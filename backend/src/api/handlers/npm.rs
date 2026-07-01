@@ -1841,6 +1841,7 @@ async fn publish_package(
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
 
@@ -1952,6 +1953,7 @@ async fn dist_tags_put(
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if tag.is_empty() {
         return Err(
@@ -2024,6 +2026,7 @@ async fn dist_tags_delete(
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if tag == "latest" {
         return Err(
@@ -2771,6 +2774,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -4543,6 +4547,65 @@ mod tests {
         assert_eq!(
             json["dist-tags"]["latest"], "1.1.0",
             "latest must stay the highest stable, not the published prerelease"
+        );
+    }
+
+    /// #2022: a direct `npm publish` to a `promotion_only` repository must be
+    /// rejected with 409 CONFLICT; the same publish to a normal repository must
+    /// still succeed. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_blocked_on_promotion_only_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
+            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
+        });
+        let body_bytes =
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body"));
+
+        // Flag the repo promotion_only -> direct publish is rejected with 409.
+        fx.set_promotion_only(true).await;
+        let blocked = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            body_bytes.clone(),
+        )
+        .await;
+
+        // Clear the flag -> the same publish succeeds.
+        fx.set_promotion_only(false).await;
+        let allowed = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            body_bytes,
+        )
+        .await;
+
+        fx.teardown().await;
+
+        let err = blocked.expect_err("publish to promotion_only repo must be rejected");
+        assert_eq!(
+            err.status(),
+            StatusCode::CONFLICT,
+            "promotion_only direct publish must return 409"
+        );
+        assert!(
+            allowed.is_ok(),
+            "publish to a normal repo must still succeed: {:?}",
+            allowed.err().map(|r| r.status())
         );
     }
 

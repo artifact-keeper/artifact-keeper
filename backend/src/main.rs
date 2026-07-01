@@ -553,6 +553,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         scan_result_service,
         scan_config_service,
         config.trivy_url.clone(),
+        config.trivy_adapter_url.clone(),
         primary_storage.clone(),
         storage_registry.clone(),
         config.storage_path.clone(),
@@ -952,17 +953,108 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // a peer and the per-IP rate-limit key degenerates to the constant
     // `ip:unknown` bucket for every unauthenticated request (direct-to-backend
     // topology with no X-Forwarded-For), collapsing the login limiter into a
-    // single global counter that 429s every account at once.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
-    .await?;
+    // single global counter that 429s every account at once. It is also load-
+    // bearing for the trusted-proxy X-Forwarded-For gate (#2023): the gate
+    // keys on the real TCP peer and only believes XFF when that peer is a
+    // configured trusted proxy.
+    //
+    // Boot-time guard (#2023): fail fast on startup if this wiring is ever
+    // dropped (e.g. a future refactor reverting to a plain
+    // `app.into_make_service()`), rather than silently degrading every
+    // per-IP / login limiter to a single shared bucket. The probe runs the
+    // EXACT `connect_info_make_service` adapter used by the serve call below,
+    // applied to a sentinel clone of the real router, so any change that stops
+    // injecting `ConnectInfo` fails here at startup. Gated to the serve path
+    // so unit tests that build the Router directly never trip it.
+    assert_connect_info_wired(app.clone()).await;
+    axum::serve(listener, connect_info_make_service(app))
+        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
+        .await?;
 
     tracing::info!("HTTP server shut down");
 
     Ok(())
+}
+
+/// The single source of truth for installing `ConnectInfo<SocketAddr>` on the
+/// HTTP serve path (#2023). Both the real `axum::serve` call and the boot-time
+/// guard route through this adapter, so the guard validates exactly the wiring
+/// that is served — reverting it (e.g. to a plain `into_make_service()`) is a
+/// one-line change here that the guard then catches at startup.
+fn connect_info_make_service(
+    app: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    app.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
+/// Boot-time assertion that the serve-path `ConnectInfo<SocketAddr>` wiring
+/// actually injects the TCP peer address into request extensions (#2023).
+///
+/// Appends a sentinel `ConnectInfo`-reading route to the real router, wraps it
+/// with the SAME [`connect_info_make_service`] adapter the server uses, drives
+/// one synthetic connection through it, and panics if the handler does not
+/// observe the peer. A future change that stops wiring `ConnectInfo` (reverting
+/// to a plain `into_make_service()`) fails this probe at startup instead of
+/// silently collapsing every per-IP / login rate-limit bucket into one shared
+/// counter. Called only from the serve path, so unit tests that build the
+/// Router directly are unaffected.
+async fn assert_connect_info_wired(app: Router) {
+    use axum::extract::connect_info::Connected;
+    use std::net::SocketAddr;
+    use tower::Service;
+
+    const PROBE_PATH: &str = "/__connect_info_boot_probe__";
+
+    // A fake connected stream that reports a fixed peer address, mirroring how
+    // `axum::serve` feeds accepted TCP connections to the make-service.
+    #[derive(Clone)]
+    struct ProbeStream(SocketAddr);
+    impl Connected<ProbeStream> for SocketAddr {
+        fn connect_info(target: ProbeStream) -> Self {
+            target.0
+        }
+    }
+
+    let probe_peer: SocketAddr = "203.0.113.123:54321".parse().expect("probe peer parses");
+    // Sentinel route on the REAL router so the probe exercises the same
+    // make-service wiring that will serve production traffic.
+    let app = app.route(
+        PROBE_PATH,
+        axum::routing::get(
+            |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                peer.to_string()
+            },
+        ),
+    );
+
+    let mut make = connect_info_make_service(app);
+    // `MakeService::call` yields the per-connection service for this peer.
+    let mut svc = make
+        .call(ProbeStream(probe_peer))
+        .await
+        .expect("connect-info make-service must produce a per-connection service");
+    let request = axum::http::Request::builder()
+        .uri(PROBE_PATH)
+        .body(axum::body::Body::empty())
+        .expect("probe request builds");
+    let response = svc.call(request).await.expect("probe request must route");
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "ConnectInfo<SocketAddr> wiring is not active: boot probe returned {status} \
+         (expected the serve path's connect_info_make_service to inject the peer)"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64)
+        .await
+        .expect("probe body");
+    let observed = String::from_utf8_lossy(&body);
+    assert_eq!(
+        observed,
+        probe_peer.to_string(),
+        "ConnectInfo<SocketAddr> wiring did not propagate the TCP peer to request \
+         extensions (observed {observed:?}); the per-IP / login rate-limit keying \
+         would silently collapse to a single shared bucket"
+    );
 }
 
 // ---------------------------------------------------------------------------

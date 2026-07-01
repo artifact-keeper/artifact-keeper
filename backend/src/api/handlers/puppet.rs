@@ -327,6 +327,7 @@ async fn publish_module(
     let user_id = require_auth_basic(auth, "puppet")?.user_id;
     let repo = resolve_puppet_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let (tarball, module_json) =
         proxy_helpers::parse_multipart_file_with_json(multipart, &["module"]).await?;

@@ -373,6 +373,7 @@ async fn upload_plugin(
     let user_id = require_auth_basic(auth, "jetbrains")?.user_id;
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty upload body").into_response());
@@ -875,6 +876,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

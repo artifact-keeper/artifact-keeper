@@ -36,8 +36,10 @@ env:
   REGISTRY: ghcr.io
   BACKEND_IMAGE: ${{ github.repository }}-backend
   OPENSCAP_IMAGE: ${{ github.repository }}-openscap
+  SCANNER_ADAPTER_IMAGE: ${{ github.repository }}-scanner-adapter
   DOCKERHUB_BACKEND: artifactkeeper/backend
   DOCKERHUB_OPENSCAP: artifactkeeper/openscap
+  DOCKERHUB_SCANNER_ADAPTER: artifactkeeper/scanner-adapter
 
 jobs:
   build-backend:
@@ -201,6 +203,82 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-scanner-adapter:
+    name: Scanner Adapter (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ak-ci-runners
+            cache-tag: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache-tag: arm64
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest }}
+      digest-arm64: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Authenticate to Docker Hub for transitive base-image pulls; see
+      # the matching step in build-backend for rationale.
+      - name: Log in to Docker Hub (for transitive base-image pulls)
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.scanner-adapter
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:buildcache-${{ matrix.cache-tag }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          sbom: true
+          provenance: mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scanner-adapter-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   build-backend-alpine:
     name: Backend Alpine (${{ matrix.platform }})
     # Alpine builds suspended. UBI is the default backend image and the
@@ -282,7 +360,7 @@ jobs:
     # `build-backend-alpine` removed from `needs` while alpine builds are
     # suspended. Re-add it (and re-enable the alpine-gated steps below)
     # when the alpine variant comes back online.
-    needs: [build-backend, build-openscap]
+    needs: [build-backend, build-openscap, build-scanner-adapter]
     permissions:
       contents: read
       packages: read
@@ -311,6 +389,12 @@ jobs:
           name: openscap-digests-amd64
           path: /tmp/openscap-digests
 
+      - name: Download scanner-adapter amd64 digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: scanner-adapter-digests-amd64
+          path: /tmp/scanner-adapter-digests
+
       # Alpine digest download skipped while alpine builds are suspended.
       # - name: Download backend alpine amd64 digest
       #   uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -323,8 +407,10 @@ jobs:
         run: |
           BACKEND_DIGEST=$(ls /tmp/backend-digests/)
           OPENSCAP_DIGEST=$(ls /tmp/openscap-digests/)
+          SCANNER_ADAPTER_DIGEST=$(ls /tmp/scanner-adapter-digests/)
           echo "backend=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
           echo "openscap=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:${OPENSCAP_DIGEST}" >> $GITHUB_OUTPUT
+          echo "scanner-adapter=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@sha256:${SCANNER_ADAPTER_DIGEST}" >> $GITHUB_OUTPUT
           # backend-alpine digest output skipped while alpine builds are suspended.
 
       # --- Trivy CVE scanning ---
@@ -370,6 +456,19 @@ jobs:
           exit-code: '0'
           skip-setup-trivy: true
 
+      - name: Trivy scan - Scanner Adapter
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.scanner-adapter }}
+          format: 'sarif'
+          output: 'scanner-adapter-trivy.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+          exit-code: '0'
+          skip-setup-trivy: true
+
       # Alpine scan skipped while alpine builds are suspended.
       - name: Trivy scan - Backend Alpine
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
@@ -398,6 +497,13 @@ jobs:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
+      - name: Upload Scanner Adapter Trivy SARIF
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        if: always()
+        with:
+          sarif_file: 'scanner-adapter-trivy.sarif'
+          category: 'trivy-scanner-adapter'
+
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
         uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
@@ -414,6 +520,7 @@ jobs:
           path: |
             backend-trivy.sarif
             openscap-trivy.sarif
+            scanner-adapter-trivy.sarif
             backend-alpine-trivy.sarif
           retention-days: 90
 
@@ -485,6 +592,7 @@ jobs:
           echo "- **Policy**: Fail on CRITICAL or HIGH severity CVEs" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Scanner Adapter**: $([ -f scanner-adapter-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend Alpine**: $([ -f backend-alpine-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### OpenSCAP STIG Compliance" >> $GITHUB_STEP_SUMMARY
@@ -720,6 +828,110 @@ jobs:
           push-to-registry: true
         continue-on-error: true
 
+  merge-scanner-adapter:
+    name: Scanner Adapter Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: [build-scanner-adapter]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: scanner-adapter-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Extract metadata (Docker Hub)
+        id: meta-dockerhub
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push (ghcr.io)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+
+      - name: Inspect image
+        id: inspect
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:${{ steps.meta.outputs.version }}
+          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
+            ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Copy to Docker Hub
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
+            ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest }}
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+        continue-on-error: true
+
   merge-backend-alpine:
     name: Backend Alpine Multi-Arch Manifest
     # Alpine builds suspended; the multi-arch manifest job follows them.
@@ -871,7 +1083,7 @@ jobs:
       packages: read
     # `merge-backend-alpine` removed from `needs` while alpine builds are
     # suspended (it is `if: false` and would never report success).
-    needs: [merge-backend, merge-openscap]
+    needs: [merge-backend, merge-openscap, merge-scanner-adapter]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Probe ghcr.io manifests for expected semver tags
@@ -879,6 +1091,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
           OPENSCAP_IMAGE: ${{ env.OPENSCAP_IMAGE }}
+          SCANNER_ADAPTER_IMAGE: ${{ env.SCANNER_ADAPTER_IMAGE }}
         run: |
           set -u
           VERSION="${GITHUB_REF#refs/tags/v}"
@@ -908,6 +1121,7 @@ jobs:
           EXPECTED=(
             "${BACKEND_IMAGE}:${VERSION}"
             "${OPENSCAP_IMAGE}:${VERSION}"
+            "${SCANNER_ADAPTER_IMAGE}:${VERSION}"
           )
 
           missing=()
@@ -933,7 +1147,7 @@ jobs:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-backend, merge-openscap]
+    needs: [merge-backend, merge-openscap, merge-scanner-adapter]
     if: always()
     steps:
       - name: Summary
@@ -947,6 +1161,10 @@ jobs:
           echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`docker.io/${{ env.DOCKERHUB_OPENSCAP }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scanner Adapter" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
           echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY

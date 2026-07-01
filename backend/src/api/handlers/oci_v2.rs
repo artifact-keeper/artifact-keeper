@@ -4644,6 +4644,26 @@ async fn handle_complete_upload(
         return resp;
     }
 
+    // Defense-in-depth: reject direct blob finalize on promotion-only repos so
+    // such a repo never accumulates orphan blobs from a blocked push. The
+    // manifest PUT is the load-bearing gate; this stops the blob upstream of it.
+    let promotion_only = sqlx::query_scalar!(
+        "SELECT promotion_only FROM repositories WHERE id = $1",
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if promotion_only {
+        return oci_error(
+            StatusCode::CONFLICT,
+            "DENIED",
+            "Direct uploads are disabled for this repository; publish via promotion",
+        );
+    }
+
     let storage = match state.storage_for_repo(&repo.location) {
         Ok(s) => s,
         Err(e) => {
@@ -6008,6 +6028,25 @@ async fn handle_put_manifest(
             StatusCode::METHOD_NOT_ALLOWED,
             "UNSUPPORTED",
             "pushes are not supported on remote or virtual repositories",
+        );
+    }
+    // Reject direct pushes to promotion-only repositories. The manifest PUT is
+    // the load-bearing commit of `docker push`; such repos accept images only
+    // via the promotion path. No admin exemption (matches the shared helper).
+    let promotion_only = sqlx::query_scalar!(
+        "SELECT promotion_only FROM repositories WHERE id = $1",
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if promotion_only {
+        return oci_error(
+            StatusCode::CONFLICT,
+            "DENIED",
+            "Direct uploads are disabled for this repository; publish via promotion",
         );
     }
     let repo_id = repo.id;
@@ -12629,6 +12668,67 @@ mod oci_blob_upload_streaming_tests {
         assert_eq!(
             tags, 0,
             "a rejected degenerate manifest must not create a live tag"
+        );
+    }
+
+    /// #2022: a direct manifest PUT (the `docker push` commit) to a
+    /// `promotion_only` repository must be rejected with 409 + OCI code DENIED.
+    /// The same PUT to a normal repository must pass the gate (here it reaches
+    /// manifest validation and is rejected as degenerate with 400, NOT 409 —
+    /// proving the promotion gate is a no-op on ordinary repos).
+    #[tokio::test]
+    async fn put_manifest_blocked_on_promotion_only_repo() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        // A degenerate-but-parseable manifest body. On a promotion_only repo the
+        // gate fires BEFORE classification (409); on a normal repo the body is
+        // classified and rejected as degenerate (400).
+        let body = Bytes::from_static(br#"{"schemaVersion":2,"layers":[]}"#);
+
+        // promotion_only = true -> 409 DENIED.
+        f.inner.set_promotion_only(true).await;
+        let (blocked_status, _h, blocked_body) = send(
+            f.app(),
+            request(
+                Method::PUT,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                body.clone(),
+            ),
+        )
+        .await;
+
+        // promotion_only = false -> gate is a no-op; the degenerate manifest is
+        // rejected with 400, not 409.
+        f.inner.set_promotion_only(false).await;
+        let (allowed_status, _h2, _b2) = send(
+            f.app(),
+            request(
+                Method::PUT,
+                format!("/{}/app/manifests/v1", f.inner.repo_key),
+                &f.authorization,
+                body,
+            ),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::CONFLICT,
+            "manifest PUT to promotion_only repo must return 409"
+        );
+        assert!(
+            String::from_utf8_lossy(&blocked_body).contains("DENIED"),
+            "409 body must carry the OCI DENIED code; got: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::BAD_REQUEST,
+            "manifest PUT to a normal repo must pass the gate (degenerate -> 400, not 409)"
         );
     }
 

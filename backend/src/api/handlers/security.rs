@@ -1885,6 +1885,7 @@ mod tests {
             scan_result_service,
             scan_config_service,
             None, // trivy_url
+            None, // trivy_adapter_url
             fx.state.storage.clone(),
             fx.state.storage_registry.clone(),
             fx.storage_dir.to_string_lossy().into_owned(),

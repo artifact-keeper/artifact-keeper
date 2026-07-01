@@ -1344,6 +1344,7 @@ async fn recipe_file_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
@@ -2115,6 +2116,7 @@ async fn package_file_upload(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = package_artifact_path(
         &name,
@@ -2991,6 +2993,7 @@ mod tests {
                 ldap_url: None,
                 ldap_base_dn: None,
                 trivy_url: None,
+                trivy_adapter_url: None,
                 openscap_url: None,
                 openscap_profile: "standard".into(),
                 opensearch_url: None,
@@ -3039,6 +3042,7 @@ mod tests {
                 rate_limit_exempt_usernames: Vec::new(),
                 rate_limit_exempt_service_accounts: false,
                 rate_limit_trusted_cidrs: Vec::new(),
+                rate_limit_trusted_proxy_cidrs: Vec::new(),
                 account_lockout_threshold: 5,
                 account_lockout_duration_minutes: 30,
                 quarantine_enabled: false,

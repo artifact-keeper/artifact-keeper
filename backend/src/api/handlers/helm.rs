@@ -446,6 +446,7 @@ async fn upload_chart(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract chart file from multipart form (field name: "chart")
     let mut chart_content: Option<Bytes> = None;
@@ -760,6 +761,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -774,6 +776,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://charts.helm.sh/stable".to_string()),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -1129,6 +1132,7 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url),
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "tc", "2.0.0", "tc-2.0.0.tgz").await;
@@ -1160,6 +1164,7 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
@@ -1183,6 +1188,7 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;

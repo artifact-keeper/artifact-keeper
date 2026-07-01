@@ -3,10 +3,15 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.2.1"
+version = "1.2.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
+
+# Strip symbols from the release binary. Reduces the shipped binary size with no
+# behavioral change; complements the runtime-image hardening in issue #1544.
+[profile.release]
+strip = true
 
 [workspace.dependencies]
 # Async runtime
@@ -95,8 +100,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.11", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.11"
+wasmtime = { version = "36.0.12", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.12"
 
 # Git operations
 git2 = "0.20"

@@ -154,6 +154,14 @@ pub struct RateLimitState {
     /// circuits before touching the limiter so no request is ever limited.
     /// Intended for internal-only / VPN-gated deployments. See #1602.
     pub enabled: bool,
+    /// CIDR ranges identifying trusted reverse proxies. `X-Forwarded-For` is
+    /// consulted for client-IP resolution **only** when the immediate TCP
+    /// peer falls within one of these ranges; otherwise the real TCP peer is
+    /// used so a spoofed/rotating `XFF` from an untrusted client cannot steer
+    /// or multiply its rate-limit budget. Empty (the default) means `XFF` is
+    /// never trusted. Driven by `Config::rate_limit_trusted_proxy_cidrs`
+    /// (env `RATE_LIMIT_TRUSTED_PROXY_CIDRS`).
+    pub trusted_proxies: Arc<Vec<CidrRange>>,
 }
 
 /// Whether a request should be limited at all, given the master switch.
@@ -191,6 +199,7 @@ fn check_rate_limit_exemptions(
     exemptions: &RateLimitExemptions,
     auth: Option<&AuthExtension>,
     request: &Request,
+    trusted_proxies: &[CidrRange],
 ) -> Option<&'static str> {
     // User/service-account exemption.
     if let Some(auth) = auth {
@@ -200,7 +209,7 @@ fn check_rate_limit_exemptions(
     }
     // Trusted-CIDR exemption (#969): applies to authed and unauthed alike.
     if !exemptions.trusted_cidrs.is_empty() {
-        if let Some(ip) = extract_client_ip_addr(request) {
+        if let Some(ip) = extract_client_ip_addr(request, trusted_proxies) {
             if exemptions.is_trusted_cidr(ip) {
                 return Some("trusted-cidr");
             }
@@ -328,7 +337,12 @@ pub async fn rate_limit_middleware(
     let auth = auth_from_request(&request);
 
     // Username/service-account + trusted-CIDR exemptions (#969).
-    if let Some(tag) = check_rate_limit_exemptions(&state.exemptions, auth.as_ref(), &request) {
+    if let Some(tag) = check_rate_limit_exemptions(
+        &state.exemptions,
+        auth.as_ref(),
+        &request,
+        &state.trusted_proxies,
+    ) {
         return tag_exempt(next.run(request).await, tag);
     }
 
@@ -337,7 +351,7 @@ pub async fn rate_limit_middleware(
     let key = if let Some(ref auth) = auth {
         format!("user:{}", auth.user_id)
     } else {
-        extract_client_ip(&request)
+        extract_client_ip(&request, &state.trusted_proxies)
     };
 
     // Check rate limit
@@ -380,14 +394,19 @@ pub async fn rate_limit_by_ip_middleware(
     // batch downloads by admin / CI bots (or trusted internal ranges) should
     // not be throttled even when they share a single egress IP.
     let auth = auth_from_request(&request);
-    if let Some(tag) = check_rate_limit_exemptions(&state.exemptions, auth.as_ref(), &request) {
+    if let Some(tag) = check_rate_limit_exemptions(
+        &state.exemptions,
+        auth.as_ref(),
+        &request,
+        &state.trusted_proxies,
+    ) {
         return tag_exempt(next.run(request).await, tag);
     }
 
     // The whole point of this variant: key by IP, not user_id. An
     // attacker who has N valid auth tokens behind a single egress IP
     // cannot multiply their presign-mint budget by minting tokens.
-    let key = extract_client_ip(&request);
+    let key = extract_client_ip(&request, &state.trusted_proxies);
 
     match state.limiter.check_rate_limit(&key).await {
         Ok(remaining) => tag_allowed(
@@ -465,12 +484,17 @@ pub async fn login_rate_limit_middleware(
     // AuthExtension upstream; honor the same exemption contract as
     // rate_limit_middleware for parity.
     let auth = auth_from_request(&request);
-    if let Some(tag) = check_rate_limit_exemptions(&inner.exemptions, auth.as_ref(), &request) {
+    if let Some(tag) = check_rate_limit_exemptions(
+        &inner.exemptions,
+        auth.as_ref(),
+        &request,
+        &inner.trusted_proxies,
+    ) {
         return tag_exempt(next.run(request).await, tag);
     }
 
     // Resolve the client IP before consuming the body.
-    let client_ip = extract_client_ip(&request);
+    let client_ip = extract_client_ip(&request, &inner.trusted_proxies);
 
     // Buffer the (small) login body so we can peek `username`, then re-attach
     // it unchanged for the handler's custom Json extractor.
@@ -554,50 +578,102 @@ fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
     response
 }
 
-/// Extract the client IP address from the request.
+/// First `X-Forwarded-For` token, trimmed, as a string (may be a hostname or
+/// otherwise non-parseable). `None` when the header is absent or empty.
+fn first_xff_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the request's immediate TCP peer (from `ConnectInfo`) is a trusted
+/// reverse proxy, i.e. its IP falls within one of `trusted_proxies`. Returns
+/// `false` when `ConnectInfo` is absent or the list is empty, so `XFF` is only
+/// believed for an explicitly-configured proxy in front of the backend.
+fn peer_is_trusted_proxy(request: &Request, trusted_proxies: &[CidrRange]) -> bool {
+    if trusted_proxies.is_empty() {
+        return false;
+    }
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .map(|peer| trusted_proxies.iter().any(|cidr| cidr.contains(peer)))
+        .unwrap_or(false)
+}
+
+/// Extract the client IP address from the request, as the rate-limit key.
 ///
-/// Uses the actual TCP peer address from ConnectInfo as the primary source.
-/// When ConnectInfo is unavailable (common in Kubernetes where the backend
-/// sits behind an ingress controller), falls back to X-Forwarded-For set
-/// by the trusted reverse proxy. As a last resort, all unauthenticated
-/// requests share a single bucket.
-fn extract_client_ip(request: &Request) -> String {
-    if let Some(ip) = extract_client_ip_addr(request) {
+/// The real TCP peer address from `ConnectInfo` is authoritative. The
+/// spoofable `X-Forwarded-For` header is consulted to recover the real client
+/// IP **only** when the immediate peer is a configured trusted reverse proxy
+/// (`trusted_proxies`); otherwise it is ignored so a rotating/spoofed `XFF`
+/// from an untrusted client cannot steer or multiply its budget (#2023).
+///
+/// When `ConnectInfo` is unavailable (e.g. a test harness building the Router
+/// directly, with no socket peer), `XFF` is used as a last-resort fallback so
+/// keying still distinguishes callers; otherwise all such requests would share
+/// a single `ip:unknown` bucket.
+fn extract_client_ip(request: &Request, trusted_proxies: &[CidrRange]) -> String {
+    if let Some(ip) = extract_client_ip_addr(request, trusted_proxies) {
         return format!("ip:{}", ip);
     }
-    // Fall back to a stringly-typed XFF first-token even when it does NOT
-    // parse as an IpAddr - this preserves pre-#969 bucket behavior for
-    // hostnames or malformed entries (the rate-limit key was always a
-    // String and never required parseability).
-    if let Some(xff) = request.headers().get("x-forwarded-for") {
-        if let Ok(xff_str) = xff.to_str() {
-            if let Some(first) = xff_str.split(',').next() {
-                return format!("ip:{}", first.trim());
-            }
+    // No resolvable IP yet. If the peer is a trusted proxy, honor a non-
+    // parseable XFF token (hostname / malformed) so the key is still per-
+    // client. If there is no ConnectInfo at all, fall back to XFF too (the
+    // direct-test / pre-ConnectInfo topology). An untrusted real peer never
+    // reaches here: `extract_client_ip_addr` already returned its socket IP.
+    let connect_info_present = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_some();
+    if !connect_info_present || peer_is_trusted_proxy(request, trusted_proxies) {
+        if let Some(first) = first_xff_token(request) {
+            return format!("ip:{}", first);
         }
     }
     "ip:unknown".to_string()
 }
 
-/// Extract the client IP as a parsed `IpAddr` for CIDR matching (#969).
+/// Extract the client IP as a parsed `IpAddr` for CIDR matching (#969) and
+/// rate-limit keying (#2023).
+///
+/// `ConnectInfo` (the real TCP peer) is authoritative. `X-Forwarded-For` is
+/// trusted to override the peer **only** when that peer is a configured
+/// trusted reverse proxy; for any other (untrusted) peer the socket IP is
+/// returned and `XFF` is ignored. When `ConnectInfo` is absent entirely, fall
+/// back to a parseable `XFF` (direct-test / pre-ConnectInfo topology).
 /// Returns `None` if the address cannot be resolved or does not parse.
-fn extract_client_ip_addr(request: &Request) -> Option<IpAddr> {
-    // ConnectInfo: the actual TCP peer.
+fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> Option<IpAddr> {
     if let Some(connect_info) = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
-        return Some(connect_info.0.ip());
-    }
-
-    // X-Forwarded-For from a trusted ingress (Kubernetes deployment).
-    if let Some(xff) = request.headers().get("x-forwarded-for") {
-        if let Ok(xff_str) = xff.to_str() {
-            if let Some(first) = xff_str.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+        let peer = connect_info.0.ip();
+        // Believe XFF only when the immediate peer is a trusted proxy.
+        if trusted_proxies.iter().any(|cidr| cidr.contains(peer)) {
+            if let Some(first) = first_xff_token(request) {
+                if let Ok(ip) = first.parse::<IpAddr>() {
                     return Some(ip);
                 }
             }
+        }
+        // Untrusted peer (or trusted peer with no/unparseable XFF): the real
+        // TCP peer is the key.
+        return Some(peer);
+    }
+
+    // No ConnectInfo (test harness / pre-ConnectInfo topology): fall back to a
+    // parseable XFF first token so keying still distinguishes callers.
+    if let Some(first) = first_xff_token(request) {
+        if let Ok(ip) = first.parse::<IpAddr>() {
+            return Some(ip);
         }
     }
     None
@@ -787,28 +863,107 @@ mod tests {
     // extract_client_ip
     // -----------------------------------------------------------------------
 
+    /// No trusted-proxy CIDRs configured (the secure default): XFF is never
+    /// believed when a real TCP peer is present.
+    fn no_trusted_proxies() -> Vec<CidrRange> {
+        Vec::new()
+    }
+
+    /// A trusted-proxy set covering the whole loopback range, mirroring the
+    /// reverse-proxy deployment (`RATE_LIMIT_TRUSTED_PROXY_CIDRS=127.0.0.0/8`).
+    fn loopback_trusted_proxies() -> Vec<CidrRange> {
+        vec![CidrRange::parse("127.0.0.0/8").unwrap()]
+    }
+
+    /// Build a request with a `ConnectInfo` peer and an optional XFF header.
+    fn req_with_peer(peer: &str, xff: Option<&str>) -> Request {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = peer.parse().unwrap();
+        let mut builder = axum::extract::Request::builder();
+        if let Some(xff) = xff {
+            builder = builder.header("X-Forwarded-For", xff);
+        }
+        let mut request = builder.body(axum::body::Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        request
+    }
+
     #[test]
-    fn test_extract_client_ip_uses_x_forwarded_for_as_fallback() {
-        // Without ConnectInfo, X-Forwarded-For is used as a fallback
-        // (trusted when behind a known reverse proxy / ingress controller)
+    fn test_extract_client_ip_honors_xff_from_trusted_proxy() {
+        // Behind a configured reverse proxy (peer in trusted_proxies), the XFF
+        // first token resolves the real client IP — legit reverse-proxy mode.
+        let request = req_with_peer("127.0.0.1:443", Some("192.168.1.1"));
+        assert_eq!(
+            extract_client_ip(&request, &loopback_trusted_proxies()),
+            "ip:192.168.1.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip_uses_first_xff_ip_from_trusted_proxy() {
+        // When XFF contains multiple IPs and the peer is trusted, use the first
+        // (the client IP set by the outermost proxy).
+        let request = req_with_peer(
+            "127.0.0.1:443",
+            Some("203.0.113.50, 70.41.3.18, 150.172.238.178"),
+        );
+        assert_eq!(
+            extract_client_ip(&request, &loopback_trusted_proxies()),
+            "ip:203.0.113.50"
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip_ignores_xff_from_untrusted_peer() {
+        // Default policy (no trusted proxies): XFF from an untrusted peer is
+        // ignored; keying tracks the real TCP peer (#2023).
+        let request = req_with_peer("198.51.100.9:5555", Some("192.168.1.1"));
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:198.51.100.9"
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip_rotating_xff_from_untrusted_keys_per_socket() {
+        // A single untrusted peer rotating XFF across requests must NOT split
+        // into separate buckets — both resolve to the same socket IP, so the
+        // attacker cannot multiply their rate-limit budget (#2023).
+        let req1 = req_with_peer("198.51.100.9:1111", Some("10.0.0.1"));
+        let req2 = req_with_peer("198.51.100.9:2222", Some("10.0.0.2"));
+        let proxies = no_trusted_proxies();
+        assert_eq!(
+            extract_client_ip(&req1, &proxies),
+            extract_client_ip(&req2, &proxies)
+        );
+        assert_eq!(extract_client_ip(&req1, &proxies), "ip:198.51.100.9");
+    }
+
+    #[test]
+    fn test_extract_client_ip_trusted_peer_empty_xff_falls_back_to_peer() {
+        // Trusted proxy but no XFF present: fall back to the proxy's socket IP
+        // rather than collapsing to `ip:unknown`.
+        let request = req_with_peer("127.0.0.1:443", None);
+        assert_eq!(
+            extract_client_ip(&request, &loopback_trusted_proxies()),
+            "ip:127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip_uses_x_forwarded_for_when_no_connect_info() {
+        // Direct-test / pre-ConnectInfo topology: with NO ConnectInfo at all,
+        // XFF is the last-resort key so callers are still distinguished.
         let request = axum::extract::Request::builder()
             .header("X-Forwarded-For", "192.168.1.1")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:192.168.1.1");
-    }
-
-    #[test]
-    fn test_extract_client_ip_uses_first_xff_ip() {
-        // When XFF contains multiple IPs, use the first (client IP set by proxy)
-        let request = axum::extract::Request::builder()
-            .header(
-                "X-Forwarded-For",
-                "203.0.113.50, 70.41.3.18, 150.172.238.178",
-            )
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:203.0.113.50");
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:192.168.1.1"
+        );
     }
 
     #[test]
@@ -817,7 +972,10 @@ mod tests {
             .header("X-Real-IP", "10.20.30.40")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:unknown");
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:unknown"
+        );
     }
 
     #[test]
@@ -825,36 +983,29 @@ mod tests {
         let request = axum::extract::Request::builder()
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:unknown");
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:unknown"
+        );
     }
 
     #[test]
     fn test_extract_client_ip_uses_connect_info() {
-        use std::net::SocketAddr;
-        let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-        let mut request = axum::extract::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
-        assert_eq!(extract_client_ip(&request), "ip:192.168.1.100");
+        let request = req_with_peer("192.168.1.100:12345", None);
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:192.168.1.100"
+        );
     }
 
     #[test]
     fn test_extract_client_ip_connect_info_over_headers() {
-        use std::net::SocketAddr;
-        let addr: SocketAddr = "10.0.0.5:9999".parse().unwrap();
-        let mut request = axum::extract::Request::builder()
-            .header("X-Forwarded-For", "1.2.3.4")
-            .header("X-Real-IP", "5.6.7.8")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
-        // ConnectInfo takes priority over spoofable headers
-        assert_eq!(extract_client_ip(&request), "ip:10.0.0.5");
+        // Untrusted peer: ConnectInfo wins over spoofable headers.
+        let request = req_with_peer("10.0.0.5:9999", Some("1.2.3.4"));
+        assert_eq!(
+            extract_client_ip(&request, &no_trusted_proxies()),
+            "ip:10.0.0.5"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1050,8 +1201,12 @@ mod tests {
             .header("X-Forwarded-For", "203.0.113.42")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&req1), extract_client_ip(&req2));
-        assert_eq!(extract_client_ip(&req1), "ip:203.0.113.42");
+        let proxies = no_trusted_proxies();
+        assert_eq!(
+            extract_client_ip(&req1, &proxies),
+            extract_client_ip(&req2, &proxies)
+        );
+        assert_eq!(extract_client_ip(&req1, &proxies), "ip:203.0.113.42");
     }
 
     // --- Master enable/disable switch (#1602) ---
@@ -1070,6 +1225,7 @@ mod tests {
             limiter: Arc::new(RateLimiter::new(1, 60)),
             exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
             enabled,
+            trusted_proxies: Arc::new(Vec::new()),
         }
     }
 
@@ -1171,7 +1327,11 @@ mod tests {
             .header("X-Forwarded-For", "198.51.100.7")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_ne!(extract_client_ip(&req1), extract_client_ip(&req2));
+        let proxies = no_trusted_proxies();
+        assert_ne!(
+            extract_client_ip(&req1, &proxies),
+            extract_client_ip(&req2, &proxies)
+        );
     }
 
     // ── Layer-ordering regression: auth must populate before the limiter ──────
@@ -1364,6 +1524,7 @@ mod tests {
                 limiter: Arc::new(RateLimiter::new(per_key, 60)),
                 exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
                 enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(backstop, 60)),
         };
@@ -1471,6 +1632,7 @@ mod tests {
                 limiter: Arc::new(RateLimiter::new(100, 60)),
                 exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
                 enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
         };
@@ -1520,6 +1682,7 @@ mod tests {
                 limiter: Arc::new(RateLimiter::new(1, 60)),
                 exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
                 enabled: false,
+                trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(1, 60)),
         };
@@ -1544,6 +1707,7 @@ mod tests {
                 limiter: Arc::new(RateLimiter::new(1, 60)),
                 exemptions: Arc::new(RateLimitExemptions::new(vec!["ci-bot".into()], false)),
                 enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
         };

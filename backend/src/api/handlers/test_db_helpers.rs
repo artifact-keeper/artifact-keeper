@@ -72,6 +72,7 @@ fn cfg(storage_path: &str) -> Config {
         ldap_url: None,
         ldap_base_dn: None,
         trivy_url: None,
+        trivy_adapter_url: None,
         openscap_url: None,
         openscap_profile: "standard".into(),
         opensearch_url: None,
@@ -120,6 +121,7 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
         rate_limit_trusted_cidrs: Vec::new(),
+        rate_limit_trusted_proxy_cidrs: Vec::new(),
         account_lockout_threshold: 5,
         account_lockout_duration_minutes: 30,
         quarantine_enabled: false,
@@ -351,6 +353,7 @@ pub fn make_repo_info(
         storage_backend: "filesystem".to_string(),
         repo_type: repo_type.to_string(),
         upstream_url: upstream_url.map(|s| s.to_string()),
+        promotion_only: false,
     }
 }
 
@@ -475,6 +478,18 @@ impl Fixture {
             storage_dir,
             state,
         })
+    }
+
+    /// Flag the fixture repository as `promotion_only` (or clear the flag).
+    /// Used by the format-native publish-gate tests to assert that a direct
+    /// upload to a promotion_only repository is rejected.
+    pub async fn set_promotion_only(&self, value: bool) {
+        sqlx::query("UPDATE repositories SET promotion_only = $1 WHERE id = $2")
+            .bind(value)
+            .bind(self.repo_id)
+            .execute(&self.pool)
+            .await
+            .expect("set promotion_only");
     }
 
     /// Build a `RepoInfo` matching this fixture's repository. Mirrors the

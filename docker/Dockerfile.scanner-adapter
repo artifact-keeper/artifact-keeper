@@ -1,0 +1,63 @@
+# =============================================================================
+# Artifact Keeper — in-house Trivy scanner adapter (multi-arch)
+# =============================================================================
+# A small AK-owned Go service implementing the Harbor Pluggable Scanner API v1
+# (issue #2091). The backend (TRIVY_ADAPTER_URL) posts a scan request; the
+# adapter execs the bundled trivy CLI against the requested image in the AK
+# registry and serves the resulting vulnerability report in the Harbor format
+# the backend consumes. Trivy is NOT in the backend image (#2059) — it lives
+# here.
+#
+# Build (buildx resolves $TARGETPLATFORM per requested arch):
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f docker/Dockerfile.scanner-adapter -t artifact-keeper-scanner-adapter:dev .
+# Context is the repo root; the Go module lives at docker/scanner-adapter.
+
+# ---------- Stage 1: cross-compile the Go adapter ----------
+# Pinned to the BUILDPLATFORM so the toolchain runs natively and cross-compiles
+# to the requested TARGET arch (fast, no emulation for the compile step).
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+
+# stdlib-only module: copying go.mod is enough for the build cache; there are no
+# third-party dependencies to download.
+COPY docker/scanner-adapter/go.mod ./
+COPY docker/scanner-adapter/*.go ./
+
+# CGO disabled for a fully static binary; -trimpath + -s -w for a small,
+# reproducible artifact.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/scanner-adapter .
+
+# ---------- Stage 2: pull the matching trivy binary ----------
+# buildx selects this image's TARGETPLATFORM variant automatically, so the
+# arm64 build gets the arm64 trivy and the amd64 build gets amd64. Pinned to
+# 0.71.2 (rig-standard; #2090's backend tests assert trivy-0.71.2). Aqua
+# publishes both linux/amd64 and linux/arm64 for this tag.
+FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy
+
+# ---------- Stage 3: minimal runtime ----------
+FROM alpine:3.20
+
+# ca-certificates: TLS to the trivy vuln-DB registry / HTTPS registries.
+# git + rpm: trivy uses them for certain package/source scanners.
+RUN apk add --no-cache ca-certificates git rpm \
+    && adduser -D -u 1001 scanner \
+    && mkdir -p /home/scanner/.cache/trivy \
+    && chown -R scanner:scanner /home/scanner
+
+COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
+COPY --from=build /out/scanner-adapter /usr/local/bin/scanner-adapter
+
+ENV SCANNER_ADAPTER_ADDR=:8080 \
+    SCANNER_TRIVY_PATH=/usr/local/bin/trivy \
+    SCANNER_TRIVY_CACHE_DIR=/home/scanner/.cache/trivy
+
+USER 1001
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/scanner-adapter"]

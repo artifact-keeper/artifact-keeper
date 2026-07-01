@@ -406,6 +406,7 @@ async fn upload_collection(
     let user_id = require_auth_basic(auth, "ansible")?.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // The `ansible-galaxy collection publish` CLI sends a multipart body with:
     //   * `file`: the tarball, with the canonical filename
@@ -642,6 +643,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://example.com".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.storage_path, "/tmp/test");
         assert_eq!(info.repo_type, "hosted");

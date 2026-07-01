@@ -395,7 +395,7 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
 async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        r#"SELECT id, key, storage_backend, storage_path, format::text AS format, repo_type::text AS repo_type, upstream_url
+        r#"SELECT id, key, storage_backend, storage_path, format::text AS format, repo_type::text AS repo_type, upstream_url, promotion_only
         FROM repositories WHERE key = $1"#,
     )
     .bind(repo_key)
@@ -435,6 +435,7 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         storage_backend: row.get("storage_backend"),
         repo_type: row.get("repo_type"),
         upstream_url: row.get("upstream_url"),
+        promotion_only: row.try_get("promotion_only").unwrap_or(false),
     })
 }
 
@@ -875,6 +876,7 @@ async fn create_modules(
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // CreateModules is implicitly handled during upload. Return the request
     // echoed back as acknowledgement (modules are created on first push).
@@ -1046,6 +1048,7 @@ async fn upload(
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let mut result_commits = Vec::new();
 
@@ -1501,6 +1504,7 @@ async fn create_or_update_labels(
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let mut labels = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();

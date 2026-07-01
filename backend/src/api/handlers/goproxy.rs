@@ -327,6 +327,7 @@ async fn handle_put(
             .await?;
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
     let request = parse_path(&path)?;
 
     match request {

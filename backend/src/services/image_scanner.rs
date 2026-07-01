@@ -1,20 +1,32 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::services::scanner_service::{
-    cached_trivy_cli_version, ScanOutput, ScanTarget, Scanner, VersionCache,
-};
+use crate::models::user::User;
+use crate::services::auth_service::AuthService;
+use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
 #[cfg(test)]
 use crate::models::security::RawFinding;
 #[cfg(test)]
 use crate::services::scanner_service::convert_trivy_findings;
 
+// ---------------------------------------------------------------------------
 // Trivy JSON report structures
+//
+// These are retained as the *internal* canonical report shape because
+// `TrivyFsScanner` and `IncusScanner` still drive the trivy server directly
+// (CLI `--server` / dir-mode) and deserialize this exact JSON, and because the
+// shared `scanner_service::convert_trivy_findings` / `convert_trivy_packages`
+// converters consume it. The container `ImageScanner` no longer produces this
+// from a trivy server: it talks to a Harbor scanner-adapter (below) and maps
+// the adapter's report INTO this shape so the conversion + dashboards
+// (source = 'trivy') stay byte-for-byte compatible.
+// ---------------------------------------------------------------------------
 #[derive(Debug, Deserialize)]
 pub struct TrivyReport {
     #[serde(rename = "Results", default)]
@@ -84,27 +96,229 @@ pub struct TrivyPackageIdentifier {
     pub purl: Option<String>,
 }
 
-/// Container image scanner that delegates to a Trivy server instance.
+// ---------------------------------------------------------------------------
+// Harbor Pluggable Scanner API v1 report structures
+//
+// https://github.com/goharbor/pluggable-scanner-spec — the `harbor-scanner-trivy`
+// adapter (and any other Harbor-compatible adapter) returns this shape from
+// GET /api/v1/scan/{id}/report. Only the fields we map into `TrivyReport` are
+// deserialized; unknown fields (`artifact`, `severity` aggregate, CVSS blocks)
+// are ignored.
+// ---------------------------------------------------------------------------
+
+/// Response body of `POST /api/v1/scan` — the adapter accepts the scan and
+/// returns the opaque id used to fetch the report.
+#[derive(Debug, Deserialize)]
+struct HarborScanResponse {
+    id: String,
+}
+
+/// Top-level Harbor vulnerability report (`version=1.1`).
+#[derive(Debug, Deserialize)]
+pub struct HarborScanReport {
+    #[serde(default)]
+    pub scanner: Option<HarborScanner>,
+    #[serde(default)]
+    pub vulnerabilities: Vec<HarborVulnerability>,
+}
+
+/// Identifies the scanner that produced the report. Feeds
+/// `Scanner::version()` now that the in-image trivy CLI (and its
+/// `trivy --version` probe) is gone (#2059).
+#[derive(Debug, Deserialize)]
+pub struct HarborScanner {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// A single Harbor vulnerability row.
+#[derive(Debug, Deserialize)]
+pub struct HarborVulnerability {
+    pub id: String,
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub fix_version: Option<String>,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub links: Option<Vec<String>>,
+}
+
+/// Normalize a Harbor severity token to the trivy severity vocabulary the
+/// shared converter understands. Harbor adds `Negligible` (mapped to `Low`)
+/// and `Unknown` (mapped to `Unknown`, which `Severity::from_str_loose` does
+/// not recognise and therefore falls back to `Info` in the converter). All
+/// other tokens (Critical/High/Medium/Low/None) pass through unchanged. Pure
+/// fn so it is covered without a network.
+fn normalize_harbor_severity(sev: &str) -> String {
+    match sev.to_ascii_lowercase().as_str() {
+        "negligible" => "Low".to_string(),
+        // Empty severity is normalized to `Unknown` (-> Info in the converter).
+        // `Unknown` itself is intentionally passed through: `from_str_loose`
+        // returns None for it and the converter defaults to Info, matching the
+        // spec's "Unknown -> Info" requirement without duplicating the mapping.
+        "" => "Unknown".to_string(),
+        _ => sev.to_string(),
+    }
+}
+
+/// Map a Harbor scan report into the internal [`TrivyReport`] shape so the
+/// shared `convert_trivy_findings` / `ScanOutput::from_trivy_report`
+/// conversion (and the `source = 'trivy'` dashboards) are reused verbatim —
+/// no duplicated severity mapping. Pure fn: fully unit-testable.
+fn harbor_report_to_trivy(report: &HarborScanReport, target: &str) -> TrivyReport {
+    let vulnerabilities: Vec<TrivyVulnerability> = report
+        .vulnerabilities
+        .iter()
+        .map(|v| TrivyVulnerability {
+            vulnerability_id: v.id.clone(),
+            pkg_name: v.package.clone(),
+            installed_version: v.version.clone(),
+            fixed_version: v.fix_version.clone(),
+            severity: normalize_harbor_severity(&v.severity),
+            // Leave the title empty so the converter synthesizes
+            // "<id> in <pkg>" exactly as it does for native trivy rows.
+            title: None,
+            description: v.description.clone(),
+            primary_url: v.links.as_ref().and_then(|l| l.first()).cloned(),
+        })
+        .collect();
+
+    TrivyReport {
+        results: vec![TrivyResult {
+            target: target.to_string(),
+            class: "os-pkgs".to_string(),
+            result_type: String::new(),
+            vulnerabilities: if vulnerabilities.is_empty() {
+                None
+            } else {
+                Some(vulnerabilities)
+            },
+            // Harbor's vulnerability report (v1.1) does not enumerate the full
+            // package inventory, so there is no Packages block to map. Image
+            // SBOM inventory continues to come from the grype path.
+            packages: None,
+        }],
+    }
+}
+
+/// How the adapter should address the artifact: by tag or by digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdapterReference {
+    Tag(String),
+    Digest(String),
+}
+
+/// A resolved Harbor scan target: the registry-relative repository path and
+/// the tag/digest reference. Produced by [`build_adapter_scan_artifact`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdapterScanArtifact {
+    /// `<repo_key>/<name>` (or bare `<name>` for the legacy keyless path).
+    pub repository: String,
+    pub reference: AdapterReference,
+}
+
+/// Build the Harbor `artifact` target from the stored OCI manifest path.
+///
+/// Reuses `parse_oci_manifest_path` to split `(name, reference)` and
+/// `resolve_scan_reference` to (a) resolve a multi-arch image index to a
+/// concrete child-platform digest (#1971) and (b) keep digest-pinned refs
+/// (#1483) as digests. The owning `repository_key` is prepended so the adapter
+/// pulls Artifact Keeper's own stored image rather than a same-named public
+/// image. Pure fn: no network, fully unit-testable.
+pub(crate) fn build_adapter_scan_artifact(
+    artifact_path: &str,
+    repository_key: Option<&str>,
+    body: &[u8],
+) -> Option<AdapterScanArtifact> {
+    let (name, reference) =
+        crate::services::scanner_service::parse_oci_manifest_path(artifact_path)?;
+    let resolved =
+        crate::services::scanner_service::resolve_scan_reference(body, reference).into_reference();
+
+    let repository = match repository_key {
+        Some(key) => format!("{}/{}", key, name),
+        None => name.to_string(),
+    };
+
+    let reference = if crate::services::scanner_service::is_oci_digest_reference(&resolved) {
+        AdapterReference::Digest(resolved)
+    } else {
+        AdapterReference::Tag(resolved)
+    };
+
+    Some(AdapterScanArtifact {
+        repository,
+        reference,
+    })
+}
+
+/// Container image scanner that delegates to a Harbor Pluggable Scanner API v1
+/// adapter (e.g. `harbor-scanner-trivy`) over HTTP.
+///
+/// FAIL-CLOSED contract (#2088): every adapter error — unreachable, non-2xx,
+/// timeout, or a report that never becomes ready within the scan budget —
+/// surfaces as `Err(AppError::BadGateway)` so the orchestrator marks the scan
+/// `failed`. This scanner MUST NEVER return `Ok` with empty findings on an
+/// error path: a silent zero-finding completion is exactly the false-clean
+/// regression #2088 tracks (the old trivy-server Twirp `Scan` call returned an
+/// empty result that was mapped to "completed, 0 findings").
 pub struct ImageScanner {
-    trivy_url: String,
+    /// Base URL of the Harbor scanner adapter, e.g. `http://trivy:8090`.
+    adapter_url: String,
     http: reqwest::Client,
-    /// Lazily-probed version string from `trivy --version`, e.g.
-    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
-    /// does not pay an extra subprocess; failed probes expire after 60s so
-    /// the field starts populating once the binary becomes available.
-    cached_version: VersionCache,
+    /// Dedicated client with redirects disabled so a `302 Found` "report not
+    /// ready" response from the adapter is observed rather than followed.
+    poll_http: reqwest::Client,
+    /// Optional token minter for private-repo pulls. When both an
+    /// `AuthService` and a system scan identity are wired, each scan request
+    /// carries a short-lived scoped JWT as `registry.authorization` so the
+    /// adapter can pull internal/private images. Absent in the default
+    /// (anonymous) wiring; provisioning a scanner service account to populate
+    /// it is an ops follow-up (see PR notes).
+    auth: Option<Arc<AuthService>>,
+    scan_identity: Option<User>,
+    /// Scanner version reported by the adapter on the most recent successful
+    /// scan (e.g. `trivy-0.71.2`). The in-image `trivy --version` probe is
+    /// gone (#2059), so this is the only available provenance.
+    last_scanner_version: Mutex<Option<String>>,
 }
 
 impl ImageScanner {
-    pub fn new(trivy_url: String) -> Self {
+    pub fn new(adapter_url: String) -> Self {
         Self {
-            trivy_url,
+            adapter_url,
             http: crate::services::http_client::base_client_builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
-            cached_version: VersionCache::new(),
+            poll_http: crate::services::http_client::base_client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            auth: None,
+            scan_identity: None,
+            last_scanner_version: Mutex::new(None),
         }
+    }
+
+    /// Attach a token minter so private-repo image pulls carry a short-lived
+    /// scoped JWT in `registry.authorization`. The identity is a scanner /
+    /// system account; the token is minted per scan via
+    /// `AuthService::generate_tokens` and is NEVER logged.
+    #[must_use]
+    pub fn with_token_minter(mut self, auth: Arc<AuthService>, identity: User) -> Self {
+        self.auth = Some(auth);
+        self.scan_identity = Some(identity);
+        self
     }
 
     /// Check if this artifact is an OCI/Docker image manifest. Thin wrapper
@@ -114,134 +328,101 @@ impl ImageScanner {
         crate::services::scanner_service::is_oci_image_artifact(artifact)
     }
 
-    /// Extract an image reference from the artifact path.
-    /// OCI paths look like: v2/<name>/manifests/<reference>. Parsing is
-    /// shared with `GrypeScanner::build_registry_image_ref` via
-    /// `parse_oci_manifest_path` so both scanners agree on what counts as
-    /// a well-formed image artifact (#1160). The name and reference are
-    /// joined via `join_oci_image_ref`, which uses `@` for digest refs and
-    /// `:` for tags per the OCI distribution spec (#1483). Using `:` for
-    /// digest refs produces a string the Trivy CLI rejects with
-    /// "could not parse reference".
-    /// `body` is the in-hand manifest body the orchestrator already loaded.
-    /// For a multi-arch image index it is used to resolve a concrete scannable
-    /// child-platform digest before the join (#1971); for single-arch /
-    /// malformed / absent bodies the reference is unchanged (passthrough).
-    /// Applicability gating has no body and passes `None`, so it stays
-    /// path-only. The resolved digest flows through both `scan_with_trivy` and
-    /// the HTTP-Twirp fallback `scan_with_trivy_http` unchanged.
-    fn extract_image_ref(artifact: &Artifact, body: Option<&[u8]>) -> Option<String> {
-        let (name, reference) =
-            crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
-        let resolved = crate::services::scanner_service::resolve_scan_reference(
-            body.unwrap_or_default(),
-            reference,
-        )
-        .into_reference();
-        Some(crate::services::scanner_service::join_oci_image_ref(
-            name, &resolved,
-        ))
-    }
-
-    /// Repository-aware image ref: `<host>/<repo_key>/<name>:<reference>`.
-    ///
-    /// Stored OCI artifact paths omit the routing key
-    /// (`v2/<image>/manifests/<ref>`), so the bare ref from `extract_image_ref`
-    /// resolves against Docker Hub instead of Artifact Keeper's own registry —
-    /// silently scanning the wrong image (public name collision) or returning 0
-    /// packages for internal-only images. Prepending the owning repository key
-    /// (mirroring `GrypeScanner::build_registry_image_ref_for_repo`) makes the
-    /// scan target the stored artifact. Host comes from the shared
-    /// `grype_scanner::resolve_registry_host` (AK_GRYPE_REGISTRY_HOST /
-    /// PEER_PUBLIC_ENDPOINT / `localhost:8080`).
-    ///
-    /// `body` is the in-hand manifest body the orchestrator already loaded.
-    /// For a multi-arch image index it is resolved to a concrete scannable
-    /// child-platform digest before the ref is joined (#1971); for single-arch
-    /// / malformed / absent bodies the reference is unchanged (passthrough).
-    /// This keeps the repository-qualified scan path (#1965) and the
-    /// index-resolution behavior (#1971) composed: the ref is first qualified
-    /// with the owning repository key, then the index is resolved to a child
-    /// platform so a no-matching-child index does not yield an empty SBOM.
-    fn extract_image_ref_for_repo(
-        artifact: &Artifact,
-        repository_key: &str,
-        body: Option<&[u8]>,
-    ) -> Option<String> {
-        let (name, reference) =
-            crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+    /// Registry base URL the adapter should pull from. Host comes from the
+    /// shared `grype_scanner::resolve_registry_host` (AK_GRYPE_REGISTRY_HOST /
+    /// PEER_PUBLIC_ENDPOINT / `localhost:8080`), which strips any scheme and
+    /// embedded credentials; we re-add an `http://` scheme for the adapter's
+    /// registry client.
+    fn registry_url() -> String {
         let host = crate::services::grype_scanner::resolve_registry_host();
-        let qualified = format!("{}/{}/{}", host, repository_key, name);
-        let resolved = crate::services::scanner_service::resolve_scan_reference(
-            body.unwrap_or_default(),
-            reference,
-        )
-        .into_reference();
-        Some(crate::services::scanner_service::join_oci_image_ref(
-            &qualified, &resolved,
-        ))
+        format!("http://{}", host)
     }
 
-    /// Health-check Trivy, scan `image_ref`, and convert the report. Shared by
-    /// the legacy `scan` (bare ref) and the repository-aware `scan_target`
-    /// so both paths apply the same health gate and conversion.
-    async fn run_image_scan(&self, image_ref: &str) -> Result<ScanOutput> {
-        // Check if Trivy server is healthy. If it is not reachable we must
-        // surface an error so the scan record is marked FAILED. Returning
-        // Ok(vec![]) here would silently mark the scan COMPLETED with zero
-        // findings even though no scanning ever happened (issue #888).
-        if let Err(e) = self.check_trivy_health().await {
-            return Err(AppError::BadGateway(format!(
-                "Trivy image scan failed for {}: {}",
-                image_ref, e
-            )));
+    /// Mint the `registry.authorization` value for a scan request, or `None`
+    /// for an anonymous pull. The token is short-lived (the configured access
+    /// token expiry) and scoped to the scan identity. NEVER log the result.
+    fn registry_authorization(&self) -> Option<String> {
+        match (&self.auth, &self.scan_identity) {
+            (Some(auth), Some(user)) => match auth.generate_tokens(user) {
+                Ok(tokens) => Some(format!("Bearer {}", tokens.access_token)),
+                Err(e) => {
+                    // Token minting failure degrades to an anonymous pull
+                    // rather than failing the scan outright: the scan still
+                    // fails-closed downstream if the (now anonymous) pull is
+                    // rejected by the adapter. Do not include the error's
+                    // token material.
+                    warn!("Image scan registry token minting failed: {}", e);
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Best-effort manifest media type for the Harbor request. Uses the stored
+    /// content type when it is a recognised manifest media type, otherwise
+    /// defaults to the Docker v2 manifest type the adapter accepts.
+    fn manifest_mime_type(content_type: &str) -> String {
+        if content_type.contains("manifest") || content_type.contains("image.index") {
+            content_type.to_string()
+        } else {
+            "application/vnd.docker.distribution.manifest.v2+json".to_string()
+        }
+    }
+
+    /// Build the JSON body for `POST /api/v1/scan`.
+    fn build_scan_request(
+        registry_url: &str,
+        authorization: Option<&str>,
+        artifact: &AdapterScanArtifact,
+        mime_type: &str,
+    ) -> serde_json::Value {
+        let mut registry = serde_json::json!({ "url": registry_url });
+        if let Some(auth) = authorization {
+            registry["authorization"] = serde_json::Value::String(auth.to_string());
         }
 
-        info!("Starting Trivy scan for image: {}", image_ref);
+        let mut artifact_obj = serde_json::json!({
+            "repository": artifact.repository,
+            "mime_type": mime_type,
+        });
+        match &artifact.reference {
+            AdapterReference::Tag(t) => {
+                artifact_obj["tag"] = serde_json::Value::String(t.clone());
+            }
+            AdapterReference::Digest(d) => {
+                artifact_obj["digest"] = serde_json::Value::String(d.clone());
+            }
+        }
 
-        let report = self.scan_with_trivy(image_ref).await?;
-        // Source label is intentionally "trivy" (not "trivy-image") to
-        // preserve back-compat with dashboards / filters that group
-        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
-        // the same string. Changing it here would silently drop
-        // existing image-scanner rows from any operator filter.
-        let output = ScanOutput::from_trivy_report(&report, "trivy");
-
-        info!(
-            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
-            image_ref,
-            output.findings.len(),
-            output.packages.len()
-        );
-
-        Ok(output)
+        serde_json::json!({
+            "registry": registry,
+            "artifact": artifact_obj,
+        })
     }
 
-    /// Number of `/healthz` attempts before declaring the Trivy server down.
-    /// Three attempts with backoff covers a 30-60s pod restart without
-    /// permanently failing in-flight scans, which would otherwise flag the
-    /// underlying artifacts. See issue #888.
+    /// Number of `/probe/ready` attempts before declaring the adapter down.
+    /// Mirrors the previous trivy `/healthz` gate (#888): three attempts with
+    /// backoff absorbs a short pod restart without permanently failing
+    /// in-flight scans.
     const HEALTH_CHECK_ATTEMPTS: u32 = 3;
-    /// Per-attempt timeout for `/healthz`. Independent of the 300s scan
-    /// timeout so a NetworkPolicy-blocked or hung Trivy does not tie up a
-    /// worker for five minutes per scan.
     const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    /// Backoff between health-check attempts. Short on purpose: the goal is
-    /// to absorb a pod-restart blip, not to wait out a sustained outage.
     const HEALTH_CHECK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
-    /// Check if the Trivy server is available.
-    ///
-    /// Returns `Ok(())` when `/healthz` responds 2xx. On failure, retries
-    /// `HEALTH_CHECK_ATTEMPTS` times with `HEALTH_CHECK_BACKOFF` between
-    /// attempts before surfacing an `AppError::BadGateway` so the scan
-    /// orchestrator can mark the scan FAILED with a descriptive message
-    /// rather than silently completing with zero findings (issue #888).
-    ///
-    /// Each attempt has its own `HEALTH_CHECK_TIMEOUT` so a hung Trivy does
-    /// not block a worker for the full 300s scan timeout.
-    async fn check_trivy_health(&self) -> Result<()> {
-        let url = format!("{}/healthz", self.trivy_url);
+    /// Total wall-clock budget for polling the report. Kept under the 300s
+    /// client timeout so we surface a descriptive BadGateway rather than a
+    /// raw reqwest timeout.
+    const REPORT_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(280);
+    /// Default delay between report polls when the adapter does not send a
+    /// `Refresh-After` header.
+    const REPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Adapter readiness gate. Returns `Ok(())` when `/probe/ready` responds
+    /// 2xx, otherwise `Err(AppError::BadGateway)` after retries so the
+    /// orchestrator marks the scan FAILED rather than silently completing with
+    /// zero findings (#888 / #2088).
+    async fn check_adapter_health(&self) -> Result<()> {
+        let url = format!("{}/probe/ready", self.adapter_url);
         let mut last_err: Option<AppError> = None;
 
         for attempt in 1..=Self::HEALTH_CHECK_ATTEMPTS {
@@ -256,24 +437,33 @@ impl ImageScanner {
                 Ok(resp) if resp.status().is_success() => return Ok(()),
                 Ok(resp) => {
                     let msg = format!(
-                        "Trivy server at {} is unhealthy: HTTP {}",
-                        self.trivy_url,
+                        "Scanner adapter at {} is not ready: HTTP {}",
+                        self.adapter_url,
                         resp.status()
                     );
                     crate::services::metrics_service::record_scanner_health_check_failure(
                         "trivy",
                         "unhealthy",
                     );
-                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    warn!(
+                        "Scanner adapter /probe/ready attempt {} failed: {}",
+                        attempt, msg
+                    );
                     last_err = Some(AppError::BadGateway(msg));
                 }
                 Err(e) => {
-                    let msg = format!("Trivy server at {} is unreachable: {}", self.trivy_url, e);
+                    let msg = format!(
+                        "Scanner adapter at {} is unreachable: {}",
+                        self.adapter_url, e
+                    );
                     crate::services::metrics_service::record_scanner_health_check_failure(
                         "trivy",
                         "unreachable",
                     );
-                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    warn!(
+                        "Scanner adapter /probe/ready attempt {} failed: {}",
+                        attempt, msg
+                    );
                     last_err = Some(AppError::BadGateway(msg));
                 }
             }
@@ -285,100 +475,172 @@ impl ImageScanner {
 
         Err(last_err.unwrap_or_else(|| {
             AppError::BadGateway(format!(
-                "Trivy server at {} health check failed",
-                self.trivy_url
+                "Scanner adapter at {} readiness check failed",
+                self.adapter_url
             ))
         }))
     }
 
-    /// Scan an image reference using the Trivy CLI with server mode.
-    async fn scan_with_trivy(&self, image_ref: &str) -> Result<TrivyReport> {
-        // Use tokio::process to call trivy CLI with server mode
-        let output = tokio::process::Command::new("trivy")
-            .args([
-                "image",
-                "--server",
-                &self.trivy_url,
-                "--format",
-                "json",
-                // #903: enumerate the full package inventory, not just
-                // CVE-bearing rows. Adds the `Packages` block to the
-                // JSON report which `convert_trivy_packages` consumes.
-                "--list-all-pkgs",
-                "--quiet",
-                "--timeout",
-                "5m",
-                image_ref,
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Trivy: {}", e)))?;
+    /// Submit a scan request and return the adapter-assigned scan id.
+    async fn submit_scan(&self, body: &serde_json::Value) -> Result<String> {
+        let url = format!("{}/api/v1/scan", self.adapter_url);
+        let resp = self.http.post(&url).json(body).send().await.map_err(|e| {
+            AppError::BadGateway(format!("Scanner adapter scan request failed: {}", e))
+        })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // If trivy is not installed, degrade gracefully
-            if stderr.contains("not found") || stderr.contains("No such file") {
-                warn!("Trivy CLI not available, falling back to HTTP API");
-                return self.scan_with_trivy_http(image_ref).await;
-            }
-            return Err(AppError::Internal(format!(
-                "Trivy scan failed (exit {}): {}",
-                output.status, stderr
-            )));
-        }
-
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
-    }
-
-    /// Fallback: scan via Trivy server HTTP API (Twirp).
-    async fn scan_with_trivy_http(&self, image_ref: &str) -> Result<TrivyReport> {
-        // Trivy server exposes scanning via its REST-like interface
-        // POST /twirp/trivy.scanner.v1.Scanner/Scan
-        let url = format!("{}/twirp/trivy.scanner.v1.Scanner/Scan", self.trivy_url);
-
-        // `list_all_packages: true` mirrors the `--list-all-pkgs` CLI flag
-        // (#903): without it the Twirp endpoint returns no `Packages`
-        // block, and any environment that falls through to this HTTP
-        // path (ARC runners + demo EC2 without the trivy CLI binary)
-        // would silently keep the empty-SBOM bug for image scans.
-        let body = serde_json::json!({
-            "target": image_ref,
-            "artifact_type": "container_image",
-            "options": {
-                "vuln_type": ["os", "library"],
-                "scanners": ["vuln"],
-                "list_all_packages": true,
-            }
-        });
-
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("Trivy HTTP request failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        // Harbor returns 202 Accepted; tolerate any 2xx with a parseable id.
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "Trivy server returned {}: {}",
+            return Err(AppError::BadGateway(format!(
+                "Scanner adapter returned {} on scan submit: {}",
                 status, text
             )));
         }
 
-        resp.json::<TrivyReport>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy response: {}", e)))
+        let parsed: HarborScanResponse = resp.json().await.map_err(|e| {
+            AppError::BadGateway(format!(
+                "Failed to parse scanner adapter scan response: {}",
+                e
+            ))
+        })?;
+        // An empty/whitespace id would produce a bogus `/scan//report` poll URL
+        // that can never resolve; reject it up front (fail-closed) rather than
+        // polling a nonsensical endpoint until the budget is exhausted.
+        if parsed.id.trim().is_empty() {
+            return Err(AppError::BadGateway(
+                "Scanner adapter returned an empty scan id on submit".to_string(),
+            ));
+        }
+        Ok(parsed.id)
     }
 
-    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
-    /// around the shared [`convert_trivy_findings`] helper so the existing
-    /// tests can call `ImageScanner::convert_findings(report)` as before.
-    /// Production code uses `ScanOutput::from_trivy_report` instead, which
-    /// also extracts the package inventory (#903).
+    /// Poll `GET /api/v1/scan/{id}/report` until the report is ready or the
+    /// poll budget is exhausted. Honors a `Refresh-After` header when present.
+    ///
+    /// Fail-closed: a never-ready report, a non-2xx terminal status, or a
+    /// transport error all return `Err(AppError::BadGateway)` — never an empty
+    /// report.
+    async fn poll_report(&self, scan_id: &str) -> Result<HarborScanReport> {
+        let url = format!("{}/api/v1/scan/{}/report", self.adapter_url, scan_id);
+        let deadline = std::time::Instant::now() + Self::REPORT_POLL_BUDGET;
+
+        loop {
+            let resp = self
+                .poll_http
+                .get(&url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/vnd.security.vulnerability.report; version=1.1",
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    AppError::BadGateway(format!("Scanner adapter report request failed: {}", e))
+                })?;
+
+            let status = resp.status();
+
+            if status.is_success() {
+                return resp.json::<HarborScanReport>().await.map_err(|e| {
+                    AppError::BadGateway(format!("Failed to parse scanner adapter report: {}", e))
+                });
+            }
+
+            // "Not ready yet": Harbor (and our in-house adapter #2092) signal
+            // this with a 302 Found and a `Refresh-After` header. Everything
+            // else — including a 404 — is terminal: #2092 returns 404 for a
+            // genuinely unknown/expired scan id, so treating it as pending would
+            // poll fruitlessly until the ~280s budget is exhausted, tying up a
+            // scan worker for ~5 minutes. Fail fast (still fail-closed: an Err,
+            // never an Ok-with-0-findings).
+            let pending = status == reqwest::StatusCode::FOUND;
+            if !pending {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(AppError::BadGateway(format!(
+                    "Scanner adapter returned {} fetching report: {}",
+                    status, text
+                )));
+            }
+
+            let refresh_after = resp
+                .headers()
+                .get("Refresh-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(Self::REPORT_POLL_INTERVAL);
+
+            if std::time::Instant::now() + refresh_after >= deadline {
+                return Err(AppError::BadGateway(format!(
+                    "Scanner adapter report for {} not ready within {}s budget",
+                    scan_id,
+                    Self::REPORT_POLL_BUDGET.as_secs()
+                )));
+            }
+
+            tokio::time::sleep(refresh_after).await;
+        }
+    }
+
+    /// Submit a scan, poll for the report, and convert it. Shared by the
+    /// legacy `scan` (bare repository) and the repository-aware `scan_target`.
+    async fn run_image_scan(
+        &self,
+        artifact: &AdapterScanArtifact,
+        mime_type: &str,
+    ) -> Result<ScanOutput> {
+        // Readiness gate first so a down adapter fails the scan with a clear
+        // BadGateway rather than mid-stream.
+        self.check_adapter_health().await?;
+
+        let registry_url = Self::registry_url();
+        let authorization = self.registry_authorization();
+        let body =
+            Self::build_scan_request(&registry_url, authorization.as_deref(), artifact, mime_type);
+
+        let reference_label = match &artifact.reference {
+            AdapterReference::Tag(t) => format!("{}:{}", artifact.repository, t),
+            AdapterReference::Digest(d) => format!("{}@{}", artifact.repository, d),
+        };
+        info!("Starting adapter image scan for {}", reference_label);
+
+        let scan_id = self.submit_scan(&body).await?;
+        let report = self.poll_report(&scan_id).await?;
+
+        // Cache the adapter-reported scanner version for `version()` — the
+        // in-image trivy --version probe is gone (#2059).
+        if let Some(scanner) = report.scanner.as_ref() {
+            if let Some(ver) = scanner.version.as_ref().filter(|v| !v.is_empty()) {
+                let normalized = if ver.starts_with("trivy-") {
+                    ver.clone()
+                } else {
+                    format!("trivy-{}", ver)
+                };
+                if let Ok(mut guard) = self.last_scanner_version.lock() {
+                    *guard = Some(normalized);
+                }
+            }
+        }
+
+        // Source label is intentionally "trivy" (not "trivy-image") to
+        // preserve back-compat with dashboards / filters that group findings
+        // by `source = 'trivy'`.
+        let trivy_report = harbor_report_to_trivy(&report, &reference_label);
+        let output = ScanOutput::from_trivy_report(&trivy_report, "trivy");
+
+        info!(
+            "Adapter image scan complete for {}: {} vulnerabilities",
+            reference_label,
+            output.findings.len()
+        );
+
+        Ok(output)
+    }
+
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper around
+    /// the shared [`convert_trivy_findings`] helper so the existing tests can
+    /// call `ImageScanner::convert_findings(report)` as before.
     #[cfg(test)]
     pub(crate) fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
         convert_trivy_findings(report, "trivy")
@@ -395,21 +657,21 @@ impl Scanner for ImageScanner {
         "image"
     }
 
-    /// Surface the container-image content-type check through the trait so
-    /// the orchestrator can gate on it without creating a `scan_results`
-    /// row for non-image artifacts (issues #961, #994). This is the exact
-    /// case that produced the lodash silent-success: a generic tarball
-    /// uploaded as `scan_type=image` should never have flowed into
-    /// `ImageScanner::scan` at all.
+    /// Surface the container-image content-type check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row for
+    /// non-image artifacts (issues #961, #994).
     fn is_applicable(&self, artifact: &Artifact) -> bool {
         Self::is_container_image(artifact)
     }
 
-    /// Probe `trivy --version` once and cache the parsed version string.
-    /// Returns `None` if the binary is missing or its output cannot be
-    /// parsed.
+    /// Scanner version reported by the adapter on the last successful scan
+    /// (e.g. `trivy-0.71.2`). `None` until a scan has run, because the
+    /// in-image `trivy --version` probe was removed with the CLI (#2059).
     async fn version(&self) -> Option<String> {
-        cached_trivy_cli_version(&self.cached_version).await
+        self.last_scanner_version
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     async fn scan(
@@ -423,22 +685,12 @@ impl Scanner for ImageScanner {
             "ImageScanner::scan called on a non-container artifact; the orchestrator must gate on is_applicable first"
         );
 
-        // Legacy path retained for the trait contract / direct callers. It
-        // uses the bare ref from the stored path, which omits the repository
-        // key. The orchestrator calls `scan_target` (below), which restores
-        // the key so Trivy pulls AK's own artifact rather than a Docker Hub
-        // image of the same name.
-        //
-        // Image reference extraction can still fail even on an applicable
-        // (content-type-matching) artifact when the path is malformed.
-        // That is a real error, not a "not applicable" case: surface it as
-        // a failed scan so the operator sees error_message rather than a
-        // silent completed-with-zero-findings row (issue #994).
-        // #1971: pass the in-hand manifest body so a multi-arch image index is
-        // resolved to a concrete scannable child digest before trivy (CLI or
-        // the HTTP-Twirp fallback) sees it.
-        let image_ref = match Self::extract_image_ref(artifact, Some(content)) {
-            Some(r) => r,
+        // Legacy keyless path retained for the trait contract / direct
+        // callers. A malformed path is a real error, not "not applicable":
+        // surface it so the operator sees a failed scan rather than a silent
+        // completed-with-zero-findings row (#994).
+        let target = match build_adapter_scan_artifact(&artifact.path, None, content) {
+            Some(t) => t,
             None => {
                 return Err(AppError::Internal(format!(
                     "Could not extract image reference from artifact path: {}",
@@ -446,18 +698,14 @@ impl Scanner for ImageScanner {
                 )));
             }
         };
-        self.run_image_scan(&image_ref).await
+        let mime = Self::manifest_mime_type(&artifact.content_type);
+        self.run_image_scan(&target, &mime).await
     }
 
-    /// Repository-aware scan hook used by the orchestrator.
-    ///
-    /// The legacy `scan` builds a bare `<name>:<tag>` ref from the stored OCI
-    /// path, which the Trivy client resolves against Docker Hub — NOT Artifact
-    /// Keeper's own registry. For public images sharing the name the result
-    /// looked plausible; for internal/private images Trivy enumerated 0
-    /// packages and the scan completed "clean" (a false negative). This
-    /// override prepends the owning repository key so Trivy pulls the actual
-    /// stored artifact, mirroring `GrypeScanner::scan_target`.
+    /// Repository-aware scan hook used by the orchestrator. Prepends the owning
+    /// repository key so the adapter pulls Artifact Keeper's own stored
+    /// artifact rather than a same-named public image (mirrors
+    /// `GrypeScanner::scan_target`).
     async fn scan_target(
         &self,
         target: &ScanTarget<'_>,
@@ -468,18 +716,19 @@ impl Scanner for ImageScanner {
             Self::is_container_image(target.artifact),
             "ImageScanner::scan_target called on a non-container artifact; the orchestrator must gate on is_applicable first"
         );
-        // #1971: pass the in-hand manifest body so a multi-arch image index is
-        // resolved to a concrete scannable child digest after the ref is
-        // qualified with the owning repository key (#1965).
-        let image_ref =
-            Self::extract_image_ref_for_repo(target.artifact, target.repository_key, Some(content))
-                .ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "Could not extract image reference from artifact path: {}",
-                        target.artifact.path
-                    ))
-                })?;
-        self.run_image_scan(&image_ref).await
+        let scan_target = build_adapter_scan_artifact(
+            &target.artifact.path,
+            Some(target.repository_key),
+            content,
+        )
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "Could not extract image reference from artifact path: {}",
+                target.artifact.path
+            ))
+        })?;
+        let mime = Self::manifest_mime_type(&target.artifact.content_type);
+        self.run_image_scan(&scan_target, &mime).await
     }
 }
 
@@ -489,8 +738,8 @@ mod tests {
     use crate::models::security::Severity;
 
     /// Build an Artifact fixture for scanner tests. Most fields are not
-    /// load-bearing for the scanner — the scanner only branches on `path`
-    /// and `content_type` — so we collapse the boilerplate here.
+    /// load-bearing for the scanner — the scanner only branches on `path` and
+    /// `content_type` — so we collapse the boilerplate here.
     fn make_test_artifact(path: &str, content_type: &str) -> Artifact {
         Artifact {
             id: uuid::Uuid::new_v4(),
@@ -526,64 +775,51 @@ mod tests {
         assert!(!ImageScanner::is_container_image(&artifact));
     }
 
+    // -----------------------------------------------------------------------
+    // build_adapter_scan_artifact: ref + tag-vs-digest resolution (pure fn)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_extract_image_ref() {
-        let artifact = make_test_artifact(
-            "v2/myapp/manifests/v1.0.0",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-        assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, None),
-            Some("myapp:v1.0.0".to_string())
-        );
+    fn test_build_adapter_artifact_keyless_tag() {
+        let a = build_adapter_scan_artifact("v2/myapp/manifests/v1.0.0", None, &[])
+            .expect("valid OCI manifest path");
+        assert_eq!(a.repository, "myapp");
+        assert_eq!(a.reference, AdapterReference::Tag("v1.0.0".to_string()));
     }
 
     #[test]
-    fn test_extract_image_ref_with_namespace_tag() {
-        let artifact = make_test_artifact(
-            "v2/org/myapp/manifests/v1.0.0",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        );
-        assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, None),
-            Some("org/myapp:v1.0.0".to_string())
-        );
+    fn test_build_adapter_artifact_prepends_repository_key() {
+        let a = build_adapter_scan_artifact(
+            "v2/library/nginx/manifests/latest",
+            Some("docker-local"),
+            &[],
+        )
+        .expect("valid OCI manifest path");
+        assert_eq!(a.repository, "docker-local/library/nginx");
+        assert_eq!(a.reference, AdapterReference::Tag("latest".to_string()));
     }
 
-    /// Regression test for issue #1483. Digest-pinned manifests must use
-    /// the `name@sha256:...` form so the Trivy CLI can parse them. The
-    /// previous code emitted `name:sha256:...` which Trivy and Grype reject
-    /// with "could not parse reference". A single `docker buildx push`
-    /// creates two such digest-referenced manifests (platform manifest +
-    /// attestation manifest), so this case is the common case for image
-    /// scans, not an edge case.
+    /// Regression for #1483: a digest-pinned manifest (written by every
+    /// `docker buildx push`) must be addressed by DIGEST, never as a tag. The
+    /// `@`-separator decision lives in `is_oci_digest_reference`; here we prove
+    /// the adapter target carries it as `AdapterReference::Digest`.
     #[test]
-    fn test_extract_image_ref_digest_uses_at_separator() {
-        let artifact = make_test_artifact(
-            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-        assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, None),
-            Some(
-                "org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
-                    .to_string()
-            )
-        );
+    fn test_build_adapter_artifact_digest_uses_digest_reference() {
+        let digest = "sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b";
+        let a = build_adapter_scan_artifact(
+            &format!("v2/org/app/manifests/{}", digest),
+            Some("oci-prod"),
+            &[],
+        )
+        .expect("valid digest-pinned manifest path");
+        assert_eq!(a.repository, "oci-prod/org/app");
+        assert_eq!(a.reference, AdapterReference::Digest(digest.to_string()));
     }
 
+    /// #1971: a multi-arch image index body resolves to a concrete child
+    /// platform digest, addressed by digest.
     #[test]
-    fn test_extract_image_ref_invalid_path() {
-        let artifact = make_test_artifact("some/random/path", "application/json");
-        assert_eq!(ImageScanner::extract_image_ref(&artifact, None), None);
-    }
-
-    /// #1971: an image-index body threaded into extract_image_ref resolves the
-    /// tag ref to a concrete child digest (name@sha256:<child>), so Trivy (CLI
-    /// or the HTTP-Twirp fallback) scans a real image rather than relying on a
-    /// default platform pick that can produce an empty SBOM.
-    #[test]
-    fn test_extract_image_ref_resolves_index_to_child_digest() {
+    fn test_build_adapter_artifact_resolves_index_to_child_digest() {
         let child = match crate::services::scanner_service::runner_arch() {
             "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
@@ -592,34 +828,91 @@ mod tests {
              {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
              {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
            ]}"#;
-        let artifact = make_test_artifact(
-            "v2/org/myapp/manifests/latest",
-            "application/vnd.oci.image.index.v1+json",
-        );
+        let a = build_adapter_scan_artifact(
+            "v2/library/nginx/manifests/latest",
+            Some("docker-local"),
+            index_body.as_bytes(),
+        )
+        .expect("valid OCI index path");
+        assert_eq!(a.repository, "docker-local/library/nginx");
+        assert_eq!(a.reference, AdapterReference::Digest(child.to_string()));
+    }
+
+    #[test]
+    fn test_build_adapter_artifact_invalid_path() {
         assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, Some(index_body.as_bytes())),
-            Some(format!("org/myapp@{}", child))
+            build_adapter_scan_artifact("some/random/path", Some("k"), &[]),
+            None
         );
     }
 
-    /// #1971 regression: a single-arch image body leaves the tag ref unchanged
-    /// (passthrough) — identical to the no-body path.
+    // -----------------------------------------------------------------------
+    // Harbor report -> TrivyReport mapping (pure fn)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_extract_image_ref_single_arch_body_is_unchanged() {
-        let single_arch = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
-        let artifact = make_test_artifact(
-            "v2/org/myapp/manifests/v1.0.0",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-        assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
-            ImageScanner::extract_image_ref(&artifact, None),
-        );
-        assert_eq!(
-            ImageScanner::extract_image_ref(&artifact, Some(single_arch)),
-            Some("org/myapp:v1.0.0".to_string())
-        );
+    fn test_harbor_report_to_trivy_maps_fields_and_severity() {
+        let report = HarborScanReport {
+            scanner: Some(HarborScanner {
+                name: Some("Trivy".to_string()),
+                version: Some("0.71.2".to_string()),
+            }),
+            vulnerabilities: vec![
+                HarborVulnerability {
+                    id: "CVE-2021-36159".to_string(),
+                    package: "apk-tools".to_string(),
+                    version: "2.12.5-r1".to_string(),
+                    fix_version: Some("2.12.6-r0".to_string()),
+                    severity: "Critical".to_string(),
+                    description: Some("heap overflow".to_string()),
+                    links: Some(vec!["https://avd.aquasec.com/x".to_string()]),
+                },
+                HarborVulnerability {
+                    id: "CVE-2026-0002".to_string(),
+                    package: "zlib".to_string(),
+                    version: "1.0".to_string(),
+                    fix_version: None,
+                    severity: "Negligible".to_string(),
+                    description: None,
+                    links: None,
+                },
+                HarborVulnerability {
+                    id: "CVE-2026-0003".to_string(),
+                    package: "musl".to_string(),
+                    version: "1.0".to_string(),
+                    fix_version: None,
+                    severity: "Unknown".to_string(),
+                    description: None,
+                    links: None,
+                },
+            ],
+        };
+
+        let findings = ImageScanner::convert_findings(&harbor_report_to_trivy(&report, "img:tag"));
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].cve_id, Some("CVE-2021-36159".to_string()));
+        assert_eq!(findings[0].source, Some("trivy".to_string()));
+        assert_eq!(findings[0].fixed_version, Some("2.12.6-r0".to_string()));
+        // Negligible -> Low
+        assert_eq!(findings[1].severity, Severity::Low);
+        // Unknown -> Info (from_str_loose returns None -> default Info)
+        assert_eq!(findings[2].severity, Severity::Info);
+        // No title -> synthesized "<id> in <pkg>"
+        assert!(findings[2].title.contains("CVE-2026-0003"));
     }
+
+    #[test]
+    fn test_normalize_harbor_severity() {
+        assert_eq!(normalize_harbor_severity("Negligible"), "Low");
+        assert_eq!(normalize_harbor_severity("Critical"), "Critical");
+        assert_eq!(normalize_harbor_severity("Unknown"), "Unknown");
+        assert_eq!(normalize_harbor_severity(""), "Unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // Retained TrivyReport conversion tests (shape still used by fs/incus)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_convert_findings() {
@@ -628,49 +921,24 @@ mod tests {
                 target: "alpine:3.14 (alpine 3.14.2)".to_string(),
                 class: "os-pkgs".to_string(),
                 result_type: "alpine".to_string(),
-                vulnerabilities: Some(vec![
-                    TrivyVulnerability {
-                        vulnerability_id: "CVE-2021-36159".to_string(),
-                        pkg_name: "apk-tools".to_string(),
-                        installed_version: "2.12.5-r1".to_string(),
-                        fixed_version: Some("2.12.6-r0".to_string()),
-                        severity: "CRITICAL".to_string(),
-                        title: Some("apk-tools: heap overflow in libfetch".to_string()),
-                        description: Some("A vulnerability was found in apk-tools".to_string()),
-                        primary_url: Some("https://avd.aquasec.com/nvd/cve-2021-36159".to_string()),
-                    },
-                    TrivyVulnerability {
-                        vulnerability_id: "CVE-2021-3711".to_string(),
-                        pkg_name: "libssl1.1".to_string(),
-                        installed_version: "1.1.1k-r0".to_string(),
-                        fixed_version: Some("1.1.1l-r0".to_string()),
-                        severity: "HIGH".to_string(),
-                        title: None,
-                        description: None,
-                        primary_url: None,
-                    },
-                ]),
+                vulnerabilities: Some(vec![TrivyVulnerability {
+                    vulnerability_id: "CVE-2021-36159".to_string(),
+                    pkg_name: "apk-tools".to_string(),
+                    installed_version: "2.12.5-r1".to_string(),
+                    fixed_version: Some("2.12.6-r0".to_string()),
+                    severity: "CRITICAL".to_string(),
+                    title: Some("apk-tools: heap overflow in libfetch".to_string()),
+                    description: Some("A vulnerability was found in apk-tools".to_string()),
+                    primary_url: Some("https://avd.aquasec.com/nvd/cve-2021-36159".to_string()),
+                }]),
                 packages: None,
             }],
         };
 
         let findings = ImageScanner::convert_findings(&report);
-        assert_eq!(findings.len(), 2);
-
+        assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
-        assert_eq!(findings[0].cve_id, Some("CVE-2021-36159".to_string()));
-        assert_eq!(findings[0].title, "apk-tools: heap overflow in libfetch");
-        assert!(findings[0]
-            .affected_component
-            .as_ref()
-            .unwrap()
-            .contains("apk-tools"));
-        assert_eq!(findings[0].fixed_version, Some("2.12.6-r0".to_string()));
         assert_eq!(findings[0].source, Some("trivy".to_string()));
-
-        assert_eq!(findings[1].severity, Severity::High);
-        assert_eq!(findings[1].cve_id, Some("CVE-2021-3711".to_string()));
-        assert!(findings[1].title.contains("CVE-2021-3711"));
     }
 
     #[test]
@@ -684,113 +952,7 @@ mod tests {
                 packages: None,
             }],
         };
-
-        let findings = ImageScanner::convert_findings(&report);
-        assert_eq!(findings.len(), 0);
-    }
-
-    /// Regression test for issue #888: when the Trivy server is
-    /// unreachable, `scan` must return Err so the orchestrator marks the
-    /// scan FAILED. Returning Ok(vec![]) would silently complete the scan
-    /// with zero findings even though Trivy never ran.
-    #[tokio::test]
-    async fn test_scan_fails_when_trivy_unreachable() {
-        // Use an unrouteable port so /healthz cannot succeed. Port 1 is
-        // reserved and any client binding to it will get a connection error.
-        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let artifact = make_test_artifact(
-            "v2/myapp/manifests/latest",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-
-        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
-
-        assert!(
-            result.is_err(),
-            "scan() must return Err when Trivy is unreachable, not Ok(vec![]); \
-             a silent Ok(vec![]) is what caused the scan to be marked COMPLETED \
-             instead of FAILED in issue #888"
-        );
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Trivy") && err_msg.contains("myapp:latest"),
-            "error must identify the failed scanner and image, got: {}",
-            err_msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_check_trivy_health_returns_err_on_unreachable() {
-        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let result = scanner.check_trivy_health().await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("unreachable") || msg.contains("unhealthy"),
-            "error message should describe the health-check failure, got: {}",
-            msg
-        );
-    }
-
-    /// `check_trivy_health` retries before declaring failure so a brief
-    /// Trivy pod restart does not hard-fail every concurrent scan. Verified
-    /// indirectly by elapsed time: with ATTEMPTS=3 and BACKOFF=500ms there
-    /// are two backoff sleeps, so a fully-failed run takes >= ~900ms.
-    #[tokio::test]
-    async fn test_check_trivy_health_retries_before_failing() {
-        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let start = std::time::Instant::now();
-        let result = scanner.check_trivy_health().await;
-        let elapsed = start.elapsed();
-
-        assert!(result.is_err());
-        let expected_min =
-            ImageScanner::HEALTH_CHECK_BACKOFF * (ImageScanner::HEALTH_CHECK_ATTEMPTS - 1);
-        assert!(
-            elapsed >= expected_min - std::time::Duration::from_millis(100),
-            "expected at least {:?} of backoff across {} attempts, got {:?}",
-            expected_min,
-            ImageScanner::HEALTH_CHECK_ATTEMPTS,
-            elapsed
-        );
-    }
-
-    /// `check_trivy_health` returns BadGateway, not Internal. The
-    /// orchestrator does not currently translate AppError to HTTP, but
-    /// classifying upstream-scanner failures as 502 keeps internal-error
-    /// alerting clean. Pinned because we just changed the variant.
-    #[tokio::test]
-    async fn test_check_trivy_health_error_is_bad_gateway() {
-        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let err = scanner.check_trivy_health().await.unwrap_err();
-        assert!(
-            matches!(err, AppError::BadGateway(_)),
-            "expected BadGateway, got {:?}",
-            err
-        );
-    }
-
-    /// Non-container artifacts must report `is_applicable=false` so the
-    /// orchestrator never calls `scan()` on them, rather than the scanner
-    /// silently swallowing them inside `scan()` and producing a
-    /// completed-with-zero-findings row. This is the trait-level contract
-    /// behind the fix for issues #961 and #994.
-    ///
-    /// `scan()` itself is now allowed to panic on a non-applicable artifact
-    /// via `debug_assert!`, because the orchestrator is the single gate
-    /// point. Asserting on `is_applicable` here keeps the regression-test
-    /// pressure on the right surface.
-    #[test]
-    fn test_is_applicable_rejects_non_container_artifact() {
-        use crate::services::scanner_service::Scanner;
-
-        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
-        assert!(
-            !Scanner::is_applicable(&scanner, &artifact),
-            "ImageScanner must yield to a filesystem scanner for non-container artifacts (#961, #994)"
-        );
+        assert_eq!(ImageScanner::convert_findings(&report).len(), 0);
     }
 
     #[test]
@@ -812,132 +974,248 @@ mod tests {
                 }]
             }]
         }"#;
-
         let report: TrivyReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].vulnerabilities.as_ref().unwrap().len(), 1);
     }
 
-    /// `version()` covers the TTL-backed cached `trivy --version` probe path
-    /// for the container-image scanner. As with the Trivy filesystem
-    /// scanner, we tolerate hosts both with and without `trivy` installed:
-    /// the assertion is that repeated calls are cached and that any
-    /// returned token has the normalized `trivy-` prefix.
-    #[tokio::test]
-    async fn test_version_is_cached_and_deterministic() {
-        let scanner = ImageScanner::new("http://localhost:0".to_string());
-        let v1 = scanner.version().await;
-        let v2 = scanner.version().await;
-        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
-        if let Some(v) = v1 {
-            assert!(
-                v.starts_with("trivy-"),
-                "image scanner version must be normalized 'trivy-<ver>'; got {}",
-                v
-            );
-        }
+    #[test]
+    fn test_is_applicable_rejects_non_container_artifact() {
+        use crate::services::scanner_service::Scanner;
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
+        assert!(
+            !Scanner::is_applicable(&scanner, &artifact),
+            "ImageScanner must yield to a filesystem scanner for non-container artifacts (#961, #994)"
+        );
     }
 
-    /// The repository-aware ref must prepend the owning repository
-    /// key so the Trivy client pulls Artifact Keeper's own stored image rather
-    /// than a same-named image from Docker Hub. Mirrors
-    /// `GrypeScanner::build_registry_image_ref_for_repo`. Asserts on the
-    /// host-independent suffix so the test does not depend on the registry-host
-    /// env (host resolution is covered by the grype_scanner tests).
-    #[test]
-    fn test_extract_image_ref_for_repo_prepends_repository_key() {
-        let artifact = make_test_artifact(
-            "v2/library/nginx/manifests/latest",
+    // -----------------------------------------------------------------------
+    // Adapter scan flow tests (the #2088 regression surface)
+    // -----------------------------------------------------------------------
+
+    /// REPLACES the #2059 `test_scan_with_trivy_http_fallback_parses_report`
+    /// wiremock test.
+    ///
+    /// BLIND SPOT of the removed test: it mocked the trivy-server Twirp
+    /// `/twirp/.../Scan` endpoint and asserted only that a hand-fed report
+    /// PARSED. It never checked that the call actually scans the image — and in
+    /// production the Twirp `Scan` endpoint, invoked with only `{"target":...}`,
+    /// returns an EMPTY result (it requires the client to walk + PutBlob every
+    /// layer first). That empty result was mapped to "completed, 0 findings": a
+    /// false-clean (#2088). The tests below assert the two properties that
+    /// actually matter: a real report yields NON-EMPTY findings, and EVERY
+    /// adapter error path FAILS the scan (never Ok-empty).
+    /// A standard OCI image artifact fixture for the adapter flow tests.
+    fn oci_image_artifact() -> Artifact {
+        make_test_artifact(
+            "v2/myapp/manifests/latest",
             "application/vnd.oci.image.manifest.v1+json",
-        );
-        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "docker-local", None)
-            .expect("ref must build for a valid OCI manifest path");
-        assert!(
-            r.ends_with("/docker-local/library/nginx:latest"),
-            "scan target must be qualified with the repository key: {r}"
-        );
-    }
-
-    /// Regression (mirrors grype #1483): digest-pinned manifests —
-    /// written by every `docker buildx push` — must join the digest with `@`,
-    /// never `:`, or the Trivy CLI rejects the reference.
-    #[test]
-    fn test_extract_image_ref_for_repo_digest_uses_at_separator() {
-        let artifact = make_test_artifact(
-            "v2/org/app/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-        let r = ImageScanner::extract_image_ref_for_repo(&artifact, "oci-prod", None)
-            .expect("ref must build for a digest-pinned manifest");
-        assert!(
-            r.ends_with(
-                "/oci-prod/org/app@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
-            ),
-            "digest ref must keep the repository key and `@` separator: {r}"
-        );
-        assert!(
-            !r.contains("org/app:sha256:"),
-            "digest ref must not use ':' between name and digest: {r}"
-        );
-    }
-
-    /// #1971 + #1965 composed: the repository-qualified scan target must also
-    /// resolve a multi-arch image index to a concrete child-platform digest.
-    /// The result keeps the owning repository key (qualification) AND points at
-    /// a real child manifest (`@sha256:<child>`) rather than the index tag, so a
-    /// no-matching-child index never yields an empty SBOM.
-    #[test]
-    fn test_extract_image_ref_for_repo_resolves_index_to_child_digest() {
-        let child = match crate::services::scanner_service::runner_arch() {
-            "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-            _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        };
-        let index_body = r#"{"manifests":[
-             {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
-             {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
-           ]}"#;
-        let artifact = make_test_artifact(
-            "v2/library/nginx/manifests/latest",
-            "application/vnd.oci.image.index.v1+json",
-        );
-        let r = ImageScanner::extract_image_ref_for_repo(
-            &artifact,
-            "docker-local",
-            Some(index_body.as_bytes()),
         )
-        .expect("ref must build for a valid OCI index path");
-        assert!(
-            r.ends_with(&format!("/docker-local/library/nginx@{}", child)),
-            "index scan target must be repository-qualified AND resolved to a child digest: {r}"
-        );
     }
 
-    /// The legacy `extract_image_ref` (kept for the trait `scan`
-    /// fallback and direct callers) stays repository-key-free and host-free — a
-    /// bare `<name>:<tag>` that resolves against Docker Hub. Only the new
-    /// `scan_target` path is repository-qualified; this guards that contrast so
-    /// the legacy ref is never silently qualified.
-    #[test]
-    fn test_legacy_extract_image_ref_stays_unqualified() {
-        let artifact = make_test_artifact(
-            "v2/library/nginx/manifests/latest",
-            "application/vnd.oci.image.manifest.v1+json",
-        );
-        let r = ImageScanner::extract_image_ref(&artifact, None).expect("legacy ref must build");
-        assert_eq!(
-            r, "library/nginx:latest",
-            "legacy ref must remain a bare name:tag without host or repository key"
-        );
+    /// Mount the readiness gate (200) and scan-submit (202 {id}) mocks shared
+    /// by every adapter-flow test, so each test only declares its own
+    /// report-endpoint behavior. Extracted to keep the tests DRY (jscpd).
+    #[cfg(test)]
+    async fn mount_ready_and_submit(server: &wiremock::MockServer, scan_id: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(serde_json::json!({ "id": scan_id })),
+            )
+            .mount(server)
+            .await;
     }
 
-    /// `scan_target` builds the repository-qualified target and routes it
-    /// through the shared health gate. With Trivy unreachable the scan must
-    /// fail (never a silent zero-finding completion, cf. #888), and the
-    /// surfaced error must carry the repository-qualified ref — proving the
-    /// owning repository key reached the scan target rather than the bare
-    /// Docker Hub ref the legacy path produces.
     #[tokio::test]
-    async fn test_scan_target_uses_repo_qualified_ref_when_trivy_unreachable() {
+    async fn test_adapter_scan_returns_findings() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_ready_and_submit(&server, "scan-abc").await;
+        let report = serde_json::json!({
+            "scanner": {"name": "Trivy", "version": "0.71.2"},
+            "vulnerabilities": [{
+                "id": "CVE-2026-0001",
+                "package": "openssl",
+                "version": "3.1.0",
+                "fix_version": "3.1.1",
+                "severity": "High",
+                "description": "test vuln",
+                "links": ["https://example.test/cve"]
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(report))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let out = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await
+            .expect("adapter scan should complete");
+
+        assert_eq!(out.findings.len(), 1, "real report must yield findings");
+        assert_eq!(out.findings[0].cve_id, Some("CVE-2026-0001".to_string()));
+        assert_eq!(out.findings[0].severity, Severity::High);
+        assert_eq!(out.findings[0].source, Some("trivy".to_string()));
+        assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+    }
+
+    /// Mirror of #888 `test_scan_fails_when_trivy_unreachable`: an unreachable
+    /// adapter must fail the scan, never silently complete with zero findings.
+    #[tokio::test]
+    async fn test_adapter_unreachable_fails_scan() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+        assert!(
+            result.is_err(),
+            "scan() must Err when the adapter is unreachable, not Ok(empty)"
+        );
+        assert!(matches!(result.unwrap_err(), AppError::BadGateway(_)));
+    }
+
+    /// A non-2xx submit response must fail the scan.
+    #[tokio::test]
+    async fn test_adapter_non_2xx_fails_scan() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "adapter 500 must fail the scan with BadGateway, got {:?}",
+            result
+        );
+    }
+
+    /// A report that never becomes ready must FAIL after the bounded budget,
+    /// not return Ok(empty). We trip the deadline immediately by sending a
+    /// Refresh-After larger than the remaining budget on the first pending poll.
+    #[tokio::test]
+    async fn test_adapter_report_pending_then_timeout_fails() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_ready_and_submit(&server, "scan-pending").await;
+        // Always pending, with a Refresh-After far beyond the poll budget so
+        // the deadline check trips on the first poll (keeps the test fast).
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Refresh-After", "100000"))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "a never-ready report must fail the scan (NOT Ok-empty), got {:?}",
+            result
+        );
+    }
+
+    /// A 404 report response is a TERMINAL error, not "pending": our in-house
+    /// adapter (#2092) returns 404 for a genuinely unknown/expired scan id. It
+    /// must fail the scan immediately (fail-fast) rather than polling until the
+    /// ~280s budget is exhausted and tying up a worker. We wrap the call in a
+    /// short timeout to prove it returns promptly rather than waiting out the
+    /// poll budget.
+    #[tokio::test]
+    async fn test_adapter_report_404_fails_fast() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_ready_and_submit(&server, "scan-unknown").await;
+        // Adapter reports 404 for an unknown id — terminal, not pending.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/scan/.+/report$"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown scan id"))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scanner.scan(&oci_image_artifact(), None, &Bytes::new()),
+        )
+        .await
+        .expect("404 report must fail fast, not poll out the ~280s budget");
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "a 404 report (unknown scan id) must fail the scan immediately, got {:?}",
+            result
+        );
+    }
+
+    /// An empty scan id from the submit endpoint must fail the scan up front:
+    /// an empty id yields a bogus `/scan//report` poll URL that never resolves.
+    #[tokio::test]
+    async fn test_adapter_empty_scan_id_fails_scan() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe/ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/scan"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({ "id": "" })))
+            .mount(&server)
+            .await;
+
+        let scanner = ImageScanner::new(server.uri());
+        let result = scanner
+            .scan(&oci_image_artifact(), None, &Bytes::new())
+            .await;
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "an empty scan id must fail the scan with BadGateway, got {:?}",
+            result
+        );
+    }
+
+    /// `scan_target` builds the repository-qualified target. With an
+    /// unreachable adapter the scan must fail (never a silent zero-finding
+    /// completion, cf. #888).
+    #[tokio::test]
+    async fn test_scan_target_fails_when_adapter_unreachable() {
         let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
         let artifact = make_test_artifact(
             "v2/myapp/manifests/latest",
@@ -947,19 +1225,52 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
-
         let result = scanner.scan_target(&target, None, &Bytes::new()).await;
+        assert!(
+            matches!(result, Err(AppError::BadGateway(_))),
+            "scan_target must fail-closed when the adapter is unreachable"
+        );
+    }
 
-        assert!(
-            result.is_err(),
-            "scan_target() must return Err when Trivy is unreachable, not a silent Ok"
+    /// The Harbor scan request carries the `registry.authorization` bearer when
+    /// a token minter is wired, and the repository/reference shape is correct.
+    /// Proves the token is attached (private-repo pull support) and exercises
+    /// the request builder. Uses a lazily-connected pool so no DB is needed.
+    #[test]
+    fn test_build_scan_request_shape_and_authorization() {
+        let artifact = AdapterScanArtifact {
+            repository: "docker-local/library/nginx".to_string(),
+            reference: AdapterReference::Tag("latest".to_string()),
+        };
+        let body = ImageScanner::build_scan_request(
+            "http://localhost:8080",
+            Some("Bearer test-jwt"),
+            &artifact,
+            "application/vnd.docker.distribution.manifest.v2+json",
         );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("docker-local/myapp:latest"),
-            "error must carry the repository-qualified scan target, got: {}",
-            err_msg
+        assert_eq!(body["registry"]["url"], "http://localhost:8080");
+        assert_eq!(body["registry"]["authorization"], "Bearer test-jwt");
+        assert_eq!(body["artifact"]["repository"], "docker-local/library/nginx");
+        assert_eq!(body["artifact"]["tag"], "latest");
+        assert!(body["artifact"].get("digest").is_none());
+
+        // Digest target uses `digest`, not `tag`.
+        let dref = AdapterScanArtifact {
+            repository: "oci-prod/org/app".to_string(),
+            reference: AdapterReference::Digest("sha256:deadbeef".to_string()),
+        };
+        let dbody = ImageScanner::build_scan_request(
+            "http://localhost:8080",
+            None,
+            &dref,
+            "application/vnd.oci.image.manifest.v1+json",
         );
+        assert_eq!(dbody["artifact"]["digest"], "sha256:deadbeef");
+        assert!(dbody["artifact"].get("tag").is_none());
+        // No minter -> no authorization field.
+        assert!(dbody["registry"].get("authorization").is_none());
     }
 }

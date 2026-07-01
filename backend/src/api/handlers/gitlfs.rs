@@ -193,7 +193,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url FROM repositories WHERE key = $1",
+         repo_type::text as repo_type, upstream_url, promotion_only FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -225,6 +225,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
         storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
         upstream_url: repo.try_get("upstream_url").ok(),
+        promotion_only: repo.try_get("promotion_only").unwrap_or(false),
     })
 }
 
@@ -442,6 +443,7 @@ async fn upload_object(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     validate_oid(&oid)?;
 
@@ -1431,6 +1433,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

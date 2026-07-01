@@ -741,6 +741,7 @@ async fn upload_package_put(
     let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
@@ -774,6 +775,7 @@ async fn upload_package_post(
     let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract filename from headers
     let filename = headers

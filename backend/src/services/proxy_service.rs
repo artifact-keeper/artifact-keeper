@@ -2063,11 +2063,13 @@ impl ProxyService {
             .await
     }
 
-    /// Inner variant of [`Self::fetch_artifact_with_cache_path`] that also
-    /// forwards an optional `Accept` header to the upstream request. Used by
-    /// callers that need OCI content negotiation (manifest GETs). Pass
-    /// `None` to preserve the buffered-fetch behaviour exactly.
-    async fn fetch_artifact_with_cache_path_and_accept(
+    /// Variant of [`Self::fetch_artifact_with_cache_path`] that also forwards
+    /// an optional `Accept` header to the upstream request. Used by callers
+    /// that need content negotiation: OCI manifest GETs, and the PyPI
+    /// simple-index proxy requesting the PEP 691 JSON representation under a
+    /// format-qualified `cache_path`. Pass `None` to preserve the buffered
+    /// fetch behaviour exactly.
+    pub async fn fetch_artifact_with_cache_path_and_accept(
         &self,
         repo: &Repository,
         fetch_path: &str,
@@ -2179,6 +2181,20 @@ impl ProxyService {
                             // unimplemented setting fails loudly, not silently.
                             self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
                                 .await;
+
+                            // #1999: index the newly-cached Maven artifact into
+                            // the package catalog (packages/package_versions
+                            // only — never the artifacts table, preserving
+                            // #1278). Best-effort: failures are swallowed and
+                            // never fail the client's proxy fetch.
+                            let checksum = StorageService::calculate_hash(&resp.content);
+                            self.index_cached_package(
+                                repo.id,
+                                cache_path,
+                                resp.content.len() as i64,
+                                Some(&checksum),
+                            )
+                            .await;
                         }
 
                         // Package Age Policy (#1770): hold the just-fetched
@@ -2555,6 +2571,20 @@ impl ProxyService {
         // setting is observable in logs rather than silently doing nothing.
         self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
             .await;
+
+        // #1999: index the newly-cached Maven artifact into the package
+        // catalog (packages/package_versions only — never the artifacts
+        // table, preserving #1278). The streaming tee computes the checksum
+        // only after the body is fully written, so it is unknown here; pass
+        // the upstream Content-Length when advertised (0 otherwise) and no
+        // checksum. Best-effort: failures never fail the client's fetch.
+        self.index_cached_package(
+            repo.id,
+            cache_path,
+            upstream.content_length.unwrap_or(0) as i64,
+            None,
+        )
+        .await;
 
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
@@ -3164,6 +3194,52 @@ impl ProxyService {
         storage_key.starts_with("proxy-cache/")
     }
 
+    /// Purge every proxy-cache object for a repository from the global default
+    /// storage backend, returning the number of keys deleted.
+    ///
+    /// Proxy-cached content is keyed by the repository *key* (not its id) and
+    /// is intentionally NOT recorded in the `artifacts` table (#1278), so the
+    /// repository-delete path that purges `artifacts`-backed objects never sees
+    /// these blobs. Left behind, the whole `proxy-cache/<repo_key>/` subtree
+    /// outlives the repository; a later repository created with the same key
+    /// derives the same cache keys and would serve the deleted repository's
+    /// stale upstream content instead of fetching from its own upstream (#2047,
+    /// a content-integrity / supply-chain hazard).
+    ///
+    /// This lists the entire `proxy-cache/<repo_key>/` prefix on the same
+    /// global-default backend the cache writer uses (`self.storage`) and deletes
+    /// every returned key. Listing the raw keys (rather than reconstructing
+    /// logical paths via [`Self::cached_artifact_paths`]) is deliberate: it
+    /// covers the `__content__` body, the `__cache_meta__.json` sidecar, AND
+    /// negative-cache sidecars that exist with no `__content__` companion, so a
+    /// previously cached 404 is re-evaluated against the new upstream too.
+    ///
+    /// Best-effort: a listing failure yields a no-op (logged by the caller via
+    /// the returned `Result`), and individual `NotFound` deletes are tolerated
+    /// so a concurrent eviction does not turn the purge into an error. The
+    /// prefix is repo-key scoped, so calling this for a hosted repository (which
+    /// has no proxy cache) is a harmless empty list.
+    pub async fn purge_repo_cache(&self, repo_key: &str) -> Result<usize> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = self.storage.list(Some(&prefix)).await?;
+        let mut deleted = 0usize;
+        for key in keys {
+            match self.storage.delete(&key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        repo_key = %repo_key,
+                        storage_key = %key,
+                        error = %e,
+                        "failed to purge proxy-cache object on repository delete"
+                    );
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.metadata)
@@ -3708,6 +3784,90 @@ impl ProxyService {
         }
     }
 
+    /// Index a newly proxy-cached artifact into the `packages` /
+    /// `package_versions` catalog (#1999).
+    ///
+    /// Proxy-cached artifacts are deliberately NOT written to the `artifacts`
+    /// table (#1278 / #1280): doing so reintroduced a doubled-prefix storage
+    /// bug on filesystem backends, and the contract is pinned by the meta-test
+    /// `test_cache_artifact_does_not_insert_into_artifacts_table`. As a result
+    /// the package catalog — populated only by the local-upload handlers via
+    /// [`PackageService::try_create_or_update_from_artifact`] — stayed empty for
+    /// remote/proxy repositories, so `GET /api/v1/packages` and Maven component
+    /// grouping returned nothing for cached artifacts (#1999, regression in
+    /// 1.2.1).
+    ///
+    /// This best-effort helper closes that gap WITHOUT touching the `artifacts`
+    /// table: it writes ONLY `packages` / `package_versions` rows (idempotent
+    /// `ON CONFLICT` upsert), so a second pull of the same GAV (cache hit) does
+    /// not double the catalog and the #1278 meta-test stays green.
+    ///
+    /// Invariants:
+    /// * Called ONLY on the new-cache branch (the same gated spot as
+    ///   [`Self::warn_if_proxy_scan_unsupported`]), so it fires once per new
+    ///   write and never on cache hits.
+    /// * Maven checksum sidecars (`.sha1` / `.md5`) and `maven-metadata.xml`
+    ///   are skipped — they are not packages.
+    /// * A path with no extractable version yields no row.
+    /// * Indexing failure must NOT fail the client's proxy fetch:
+    ///   [`PackageService::try_create_or_update_from_artifact`] swallows + logs.
+    ///
+    /// The repository format is resolved from the DB by `repository_id` rather
+    /// than taken from the caller: the proxy fetch path operates on a synthetic
+    /// `Repository` whose `format` is always `Generic`
+    /// (`proxy_helpers::build_remote_repo`), so trusting it would skip every
+    /// real Maven repo.
+    async fn index_cached_package(
+        &self,
+        repository_id: Uuid,
+        artifact_path: &str,
+        size_bytes: i64,
+        checksum_sha256: Option<&str>,
+    ) {
+        // Resolve the real repository format (the synthetic proxy `Repository`
+        // carries `Generic`, not the configured format). A read failure or
+        // unparseable format degrades to "not indexed" (best-effort).
+        let format_text: Option<String> =
+            sqlx::query_scalar(r#"SELECT format::text FROM repositories WHERE id = $1"#)
+                .bind(repository_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+        let Some(repo_format) = catalog_indexable_format(format_text.as_deref()) else {
+            // Only Maven-family proxy repos populate the catalog for now
+            // (#1999). Other formats keep the pre-fix behavior until their
+            // grouping/listing paths are taught to read from the catalog too.
+            return;
+        };
+
+        let Some(name) = maven_proxy_package_name(artifact_path) else {
+            return;
+        };
+        let Some(version) = extract_version_from_path(&repo_format, artifact_path) else {
+            return;
+        };
+
+        // The streaming tee computes the checksum only after the body is fully
+        // written, so it is unknown at this gated spot; fall back to an empty
+        // string. The buffered path passes the real digest. Either way the
+        // catalog row exists; a later buffered pull refreshes the digest.
+        let checksum = checksum_sha256.unwrap_or("");
+
+        let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repository_id,
+                &name,
+                &version,
+                size_bytes,
+                checksum,
+                None,
+                None,
+            )
+            .await;
+    }
+
     /// Attempt to retrieve a cached artifact even if it has expired.
     /// Used as a fallback when upstream is unavailable.
     ///
@@ -3738,6 +3898,56 @@ impl ProxyService {
     }
 }
 
+/// Derive the package-catalog name (`groupId:artifactId`) for a Maven-family
+/// proxy-cached artifact path (#1999), or `None` if the path is not a Maven
+/// package asset that should be indexed.
+///
+/// Skip rules (these are not packages):
+/// * Maven checksum sidecars — `*.sha1`, `*.md5`, `*.sha256`, `*.sha512`, `*.asc`.
+/// * `maven-metadata.xml` (and its own checksum sidecars).
+/// * Any path that does not parse as Maven coordinates
+///   (`groupId/artifactId/version/filename`).
+///
+/// Using `groupId:artifactId` (rather than the bare `artifactId` that the
+/// local-upload path stores) keeps proxy package names globally unambiguous and
+/// lets the remote component-grouping branch reconstruct the `groupId` /
+/// `artifactId` split without consulting the storage path.
+pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let lower = filename.to_ascii_lowercase();
+
+    // Checksum / signature sidecars are not packages.
+    const SKIP_SUFFIXES: [&str; 5] = [".sha1", ".md5", ".sha256", ".sha512", ".asc"];
+    if SKIP_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return None;
+    }
+
+    // Maven metadata index files are not packages.
+    if lower == "maven-metadata.xml" || lower.starts_with("maven-metadata.xml.") {
+        return None;
+    }
+
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    Some(format!("{}:{}", coords.group_id, coords.artifact_id))
+}
+
+/// Map a repository `format::text` value to the [`RepositoryFormat`] whose
+/// proxy-cached artifacts are indexed into the package catalog (#1999).
+///
+/// Only the Maven family is indexed for now; every other format (including a
+/// missing/unknown value) returns `None`, leaving the pre-fix behavior intact.
+/// Factored out of [`ProxyService::index_cached_package`] so the eligibility
+/// decision is unit-testable without a database round-trip.
+pub(crate) fn catalog_indexable_format(format_text: Option<&str>) -> Option<RepositoryFormat> {
+    match format_text {
+        Some("maven") => Some(RepositoryFormat::Maven),
+        Some("gradle") => Some(RepositoryFormat::Gradle),
+        Some("sbt") => Some(RepositoryFormat::Sbt),
+        _ => None,
+    }
+}
+
 /// Extract version from an artifact path based on the repository format.
 ///
 /// Each package format encodes the version differently in the path. This
@@ -3745,12 +3955,9 @@ impl ProxyService {
 /// for metadata files, index pages, or paths where the version cannot be
 /// determined.
 ///
-/// Currently unused: the previous caller in `cache_artifact` was removed
-/// when proxy-cached items stopped being inserted into the `artifacts`
-/// table (issue #1278). Kept around because the version-extraction logic
-/// is broadly useful and tests still exercise it; if a future cache
-/// listing/UX feature wants per-version metadata it should call this.
-#[allow(dead_code)]
+/// Called by [`ProxyService::index_cached_package`] (#1999) to populate the
+/// package catalog for proxy-cached Maven artifacts, and exercised directly by
+/// the unit tests below.
 pub(crate) fn extract_version_from_path(format: &RepositoryFormat, path: &str) -> Option<String> {
     let path = path.trim_start_matches('/');
 
@@ -5440,6 +5647,119 @@ SHA256:
         assert!(version.is_none());
     }
 
+    // =======================================================================
+    // maven_proxy_package_name — package-catalog name derivation + skip logic
+    // for proxy-cached Maven artifacts (#1999)
+    // =======================================================================
+
+    #[test]
+    fn test_maven_proxy_package_name_jar() {
+        assert_eq!(
+            maven_proxy_package_name(
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+            )
+            .as_deref(),
+            Some("org.apache.commons:commons-lang3")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_pom() {
+        assert_eq!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_leading_slash() {
+        // The cache_path may arrive with a leading slash; it must be trimmed.
+        assert_eq!(
+            maven_proxy_package_name("/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_sha1() {
+        // Checksum sidecars are not packages and must NOT create a row.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_md5() {
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom.md5")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_signature_and_other_checksums() {
+        for path in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.asc",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha256",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha512",
+        ] {
+            assert!(
+                maven_proxy_package_name(path).is_none(),
+                "expected {path} to be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_maven_metadata() {
+        // Version-level maven-metadata.xml (and its checksums) are index files.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml").is_none()
+        );
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_unparseable_path() {
+        // Too few segments to be a GAV → no package.
+        assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_maven_family() {
+        assert_eq!(
+            catalog_indexable_format(Some("maven")),
+            Some(RepositoryFormat::Maven)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("gradle")),
+            Some(RepositoryFormat::Gradle)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("sbt")),
+            Some(RepositoryFormat::Sbt)
+        );
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_other_formats_not_indexed() {
+        for f in ["npm", "pypi", "docker", "generic", "cargo", "nuget"] {
+            assert!(
+                catalog_indexable_format(Some(f)).is_none(),
+                "{f} must not be catalog-indexed yet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_missing_value() {
+        assert!(catalog_indexable_format(None).is_none());
+    }
+
     #[test]
     fn test_extract_version_npm_unscoped_tarball() {
         let version =
@@ -6132,6 +6452,166 @@ SHA256:
             deletes.is_empty(),
             "no delete should be issued on path-traversal: {:?}",
             deletes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // purge_repo_cache (#2047)
+    //
+    // Repository delete must purge the whole `proxy-cache/<repo_key>/` subtree
+    // from the global default backend so a later repo created with the same key
+    // cannot serve the deleted repo's stale upstream content. The helper is
+    // storage-only (list + delete), so a recording mock that serves a fixed key
+    // set from `list` and captures every `delete` pins the contract.
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that serves a fixed key set from `list(prefix)` (filtered
+    /// by prefix) and captures every `delete()` call, with a configurable
+    /// listing failure to exercise the best-effort error path.
+    struct PrefixListDeleteStorage {
+        keys: Vec<String>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
+        list_fails: bool,
+    }
+
+    impl PrefixListDeleteStorage {
+        fn new(keys: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                keys: keys.into_iter().map(String::from).collect(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: false,
+            })
+        }
+        fn failing_list() -> Arc<Self> {
+            Arc::new(Self {
+                keys: Vec::new(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: true,
+            })
+        }
+        async fn deletes_snapshot(&self) -> Vec<String> {
+            self.deletes.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PrefixListDeleteStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            let p = prefix.unwrap_or("");
+            Ok(self
+                .keys
+                .iter()
+                .filter(|k| k.starts_with(p))
+                .cloned()
+                .collect())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_deletes_entire_repo_key_subtree() {
+        // Two cached entries (body + sidecar each) plus a negative-cache
+        // sidecar with no `__content__` companion, all under the target repo
+        // key, and an unrelated repo's entry that must be left untouched.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            // Negative-cache sidecar: a previously-404'd path, sidecar only.
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+            // Different repo that happens to share a key prefix substring:
+            // must NOT be purged (prefix is slash-terminated).
+            "proxy-cache/rpm-remote-other/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("rpm-remote")
+            .await
+            .expect("purge should succeed");
+
+        let deletes = storage.deletes_snapshot().await;
+        assert_eq!(deleted, 5, "should report 5 purged keys, got {:?}", deletes);
+        // Every object under the target repo key — content, sidecar, AND the
+        // negative-cache-only sidecar — must be gone.
+        for k in [
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+        ] {
+            assert!(deletes.iter().any(|d| d == k), "expected delete of {k}");
+        }
+        // A different repo's cache must survive.
+        assert!(
+            !deletes
+                .iter()
+                .any(|d| d.starts_with("proxy-cache/rpm-remote-other/")),
+            "must not purge a sibling repo's cache: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_empty_for_repo_with_no_cache() {
+        // A hosted repo (or a remote that was never fetched) has no
+        // proxy-cache objects: the helper must be a clean no-op, not an error.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/some-other-repo/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("hosted-repo")
+            .await
+            .expect("purge should succeed");
+
+        assert_eq!(
+            deleted, 0,
+            "no keys should be purged for a repo with no cache"
+        );
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when nothing matches the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_propagates_list_failure() {
+        // A listing failure surfaces as Err so the caller can log it; the
+        // caller (delete_repository) swallows it so the delete still proceeds.
+        let storage = PrefixListDeleteStorage::failing_list();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service.purge_repo_cache("rpm-remote").await;
+
+        assert!(result.is_err(), "list failure should surface as Err");
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when listing failed"
         );
     }
 

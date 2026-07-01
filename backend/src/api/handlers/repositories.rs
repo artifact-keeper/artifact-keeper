@@ -1882,6 +1882,30 @@ pub async fn delete_repository(
     // (#1551). Best-effort: never blocks the delete.
     purge_repo_artifact_objects(&state, repo.id, &repo.storage_location()).await;
 
+    // Purge this repo's proxy-cache subtree from the global default storage
+    // backend. Proxy-cached blobs are keyed by the repo KEY and are not tracked
+    // in `artifacts` (#1278), so the purge above never reaches them; left
+    // behind, a new repository created with the same key would serve the deleted
+    // repo's stale upstream content (#2047). Best-effort: never blocks the
+    // delete. Hosted repos have no proxy cache, so this is a no-op for them.
+    if let Some(proxy) = state.proxy_service.as_ref() {
+        match proxy.purge_repo_cache(&repo.key).await {
+            Ok(purged) if purged > 0 => tracing::info!(
+                repo_id = %repo.id,
+                repo_key = %repo.key,
+                purged,
+                "Purged proxy-cache storage objects for deleted repository"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                repo_id = %repo.id,
+                repo_key = %repo.key,
+                error = %e,
+                "Failed to list proxy-cache objects to purge before repository delete"
+            ),
+        }
+    }
+
     service.delete(repo.id).await?;
 
     // Remove the deleted repo from the in-memory cache.
@@ -2706,6 +2730,25 @@ async fn list_artifacts_grouped_by_maven_component(
     // is generous; most Maven repos have far fewer cached artifacts.
     const MAX_FETCH: i64 = 10_000;
 
+    // Remote (proxy) repositories do NOT record cached items in the `artifacts`
+    // table (#1278 / #1280), so `artifact_service.list` returns nothing for them
+    // and component grouping came back empty (#1999, regression in 1.2.1).
+    // Proxy-cached Maven artifacts ARE indexed into the package catalog
+    // (`packages` / `package_versions`, written by
+    // `ProxyService::index_cached_package`), so reconstruct the component list
+    // from there instead. Hosted/local/virtual grouping is unchanged below.
+    if repo.repo_type == RepositoryType::Remote {
+        let components = maven_components_from_catalog(
+            &state.db,
+            repo.id,
+            repo_key,
+            &format!("{:?}", repo.format).to_lowercase(),
+            search_query,
+        )
+        .await?;
+        return Ok(paginate_maven_components(components, page, per_page));
+    }
+
     let (artifacts, _total_files) = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
@@ -2734,6 +2777,18 @@ async fn list_artifacts_grouped_by_maven_component(
         &format!("{:?}", repo.format).to_lowercase(),
     );
 
+    Ok(paginate_maven_components(components, page, per_page))
+}
+
+/// Paginate a fully-built list of Maven components into an
+/// [`ArtifactListResponse`]. Shared by the hosted/local (artifacts-table) and
+/// the remote/proxy (package-catalog) grouping paths so pagination math lives
+/// in exactly one place.
+fn paginate_maven_components(
+    components: Vec<MavenComponentResponse>,
+    page: u32,
+    per_page: u32,
+) -> Json<ArtifactListResponse> {
     let total_components = components.len() as i64;
     let total_pages = ((total_components as f64) / (per_page as f64)).ceil() as u32;
     let offset = ((page - 1) * per_page) as usize;
@@ -2743,7 +2798,7 @@ async fn list_artifacts_grouped_by_maven_component(
         .take(per_page as usize)
         .collect();
 
-    Ok(Json(ArtifactListResponse {
+    Json(ArtifactListResponse {
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -2753,7 +2808,80 @@ async fn list_artifacts_grouped_by_maven_component(
         },
         components: Some(page_components),
         docker_tags: None,
-    }))
+    })
+}
+
+/// Build the Maven component list for a remote/proxy repository from the
+/// package catalog (#1999).
+///
+/// Proxy-cached Maven artifacts are indexed into `packages` /
+/// `package_versions` with `packages.name = "groupId:artifactId"` (see
+/// [`crate::services::proxy_service::maven_proxy_package_name`]). Each catalog
+/// row maps to one [`MavenComponentResponse`]; rows whose name does not split
+/// into `groupId:artifactId` are skipped defensively. Results are ordered by
+/// name for a stable, paginatable list.
+async fn maven_components_from_catalog(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    repo_key: &str,
+    format: &str,
+    search_query: Option<&str>,
+) -> Result<Vec<MavenComponentResponse>> {
+    use sqlx::Row;
+
+    let search_pattern = search_query.map(|q| format!("%{}%", q));
+
+    let rows = sqlx::query(
+        r#"
+        SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at
+        FROM packages p
+        WHERE p.repository_id = $1
+          AND ($2::text IS NULL OR p.name ILIKE $2)
+        ORDER BY p.name ASC, p.version ASC
+        "#,
+    )
+    .bind(repository_id)
+    .bind(&search_pattern)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to list proxy package catalog: {e}")))?;
+
+    let mut components = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get("name");
+        let Some((group_id, artifact_id)) = split_maven_catalog_name(&name) else {
+            // Defensive: a catalog row not written by the proxy indexer (no
+            // `groupId:artifactId` shape) cannot be rendered as a component.
+            continue;
+        };
+        components.push(MavenComponentResponse {
+            id: row.get("id"),
+            group_id,
+            artifact_id,
+            version: row.get("version"),
+            repository_key: repo_key.to_string(),
+            format: format.to_string(),
+            size_bytes: row.get("size_bytes"),
+            download_count: row.get("download_count"),
+            created_at: row.get("created_at"),
+            artifact_files: Vec::new(),
+        });
+    }
+
+    Ok(components)
+}
+
+/// Split a proxy package-catalog name (`groupId:artifactId`) back into its
+/// `(groupId, artifactId)` parts (#1999). Returns `None` when the name has no
+/// `:` separator or either side is empty, so a malformed/foreign catalog row is
+/// skipped rather than rendered as a broken component. Maven artifactIds never
+/// contain `:`, and groupIds use `.` separators, so the FIRST `:` is the split.
+fn split_maven_catalog_name(name: &str) -> Option<(String, String)> {
+    let (group_id, artifact_id) = name.split_once(':')?;
+    if group_id.is_empty() || artifact_id.is_empty() {
+        return None;
+    }
+    Some((group_id.to_string(), artifact_id.to_string()))
 }
 
 /// GAV key used to group Maven artifacts.
@@ -5288,6 +5416,93 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy package-catalog component grouping (#1999)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_maven_catalog_name_splits_group_and_artifact() {
+        assert_eq!(
+            split_maven_catalog_name("org.apache.commons:commons-lang3"),
+            Some((
+                "org.apache.commons".to_string(),
+                "commons-lang3".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn split_maven_catalog_name_rejects_missing_separator() {
+        assert!(split_maven_catalog_name("commons-lang3").is_none());
+    }
+
+    #[test]
+    fn split_maven_catalog_name_rejects_empty_sides() {
+        assert!(split_maven_catalog_name(":commons-lang3").is_none());
+        assert!(split_maven_catalog_name("org.apache:").is_none());
+        assert!(split_maven_catalog_name(":").is_none());
+    }
+
+    #[test]
+    fn split_maven_catalog_name_uses_first_colon() {
+        // groupId uses dot separators and artifactId has no colon, so any
+        // extra colon (defensive) is folded into the artifactId.
+        assert_eq!(
+            split_maven_catalog_name("g:a:b"),
+            Some(("g".to_string(), "a:b".to_string()))
+        );
+    }
+
+    fn maven_component(group: &str, artifact: &str) -> MavenComponentResponse {
+        MavenComponentResponse {
+            id: Uuid::new_v4(),
+            group_id: group.to_string(),
+            artifact_id: artifact.to_string(),
+            version: "1.0.0".to_string(),
+            repository_key: "maven-proxy".to_string(),
+            format: "maven".to_string(),
+            size_bytes: 10,
+            download_count: 0,
+            created_at: chrono::Utc::now(),
+            artifact_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn paginate_maven_components_reports_total_and_page() {
+        let comps = vec![
+            maven_component("g", "a"),
+            maven_component("g", "b"),
+            maven_component("g", "c"),
+        ];
+        let resp = paginate_maven_components(comps, 1, 2).0;
+        assert_eq!(resp.pagination.total, 3);
+        assert_eq!(resp.pagination.total_pages, 2);
+        assert_eq!(resp.components.as_ref().unwrap().len(), 2);
+        assert!(resp.items.is_empty());
+        assert!(resp.docker_tags.is_none());
+    }
+
+    #[test]
+    fn paginate_maven_components_second_page_has_remainder() {
+        let comps = vec![
+            maven_component("g", "a"),
+            maven_component("g", "b"),
+            maven_component("g", "c"),
+        ];
+        let resp = paginate_maven_components(comps, 2, 2).0;
+        assert_eq!(resp.components.as_ref().unwrap().len(), 1);
+        assert_eq!(resp.components.as_ref().unwrap()[0].artifact_id, "c");
+    }
+
+    #[test]
+    fn paginate_maven_components_empty_catalog() {
+        let resp = paginate_maven_components(Vec::new(), 1, 20).0;
+        assert_eq!(resp.pagination.total, 0);
+        assert_eq!(resp.pagination.total_pages, 0);
+        assert!(resp.components.as_ref().unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------------

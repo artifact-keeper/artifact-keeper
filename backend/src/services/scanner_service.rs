@@ -1400,10 +1400,15 @@ fn extract_tar_gz_safe(content: &[u8], target: &Path) -> Result<()> {
 /// `Artifact::path` is repository-internal. Scanners that need an externally
 /// routable identity (currently Grype's OCI `registry:` mode) must use the
 /// repository fields from this context instead of guessing from the path.
+/// Scanners may also use the optional database/storage handles to inspect
+/// repository-local artifact state without re-entering the public registry
+/// route.
 pub struct ScanTarget<'a> {
     pub artifact: &'a Artifact,
     pub repository_key: &'a str,
     pub repository_type: &'a str,
+    pub db: Option<&'a PgPool>,
+    pub storage: Option<&'a dyn StorageBackend>,
 }
 
 /// A pluggable vulnerability scanner.
@@ -2624,6 +2629,7 @@ impl ScannerService {
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
         trivy_url: Option<String>,
+        trivy_adapter_url: Option<String>,
         storage: Arc<dyn StorageBackend>,
         storage_registry: Arc<crate::storage::StorageRegistry>,
         storage_base_path: String,
@@ -2634,16 +2640,28 @@ impl ScannerService {
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
 
+        // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
+        // ONLY when an adapter URL is configured. When unset, no trivy/image
+        // scan row is produced at all (grype still runs) — we do not claim to
+        // have run trivy on images.
+        if let Some(adapter_url) = trivy_adapter_url {
+            info!(
+                "Container image scanner (Harbor adapter) enabled at {}",
+                adapter_url
+            );
+            scanners.push(Arc::new(ImageScanner::new(adapter_url)));
+        }
+
+        // Trivy filesystem + incus (rootfs) scanners drive the trivy server
+        // directly and keep consuming TRIVY_URL unchanged: their
+        // `--server` / dir-mode protocol is incompatible with the Harbor
+        // adapter, so they are NOT repointed at it.
         if let Some(url) = trivy_url {
-            info!("Trivy image scanner enabled at {}", url);
-            scanners.push(Arc::new(ImageScanner::new(url.clone())));
-            // Trivy filesystem scanner for non-container artifacts
             info!("Trivy filesystem scanner enabled");
             scanners.push(Arc::new(TrivyFsScanner::new(
                 url.clone(),
                 scan_workspace_path.clone(),
             )));
-            // Incus/LXC container image scanner (extracts rootfs, scans with trivy)
             info!("Incus container image scanner enabled");
             scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
                 url,
@@ -2902,7 +2920,10 @@ impl ScannerService {
         // Load content from storage (we need the storage key)
         // NOTE: The orchestrator is called with content already available in
         // upload/proxy paths. For on-demand scans, we fetch from DB metadata.
-        let content = self.fetch_artifact_content(&artifact).await?;
+        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
+        let content = self
+            .fetch_artifact_content_from_storage(&artifact, storage.as_ref())
+            .await?;
 
         // Load metadata if available
         let metadata = sqlx::query_as!(
@@ -2925,6 +2946,8 @@ impl ScannerService {
             artifact: &artifact,
             repository_key: &repository_key,
             repository_type: &repository_type,
+            db: Some(&self.db),
+            storage: Some(storage.as_ref()),
         };
 
         for scanner in &self.scanners {
@@ -3670,7 +3693,11 @@ impl ScannerService {
     /// streaming reads for those backends is tracked separately by #1430 and
     /// #1431 (GCS `get_stream`); this fix deliberately does not expand into
     /// that work.
-    async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
+    async fn fetch_artifact_content_from_storage(
+        &self,
+        artifact: &Artifact,
+        storage: &dyn StorageBackend,
+    ) -> Result<Bytes> {
         // Early reject using the recorded size before we open the stream. The
         // streaming loop below re-checks against the same ceiling because
         // `size_bytes` can be stale or wrong for proxied/upstream content.
@@ -3681,22 +3708,17 @@ impl ScannerService {
             )));
         }
 
-        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
-        Self::stage_from_storage(
-            storage.as_ref(),
-            &artifact.storage_key,
-            &self.scan_workspace_path,
-        )
-        .await
-        .map_err(|e| match e {
-            // Preserve the validation/size-cap variant; only wrap raw
-            // storage/stream-open failures with artifact context.
-            AppError::Storage(msg) => AppError::Storage(format!(
-                "Failed to stage artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, msg
-            )),
-            other => other,
-        })
+        Self::stage_from_storage(storage, &artifact.storage_key, &self.scan_workspace_path)
+            .await
+            .map_err(|e| match e {
+                // Preserve the validation/size-cap variant; only wrap raw
+                // storage/stream-open failures with artifact context.
+                AppError::Storage(msg) => AppError::Storage(format!(
+                    "Failed to stage artifact {} (key={}): {}",
+                    artifact.id, artifact.storage_key, msg
+                )),
+                other => other,
+            })
     }
 
     /// Open a streaming read from `storage` for `key` and stage it for scanning.
@@ -11381,6 +11403,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11402,6 +11426,8 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11809,7 +11835,8 @@ mod tests {
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip image / fs / incus scanners
+            None, // trivy_url: skip fs / incus scanners
+            None, // trivy_adapter_url: skip image scanner
             storage,
             storage_registry,
             storage_base_path,

@@ -211,6 +211,7 @@ async fn upload_artifact(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = artifact_path.trim_start_matches('/').to_string();
 

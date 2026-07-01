@@ -720,6 +720,20 @@ async fn publish(
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
+    // Reject direct uploads to promotion-only repositories. Such repos accept
+    // artifacts only via the promotion path, not direct `cargo publish`. The
+    // cargo handler owns its own repo struct/cache, so query the flag directly
+    // at this commit choke point (stale-proof, no admin exemption).
+    let promotion_only = sqlx::query_scalar!(
+        "SELECT promotion_only FROM repositories WHERE id = $1",
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| proxy_helpers::internal_error("Database", e))?
+    .unwrap_or(false);
+    proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, false)?;
+
     let parsed = parse_publish_payload(&body)?;
     let name_lower = parsed.crate_name.to_lowercase();
 
@@ -1598,6 +1612,58 @@ mod tests {
             "links": null,
             "rust_version": "1.70.0"
         })
+    }
+
+    /// #2022: a direct `cargo publish` (PUT /api/v1/crates/new) to a
+    /// `promotion_only` repository must be rejected with 409 CONFLICT; the same
+    /// publish to a normal repository must still succeed. Cargo owns its own
+    /// repo struct/cache, so the gate is a direct scalar query at the publish
+    /// choke point. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_blocked_on_promotion_only_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+
+        let crate_data = b"fake-crate-tarball-bytes";
+        let payload = make_publish_payload(&sample_metadata(), crate_data);
+        let uri = format!("/{}/api/v1/crates/new", fx.repo_key);
+
+        // Flag the repo promotion_only -> direct publish is rejected with 409.
+        fx.set_promotion_only(true).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        let req = tdh::put(uri.clone(), payload.clone());
+        let (blocked_status, _) = tdh::send(app, req).await;
+
+        // Clear the flag -> the same publish succeeds.
+        fx.set_promotion_only(false).await;
+        let app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        let req = tdh::put(uri, payload);
+        let (allowed_status, allowed_body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::CONFLICT,
+            "promotion_only direct publish must return 409"
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::OK,
+            "publish to a normal repo must still succeed; body: {}",
+            String::from_utf8_lossy(&allowed_body)
+        );
     }
 
     // -----------------------------------------------------------------------

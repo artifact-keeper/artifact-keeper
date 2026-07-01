@@ -406,6 +406,7 @@ async fn upload_cookbook(
     let user_id = require_auth_basic(auth, "chef")?.user_id;
     let repo = resolve_chef_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let mut tarball: Option<bytes::Bytes> = None;
     let mut cookbook_json: Option<serde_json::Value> = None;
@@ -674,6 +675,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -688,6 +690,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://supermarket.chef.io".to_string()),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
