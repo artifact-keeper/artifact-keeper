@@ -189,6 +189,28 @@ pub fn reject_direct_upload_if_promotion_only(
     }
 }
 
+/// Strip query strings and fragments before logging a proxy path. Some
+/// split-path proxy callers fetch absolute, signed upstream URLs while caching
+/// under a stable local key; the fetch target must remain raw for the outbound
+/// request, but diagnostics must not preserve credential-bearing URL material.
+fn redact_proxy_path_for_diagnostics(path: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(path) {
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+
+    let query_pos = path.find('?');
+    let fragment_pos = path.find('#');
+    let end = match (query_pos, fragment_pos) {
+        (Some(q), Some(f)) => q.min(f),
+        (Some(q), None) => q,
+        (None, Some(f)) => f,
+        (None, None) => path.len(),
+    };
+    path[..end].to_string()
+}
+
 /// Map a proxy service error to an HTTP error response.
 ///
 /// * `NotFound` → 404 (upstream definitively does not have the artifact)
@@ -227,11 +249,12 @@ pub fn reject_direct_upload_if_promotion_only(
 ///   failures, body read errors) stays at `warn` because those genuinely
 ///   warrant operator attention.
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
+    let diagnostic_path = redact_proxy_path_for_diagnostics(path);
     match &e {
         crate::error::AppError::NotFound(_) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Upstream returned 404 (artifact or tag does not exist): {}",
                 e
             );
@@ -247,7 +270,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Validation(_) => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy rejected request path: {}",
                 e
             );
@@ -260,7 +283,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::ServiceUnavailable(_) => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Upstream transient failure (5xx); returning 503: {}",
                 e
             );
@@ -278,7 +301,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Conflict(msg) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy download blocked by quarantine policy: {}",
                 e
             );
@@ -289,7 +312,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::Authorization(msg) => {
             tracing::info!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy download forbidden by quarantine policy: {}",
                 e
             );
@@ -298,7 +321,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         _ => {
             tracing::warn!(
                 repo_key = %repo_key,
-                path = %path,
+                path = %diagnostic_path,
                 "Proxy fetch failed: {}",
                 e
             );
@@ -3015,6 +3038,20 @@ mod tests {
             "upstream".into()
         )));
         assert!(!is_quarantine_block(&AppError::Storage("io".into())));
+    }
+
+    #[test]
+    fn test_redact_proxy_path_for_diagnostics_strips_signed_url_query() {
+        let signed = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                      ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#frag";
+        assert_eq!(
+            redact_proxy_path_for_diagnostics(signed),
+            "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"
+        );
+        assert_eq!(
+            redact_proxy_path_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
     }
 
     #[test]

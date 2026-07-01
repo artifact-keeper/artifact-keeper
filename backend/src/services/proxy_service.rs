@@ -252,6 +252,26 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
     paths
 }
 
+/// Remove credential-bearing URL material before rendering an upstream target
+/// into logs or [`AppError`] messages.
+fn redact_url_for_diagnostics(url: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(url) {
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+
+    let query_pos = url.find('?');
+    let fragment_pos = url.find('#');
+    let end = match (query_pos, fragment_pos) {
+        (Some(q), Some(f)) => q.min(f),
+        (Some(q), None) => q,
+        (None, Some(f)) => f,
+        (None, None) => url.len(),
+    };
+    url[..end].to_string()
+}
+
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
 /// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
@@ -266,22 +286,23 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
 ///   503 would be misleading.
 /// * 2xx → `Ok(())`
 fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
+    let diagnostic_url = redact_url_for_diagnostics(url);
     if status == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound(format!(
             "Artifact not found at upstream: {}",
-            url
+            diagnostic_url
         )));
     }
     if status.is_server_error() {
         return Err(AppError::ServiceUnavailable(format!(
             "Upstream returned error status {}: {}",
-            status, url
+            status, diagnostic_url
         )));
     }
     if !status.is_success() {
         return Err(AppError::BadGateway(format!(
             "Upstream returned error status {}: {}",
-            status, url
+            status, diagnostic_url
         )));
     }
     Ok(())
@@ -1356,9 +1377,10 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<UpstreamResponse> {
+        let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
             "Fetching artifact from upstream: {} (accept={:?})",
-            url,
+            diagnostic_url,
             accept
         );
 
@@ -1376,10 +1398,13 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to fetch from upstream {}: {}",
+                diagnostic_url,
+                e.without_url()
+            ))
+        })?;
 
         let status = response.status();
 
@@ -1405,7 +1430,7 @@ impl UpstreamClient {
 
             return Err(AppError::Storage(format!(
                 "Upstream returned error status {}: {}",
-                status, url
+                status, diagnostic_url
             )));
         }
 
@@ -1453,10 +1478,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        let content = response
-            .bytes()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
+        let content = response.bytes().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to read upstream response: {}",
+                e.without_url()
+            ))
+        })?;
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
@@ -1488,7 +1515,11 @@ impl UpstreamClient {
     /// buffered variant; only the body extraction differs — and, critically,
     /// the streaming path sets NO `Accept` header anywhere (see below).
     async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
-        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
+        let diagnostic_url = redact_url_for_diagnostics(url);
+        tracing::info!(
+            "Fetching artifact from upstream (streaming): {}",
+            diagnostic_url
+        );
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
@@ -1502,10 +1533,13 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to fetch from upstream {}: {}",
+                diagnostic_url,
+                e.without_url()
+            ))
+        })?;
 
         let status = response.status();
 
@@ -1522,7 +1556,7 @@ impl UpstreamClient {
 
             return Err(AppError::Storage(format!(
                 "Upstream returned error status {}: {}",
-                status, url
+                status, diagnostic_url
             )));
         }
 
@@ -1600,10 +1634,12 @@ impl UpstreamClient {
                 // method doc on the intentional asymmetry (#1618 S8).
                 let retry_request = build_request(self.http_client.get(url).bearer_auth(&token));
 
+                let retry_diagnostic_url = redact_url_for_diagnostics(url);
                 let retry_response = retry_request.send().await.map_err(|e| {
                     AppError::Storage(format!(
-                        "Failed to fetch from upstream after token exchange: {}",
-                        e
+                        "Failed to fetch from upstream {} after token exchange: {}",
+                        retry_diagnostic_url,
+                        e.without_url()
                     ))
                 })?;
 
@@ -1628,7 +1664,12 @@ impl UpstreamClient {
         let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
 
         let body = response.bytes_stream().map(|r| {
-            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
+            r.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to read upstream stream: {}",
+                    e.without_url()
+                ))
+            })
         });
 
         Ok(UpstreamStream {
@@ -7553,6 +7594,21 @@ SHA256:
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_redact_url_for_diagnostics_strips_query_and_fragment() {
+        let signed = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                      ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#section";
+        assert_eq!(
+            redact_url_for_diagnostics(signed),
+            "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"
+        );
+
+        assert_eq!(
+            redact_url_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
+    }
+
+    #[test]
     fn test_validate_upstream_status_2xx_is_ok() {
         validate_upstream_status(StatusCode::OK, "http://x").expect("200 must pass");
         validate_upstream_status(StatusCode::PARTIAL_CONTENT, "http://x")
@@ -7631,6 +7687,23 @@ SHA256:
         match validate_upstream_status(StatusCode::UNAUTHORIZED, "http://up/x") {
             Err(AppError::BadGateway(_)) => {}
             other => panic!("401 must map to AppError::BadGateway; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_redacts_signed_url_diagnostics() {
+        let signed_url = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                          ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#frag";
+
+        match validate_upstream_status(StatusCode::FORBIDDEN, signed_url) {
+            Err(AppError::BadGateway(msg)) => {
+                assert!(msg.contains("https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"));
+                assert!(
+                    !msg.contains("X-Amz") && !msg.contains("deadbeef") && !msg.contains("#frag"),
+                    "signed URL material must not appear in diagnostics: {msg}"
+                );
+            }
+            other => panic!("403 must map to redacted AppError::BadGateway; got {other:?}"),
         }
     }
 

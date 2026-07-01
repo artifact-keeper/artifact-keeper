@@ -22,6 +22,7 @@ on:
           - docker
           - protobuf
           - tag-replication
+          - terraform-mirror
         default: smoke
       include_stress:
         description: 'Include stress tests'

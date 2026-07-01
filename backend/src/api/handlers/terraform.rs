@@ -35,6 +35,7 @@ use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -1304,6 +1305,11 @@ fn resolve_archive_url(download: &serde_json::Value) -> Result<&str, Response> {
 /// `<namespace>/<type>/<version>/<os>/<arch>/<filename>` path from the
 /// archive URL's own filename, keeping cache keys stable regardless of which
 /// host or path shape the upstream registry serves archives from (#1998).
+///
+/// Parses `archive_url` instead of splitting the raw string so that a signed
+/// URL's query string (e.g. `?X-Amz-Signature=...`) or fragment is dropped
+/// along with everything else outside the path: query material must never
+/// end up embedded in a proxy-cache object key.
 fn mirror_archive_cache_path(
     namespace: &str,
     type_name: &str,
@@ -1312,11 +1318,11 @@ fn mirror_archive_cache_path(
     arch: &str,
     archive_url: &str,
 ) -> String {
-    let filename = archive_url
-        .rsplit('/')
-        .next()
+    let filename = reqwest::Url::parse(archive_url)
+        .ok()
+        .and_then(|url| url.path_segments()?.next_back().map(str::to_string))
         .filter(|name| !name.is_empty())
-        .unwrap_or("provider.zip");
+        .unwrap_or_else(|| "provider.zip".to_string());
 
     format!("{namespace}/{type_name}/{version}/{os}/{arch}/{filename}")
 }
@@ -1470,6 +1476,33 @@ async fn mirror_download(
     let download = fetch_upstream_json(&remote, &repo_key, &dl_path).await?;
 
     let archive_url = resolve_archive_url(&download)?;
+
+    // A malicious/compromised upstream registry could return an internal
+    // address (e.g. the cloud metadata endpoint) as `download_url`. Validate
+    // it against the same anti-SSRF policy used for other registries'
+    // registry-discovered download URLs (see cargo.rs's `download` handler
+    // and pypi.rs's `find_upstream_url_for_file` path) before fetching it.
+    validate_outbound_url(archive_url, "Terraform upstream archive URL").map_err(|e| {
+        // Deliberately omit `archive_url` from this log line: it is
+        // registry-controlled and frequently a signed URL (e.g.
+        // `?X-Amz-Signature=...`), so logging it verbatim would leak
+        // credential-bearing query material. `e` already names the
+        // specific blocked host/IP without echoing the query string.
+        tracing::warn!(
+            "SSRF check rejected upstream download_url for {}/{} {} {}/{}: {}",
+            namespace,
+            type_name,
+            version,
+            os,
+            arch,
+            e
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream registry returned a disallowed download_url: {e}"),
+        )
+            .into_response()
+    })?;
 
     // `archive_url` is frequently an absolute `https://` URL (#1998): fine as
     // the upstream fetch target (absolute URLs pass through unchanged), but
@@ -2518,6 +2551,59 @@ mod tests {
 
         let err2 = resolve_archive_url(&serde_json::json!({ "download_url": "" })).unwrap_err();
         assert_eq!(err2.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Regression guard for the SSRF gap found in review of #1998: a
+    /// malicious/compromised upstream Terraform registry must not be able to
+    /// redirect `mirror_download` at an internal address via `download_url`.
+    /// Mirrors `test_build_download_url_rejects_internal_addresses` in
+    /// cargo.rs — one realistic bypass case pins the integration; the full
+    /// bypass matrix lives in `api::validation::tests`.
+    #[test]
+    fn test_resolve_archive_url_rejects_ssrf_targets() {
+        let metadata =
+            serde_json::json!({ "download_url": "http://169.254.169.254/latest/meta-data/" });
+        let archive_url = resolve_archive_url(&metadata).unwrap();
+        let err = validate_outbound_url(archive_url, "Terraform upstream archive URL")
+            .expect_err("cloud metadata download_url must be rejected");
+        assert!(
+            err.to_string().contains("private/internal network")
+                || err.to_string().contains("not allowed"),
+            "expected SSRF rejection reason in error message, got: {err}"
+        );
+
+        let legit = serde_json::json!({
+            "download_url": "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip"
+        });
+        let archive_url = resolve_archive_url(&legit).unwrap();
+        assert!(
+            validate_outbound_url(archive_url, "Terraform upstream archive URL").is_ok(),
+            "legitimate external archive URL should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_mirror_archive_cache_path_strips_signed_url_query_string() {
+        // A signed archive URL (e.g. an S3 presigned link) must not leak its
+        // query-string credentials into the derived cache path / storage
+        // object key.
+        let cache_path = mirror_archive_cache_path(
+            "hashicorp",
+            "null",
+            "3.2.3",
+            "linux",
+            "arm64",
+            "https://provider-bucket.s3.amazonaws.com/terraform-provider-null_3.2.3_linux_arm64.zip\
+             ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE%2F20260630%2Fus-east-1",
+        );
+        assert_eq!(
+            cache_path,
+            "hashicorp/null/3.2.3/linux/arm64/terraform-provider-null_3.2.3_linux_arm64.zip"
+        );
+        assert!(
+            !cache_path.contains("X-Amz"),
+            "cache path must not contain signed-URL query material, got: {cache_path}"
+        );
     }
 
     #[test]
