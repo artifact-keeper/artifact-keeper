@@ -3,6 +3,10 @@
 //! Loads encrypted credentials from `repository_config` and applies them
 //! to outgoing HTTP requests. Supports Basic and Bearer auth types.
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
 use reqwest::RequestBuilder;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -10,6 +14,61 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::services::auth_config_service::encryption_key;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+
+/// How long a "this repo has no upstream auth" result stays cached.
+const UPSTREAM_AUTH_NO_CREDS_TTL: Duration = Duration::from_secs(60);
+
+/// Negative cache of repositories known to have NO upstream auth configured.
+///
+/// `load_upstream_auth` runs on every proxy fetch; the common case (a public
+/// upstream with no credentials) otherwise costs a `repository_config` SELECT
+/// that always returns nothing. Caching that negative result for a short TTL
+/// skips the query on the remote-download hot path. Only the *absence* of auth
+/// is ever cached -- never credentials -- so no secret material lives here.
+/// `save_`/`remove_upstream_auth` invalidate the entry immediately, so the TTL
+/// only bounds staleness for changes made out of process.
+fn no_creds_cache() -> &'static RwLock<HashMap<Uuid, Instant>> {
+    static CACHE: OnceLock<RwLock<HashMap<Uuid, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Return true if `repo_id` was recently confirmed to have no upstream auth.
+fn is_cached_no_upstream_auth(repo_id: Uuid) -> bool {
+    match no_creds_cache().read() {
+        Ok(cache) => cache
+            .get(&repo_id)
+            .is_some_and(|inserted| inserted.elapsed() < UPSTREAM_AUTH_NO_CREDS_TTL),
+        // A poisoned lock degrades to a cache miss (we just run the query).
+        Err(_) => false,
+    }
+}
+
+/// Record that `repo_id` has no upstream auth configured.
+fn cache_no_upstream_auth(repo_id: Uuid) {
+    if let Ok(mut cache) = no_creds_cache().write() {
+        // Evict expired entries while holding the write lock to bound memory.
+        cache.retain(|_, inserted| inserted.elapsed() < UPSTREAM_AUTH_NO_CREDS_TTL);
+        cache.insert(repo_id, Instant::now());
+    }
+}
+
+/// Drop the negative-cache entry for a repo after its upstream auth changes.
+///
+/// Unlike the read/insert helpers (where a poisoned lock can safely degrade to
+/// a cache miss), invalidation MUST still happen — otherwise a stale "no auth"
+/// entry could mask freshly-saved credentials for up to one TTL. So recover
+/// from a poisoned lock and remove anyway, mirroring `permission_service`.
+pub(crate) fn invalidate_upstream_auth_cache(repo_id: Uuid) {
+    match no_creds_cache().write() {
+        Ok(mut cache) => {
+            cache.remove(&repo_id);
+        }
+        Err(poisoned) => {
+            tracing::error!("upstream-auth no-creds cache write lock poisoned, recovering");
+            poisoned.into_inner().remove(&repo_id);
+        }
+    }
+}
 
 /// Auth types supported for upstream repositories.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +80,12 @@ pub enum UpstreamAuthType {
 /// Load upstream auth credentials for a repository.
 /// Returns None if no auth is configured.
 pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<UpstreamAuthType>> {
+    // Fast path: skip the repository_config query for repos recently confirmed
+    // to have no upstream auth (the common public-upstream case on the hot path).
+    if is_cached_no_upstream_auth(repo_id) {
+        return Ok(None);
+    }
+
     // Load auth type
     let auth_type: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'upstream_auth_type'",
@@ -33,7 +98,10 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
 
     let auth_type = match filter_auth_type(auth_type) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            cache_no_upstream_auth(repo_id);
+            return Ok(None);
+        }
     };
 
     // Load and decrypt credentials
@@ -122,6 +190,9 @@ pub async fn save_upstream_auth(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Credentials just changed: drop any stale "no auth" cache entry so the
+    // next load reflects them immediately instead of after the TTL.
+    invalidate_upstream_auth_cache(repo_id);
     Ok(())
 }
 
@@ -136,6 +207,9 @@ pub async fn remove_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<()> {
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Auth was removed: drop any cache entry so the next load re-derives the
+    // (now absent) state rather than serving a stale value.
+    invalidate_upstream_auth_cache(repo_id);
     Ok(())
 }
 
@@ -507,6 +581,73 @@ mod tests {
         let hex = encrypt_credentials_hex(r#"{"token":"secret"}"#, "correct-key");
         let result = decrypt_credentials_hex(&hex, "wrong-key");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative upstream-auth cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_creds_cache_mark_and_invalidate() {
+        let id = Uuid::new_v4();
+        assert!(!is_cached_no_upstream_auth(id));
+        cache_no_upstream_auth(id);
+        assert!(is_cached_no_upstream_auth(id));
+        invalidate_upstream_auth_cache(id);
+        assert!(!is_cached_no_upstream_auth(id));
+    }
+
+    // DATABASE_URL-gated: proves load caches the "no auth" result and that a
+    // subsequent load is served from the cache, and that remove invalidates it.
+    #[tokio::test]
+    async fn test_load_upstream_auth_negative_cache_and_invalidation() {
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "maven").await
+        else {
+            return;
+        };
+        invalidate_upstream_auth_cache(fx.repo_id);
+        // No auth configured: returns None and caches the negative result.
+        assert!(load_upstream_auth(&fx.pool, fx.repo_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(is_cached_no_upstream_auth(fx.repo_id));
+        // A second load is served from the cache (still None).
+        assert!(load_upstream_auth(&fx.pool, fx.repo_id)
+            .await
+            .unwrap()
+            .is_none());
+        // Removing (absent) auth invalidates the cache entry.
+        remove_upstream_auth(&fx.pool, fx.repo_id).await.unwrap();
+        assert!(!is_cached_no_upstream_auth(fx.repo_id));
+        fx.teardown().await;
+    }
+
+    // DATABASE_URL-gated: saving credentials must flush a stale "no auth" entry
+    // immediately. `save_upstream_auth` encrypts via `encryption_key()`, which
+    // requires an encryption secret, so skip when neither is configured.
+    #[tokio::test]
+    async fn test_save_upstream_auth_invalidates_negative_cache() {
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "maven").await
+        else {
+            return;
+        };
+        // Seed the negative cache as if a prior load found no auth.
+        cache_no_upstream_auth(fx.repo_id);
+        assert!(is_cached_no_upstream_auth(fx.repo_id));
+        let creds = build_credentials_json(&UpstreamAuthType::Bearer {
+            token: "tok".into(),
+        });
+        save_upstream_auth(&fx.pool, fx.repo_id, "bearer", &creds)
+            .await
+            .unwrap();
+        assert!(!is_cached_no_upstream_auth(fx.repo_id));
+        fx.teardown().await;
     }
 
     #[test]
