@@ -215,6 +215,7 @@ pub mod artifact_labels;
 pub mod artifacts;
 pub mod auth;
 pub mod builds;
+pub mod cache_headers;
 pub mod cargo;
 pub mod chef;
 pub mod cocoapods;

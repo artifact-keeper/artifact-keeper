@@ -8,6 +8,9 @@
 //!   GET  /maven/{repo_key}/*path — Download artifact, metadata, or checksum
 //!   PUT  /maven/{repo_key}/*path — Upload artifact (mvn deploy)
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -17,10 +20,14 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use moka::future::Cache as MokaCache;
+use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
+use uuid::Uuid;
 
+use crate::api::handlers::cache_headers;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -31,6 +38,41 @@ use crate::models::repository::RepositoryType;
 
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
+
+// ---------------------------------------------------------------------------
+// Maven `maven-metadata.xml` generation cache (#2079)
+// ---------------------------------------------------------------------------
+
+const MAVEN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAVEN_METADATA_CACHE_CAPACITY: u64 = 10_000;
+
+#[derive(Clone)]
+struct MavenMetadataCacheEntry {
+    versions: Vec<String>,
+    last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+type MavenMetadataCacheKey = (Uuid, String, String);
+
+static MAVEN_METADATA_CACHE: Lazy<MokaCache<MavenMetadataCacheKey, Arc<MavenMetadataCacheEntry>>> =
+    Lazy::new(|| {
+        MokaCache::builder()
+            .max_capacity(MAVEN_METADATA_CACHE_CAPACITY)
+            .time_to_live(MAVEN_METADATA_CACHE_TTL)
+            .build()
+    });
+
+/// Invalidate the cached `maven-metadata.xml` for one `(repo, group, artifact)`
+/// tuple. Called whenever the version set for a GAV changes — i.e. on artifact
+/// upload and delete — so a GET within the 60s TTL window immediately reflects
+/// the new version list (and emits a fresh ETag) instead of serving a stale
+/// aggregate. The TTL only bounds staleness for changes we don't observe
+/// directly (e.g. bulk lifecycle sweeps).
+pub async fn invalidate_maven_metadata_cache(repo_id: Uuid, group_id: &str, artifact_id: &str) {
+    MAVEN_METADATA_CACHE
+        .invalidate(&(repo_id, group_id.to_string(), artifact_id.to_string()))
+        .await;
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -780,6 +822,7 @@ async fn download(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
     let storage = state
@@ -809,12 +852,11 @@ async fn download(
     if MavenHandler::is_metadata(&path) {
         let content =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/xml")
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap());
+        return Ok(cache_headers::cacheable_response(
+            content.to_vec(),
+            "text/xml",
+            &headers,
+        ));
     }
 
     // 3. Check if this is a checksum request for a stored file
@@ -1022,12 +1064,16 @@ async fn fetch_maven_metadata_bytes(
                 let latest = sorted.last().unwrap().clone();
                 let release = maven_version::latest_release(&sorted).cloned();
 
+                // No single `MAX(updated_at)` across heterogeneous members;
+                // wall clock is the best we can do for the virtual aggregate.
+                let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
                 let xml = generate_metadata_xml(
                     &group_id,
                     &artifact_id,
                     &sorted,
                     &latest,
                     release.as_deref(),
+                    &last_updated,
                 );
 
                 return Ok(Bytes::from(xml));
@@ -1166,9 +1212,60 @@ async fn generate_metadata_for_artifact(
     group_id: &str,
     artifact_id: &str,
 ) -> Result<String, Response> {
-    let rows = sqlx::query!(
+    let entry = MAVEN_METADATA_CACHE
+        .try_get_with(
+            (repo_id, group_id.to_string(), artifact_id.to_string()),
+            load_maven_metadata_entry(db, repo_id, group_id, artifact_id),
+        )
+        .await
+        .map_err(|err: Arc<String>| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", err),
+            )
+                .into_response()
+        })?;
+
+    if entry.versions.is_empty() {
+        return Err(AppError::NotFound("No versions found".to_string()).into_response());
+    }
+
+    use crate::formats::maven_version;
+
+    let versions = entry.versions.clone();
+    let sorted = maven_version::sort_maven_versions(&versions);
+    let latest = sorted.last().unwrap().clone();
+    let release = maven_version::latest_release(&sorted).cloned();
+    let last_updated = entry
+        .last_updated_at
+        .map(|dt| dt.format("%Y%m%d%H%M%S").to_string())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
+
+    Ok(generate_metadata_xml(
+        group_id,
+        artifact_id,
+        &sorted,
+        &latest,
+        release.as_deref(),
+        &last_updated,
+    ))
+}
+
+/// Load `(versions, max(updated_at))` for one GAV. Two queries — both served
+/// by `idx_artifact_metadata_maven_gav` (#2079) — so a Hosted repo's
+/// `maven-metadata.xml` response stabilizes `<lastUpdated>` across requests
+/// instead of always reporting `Utc::now()` like the previous handler did.
+async fn load_maven_metadata_entry(
+    db: &PgPool,
+    repo_id: Uuid,
+    group_id: &str,
+    artifact_id: &str,
+) -> Result<Arc<MavenMetadataCacheEntry>, String> {
+    use sqlx::Row;
+
+    let versions: Vec<String> = sqlx::query(
         r#"
-        SELECT DISTINCT a.version as "version?"
+        SELECT DISTINCT a.version
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -1178,29 +1275,44 @@ async fn generate_metadata_for_artifact(
           AND am.metadata->>'artifactId' = $3
           AND a.version IS NOT NULL
         "#,
-        repo_id,
-        group_id,
-        artifact_id,
     )
+    .bind(repo_id)
+    .bind(group_id)
+    .bind(artifact_id)
     .fetch_all(db)
     .await
-    .map_err(map_db_err)?;
+    .map_err(|e| format!("db error: {}", e))?
+    .into_iter()
+    .filter_map(|row| row.try_get::<Option<String>, _>("version").ok().flatten())
+    .collect();
 
-    let versions: Vec<String> = rows.into_iter().filter_map(|r| r.version).collect();
+    let last_updated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query(
+        r#"
+        SELECT MAX(a.updated_at)
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'maven'
+          AND am.metadata->>'groupId' = $2
+          AND am.metadata->>'artifactId' = $3
+          AND a.version IS NOT NULL
+        "#,
+    )
+    .bind(repo_id)
+    .bind(group_id)
+    .bind(artifact_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| format!("db error: {}", e))?
+    .try_get("max")
+    .ok()
+    .flatten();
 
-    if versions.is_empty() {
-        return Err(AppError::NotFound("No versions found".to_string()).into_response());
-    }
-
-    use crate::formats::maven_version;
-
-    let sorted = maven_version::sort_maven_versions(&versions);
-    let latest = sorted.last().unwrap().clone();
-    let release = maven_version::latest_release(&sorted).cloned();
-
-    let xml = generate_metadata_xml(group_id, artifact_id, &sorted, &latest, release.as_deref());
-
-    Ok(xml)
+    Ok(Arc::new(MavenMetadataCacheEntry {
+        versions,
+        last_updated_at,
+    }))
 }
 
 async fn serve_artifact(
@@ -1939,6 +2051,12 @@ async fn upload(
     )
     .execute(&state.db)
     .await;
+
+    // The version set for this GAV just changed; drop any cached
+    // maven-metadata.xml so the next GET (even within the TTL window) rebuilds
+    // the aggregate and emits a fresh ETag instead of serving a stale list
+    // that omits the version just published.
+    invalidate_maven_metadata_cache(repo.id, &coords.group_id, &coords.artifact_id).await;
 
     info!(
         "Maven upload: {}:{}:{} ({}) to repo {}",
@@ -3043,6 +3161,112 @@ mod tests {
         assert_eq!(metadata["artifactId"], "demo-lib");
     }
 
+    /// Publishing a new Maven version must immediately invalidate the cached
+    /// `maven-metadata.xml` for that GAV: a GET inside the 60s TTL window must
+    /// return the NEW version set (not a stale list) and a NEW ETag. A
+    /// conditional GET (`If-None-Match`) must return `304` while the metadata is
+    /// unchanged, and stop matching once the version set changes. Regression
+    /// guard for the previously unwired invalidation hook (#2079).
+    #[tokio::test]
+    async fn test_maven_metadata_cache_invalidated_on_publish_2079() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+        use axum::http::header::{ETAG, IF_NONE_MATCH};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+
+        let ga = "com/example/cacheinval/widget";
+        let meta_path = format!("/{}/{}/maven-metadata.xml", fx.repo_key, ga);
+
+        let publish = |ver: &str| {
+            let path = format!("/{}/{}/{ver}/widget-{ver}.jar", fx.repo_key, ga);
+            (path, bytes::Bytes::from(format!("jar-bytes-{ver}")))
+        };
+        let etag_of = |resp: &Response| {
+            resp.headers()
+                .get(ETAG)
+                .expect("ETag header present")
+                .to_str()
+                .expect("ETag is ascii")
+                .to_string()
+        };
+        let cond_get = |etag: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(meta_path.clone())
+                .header(IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .expect("build conditional GET")
+        };
+
+        // Publish 1.0.0.
+        let (p1, b1) = publish("1.0.0");
+        let (s1, _) = tdh::send(router.clone(), tdh::put(p1, b1)).await;
+        assert_eq!(s1, StatusCode::CREATED);
+
+        // First metadata GET: 200, lists 1.0.0 only, and yields an ETag.
+        let resp = router
+            .clone()
+            .oneshot(tdh::get(meta_path.clone()))
+            .await
+            .expect("metadata GET");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag1 = etag_of(&resp);
+        let body1 = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body1 = String::from_utf8_lossy(&body1);
+        assert!(body1.contains("<version>1.0.0</version>"), "body={body1}");
+        assert!(!body1.contains("2.0.0"), "unexpected 2.0.0; body={body1}");
+
+        // Conditional GET with the matching ETag -> 304 (cache is serving).
+        let resp = router
+            .clone()
+            .oneshot(cond_get(&etag1))
+            .await
+            .expect("conditional GET");
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        // Publish 2.0.0 within the 60s TTL window. Invalidation (not TTL expiry)
+        // must be what makes the new version visible.
+        let (p2, b2) = publish("2.0.0");
+        let (s2, _) = tdh::send(router.clone(), tdh::put(p2, b2)).await;
+        assert_eq!(s2, StatusCode::CREATED);
+
+        // Metadata GET now reflects 2.0.0 immediately with a NEW ETag.
+        let resp = router
+            .clone()
+            .oneshot(tdh::get(meta_path.clone()))
+            .await
+            .expect("metadata GET after publish");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag2 = etag_of(&resp);
+        let body2 = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body2 = String::from_utf8_lossy(&body2);
+        assert!(body2.contains("<version>1.0.0</version>"), "body={body2}");
+        assert!(
+            body2.contains("<version>2.0.0</version>"),
+            "stale metadata after publish (invalidation not wired); body={body2}"
+        );
+        assert_ne!(
+            etag1, etag2,
+            "ETag must change once the version set changes"
+        );
+
+        // The stale ETag must no longer produce a 304.
+        let resp = router
+            .clone()
+            .oneshot(cond_get(&etag1))
+            .await
+            .expect("stale conditional GET");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        fx.teardown().await;
+    }
+
     /// Maven uploads must keep a physical artifact row for every uploaded
     /// asset path. The package catalog groups them into one package, but the
     /// `artifacts` table is the canonical ledger used by exact-path APIs,
@@ -3660,6 +3884,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), meta_path.to_string())),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("metadata download must succeed");
@@ -3676,6 +3901,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), format!("{}.{}", meta_path, ext))),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("checksum download must succeed");
@@ -3868,6 +4094,7 @@ mod tests {
             &["1.0.0".to_string(), "1.1.0".to_string()],
             "1.1.0",
             Some("1.1.0"),
+            "20240101000000",
         );
 
         let mock = MockServer::start().await;
@@ -4004,6 +4231,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth)),
             Path((virtual_key.clone(), pom_path.to_string())),
+            HeaderMap::new(),
         )
         .await;
 

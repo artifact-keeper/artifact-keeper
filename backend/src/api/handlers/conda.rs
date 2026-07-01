@@ -31,7 +31,6 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
-    IF_NONE_MATCH,
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -42,6 +41,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
+use crate::api::handlers::cache_headers::{check_conditional_request, compute_etag};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -383,36 +383,9 @@ const KNOWN_SUBDIRS: &[&str] = &[
     "win-arm64",
 ];
 
-// ---------------------------------------------------------------------------
-// HTTP Caching helpers
-// ---------------------------------------------------------------------------
-
-/// Compute an ETag from response body bytes using the full SHA-256 hash.
-fn compute_etag(body: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(body);
-    let hash = format!("{:x}", hasher.finalize());
-    format!("\"{}\"", hash)
-}
-
-/// Check if the request has a matching ETag (If-None-Match) and return 304 if so.
-/// Returns Some(304 response) if the client's cached version matches, None otherwise.
-fn check_conditional_request(headers: &HeaderMap, etag: &str) -> Option<Response> {
-    if let Some(if_none_match) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
-        // Handle comma-separated ETags and wildcard
-        if if_none_match == "*" || if_none_match.split(',').any(|t| t.trim() == etag) {
-            return Some(
-                Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(ETAG, etag)
-                    .header(CACHE_CONTROL, "public, max-age=60")
-                    .body(Body::empty())
-                    .unwrap(),
-            );
-        }
-    }
-    None
-}
+// HTTP caching helpers (compute_etag, check_conditional_request, etc.) now
+// live in `crate::api::handlers::cache_headers` and are shared with the Maven
+// handler (#2079). This file keeps Conda's gzip-aware wrapper.
 
 /// Check if the client accepts gzip encoding.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
@@ -434,16 +407,17 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
 
 /// Build a cacheable response with ETag and Cache-Control headers.
 fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) -> Response {
+    use crate::api::handlers::cache_headers;
+
     let etag = compute_etag(&body);
 
-    // Check for conditional request first
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
         return not_modified;
     }
 
-    // Serve gzip-compressed response if the client accepts it and the content
-    // type is JSON (repodata, channeldata, etc.). This helps clients that
-    // don't support zstd or bz2.
+    // Conda-specific: serve gzip-compressed JSON responses when the client
+    // advertises gzip (Conda clients commonly don't support zstd/bz2 for
+    // repodata, so gzip is a useful middle ground).
     if content_type == "application/json" && accepts_gzip(headers) {
         let compressed = gzip_compress(&body);
         return Response::builder()
@@ -452,7 +426,7 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
             .header(CONTENT_ENCODING, "gzip")
             .header(CONTENT_LENGTH, compressed.len().to_string())
             .header(ETAG, &etag)
-            .header(CACHE_CONTROL, "public, max-age=60")
+            .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
             .header("Vary", "Accept-Encoding")
             .body(Body::from(compressed))
             .unwrap();
@@ -463,7 +437,7 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.len().to_string())
         .header(ETAG, &etag)
-        .header(CACHE_CONTROL, "public, max-age=60")
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
         .body(Body::from(body))
         .unwrap()
 }
@@ -3329,6 +3303,7 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::IF_NONE_MATCH;
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)
