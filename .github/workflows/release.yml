@@ -213,9 +213,11 @@ jobs:
             "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:${VERSION}"
             "docker.io|artifactkeeper/backend:${VERSION}"
             "docker.io|artifactkeeper/openscap:${VERSION}"
             "docker.io|artifactkeeper/web:${VERSION}"
+            "docker.io|artifactkeeper/scanner-adapter:${VERSION}"
           )
 
           # Common Accept headers cover OCI index, Docker manifest list,
