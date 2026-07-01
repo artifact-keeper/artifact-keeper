@@ -105,7 +105,7 @@ services:
       retries: 30
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "redteam", "tag-replication", "curation", "cache-correctness"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "proxy", "docker-proxy", "terraform-mirror", "redteam", "tag-replication", "curation", "cache-correctness"]
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
@@ -395,6 +395,36 @@ services:
     networks:
       - e2e-test-network
     profiles: ["hex", "all"]
+
+  # ==========================================================================
+  # TERRAFORM / OPENTOFU NETWORK MIRROR TESTS
+  # ==========================================================================
+
+  terraform-mirror-test:
+    image: hashicorp/terraform:1.13.0
+    container_name: e2e-test-terraform-mirror
+    depends_on:
+      setup:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      ADMIN_PASS: TestRunner!2026secure
+      TF_UPSTREAM_URL: https://registry.terraform.io
+      TF_HOSTNAME: registry.terraform.io
+      TF_NAMESPACE: hashicorp
+      TF_TYPE: null
+      TF_VERSION: 3.2.3
+      TF_OS: linux
+      TF_ARCH: amd64
+      RUN_TERRAFORM_CLI: "1"
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["apk add --no-cache bash curl jq coreutils >/dev/null 2>&1 && bash /scripts/test-terraform-mirror.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["terraform-mirror"]
 
   # ==========================================================================
   # PROXY + VIRTUAL REPOSITORY TESTS
