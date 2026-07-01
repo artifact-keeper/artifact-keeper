@@ -10,11 +10,74 @@
 //! 2. Global env vars `QUARANTINE_ENABLED` / `QUARANTINE_DURATION_MINUTES`
 //! 3. Hardcoded defaults (disabled, 60 minutes)
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::Instant;
+
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+
+// NOTE: `std::time::Duration` is referenced fully-qualified below to avoid
+// clashing with `chrono::Duration` imported above.
+
+/// How long a repo's quarantine override lookup stays cached.
+const QUARANTINE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `repository_config` quarantine override tuple: `(enabled, duration)`.
+type RepoQuarantineSettings = (Option<bool>, Option<i64>);
+
+/// Per-repo cache of the `repository_config` quarantine override lookup.
+///
+/// `resolve_config` runs on every proxy fetch and upload; the per-repo
+/// `repository_config` SELECT it makes returns nothing for the common case (no
+/// override). Caching the resolved tuple for a short TTL skips that query on
+/// the hot path. `invalidate_config_cache` (called by the settings-update
+/// handler) makes changes take effect immediately; the TTL only bounds
+/// staleness for edits made out of process.
+fn config_cache() -> &'static RwLock<HashMap<Uuid, (Instant, RepoQuarantineSettings)>> {
+    static CACHE: OnceLock<RwLock<HashMap<Uuid, (Instant, RepoQuarantineSettings)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Return a repo's cached override tuple if the entry is still fresh.
+fn cached_repo_settings(repository_id: Uuid) -> Option<RepoQuarantineSettings> {
+    let cache = config_cache().read().ok()?;
+    let (inserted, settings) = cache.get(&repository_id)?;
+    (inserted.elapsed() < QUARANTINE_CONFIG_TTL).then_some(*settings)
+}
+
+/// Record a repo's override tuple, evicting expired entries to bound memory.
+/// Recovers from a poisoned lock (mirroring `permission_service`) so a poisoned
+/// write cannot silently turn the cache into a permanent no-op.
+fn store_repo_settings(repository_id: Uuid, settings: RepoQuarantineSettings) {
+    let mut cache = match config_cache().write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("quarantine config cache write lock poisoned, recovering to store");
+            poisoned.into_inner()
+        }
+    };
+    cache.retain(|_, (inserted, _)| inserted.elapsed() < QUARANTINE_CONFIG_TTL);
+    cache.insert(repository_id, (Instant::now(), settings));
+}
+
+/// Drop a repo's cached quarantine settings after they change. Recovers from a
+/// poisoned lock so a stale entry can never outlive a settings update.
+pub fn invalidate_config_cache(repository_id: Uuid) {
+    match config_cache().write() {
+        Ok(mut cache) => {
+            cache.remove(&repository_id);
+        }
+        Err(poisoned) => {
+            tracing::error!("quarantine config cache write lock poisoned, recovering");
+            poisoned.into_inner().remove(&repository_id);
+        }
+    }
+}
 
 /// Default quarantine duration in minutes when not configured.
 const DEFAULT_DURATION_MINUTES: i64 = 60;
@@ -183,8 +246,16 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_DURATION_MINUTES);
 
-    // Per-repo overrides from repository_config take precedence.
-    let (enabled, duration) = repo_settings(db, repository_id).await;
+    // Per-repo overrides from repository_config take precedence. Cached for a
+    // short TTL (invalidated on write) so this stays off the DB on the hot path.
+    let (enabled, duration) = match cached_repo_settings(repository_id) {
+        Some(cached) => cached,
+        None => {
+            let settings = repo_settings(db, repository_id).await;
+            store_repo_settings(repository_id, settings);
+            settings
+        }
+    };
 
     QuarantineConfig {
         enabled: enabled.unwrap_or(global_enabled),
@@ -592,5 +663,52 @@ mod tests {
             crate::error::AppError::Conflict(_) => {}
             other => panic!("Expected Conflict error, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_config cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_cache_store_and_invalidate() {
+        let id = Uuid::new_v4();
+        assert!(cached_repo_settings(id).is_none());
+        store_repo_settings(id, (Some(true), Some(15)));
+        assert_eq!(cached_repo_settings(id), Some((Some(true), Some(15))));
+        invalidate_config_cache(id);
+        assert!(cached_repo_settings(id).is_none());
+    }
+
+    // DATABASE_URL-gated: covers resolve_config's cache-miss (query + populate)
+    // and cache-hit paths, plus invalidation. The fixture repo has no override
+    // in the DB, so a cached duration of 15 can only come from the cache.
+    #[tokio::test]
+    async fn test_resolve_config_uses_cache_and_invalidation() {
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "maven").await
+        else {
+            return;
+        };
+        // Start empty: the first call is a cache miss that queries the DB and
+        // populates the cache.
+        invalidate_config_cache(fx.repo_id);
+        let _ = resolve_config(&fx.pool, fx.repo_id).await;
+        assert!(
+            cached_repo_settings(fx.repo_id).is_some(),
+            "a cache miss must populate the cache"
+        );
+        // Seed a sentinel override; resolve_config must serve it from the cache
+        // rather than the DB (which has no override for this repo).
+        store_repo_settings(fx.repo_id, (Some(true), Some(15)));
+        let cfg = resolve_config(&fx.pool, fx.repo_id).await;
+        assert!(cfg.enabled, "cached override should be read");
+        assert_eq!(cfg.duration_minutes, 15, "cached duration should be served");
+        // Invalidation drops the entry (env-independent assertion).
+        invalidate_config_cache(fx.repo_id);
+        assert!(
+            cached_repo_settings(fx.repo_id).is_none(),
+            "invalidation must drop the cache entry"
+        );
+        fx.teardown().await;
     }
 }

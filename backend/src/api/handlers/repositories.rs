@@ -1631,6 +1631,12 @@ pub async fn update_repository(
         .await?;
     }
 
+    // Any quarantine change must flush the resolve_config cache so it takes
+    // effect immediately rather than after the short TTL.
+    if payload.quarantine_enabled.is_some() || payload.quarantine_duration_minutes.is_some() {
+        crate::services::quarantine_service::invalidate_config_cache(repo.id);
+    }
+
     // Handle release repository linking for staging repos
     if let Some(ref release_key) = payload.release_repository_key {
         if release_key.is_empty() {
