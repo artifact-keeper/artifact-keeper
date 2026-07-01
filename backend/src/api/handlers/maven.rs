@@ -1210,8 +1210,21 @@ async fn serve_artifact(
     path: &str,
     auth: Option<&AuthExtension>,
 ) -> Result<Response, Response> {
-    let artifact = sqlx::query!(
-        r#"
+    // Remote (proxy) repos never persist rows in the `artifacts` table: the
+    // proxy cache writes to the package catalog + filesystem only (guarded by
+    // `test_cache_artifact_does_not_insert_into_artifacts_table`, #1278). So the
+    // exact-path lookup and SNAPSHOT resolution below always miss for them.
+    // Skip those 1-2 DB acquires and fall straight through to the upstream
+    // proxy fetch, cutting the per-request DB pressure on the remote
+    // artifact-GET hot path. Hosted/Virtual repos are unaffected.
+    let artifact = if repo.repo_type == RepositoryType::Remote {
+        None
+    } else {
+        // NOTE: the SQL string keeps its original 8-space indentation (not the
+        // block's) so the compile-time-checked query text matches the committed
+        // .sqlx offline cache key byte-for-byte.
+        let artifact = sqlx::query!(
+            r#"
         SELECT id, path, size_bytes, checksum_sha256,
                checksum_md5, checksum_sha1,
                content_type, storage_key
@@ -1221,38 +1234,39 @@ async fn serve_artifact(
           AND path = $2
         LIMIT 1
         "#,
-        repo.id,
-        path,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(map_db_err)?;
+            repo.id,
+            path,
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(map_db_err)?;
 
-    // If artifact not found by exact path, try SNAPSHOT resolution
-    let artifact = match artifact {
-        Some(a) => Some(a),
-        None if path.contains("-SNAPSHOT") => {
-            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
-                let storage = state
-                    .storage_for_repo(&repo.storage_location())
-                    .map_err(|e| e.into_response())?;
-                let content = storage
-                    .get(&resolved.storage_key)
-                    .await
-                    .map_err(map_storage_err)?;
+        // If artifact not found by exact path, try SNAPSHOT resolution
+        match artifact {
+            Some(a) => Some(a),
+            None if path.contains("-SNAPSHOT") => {
+                if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
+                    let storage = state
+                        .storage_for_repo(&repo.storage_location())
+                        .map_err(|e| e.into_response())?;
+                    let content = storage
+                        .get(&resolved.storage_key)
+                        .await
+                        .map_err(map_storage_err)?;
 
-                let ct = content_type_for_path(path);
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header("X-Checksum-SHA256", &resolved.checksum_sha256)
-                    .body(Body::from(content))
-                    .unwrap());
+                    let ct = content_type_for_path(path);
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .header("X-Checksum-SHA256", &resolved.checksum_sha256)
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+                None
             }
-            None
+            None => None,
         }
-        None => None,
     };
 
     // If artifact not found locally, try proxy for remote repos
@@ -4016,5 +4030,78 @@ mod tests {
             pom_body.as_bytes(),
             "virtual must return the upstream POM bytes (#1562)"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_skip_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Remote (proxy) repos never persist rows in `artifacts` (the proxy cache
+    // writes to the package catalog + filesystem only, #1278), so serve_artifact
+    // must skip the artifacts-table lookup for them. Proof: seed an `artifacts`
+    // row for a REMOTE repo, then GET it with no proxy service configured. The
+    // pre-fix code consulted the table and served the seeded row (200); the fix
+    // skips the lookup and falls through to a not-found (non-200).
+    #[tokio::test]
+    async fn test_serve_artifact_remote_skips_artifacts_lookup() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let repo = fx.repo_info("remote", Some("https://upstream.example.test"));
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "pr2-remote-skip",
+            path,
+            "lib",
+            "1.0",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"seeded"),
+            fx.user_id,
+        )
+        .await;
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "Remote repo must not serve rows from the artifacts table; the lookup should be skipped"
+        );
+        fx.teardown().await;
+    }
+
+    // Hosted repos still resolve the `-SNAPSHOT` alias to the timestamped file
+    // Maven actually deploys. Seed the timestamped artifact, request the
+    // `-SNAPSHOT` alias, and assert serve_artifact resolves + streams it. This
+    // exercises the SNAPSHOT-resolution branch that the Remote skip wraps.
+    #[tokio::test]
+    async fn test_serve_artifact_snapshot_alias_resolves_and_serves() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let stored = "com/example/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "pr2-snapshot-key",
+            stored,
+            "lib",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"snap-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let alias = "com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar";
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, alias))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], b"snap-bytes");
+        fx.teardown().await;
     }
 }
