@@ -196,7 +196,7 @@ pub struct SamlConfigResponse {
     pub require_signed_assertions: bool,
     pub admin_group: Option<String>,
     pub is_enabled: bool,
-    /// Opt-in flag (see migration 138): when true, the SAML AuthnRequest
+    /// Opt-in flag (see migration 139): when true, the SAML AuthnRequest
     /// emits an absolute ACS URL. Defaults to false so existing providers
     /// keep their pre-138 wire format.
     pub use_absolute_acs_url: bool,
@@ -305,7 +305,7 @@ pub struct CreateSamlConfigRequest {
     pub require_signed_assertions: Option<bool>,
     pub admin_group: Option<String>,
     pub is_enabled: Option<bool>,
-    /// Opt-in flag (see migration 138): when true, the SAML AuthnRequest
+    /// Opt-in flag (see migration 139): when true, the SAML AuthnRequest
     /// emits an absolute ACS URL for stricter IdPs that reject the
     /// historical relative path. Defaults to false.
     pub use_absolute_acs_url: Option<bool>,
@@ -2975,7 +2975,7 @@ mod tests {
         }
 
         // -------------------------------------------------------------------
-        // SAML use_absolute_acs_url column (migration 138). These pin every
+        // SAML use_absolute_acs_url column (migration 139). These pin every
         // SQL path that touches the new column — defaults on create, explicit
         // create, get / get_decrypted SELECT, update preserve-existing,
         // update explicit flip, list, toggle.
@@ -3023,7 +3023,7 @@ mod tests {
                 .expect("create_saml");
             assert!(
                 !resp.use_absolute_acs_url,
-                "omitted use_absolute_acs_url must default to false (migration 138 invariant)"
+                "omitted use_absolute_acs_url must default to false (migration 139 invariant)"
             );
             cleanup_saml(&pool, resp.id).await;
         }

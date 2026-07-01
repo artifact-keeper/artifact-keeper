@@ -679,7 +679,7 @@ pub async fn saml_login(
     // Create SSO session for CSRF
     let _session = AuthConfigService::create_sso_session(&state.db, "saml", id).await?;
 
-    // Build ACS URL — per-provider opt-in to absolute form (migration 138).
+    // Build ACS URL — per-provider opt-in to absolute form (migration 139).
     // The trusted base MUST come from AK_EXTERNAL_URL, not from request
     // headers; otherwise a spoofed X-Forwarded-Host would let an attacker
     // steer the IdP into POSTing the signed assertion elsewhere.
@@ -2590,7 +2590,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_saml_acs_url (migration 138 — per-provider opt-in to absolute
+    // build_saml_acs_url (migration 139 — per-provider opt-in to absolute
     // ACS URLs for IdPs that reject the historical relative form)
     // -----------------------------------------------------------------------
 

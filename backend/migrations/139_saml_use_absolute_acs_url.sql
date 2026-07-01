@@ -1,0 +1,25 @@
+-- Opt-in flag: when true, the SAML AuthnRequest emits an absolute ACS URL
+-- (scheme://host/api/v1/auth/sso/saml/<id>/acs) instead of the relative
+-- "/api/v1/auth/sso/saml/<id>/acs" path that the codebase has always sent.
+--
+-- Some IdPs (notably stricter SAML 2.0 implementations and certain enterprise
+-- deployments) reject a relative AssertionConsumerServiceURL outright, while
+-- others happily resolve it against the SP host. Toggling the behaviour
+-- per-provider lets operators turn on the absolute form for the IdPs that
+-- require it without changing the wire format for every other provider — the
+-- default stays false so existing SAML configurations keep their exact
+-- pre-139 wire format with no behavioral change on upgrade.
+--
+-- When the flag is true, the absolute URL is built ONLY from the trusted
+-- config source (AK_EXTERNAL_URL env, exposed as
+-- api::extractors::trusted_external_url()), never from request-derived
+-- headers like Host / X-Forwarded-Host. This constraint is a security
+-- requirement: the resulting URL is embedded in the outbound AuthnRequest's
+-- AssertionConsumerServiceURL that the IdP uses to route the signed
+-- assertion, and validated back on the ACS callback; letting an
+-- attacker-controllable request header influence either side would allow
+-- assertion redirection to an attacker origin. If AK_EXTERNAL_URL is unset
+-- while this flag is on, the handler fails closed to the relative form (the
+-- pre-139 baseline) and logs a warning so the misconfiguration is visible.
+ALTER TABLE saml_configs
+    ADD COLUMN IF NOT EXISTS use_absolute_acs_url BOOLEAN NOT NULL DEFAULT false;
