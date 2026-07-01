@@ -831,6 +831,7 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            scan_token_ttl_seconds: 300,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -934,6 +935,7 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            scan_token_ttl_seconds: 300,
         }
     }
 

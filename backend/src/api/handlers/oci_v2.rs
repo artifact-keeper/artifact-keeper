@@ -416,6 +416,28 @@ fn oci_denied_repo_access() -> Response {
     )
 }
 
+/// Per-repository read gate for scanner-scoped pull tokens (#2093).
+///
+/// A token minted by [`crate::services::auth_service::AuthService::generate_scan_token`]
+/// carries a `scan_pull_repo` claim pinning it to exactly one repository key.
+/// On the OCI blob/manifest *read* handlers, reject any pull whose target
+/// repository key differs — a scan token issued for `repoA` must not be usable
+/// to pull `repoB`, even though the scanner account is otherwise a valid
+/// identity. Normal tokens (login / refresh / API-token exchange) have no
+/// `scan_pull_repo` claim, so this is a no-op for them: it only ever *narrows*.
+///
+/// Pure decision fn (no I/O) so it is directly unit-testable.
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn enforce_scan_pull_scope(
+    claims: &crate::services::auth_service::Claims,
+    repo_key: &str,
+) -> Result<(), Response> {
+    match &claims.scan_pull_repo {
+        Some(scoped) if scoped != repo_key => Err(oci_denied_repo_access()),
+        _ => Ok(()),
+    }
+}
+
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
 ///
 /// The REST artifact path enforces a private-repository members-only gate
@@ -3286,21 +3308,45 @@ async fn token(
                     }
                 };
 
-                let tokens = match auth_service.generate_tokens(&user) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return oci_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "INTERNAL_ERROR",
-                            "token generation failed",
-                        )
-                    }
-                };
+                // Preserve a scanner-scoped pull claim across the exchange
+                // (#2093). grype presents its scoped JWT here to obtain a
+                // registry access token; re-minting a full token would drop
+                // `scan_pull_repo` and re-widen the token to pull-all. Re-issue
+                // a single-repo scan token instead. This only ever *narrows*:
+                // a normal exchange (no incoming claim) is unaffected.
+                let (access_token, expires_in) =
+                    if let Some(repo_key) = claims.scan_pull_repo.as_deref() {
+                        match auth_service.generate_scan_token(
+                            &user,
+                            repo_key,
+                            state.config.scan_token_ttl_seconds as i64,
+                        ) {
+                            Ok(t) => (t, state.config.scan_token_ttl_seconds),
+                            Err(_) => {
+                                return oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    "token generation failed",
+                                )
+                            }
+                        }
+                    } else {
+                        match auth_service.generate_tokens(&user) {
+                            Ok(t) => (t.access_token, t.expires_in),
+                            Err(_) => {
+                                return oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    "token generation failed",
+                                )
+                            }
+                        }
+                    };
 
                 let resp = TokenResponse {
-                    token: tokens.access_token.clone(),
-                    access_token: tokens.access_token,
-                    expires_in: tokens.expires_in,
+                    token: access_token.clone(),
+                    access_token,
+                    expires_in,
                     issued_at: chrono::Utc::now().to_rfc3339(),
                 };
 
@@ -3538,13 +3584,16 @@ async fn handle_head_blob(
 ) -> Response {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon
-        && authenticate_oci(&state.db, &state.config, headers)
-            .await
-            .is_err()
-    {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
+    // Bind the authenticated claims (don't discard) so scanner-scoped pull
+    // tokens can be enforced per-repository below (#2093).
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        }
+    };
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -3554,6 +3603,14 @@ async fn handle_head_blob(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(base_url, Some(&scope));
+    }
+
+    // A scanner-scoped pull token is pinned to a single repository key; reject
+    // a read of any other repo (#2093). No-op for normal tokens.
+    if let Some(claims) = &claims {
+        if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
     }
 
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
@@ -3678,13 +3735,16 @@ async fn handle_get_blob(
 ) -> Response {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon
-        && authenticate_oci(&state.db, &state.config, headers)
-            .await
-            .is_err()
-    {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
+    // Bind the authenticated claims (don't discard) so scanner-scoped pull
+    // tokens can be enforced per-repository below (#2093).
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        }
+    };
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -3694,6 +3754,14 @@ async fn handle_get_blob(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(base_url, Some(&scope));
+    }
+
+    // A scanner-scoped pull token is pinned to a single repository key; reject
+    // a read of any other repo (#2093). No-op for normal tokens.
+    if let Some(claims) = &claims {
+        if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
     }
 
     // Look up by the canonical digest so an upper-case pull still resolves a
@@ -5715,13 +5783,16 @@ async fn handle_head_manifest(
 ) -> Response {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon
-        && authenticate_oci(&state.db, &state.config, headers)
-            .await
-            .is_err()
-    {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
+    // Bind the authenticated claims (don't discard) so scanner-scoped pull
+    // tokens can be enforced per-repository below (#2093).
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        }
+    };
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -5731,6 +5802,14 @@ async fn handle_head_manifest(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(base_url, Some(&scope));
+    }
+
+    // A scanner-scoped pull token is pinned to a single repository key; reject
+    // a read of any other repo (#2093). No-op for normal tokens.
+    if let Some(claims) = &claims {
+        if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -5855,13 +5934,16 @@ async fn handle_get_manifest(
 ) -> Response {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon
-        && authenticate_oci(&state.db, &state.config, headers)
-            .await
-            .is_err()
-    {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
+    // Bind the authenticated claims (don't discard) so scanner-scoped pull
+    // tokens can be enforced per-repository below (#2093).
+    let claims = if is_anon {
+        None
+    } else {
+        match authenticate_oci(&state.db, &state.config, headers).await {
+            Ok(c) => Some(c),
+            Err(()) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
+        }
+    };
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
@@ -5871,6 +5953,14 @@ async fn handle_get_manifest(
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
         return unauthorized_challenge_with_scope(base_url, Some(&scope));
+    }
+
+    // A scanner-scoped pull token is pinned to a single repository key; reject
+    // a read of any other repo (#2093). No-op for normal tokens.
+    if let Some(claims) = &claims {
+        if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
     }
 
     // Resolve locally first: a surviving tag row, or — for a digest this hosted
@@ -7365,6 +7455,49 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    // -----------------------------------------------------------------------
+    // enforce_scan_pull_scope (#2093)
+    // -----------------------------------------------------------------------
+
+    fn claims_with_scan_scope(scope: Option<&str>) -> crate::services::auth_service::Claims {
+        crate::services::auth_service::Claims {
+            sub: uuid::Uuid::new_v4(),
+            username: "_ak_scanner".to_string(),
+            email: "scanner@artifact-keeper.internal".to_string(),
+            is_admin: false,
+            iat: 0,
+            iat_ms: None,
+            exp: i64::MAX,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: scope.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_enforce_scan_pull_scope_allows_matching_repo() {
+        let claims = claims_with_scan_scope(Some("repo-a"));
+        assert!(enforce_scan_pull_scope(&claims, "repo-a").is_ok());
+    }
+
+    #[test]
+    fn test_enforce_scan_pull_scope_denies_other_repo() {
+        let claims = claims_with_scan_scope(Some("repo-a"));
+        let err = enforce_scan_pull_scope(&claims, "repo-b")
+            .expect_err("scoped token must be denied on a different repo");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_enforce_scan_pull_scope_noop_for_normal_token() {
+        // A normal (unscoped) token has no scan_pull_repo claim: the gate is a
+        // no-op and any repo is allowed (existing authz still applies upstream).
+        let claims = claims_with_scan_scope(None);
+        assert!(enforce_scan_pull_scope(&claims, "repo-a").is_ok());
+        assert!(enforce_scan_pull_scope(&claims, "any-other-repo").is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // oci_error

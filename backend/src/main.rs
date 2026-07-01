@@ -547,6 +547,32 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
     let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
+
+    // #2093: token minter + scanner identity for private-repo image pulls.
+    // Load the dedicated `_ak_scanner` service account (migration 138). When it
+    // is present, the image/grype scanners mint short-lived, single-repo-scoped
+    // pull tokens so they can pull private images; when absent (not yet
+    // migrated), pulls fall back to anonymous — public repos only.
+    let scanner_auth = Arc::new(AuthService::new(db_pool.clone(), Arc::new(config.clone())));
+    let scanner_identity = match scanner_auth.load_scanner_identity().await {
+        Ok(Some(u)) => {
+            tracing::info!("Scanner service account loaded; private-repo image scanning enabled");
+            Some(u)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "Scanner service account (_ak_scanner) not found; image scans will pull \
+                 anonymously (public repositories only). Run migrations to enable private-repo \
+                 scanning."
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!("Failed to load scanner service account: {}", e);
+            None
+        }
+    };
+
     let mut scanner_service = ScannerService::new(
         db_pool.clone(),
         advisory_client,
@@ -560,6 +586,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         config.scan_workspace_path.clone(),
         config.openscap_url.clone(),
         config.openscap_profile.clone(),
+        scanner_auth,
+        scanner_identity,
+        config.scan_token_ttl_seconds,
     );
 
     // Initialize Dependency-Track integration (before wrapping scanner in Arc,

@@ -285,6 +285,10 @@ pub struct ImageScanner {
     /// it is an ops follow-up (see PR notes).
     auth: Option<Arc<AuthService>>,
     scan_identity: Option<User>,
+    /// TTL (seconds) for the per-repo scan token minted for each scan request
+    /// (config `scan_token_ttl_seconds`). Only consulted when a minter is
+    /// wired.
+    scan_token_ttl_seconds: i64,
     /// Scanner version reported by the adapter on the most recent successful
     /// scan (e.g. `trivy-0.71.2`). The in-image `trivy --version` probe is
     /// gone (#2059), so this is the only available provenance.
@@ -306,6 +310,7 @@ impl ImageScanner {
                 .unwrap_or_default(),
             auth: None,
             scan_identity: None,
+            scan_token_ttl_seconds: 300,
             last_scanner_version: Mutex::new(None),
         }
     }
@@ -313,11 +318,18 @@ impl ImageScanner {
     /// Attach a token minter so private-repo image pulls carry a short-lived
     /// scoped JWT in `registry.authorization`. The identity is a scanner /
     /// system account; the token is minted per scan via
-    /// `AuthService::generate_tokens` and is NEVER logged.
+    /// `AuthService::generate_scan_token` — pinned to the repository being
+    /// scanned and short-lived (`ttl_seconds`) — and is NEVER logged.
     #[must_use]
-    pub fn with_token_minter(mut self, auth: Arc<AuthService>, identity: User) -> Self {
+    pub fn with_token_minter(
+        mut self,
+        auth: Arc<AuthService>,
+        identity: User,
+        ttl_seconds: i64,
+    ) -> Self {
         self.auth = Some(auth);
         self.scan_identity = Some(identity);
+        self.scan_token_ttl_seconds = ttl_seconds;
         self
     }
 
@@ -339,22 +351,26 @@ impl ImageScanner {
     }
 
     /// Mint the `registry.authorization` value for a scan request, or `None`
-    /// for an anonymous pull. The token is short-lived (the configured access
-    /// token expiry) and scoped to the scan identity. NEVER log the result.
-    fn registry_authorization(&self) -> Option<String> {
+    /// for an anonymous pull. The token is short-lived (`scan_token_ttl_seconds`)
+    /// and scoped to exactly the repository being scanned (`repo_key`, matched
+    /// against the OCI pull handler's `scan_pull_repo` gate), so a leaked scan
+    /// token cannot pull any other repository. NEVER log the result.
+    fn registry_authorization(&self, repo_key: &str) -> Option<String> {
         match (&self.auth, &self.scan_identity) {
-            (Some(auth), Some(user)) => match auth.generate_tokens(user) {
-                Ok(tokens) => Some(format!("Bearer {}", tokens.access_token)),
-                Err(e) => {
-                    // Token minting failure degrades to an anonymous pull
-                    // rather than failing the scan outright: the scan still
-                    // fails-closed downstream if the (now anonymous) pull is
-                    // rejected by the adapter. Do not include the error's
-                    // token material.
-                    warn!("Image scan registry token minting failed: {}", e);
-                    None
+            (Some(auth), Some(user)) => {
+                match auth.generate_scan_token(user, repo_key, self.scan_token_ttl_seconds) {
+                    Ok(token) => Some(format!("Bearer {}", token)),
+                    Err(e) => {
+                        // Token minting failure degrades to an anonymous pull
+                        // rather than failing the scan outright: the scan still
+                        // fails-closed downstream if the (now anonymous) pull is
+                        // rejected by the adapter. Do not include the error's
+                        // token material.
+                        warn!("Image scan registry token minting failed: {}", e);
+                        None
+                    }
                 }
-            },
+            }
             _ => None,
         }
     }
@@ -578,13 +594,17 @@ impl ImageScanner {
         &self,
         artifact: &AdapterScanArtifact,
         mime_type: &str,
+        repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
         // Readiness gate first so a down adapter fails the scan with a clear
         // BadGateway rather than mid-stream.
         self.check_adapter_health().await?;
 
         let registry_url = Self::registry_url();
-        let authorization = self.registry_authorization();
+        // Mint a per-repository scoped pull token only when we know which repo
+        // is being scanned (the repository-aware `scan_target` path). The
+        // legacy keyless `scan` path pulls anonymously as before.
+        let authorization = repo_key.and_then(|k| self.registry_authorization(k));
         let body =
             Self::build_scan_request(&registry_url, authorization.as_deref(), artifact, mime_type);
 
@@ -688,7 +708,8 @@ impl Scanner for ImageScanner {
             }
         };
         let mime = Self::manifest_mime_type(&artifact.content_type);
-        self.run_image_scan(&target, &mime).await
+        // Legacy keyless path: no owning repository key, so pull anonymously.
+        self.run_image_scan(&target, &mime, None).await
     }
 
     /// Repository-aware scan hook used by the orchestrator. Prepends the owning
@@ -717,7 +738,9 @@ impl Scanner for ImageScanner {
             ))
         })?;
         let mime = Self::manifest_mime_type(&target.artifact.content_type);
-        self.run_image_scan(&scan_target, &mime).await
+        // Repository-aware path: mint a pull token scoped to this repository.
+        self.run_image_scan(&scan_target, &mime, Some(target.repository_key))
+            .await
     }
 }
 
@@ -749,6 +772,41 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    use crate::services::scanner_service::test_helpers::{make_scanner_auth, make_scanner_user};
+
+    #[test]
+    fn test_registry_authorization_none_without_minter() {
+        // Default (anonymous) wiring: no token minter -> no Authorization,
+        // preserving the public-only pull behavior.
+        let scanner = ImageScanner::new("http://trivy:8090".to_string());
+        assert!(scanner.registry_authorization("docker-private-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_authorization_mints_repo_scoped_bearer() {
+        let auth = make_scanner_auth();
+        let scanner = ImageScanner::new("http://trivy:8090".to_string()).with_token_minter(
+            auth.clone(),
+            make_scanner_user(),
+            300,
+        );
+
+        let header = scanner
+            .registry_authorization("docker-private-a")
+            .expect("minter wired -> Authorization present");
+        let token = header
+            .strip_prefix("Bearer ")
+            .expect("registry.authorization must be a Bearer credential");
+
+        // The minted token must be pinned to exactly the scanned repository so
+        // the OCI pull gate (enforce_scan_pull_scope) admits this repo only.
+        let claims = auth
+            .validate_access_token(token)
+            .expect("minted scan token must validate");
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("docker-private-a"));
+        assert!(!claims.is_admin);
     }
 
     #[test]

@@ -29,6 +29,8 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::user::User;
+use crate::services::auth_service::AuthService;
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -2636,7 +2638,16 @@ impl ScannerService {
         scan_workspace_path: String,
         openscap_url: Option<String>,
         openscap_profile: String,
+        // #2093: token minter for private-repo image pulls. `auth` mints the
+        // per-repo scoped scan tokens; `scan_identity` is the loaded
+        // `_ak_scanner` service account (None when it is not seeded yet, in
+        // which case image pulls fall back to anonymous — public repos only);
+        // `scan_token_ttl_seconds` bounds each token's lifetime.
+        auth: Arc<AuthService>,
+        scan_identity: Option<User>,
+        scan_token_ttl_seconds: u64,
     ) -> Self {
+        let scan_token_ttl_seconds = scan_token_ttl_seconds as i64;
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
 
@@ -2649,7 +2660,15 @@ impl ScannerService {
                 "Container image scanner (Harbor adapter) enabled at {}",
                 adapter_url
             );
-            scanners.push(Arc::new(ImageScanner::new(adapter_url)));
+            let mut image_scanner = ImageScanner::new(adapter_url);
+            // Wire the per-repo token minter so the adapter can pull private
+            // images (#2093). Only when the scanner identity is loaded;
+            // otherwise pulls stay anonymous (public repos only).
+            if let Some(identity) = scan_identity.clone() {
+                image_scanner =
+                    image_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
+            }
+            scanners.push(Arc::new(image_scanner));
         }
 
         // Trivy filesystem + incus (rootfs) scanners drive the trivy server
@@ -2671,7 +2690,14 @@ impl ScannerService {
 
         // Grype scanner (CLI-based, degrades gracefully if binary not available)
         info!("Grype scanner enabled");
-        scanners.push(Arc::new(GrypeScanner::new(scan_workspace_path.clone())));
+        let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
+        // Wire the per-repo token minter so grype's registry pull is
+        // authenticated for private images (#2093).
+        if let Some(identity) = scan_identity.clone() {
+            grype_scanner =
+                grype_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
+        }
+        scanners.push(Arc::new(grype_scanner));
 
         // OpenSCAP compliance scanner (optional sidecar)
         if let Some(url) = openscap_url {
@@ -4183,6 +4209,48 @@ pub(crate) mod test_helpers {
             expected_label,
             err_msg
         );
+    }
+
+    /// A non-login scanner service-account `User` fixture (#2093). Shared by the
+    /// image- and grype-scanner token-minter tests so the fixture is defined
+    /// once.
+    pub fn make_scanner_user() -> crate::models::user::User {
+        crate::models::user::User {
+            id: uuid::Uuid::new_v4(),
+            username: "_ak_scanner".to_string(),
+            email: "scanner@artifact-keeper.internal".to_string(),
+            password_hash: None,
+            auth_provider: crate::models::user::AuthProvider::Local,
+            external_id: None,
+            display_name: Some("Image Scanner (system)".to_string()),
+            is_active: true,
+            is_admin: false,
+            is_service_account: true,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: chrono::Utc::now(),
+            last_login_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An `AuthService` whose pool never connects (`connect_lazy`), for
+    /// unit-testing pure token-minting/validation with no DB. MUST be called
+    /// from within a tokio runtime (`#[tokio::test]`).
+    pub fn make_scanner_auth() -> std::sync::Arc<crate::services::auth_service::AuthService> {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        std::sync::Arc::new(crate::services::auth_service::AuthService::new(
+            pool,
+            std::sync::Arc::new(crate::config::Config::test_config()),
+        ))
     }
 }
 
@@ -11830,6 +11898,10 @@ mod tests {
         let scan_result_service = Arc::new(ScanResultService::new(pool.clone()));
         let scan_config_service =
             Arc::new(crate::services::scan_config_service::ScanConfigService::new(pool.clone()));
+        let auth = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::test_config()),
+        ));
         Arc::new(ScannerService::new(
             pool,
             advisory_client,
@@ -11843,6 +11915,9 @@ mod tests {
             "/tmp/scan-1469-tests".to_string(),
             None, // openscap_url
             "standard".to_string(),
+            auth,
+            None, // scan_identity: anonymous pulls in tests
+            300,  // scan_token_ttl_seconds
         ))
     }
 

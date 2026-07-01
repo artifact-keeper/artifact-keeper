@@ -22,12 +22,15 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::user::User;
+use crate::services::auth_service::AuthService;
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
@@ -285,6 +288,16 @@ pub struct GrypeScanner {
     /// does not pay an extra subprocess; failed probes expire after 60s so
     /// the field starts populating once the binary becomes available.
     cached_version: VersionCache,
+    /// Optional token minter for private-repo registry pulls (#2093). When
+    /// wired, a registry-mode scan of a known repository injects a short-lived,
+    /// single-repo-scoped JWT into grype's child process via
+    /// `GRYPE_REGISTRY_AUTH_*` so grype can pull internal/private images that
+    /// anonymous pulls 401 on. Absent in the default (anonymous) wiring.
+    auth: Option<Arc<AuthService>>,
+    scan_identity: Option<User>,
+    /// TTL (seconds) for the per-repo scan token (config
+    /// `scan_token_ttl_seconds`). Only consulted when a minter is wired.
+    scan_token_ttl_seconds: i64,
 }
 
 struct LocalOciBlob {
@@ -427,7 +440,71 @@ impl GrypeScanner {
         Self {
             scan_workspace,
             cached_version: VersionCache::new(),
+            auth: None,
+            scan_identity: None,
+            scan_token_ttl_seconds: 300,
         }
+    }
+
+    /// Attach a token minter so registry-mode scans of a known repository pull
+    /// with a short-lived, single-repo-scoped JWT (#2093). The identity is the
+    /// scanner service account; the token is minted per scan via
+    /// `AuthService::generate_scan_token` and injected into grype's child
+    /// process env — NEVER written to a file or logged.
+    #[must_use]
+    pub fn with_token_minter(
+        mut self,
+        auth: Arc<AuthService>,
+        identity: User,
+        ttl_seconds: i64,
+    ) -> Self {
+        self.auth = Some(auth);
+        self.scan_identity = Some(identity);
+        self.scan_token_ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// Assemble the `GRYPE_REGISTRY_AUTH_*` child-process env pairs for a
+    /// registry pull. Pure fn (no minting / no I/O) so it is directly
+    /// unit-testable: given the resolved registry `authority` (host) and an
+    /// optional bearer `token`, it returns the env vars grype's registry
+    /// client consumes. Returns an empty vec when there is no token (anonymous
+    /// pull — the legacy behavior). `GRYPE_REGISTRY_INSECURE_USE_HTTP` is set
+    /// because the in-cluster / dev registry endpoint is plain HTTP.
+    fn grype_registry_auth_env(
+        authority: &str,
+        token: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
+        match token {
+            Some(t) => vec![
+                ("GRYPE_REGISTRY_AUTH_AUTHORITY", authority.to_string()),
+                ("GRYPE_REGISTRY_AUTH_TOKEN", t.to_string()),
+                ("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true".to_string()),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Mint the registry-auth env for a scoped registry pull of `repo_key`, or
+    /// an empty vec for an anonymous pull (no minter wired, or no repo key).
+    /// The minted token is single-repo-scoped and short-lived; NEVER logged.
+    fn registry_auth_env_for_repo(&self, repo_key: Option<&str>) -> Vec<(&'static str, String)> {
+        let token = match (repo_key, &self.auth, &self.scan_identity) {
+            (Some(key), Some(auth), Some(user)) => {
+                match auth.generate_scan_token(user, key, self.scan_token_ttl_seconds) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        // Degrade to an anonymous pull; the scan still
+                        // fails-closed downstream if the (now anonymous) pull
+                        // is rejected. Never include token material in the log.
+                        info!("Grype registry token minting failed: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        Self::grype_registry_auth_env(&resolve_registry_host(), token.as_deref())
     }
 
     /// Build the `<host>/<name><sep><reference>` image ref that Grype's
@@ -519,11 +596,16 @@ impl GrypeScanner {
         &self,
         artifact: &Artifact,
         image_ref: String,
+        repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
         let target = format!("registry:{}", image_ref);
         info!("Grype OCI registry scan target: {}", target);
 
-        let report = match self.run_grype_target(&target).await {
+        // Mint a per-repository scoped pull token when a minter is wired and we
+        // know the owning repo (production `scan_target` path). Legacy keyless
+        // scans pull anonymously (empty env), preserving prior behavior.
+        let auth_env = self.registry_auth_env_for_repo(repo_key);
+        let report = match self.run_grype_target(&target, &auth_env).await {
             Ok(report) => report,
             Err(e) => {
                 return Err(
@@ -568,7 +650,8 @@ impl GrypeScanner {
 
         let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
         info!("Grype OCI local layout scan target: {}", grype_target);
-        let result = match self.run_grype_target(&grype_target).await {
+        // Local OCI layout: no registry pull, so no registry-auth env.
+        let result = match self.run_grype_target(&grype_target, &[]).await {
             Ok(report) => {
                 let findings = Self::convert_findings(&report);
                 let packages = Self::convert_packages(&report);
@@ -806,7 +889,9 @@ impl GrypeScanner {
     /// Run grype against the workspace directory.
     async fn run_grype(&self, workspace: &Path) -> Result<GrypeReport> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
-        self.run_grype_target(&dir_arg).await
+        // Directory (local layout) scans never touch the registry, so no
+        // registry-auth env is needed.
+        self.run_grype_target(&dir_arg, &[]).await
     }
 
     /// Run grype against an arbitrary target string (e.g. `dir:/path`,
@@ -834,7 +919,11 @@ impl GrypeScanner {
     ///    keeps working under deployment configs that wipe inherited env
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
-    async fn run_grype_target(&self, target: &str) -> Result<GrypeReport> {
+    async fn run_grype_target(
+        &self,
+        target: &str,
+        auth_env: &[(&'static str, String)],
+    ) -> Result<GrypeReport> {
         // Issue #1465: detect "grype binary missing from PATH" via the
         // io::ErrorKind of the spawn failure, NOT a substring search on
         // stderr. The previous implementation classified any non-zero exit
@@ -847,11 +936,19 @@ impl GrypeScanner {
         // ref, sending operators down a wild-goose chase patching their
         // Docker image. The kernel already gives us a precise NotFound
         // signal when execve() cannot resolve "grype"; use that.
-        let output = tokio::process::Command::new("grype")
+        let mut command = tokio::process::Command::new("grype");
+        command
             .args([target, "-o", "json"])
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
-            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false")
+            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // Registry-auth env for a scoped private-repo pull (#2093). Applied as
+        // child-process env only — never persisted or logged. Empty for local
+        // (dir-mode) and anonymous registry scans.
+        for (key, value) in auth_env {
+            command.env(key, value);
+        }
+        let output = command
             .output()
             .await
             .map_err(|e| classify_grype_spawn_error(&e))?;
@@ -1199,7 +1296,8 @@ impl Scanner for GrypeScanner {
                             .to_string(),
                     )
                 })?;
-            return self.scan_oci_registry_ref(artifact, image_ref).await;
+            // Legacy keyless path: no owning repository key, anonymous pull.
+            return self.scan_oci_registry_ref(artifact, image_ref, None).await;
         }
 
         let workspace =
@@ -1265,7 +1363,10 @@ impl Scanner for GrypeScanner {
                             .to_string(),
                     )
                 })?;
-            return self.scan_oci_registry_ref(artifact, image_ref).await;
+            // Repository-aware path: mint a pull token scoped to this repo.
+            return self
+                .scan_oci_registry_ref(artifact, image_ref, Some(target.repository_key))
+                .await;
         }
 
         self.scan(artifact, metadata, content).await
@@ -1279,6 +1380,69 @@ mod tests {
 
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         make_test_artifact(name, content_type, &format!("test/{}", name))
+    }
+
+    // ---- #2093: registry-auth env builder --------------------------------
+
+    use crate::services::scanner_service::test_helpers::{make_scanner_auth, make_scanner_user};
+
+    #[test]
+    fn test_grype_registry_auth_env_empty_without_token() {
+        // Anonymous pull: no token -> no GRYPE_REGISTRY_AUTH_* env, so grype
+        // keeps its prior public-only behavior.
+        let env = GrypeScanner::grype_registry_auth_env("host:8080", None);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_grype_registry_auth_env_sets_authority_and_token() {
+        let env = GrypeScanner::grype_registry_auth_env("host:8080", Some("jwt-abc"));
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_AUTH_AUTHORITY").map(String::as_str),
+            Some("host:8080")
+        );
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_AUTH_TOKEN").map(String::as_str),
+            Some("jwt-abc")
+        );
+        // Plain-HTTP dev/in-cluster registry endpoint.
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_INSECURE_USE_HTTP")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_registry_auth_env_for_repo_empty_without_minter() {
+        let scanner = GrypeScanner::new("/tmp/grype-2093-noauth".to_string());
+        assert!(scanner
+            .registry_auth_env_for_repo(Some("docker-private-a"))
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_registry_auth_env_for_repo_mints_scoped_token() {
+        let auth = make_scanner_auth();
+        let scanner = GrypeScanner::new("/tmp/grype-2093-auth".to_string()).with_token_minter(
+            auth.clone(),
+            make_scanner_user(),
+            300,
+        );
+
+        // No repo key -> anonymous even with a minter wired.
+        assert!(scanner.registry_auth_env_for_repo(None).is_empty());
+
+        let env = scanner.registry_auth_env_for_repo(Some("docker-private-a"));
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let token = map
+            .get("GRYPE_REGISTRY_AUTH_TOKEN")
+            .expect("scoped pull must inject a token");
+        let claims = auth
+            .validate_access_token(token)
+            .expect("minted token must validate");
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("docker-private-a"));
     }
 
     /// Canonical config/layer digests reused by the local-OCI-layout tests.

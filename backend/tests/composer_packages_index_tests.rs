@@ -61,6 +61,7 @@ fn test_config(storage_path: &str) -> Config {
         ldap_base_dn: None,
         trivy_url: None,
         trivy_adapter_url: None,
+        scan_token_ttl_seconds: 300,
         openscap_url: None,
         openscap_profile: "standard".into(),
         opensearch_url: None,

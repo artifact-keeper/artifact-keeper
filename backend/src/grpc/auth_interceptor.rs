@@ -151,6 +151,7 @@ mod tests {
             token_type: token_type.to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),
@@ -277,6 +278,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         let token = encode(
             &Header::default(),
@@ -316,6 +318,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),

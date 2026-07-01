@@ -103,6 +103,15 @@ pub struct Claims {
     /// family. Set on refresh tokens only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_id: Option<Uuid>,
+    /// Repository routing key this token is authorized to *pull* from, and
+    /// ONLY that repository (#2093). Present only on scanner-minted tokens
+    /// (see [`AuthService::generate_scan_token`]); enforced by
+    /// `oci_v2::enforce_scan_pull_scope` on the OCI blob/manifest read
+    /// handlers. `None` on every normal (login / refresh / API-token-exchange)
+    /// token, where it is a no-op — normal tokens are unaffected. `Option`
+    /// with a serde default so pre-existing tokens deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_pull_repo: Option<String>,
 }
 
 impl Claims {
@@ -1036,6 +1045,7 @@ impl AuthService {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let refresh_jti = Uuid::new_v4();
@@ -1050,6 +1060,7 @@ impl AuthService {
             token_type: "refresh".to_string(),
             jti: Some(refresh_jti),
             family_id: Some(family_id),
+            scan_pull_repo: None,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -1063,6 +1074,50 @@ impl AuthService {
             refresh_token,
             expires_in: (self.config.jwt_access_token_expiry_minutes * 60) as u64,
         })
+    }
+
+    /// Mint a short-lived, single-repository *pull* token for the scanner
+    /// service account (#2093).
+    ///
+    /// Unlike [`generate_tokens`], this returns a bare access-token string
+    /// carrying a `scan_pull_repo` claim that pins the token to exactly one
+    /// repository routing key. `oci_v2::enforce_scan_pull_scope` rejects any
+    /// blob/manifest read whose repository key does not match, so a leaked
+    /// scan token cannot be used to pull *other* private repositories — it is
+    /// narrower than a normal JWT, never wider.
+    ///
+    /// * `ttl_seconds` is a hard, short expiry (config `scan_token_ttl_seconds`,
+    ///   default 300s) — far below the 30-minute interactive access-token TTL.
+    /// * `is_admin` mirrors the passed identity (the scanner account is a
+    ///   non-admin service account) — an admin claim would bypass the per-repo
+    ///   gate, so this MUST never be forced to `true`.
+    /// * No refresh token is issued and the result is NEVER logged.
+    pub fn generate_scan_token(
+        &self,
+        user: &User,
+        repo_key: &str,
+        ttl_seconds: i64,
+    ) -> Result<String> {
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+        let exp = now + Duration::seconds(ttl_seconds);
+
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            iat: now.timestamp(),
+            iat_ms: Some(now_ms),
+            exp: exp.timestamp(),
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: Some(repo_key.to_string()),
+        };
+
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
     }
 
     /// Persist a refresh-token `jti` so future presentations can detect
@@ -1349,6 +1404,36 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("User not found".to_string()))
+    }
+
+    /// Load the dedicated, non-login scanner service account (`_ak_scanner`,
+    /// migration 138) used to mint per-repository scan pull tokens (#2093).
+    ///
+    /// Returns `Ok(None)` when the account has not been seeded yet (e.g. before
+    /// migrations run), in which case image scans fall back to anonymous pulls
+    /// (public repositories only) rather than failing. The lookup is pinned to
+    /// `is_service_account = true` so it can never resolve a same-named human
+    /// account.
+    pub async fn load_scanner_identity(&self) -> Result<Option<User>> {
+        sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            FROM users
+            WHERE username = '_ak_scanner'
+              AND is_service_account = true
+              AND is_active = true
+            "#
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Revoke every refresh token in every active family for `user_id`. Called
@@ -2386,6 +2471,7 @@ impl AuthService {
             token_type: "totp_pending".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -2834,6 +2920,7 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            scan_token_ttl_seconds: 300,
         })
     }
 
@@ -2868,6 +2955,82 @@ mod tests {
     // need JWT encoding/decoding, we directly use jsonwebtoken's encode/decode
     // with the same keys the AuthService would use.
 
+    /// Build an `AuthService` whose pool never actually connects (`connect_lazy`)
+    /// so pure token-minting/validation methods can be unit-tested with no DB.
+    fn make_lazy_auth_service() -> AuthService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        AuthService::new(pool, make_test_config())
+    }
+
+    #[tokio::test]
+    async fn test_generate_scan_token_is_scoped_short_lived_and_validates() {
+        let auth = make_lazy_auth_service();
+        let user = make_test_user(); // is_admin = false
+        let ttl = 300;
+
+        let token = auth
+            .generate_scan_token(&user, "docker-private-a", ttl)
+            .expect("scan token must mint");
+
+        // Round-trips through the normal access-token validator (#2093 scanner
+        // pull path presents this exact token to the OCI handlers).
+        let claims = auth
+            .validate_access_token(&token)
+            .expect("scan token must validate as an access token");
+
+        assert_eq!(claims.token_type, "access");
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("docker-private-a"));
+        // Must NOT be admin — an admin claim would bypass the per-repo gate.
+        assert!(!claims.is_admin, "scan token must not carry admin");
+        assert_eq!(claims.sub, user.id);
+
+        // Expiry is bounded by the short scan TTL, far under the 30-minute
+        // interactive access-token expiry.
+        let lifetime = claims.exp - claims.iat;
+        assert!(
+            lifetime <= ttl && lifetime >= ttl - 5,
+            "scan token lifetime {}s must be ~{}s (well under 30min)",
+            lifetime,
+            ttl
+        );
+        assert!(
+            lifetime < 30 * 60,
+            "scan token must be much shorter than the interactive TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_scan_token_preserves_identity_admin_flag() {
+        // A scan token minted for an admin identity keeps is_admin=true (the
+        // helper never forces false); the scanner account is seeded non-admin,
+        // so in production the gate is real. This guards the identity mapping.
+        let auth = make_lazy_auth_service();
+        let mut user = make_test_user();
+        user.is_admin = true;
+        let token = auth.generate_scan_token(&user, "repo-x", 300).unwrap();
+        let claims = auth.validate_access_token(&token).unwrap();
+        assert!(claims.is_admin);
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("repo-x"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_access_token_without_scan_claim_still_validates() {
+        // Backward-compat: a token minted before this change (no
+        // scan_pull_repo field on the wire) must deserialize via the serde
+        // default to None and remain a valid, unscoped access token.
+        let auth = make_lazy_auth_service();
+        let user = make_test_user();
+        let tokens = auth.generate_tokens(&user).expect("tokens");
+        let claims = auth
+            .validate_access_token(&tokens.access_token)
+            .expect("normal access token must validate");
+        assert!(
+            claims.scan_pull_repo.is_none(),
+            "normal tokens carry no scan scope (no-op for enforcement)"
+        );
+    }
+
     #[test]
     fn test_generate_tokens_and_validate_access_token() {
         let config = make_test_config();
@@ -2891,6 +3054,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let refresh_claims = Claims {
@@ -2904,6 +3068,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
+            scan_pull_repo: None,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -2951,6 +3116,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -2981,6 +3147,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3005,6 +3172,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3030,6 +3198,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -3057,6 +3226,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(jti),
             family_id: Some(family),
+            scan_pull_repo: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(json.contains("jti"));
@@ -3884,6 +4054,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),
@@ -4182,6 +4353,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         // The fallback is exactly `iat * 1000`.
         assert_eq!(legacy.effective_iat_ms(), iat_sec.saturating_mul(1000));
@@ -4550,6 +4722,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         let payload_json = serde_json::to_vec(&claims).unwrap();
         let payload_b64 = {
@@ -5203,6 +5376,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),

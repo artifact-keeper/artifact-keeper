@@ -208,6 +208,14 @@ pub struct Config {
     /// fs/incus scanners use. See #2088.
     pub trivy_adapter_url: Option<String>,
 
+    /// Lifetime, in seconds, of the short-lived per-repository pull token the
+    /// scanner mints for private-image scans (#2093). Env
+    /// `SCAN_TOKEN_TTL_SECONDS`, default 300. Kept intentionally short: the
+    /// token only has to live long enough for the adapter / grype to complete
+    /// the OCI pull, and a shorter window bounds the blast radius if one leaks
+    /// (it is also single-repo-scoped via the `scan_pull_repo` claim).
+    pub scan_token_ttl_seconds: u64,
+
     /// OpenSCAP wrapper URL for compliance scanning (optional)
     pub openscap_url: Option<String>,
 
@@ -585,6 +593,7 @@ redacted_debug!(Config {
     show ldap_base_dn,
     show trivy_url,
     show trivy_adapter_url,
+    show scan_token_ttl_seconds,
     show openscap_url,
     show openscap_profile,
     show opensearch_url,
@@ -678,6 +687,7 @@ impl Default for Config {
             ldap_base_dn: None,
             trivy_url: None,
             trivy_adapter_url: None,
+            scan_token_ttl_seconds: 300,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             opensearch_url: None,
@@ -797,6 +807,7 @@ impl Config {
             // is off, and registering the image scanner with an empty URL would
             // make every image scan fail closed instead of not running at all.
             trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
+            scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),

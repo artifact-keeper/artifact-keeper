@@ -387,6 +387,7 @@ mod credential_change_grpc {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),
