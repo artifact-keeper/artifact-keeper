@@ -106,7 +106,7 @@ async-trait = "0.1"
 async-stream = "0.3"
 hex = "0.4"
 moka.workspace = true
-rand = "0.9"
+rand = "0.10"
 rand08 = { package = "rand", version = "0.8" }
 pgp = "0.14.2"
 
