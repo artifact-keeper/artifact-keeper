@@ -107,9 +107,15 @@ services:
   # Gated behind the `dtrack` profile so the default stack does not pull in
   # Dependency-Track (issue #1432: DT consumes ~4 GiB RAM and pegs the
   # bundled Postgres while idle).
-  # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
+  #
+  # This runs on a small shell-bearing image (alpine) rather than the backend
+  # image: the hardened runtime image (issue #2059) has no /bin/sh — nor the
+  # `jq` that init-dtrack.sh needs — so it can no longer host this bootstrap
+  # script (issue #2084). alpine keeps the hardening intact (the app image stays
+  # shell-free) while providing sh + curl + jq. Mirrors the pg-certs init
+  # container's `apk add` pattern above.
   dtrack-init:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+    image: alpine:3.23
     container_name: artifact-keeper-dtrack-init
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -124,7 +130,11 @@ services:
     environment:
       DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
       DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
-    entrypoint: ["/bin/sh", "/init-dtrack.sh"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq >/dev/null 2>&1
+        exec /bin/sh /init-dtrack.sh
     restart: "no"
     healthcheck:
       disable: true
@@ -186,26 +196,14 @@ services:
       dtrack-init:
         condition: service_completed_successfully
         required: false
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        # Wait for dtrack-init to provision the API key (up to 5 min)
-        if [ "$${DEPENDENCY_TRACK_ENABLED}" != "false" ]; then
-          echo "backend: waiting for Dependency-Track API key..."
-          for i in $$(seq 1 60); do
-            if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
-              export DEPENDENCY_TRACK_API_KEY="$$(cat /shared/dtrack-api-key)"
-              echo "backend: Dependency-Track API key loaded"
-              break
-            fi
-            if [ "$$i" -eq 60 ]; then
-              echo "backend: WARNING - Dependency-Track API key not found after 5 min, starting without it"
-            fi
-            sleep 5
-          done
-        fi
-        exec artifact-keeper
+    # No entrypoint override: the hardened runtime image (issue #2059) has no
+    # /bin/sh, so the previous `["/bin/sh","-c", <wait-for-DT-key>]` wrapper
+    # broke `docker compose up` with `exec: "/bin/sh": no such file or
+    # directory` (issue #2084). We run the image CMD (`["artifact-keeper"]`)
+    # directly instead. The Dependency-Track API key is read from the shared
+    # volume via DEPENDENCY_TRACK_API_KEY_FILE below; the dtrack-init
+    # dependency above (service_completed_successfully) already guarantees the
+    # key file exists before the backend starts, so no in-shell wait is needed.
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry?sslmode=require
       STORAGE_PATH: /data/storage
@@ -226,6 +224,10 @@ services:
       OPENSEARCH_URL: http://opensearch:9200
       # Dependency-Track integration (API key auto-provisioned by dtrack-init)
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
+      # The dtrack-init container writes the provisioned API key to this shared
+      # path; the backend reads it via the *_FILE convention (no shell needed).
+      # Only consumed when DEPENDENCY_TRACK_ENABLED=true (dtrack profile).
+      DEPENDENCY_TRACK_API_KEY_FILE: /shared/dtrack-api-key
       # Default off: Dependency-Track is an optional integration that runs a
       # heavyweight Java service plus its own NVD mirror. Operators opt in by
       # setting DEPENDENCY_TRACK_ENABLED=true *and* starting the dtrack

@@ -11,6 +11,13 @@
 //! DEPENDENCY_TRACK_ENABLED=true
 //! ```
 //!
+//! The API key may instead be supplied via `DEPENDENCY_TRACK_API_KEY_FILE`
+//! pointing at a file that holds the key (the `*_FILE` secret-mounting
+//! convention). This is how the shell-less hardened runtime image consumes the
+//! key that `docker/init-dtrack.sh` writes to the shared volume, without a
+//! `/bin/sh` entrypoint wrapper (issues #2059/#2084). The direct
+//! `DEPENDENCY_TRACK_API_KEY` value takes precedence when both are set.
+//!
 //! ## Required Dependency-Track team permissions (#1472)
 //!
 //! The API key passed via `DEPENDENCY_TRACK_API_KEY` must belong to a team
@@ -201,13 +208,56 @@ impl DependencyTrackConfig {
         }
 
         let base_url = std::env::var("DEPENDENCY_TRACK_URL").ok()?;
-        let api_key = std::env::var("DEPENDENCY_TRACK_API_KEY").ok()?;
+        let api_key = resolve_api_key(
+            std::env::var("DEPENDENCY_TRACK_API_KEY").ok(),
+            std::env::var("DEPENDENCY_TRACK_API_KEY_FILE").ok(),
+        )?;
 
         Some(Self {
             base_url,
             api_key,
             enabled,
         })
+    }
+}
+
+/// Resolve the Dependency-Track API key from either the direct
+/// `DEPENDENCY_TRACK_API_KEY` value or a path in `DEPENDENCY_TRACK_API_KEY_FILE`.
+///
+/// The `*_FILE` fallback mirrors the common secret-mounting convention and
+/// lets the hardened, shell-less runtime image (issue #2059) read the key that
+/// [`docker/init-dtrack.sh`](../../../docker/init-dtrack.sh) writes to a shared
+/// volume — without wrapping the entrypoint in `/bin/sh -c 'export ...=$(cat
+/// /shared/dtrack-api-key)'`, which the image no longer supports (issue #2084).
+///
+/// The direct value takes precedence when both are set. File contents are
+/// trimmed of surrounding whitespace/newlines (the bootstrap script writes the
+/// bare key, but a trailing newline is tolerated). A blank variable, an empty
+/// path, a missing file, or an empty/whitespace-only file all yield `None`.
+fn resolve_api_key(direct: Option<String>, key_file: Option<String>) -> Option<String> {
+    if let Some(key) = direct {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
+
+    let path = key_file?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let key = contents.trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some(key.to_string())
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -2793,5 +2843,70 @@ mod tests {
             AppError::ServiceUnavailable(ref m) => assert!(m.contains("unreachable")),
             _ => panic!("expected ServiceUnavailable"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_api_key: DEPENDENCY_TRACK_API_KEY vs *_FILE fallback (#2084)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_api_key_prefers_direct_value() {
+        // A non-empty direct value wins even when a (would-be) file is present.
+        let got = resolve_api_key(
+            Some("direct-key".to_string()),
+            Some("/nonexistent".to_string()),
+        );
+        assert_eq!(got.as_deref(), Some("direct-key"));
+    }
+
+    #[test]
+    fn resolve_api_key_trims_direct_value() {
+        let got = resolve_api_key(Some("  spaced-key\n".to_string()), None);
+        assert_eq!(got.as_deref(), Some("spaced-key"));
+    }
+
+    #[test]
+    fn resolve_api_key_reads_file_when_direct_absent() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "file-key\n").unwrap();
+        let got = resolve_api_key(None, Some(f.path().to_string_lossy().into_owned()));
+        assert_eq!(got.as_deref(), Some("file-key"));
+    }
+
+    #[test]
+    fn resolve_api_key_reads_file_when_direct_is_blank() {
+        // An empty/whitespace direct value must not shadow the file fallback.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "  from-file  ").unwrap();
+        let got = resolve_api_key(
+            Some("   ".to_string()),
+            Some(f.path().to_string_lossy().into_owned()),
+        );
+        assert_eq!(got.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn resolve_api_key_none_when_nothing_set() {
+        assert_eq!(resolve_api_key(None, None), None);
+        assert_eq!(resolve_api_key(Some(String::new()), None), None);
+    }
+
+    #[test]
+    fn resolve_api_key_none_for_empty_path() {
+        assert_eq!(resolve_api_key(None, Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn resolve_api_key_none_when_file_missing() {
+        let got = resolve_api_key(None, Some("/nonexistent/dtrack-api-key-xyz".to_string()));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn resolve_api_key_none_when_file_empty() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "\n  \n").unwrap();
+        let got = resolve_api_key(None, Some(f.path().to_string_lossy().into_owned()));
+        assert_eq!(got, None);
     }
 }

@@ -3304,4 +3304,76 @@ mod tests {
         assert!(storage_path_error("s3", "", "").is_none());
         assert!(storage_path_error("gcs", "some/prefix", "").is_none());
     }
+
+    /// Extract the text of a top-level `services.<name>` block (a 2-space
+    /// indented key) from a compose file, up to the next sibling service or
+    /// 2-space-indented line. Comment lines are stripped so assertions match
+    /// live configuration, not documentation. Test-only, minimal parser.
+    fn compose_service_block(compose: &str, name: &str) -> String {
+        let mut out = String::new();
+        let mut in_block = false;
+        let key = format!("{name}:");
+        for line in compose.lines() {
+            let is_service_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_start().starts_with(&key);
+            if is_service_key {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                let boundary =
+                    line.starts_with("  ") && !line.starts_with("   ") && !line.trim().is_empty();
+                if boundary {
+                    break;
+                }
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Regression guard for #2084: the hardened runtime image (#2059) ships no
+    /// `/bin/sh`, so no compose service that runs that image may be launched
+    /// through a shell. On `main` the `backend` service used
+    /// `entrypoint: ["/bin/sh","-c", <wait-for-DT-key>]` and `dtrack-init` ran
+    /// the backend image via `/bin/sh`; both broke `docker compose up` with
+    /// `exec: "/bin/sh": no such file or directory`.
+    #[test]
+    fn shipped_compose_does_not_run_hardened_image_through_a_shell() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+        let compose_path = repo_root.join("docker-compose.yml");
+        let compose = std::fs::read_to_string(&compose_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()));
+
+        let backend = compose_service_block(&compose, "backend");
+        assert!(
+            !backend.is_empty(),
+            "backend service not found in docker-compose.yml"
+        );
+        assert!(
+            !backend.contains("/bin/sh") && !backend.contains("/bin/bash"),
+            "backend service must not use a shell entrypoint; the runtime image \
+             has no shell (#2059/#2084). Offending block:\n{backend}"
+        );
+
+        // dtrack-init may legitimately use a shell, but not on the shell-less
+        // backend image — it must run a shell-bearing image instead.
+        let dtrack_init = compose_service_block(&compose, "dtrack-init");
+        assert!(
+            !dtrack_init.is_empty(),
+            "dtrack-init service not found in docker-compose.yml"
+        );
+        assert!(
+            !dtrack_init.contains("artifact-keeper-backend"),
+            "dtrack-init must not run the shell-less backend image (#2084). \
+             Offending block:\n{dtrack_init}"
+        );
+    }
 }
