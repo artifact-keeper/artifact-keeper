@@ -515,6 +515,13 @@ impl OidcService {
                 SET email = $1, display_name = $2, is_admin = $3,
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
+                  AND (
+                    email IS DISTINCT FROM $1
+                    OR display_name IS DISTINCT FROM $2
+                    OR is_admin IS DISTINCT FROM $3
+                    OR last_login_at IS NULL
+                    OR last_login_at < NOW() - INTERVAL '5 minutes'
+                  )
                 "#,
                 oidc_user.email,
                 oidc_user.display_name,
@@ -715,6 +722,104 @@ fn base64_decode_url_safe(input: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_oidc_config() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://issuer.example.com".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app.example.com/callback".into(),
+            scopes: vec!["openid".into()],
+            username_claim: "preferred_username".into(),
+            email_claim: "email".into(),
+            display_name_claim: "name".into(),
+            groups_claim: "groups".into(),
+            admin_group: Some("ak-admins".into()),
+            default_role: "user".into(),
+        }
+    }
+
+    // Profile sync (#2107): within the 5-minute throttle window a CHANGED
+    // is_admin (privilege sync) must still be written, while an unchanged
+    // profile must be throttled. DB-backed; no-ops without DATABASE_URL.
+    #[tokio::test]
+    async fn test_sso_profile_sync_throttles_but_still_writes_privilege_change() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = OidcService::with_config(pool.clone(), test_oidc_config());
+
+        let id = Uuid::new_v4();
+        let ext = format!("oidc-ext-{id}");
+        let email = format!("{id}@example.com");
+        // Seed an existing OIDC user, non-admin, last_login well inside the
+        // throttle window.
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, display_name, auth_provider, external_id, \
+                 is_active, is_admin, last_login_at) \
+             VALUES ($1, $2, $3, 'Old Name', 'oidc', $4, true, false, NOW())",
+            id,
+            format!("user_{id}"),
+            email,
+            ext
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let t0: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // Unchanged profile inside the window -> throttled (no write).
+        let unchanged = OidcUserInfo {
+            sub: ext.clone(),
+            username: format!("user_{id}"),
+            email: email.clone(),
+            email_verified: Some(true),
+            display_name: Some("Old Name".into()),
+            groups: vec![],
+            extra_claims: std::collections::HashMap::new(),
+        };
+        svc.get_or_create_user(&unchanged).await.unwrap();
+        let after_unchanged = sqlx::query!(
+            "SELECT is_admin, last_login_at FROM users WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!after_unchanged.is_admin);
+        assert_eq!(
+            after_unchanged.last_login_at, t0,
+            "unchanged profile within window must not advance last_login_at"
+        );
+
+        // is_admin flips false -> true inside the window -> MUST write.
+        let promoted = OidcUserInfo {
+            groups: vec!["ak-admins".into()],
+            ..unchanged.clone()
+        };
+        svc.get_or_create_user(&promoted).await.unwrap();
+        let after_promote = sqlx::query!(
+            "SELECT is_admin, last_login_at FROM users WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            after_promote.is_admin,
+            "privilege change must be written even within throttle window"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn test_base64_decode_url_safe() {

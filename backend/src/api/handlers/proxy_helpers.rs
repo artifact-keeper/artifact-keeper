@@ -498,6 +498,71 @@ pub async fn proxy_fetch_streaming_with_disposition(
     })
 }
 
+/// Streaming fetch of `path` from a virtual member, using the member's REAL
+/// repository record so its `format` drives cache classification (#2069 bug 1)
+/// instead of the synthesized `Generic` stand-in [`build_remote_repo`] would
+/// produce. Builds a ready-to-serve [`Response`]; errors are mapped to a
+/// [`Response`] exactly as [`proxy_fetch_streaming_with_disposition`] does, so
+/// the streaming virtual-download path can detect a quarantine block via
+/// [`is_quarantine_block_response`].
+async fn proxy_fetch_streaming_member(
+    proxy_service: &ProxyService,
+    member: &Repository,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> Result<Response, Response> {
+    let result = proxy_service
+        .fetch_artifact_streaming(member, path)
+        .await
+        .map_err(|e| map_proxy_error(&member.key, path, e))?;
+    build_streaming_response_with_disposition(
+        result,
+        default_content_type,
+        content_disposition_filename,
+    )
+    .map_err(|e| {
+        map_proxy_error(
+            &member.key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
+}
+
+/// #1555 presigned-redirect fast path for a single virtual member: when the
+/// member's proxy cache holds a FRESH copy of `path` and the cache storage
+/// backend supports redirects, return a presigned redirect [`Response`] so the
+/// backend never streams a large body itself (streaming holds a worker thread
+/// for the whole transfer; under burst load that cascades into 502s). Returns
+/// `None` when a redirect does not apply (presigned downloads disabled,
+/// non-redirecting backend, or cache not fresh), in which case the caller falls
+/// back to a streaming cache probe / upstream fetch.
+async fn try_member_cache_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    member: &Repository,
+    path: &str,
+) -> Option<Response> {
+    if !state.config.presigned_downloads_enabled {
+        return None;
+    }
+    let storage = proxy.cache_storage_backend();
+    let cache_key = ProxyService::cache_storage_key(&member.key, path).ok()?;
+    if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
+        return None;
+    }
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    try_proxy_cache_redirect(
+        storage.as_ref(),
+        &cache_key,
+        /* presigned_enabled = */ true,
+        expiry,
+        /* cache_is_fresh = */ true,
+    )
+    .await
+}
+
 /// Build the outbound HTTP response from a [`StreamingFetchResult`].
 ///
 /// Sets `Content-Type` from the result's `content_type` field when
@@ -1106,6 +1171,345 @@ pub(crate) fn virtual_member_fetch_strategy(
     }
 }
 
+/// Pass-1 cache classification of a single virtual member during a two-phase
+/// resolve (#2069). Pass 1 inspects each member *without contacting upstream*
+/// (a local DB lookup, or a cache-only proxy probe); Pass 2 then resolves only
+/// the members that still need an upstream round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberCacheClass {
+    /// The member can serve the artifact with no upstream contact — a positive
+    /// proxy-cache hit or a local/staging artifact.
+    DefiniteHit,
+    /// The member definitely does not have the artifact, known without upstream
+    /// contact: a local miss, a negative-cached 404 still inside its window, or
+    /// a skipped (un-proxyable) member.
+    DefiniteMiss,
+    /// A proxy-cache miss that requires an upstream round-trip to resolve.
+    NeedsUpstream,
+}
+
+/// Final outcome of resolving a single virtual member, after Pass 1 and (where
+/// needed) Pass 2. Generic over the success payload `T` (a streaming result or
+/// a built `Response`) and the quarantine carrier `E`.
+#[derive(Debug)]
+pub(crate) enum MemberResolveOutcome<T, E> {
+    /// The member produced the artifact.
+    Hit(T),
+    /// The member returned a deliberate Package-Age-Policy quarantine block
+    /// (409/403, #1770) that must surface rather than fall through.
+    Quarantine(E),
+    /// The member does not have the artifact; try the next by priority.
+    Miss,
+}
+
+/// Indices of the members that must be resolved against upstream in Pass 2,
+/// given each member's Pass-1 cache classification in **priority order**
+/// (#2069).
+///
+/// Only members that could still outrank the best already-known
+/// [`MemberCacheClass::DefiniteHit`] need an upstream round-trip: every
+/// [`MemberCacheClass::NeedsUpstream`] member whose priority is higher than
+/// (i.e. index below) the first definite hit. If no member is a definite hit,
+/// every `NeedsUpstream` member is a candidate.
+///
+/// Members at or below the first definite hit are intentionally excluded — the
+/// definite hit already wins over them by priority — so a warm cache hit on a
+/// high-priority member never triggers upstream traffic on the members behind
+/// it (the regression this two-phase split exists to avoid).
+pub(crate) fn upstream_candidate_indices(classes: &[MemberCacheClass]) -> Vec<usize> {
+    let cutoff = classes
+        .iter()
+        .position(|c| *c == MemberCacheClass::DefiniteHit)
+        .unwrap_or(classes.len());
+    classes
+        .iter()
+        .take(cutoff)
+        .enumerate()
+        .filter(|(_, c)| **c == MemberCacheClass::NeedsUpstream)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Upper bound on concurrent upstream fetches a virtual-repository
+/// **metadata-merge** fan-out may have in flight at once (#2069) — i.e. the
+/// "query every member and combine" paths ([`collect_virtual_metadata`] and the
+/// Maven metadata-merge loops). Virtual repos typically aggregate a handful of
+/// members, so this is generous; it caps the reqwest connection-pool / socket
+/// pressure (and upstream load) a pathologically large virtual repo could
+/// otherwise create by opening one upstream connection per member at once.
+/// (A future enhancement could make this operator-configurable, cf. #1424 for
+/// the OCI negative-cache knobs.)
+///
+/// The first-match resolvers do NOT use this: their fan-out is already bounded
+/// to the candidates ranked above the first cache hit (see
+/// [`resolve_members_two_phase`]).
+pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
+
+/// Two-phase, priority-preserving virtual-member resolution (#2069).
+///
+/// Pass 1 calls `probe` on members in priority order, stopping at the first
+/// [`MemberCacheClass::DefiniteHit`] (a cache hit or local artifact). `probe`
+/// must NOT contact upstream — it returns the member's [`MemberCacheClass`]
+/// together with the already-built success payload for a `DefiniteHit`.
+/// Members ranked below the first hit are never probed: they can never win
+/// (`upstream_candidate_indices` only considers members above the first hit),
+/// so this preserves the old sequential loop's warm-path short-circuit —
+/// probe cost is O(rank of first hit), not O(member count).
+///
+/// Pass 2 calls `upstream` — concurrently — for the members that are both
+/// [`MemberCacheClass::NeedsUpstream`] AND could still outrank the
+/// highest-priority Pass-1 hit (see [`upstream_candidate_indices`]). The winner
+/// is the first member in priority order that produced a hit or a quarantine
+/// block; `None` means every member missed. The caller maps that to its own
+/// success/`NOT_FOUND` response.
+///
+/// Concurrency / fan-out semantics (the load-bearing tradeoff):
+/// * The **warm path stays upstream-free**: when a high-priority member is a
+///   Pass-1 cache hit, no member behind it is even a candidate, so Pass 2 makes
+///   no upstream calls at all.
+/// * **Confirm-top-first**: Pass 2 first resolves the *highest-priority*
+///   candidate alone. If it is a non-miss it is the overall winner (nothing
+///   outranks it) and we return WITHOUT launching any other upstream request.
+///   So a cold first request for an artifact the top candidate holds — the
+///   common cold-*positive* case — costs exactly ONE upstream request, not one
+///   per member.
+/// * Only when the top candidate **misses** are the remaining candidates driven
+///   concurrently — the cold-*negative* (artifact missing everywhere) and
+///   cold-positive-on-a-lower-member cases. Here every remaining candidate's
+///   `upstream` future is launched at once, so a true negative still resolves in
+///   roughly the slowest single miss rather than the sum. This fan-out does
+///   initiate upstream requests to all remaining candidates (the losers are
+///   cancelled once the winner is known, but their requests were dispatched) —
+///   bounded request-initiation amplification, only on the cold path, and only
+///   after the top candidate has already missed. Bodies of losing members are
+///   never polled.
+/// * The remaining-candidate result is finalized in **strict priority order with
+///   early return**: as soon as the highest-priority remaining candidate that
+///   resolves to a non-miss is known (all higher-priority ones having resolved
+///   to a miss), that outcome wins and the in-flight losers are dropped
+///   (cancelled). A fast high-priority hit is never delayed by a slow
+///   low-priority member. The remaining-candidate fan-out is naturally bounded:
+///   it only includes candidates ranked above the first Pass-1 cache hit, minus
+///   the top one already confirmed.
+pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
+    members: &'a [Repository],
+    probe: P,
+    upstream: U,
+) -> Option<MemberResolveOutcome<T, E>>
+where
+    P: Fn(&'a Repository) -> PFut,
+    PFut: std::future::Future<Output = (MemberCacheClass, Option<T>)> + 'a,
+    U: Fn(&'a Repository) -> UFut,
+    UFut: std::future::Future<Output = MemberResolveOutcome<T, E>> + 'a,
+{
+    // Pass 1: classify members without contacting upstream, stopping at the
+    // first DefiniteHit. Members below it can never win, and
+    // `upstream_candidate_indices` only considers members above the first hit,
+    // so probing the rest would be wasted work (and, for the streaming/metadata
+    // resolvers, wasted storage round-trips / body reads on the warm path).
+    let mut classes: Vec<MemberCacheClass> = Vec::with_capacity(members.len());
+    let mut pass1_hits: Vec<Option<T>> = Vec::with_capacity(members.len());
+    for member in members {
+        let (class, hit) = probe(member).await;
+        let is_definite_hit = class == MemberCacheClass::DefiniteHit;
+        classes.push(class);
+        pass1_hits.push(hit);
+        if is_definite_hit {
+            break;
+        }
+    }
+
+    // The highest-priority Pass-1 cache hit is the fallback winner used when
+    // every upstream candidate misses. By construction every candidate index is
+    // higher priority than (below) the first DefiniteHit, so any candidate hit
+    // outranks this fallback.
+    let pass1_winner: Option<MemberResolveOutcome<T, E>> = pass1_hits
+        .into_iter()
+        .find_map(|hit| hit.map(MemberResolveOutcome::Hit));
+
+    let candidates = upstream_candidate_indices(&classes);
+    let Some((&first, rest)) = candidates.split_first() else {
+        return pass1_winner;
+    };
+
+    let upstream = &upstream;
+
+    // Pass 2, step 1 — confirm the HIGHEST-priority candidate on its own. If it
+    // produces a non-miss it is the overall winner (nothing outranks it), so we
+    // return WITHOUT launching any other upstream request. This eliminates the
+    // cold-positive fan-out for the common "top member has it" case (#2069): a
+    // first request for an artifact the top remote member holds costs exactly
+    // one upstream request, not one per member.
+    let first_outcome = upstream(&members[first]).await;
+    if !matches!(first_outcome, MemberResolveOutcome::Miss) {
+        return Some(first_outcome);
+    }
+    if rest.is_empty() {
+        return pass1_winner;
+    }
+
+    // Pass 2, step 2 — the top candidate missed, so the remaining candidates are
+    // driven concurrently (a cold negative/miss fans out here), finalizing in
+    // strict priority order with early return + cancellation of losers.
+    // `rest` is ascending by priority, so a candidate's position in `rest` is
+    // its priority rank among the remaining candidates.
+    // The remaining candidates run concurrently via `FuturesUnordered`,
+    // yielding results as they complete, each tagged with its priority `rank`
+    // for the ordered finalize below. The exposure here is naturally bounded:
+    // `upstream_candidate_indices` only includes candidates ranked above the
+    // first Pass-1 cache hit, and confirm-top-first has already peeled off the
+    // top one — so `rest` is small in practice. (`FuturesUnordered` is used
+    // rather than a lazy `buffer_unordered` stream because the latter's
+    // borrowed-closure future is not provably `Send` for the generic `U`, which
+    // would make every caller's handler future non-`Send`.)
+    let mut running: futures::stream::FuturesUnordered<_> = rest
+        .iter()
+        .enumerate()
+        .map(|(rank, &i)| {
+            let member = &members[i];
+            async move { (rank, upstream(member).await) }
+        })
+        .collect();
+
+    let mut buffer: Vec<Option<MemberResolveOutcome<T, E>>> =
+        (0..rest.len()).map(|_| None).collect();
+    // `next` is the lowest-priority-rank candidate whose outcome is not yet
+    // decided to be a miss; once `buffer[next]` is a known non-miss it wins.
+    let mut next = 0usize;
+
+    while let Some((rank, outcome)) = running.next().await {
+        buffer[rank] = Some(outcome);
+        // Advance over a contiguous run of already-resolved candidates.
+        while next < buffer.len() {
+            match buffer[next] {
+                Some(MemberResolveOutcome::Miss) => next += 1,
+                // A higher-priority candidate is still pending: must wait.
+                None => break,
+                // First non-miss in priority order wins; dropping `running`
+                // cancels the remaining in-flight upstream futures.
+                Some(_) => return buffer[next].take(),
+            }
+        }
+    }
+
+    // Every candidate resolved to a miss → fall back to the best Pass-1 hit.
+    pass1_winner
+}
+
+/// Map a cache-only proxy probe (`streaming_cached_artifact_by_path`) to a
+/// Pass-1 [`MemberCacheClass`] (#2069).
+///
+/// * `Ok(Some(_))` — a servable cache hit ([`MemberCacheClass::DefiniteHit`]).
+/// * `Ok(None)` — a cache miss needing an upstream round-trip
+///   ([`MemberCacheClass::NeedsUpstream`]).
+/// * `Err(quarantine)` — a *fresh but held* cached entry surfaces from the probe
+///   as a Package-Age-Policy block (#1770: `Conflict`/`Authorization`). It MUST
+///   NOT be dropped (that would mask the 409/403 and serve a lower-priority
+///   member or 404). It is classified [`MemberCacheClass::NeedsUpstream`] so
+///   Pass 2 re-resolves it via `fetch_artifact_streaming` — which re-detects the
+///   held cache entry and surfaces the block through `classify_stream_upstream`
+///   WITHOUT contacting upstream (the held entry is a cache hit).
+/// * `Err(other)` — a negative-cached 404 or an unusable cache key: a definite
+///   miss we must NOT re-fetch.
+///
+/// (A transient sidecar read/parse error is mapped to `Ok(None)` upstream of
+/// this in `read_cached_with_revalidation_streaming`, so it falls through to an
+/// upstream fetch rather than being suppressed here.)
+pub(crate) fn classify_cache_probe<T>(
+    probe: Result<Option<T>, crate::error::AppError>,
+) -> (MemberCacheClass, Option<T>) {
+    match probe {
+        Ok(Some(hit)) => (MemberCacheClass::DefiniteHit, Some(hit)),
+        Ok(None) => (MemberCacheClass::NeedsUpstream, None),
+        // A quarantine block must surface (#1770): re-resolve in Pass 2.
+        Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
+        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+    }
+}
+
+/// Map a Remote member's buffered/streaming upstream fetch result to its final
+/// [`MemberResolveOutcome`] (#2069). A Package-Age-Policy quarantine block
+/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]; any other error is
+/// an ordinary miss.
+pub(crate) fn classify_stream_upstream(
+    result: Result<StreamingFetchResult, crate::error::AppError>,
+    member_key: &str,
+    path: &str,
+) -> MemberResolveOutcome<StreamingFetchResult, Response> {
+    match result {
+        Ok(result) => MemberResolveOutcome::Hit(result),
+        Err(e) if is_quarantine_block(&e) => {
+            MemberResolveOutcome::Quarantine(map_proxy_error(member_key, path, e))
+        }
+        Err(_) => MemberResolveOutcome::Miss,
+    }
+}
+
+/// Streaming-path sibling of [`classify_cache_probe`] (#2069): build a
+/// ready-to-serve [`Response`] from a cache hit so it can be returned without
+/// touching upstream. A rare header-build failure degrades to
+/// [`MemberCacheClass::NeedsUpstream`] rather than failing the whole virtual. A
+/// quarantine block (#1770) from the probe is classified `NeedsUpstream` so
+/// Pass 2 re-resolves and surfaces the 409/403 (see [`classify_cache_probe`]);
+/// a negative-cached 404 / unusable key is a definite miss.
+pub(crate) fn classify_streaming_cache_probe(
+    probe: Result<Option<StreamingFetchResult>, crate::error::AppError>,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> (MemberCacheClass, Option<Response>) {
+    match probe {
+        Ok(Some(result)) => match build_streaming_response_with_disposition(
+            result,
+            default_content_type,
+            content_disposition_filename,
+        ) {
+            Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+            Err(_) => (MemberCacheClass::NeedsUpstream, None),
+        },
+        Ok(None) => (MemberCacheClass::NeedsUpstream, None),
+        // A quarantine block must surface (#1770): re-resolve in Pass 2.
+        Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
+        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+    }
+}
+
+/// Classify a Local/Staging member's buffered fetch for the streaming resolver
+/// (#2069): build the streaming response on a hit (or serve a 500 if header
+/// building fails — that member still "wins" with an error), else a miss.
+pub(crate) fn classify_streaming_local(
+    fetched: Result<StreamingFetchResult, Response>,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> (MemberCacheClass, Option<Response>) {
+    match fetched {
+        Ok(result) => match build_streaming_response_with_disposition(
+            result,
+            default_content_type,
+            content_disposition_filename,
+        ) {
+            Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+            Err(e) => (
+                MemberCacheClass::DefiniteHit,
+                Some((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+            ),
+        },
+        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+    }
+}
+
+/// Map a Remote member's streaming upstream fetch (already mapped to a
+/// [`Response`] by [`proxy_fetch_streaming_member`]) to its final outcome
+/// (#2069). A quarantine 409/403 surfaces; any other error Response is a miss.
+pub(crate) fn classify_streaming_upstream(
+    result: Result<Response, Response>,
+) -> MemberResolveOutcome<Response, Response> {
+    match result {
+        Ok(response) => MemberResolveOutcome::Hit(response),
+        Err(resp) if is_quarantine_block_response(&resp) => MemberResolveOutcome::Quarantine(resp),
+        Err(_) => MemberResolveOutcome::Miss,
+    }
+}
+
 /// Resolve virtual repository members and attempt to find an artifact.
 ///
 /// Iterates through members in priority order using type-specific fetch
@@ -1157,6 +1561,14 @@ where
 /// members) fetch the members, run them through
 /// [`authorize_virtual_members`], and pass the result here so only members the
 /// caller could read directly can ever serve bytes.
+///
+/// Precondition (#2069): `path` must address an **immutable** artifact (a
+/// versioned download), not a mutable index/metadata path. The Pass-1 cache
+/// probe is upstream-free only for immutable content; a stale *mutable* entry
+/// would conditionally revalidate against upstream, serializing per-member
+/// round-trips in Pass 1 and defeating the concurrent fan-out. Mutable indexes
+/// must instead go through [`resolve_virtual_metadata`] / the metadata-merge
+/// helpers.
 pub async fn resolve_virtual_download_from_members<F, Fut>(
     members: Vec<Repository>,
     proxy_service: Option<&ProxyService>,
@@ -1171,48 +1583,73 @@ where
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
     }
 
-    for member in &members {
-        let strategy = virtual_member_fetch_strategy(
-            &member.repo_type,
-            proxy_service.is_some(),
-            member.upstream_url.is_some(),
-        );
-
-        match strategy {
-            VirtualMemberFetchStrategy::Proxy => {
-                // Both branches above are guaranteed by `strategy`:
-                // proxy_service and upstream_url must be present.
-                if let (Some(proxy), Some(upstream_url)) =
-                    (proxy_service, member.upstream_url.as_deref())
-                {
-                    let repo = build_remote_repo(member.id, &member.key, upstream_url);
-                    match proxy.fetch_artifact_streaming(&repo, path).await {
-                        Ok(result) => return Ok(result),
-                        // Package Age Policy (#1770): a quarantine block from a
-                        // member is a deliberate 409/403, NOT a "member miss".
-                        // Surface it immediately instead of silently trying the
-                        // next member (which would mask the policy and 404).
-                        Err(e) if is_quarantine_block(&e) => {
-                            return Err(map_proxy_error(&member.key, path, e));
-                        }
-                        Err(_) => { /* genuine miss: try the next member */ }
+    // Two-phase, priority-preserving resolution (#2069). Pass 1 (the `probe`
+    // closure) classifies each member: Local members hit the DB; Remote members
+    // get a cache-only proxy probe (a versioned-artifact hit or a negative-cached
+    // 404 lands here). `member` is passed to the proxy as-is so it carries its
+    // REAL format (#2069 bug 1). NOTE on upstream contact: the probe is
+    // upstream-free for IMMUTABLE content (which is what download callers route
+    // here — versioned artifacts never revalidate). The probe (`streaming_cached_
+    // artifact_by_path`) WOULD conditionally revalidate a *stale mutable* entry
+    // against upstream; that is still correct but no longer upstream-free, so
+    // routing a mutable path through this download resolver is not intended.
+    // Pass 2 (the `upstream` closure) fans out — in parallel — over the members
+    // that still need an upstream round-trip and could outrank a Pass-1 hit,
+    // finalizing in strict priority order with early return. See
+    // `resolve_members_two_phase` for the full fan-out / amplification tradeoff
+    // (the fan-out also fires on a cold *positive*, not only the all-miss case).
+    // Borrow `local_fetch` so the per-member `probe` closure copies the
+    // reference instead of moving the `Fn` into each `async move` future.
+    let local_fetch = &local_fetch;
+    let outcome = resolve_members_two_phase::<StreamingFetchResult, Response, _, _, _, _>(
+        &members,
+        |member| async move {
+            match virtual_member_fetch_strategy(
+                &member.repo_type,
+                proxy_service.is_some(),
+                member.upstream_url.is_some(),
+            ) {
+                VirtualMemberFetchStrategy::Local => {
+                    match local_fetch(member.id, member.storage_location()).await {
+                        Ok(result) => (MemberCacheClass::DefiniteHit, Some(result)),
+                        Err(_) => (MemberCacheClass::DefiniteMiss, None),
                     }
                 }
+                VirtualMemberFetchStrategy::Proxy => match proxy_service {
+                    // The cache-only probe contacts no upstream; its result is
+                    // classified by the pure `classify_cache_probe`.
+                    Some(proxy) => classify_cache_probe(
+                        proxy.streaming_cached_artifact_by_path(member, path).await,
+                    ),
+                    None => (MemberCacheClass::DefiniteMiss, None),
+                },
+                VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
             }
-            VirtualMemberFetchStrategy::Local => {
-                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
-                    return Ok(result);
-                }
+        },
+        |member| async move {
+            // Only reached for Remote members the strategy resolved as Proxy, so
+            // a proxy service is guaranteed present.
+            match proxy_service {
+                Some(proxy) => classify_stream_upstream(
+                    proxy.fetch_artifact_streaming(member, path).await,
+                    &member.key,
+                    path,
+                ),
+                None => MemberResolveOutcome::Miss,
             }
-            VirtualMemberFetchStrategy::Skip => {}
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        "Artifact not found in any member repository",
+        },
     )
-        .into_response())
+    .await;
+
+    match outcome {
+        Some(MemberResolveOutcome::Hit(result)) => Ok(result),
+        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "Artifact not found in any member repository",
+        )
+            .into_response()),
+    }
 }
 
 /// Whether an [`AppError`] from a proxy member fetch is a deliberate Package
@@ -1261,6 +1698,11 @@ fn is_quarantine_block_response(resp: &Response) -> bool {
 /// the `Content-Disposition: attachment` header so the streaming path
 /// emits the same outbound headers as the buffered
 /// [`build_download_response`] used to.
+///
+/// Precondition (#2069): as with [`resolve_virtual_download_from_members`],
+/// `path` must address an **immutable** artifact. The Pass-1 cache probe is
+/// upstream-free only for immutable content; mutable indexes/metadata must go
+/// through [`resolve_virtual_metadata`] / the metadata-merge helpers instead.
 pub async fn resolve_virtual_download_streaming<F, Fut>(
     state: &AppState,
     proxy_service: Option<&ProxyService>,
@@ -1280,100 +1722,83 @@ where
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
     }
 
-    for member in &members {
-        let strategy = virtual_member_fetch_strategy(
-            &member.repo_type,
-            proxy_service.is_some(),
-            member.upstream_url.is_some(),
-        );
-
-        match strategy {
-            VirtualMemberFetchStrategy::Proxy => {
-                if let (Some(proxy), Some(upstream_url)) =
-                    (proxy_service, member.upstream_url.as_deref())
-                {
-                    // #1555: prefer a presigned S3 redirect for a fresh cache
-                    // hit so large artifacts (e.g. torch wheels, multi-GB) are
-                    // not streamed through the backend. Streaming holds a
-                    // worker thread for the whole transfer; under burst load
-                    // that saturates the dispatcher and cascades into 502s.
-                    // Mirrors the fast path in `proxy_fetch_or_redirect`.
-                    // Falls through to streaming on a cache miss, so the
-                    // OOM-avoidance from #1215 still covers uncached bodies.
-                    // #1555: resolve the no-prefix presign handle and check
-                    // redirect support BEFORE the `is_cache_fresh` probe — the
-                    // probe loads the cache-meta sidecar, so skipping it when we
-                    // can't redirect avoids a wasted S3 GET on the (common)
-                    // cache-miss path that then re-reads the sidecar in the
-                    // streaming fallback below.
-                    if state.config.presigned_downloads_enabled {
-                        let storage = proxy.cache_storage_backend();
-                        if let Ok(cache_key) = ProxyService::cache_storage_key(&member.key, path) {
-                            if storage.supports_redirect()
-                                && proxy.is_cache_fresh(&member.key, path).await
-                            {
-                                // sign through the proxy's no-prefix backend
-                                // (proxy-cache content lives at the storage
-                                // root, not under the global key prefix).
-                                let expiry = Duration::from_secs(
-                                    state.config.presigned_download_expiry_secs,
-                                );
-                                if let Some(redirect) = try_proxy_cache_redirect(
-                                    storage.as_ref(),
-                                    &cache_key,
-                                    /* presigned_enabled = */ true,
-                                    expiry,
-                                    /* cache_is_fresh = */ true,
-                                )
-                                .await
-                                {
-                                    return Ok(redirect);
-                                }
-                            }
+    // Two-phase, priority-preserving resolution (#2069), streaming sibling of
+    // [`resolve_virtual_download_from_members`]. Pass 1 (`probe`) classifies
+    // each member: Local members hit the DB; Remote members try the #1555
+    // presigned-redirect fast path then a cache-only streaming probe. `member`
+    // is used as-is so its REAL format drives cache classification (#2069
+    // bug 1). Same upstream-contact note as the buffered sibling: the probe is
+    // upstream-free for the IMMUTABLE artifact paths download callers route
+    // here; a *stale mutable* entry would conditionally revalidate upstream
+    // (correct, but not upstream-free), so routing a mutable path here is not
+    // intended. Pass 2 (`upstream`) fans out — in parallel — only over members
+    // that still need it, preserving #1215 OOM-avoidance (uncached bodies are
+    // streamed, never buffered).
+    // Borrow `local_fetch` so the per-member `probe` closure copies the
+    // reference instead of moving the `Fn` into each `async move` future.
+    let local_fetch = &local_fetch;
+    let outcome = resolve_members_two_phase::<Response, Response, _, _, _, _>(
+        &members,
+        |member| async move {
+            match virtual_member_fetch_strategy(
+                &member.repo_type,
+                proxy_service.is_some(),
+                member.upstream_url.is_some(),
+            ) {
+                VirtualMemberFetchStrategy::Local => classify_streaming_local(
+                    local_fetch(member.id, member.storage_location()).await,
+                    default_content_type,
+                    content_disposition_filename,
+                ),
+                VirtualMemberFetchStrategy::Proxy => match proxy_service {
+                    Some(proxy) => {
+                        // #1555: a fresh proxy-cache hit on a redirect-capable
+                        // backend is served as a presigned redirect, never
+                        // streamed through the backend.
+                        if let Some(redirect) =
+                            try_member_cache_redirect(state, proxy, member, path).await
+                        {
+                            (MemberCacheClass::DefiniteHit, Some(redirect))
+                        } else {
+                            classify_streaming_cache_probe(
+                                proxy.streaming_cached_artifact_by_path(member, path).await,
+                                default_content_type,
+                                content_disposition_filename,
+                            )
                         }
                     }
-
-                    match proxy_fetch_streaming_with_disposition(
+                    None => (MemberCacheClass::DefiniteMiss, None),
+                },
+                VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
+            }
+        },
+        |member| async move {
+            match proxy_service {
+                Some(proxy) => classify_streaming_upstream(
+                    proxy_fetch_streaming_member(
                         proxy,
-                        member.id,
-                        &member.key,
-                        upstream_url,
+                        member,
                         path,
                         default_content_type,
                         content_disposition_filename,
                     )
-                    .await
-                    {
-                        Ok(response) => return Ok(response),
-                        // Package Age Policy (#1770): a member's quarantine
-                        // block (409/403, already mapped to a Response) must
-                        // surface rather than fall through to the next member.
-                        Err(resp) if is_quarantine_block_response(&resp) => return Err(resp),
-                        Err(_) => { /* genuine miss: try the next member */ }
-                    }
-                }
+                    .await,
+                ),
+                None => MemberResolveOutcome::Miss,
             }
-            VirtualMemberFetchStrategy::Local => {
-                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
-                    return build_streaming_response_with_disposition(
-                        result,
-                        default_content_type,
-                        content_disposition_filename,
-                    )
-                    .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                    });
-                }
-            }
-            VirtualMemberFetchStrategy::Skip => {}
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        "Artifact not found in any member repository",
+        },
     )
-        .into_response())
+    .await;
+
+    match outcome {
+        Some(MemberResolveOutcome::Hit(response)) => Ok(response),
+        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "Artifact not found in any member repository",
+        )
+            .into_response()),
+    }
 }
 
 /// Resolve virtual repository metadata using first-match semantics.
@@ -1400,45 +1825,103 @@ where
         return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
     }
 
-    for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-
-        let Some(upstream_url) = member.upstream_url.as_deref() else {
-            continue;
-        };
-
-        let Some(proxy) = proxy_service else {
-            continue;
-        };
-
-        match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
-            Ok((bytes, _content_type)) => match transform(bytes, member.key.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(_e) => {
-                    tracing::warn!(
-                        "Metadata transform failed for member '{}' at path '{}'",
-                        member.key,
-                        path
-                    );
-                }
-            },
-            Err(_e) => {
-                tracing::debug!(
-                    "Metadata proxy fetch miss for member '{}' at path '{}'",
-                    member.key,
-                    path
-                );
+    // Two-phase, priority-preserving first-match resolution (#2069). Metadata is
+    // served only from Remote members. Bug 1 (member format passthrough) is a
+    // no-op here: every metadata index (maven-metadata.xml, npm packument, the
+    // PyPI simple index, ...) classifies as mutable regardless of format, so the
+    // synthesized `build_remote_repo` format in `proxy_fetch` changes nothing.
+    let transform = &transform;
+    let outcome = resolve_members_two_phase::<Response, Response, _, _, _, _>(
+        &members,
+        |member| async move {
+            if member.repo_type != RepositoryType::Remote {
+                return (MemberCacheClass::DefiniteMiss, None);
             }
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        "Metadata not found in any member repository",
+            let Some(proxy) = proxy_service else {
+                return (MemberCacheClass::DefiniteMiss, None);
+            };
+            // Cache-only probe (no upstream) that honours the #1611 classifier
+            // and the #1770 Package-Age-Policy gate, so a fresh hit is served
+            // (warm path never fans out) while a held entry is skipped rather
+            // than served raw. A fresh hit is transformed into the response.
+            match proxy.cached_metadata_if_servable(member, path).await {
+                Ok(Some((bytes, _ct))) => match transform(bytes, member.key.clone()).await {
+                    Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
+                    // The cached bytes failed to transform (e.g. corrupt cached
+                    // metadata). Don't treat the member as a definite miss —
+                    // fall through to an upstream re-fetch in Pass 2 so a good
+                    // upstream copy can still recover it (parity with the old
+                    // `proxy_fetch`-then-transform path). Surface it for field
+                    // debugging.
+                    Err(_) => {
+                        tracing::warn!(
+                            member = %member.key,
+                            path = %path,
+                            "virtual metadata transform failed for cached member response; \
+                             will re-fetch upstream"
+                        );
+                        (MemberCacheClass::NeedsUpstream, None)
+                    }
+                },
+                // `Ok(None)` covers a cache miss AND a negative-cached 404
+                // (both collapse to `None` here). Unlike the download resolvers
+                // — which see the negative 404 as `Err` and classify it
+                // `DefiniteMiss` — this metadata path re-checks it via Pass-2's
+                // `proxy_fetch`, which re-honors the negative cache and returns
+                // fast WITHOUT real upstream contact. The only cost of the
+                // divergence is one extra (cheap) cache read for a negatively-
+                // cached metadata member; correctness is identical.
+                Ok(None) => (MemberCacheClass::NeedsUpstream, None),
+                // A held (quarantined) or unusable-key entry: skip this member
+                // (matches the old `proxy_fetch`-then-continue behaviour),
+                // letting a lower-priority member serve if it can.
+                Err(_) => (MemberCacheClass::DefiniteMiss, None),
+            }
+        },
+        |member| async move {
+            let (Some(proxy), Some(upstream_url)) = (proxy_service, member.upstream_url.as_deref())
+            else {
+                return MemberResolveOutcome::Miss;
+            };
+            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
+                Ok((bytes, _ct)) => match transform(bytes, member.key.clone()).await {
+                    Ok(response) => MemberResolveOutcome::Hit(response),
+                    Err(_) => {
+                        tracing::warn!(
+                            member = %member.key,
+                            path = %path,
+                            "virtual metadata transform failed for upstream member response"
+                        );
+                        MemberResolveOutcome::Miss
+                    }
+                },
+                Err(_) => {
+                    tracing::debug!(
+                        member = %member.key,
+                        path = %path,
+                        "virtual metadata upstream fetch miss"
+                    );
+                    MemberResolveOutcome::Miss
+                }
+            }
+        },
     )
-        .into_response())
+    .await;
+
+    match outcome {
+        Some(MemberResolveOutcome::Hit(response)) => Ok(response),
+        // The metadata probe/upstream closures never produce `Quarantine` today
+        // (they map a held entry to a skipped member, matching the prior
+        // `proxy_fetch`-then-continue behaviour). Handle it explicitly anyway so
+        // that intent is enforced: if metadata quarantine surfacing is ever
+        // added, the 409/403 propagates instead of silently collapsing to 404.
+        Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "Metadata not found in any member repository",
+        )
+            .into_response()),
+    }
 }
 
 /// Collect metadata from ALL remote members of a virtual repository.
@@ -1460,42 +1943,49 @@ where
     Fut: std::future::Future<Output = Result<T, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
+
+    // Remote members are queried CONCURRENTLY (#2069) in priority-order batches
+    // of at most [`MAX_VIRTUAL_FANOUT`], so a cold merge fan-out costs roughly
+    // the slowest single upstream (per batch) rather than the sum, while never
+    // opening more than the cap of upstream connections at once. Order is
+    // preserved (batches are consumed in member/priority order and `join_all`
+    // keeps within-batch order), which the caller's merge relies on.
+    let extract = &extract;
+    let remote_members: Vec<&Repository> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+        .collect();
     let mut results: Vec<(String, T)> = Vec::new();
-
-    for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-
-        let Some(upstream_url) = member.upstream_url.as_deref() else {
-            continue;
-        };
-
-        let Some(proxy) = proxy_service else {
-            continue;
-        };
-
-        match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
-            Ok((bytes, _content_type)) => match extract(bytes, member.key.clone()).await {
-                Ok(data) => {
-                    results.push((member.key.clone(), data));
-                }
-                Err(_e) => {
+    for chunk in remote_members.chunks(MAX_VIRTUAL_FANOUT) {
+        let batch = futures::future::join_all(chunk.iter().copied().map(|member| async move {
+            let (Some(proxy), Some(upstream_url)) = (proxy_service, member.upstream_url.as_deref())
+            else {
+                return None;
+            };
+            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
+                Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
+                    Ok(data) => Some((member.key.clone(), data)),
+                    Err(_) => {
+                        tracing::warn!(
+                            member = %member.key,
+                            path = %path,
+                            "virtual metadata extract failed for member response"
+                        );
+                        None
+                    }
+                },
+                Err(_) => {
                     tracing::warn!(
-                        "Metadata extract failed for member '{}' at path '{}'",
-                        member.key,
-                        path
+                        member = %member.key,
+                        path = %path,
+                        "virtual metadata proxy fetch failed for member"
                     );
+                    None
                 }
-            },
-            Err(_e) => {
-                tracing::warn!(
-                    "Metadata proxy fetch failed for member '{}' at path '{}'",
-                    member.key,
-                    path
-                );
             }
-        }
+        }))
+        .await;
+        results.extend(batch.into_iter().flatten());
     }
 
     Ok(results)
@@ -3058,6 +3548,574 @@ mod tests {
             "upstream".into()
         )));
         assert!(!is_quarantine_block(&AppError::Storage("io".into())));
+    }
+
+    // ── Two-phase virtual fan-out: priority-preserving decision logic ──
+    //
+    // Cold negative resolution parallelizes the upstream fan-out (#2069) but
+    // MUST preserve the sequential loop's strict-priority, first-non-miss
+    // semantics. These cover the two pure helpers that encode that contract.
+
+    #[test]
+    fn upstream_candidates_are_all_needs_upstream_when_no_cache_hit() {
+        use MemberCacheClass::*;
+        // No member is a definite cache hit: every member that needs an
+        // upstream round-trip must be probed.
+        let classes = [NeedsUpstream, DefiniteMiss, NeedsUpstream];
+        assert_eq!(upstream_candidate_indices(&classes), vec![0, 2]);
+    }
+
+    #[test]
+    fn upstream_candidates_exclude_members_at_or_below_first_cache_hit() {
+        use MemberCacheClass::*;
+        // A definite cache hit at index 2 already wins over everything below
+        // it by priority, so only the higher-priority NeedsUpstream member (0)
+        // could still outrank it and needs an upstream probe. The NeedsUpstream
+        // at index 3 (below the hit) is irrelevant and must NOT be probed —
+        // this is what keeps the warm path upstream-free.
+        let classes = [NeedsUpstream, DefiniteMiss, DefiniteHit, NeedsUpstream];
+        assert_eq!(upstream_candidate_indices(&classes), vec![0]);
+    }
+
+    #[test]
+    fn upstream_candidates_empty_when_top_priority_is_a_cache_hit() {
+        use MemberCacheClass::*;
+        // Highest-priority member is already a hit: nothing can outrank it, so
+        // no upstream traffic at all.
+        let classes = [DefiniteHit, NeedsUpstream, NeedsUpstream];
+        assert!(upstream_candidate_indices(&classes).is_empty());
+    }
+
+    #[test]
+    fn upstream_candidates_empty_when_all_definite_miss() {
+        use MemberCacheClass::*;
+        let classes = [DefiniteMiss, DefiniteMiss];
+        assert!(upstream_candidate_indices(&classes).is_empty());
+    }
+
+    // ── Two-phase virtual fan-out: generic orchestrator (no proxy / no net) ──
+    //
+    // `resolve_members_two_phase` drives Pass 1 (cache-only probe, in priority
+    // order) and Pass 2 (parallel upstream fan-out for members that could still
+    // outrank a Pass-1 hit). These exercise the full control flow with canned
+    // async closures, so they need no database, proxy, or upstream.
+
+    fn two_members() -> Vec<Repository> {
+        vec![test_local_member("m0"), test_local_member("m1")]
+    }
+
+    #[tokio::test]
+    async fn two_phase_top_priority_cache_hit_skips_all_upstream() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |m| {
+                let class = if m.key == "m0" {
+                    (MemberCacheClass::DefiniteHit, Some("cache0".to_string()))
+                } else {
+                    (MemberCacheClass::NeedsUpstream, None)
+                };
+                async move { class }
+            },
+            |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+                async move { MemberResolveOutcome::Hit("upstream".to_string()) }
+            },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "cache0"),
+            other => panic!("expected Hit(cache0), got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a dominating hit must not fan out"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_phase_higher_priority_upstream_beats_lower_cache_hit() {
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |m| {
+                let class = if m.key == "m0" {
+                    (MemberCacheClass::NeedsUpstream, None)
+                } else {
+                    (MemberCacheClass::DefiniteHit, Some("cache1".to_string()))
+                };
+                async move { class }
+            },
+            |_m| async move { MemberResolveOutcome::Hit("upstream0".to_string()) },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "upstream0"),
+            other => panic!("expected Hit(upstream0), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_phase_falls_back_to_cache_hit_when_upstream_misses() {
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |m| {
+                let class = if m.key == "m0" {
+                    (MemberCacheClass::NeedsUpstream, None)
+                } else {
+                    (MemberCacheClass::DefiniteHit, Some("cache1".to_string()))
+                };
+                async move { class }
+            },
+            |_m| async move { MemberResolveOutcome::Miss },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "cache1"),
+            other => panic!("expected Hit(cache1), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_phase_all_miss_is_none_and_never_fans_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::DefiniteMiss, None) },
+            |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+                async move { MemberResolveOutcome::Hit("x".to_string()) }
+            },
+        )
+        .await;
+        assert!(out.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn two_phase_quarantine_block_surfaces_from_upstream() {
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| {
+                let r = if m.key == "m0" {
+                    MemberResolveOutcome::Quarantine("held".to_string())
+                } else {
+                    MemberResolveOutcome::Hit("hit1".to_string())
+                };
+                async move { r }
+            },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Quarantine(e)) => assert_eq!(e, "held"),
+            other => panic!("expected Quarantine(held), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_phase_returns_highest_priority_hit_even_if_lower_resolves_first() {
+        // Both members need upstream and both would hit, but the LOWER-priority
+        // member (m1) resolves immediately while the HIGHER-priority member (m0)
+        // is slower. The ordered finalize MUST still return m0's hit — the
+        // winner is decided by priority, never by which future resolves first.
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| {
+                let key = m.key.clone();
+                async move {
+                    if key == "m0" {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        MemberResolveOutcome::Hit("hit0".to_string())
+                    } else {
+                        MemberResolveOutcome::Hit("hit1".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(
+                v, "hit0",
+                "highest-priority hit must win regardless of resolution order"
+            ),
+            other => panic!("expected Hit(hit0), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_phase_cancels_lower_priority_loser_once_winner_known() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // m0 (highest priority) hits immediately; m1 would block for 10s. The
+        // resolver must return m0 promptly and DROP (cancel) m1's in-flight
+        // future rather than await it — so m1's completion flag stays false.
+        let members = two_members();
+        let lower_completed = Arc::new(AtomicBool::new(false));
+        let lc = lower_completed.clone();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            move |m| {
+                let key = m.key.clone();
+                let lc = lc.clone();
+                async move {
+                    if key == "m0" {
+                        MemberResolveOutcome::Hit("hit0".to_string())
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        lc.store(true, Ordering::SeqCst);
+                        MemberResolveOutcome::Hit("hit1".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hit0"),
+            "highest-priority immediate hit must win"
+        );
+        assert!(
+            !lower_completed.load(Ordering::SeqCst),
+            "the lower-priority loser must be cancelled, not awaited to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_phase_stops_probing_after_first_definite_hit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // member 0 is a DefiniteHit; members 1 and 2 must NOT be probed (they
+        // can never outrank it) — preserves the sequential loop's warm-path
+        // short-circuit so probe cost is O(rank of first hit), not O(N).
+        let members = vec![
+            test_local_member("m0"),
+            test_local_member("m1"),
+            test_local_member("m2"),
+        ];
+        let probes = Arc::new(AtomicUsize::new(0));
+        let p = probes.clone();
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let u = upstream_calls.clone();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            move |_m| {
+                p.fetch_add(1, Ordering::SeqCst);
+                async move { (MemberCacheClass::DefiniteHit, Some("hit0".to_string())) }
+            },
+            move |_m| {
+                u.fetch_add(1, Ordering::SeqCst);
+                async move { MemberResolveOutcome::Hit("upstream".to_string()) }
+            },
+        )
+        .await;
+        assert!(matches!(out, Some(MemberResolveOutcome::Hit(ref v)) if v == "hit0"));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "Pass 1 must stop probing at the first DefiniteHit"
+        );
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            0,
+            "a top hit fans out to nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_phase_confirm_top_candidate_hit_skips_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // Cold (no Pass-1 hit): the highest-priority candidate hits. Confirm-top-
+        // first (#2069) must return it WITHOUT launching the lower-priority
+        // candidates' upstream fetches — exactly ONE upstream request, no
+        // cold-positive fan-out.
+        let members = vec![
+            test_local_member("m0"),
+            test_local_member("m1"),
+            test_local_member("m2"),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            move |m| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let key = m.key.clone();
+                async move { MemberResolveOutcome::Hit(format!("hit-{key}")) }
+            },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "hit-m0"),
+            other => panic!("expected Hit(hit-m0), got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "confirm-top-first must contact only the top candidate when it hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_phase_top_candidate_miss_fans_out_rest_in_priority() {
+        // Cold: the top candidate misses, so the rest are fanned out and the
+        // highest-priority non-miss among them wins (strict priority).
+        let members = vec![
+            test_local_member("m0"),
+            test_local_member("m1"),
+            test_local_member("m2"),
+        ];
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::NeedsUpstream, None) },
+            |m| {
+                let key = m.key.clone();
+                async move {
+                    if key == "m0" {
+                        MemberResolveOutcome::Miss
+                    } else {
+                        MemberResolveOutcome::Hit(format!("hit-{key}"))
+                    }
+                }
+            },
+        )
+        .await;
+        match out {
+            Some(MemberResolveOutcome::Hit(v)) => assert_eq!(
+                v, "hit-m1",
+                "after the top candidate misses, the highest-priority remaining hit wins"
+            ),
+            other => panic!("expected Hit(hit-m1), got {other:?}"),
+        }
+    }
+
+    // ── Two-phase virtual fan-out: probe / upstream classifiers (pure) ──
+
+    #[test]
+    fn classify_cache_probe_maps_hit_miss_negative() {
+        use crate::error::AppError;
+        let (class, hit) = classify_cache_probe::<i32>(Ok(Some(7)));
+        assert_eq!(class, MemberCacheClass::DefiniteHit);
+        assert_eq!(hit, Some(7));
+
+        let (class, hit) = classify_cache_probe::<i32>(Ok(None));
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+        assert!(hit.is_none());
+
+        // A negative-cached 404 surfaces as Err -> definite miss (no re-fetch).
+        let (class, hit) = classify_cache_probe::<i32>(Err(AppError::NotFound("neg".into())));
+        assert_eq!(class, MemberCacheClass::DefiniteMiss);
+        assert!(hit.is_none());
+
+        // A quarantine block (#1770) from a *cached* held entry must NOT be
+        // dropped: it is re-resolved in Pass 2 (which surfaces the 409/403),
+        // so it classifies NeedsUpstream, not DefiniteMiss.
+        let (class, _) = classify_cache_probe::<i32>(Err(AppError::Conflict("held".into())));
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+        let (class, _) =
+            classify_cache_probe::<i32>(Err(AppError::Authorization("rejected".into())));
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+    }
+
+    #[test]
+    fn classify_stream_upstream_maps_hit_quarantine_miss() {
+        use crate::error::AppError;
+        match classify_stream_upstream(Ok(empty_stream_result()), "k", "p") {
+            MemberResolveOutcome::Hit(_) => {}
+            other => panic!("expected Hit, got {other:?}"),
+        }
+        // A quarantine block (409) must surface as Quarantine with a 409 status.
+        match classify_stream_upstream(Err(AppError::Conflict("held".into())), "k", "p") {
+            MemberResolveOutcome::Quarantine(resp) => {
+                assert_eq!(resp.status(), StatusCode::CONFLICT)
+            }
+            other => panic!("expected Quarantine, got {other:?}"),
+        }
+        // An ordinary 404 is a miss, not a surfacing error.
+        match classify_stream_upstream(Err(AppError::NotFound("gone".into())), "k", "p") {
+            MemberResolveOutcome::Miss => {}
+            other => panic!("expected Miss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_streaming_cache_probe_maps_hit_miss_negative() {
+        use crate::error::AppError;
+        let (class, resp) =
+            classify_streaming_cache_probe(Ok(Some(empty_stream_result())), "text/xml", None);
+        assert_eq!(class, MemberCacheClass::DefiniteHit);
+        assert!(resp.is_some());
+
+        let (class, resp) = classify_streaming_cache_probe(Ok(None), "text/xml", None);
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+        assert!(resp.is_none());
+
+        let (class, resp) =
+            classify_streaming_cache_probe(Err(AppError::NotFound("neg".into())), "text/xml", None);
+        assert_eq!(class, MemberCacheClass::DefiniteMiss);
+        assert!(resp.is_none());
+
+        // A quarantine block (#1770) re-resolves in Pass 2 → NeedsUpstream.
+        let (class, _) = classify_streaming_cache_probe(
+            Err(AppError::Conflict("held".into())),
+            "text/xml",
+            None,
+        );
+        assert_eq!(class, MemberCacheClass::NeedsUpstream);
+    }
+
+    #[test]
+    fn classify_streaming_local_maps_hit_and_miss() {
+        let (class, resp) =
+            classify_streaming_local(Ok(empty_stream_result()), "application/json", Some("f.bin"));
+        assert_eq!(class, MemberCacheClass::DefiniteHit);
+        assert!(resp.is_some());
+
+        let miss = Err((StatusCode::NOT_FOUND, "missing").into_response());
+        let (class, resp) = classify_streaming_local(miss, "application/json", None);
+        assert_eq!(class, MemberCacheClass::DefiniteMiss);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn classify_streaming_upstream_maps_hit_quarantine_miss() {
+        let ok = Ok((StatusCode::OK, "body").into_response());
+        match classify_streaming_upstream(ok) {
+            MemberResolveOutcome::Hit(r) => assert_eq!(r.status(), StatusCode::OK),
+            other => panic!("expected Hit, got {other:?}"),
+        }
+        // A 409/403 Response is a quarantine block that must surface.
+        let held = Err((StatusCode::CONFLICT, "held").into_response());
+        match classify_streaming_upstream(held) {
+            MemberResolveOutcome::Quarantine(r) => assert_eq!(r.status(), StatusCode::CONFLICT),
+            other => panic!("expected Quarantine, got {other:?}"),
+        }
+        // Any other error Response is a miss.
+        let gone = Err((StatusCode::NOT_FOUND, "gone").into_response());
+        match classify_streaming_upstream(gone) {
+            MemberResolveOutcome::Miss => {}
+            other => panic!("expected Miss, got {other:?}"),
+        }
+    }
+
+    // ── Two-phase virtual fan-out: orchestration (no proxy / no network) ──
+    //
+    // These exercise `resolve_virtual_download_from_members` over Local and
+    // un-proxyable members (proxy_service = None), so they need neither a
+    // database nor an upstream. The Remote cache-probe / parallel upstream
+    // branches require a live `ProxyService` and are covered by the virtual
+    // resolution integration tests.
+
+    fn empty_stream_result() -> StreamingFetchResult {
+        StreamingFetchResult {
+            body: Box::pin(futures::stream::empty()),
+            content_type: None,
+            content_length: Some(0),
+        }
+    }
+
+    fn test_local_member(key: &str) -> Repository {
+        let mut r = build_remote_repo(Uuid::new_v4(), key, "https://unused.example.com");
+        r.repo_type = RepositoryType::Local;
+        r.upstream_url = None;
+        r
+    }
+
+    #[tokio::test]
+    async fn resolve_from_members_empty_is_404() {
+        let res = resolve_virtual_download_from_members(
+            Vec::new(),
+            None,
+            "g/a/1.0/a-1.0.jar",
+            |_id, _loc| async { Ok(empty_stream_result()) },
+        )
+        .await;
+        assert_eq!(res.err().map(|r| r.status()), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn resolve_from_members_returns_local_hit() {
+        let members = vec![test_local_member("maven-local")];
+        let res = resolve_virtual_download_from_members(
+            members,
+            None,
+            "g/a/1.0/a-1.0.jar",
+            |_id, _loc| async { Ok(empty_stream_result()) },
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "a local member that has the artifact must serve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_from_members_all_miss_is_404() {
+        // One local member that misses + one remote member that cannot be
+        // proxied (no proxy service) => skipped => overall 404.
+        let members = vec![
+            test_local_member("maven-local"),
+            build_remote_repo(Uuid::new_v4(), "maven-remote", "https://repo1.example.com"),
+        ];
+        let res = resolve_virtual_download_from_members(
+            members,
+            None,
+            "g/a/1.0/a-1.0.jar",
+            |_id, _loc| async { Err((StatusCode::NOT_FOUND, "missing").into_response()) },
+        )
+        .await;
+        assert_eq!(res.err().map(|r| r.status()), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn resolve_from_members_falls_through_to_lower_priority_local() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // Highest-priority local misses; the next local has it. With no member
+        // pending upstream, the lower-priority hit must win.
+        let members = vec![
+            test_local_member("maven-local-a"),
+            test_local_member("maven-local-b"),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let res = resolve_virtual_download_from_members(
+            members,
+            None,
+            "g/a/1.0/a-1.0.jar",
+            move |_id, _loc| {
+                let n = calls2.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err((StatusCode::NOT_FOUND, "miss").into_response())
+                    } else {
+                        Ok(empty_stream_result())
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "lower-priority local hit must be served");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both locals are probed in order"
+        );
     }
 
     #[test]
@@ -6186,18 +7244,28 @@ mod tests {
     // so the pin reads its own source rather than another handler.
     // -------------------------------------------------------------------
 
+    /// Source slice of one top-level item starting at `start`, bounded at the
+    /// next column-0 `}` line (the item's own closing brace — body lines are all
+    /// indented, so this matches only the top-level close). Keeps the
+    /// #1215/#1555 source-guard pins robust to the function growing or being
+    /// reordered, instead of relying on a fixed byte window.
+    fn item_body(src: &str, start: usize) -> &str {
+        let rel_end = src[start..]
+            .find("\n}\n")
+            .map(|e| e + 3)
+            .unwrap_or(src.len() - start);
+        &src[start..start + rel_end]
+    }
+
     #[test]
     fn test_try_remote_or_virtual_download_remote_uses_streaming_helper_1215() {
         let src = include_str!("proxy_helpers.rs");
         let fn_start = src
             .find("pub async fn try_remote_or_virtual_download(")
             .expect("try_remote_or_virtual_download must exist");
-        // Bound the window to just this function so the streaming token
-        // from elsewhere in the file does not satisfy the assertion
-        // vacuously. The closing brace of the function comes before the
-        // next `pub` item; a generous window of 8 KiB safely covers it.
-        let window_end = (fn_start + 8192).min(src.len());
-        let window = &src[fn_start..window_end];
+        // Bound the window to just this function so a streaming token elsewhere
+        // in the file cannot satisfy the assertion vacuously.
+        let window = item_body(src, fn_start);
         assert!(
             window.contains("proxy_fetch_streaming_with_disposition("),
             "`try_remote_or_virtual_download`'s Remote arm MUST call \
@@ -6219,8 +7287,7 @@ mod tests {
         let fn_start = src
             .find("pub async fn try_remote_or_virtual_download(")
             .expect("try_remote_or_virtual_download must exist");
-        let window_end = (fn_start + 8192).min(src.len());
-        let window = &src[fn_start..window_end];
+        let window = item_body(src, fn_start);
         assert!(
             window.contains("resolve_virtual_download_streaming("),
             "`try_remote_or_virtual_download`'s Virtual arm MUST call \
@@ -6236,19 +7303,32 @@ mod tests {
 
     #[test]
     fn test_resolve_virtual_download_streaming_uses_streaming_helper_1215() {
+        // #1215: Remote members of a Virtual repo MUST stream, never buffer.
+        // The two-phase resolver (#2069) drives each Remote member's upstream
+        // fetch through `proxy_fetch_streaming_member(`, which in turn calls the
+        // streaming `fetch_artifact_streaming(` (not the buffered `fetch_artifact`).
         let src = include_str!("proxy_helpers.rs");
         let fn_start = src
             .find("pub async fn resolve_virtual_download_streaming<")
             .expect("resolve_virtual_download_streaming must exist");
-        let window_end = (fn_start + 4096).min(src.len());
-        let window = &src[fn_start..window_end];
+        let window = item_body(src, fn_start);
         assert!(
-            window.contains("proxy_fetch_streaming_with_disposition("),
-            "`resolve_virtual_download_streaming` MUST drive Remote \
-             members through `proxy_fetch_streaming_with_disposition(` \
-             (#1215). Buffering each Remote member's body before serving \
-             it would defeat the whole point of having a streaming \
-             resolver."
+            window.contains("proxy_fetch_streaming_member("),
+            "`resolve_virtual_download_streaming` MUST drive Remote members \
+             through the streaming `proxy_fetch_streaming_member(` helper \
+             (#1215/#2069). Buffering each Remote member's body before serving \
+             it would defeat the whole point of having a streaming resolver."
+        );
+
+        // And that helper must itself stream, not buffer.
+        let helper_start = src
+            .find("async fn proxy_fetch_streaming_member(")
+            .expect("proxy_fetch_streaming_member must exist");
+        let helper_window = item_body(src, helper_start);
+        assert!(
+            helper_window.contains("fetch_artifact_streaming("),
+            "`proxy_fetch_streaming_member` MUST use the streaming \
+             `fetch_artifact_streaming(` (#1215), never a buffered fetch."
         );
     }
 
@@ -6258,32 +7338,41 @@ mod tests {
         // served as a presigned redirect, NOT streamed through the
         // backend. Streaming holds a worker thread for the whole transfer
         // and saturates the dispatcher under burst load. The redirect
-        // attempt must sit BEFORE the streaming fallback so cached bodies
-        // never reach `proxy_fetch_streaming_with_disposition`.
+        // attempt (Pass 1, via `try_member_cache_redirect(`) must sit BEFORE
+        // the streaming fallback (Pass 2, `proxy_fetch_streaming_member(`) so
+        // cached bodies never get streamed through the backend.
         let src = include_str!("proxy_helpers.rs");
         let fn_start = src
             .find("pub async fn resolve_virtual_download_streaming<")
             .expect("resolve_virtual_download_streaming must exist");
-        let window_end = (fn_start + 4096).min(src.len());
-        let window = &src[fn_start..window_end];
+        let window = item_body(src, fn_start);
 
-        let redirect_pos = window.find("try_proxy_cache_redirect(").expect(
-            "`resolve_virtual_download_streaming` MUST attempt \
-             `try_proxy_cache_redirect(` for fresh proxy-cache hits (#1555).",
-        );
-        assert!(
-            window.contains("is_cache_fresh("),
-            "redirect fast-path MUST gate on a metadata-only \
-             `is_cache_fresh(` probe (#1555) so it never pulls the body.",
+        let redirect_pos = window.find("try_member_cache_redirect(").expect(
+            "`resolve_virtual_download_streaming` MUST attempt the presigned \
+             redirect fast path via `try_member_cache_redirect(` (#1555).",
         );
         let stream_pos = window
-            .find("proxy_fetch_streaming_with_disposition(")
+            .find("proxy_fetch_streaming_member(")
             .expect("streaming fallback must still exist (#1215)");
         assert!(
             redirect_pos < stream_pos,
             "the presigned redirect attempt (#1555) MUST come BEFORE the \
              streaming fallback (#1215); otherwise cached large artifacts \
              still stream through the backend.",
+        );
+
+        // The redirect helper itself must call `try_proxy_cache_redirect(` and
+        // gate on a metadata-only `is_cache_fresh(` probe so it never pulls the
+        // body just to decide whether to redirect (#1555).
+        let helper_start = src
+            .find("async fn try_member_cache_redirect(")
+            .expect("try_member_cache_redirect must exist");
+        let helper_window = item_body(src, helper_start);
+        assert!(
+            helper_window.contains("try_proxy_cache_redirect(")
+                && helper_window.contains("is_cache_fresh("),
+            "`try_member_cache_redirect` MUST attempt `try_proxy_cache_redirect(` \
+             gated on a metadata-only `is_cache_fresh(` probe (#1555).",
         );
     }
 
@@ -6298,16 +7387,15 @@ mod tests {
 
         for fn_name in [
             "pub async fn proxy_fetch_or_redirect(",
-            "pub async fn resolve_virtual_download_streaming<",
+            // The Virtual streaming resolver's presign moved into this helper
+            // (#2069 two-phase refactor); it is where the no-prefix handle is used.
+            "async fn try_member_cache_redirect(",
             "pub async fn local_fetch_or_redirect(",
         ] {
             let fn_start = src
                 .find(fn_name)
                 .unwrap_or_else(|| panic!("{fn_name} must exist"));
-            // Window large enough to cover the function body but bounded so a
-            // later function's tokens cannot satisfy the assertion.
-            let window_end = (fn_start + 4096).min(src.len());
-            let window = &src[fn_start..window_end];
+            let window = item_body(src, fn_start);
 
             assert!(
                 window.contains("cache_storage_backend("),
@@ -6322,8 +7410,7 @@ mod tests {
         let fn_start = src
             .find("pub async fn proxy_fetch_or_redirect(")
             .expect("proxy_fetch_or_redirect must exist");
-        let window_end = (fn_start + 4096).min(src.len());
-        let window = &src[fn_start..window_end];
+        let window = item_body(src, fn_start);
         assert!(
             !window.contains("storage_for_repo("),
             "`proxy_fetch_or_redirect` MUST NOT sign proxy-cache keys through \

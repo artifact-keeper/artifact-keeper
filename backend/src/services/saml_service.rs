@@ -860,6 +860,13 @@ impl SamlService {
                 SET email = $1, display_name = $2, is_admin = $3,
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
+                  AND (
+                    email IS DISTINCT FROM $1
+                    OR display_name IS DISTINCT FROM $2
+                    OR is_admin IS DISTINCT FROM $3
+                    OR last_login_at IS NULL
+                    OR last_login_at < NOW() - INTERVAL '5 minutes'
+                  )
                 "#,
                 saml_user.email,
                 saml_user.display_name,

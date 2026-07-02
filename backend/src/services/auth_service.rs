@@ -989,15 +989,29 @@ impl AuthService {
             ));
         }
 
-        // Successful login: reset lockout counters and record last login
+        // Successful login: reset lockout counters and record last login.
+        // last_login_at is throttled to once per 5 minutes (display-only field,
+        // #2107), but the lockout counters MUST always be reset on a valid
+        // login, so the row is still written whenever any counter is non-clean.
         sqlx::query!(
             r#"
             UPDATE users
-            SET last_login_at = NOW(),
+            SET last_login_at = CASE
+                    WHEN last_login_at IS NULL
+                         OR last_login_at < NOW() - INTERVAL '5 minutes'
+                    THEN NOW() ELSE last_login_at
+                END,
                 failed_login_attempts = 0,
                 locked_until = NULL,
                 last_failed_login_at = NULL
             WHERE id = $1
+              AND (
+                last_login_at IS NULL
+                OR last_login_at < NOW() - INTERVAL '5 minutes'
+                OR failed_login_attempts > 0
+                OR locked_until IS NOT NULL
+                OR last_failed_login_at IS NOT NULL
+              )
             "#,
             user.id
         )
@@ -1981,9 +1995,12 @@ impl AuthService {
             ));
         }
 
-        // Update last login
+        // Update last login. Throttled to at most once per 5 minutes per user
+        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() \
+             WHERE id = $1 \
+               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)
@@ -2006,9 +2023,12 @@ impl AuthService {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
-        // Update last login
+        // Update last login. Throttled to at most once per 5 minutes per user
+        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() \
+             WHERE id = $1 \
+               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)
@@ -2595,6 +2615,153 @@ fn check_token_validation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // last_login_at write throttling (#2107)
+    //
+    // These DB-backed tests no-op cleanly when DATABASE_URL is unset. CI
+    // provisions Postgres + migrations before `cargo test --lib`, so they run
+    // for real there.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_password_login_throttles_last_login_but_always_resets_lockout() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        let id = Uuid::new_v4();
+        let username = format!("throttle_pw_{id}");
+        let password = "Correct!Horse9Battery";
+        let hash = AuthService::hash_password(password).await.unwrap();
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'local', true, false)",
+            id,
+            username,
+            format!("{username}@example.com"),
+            hash
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (1) First successful login records last_login_at.
+        svc.authenticate(&username, password).await.unwrap();
+        let t1: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(t1.is_some(), "first login must set last_login_at");
+
+        // (2) A second login inside the 5-minute window does NOT advance it.
+        svc.authenticate(&username, password).await.unwrap();
+        let t2: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(t1, t2, "last_login_at must not advance within 5 minutes");
+
+        // (3) SECURITY: even inside the throttle window, a valid login MUST
+        // still clear lockout counters, or a user stays locked after logging
+        // in with the correct password.
+        sqlx::query!(
+            "UPDATE users \
+             SET failed_login_attempts = 3, \
+                 locked_until = NOW() + INTERVAL '10 minutes', \
+                 last_failed_login_at = NOW() \
+             WHERE id = $1",
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        svc.authenticate(&username, password).await.unwrap();
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until, last_failed_login_at, last_login_at \
+             FROM users WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.failed_login_attempts, 0,
+            "lockout counter must reset on valid login even within throttle window"
+        );
+        assert!(row.locked_until.is_none(), "locked_until must clear");
+        assert!(
+            row.last_failed_login_at.is_none(),
+            "last_failed_login_at must clear"
+        );
+        assert_eq!(
+            row.last_login_at, t1,
+            "last_login_at still throttled inside the window"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_standalone_login_throttles_last_login_at() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        // LDAP hybrid mode: password_hash stored, auth_provider = 'ldap'.
+        let id = Uuid::new_v4();
+        let username = format!("throttle_ldap_{id}");
+        let password = "Correct!Horse9Battery";
+        let hash = AuthService::hash_password(password).await.unwrap();
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'ldap', true, false)",
+            id,
+            username,
+            format!("{username}@example.com"),
+            hash
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (1) First login sets last_login_at on the standalone path.
+        svc.authenticate_ldap(&username, password).await.unwrap();
+        let t1: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            t1.is_some(),
+            "first standalone login must set last_login_at"
+        );
+
+        // (2) A repeat login within 5 minutes does NOT advance it.
+        svc.authenticate_ldap(&username, password).await.unwrap();
+        let t2: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            t1, t2,
+            "standalone last_login_at must not advance within 5 minutes"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn test_password_hashing() {

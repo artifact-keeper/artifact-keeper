@@ -4496,6 +4496,20 @@ pub async fn delete_artifact(
         .delete_with_sync_options(artifact, !is_replication)
         .await?;
 
+    // Deleting a Maven artifact changes the version set for its GAV, so drop
+    // any cached maven-metadata.xml for it; otherwise a GET within the 60s TTL
+    // would keep listing the just-removed version.
+    if repo.format == RepositoryFormat::Maven {
+        if let Ok(coords) = MavenHandler::parse_coordinates(&path) {
+            crate::api::handlers::maven::invalidate_maven_metadata_cache(
+                repo.id,
+                &coords.group_id,
+                &coords.artifact_id,
+            )
+            .await;
+        }
+    }
+
     Ok(())
 }
 

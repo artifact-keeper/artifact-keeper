@@ -374,13 +374,20 @@ pub struct PomDependency {
     pub optional: Option<String>,
 }
 
-/// Generate maven-metadata.xml content
+/// Generate maven-metadata.xml content.
+///
+/// `last_updated` is written verbatim into the `<lastUpdated>` element. It is
+/// supplied by the caller so a Hot path can pin it to `MAX(artifacts.updated_at)`
+/// for the GAV rather than recomputing per request — required for the
+/// conditional-GET (`ETag` / `304`) caching to actually pay off (#2079).
+/// Maven wire format is `YYYYMMDDHHMMSS` in UTC.
 pub fn generate_metadata_xml(
     group_id: &str,
     artifact_id: &str,
     versions: &[String],
     latest: &str,
     release: Option<&str>,
+    last_updated: &str,
 ) -> String {
     let mut versions_xml = String::new();
     for v in versions {
@@ -405,12 +412,7 @@ pub fn generate_metadata_xml(
   </versioning>
 </metadata>
 "#,
-        group_id,
-        artifact_id,
-        latest,
-        release_line,
-        versions_xml,
-        chrono::Utc::now().format("%Y%m%d%H%M%S")
+        group_id, artifact_id, latest, release_line, versions_xml, last_updated,
     )
 }
 
@@ -757,11 +759,28 @@ mod tests {
             &["1.0.0".to_string(), "1.1.0".to_string()],
             "1.1.0",
             Some("1.1.0"),
+            "20240101000000",
         );
         assert!(xml.contains("<groupId>com.example</groupId>"));
         assert!(xml.contains("<artifactId>mylib</artifactId>"));
         assert!(xml.contains("<latest>1.1.0</latest>"));
         assert!(xml.contains("<release>1.1.0</release>"));
+        assert!(xml.contains("<lastUpdated>20240101000000</lastUpdated>"));
+    }
+
+    #[test]
+    fn test_generate_metadata_default_last_updated_format() {
+        let xml = generate_metadata_xml(
+            "com.example",
+            "mylib",
+            &["1.0.0".to_string()],
+            "1.0.0",
+            None,
+            "20250208235959",
+        );
+        // no release block when None
+        assert!(!xml.contains("<release>"));
+        assert!(xml.contains("<lastUpdated>20250208235959</lastUpdated>"));
     }
 
     #[test]
@@ -772,6 +791,7 @@ mod tests {
             &["1.0.0".into(), "1.1.0".into()],
             "1.1.0",
             Some("1.1.0"),
+            "20240101000000",
         );
         let (g, a, versions) = parse_metadata_versions(&xml).unwrap();
         assert_eq!(g, "com.example");
@@ -839,6 +859,7 @@ mod tests {
             &["1.0.0".into(), "1.1.0".into()],
             "1.1.0",
             Some("1.1.0"),
+            "20240101000000",
         );
         assert!(parse_plugin_prefix_entries(&xml).is_empty());
     }
@@ -880,6 +901,7 @@ mod tests {
             &["1.0.0".into()],
             "1.0.0",
             Some("1.0.0"),
+            "20240101000000",
         );
         assert!(merge_plugin_prefix_metadata(&[versions_doc, "<metadata/>".to_string()]).is_none());
     }
