@@ -26,4 +26,20 @@ ignore = [
     # rand::rng(), so the unsound code path is unreachable from artifact-keeper.
     # Re-evaluate once upstream deps bump their rand pins.
     "RUSTSEC-2026-0097",
+
+    # quick-xml XML-parser DoS batch (RUSTSEC-2026-0194: O(N^2) start-tag
+    # duplicate-attribute check; RUSTSEC-2026-0195: unbounded NsReader
+    # namespace-declaration allocation; both fixed in quick-xml >= 0.41.0).
+    # Our DIRECT quick-xml dependency is now 0.41.0, which patches every
+    # attacker-reachable parse path (SAML response parsing, proxied
+    # maven-metadata/nuget, rpm, and artifactory import). The ONLY remaining
+    # 0.39.x instance is bundled transitively by object_store 0.13.2, which we
+    # use solely to parse trusted operator-configured storage responses
+    # (S3/GCS/Azure ListBucket, multipart, and delete XML) -- never attacker
+    # input. No published object_store release depends on quick-xml >= 0.41 yet
+    # (0.13.2 and 0.14.0 both cap at ^0.39/^0.40.1), so it cannot be upgraded
+    # out today. Removal of the object_store-transitive 0.39.x is tracked in
+    # issue #2158.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
