@@ -58,7 +58,7 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # picks up fixed versions of its bundled Go deps (docker, containerd, stdlib),
 # so its residual CVEs are upstream-unfixable for now and are documented/
 # suppressed in /.trivyignore rather than "bumped away".
-FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

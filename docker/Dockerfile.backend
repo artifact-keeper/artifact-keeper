@@ -178,7 +178,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # newer Grype build that picks up fixed versions of its bundled Go deps
 # (docker, containerd, stdlib), so its residual CVEs are upstream-unfixable for
 # now and are documented/suppressed in /.trivyignore rather than "bumped away".
-FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
