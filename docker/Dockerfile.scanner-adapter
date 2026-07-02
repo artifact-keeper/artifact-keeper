@@ -38,7 +38,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # arm64 build gets the arm64 trivy and the amd64 build gets amd64. Pinned to
 # 0.71.2 (rig-standard; #2090's backend tests assert trivy-0.71.2). Aqua
 # publishes both linux/amd64 and linux/arm64 for this tag.
-FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy
+FROM ghcr.io/aquasecurity/trivy:0.72.0 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 FROM alpine:3.20
