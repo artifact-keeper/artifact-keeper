@@ -4197,6 +4197,7 @@ mod tests {
             &["3.0.0".to_string()],
             "3.0.0",
             Some("3.0.0"),
+            "20240101000000",
         );
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4253,6 +4254,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path((virtual_key.clone(), meta_path.clone())),
+            HeaderMap::new(),
         )
         .await
         .expect("virtual metadata download must succeed");
