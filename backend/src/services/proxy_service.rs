@@ -2134,6 +2134,35 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys).await
     }
 
+    /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
+    ///
+    /// The redirect fast path (`proxy_fetch_or_redirect` and the virtual-member
+    /// proxy redirect) short-circuits a fresh cache hit into a 302 pointing at a
+    /// presigned URL without ever pulling the body through the backend. That skips
+    /// the quarantine gate the buffered/streaming fetch paths enforce via
+    /// [`check_quarantine_until`], so on redirect-capable backends a fresh entry
+    /// still inside its hold window would be handed out. This probe closes that
+    /// gap: it loads the same cache sidecar and applies the identical hold
+    /// decision BEFORE any redirect is issued.
+    ///
+    /// Mirrors the B6-safe stance elsewhere in this service (see the follower
+    /// re-check in `fetch_artifact_with_cache_path_and_accept`): a missing
+    /// sidecar, an absent hold, an elapsed hold, or a sidecar READ error all
+    /// resolve to `Ok(())` ("no hold known"). Only a sidecar recording a
+    /// still-active `quarantine_until` returns `Err` (Conflict/Authorization),
+    /// which the handler maps to 409/403 — no redirect, no upstream refetch.
+    pub async fn cache_quarantine_gate(&self, repo_key: &str, path: &str) -> Result<()> {
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        if let Some(metadata) = self
+            .load_cache_metadata(&metadata_key)
+            .await
+            .unwrap_or(None)
+        {
+            check_quarantine_until(metadata.quarantine_until)?;
+        }
+        Ok(())
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
@@ -6207,6 +6236,113 @@ SHA256:
             checksum_sha256: String::new(),
         };
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    /// Build a fresh sidecar carrying the supplied Package Age Policy hold
+    /// (`quarantine_until`). Used to drive `cache_quarantine_gate` (#2075)
+    /// through the held / elapsed / no-hold states.
+    fn metadata_bytes_with_quarantine(quarantine_until: Option<DateTime<Utc>>) -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_blocks_when_hold_active() {
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(Some(until))),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let err = service
+            .cache_quarantine_gate("npm-proxy", "lodash")
+            .await
+            .expect_err("an active hold must block the redirect fast path");
+        match err {
+            AppError::Conflict(_) => {}
+            other => panic!("expected Conflict for an active hold, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_hold_elapsed() {
+        let until = Utc::now() - chrono::Duration::minutes(30);
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(Some(until))),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "an elapsed hold must not block the redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_no_hold() {
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(None)),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a sidecar with no hold must not block the redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_sidecar_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a missing sidecar means no hold known -> allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_on_sidecar_read_error() {
+        // Malformed JSON makes load_metadata return Err (not NotFound); the
+        // B6-safe stance degrades that to "no hold known" -> Ok, so a transient
+        // sidecar read/parse failure never blocks a legitimate redirect.
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(Bytes::from_static(b"{ not valid json")),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a sidecar read/parse error must be treated as no hold known"
+        );
     }
 
     #[tokio::test]
