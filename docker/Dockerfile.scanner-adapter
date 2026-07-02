@@ -41,7 +41,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
-FROM alpine:3.20
+FROM alpine:3.24
 
 # ca-certificates: TLS to the trivy vuln-DB registry / HTTPS registries.
 # git + rpm: trivy uses them for certain package/source scanners.
