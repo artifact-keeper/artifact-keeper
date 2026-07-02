@@ -16,7 +16,7 @@
 # ---------- Stage 1: cross-compile the Go adapter ----------
 # Pinned to the BUILDPLATFORM so the toolchain runs natively and cross-compiles
 # to the requested TARGET arch (fast, no emulation for the compile step).
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
