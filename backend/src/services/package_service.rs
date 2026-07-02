@@ -11,6 +11,30 @@ use uuid::Uuid;
 
 use crate::services::curation_service::version_compare;
 
+/// Deterministic `package_versions` upsert, shared by both arms of the
+/// combined catalog statement in
+/// [`PackageService::create_or_update_from_artifact`] (#2110).
+///
+/// Binds: `$1` = package_id, `$2` = version, `$3` = size_bytes,
+/// `$4` = checksum_sha256. The `WHERE` guard keeps the representative row
+/// deterministic across peers (lexicographically smallest
+/// `(checksum, size)` wins) instead of "last writer wins". `RETURNING`
+/// exposes the post-upsert `size_bytes` to the outer statement when the
+/// insert or update actually happened; an unreferenced data-modifying CTE
+/// still executes exactly once.
+const VERSION_UPSERT_CTE: &str = r#"
+                WITH upserted AS (
+                    INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (package_id, version) DO UPDATE SET
+                        size_bytes      = EXCLUDED.size_bytes,
+                        checksum_sha256 = EXCLUDED.checksum_sha256
+                    WHERE (EXCLUDED.checksum_sha256, EXCLUDED.size_bytes)
+                        < (package_versions.checksum_sha256, package_versions.size_bytes)
+                    RETURNING size_bytes
+                )
+"#;
+
 /// Service for managing package and package_version records.
 pub struct PackageService {
     db: PgPool,
@@ -45,12 +69,24 @@ impl PackageService {
         // the latest known version. The row's size is synchronized after the
         // deterministic `package_versions` upsert below so multi-asset package
         // formats do not depend on upload or replication order.
-        let inserted: Option<(Uuid,)> = sqlx::query_as(
+        //
+        // On conflict the update is a deliberate no-op whose only purpose is
+        // to make `RETURNING` yield the existing row (`ON CONFLICT DO
+        // NOTHING` returns nothing), collapsing the previous
+        // insert-then-select round trips into one (#2110). The returned
+        // `version` is the pre-existing one on conflict and the incoming one
+        // on a fresh insert, so the `version_compare(...) >= 0` gate below
+        // reduces to the old behavior in both cases (a fresh insert compares
+        // equal to itself and updates, matching the old `inserted => true`
+        // arm). `updated_at` is bumped by the follow-up statement on every
+        // path, exactly as before.
+        let (package_id, current_version): (Uuid, String) = sqlx::query_as(
             r#"
             INSERT INTO packages (repository_id, name, version, description, size_bytes, metadata)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (repository_id, name) DO NOTHING
-            RETURNING id
+            ON CONFLICT (repository_id, name) DO UPDATE
+                SET updated_at = packages.updated_at
+            RETURNING id, version
             "#,
         )
         .bind(repository_id)
@@ -59,26 +95,10 @@ impl PackageService {
         .bind(description)
         .bind(size_bytes)
         .bind(&metadata)
-        .fetch_optional(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
-        let (package_id, should_update_package_row) = if let Some((package_id,)) = inserted {
-            (package_id, true)
-        } else {
-            let existing: (Uuid, String) = sqlx::query_as(
-                r#"
-                SELECT id, version
-                FROM packages
-                WHERE repository_id = $1 AND name = $2
-                "#,
-            )
-            .bind(repository_id)
-            .bind(name)
-            .fetch_one(&self.db)
-            .await?;
-
-            (existing.0, version_compare(version, &existing.1) >= 0)
-        };
+        let should_update_package_row = version_compare(version, &current_version) >= 0;
 
         // Keep `package_versions` deterministic when a package format
         // publishes multiple physical assets for the same version. Different
@@ -86,56 +106,60 @@ impl PackageService {
         // wheel/sdist artifacts in different
         // orders during replication recovery, so "last writer wins" makes
         // otherwise-equivalent repositories diverge at the DB row level.
-        sqlx::query(
-            r#"
-            INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (package_id, version) DO UPDATE SET
-                size_bytes      = EXCLUDED.size_bytes,
-                checksum_sha256 = EXCLUDED.checksum_sha256
-            WHERE (EXCLUDED.checksum_sha256, EXCLUDED.size_bytes)
-                < (package_versions.checksum_sha256, package_versions.size_bytes)
-            "#,
-        )
-        .bind(package_id)
-        .bind(version)
-        .bind(size_bytes)
-        .bind(checksum_sha256)
-        .execute(&self.db)
-        .await?;
-
+        //
+        // The `packages`-row synchronization is folded into the same
+        // statement via a data-modifying CTE (#2110) — one round trip
+        // instead of two. CTE visibility rules matter here: the outer
+        // UPDATE's subqueries see the snapshot from BEFORE the statement, so
+        // the representative `size_bytes` must come from the CTE's
+        // `RETURNING` (fresh insert / winning update) and only fall back to
+        // the pre-existing `package_versions` row when the deterministic
+        // guard rejected the update (in which case that row is unchanged and
+        // still the representative).
         if should_update_package_row {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
+                {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET version = $2,
-                    description = COALESCE($3, description),
-                    size_bytes = (
-                        SELECT pv.size_bytes
-                        FROM package_versions pv
-                        WHERE pv.package_id = packages.id
-                          AND pv.version = $2
+                    description = COALESCE($5, description),
+                    size_bytes = COALESCE(
+                        (SELECT upserted.size_bytes FROM upserted),
+                        (
+                            SELECT pv.size_bytes
+                            FROM package_versions pv
+                            WHERE pv.package_id = packages.id
+                              AND pv.version = $2
+                        )
                     ),
-                    metadata = COALESCE($4, metadata),
+                    metadata = COALESCE($6, metadata),
                     updated_at = NOW()
                 WHERE id = $1
-                "#,
-            )
+                "#
+            ))
             .bind(package_id)
             .bind(version)
+            .bind(size_bytes)
+            .bind(checksum_sha256)
             .bind(description)
             .bind(&metadata)
             .execute(&self.db)
             .await?;
         } else {
-            sqlx::query(
+            // Data-modifying CTEs execute exactly once even when
+            // unreferenced, so the version upsert still runs.
+            sqlx::query(&format!(
                 r#"
+                {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET updated_at = NOW()
                 WHERE id = $1
-                "#,
-            )
+                "#
+            ))
             .bind(package_id)
+            .bind(version)
+            .bind(size_bytes)
+            .bind(checksum_sha256)
             .execute(&self.db)
             .await?;
         }
@@ -322,6 +346,113 @@ mod tests {
         assert_eq!(row.0, 300);
         assert_eq!(row.1, 300);
         assert_eq!(row.2, checksum_a);
+    }
+
+    #[tokio::test]
+    async fn test_repeat_upsert_same_version_is_idempotent() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "idempotent-package";
+        let version = "1.0.0";
+        let checksum = "d".repeat(64);
+
+        // Same (name, version, size, checksum) twice — the shape of a proxy
+        // cache-miss refetch (#2110). Both calls must succeed and collapse
+        // into one packages row and one package_versions row.
+        for _ in 0..2 {
+            service
+                .create_or_update_from_artifact(
+                    fx.repo_id, package, version, 512, &checksum, None, None,
+                )
+                .await
+                .expect("upsert package from artifact");
+        }
+
+        let (pkg_rows, ver_rows, pkg_version, pkg_size): (i64, i64, String, i64) = sqlx::query_as(
+            r#"
+                SELECT COUNT(DISTINCT p.id), COUNT(pv.id), MIN(p.version), MIN(p.size_bytes)
+                FROM packages p
+                JOIN package_versions pv ON pv.package_id = p.id
+                WHERE p.repository_id = $1 AND p.name = $2
+                "#,
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count catalog rows");
+
+        fx.teardown().await;
+
+        assert_eq!(pkg_rows, 1);
+        assert_eq!(ver_rows, 1);
+        assert_eq!(pkg_version, version);
+        assert_eq!(pkg_size, 512);
+    }
+
+    #[tokio::test]
+    async fn test_older_version_does_not_downgrade_package_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "gated-package";
+        let checksum = "e".repeat(64);
+
+        // Publish 2.0.0 first, then a backfill of 1.0.0: the packages row
+        // must keep reflecting the latest version (the version_compare gate),
+        // while both versions get package_versions rows. A later 3.0.0 must
+        // bump the row.
+        for (version, size) in [("2.0.0", 200_i64), ("1.0.0", 100), ("3.0.0", 300)] {
+            service
+                .create_or_update_from_artifact(
+                    fx.repo_id, package, version, size, &checksum, None, None,
+                )
+                .await
+                .expect("upsert package version");
+
+            let latest: (String, i64) = sqlx::query_as(
+                r#"SELECT version, size_bytes FROM packages WHERE repository_id = $1 AND name = $2"#,
+            )
+            .bind(fx.repo_id)
+            .bind(package)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read package row");
+
+            // After the 1.0.0 backfill the row must still say 2.0.0.
+            let expected = if version == "1.0.0" {
+                ("2.0.0", 200)
+            } else {
+                (version, size)
+            };
+            assert_eq!((latest.0.as_str(), latest.1), expected);
+        }
+
+        let ver_rows: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM package_versions pv
+            JOIN packages p ON p.id = pv.package_id
+            WHERE p.repository_id = $1 AND p.name = $2
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count version rows");
+
+        fx.teardown().await;
+
+        assert_eq!(ver_rows.0, 3);
     }
 
     // -----------------------------------------------------------------------

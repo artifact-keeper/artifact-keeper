@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE users\n                SET email = $1, display_name = $2, is_admin = $3,\n                    last_login_at = NOW(), updated_at = NOW()\n                WHERE id = $4\n                  AND (\n                    email IS DISTINCT FROM $1\n                    OR display_name IS DISTINCT FROM $2\n                    OR is_admin IS DISTINCT FROM $3\n                    OR last_login_at IS NULL\n                    OR last_login_at < NOW() - INTERVAL '5 minutes'\n                  )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bool",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7ce43cf4b38cd3082888861cda7afc836eeaf9c674e408bf66cab1eeee25d648"
+}

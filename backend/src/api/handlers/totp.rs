@@ -442,9 +442,13 @@ pub async fn verify_totp(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Update last login
+    // Update last login. Throttled to at most once per 5 minutes per user:
+    // last_login_at is display-only, and package managers re-auth per request,
+    // so unconditional writes cause needless WAL churn (#2107).
     sqlx::query!(
-        "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+        "UPDATE users SET last_login_at = NOW() \
+         WHERE id = $1 \
+           AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
         claims.sub
     )
     .execute(&state.db)
