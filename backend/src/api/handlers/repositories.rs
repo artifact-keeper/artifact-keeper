@@ -4510,6 +4510,20 @@ pub async fn delete_artifact(
         }
     }
 
+    // Deleting an npm artifact changes the packument, so drop the computed
+    // packument cache for its package — including in every virtual repo that
+    // serves this one; otherwise a warm virtual-repo GET keeps listing the
+    // just-removed version for the whole fresh window (#2162).
+    if repo.format == RepositoryFormat::Npm {
+        if let Some(package) = crate::api::handlers::npm::npm_package_name_from_artifact_path(&path)
+        {
+            crate::api::handlers::npm::invalidate_packument_caches(
+                &state, repo.id, &repo.key, package,
+            )
+            .await;
+        }
+    }
+
     Ok(())
 }
 

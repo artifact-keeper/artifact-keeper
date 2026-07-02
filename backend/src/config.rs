@@ -579,6 +579,35 @@ pub struct Config {
 
     /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
     pub smtp_tls_mode: String,
+
+    // -- npm computed-packument cache (#2162) --
+    /// Whether the npm computed-packument response cache (with
+    /// stale-while-revalidate) is enabled. Applies to **remote and virtual**
+    /// npm repositories only — local (hosted) packuments are a cheap DB read
+    /// and are never cached, so local publishes stay read-your-writes across
+    /// replicas. Defaults to `true`; only an explicit
+    /// `NPM_PACKUMENT_CACHE_ENABLED=false`/`0` disables it.
+    pub npm_packument_cache_enabled: bool,
+
+    /// Fresh window in seconds for cached packument responses: entries
+    /// younger than this serve directly with no revalidation. Env
+    /// `NPM_PACKUMENT_CACHE_FRESH_TTL_SECS`, default 300 (aligned with the
+    /// packument mutability policy in `cache_classifier`).
+    pub npm_packument_cache_fresh_ttl_secs: u64,
+
+    /// Stale window in seconds: entries older than the fresh TTL but younger
+    /// than this serve immediately while a background task refreshes them;
+    /// older entries are recomputed inline. Env
+    /// `NPM_PACKUMENT_CACHE_STALE_MAX_SECS`, default 86400 (24 h).
+    pub npm_packument_cache_stale_max_secs: u64,
+
+    /// Redis URL selecting the shared packument-cache backend for
+    /// multi-replica deployments (e.g. `redis://cache:6379/0`). When unset
+    /// (the default) the cache is in-process. When set, Redis is read first
+    /// and the in-process layer serves as a fallback whenever Redis errors,
+    /// so a Redis outage degrades to per-replica caching instead of failing
+    /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
+    pub npm_packument_cache_redis_url: Option<String>,
 }
 
 redacted_debug!(Config {
@@ -672,6 +701,10 @@ redacted_debug!(Config {
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show npm_packument_cache_enabled,
+    show npm_packument_cache_fresh_ttl_secs,
+    show npm_packument_cache_stale_max_secs,
+    redact_option npm_packument_cache_redis_url,
 });
 
 impl Default for Config {
@@ -770,6 +803,12 @@ impl Default for Config {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            npm_packument_cache_enabled: true,
+            npm_packument_cache_fresh_ttl_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
+            npm_packument_cache_stale_max_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
+            npm_packument_cache_redis_url: None,
         }
     }
 }
@@ -1037,6 +1076,25 @@ impl Config {
                     }
                 }
             },
+            // On by default; only an explicit, recognized negative disables
+            // the npm computed-packument cache (#2162).
+            npm_packument_cache_enabled: parse_opt_out_flag(
+                env::var("NPM_PACKUMENT_CACHE_ENABLED").ok().as_deref(),
+            ),
+            npm_packument_cache_fresh_ttl_secs: env_parse(
+                "NPM_PACKUMENT_CACHE_FRESH_TTL_SECS",
+                crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
+            ),
+            npm_packument_cache_stale_max_secs: env_parse(
+                "NPM_PACKUMENT_CACHE_STALE_MAX_SECS",
+                crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
+            ),
+            // Treat an empty value as unset, mirroring TRIVY_ADAPTER_URL:
+            // deployment templates commonly render the var present-but-empty
+            // when the shared cache is off.
+            npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         };
 
         config.validate_jwt_secret()?;
@@ -1759,6 +1817,13 @@ mod tests {
         assert_eq!(config.rate_limit_api_per_window, 10000);
         assert_eq!(config.rate_limit_search_per_window, 300);
         assert_eq!(config.rate_limit_window_secs, 60);
+
+        // npm computed-packument cache defaults (#2162): enabled out of the
+        // box on the in-process backend (no Redis URL).
+        assert!(config.npm_packument_cache_enabled);
+        assert_eq!(config.npm_packument_cache_fresh_ttl_secs, 300);
+        assert_eq!(config.npm_packument_cache_stale_max_secs, 86_400);
+        assert_eq!(config.npm_packument_cache_redis_url, None);
 
         // Restore
         if let Some(v) = saved_db {

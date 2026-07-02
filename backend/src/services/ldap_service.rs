@@ -832,6 +832,10 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            npm_packument_cache_enabled: true,
+            npm_packument_cache_fresh_ttl_secs: 300,
+            npm_packument_cache_stale_max_secs: 86_400,
+            npm_packument_cache_redis_url: None,
             scan_token_ttl_seconds: 300,
         }
     }

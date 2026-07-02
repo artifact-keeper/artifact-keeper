@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
+use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::opensearch_service::OpenSearchService;
 use crate::services::permission_service::PermissionService;
 use crate::services::plugin_registry::PluginRegistry;
@@ -123,6 +124,12 @@ pub struct AppState {
     /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
     /// SHA-256 re-verification on every warm index request.
     pub index_cache: IndexCache,
+    /// Cache of computed npm packument responses with stale-while-revalidate
+    /// (#2162): a warm hit skips the upstream metadata fetch, tarball-URL
+    /// rewrite, abbreviation and serialize/compress work. `None` when
+    /// disabled via `NPM_PACKUMENT_CACHE_ENABLED=false`. Invalidated on npm
+    /// publish / dist-tag changes.
+    pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -173,6 +180,7 @@ impl AppState {
                  the API (#991, #1088). Production deployments should leave this unset."
             );
         }
+        let npm_packument_cache = NpmPackumentCache::from_config(&config);
         Self {
             config,
             db,
@@ -192,6 +200,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
@@ -215,6 +224,7 @@ impl AppState {
                 "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap"
             );
         }
+        let npm_packument_cache = NpmPackumentCache::from_config(&config);
         Self {
             config,
             db,
@@ -234,6 +244,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
