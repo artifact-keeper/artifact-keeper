@@ -1438,6 +1438,48 @@ mod tests {
         assert!(response.status_code.ends_with(":Success"));
     }
 
+    /// Regression guard for RUSTSEC-2026-0194: quick-xml 0.39's start-tag
+    /// duplicate-attribute check compared every attribute against all previous
+    /// ones (O(N^2)), so a SAML `<Response>` carrying thousands of attributes
+    /// could pin a CPU core (HIGH DoS). quick-xml >= 0.41 makes this check
+    /// linear. Each attribute below has a unique name so the full duplicate
+    /// scan runs (unique names never short-circuit on a duplicate error),
+    /// exercising exactly the quadratic path. We assert the parse completes
+    /// well within a generous bound rather than hanging; on the fixed parser
+    /// it returns near-instantly.
+    #[tokio::test]
+    async fn test_parse_saml_response_many_attributes_is_bounded() {
+        use std::time::{Duration, Instant};
+
+        let service = make_test_saml_service();
+
+        let attrs = (0..8000)
+            .map(|i| format!("a{i}=\"x\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_response123" {attrs}>
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+</samlp:Response>"#
+        );
+
+        let start = Instant::now();
+        // We only care that parsing terminates promptly; the concrete result is
+        // covered by the other parser tests.
+        let _ = service.parse_saml_response(&xml);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "parse_saml_response took {elapsed:?} for an attribute-heavy SAML \
+             response; the O(N^2) quick-xml duplicate-attribute DoS \
+             (RUSTSEC-2026-0194) may have regressed"
+        );
+    }
+
     #[tokio::test]
     async fn test_parse_saml_response_assertion_fields() {
         let service = make_test_saml_service();
