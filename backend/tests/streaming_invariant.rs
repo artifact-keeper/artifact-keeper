@@ -36,9 +36,13 @@ use std::path::{Path, PathBuf};
 /// Phase 2 (#1608) streamed the light-format multipart uploads to storage via
 /// `put_artifact_stream`, removing all 5 exempt sites in ansible.rs (2),
 /// chef.rs (2) and pub_registry.rs (1): 38 -> 33.
+///
+/// Phase 3 (#1608) streamed the helm chart upload — the metadata (Chart.yaml)
+/// is now parsed from a single on-disk tar entry and the body is streamed to
+/// storage via `put_artifact_stream`, removing the 1 exempt site in helm.rs:
+/// 33 -> 32.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
-    ("src/api/handlers/helm.rs", 1),
     ("src/api/handlers/npm.rs", 5),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
@@ -405,7 +409,7 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 33,
-        "expected 33 exempt sites after #1608 Phase 2; got {total}"
+        total, 32,
+        "expected 32 exempt sites after #1608 Phase 3 (helm streamed); got {total}"
     );
 }

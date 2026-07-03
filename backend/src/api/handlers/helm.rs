@@ -18,7 +18,6 @@ use axum::routing::{delete, get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
@@ -449,41 +448,37 @@ async fn upload_chart(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Extract chart file from multipart form (field name: "chart")
-    let mut chart_content: Option<Bytes> = None;
-
+    // Spool the .tgz straight to a bounded scratch file instead of buffering
+    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         if name == "chart" {
-            chart_content = Some(field.bytes().await.map_err(|e| {
-                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                (StatusCode::BAD_REQUEST, format!("Invalid file: {}", e)).into_response()
-            })?);
+            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+            break;
         }
     }
 
-    let content = chart_content
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
+    let staged =
+        staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
 
-    // Extract and validate Chart.yaml from the package
-    let chart_yaml = HelmHandler::extract_chart_yaml(&content).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid chart package: {}", e),
-        )
-            .into_response()
-    })?;
+    // Extract and validate Chart.yaml from the staged archive on disk, reading
+    // only the Chart.yaml entry (bounded memory) rather than the whole package.
+    let chart_yaml = extract_chart_yaml_from_staged(staged.path())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chart package: {}", e),
+            )
+                .into_response()
+        })?;
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;
     let filename = format!("{}-{}.tgz", chart_name, chart_version);
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
 
     // Build artifact path
     let artifact_path = format!("{}/{}/{}", chart_name, chart_version, filename);
@@ -495,10 +490,13 @@ async fn upload_chart(
     proxy_helpers::ensure_unique_artifact_path(&state.db, repo.id, &artifact_path, &conflict_msg)
         .await?;
 
+    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
+    // which computes the SHA-256 incrementally as it copies (no re-hash pass).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, content.clone()).await?;
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let computed_sha256 = put.checksum_sha256;
 
-    let size_bytes = content.len() as i64;
+    let size_bytes = put.bytes_written as i64;
 
     // Insert artifact record
     let artifact_id = proxy_helpers::insert_artifact(
@@ -549,6 +547,21 @@ async fn upload_chart(
             .unwrap(),
         ))
         .unwrap())
+}
+
+/// Extract Chart.yaml from a staged .tgz archive on disk. The blocking
+/// flate2/tar decode runs on a blocking thread so it never stalls the async
+/// runtime, and only the Chart.yaml entry is read (bounded memory).
+async fn extract_chart_yaml_from_staged(path: &std::path::Path) -> Result<ChartYaml, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        HelmHandler::extract_chart_yaml_from_reader(std::io::BufReader::new(file))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("chart extraction task failed: {}", e))?
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +639,57 @@ async fn delete_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Build a gzip-compressed tar (`.tgz`) holding a single `path`/`body`
+    /// entry, matching the on-disk layout the upload staging path reads.
+    fn build_tgz(path: &str, body: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&tar_buf).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_chart_yaml_from_staged_parses_metadata() {
+        let tgz = build_tgz(
+            "nginx/Chart.yaml",
+            b"apiVersion: v2\nname: nginx\nversion: 9.8.7\n",
+        );
+        let dir = std::env::temp_dir().join(format!("helm-staged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chart.tgz");
+        std::fs::write(&path, &tgz).unwrap();
+
+        let chart = extract_chart_yaml_from_staged(&path).await.unwrap();
+        assert_eq!(chart.name, "nginx");
+        assert_eq!(chart.version, "9.8.7");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_extract_chart_yaml_from_staged_malformed_errors() {
+        let dir = std::env::temp_dir().join(format!("helm-staged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.tgz");
+        std::fs::write(&path, b"this is not a gzip archive").unwrap();
+
+        assert!(extract_chart_yaml_from_staged(&path).await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // -----------------------------------------------------------------------
     // resolve_chart_url
