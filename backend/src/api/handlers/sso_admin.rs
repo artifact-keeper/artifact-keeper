@@ -49,14 +49,6 @@ pub fn router() -> Router<SharedState> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn require_admin(auth: &AuthExtension) -> Result<()> {
-    auth.require_admin()
-}
-
-// ---------------------------------------------------------------------------
 // OIDC
 // ---------------------------------------------------------------------------
 
@@ -76,7 +68,7 @@ pub async fn list_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<OidcConfigResponse>>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::list_oidc(&state.db).await?;
     Ok(Json(result))
 }
@@ -102,7 +94,7 @@ pub async fn get_oidc(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<OidcConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::get_oidc(&state.db, id).await?;
     Ok(Json(result))
 }
@@ -125,7 +117,7 @@ pub async fn create_oidc(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateOidcConfigRequest>,
 ) -> Result<Json<OidcConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::create_oidc(&state.db, req).await?;
     Ok(Json(result))
 }
@@ -153,7 +145,7 @@ pub async fn update_oidc(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateOidcConfigRequest>,
 ) -> Result<Json<OidcConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::update_oidc(&state.db, id, req).await?;
     Ok(Json(result))
 }
@@ -179,7 +171,7 @@ pub async fn delete_oidc(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::delete_oidc(&state.db, id).await?;
     Ok(())
 }
@@ -207,7 +199,7 @@ pub async fn toggle_oidc(
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::toggle_oidc(&state.db, id, req).await?;
     Ok(())
 }
@@ -232,7 +224,7 @@ pub async fn list_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<LdapConfigResponse>>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::list_ldap(&state.db).await?;
     Ok(Json(result))
 }
@@ -258,7 +250,7 @@ pub async fn get_ldap(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LdapConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::get_ldap(&state.db, id).await?;
     Ok(Json(result))
 }
@@ -281,7 +273,7 @@ pub async fn create_ldap(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateLdapConfigRequest>,
 ) -> Result<Json<LdapConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     crate::api::validation::validate_outbound_ldap_url(&req.server_url, "LDAP server URL")?;
     let result = AuthConfigService::create_ldap(&state.db, req).await?;
     Ok(Json(result))
@@ -310,7 +302,7 @@ pub async fn update_ldap(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateLdapConfigRequest>,
 ) -> Result<Json<LdapConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     if let Some(server_url) = &req.server_url {
         crate::api::validation::validate_outbound_ldap_url(server_url, "LDAP server URL")?;
     }
@@ -339,7 +331,7 @@ pub async fn delete_ldap(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::delete_ldap(&state.db, id).await?;
     Ok(())
 }
@@ -367,7 +359,7 @@ pub async fn toggle_ldap(
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::toggle_ldap(&state.db, id, req).await?;
     Ok(())
 }
@@ -393,7 +385,7 @@ pub async fn test_ldap(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LdapTestResult>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::test_ldap_connection(&state.db, id).await?;
     Ok(Json(result))
 }
@@ -418,7 +410,7 @@ pub async fn list_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<SamlConfigResponse>>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::list_saml(&state.db).await?;
     Ok(Json(result))
 }
@@ -444,7 +436,7 @@ pub async fn get_saml(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SamlConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::get_saml(&state.db, id).await?;
     Ok(Json(result))
 }
@@ -467,7 +459,7 @@ pub async fn create_saml(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateSamlConfigRequest>,
 ) -> Result<Json<SamlConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::create_saml(&state.db, req).await?;
     Ok(Json(result))
 }
@@ -495,7 +487,7 @@ pub async fn update_saml(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateSamlConfigRequest>,
 ) -> Result<Json<SamlConfigResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::update_saml(&state.db, id, req).await?;
     Ok(Json(result))
 }
@@ -521,7 +513,7 @@ pub async fn delete_saml(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::delete_saml(&state.db, id).await?;
     Ok(())
 }
@@ -549,7 +541,7 @@ pub async fn toggle_saml(
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleRequest>,
 ) -> Result<()> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     AuthConfigService::toggle_saml(&state.db, id, req).await?;
     Ok(())
 }
@@ -575,7 +567,7 @@ pub async fn list_providers(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<SsoProviderInfo>>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
     let result = AuthConfigService::list_enabled_providers(&state.db).await?;
     Ok(Json(result))
 }
@@ -642,7 +634,7 @@ mod tests {
             scopes: None,
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_ok());
+        assert!(auth.require_admin().is_ok());
     }
 
     #[test]
@@ -657,7 +649,7 @@ mod tests {
             scopes: None,
             allowed_repo_ids: None,
         };
-        let err = require_admin(&auth).unwrap_err();
+        let err = auth.require_admin().unwrap_err();
         assert!(
             format!("{}", err).contains("Admin access required"),
             "Expected 'Admin access required' in error: {}",
@@ -677,7 +669,7 @@ mod tests {
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_err());
+        assert!(auth.require_admin().is_err());
     }
 
     #[test]
@@ -692,7 +684,7 @@ mod tests {
             scopes: Some(vec!["admin".to_string()]),
             allowed_repo_ids: None,
         };
-        assert!(require_admin(&auth).is_ok());
+        assert!(auth.require_admin().is_ok());
     }
 
     // -----------------------------------------------------------------------
