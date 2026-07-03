@@ -19,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -388,7 +387,6 @@ async fn new_upload_url(
 // POST /pub/{repo_key}/api/packages/versions/newUpload -- Upload package
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -400,41 +398,38 @@ async fn upload_package(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Extract the tar.gz file from multipart form data
-    let mut file_bytes: Option<bytes::Bytes> = None;
+    // Spool the tar.gz straight to a bounded scratch file instead of buffering
+    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
-            file_bytes = Some(field.bytes().await.map_err(|e| {
-                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read upload: {}", e),
-                )
-                    .into_response()
-            })?);
+            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
             break;
         }
     }
 
-    let body = file_bytes.ok_or_else(|| {
+    let staged = staged.ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "Missing 'file' field in upload").into_response()
     })?;
 
-    if body.is_empty() {
+    if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty package archive").into_response());
     }
 
-    // Extract pubspec.yaml from the tar.gz archive
-    let pubspec = extract_pubspec_from_archive(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid Pub package: {}", e),
-        )
-            .into_response()
-    })?;
+    // Extract pubspec.yaml from the staged archive on disk, decoding the gzip
+    // stream incrementally so we never hold the whole archive in memory.
+    let pubspec = extract_pubspec_from_staged(staged.path())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid Pub package: {}", e),
+            )
+                .into_response()
+        })?;
 
     let pkg_name = &pubspec.name;
     let pkg_version = &pubspec.version;
@@ -446,11 +441,6 @@ async fn upload_package(
         )
             .into_response());
     }
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
 
     let filename = format!("{}-{}.tar.gz", pkg_name, pkg_version);
     let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
@@ -471,18 +461,11 @@ async fn upload_package(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file
+    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
+    // which computes the SHA-256 incrementally as it copies (no re-hash).
     let storage_key = format!("pub/{}/{}/{}", pkg_name, pkg_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let computed_sha256 = put.checksum_sha256;
 
     // Build metadata JSON
     let pub_metadata = serde_json::json!({
@@ -490,7 +473,7 @@ async fn upload_package(
         "filename": filename,
     });
 
-    let size_bytes = body.len() as i64;
+    let size_bytes = put.bytes_written as i64;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -583,13 +566,16 @@ async fn finalize_upload(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract pubspec.yaml from a Pub package tar.gz archive.
-fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::PubSpec, String> {
+/// Extract pubspec.yaml from a Pub package tar.gz `reader`, decoding the gzip
+/// stream incrementally so the whole archive is never held in memory.
+fn extract_pubspec_from_reader<R: std::io::Read>(
+    reader: R,
+) -> Result<crate::formats::r#pub::PubSpec, String> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     use tar::Archive;
 
-    let decoder = GzDecoder::new(data);
+    let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
 
     let entries = archive
@@ -618,6 +604,28 @@ fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::Pu
     }
 
     Err("pubspec.yaml not found in archive".to_string())
+}
+
+/// Extract pubspec.yaml from a staged tar.gz archive on disk. The blocking
+/// flate2/tar decode runs on a blocking thread so it never stalls the async
+/// runtime, and the gzip stream is decoded incrementally (bounded memory).
+async fn extract_pubspec_from_staged(
+    path: &std::path::Path,
+) -> Result<crate::formats::r#pub::PubSpec, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        extract_pubspec_from_reader(std::io::BufReader::new(file))
+    })
+    .await
+    .map_err(|e| format!("pubspec extraction task failed: {}", e))?
+}
+
+/// In-memory variant retained for unit tests.
+#[cfg(test)]
+fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::PubSpec, String> {
+    extract_pubspec_from_reader(data)
 }
 
 #[cfg(test)]

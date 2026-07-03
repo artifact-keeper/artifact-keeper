@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -370,7 +371,6 @@ async fn download_cookbook(
 // POST /chef/{repo_key}/api/v1/cookbooks — Upload cookbook (multipart)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_cookbook(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -382,7 +382,10 @@ async fn upload_cookbook(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    let mut tarball: Option<bytes::Bytes> = None;
+    // Spool the tarball straight to a bounded scratch file instead of buffering
+    // the whole body in memory; the small `cookbook` JSON field is still read
+    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     let mut cookbook_json: Option<serde_json::Value> = None;
 
     while let Some(field) = multipart
@@ -393,26 +396,19 @@ async fn upload_cookbook(
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "tarball" => {
-                tarball = Some(field.bytes().await.map_err(|e| {
-                    // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read tarball: {}", e),
-                    )
-                        .into_response()
-                })?);
+                staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
             }
             "cookbook" => {
-                #[allow(clippy::disallowed_methods)]
-                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                let data = field.bytes().await.map_err(|e| {
+                // Small JSON metadata field (not the artifact body): read as
+                // text (a length-limited extractor) and parse in-hand.
+                let data = field.text().await.map_err(|e| {
                     (
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read cookbook JSON: {}", e),
                     )
                         .into_response()
                 })?;
-                cookbook_json = Some(serde_json::from_slice(&data).map_err(|e| {
+                cookbook_json = Some(serde_json::from_str(&data).map_err(|e| {
                     (
                         StatusCode::BAD_REQUEST,
                         format!("Invalid cookbook JSON: {}", e),
@@ -424,10 +420,10 @@ async fn upload_cookbook(
         }
     }
 
-    let tarball = tarball
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing tarball field").into_response())?;
+    let staged =
+        staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing tarball field").into_response())?;
 
-    if tarball.is_empty() {
+    if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
     }
 
@@ -472,11 +468,6 @@ async fn upload_cookbook(
 
     let filename = format!("{}-{}.tar.gz", cookbook_name, cookbook_version);
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&tarball);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
-
     let artifact_path = format!("{}/{}/{}", cookbook_name, cookbook_version, filename);
 
     // Check for duplicate
@@ -495,21 +486,11 @@ async fn upload_cookbook(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file
+    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
+    // which computes the SHA-256 incrementally as it copies (no re-hash).
     let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, tarball.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let computed_sha256 = put.checksum_sha256;
 
     let chef_metadata = serde_json::json!({
         "cookbook_name": cookbook_name,
@@ -518,7 +499,7 @@ async fn upload_cookbook(
         "cookbook_json": cookbook_json,
     });
 
-    let size_bytes = tarball.len() as i64;
+    let size_bytes = put.bytes_written as i64;
 
     let artifact_id = sqlx::query_scalar!(
         r#"
@@ -791,6 +772,118 @@ mod db_cov_tests {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
+        fx.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod upload_stream_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use sha2::{Digest, Sha256};
+
+    /// Build a `knife`-style cookbook upload body: a `cookbook` JSON metadata
+    /// part plus a `tarball` file part.
+    fn cookbook_multipart(
+        boundary: &str,
+        name: &str,
+        version: &str,
+        tarball: &[u8],
+    ) -> bytes::Bytes {
+        let meta = format!("{{\"cookbook_name\":\"{name}\",\"cookbook_version\":\"{version}\"}}");
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"cookbook\"\r\n\r\n");
+        body.extend_from_slice(meta.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"tarball\"; filename=\"{name}-{version}.tar.gz\"\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/gzip\r\n\r\n");
+        body.extend_from_slice(tarball);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        bytes::Bytes::from(body)
+    }
+
+    #[tokio::test]
+    async fn test_chef_upload_streams_and_records_checksum() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        // A padded payload much larger than one stream chunk, so the upload
+        // exercises the spool-to-disk streaming path rather than a small buffer.
+        let tarball = b"cookbook-payload-".repeat(8192); // ~135 KB
+        let body = cookbook_multipart("CHEFBND", "apache2", "8.0.0", &tarball);
+
+        let app = fx.router_with_auth(super::router());
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                "multipart/form-data; boundary=CHEFBND",
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "unexpected status, body={}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // The artifact row carries the checksum computed incrementally by
+        // put_stream and the true streamed size. Use the runtime query API so
+        // this test needs no offline sqlx cache entry.
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT checksum_sha256, size_bytes, storage_key FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("artifact row");
+        let checksum: String = row.get("checksum_sha256");
+        let size_bytes: i64 = row.get("size_bytes");
+        let storage_key: String = row.get("storage_key");
+        let mut hasher = Sha256::new();
+        hasher.update(&tarball);
+        assert_eq!(checksum, format!("{:x}", hasher.finalize()));
+        assert_eq!(size_bytes, tarball.len() as i64);
+
+        // The bytes really landed in the configured backend under the key.
+        let stored = fx
+            .state
+            .storage
+            .get(&storage_key)
+            .await
+            .expect("stored object");
+        assert_eq!(stored.len(), tarball.len());
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_chef_upload_rejects_empty_tarball() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let body = cookbook_multipart("CHEFBND", "apache2", "8.0.0", b"");
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                "multipart/form-data; boundary=CHEFBND",
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
     }
 }
