@@ -767,6 +767,89 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Admin gate is enforced at the top of every route handler
+    // -----------------------------------------------------------------------
+
+    // Every service-account handler calls `auth.require_admin()?` before any
+    // database access, so a non-admin caller is rejected with the canonical
+    // 403 even against a lazy (never-connected) pool.
+    fn expect_forbidden<T>(res: Result<T>) {
+        match res {
+            Err(AppError::Authorization(msg)) => assert_eq!(msg, "Admin access required"),
+            Err(other) => panic!("expected admin denial, got error: {other}"),
+            Ok(_) => panic!("expected admin denial, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_denied_on_every_service_account_route() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let dir = std::env::temp_dir().join(format!("ph-svc-acct-{}", Uuid::new_v4()));
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let auth = non_admin_auth();
+        let id = Uuid::new_v4();
+
+        expect_forbidden(
+            list_service_accounts(State(state.clone()), Extension(auth.clone())).await,
+        );
+        expect_forbidden(
+            create_service_account(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(serde_json::from_value(serde_json::json!({"name": "ci"})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            get_service_account(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            update_service_account(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(serde_json::json!({})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            delete_service_account(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            list_tokens(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            create_token(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(
+                    serde_json::from_value(serde_json::json!({"name": "t", "scopes": ["read"]}))
+                        .unwrap(),
+                ),
+            )
+            .await,
+        );
+        expect_forbidden(
+            preview_repo_selector(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(serde_json::from_value(serde_json::json!({"repo_selector": {}})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            revoke_token(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((id, Uuid::new_v4())),
+            )
+            .await,
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // From<ServiceAccountSummary> for ServiceAccountSummaryResponse
     // -----------------------------------------------------------------------
 

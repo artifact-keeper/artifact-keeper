@@ -688,6 +688,167 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Admin gate is enforced at the top of every route handler
+    // -----------------------------------------------------------------------
+
+    // Assert that a handler result is the canonical 403 admin-denial. The gate
+    // runs before any database access, so these calls short-circuit on a lazy
+    // (never-connected) pool.
+    fn assert_admin_denied<T>(res: crate::error::Result<T>) {
+        match res {
+            Err(crate::error::AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Admin access required")
+            }
+            Err(other) => panic!("expected admin denial, got error: {other}"),
+            Ok(_) => panic!("expected admin denial, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_denied_on_every_sso_admin_route() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let dir = std::env::temp_dir().join(format!("ph-sso-admin-{}", Uuid::new_v4()));
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(Uuid::new_v4(), "not-admin");
+        let id = Uuid::new_v4();
+
+        // OIDC
+        assert_admin_denied(list_oidc(State(state.clone()), Extension(auth.clone())).await);
+        assert_admin_denied(
+            get_oidc(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            create_oidc(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(
+                    serde_json::from_value(json!({
+                        "name": "x",
+                        "issuer_url": "https://issuer.example.com",
+                        "client_id": "c",
+                        "client_secret": "s"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            update_oidc(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            delete_oidc(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            toggle_oidc(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({"enabled": true})).unwrap()),
+            )
+            .await,
+        );
+
+        // LDAP
+        assert_admin_denied(list_ldap(State(state.clone()), Extension(auth.clone())).await);
+        assert_admin_denied(
+            get_ldap(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            create_ldap(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(
+                    serde_json::from_value(json!({
+                        "name": "x",
+                        "server_url": "ldaps://ldap.example.com:636",
+                        "user_base_dn": "ou=u,dc=example,dc=com"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            update_ldap(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            delete_ldap(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            toggle_ldap(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({"enabled": false})).unwrap()),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            test_ldap(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+
+        // SAML
+        assert_admin_denied(list_saml(State(state.clone()), Extension(auth.clone())).await);
+        assert_admin_denied(
+            get_saml(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            create_saml(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(
+                    serde_json::from_value(json!({
+                        "name": "x",
+                        "entity_id": "urn:entity",
+                        "sso_url": "https://sso.example.com",
+                        "certificate": "cert"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            update_saml(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await,
+        );
+        assert_admin_denied(
+            delete_saml(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        assert_admin_denied(
+            toggle_saml(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(json!({"enabled": true})).unwrap()),
+            )
+            .await,
+        );
+
+        // Providers
+        assert_admin_denied(list_providers(State(state.clone()), Extension(auth.clone())).await);
+    }
+
+    // -----------------------------------------------------------------------
     // CreateOidcConfigRequest deserialization
     // -----------------------------------------------------------------------
 
