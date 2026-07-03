@@ -464,6 +464,64 @@ impl AuditService {
     }
 }
 
+/// Fire-and-forget audit write for auth-event and token-lifecycle emitters
+/// (#1617 Phase 1: auth-event audit completeness).
+///
+/// A write failure is swallowed — logged at `warn`, never propagated — so an
+/// audit-table outage can never fail the originating request. Logins and token
+/// mint/revoke MUST succeed even when audit is unavailable; the audit trail is
+/// a side effect, never a gate. Mirrors the `audit_auth` fire-and-forget
+/// contract already used on the local-password login path.
+pub async fn audit_fire_and_forget(db: PgPool, entry: AuditEntry) {
+    if let Err(e) = AuditService::new(db).log(entry).await {
+        tracing::warn!(error = %e, "audit log write failed; ignored (fire-and-forget)");
+    }
+}
+
+/// Build the `details` JSON for a federated (SSO) login audit event.
+///
+/// `provider` is a stable label (`"oidc"` | `"saml"` | `"ldap"`) recorded so
+/// SOC 2 / EU CRA auditors can attribute enterprise-auth events per provider.
+/// Any object keys in `extra` (e.g. the attempted username on a failure) are
+/// merged in; a non-object `extra` is ignored. Pure so it is unit-testable
+/// without a database.
+pub fn federated_login_details(provider: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider": provider,
+        "auth_method": "federated",
+    });
+    if let (serde_json::Value::Object(base), serde_json::Value::Object(more)) =
+        (&mut details, extra)
+    {
+        base.extend(more);
+    }
+    details
+}
+
+/// Build an audit entry for an API-token lifecycle event (mint or revoke)
+/// (#1617 Phase 1).
+///
+/// Records the acting principal (`actor`), the token id as the resource, and
+/// the token id/name/surface in `details`. The token SECRET is NEVER included.
+/// `surface` labels the endpoint family (`"user"`, `"profile"`, `"repo"`,
+/// `"service_account"`) for SIEM attribution. Pure builder — unit-testable.
+pub fn api_token_audit_entry(
+    action: AuditAction,
+    actor: Uuid,
+    token_id: Uuid,
+    token_name: Option<&str>,
+    surface: &str,
+) -> AuditEntry {
+    AuditEntry::new(action, ResourceType::ApiToken)
+        .user(actor)
+        .resource(token_id)
+        .details(serde_json::json!({
+            "token_id": token_id.to_string(),
+            "token_name": token_name,
+            "surface": surface,
+        }))
+}
+
 /// Audit log entry from database
 #[derive(Debug)]
 pub struct AuditLogEntry {
@@ -926,5 +984,85 @@ mod tests {
         let rt = ResourceType::Artifact;
         let cloned = rt;
         assert_eq!(rt.as_str(), cloned.as_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1617 Phase 1: auth-event audit helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_federated_login_details_marks_provider_and_method() {
+        let details = federated_login_details("oidc", serde_json::json!({}));
+        assert_eq!(details["provider"], "oidc");
+        assert_eq!(details["auth_method"], "federated");
+    }
+
+    #[test]
+    fn test_federated_login_details_merges_extra_object() {
+        let details = federated_login_details("ldap", serde_json::json!({ "username": "alice" }));
+        assert_eq!(details["provider"], "ldap");
+        assert_eq!(details["username"], "alice");
+    }
+
+    #[test]
+    fn test_federated_login_details_ignores_non_object_extra() {
+        // A non-object `extra` must not clobber the base object.
+        let details = federated_login_details("saml", serde_json::json!("nope"));
+        assert_eq!(details["provider"], "saml");
+        assert_eq!(details["auth_method"], "federated");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_created_shape() {
+        let actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            actor,
+            token_id,
+            Some("ci-token"),
+            "profile",
+        );
+        assert_eq!(entry.user_id(), Some(actor));
+        assert_eq!(entry.resource_id(), Some(token_id));
+        assert_eq!(entry.action().as_str(), "API_TOKEN_CREATED");
+        assert_eq!(entry.resource_type().as_str(), "api_token");
+        let details = entry.details_ref().expect("details present");
+        assert_eq!(details["token_id"], token_id.to_string());
+        assert_eq!(details["token_name"], "ci-token");
+        assert_eq!(details["surface"], "profile");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_revoked_without_name() {
+        let actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            actor,
+            token_id,
+            None,
+            "service_account",
+        );
+        assert_eq!(entry.action().as_str(), "API_TOKEN_REVOKED");
+        let details = entry.details_ref().expect("details present");
+        // A missing name serializes to JSON null, never the secret.
+        assert!(details["token_name"].is_null());
+        assert_eq!(details["surface"], "service_account");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_never_carries_secret_key() {
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some("t"),
+            "user",
+        );
+        let details = entry.details_ref().expect("details present");
+        let obj = details.as_object().expect("details is object");
+        assert!(!obj.contains_key("token"));
+        assert!(!obj.contains_key("secret"));
     }
 }

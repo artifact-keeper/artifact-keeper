@@ -15,6 +15,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
@@ -860,6 +861,18 @@ pub async fn create_api_token(
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            token_id,
+            Some(&payload.name),
+            "user",
+        ),
+    )
+    .await;
+
     Ok(Json(ApiTokenCreatedResponse {
         id: token_id,
         name: payload.name,
@@ -894,6 +907,18 @@ pub async fn revoke_api_token(
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "user",
+        ),
+    )
+    .await;
 
     Ok(())
 }

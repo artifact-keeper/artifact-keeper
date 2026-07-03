@@ -22,7 +22,10 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::audit_service::{
+    api_token_audit_entry, audit_fire_and_forget, AuditAction, AuditEntry, AuditService,
+    ResourceType,
+};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
 use std::sync::atomic::Ordering;
@@ -514,6 +517,18 @@ pub async fn create_api_token(
         )
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            id,
+            Some(&payload.name),
+            "user_self",
+        ),
+    )
+    .await;
+
     Ok(Json(CreateApiTokenResponse {
         id,
         token,
@@ -606,6 +621,18 @@ pub async fn revoke_api_token(
     auth_service
         .revoke_api_token(token_id, auth.user_id)
         .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "user_self",
+        ),
+    )
+    .await;
 
     Ok(())
 }
@@ -1688,5 +1715,132 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id).await;
+    }
+
+    // ── #1617 Phase 1: token-lifecycle audit coverage ───────────────────
+
+    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+        )
+        .bind(token_id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("audit_log count query")
+    }
+
+    /// Minting an API token must emit an `API_TOKEN_CREATED` audit event
+    /// attributed to the acting user, carrying the token id (never the secret).
+    #[tokio::test]
+    async fn mint_api_token_emits_audit_created_event() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "audit-mint",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "mint failed: {}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            1,
+            "mint MUST write exactly one API_TOKEN_CREATED audit row"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Revoking an API token must emit an `API_TOKEN_REVOKED` audit event.
+    #[tokio::test]
+    async fn revoke_api_token_emits_audit_revoked_event() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+
+        // Mint first.
+        let body = json!({
+            "name": "audit-revoke",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        // Now revoke.
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/tokens/{}", token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state, auth), req).await;
+        assert!(status.is_success(), "revoke should succeed, got {status}");
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            1,
+            "revoke MUST write exactly one API_TOKEN_REVOKED audit row"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// The fire-and-forget invariant: a failed audit write (here forced by an
+    /// orphan actor id that violates the audit_log→users FK) must be swallowed,
+    /// never panicking or propagating, and must not persist a row.
+    #[tokio::test]
+    async fn audit_fire_and_forget_swallows_write_failure() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let orphan_actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            orphan_actor,
+            token_id,
+            Some("orphan"),
+            "user_self",
+        );
+
+        // Must complete without panic even though the INSERT fails.
+        audit_fire_and_forget(pool.clone(), entry).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE user_id = $1")
+            .bind(orphan_actor)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "FK-violating audit write must not persist a row");
     }
 }

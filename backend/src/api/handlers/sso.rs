@@ -21,6 +21,9 @@ use crate::api::validation::validate_outbound_sso_url;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::AuthProvider;
+use crate::services::audit_service::{
+    audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
@@ -38,6 +41,30 @@ pub fn router() -> Router<SharedState> {
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
         .route("/exchange", post(exchange_code))
+}
+
+/// Fire-and-forget audit for a federated (SSO) login outcome (#1617 Phase 1).
+///
+/// Mirrors the fidelity of the local-password login audit: a successful
+/// federated login emits [`AuditAction::Login`], a rejected attempt emits
+/// [`AuditAction::LoginFailed`], both tagged with the originating provider so
+/// the enterprise-auth paths (OIDC / SAML / LDAP) leave the same trail
+/// compliance auditors already get for password login. A write failure never
+/// fails the login (see [`audit_fire_and_forget`]); we never double-log a path
+/// that is already audited elsewhere.
+async fn audit_federated_login(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: Option<Uuid>,
+    provider: &str,
+    extra: serde_json::Value,
+) {
+    let mut entry = AuditEntry::new(action, ResourceType::User)
+        .details(federated_login_details(provider, extra));
+    if let Some(id) = user_id {
+        entry = entry.user(id).resource(id);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
 }
 
 /// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
@@ -457,12 +484,12 @@ async fn oidc_callback_inner(
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (user, tokens) = auth_service
+    let (user, tokens) = match auth_service
         .authenticate_federated(
             AuthProvider::Oidc,
             FederatedCredentials {
                 external_id: sub,
-                username: preferred_username,
+                username: preferred_username.clone(),
                 email,
                 display_name,
                 groups: groups.clone(),
@@ -472,7 +499,32 @@ async fn oidc_callback_inner(
                 auto_create_users: row.auto_create_users,
             },
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "oidc",
+                serde_json::json!({ "username": preferred_username }),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+
+    // Federated login succeeded — record it with the same fidelity as the
+    // local-password login audit (#1617 Phase 1).
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "oidc",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
     // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
     //     OIDC group claim values as Artifact Keeper group memberships.
@@ -573,12 +625,27 @@ pub async fn ldap_login(
         row.use_starttls,
     );
 
-    // Authenticate against LDAP
-    let ldap_user = ldap_svc.authenticate(&req.username, &req.password).await?;
+    // Authenticate against LDAP. A bind/credential failure is the LDAP
+    // equivalent of a bad password on the local login path, so it emits
+    // LoginFailed for audit parity (#1617 Phase 1).
+    let ldap_user = match ldap_svc.authenticate(&req.username, &req.password).await {
+        Ok(u) => u,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "ldap",
+                serde_json::json!({ "username": req.username }),
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Ldap,
             FederatedCredentials {
@@ -594,6 +661,15 @@ pub async fn ldap_login(
             },
         )
         .await?;
+
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "ldap",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
     let body = serde_json::json!({
         "access_token": tokens.access_token,
@@ -787,12 +863,28 @@ pub async fn saml_acs(
         row.admin_group.as_deref(),
     );
 
-    // Process SAML response
-    let saml_user = saml_svc.authenticate(&form.saml_response).await?;
+    // Process SAML response. A rejected assertion (bad signature, replay,
+    // expired, etc. — the Phase 2 checks from #2040) is a failed login; emit
+    // LoginFailed for audit parity without altering that validation logic
+    // (#1617 Phase 1).
+    let saml_user = match saml_svc.authenticate(&form.saml_response).await {
+        Ok(u) => u,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "saml",
+                serde_json::json!({}),
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Saml,
             FederatedCredentials {
@@ -808,6 +900,15 @@ pub async fn saml_acs(
             },
         )
         .await?;
+
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "saml",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(

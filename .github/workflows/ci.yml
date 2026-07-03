@@ -87,6 +87,13 @@ jobs:
       - name: Pin token-minting endpoint surface
         run: ./scripts/ci/check-token-mint-surface.sh
 
+      # Auth-event audit completeness (#1617 Phase 1): every token mint/revoke
+      # handler must emit an ApiTokenCreated/ApiTokenRevoked audit event, and
+      # every federated (OIDC/SAML/LDAP) login must audit its Login/LoginFailed
+      # outcome. Guards the compliance audit trail against silent regression.
+      - name: Check auth-event audit coverage
+        run: ./scripts/ci/check-auth-event-audit.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
