@@ -292,8 +292,13 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
         .unwrap_or("application/octet-stream")
         .to_string();
     #[allow(clippy::disallowed_methods)]
-    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
-    let body = upstream_resp.bytes().await.map_err(|e| {
+    // STREAMING-EXEMPT: capped metadata read (upstream sumdb checksum-database response, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap -> 502; tracked under #1608
+    let body = axum::body::to_bytes(
+        Body::from_stream(upstream_resp.bytes_stream()),
+        16 * 1024 * 1024,
+    )
+    .await
+    .map_err(|e| {
         tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
         (
             StatusCode::BAD_GATEWAY,

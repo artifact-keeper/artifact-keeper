@@ -305,8 +305,10 @@ async fn proxy_npm_audit_post(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            match resp.bytes().await {
-                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
+            // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
+            match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024)
+                .await
+            {
                 Ok(bytes) => {
                     if !status.is_success() {
                         debug!(
@@ -386,8 +388,8 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
         .unwrap_or("application/json")
         .to_string();
 
-    match resp.bytes().await {
-        // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
+    // STREAMING-EXEMPT: capped metadata read (upstream npm registry packument/meta JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap falls through to local fallback; tracked under #1608
+    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
         Ok(bytes) => Some(
             Response::builder()
                 .status(status)

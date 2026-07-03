@@ -4,9 +4,24 @@
 //! computes composite health scores, and evaluates quality gates.
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Hard ceiling on the artifact size we will stage for quality-gate
+/// evaluation. Inputs larger than this are skipped with an error instead of
+/// being buffered, so a pathological or padded artifact cannot exhaust memory.
+/// Mirrors the scanner's `MAX_SCAN_INPUT_BYTES` ceiling (scanner_service.rs).
+const MAX_QUALITY_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Above this running total we stop buffering the staged artifact on the heap
+/// and spill it to an mmap-backed workspace file, so large in-limit inputs do
+/// not pin anonymous heap (mmap pages are kernel-reclaimable under cgroup
+/// pressure). Mirrors the scanner's `SCAN_MMAP_THRESHOLD_BYTES`.
+const QUALITY_MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+const _: () = assert!(QUALITY_MMAP_THRESHOLD_BYTES < MAX_QUALITY_INPUT_BYTES);
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
@@ -674,7 +689,16 @@ impl QualityCheckService {
         Ok(evaluation)
     }
 
-    /// Fetch artifact content from filesystem storage.
+    /// Stage artifact content from filesystem storage for quality-gate
+    /// evaluation.
+    ///
+    /// Streams the object via `get_stream` rather than buffering the whole
+    /// artifact on the heap: small inputs stay in memory, large in-limit inputs
+    /// spill to an mmap-backed workspace file, and inputs beyond
+    /// [`MAX_QUALITY_INPUT_BYTES`] are skipped with an error instead of risking
+    /// OOM. This mirrors the scanner's staging (scanner_service.rs). For any
+    /// in-limit artifact the returned bytes are byte-for-byte identical to the
+    /// previous `storage.get()` result, so gate evaluation is unchanged.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
         let storage_path: String =
             sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
@@ -688,13 +712,160 @@ impl QualityCheckService {
                     ))
                 })?;
 
+        // Early reject on the recorded size before opening the stream; the
+        // staging loop re-checks against the same ceiling in case `size_bytes`
+        // is stale or absent for proxied/upstream content.
+        if artifact.size_bytes > MAX_QUALITY_INPUT_BYTES as i64 {
+            return Err(AppError::Validation(format!(
+                "Artifact {} is {} bytes, exceeding the {} byte quality-gate input limit; skipping quality checks",
+                artifact.id, artifact.size_bytes, MAX_QUALITY_INPUT_BYTES
+            )));
+        }
+
         let storage = FilesystemStorage::new(&storage_path);
-        storage.get(&artifact.storage_key).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to read artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, e
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to open stream for artifact {} (key={}): {}",
+                    artifact.id, artifact.storage_key, e
+                ))
+            })?;
+
+        let workspace = std::env::temp_dir().join("ak-quality-staging");
+        Self::stage_quality_input(
+            stream,
+            &workspace.to_string_lossy(),
+            QUALITY_MMAP_THRESHOLD_BYTES,
+            MAX_QUALITY_INPUT_BYTES,
+        )
+        .await
+    }
+
+    /// Stage a storage stream into `Bytes`, keeping heap usage bounded.
+    ///
+    /// Buffers on the heap while the running total stays at/below
+    /// `mmap_threshold`; the first chunk that pushes past it spills the prefix
+    /// and the remaining stream to a tempfile under `workspace_path` which is
+    /// then memory-mapped. The running total is checked against `max_bytes`
+    /// throughout, so a stream whose declared size was wrong still cannot
+    /// consume unbounded memory/disk — it is aborted with a validation error.
+    ///
+    /// The threshold and cap are parameters so both branches are exercised with
+    /// small inputs in unit tests; production callers pass the module constants.
+    async fn stage_quality_input(
+        mut stream: BoxStream<'static, Result<Bytes>>,
+        workspace_path: &str,
+        mmap_threshold: u64,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let over_limit = |max: u64| {
+            AppError::Validation(format!(
+                "Quality-gate input exceeded the {} byte limit while streaming; skipping quality checks",
+                max
             ))
-        })
+        };
+        let stream_err = |e: AppError| {
+            AppError::Storage(format!(
+                "Stream error while staging quality-gate input: {}",
+                e
+            ))
+        };
+
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+
+        // Phase 1: buffer on the heap until the stream drains (small input ->
+        // stay in memory) or we cross the mmap threshold (large input -> spill).
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(stream_err)?;
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(over_limit(max_bytes));
+            }
+            buffered.extend_from_slice(&chunk);
+            if total > mmap_threshold {
+                break;
+            }
+        }
+
+        // Small input: served straight from the heap, no tempfile/mmap.
+        if total <= mmap_threshold {
+            return Ok(Bytes::from(buffered));
+        }
+
+        // Large input: spill the buffered prefix + remaining stream to an
+        // mmap-backed workspace file so the staged artifact does not pin
+        // anonymous heap. Mirrors scanner_service.rs staging.
+        tokio::fs::create_dir_all(workspace_path)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to create quality-gate workspace {}: {}",
+                    workspace_path, e
+                ))
+            })?;
+
+        let workspace = workspace_path.to_string();
+        let temp = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(&workspace))
+            .await
+            .map_err(|e| AppError::Storage(format!("Tempfile join failure: {}", e)))?
+            .map_err(|e| {
+                AppError::Storage(format!("Failed to create quality-gate tempfile: {}", e))
+            })?;
+
+        // Write through the tempfile's own independent fd (`reopen`), never by
+        // reopening the path — that would be a TOCTOU race.
+        let owned_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen quality-gate tempfile handle for write: {}",
+                e
+            ))
+        })?;
+        {
+            let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(owned_file));
+            writer
+                .write_all(&buffered)
+                .await
+                .map_err(|e| AppError::Storage(format!("Write error staging prefix: {}", e)))?;
+            drop(buffered);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(stream_err)?;
+                total += chunk.len() as u64;
+                if total > max_bytes {
+                    return Err(over_limit(max_bytes));
+                }
+                writer.write_all(&chunk).await.map_err(|e| {
+                    AppError::Storage(format!("Write error to quality-gate tempfile: {}", e))
+                })?;
+            }
+            writer.flush().await.map_err(|e| {
+                AppError::Storage(format!("Flush error on quality-gate tempfile: {}", e))
+            })?;
+        }
+
+        let map_file = temp.reopen().map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to reopen quality-gate tempfile handle for mmap: {}",
+                e
+            ))
+        })?;
+        // SAFETY: the file is a freshly created `NamedTempFile` in a workspace
+        // the backend owns; `reopen()` yields an independent fd to the same
+        // inode and `temp` is kept live so nothing truncates/replaces it, and
+        // we never write it again after mapping. The path is unlinked on `temp`
+        // drop; the inode outlives it behind the `Mmap` referenced by the
+        // returned `Bytes`.
+        let mmap = unsafe { memmap2::Mmap::map(&map_file) }.map_err(|e| {
+            AppError::Storage(format!("mmap failed on quality-gate tempfile: {}", e))
+        })?;
+        drop(temp);
+
+        Ok(Bytes::from_owner(mmap))
     }
 
     /// Get artifact health score by artifact ID.
@@ -1154,6 +1325,72 @@ pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
 mod tests {
     use super::*;
     use crate::models::quality::RawQualityIssue;
+
+    fn chunk_stream(chunks: Vec<&'static [u8]>) -> BoxStream<'static, Result<Bytes>> {
+        Box::pin(futures::stream::iter(
+            chunks.into_iter().map(|c| Ok(Bytes::from_static(c))),
+        ))
+    }
+
+    fn unique_workspace() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ak-quality-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn test_stage_quality_input_heap_path_returns_exact_bytes() {
+        // Total (6 bytes) stays under the mmap threshold -> served from heap.
+        let stream = chunk_stream(vec![b"abc", b"def"]);
+        let out = QualityCheckService::stage_quality_input(stream, "/nonexistent", 64, 1024)
+            .await
+            .expect("heap staging");
+        assert_eq!(out.as_ref(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_stage_quality_input_spill_path_returns_exact_bytes() {
+        // Total (9 bytes) exceeds the 4-byte threshold -> spill to mmap, but
+        // stays under the cap. The staged bytes must match the concatenation.
+        let ws = unique_workspace();
+        let stream = chunk_stream(vec![b"aa", b"bb", b"cc", b"ddd"]);
+        let out = QualityCheckService::stage_quality_input(stream, &ws.to_string_lossy(), 4, 1024)
+            .await
+            .expect("spill staging");
+        assert_eq!(out.as_ref(), b"aabbccddd");
+        let _ = tokio::fs::remove_dir_all(&ws).await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_quality_input_over_limit_heap_phase_errors() {
+        // Cap of 3 is exceeded before the threshold -> clean validation error,
+        // never OOM.
+        let stream = chunk_stream(vec![b"aa", b"bb"]);
+        let err = QualityCheckService::stage_quality_input(stream, "/nonexistent", 64, 3)
+            .await
+            .expect_err("must reject over-limit input");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_stage_quality_input_over_limit_spill_phase_errors() {
+        // Crosses the mmap threshold (spill) then exceeds the cap while
+        // streaming the remainder -> validation error, not OOM.
+        let ws = unique_workspace();
+        let stream = chunk_stream(vec![b"aaa", b"bbb", b"ccc"]);
+        let err = QualityCheckService::stage_quality_input(stream, &ws.to_string_lossy(), 2, 5)
+            .await
+            .expect_err("must reject over-limit input during spill");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let _ = tokio::fs::remove_dir_all(&ws).await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_quality_input_empty_stream_is_empty() {
+        let stream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::empty());
+        let out = QualityCheckService::stage_quality_input(stream, "/nonexistent", 64, 1024)
+            .await
+            .expect("empty staging");
+        assert!(out.is_empty());
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
