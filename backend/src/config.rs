@@ -560,6 +560,26 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    // -- Proxy pull-through cache cross-replica single-flight (#1609) --
+    /// Enable the cross-replica single-flight coordinator for pull-through cache
+    /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
+    /// replica cold-fetches a given object cluster-wide instead of up to N (which
+    /// flaps the storage ETag under readers → `Stale file handle` / truncated
+    /// `.sha1`, #1606). Opt-in HA feature (like `presigned_downloads_enabled`):
+    /// default `false` keeps the unchanged per-process single-flight for
+    /// single-replica installs. Multi-replica deployments should set
+    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
+    pub proxy_singleflight_advisory_locks_enabled: bool,
+
+    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
+    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    pub proxy_singleflight_lock_poll_interval_ms: u64,
+
+    /// Upper bound (seconds) a follower waits for the leader's commit before
+    /// falling back to its own bounded fetch, when advisory locks are enabled.
+    /// Default: 65.
+    pub proxy_singleflight_lock_wait_timeout_secs: u64,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -666,6 +686,9 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show proxy_singleflight_advisory_locks_enabled,
+    show proxy_singleflight_lock_poll_interval_ms,
+    show proxy_singleflight_lock_wait_timeout_secs,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -764,6 +787,9 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            proxy_singleflight_advisory_locks_enabled: false,
+            proxy_singleflight_lock_poll_interval_ms: 200,
+            proxy_singleflight_lock_wait_timeout_secs: 65,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -1016,6 +1042,18 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            proxy_singleflight_advisory_locks_enabled: matches!(
+                env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            proxy_singleflight_lock_poll_interval_ms: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS",
+                200,
+            ),
+            proxy_singleflight_lock_wait_timeout_secs: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
+                65,
+            ),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -2686,6 +2724,39 @@ mod tests {
         env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
         let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
         assert_eq!(expiry, 300);
+    }
+
+    // ── proxy cross-replica single-flight config tests (#1609) ────────────
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+        let config = Config::from_env().expect("config should load");
+        assert!(!config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 200);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 65);
+    }
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_opt_in() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED", "true");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS", "125");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS", "42");
+        let config = Config::from_env().expect("config should load");
+        assert!(config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 125);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 42);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use crate::services::proxy_hydration::coordinate_proxy_hydration;
+use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::storage::StorageLocation;
@@ -866,10 +866,13 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    let _ = db;
     let hydration_lease_key = format!("artifact-repair:{}", storage_key);
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
+    // #1609: single-flight the missing-file repair CLUSTER-WIDE (was per-process)
+    // via the config-selected advisory-lock coordinator, so concurrent replicas
+    // do not each re-download and write back the same object.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
         || async {
             match storage.get(storage_key).await {
                 Ok(content) => Ok(Some(content)),
@@ -902,8 +905,8 @@ where
             )
                 .into_response()
         },
-    )
-    .await
+        )
+        .await
 }
 
 /// Serialise concurrent reads for a locally-stored artifact whose physical
@@ -925,43 +928,45 @@ pub(crate) async fn coordinated_retry_get(
     storage_key: &str,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
-    let _ = db;
     let hydration_lease_key = format!("artifact-read-retry:{}", storage_key);
     tracing::warn!(
         artifact_id = %artifact_id,
         storage_key = %storage_key,
         "storage miss on local artifact; coordinating re-read"
     );
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
-        || async {
-            match storage.get(storage_key).await {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(crate::error::AppError::NotFound(_)) => Ok(None),
-                Err(e) => Err(map_storage_err(e)),
-            }
-        },
-        || async {
-            tracing::error!(
-                artifact_id = %artifact_id,
-                storage_key = %storage_key,
-                "artifact file still absent after coordinated retry; returning 507"
-            );
-            Err((
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response())
-        },
-        || {
-            (
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response()
-        },
-    )
-    .await
+    // #1609: coordinate the re-read CLUSTER-WIDE (was per-process) via the
+    // config-selected advisory-lock coordinator.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
+            || async {
+                match storage.get(storage_key).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(crate::error::AppError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(map_storage_err(e)),
+                }
+            },
+            || async {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    storage_key = %storage_key,
+                    "artifact file still absent after coordinated retry; returning 507"
+                );
+                Err((
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response())
+            },
+            || {
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response()
+            },
+        )
+        .await
 }
 
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
@@ -6089,6 +6094,9 @@ mod tests {
                 password_min_strength: 0,
                 presigned_downloads_enabled: false,
                 presigned_download_expiry_secs: 300,
+                proxy_singleflight_advisory_locks_enabled: false,
+                proxy_singleflight_lock_poll_interval_ms: 200,
+                proxy_singleflight_lock_wait_timeout_secs: 65,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,

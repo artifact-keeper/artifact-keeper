@@ -26,7 +26,7 @@ use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::record_proxy_cache_lookup;
 use crate::services::proxy_hydration::{
-    BufferedCoordinator, Coordinator, StreamHandle, StreamHeaders,
+    Coordinator, HydrationCoordinator, StreamHandle, StreamHeaders,
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
@@ -1962,9 +1962,10 @@ pub struct ProxyService {
     /// // #1631 layer 2: the streaming path (`fetch_artifact_streaming`) will
     /// //               coordinate through a streaming entry point on this same
     /// //               seam (broadcast fan-out, not buffered re-check).
-    /// // #1631 layer 3: a cross-replica advisory-lock decorator (#1609) can
-    /// //               replace this field with a wrapping `Coordinator` impl.
-    coordinator: BufferedCoordinator,
+    /// // #1631 layer 3: a cross-replica advisory-lock decorator (#1609)
+    /// //               replaces this field with a wrapping `Coordinator` impl,
+    /// //               selected by config via the [`HydrationCoordinator`] enum.
+    coordinator: HydrationCoordinator,
 }
 
 impl ProxyService {
@@ -1991,10 +1992,12 @@ impl ProxyService {
         let cache_store = CacheStore::new(Arc::clone(&storage));
         let cache_persister = CachePersister::new(Arc::clone(&storage));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
-        // #1631 layer 1: inject the in-process buffered single-flight
-        // coordinator. Layer 3 (#1609) can swap this for an advisory-lock
-        // decorator without touching call sites.
-        let coordinator = BufferedCoordinator::new();
+        // #1631 layer 1/3: select the single-flight coordinator from config.
+        // Defaults to the in-process buffered coordinator; multi-replica
+        // deployments opt into the cross-replica advisory-lock decorator (#1609)
+        // with `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`. Call sites are
+        // unchanged — both variants implement the same `Coordinator` seam.
+        let coordinator = HydrationCoordinator::from_env(db.clone());
 
         Self {
             db,
@@ -2236,6 +2239,24 @@ impl ProxyService {
                         self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
                     {
                         check_quarantine_until(metadata.quarantine_until)?;
+                    }
+                    return Ok(cached);
+                }
+                // #1609: a remote cluster leader may have just recorded a
+                // negative (404) sidecar while this follower was polling. Surface
+                // a fresh negative hit as NotFound so the follower short-circuits
+                // the leader-recorded 404 instead of re-fetching upstream after
+                // the wait deadline (bounded to <=1 extra 404/replica without it).
+                if let Some(metadata) = self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
+                {
+                    if metadata
+                        .negative_cached_until
+                        .is_some_and(|until| until > Utc::now())
+                    {
+                        return Err(AppError::NotFound(format!(
+                            "Upstream returned 404 (negative-cached) for {}",
+                            fetch_path
+                        )));
                     }
                 }
                 Ok(cached)
