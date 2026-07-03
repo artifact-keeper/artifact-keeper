@@ -152,9 +152,17 @@ impl HelmHandler {
         )))
     }
 
-    /// Extract Chart.yaml from chart package
+    /// Extract Chart.yaml from chart package.
     pub fn extract_chart_yaml(content: &[u8]) -> Result<ChartYaml> {
-        let gz = GzDecoder::new(content);
+        Self::extract_chart_yaml_from_reader(content)
+    }
+
+    /// Extract Chart.yaml from a chart package `reader`, decoding the gzip
+    /// stream incrementally so the whole archive is never held in memory. Only
+    /// the Chart.yaml entry is read (capped by `read_capped_entry_to_string`),
+    /// so peak memory is a single metadata entry rather than the full artifact.
+    pub fn extract_chart_yaml_from_reader<R: Read>(reader: R) -> Result<ChartYaml> {
+        let gz = GzDecoder::new(reader);
         let mut archive = Archive::new(gz);
 
         for entry in archive
