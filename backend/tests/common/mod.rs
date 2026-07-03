@@ -11,8 +11,13 @@
 pub mod fixtures;
 pub mod sso_support;
 
+use std::sync::Arc;
+
 use axum::Router;
 use sqlx::PgPool;
+use uuid::Uuid;
+
+use artifact_keeper_backend::config::Config;
 
 /// Test context containing shared resources for tests
 pub struct TestContext {
@@ -37,6 +42,50 @@ impl TestContext {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+}
+
+/// Connect to the Postgres instance the DB-gated (`#[ignore]`) integration
+/// tests run against. Panics when `DATABASE_URL` is unset so a missing test
+/// database fails loudly instead of testing nothing.
+pub async fn require_db_pool() -> PgPool {
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for DB-gated tests");
+    PgPool::connect(&database_url)
+        .await
+        .expect("failed to connect to the test database")
+}
+
+/// Build a `Config` for DB-gated tests. `Config::from_env()` requires
+/// `DATABASE_URL` and `JWT_SECRET`; default the JWT secret when the test
+/// runner didn't set one explicitly.
+pub fn test_config_with_default_jwt() -> Arc<Config> {
+    if std::env::var("JWT_SECRET").is_err() {
+        std::env::set_var(
+            "JWT_SECRET",
+            "ak-integration-test-jwt-secret-not-for-prod-use-please",
+        );
+    }
+    Arc::new(Config::from_env().expect("Config::from_env failed"))
+}
+
+/// Insert a freshly-minted, active local user with a unique name derived
+/// from `prefix`. Returns the user_id.
+pub async fn insert_active_user(pool: &PgPool, prefix: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let username = format!("{}-{}", prefix, &id.to_string()[..8]);
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, username, email, password_hash, is_admin, is_active, auth_provider)
+        VALUES ($1, $2, $3, NULL, false, true, 'local')
+        "#,
+    )
+    .bind(id)
+    .bind(&username)
+    .bind(format!("{}@test.local", username))
+    .execute(pool)
+    .await
+    .expect("failed to insert user");
+    id
 }
 
 /// Create a test application router for handler testing
