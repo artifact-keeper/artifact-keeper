@@ -1183,6 +1183,8 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(content[..end_pos].trim().to_string())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

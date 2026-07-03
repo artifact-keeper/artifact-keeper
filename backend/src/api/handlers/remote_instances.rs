@@ -155,6 +155,8 @@ async fn reqwest_to_axum(resp: reqwest::Response) -> Result<Response> {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     let content_type = resp.headers().get("content-type").cloned();
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
     let body = resp
         .bytes()
         .await

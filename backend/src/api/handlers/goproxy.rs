@@ -291,6 +291,8 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
     let body = upstream_resp.bytes().await.map_err(|e| {
         tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
         (

@@ -20,6 +20,7 @@
 //!   cargo test --test composer_packages_index_tests -- --ignored
 //! ```
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use std::io::Write;
 use std::sync::Arc;
 

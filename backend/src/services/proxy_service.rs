@@ -1520,6 +1520,8 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: proxy upstream fetch buffered; tracked for streaming copy to storage in a later #1608 phase
         let content = response.bytes().await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to read upstream response: {}",

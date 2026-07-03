@@ -16,6 +16,7 @@
 //!
 //! Companion to PR #936 / issue #916.
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::Value;

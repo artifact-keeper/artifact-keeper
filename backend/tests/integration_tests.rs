@@ -13,7 +13,7 @@
 //! a running HTTP server. In CI, run them separately with a service container.
 
 #![allow(dead_code)]
-
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use std::env;
 use std::sync::Once;
 

@@ -246,6 +246,8 @@ pub async fn install_plugin(
         let name = field.name().unwrap_or("").to_string();
 
         if name == "package" || name == "manifest" {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data = field
                 .bytes()
                 .await
@@ -654,6 +656,7 @@ pub async fn install_from_git(
         (status = 400, description = "Missing or invalid ZIP file"),
     )
 )]
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 pub async fn install_from_zip(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -670,6 +673,7 @@ pub async fn install_from_zip(
         let name = field.name().unwrap_or("").to_string();
         if name == "file" || name == "package" || name == "zip" {
             zip_data = Some(
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 field
                     .bytes()
                     .await

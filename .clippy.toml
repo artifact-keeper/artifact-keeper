@@ -1,2 +1,17 @@
 # Clippy configuration
 msrv = "1.75.0"
+
+# Streaming-invariant enforcement gate — Part of #1608 (Core Invariant ①).
+#
+# Artifact-path handlers must never read a full artifact body into memory. These
+# calls buffer an entire HTTP/multipart body on the heap, which is exactly the
+# ad-hoc full-buffering pattern that produced the 16 memory/OOM issues tracked
+# under #1607. Forbid new call sites via clippy; every CURRENT legitimate site is
+# annotated `#[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: <reason>`
+# and enumerated in backend/tests/streaming_invariant.rs. As later phases convert
+# a site to streaming, its annotation (and allowlist entry) is removed.
+disallowed-methods = [
+    { path = "reqwest::Response::bytes", reason = "STREAMING: buffers the whole upstream body in memory; use .bytes_stream()/streaming copy or a capped read; see #1608" },
+    { path = "axum::extract::multipart::Field::bytes", reason = "STREAMING: buffers the whole multipart field in memory; use .chunk() with an incremental hash / put_stream; see #1608" },
+    { path = "axum::body::to_bytes", reason = "STREAMING: buffers the whole request/response body in memory; pass a bounded limit and prefer streaming; see #1608" },
+]

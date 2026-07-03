@@ -1658,6 +1658,8 @@ pub async fn repo_visibility_middleware(
     next.run(request).await
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

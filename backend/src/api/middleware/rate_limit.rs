@@ -499,6 +499,8 @@ pub async fn login_rate_limit_middleware(
     // Buffer the (small) login body so we can peek `username`, then re-attach
     // it unchanged for the handler's custom Json extractor.
     let (parts, body) = request.into_parts();
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: buffers the small login body (LOGIN_BODY_PEEK_LIMIT) to peek username, re-attached unchanged; not an artifact path (#1608)
     let bytes = match axum::body::to_bytes(body, LOGIN_BODY_PEEK_LIMIT).await {
         Ok(b) => b,
         Err(_) => {
@@ -679,6 +681,8 @@ fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> O
     None
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

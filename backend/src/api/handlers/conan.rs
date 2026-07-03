@@ -2465,6 +2465,8 @@ async fn package_file_upload(
         .unwrap())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4131,6 +4133,8 @@ mod tests {
     //
     // All tests are DB-backed and no-op when `DATABASE_URL` is unreachable.
     // -----------------------------------------------------------------------
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
     #[cfg(test)]
     mod agent1_auth_search {
         use super::test_helpers::*;

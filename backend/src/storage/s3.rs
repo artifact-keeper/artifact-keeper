@@ -924,6 +924,7 @@ impl S3Backend {
         let path: ObjectPath = fallback_full_key.into();
         match self.store.get(&path).await {
             Ok(result) => {
+                // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
                     AppError::Storage(format!("Failed to read fallback '{}': {}", fallback_key, e))
                 })?;
@@ -1065,6 +1066,7 @@ impl super::StorageBackend for S3Backend {
 
         match self.store.get(&path).await {
             Ok(result) => {
+                // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
                     AppError::Storage(format!("Failed to read object '{}': {}", key, e))
                 })?;
@@ -3762,6 +3764,8 @@ mod tests {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod integration_tests {
     use super::*;

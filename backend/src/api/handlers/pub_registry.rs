@@ -391,6 +391,7 @@ async fn new_upload_url(
 // POST /pub/{repo_key}/api/packages/versions/newUpload -- Upload package
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -410,6 +411,7 @@ async fn upload_package(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             file_bytes = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read upload: {}", e),

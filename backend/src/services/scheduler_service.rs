@@ -872,6 +872,8 @@ async fn run_curation_sync_cycle(
                 }
                 match primary_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
                         let xml = if primary_path.ends_with(".gz") {
                             use std::io::Read;
@@ -903,6 +905,8 @@ async fn run_curation_sync_cycle(
                 }
                 match packages_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
                         use std::io::Read;
                         let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);

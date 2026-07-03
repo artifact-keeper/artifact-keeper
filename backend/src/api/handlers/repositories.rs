@@ -3840,6 +3840,8 @@ async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, Stri
         // Accept any field that has a filename (i.e. a file upload)
         let filename = field.file_name().map(|s| s.to_string());
         if let Some(filename) = filename {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data: Bytes = field
                 .bytes()
                 .await
@@ -3875,6 +3877,8 @@ async fn extract_multipart_file_and_path(
         if let Some(filename) = filename {
             // File upload field
             if file.is_none() {
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 let data: Bytes = field
                     .bytes()
                     .await
@@ -5408,6 +5412,8 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
     format!("{:?}", repo_type).to_lowercase()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

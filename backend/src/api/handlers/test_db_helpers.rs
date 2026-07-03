@@ -12,6 +12,9 @@
 //!     let Some(pool) = tdh::try_pool().await else { return; };
 
 #![allow(dead_code)]
+// streaming-invariant: test scaffolding exempt — buffering response bodies in
+// DB-backed handler tests is not an artifact path (#1608).
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

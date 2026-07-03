@@ -1814,6 +1814,7 @@ fn extract_metadata_from_sdist(content: &[u8]) -> Option<String> {
 // POST /pypi/{repo_key}/ — Twine upload
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1887,6 +1888,7 @@ async fn upload(
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 file_content = Some(field.bytes().await.map_err(|e| {
+                    // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                     AppError::Validation(format!("Invalid file: {}", e)).into_response()
                 })?);
             }
@@ -2419,6 +2421,8 @@ fn merge_local_into_remote_simple_json(
     serde_json::to_string(&doc).ok()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

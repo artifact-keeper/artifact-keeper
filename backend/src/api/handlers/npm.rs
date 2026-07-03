@@ -281,6 +281,7 @@ fn empty_audits_quick_response() -> Response {
 /// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
 /// well-formed response so the audit degrades gracefully instead of failing
 /// the client command. See issue #1400.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_audit_post(
     upstream_url: &str,
     path: &str,
@@ -305,6 +306,7 @@ async fn proxy_npm_audit_post(
                 .unwrap_or("application/json")
                 .to_string();
             match resp.bytes().await {
+                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
                 Ok(bytes) => {
                     if !status.is_success() {
                         debug!(
@@ -353,6 +355,7 @@ async fn proxy_npm_audit_post(
 /// Returns the upstream status + body verbatim. On any transport error (DNS,
 /// TLS, timeout) returns `None` so the caller can fall through to the local
 /// fallback.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
     let base = upstream_url.trim_end_matches('/');
     // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
@@ -384,6 +387,7 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
         .to_string();
 
     match resp.bytes().await {
+        // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         Ok(bytes) => Some(
             Response::builder()
                 .status(status)
@@ -993,6 +997,8 @@ async fn get_package_version_metadata(
             &serde_json::Map::new(),
             false,
         )?;
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| {
@@ -1076,6 +1082,8 @@ async fn fetch_virtual_packument(
                     &serde_json::Map::new(),
                     false,
                 )?;
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
                 let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
                     .await
                     .map_err(|e| {
@@ -1925,6 +1933,8 @@ async fn dist_tags_get(
     if !resp.status().is_success() {
         return Ok(resp);
     }
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
     let body_bytes = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| {
@@ -2210,6 +2220,8 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     )
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

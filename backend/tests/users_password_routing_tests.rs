@@ -41,6 +41,7 @@
 //! routing/middleware composition that makes the bash test reach the
 //! handler in the first place.
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
