@@ -21,6 +21,7 @@ use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::storage::StorageLocation;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -3359,6 +3360,181 @@ pub async fn put_artifact_bytes(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Streaming artifact uploads (#1608 Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Light-format upload handlers (chef, ansible, pub, ...) historically buffered
+// the entire artifact body in memory via `Field::bytes()` before handing it to
+// `put_artifact_bytes` -> `storage.put(Bytes)`. `stage_upload_field` +
+// `put_artifact_stream` replace that with a memory-bounded path: the multipart
+// field is spooled chunk-by-chunk to a scratch temp file (peak RAM =
+// STREAM_STAGE_CHUNK), then streamed into the repo's `StorageBackend` through
+// its native `put_stream` primitive (S3 multipart / GCS resumable / Azure
+// block-blob / filesystem temp-and-rename), which computes the SHA-256
+// incrementally as it copies. Mirrors the incus monolithic-upload pattern
+// (`stream_body_to_file` + `open_temp_file_as_stream`). `put_artifact_bytes`
+// is retained for the small metadata writers that still need the bytes in hand.
+//
+// This pair is the shared entry point later #1608 phases (helm/pypi/nuget)
+// build on: `stage_upload_field` decouples the (borrowed, non-`'static`)
+// multipart field lifetime from the `'static` stream `put_stream` requires,
+// and lets a handler parse archive metadata off the staged file before the
+// storage key is known.
+
+/// Chunk size for reading a staged scratch file back into `put_stream`.
+const STREAM_STAGE_CHUNK: usize = 256 * 1024;
+
+/// A multipart upload body spooled to a bounded scratch file on local disk.
+///
+/// The scratch file is removed on drop (RAII), so every early return — a
+/// mid-receive stream error, a `?`-propagated failure, or a storage failure in
+/// [`put_artifact_stream`] — unlinks it instead of leaking an orphan (#1573).
+/// The file is staged under the shared upload staging root, so the orphan
+/// sweep reaps it as a backstop if the process dies mid-request.
+pub struct StagedUpload {
+    path: PathBuf,
+    size_bytes: i64,
+}
+
+impl StagedUpload {
+    /// On-disk path of the staged scratch file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of bytes spooled to disk (== the eventual artifact size).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// Whether the spooled body is empty (no bytes received).
+    pub fn is_empty(&self) -> bool {
+        self.size_bytes == 0
+    }
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        // Synchronous best-effort unlink: Drop can't await and the file is
+        // local scratch, so a blocking unlink is negligible.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spool one multipart field to a bounded scratch temp file, aborting with
+/// `413 Payload Too Large` once `max_upload_size_bytes` is exceeded (a value of
+/// 0 disables the limit, matching the `DefaultBodyLimit` config semantics).
+///
+/// Never buffers the whole field in memory: chunks are written straight to
+/// disk. The returned [`StagedUpload`] owns the scratch file and removes it on
+/// drop. Feed it to [`put_artifact_stream`] once the storage key is known.
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field(
+    state: &crate::api::SharedState,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<StagedUpload, Response> {
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload body: {e}"),
+        )
+            .into_response()
+    })? {
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok(staged)
+}
+
+/// Stream a [`StagedUpload`] scratch file into the repository's configured
+/// `StorageBackend` via its native `put_stream`, computing the SHA-256
+/// checksum incrementally as it copies (no separate hashing pass over a
+/// buffered body). Returns the incremental checksum + byte count for building
+/// the artifact row.
+///
+/// Consumes the `StagedUpload`: the scratch file is removed when this returns,
+/// on success or on error.
+#[allow(clippy::result_large_err)]
+pub async fn put_artifact_stream(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    staged: StagedUpload,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let stream = open_staged_stream(staged.path()).await?;
+    let result = storage
+        .put_stream(storage_key, stream)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    Ok(result)
+    // `staged` drops here -> scratch file removed.
+}
+
+/// Open a staged scratch file as a `'static` byte stream ready to feed
+/// `StorageBackend::put_stream`. A buffered `ReaderStream` keeps the
+/// disk->backend copy bounded to `STREAM_STAGE_CHUNK`.
+#[allow(clippy::result_large_err)]
+async fn open_staged_stream(
+    path: &Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| internal_error("Staging reopen", e))?;
+    let reader = BufReader::with_capacity(STREAM_STAGE_CHUNK, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_STAGE_CHUNK)
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("staged read: {e}"))));
+    Ok(Box::pin(stream))
+}
+
 /// Borrowed handle to the columns required to insert a new artifact row.
 /// The lifetime ties the supplied string slices to the surrounding scope so
 /// the helper can avoid extra allocations.
@@ -6609,6 +6785,108 @@ mod tests {
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── stage_upload_field + put_artifact_stream (#1608 Phase 2) ─────────
+
+    /// Encode a single-field (`file`) multipart/form-data body.
+    fn one_field_multipart(boundary: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"f.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Extract the first multipart field from an in-memory body.
+    async fn first_field(body: Vec<u8>) -> axum::extract::Multipart {
+        use axum::extract::FromRequest;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "multipart/form-data; boundary=BND")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stage_and_put_artifact_stream_roundtrip() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "chef").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+        };
+
+        let payload = b"streamed-artifact-body".repeat(64);
+        let mut mp = first_field(one_field_multipart("BND", &payload)).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(!staged.is_empty());
+        assert_eq!(staged.size_bytes(), payload.len() as i64);
+        // Field bytes really landed on disk (spooled, not buffered).
+        assert_eq!(tokio::fs::read(staged.path()).await.unwrap(), payload);
+        let scratch = staged.path().to_path_buf();
+
+        let put = put_artifact_stream(&state, &repo, "chef/x/1.0/x.tar.gz", staged)
+            .await
+            .expect("put_stream");
+
+        // Checksum computed incrementally by put_stream matches a direct hash.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        assert_eq!(put.checksum_sha256, format!("{:x}", hasher.finalize()));
+        assert_eq!(put.bytes_written, payload.len() as u64);
+
+        // Scratch file removed once the StagedUpload dropped.
+        assert!(!scratch.exists());
+
+        // Bytes are retrievable from the backend under the storage key.
+        let storage = state.storage_for_repo(&repo.storage_location()).unwrap();
+        let got = storage.get("chef/x/1.0/x.tar.gz").await.unwrap();
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_upload_field_reports_empty_body() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "pub").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let mut mp = first_field(one_field_multipart("BND", b"")).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(staged.is_empty());
+        assert_eq!(staged.size_bytes(), 0);
+        // Even an empty spool leaves a scratch file that is cleaned up on drop.
+        let scratch = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!scratch.exists());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
     }
 
     // ── record_artifact_metadata ────────────────────────────────────────

@@ -32,16 +32,17 @@ use std::path::{Path, PathBuf};
 ///
 /// Phase 1 total: 38 exempt sites (36 clippy-gated + 2 `object_store` storage
 /// reads). Shrink these as streaming conversions land in later phases of #1608.
+///
+/// Phase 2 (#1608) streamed the light-format multipart uploads to storage via
+/// `put_artifact_stream`, removing all 5 exempt sites in ansible.rs (2),
+/// chef.rs (2) and pub_registry.rs (1): 38 -> 33.
 const ALLOWLIST: &[(&str, usize)] = &[
-    ("src/api/handlers/ansible.rs", 2),
-    ("src/api/handlers/chef.rs", 2),
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/helm.rs", 1),
     ("src/api/handlers/npm.rs", 5),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
-    ("src/api/handlers/pub_registry.rs", 1),
     ("src/api/handlers/pypi.rs", 1),
     ("src/api/handlers/remote_instances.rs", 1),
     ("src/api/handlers/repositories.rs", 2),
@@ -404,7 +405,7 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 38,
-        "expected 38 exempt sites in Phase 1; got {total}"
+        total, 33,
+        "expected 33 exempt sites after #1608 Phase 2; got {total}"
     );
 }
