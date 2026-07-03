@@ -25,7 +25,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -397,7 +399,6 @@ async fn download_collection(
 // POST /ansible/{repo_key}/api/v3/artifacts/collections/ — Upload collection (multipart)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -417,7 +418,10 @@ async fn upload_collection(
     // older clients still send a `collection` or `metadata` JSON field, so
     // accept either source for the namespace/name/version. The filename
     // takes precedence because it is what the CLI ships with.
-    let mut tarball: Option<Bytes> = None;
+    // Spool the tarball straight to a bounded scratch file instead of buffering
+    // the whole body in memory; the small text/JSON fields are still read
+    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     let mut file_name: Option<String> = None;
     let mut declared_sha256: Option<String> = None;
     let mut collection_json: Option<serde_json::Value> = None;
@@ -430,14 +434,7 @@ async fn upload_collection(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             file_name = field.file_name().map(|s| s.to_string());
-            tarball = Some(field.bytes().await.map_err(|e| {
-                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read file: {}", e),
-                )
-                    .into_response()
-            })?);
+            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
         } else if field_name == "sha256" {
             declared_sha256 = Some(field.text().await.map_err(|e| {
                 (
@@ -447,16 +444,16 @@ async fn upload_collection(
                     .into_response()
             })?);
         } else if field_name == "collection" || field_name == "metadata" {
-            #[allow(clippy::disallowed_methods)]
-            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-            let data = field.bytes().await.map_err(|e| {
+            // Small JSON metadata field (not the artifact body): read as text (a
+            // length-limited extractor) and parse in-hand.
+            let data = field.text().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read metadata JSON: {}", e),
                 )
                     .into_response()
             })?;
-            collection_json = Some(serde_json::from_slice(&data).map_err(|e| {
+            collection_json = Some(serde_json::from_str(&data).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Invalid metadata JSON: {}", e),
@@ -466,9 +463,9 @@ async fn upload_collection(
         }
     }
 
-    let tarball =
-        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
-    if tarball.is_empty() {
+    let staged =
+        staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
+    if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
     }
 
@@ -539,16 +536,31 @@ async fn upload_collection(
         namespace, collection_name, collection_version
     );
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&tarball);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
+
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        "Collection version already exists",
+    )
+    .await?;
+
+    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
+    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let computed_sha256 = put.checksum_sha256;
 
     // If the client supplied a digest, verify the upload was not corrupted in
-    // transit. ansible-galaxy CLI always sends one.
+    // transit. ansible-galaxy CLI always sends one. On mismatch, remove the
+    // just-written object so a corrupt upload leaves nothing behind.
     if let Some(declared) = declared_sha256.as_deref() {
         let declared = declared.trim();
         if !declared.is_empty() && !declared.eq_ignore_ascii_case(&computed_sha256) {
+            if let Ok(storage) = state.storage_for_repo(&repo.storage_location()) {
+                let _ = storage.delete(&storage_key).await;
+            }
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -560,19 +572,6 @@ async fn upload_collection(
         }
     }
 
-    let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
-
-    proxy_helpers::ensure_unique_artifact_path(
-        &state.db,
-        repo.id,
-        &artifact_path,
-        "Collection version already exists",
-    )
-    .await?;
-
-    let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, tarball.clone()).await?;
-
     let ansible_metadata = serde_json::json!({
         "namespace": namespace,
         "collection_name": collection_name,
@@ -581,7 +580,7 @@ async fn upload_collection(
         "collection_json": collection_json,
     });
 
-    let size_bytes = tarball.len() as i64;
+    let size_bytes = put.bytes_written as i64;
 
     let artifact_id = proxy_helpers::insert_artifact(
         &state.db,
