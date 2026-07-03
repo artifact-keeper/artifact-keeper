@@ -538,6 +538,13 @@ async fn proxy_fetch_streaming_member(
 /// `None` when a redirect does not apply (presigned downloads disabled,
 /// non-redirecting backend, or cache not fresh), in which case the caller falls
 /// back to a streaming cache probe / upstream fetch.
+///
+/// #2075: a fresh entry still inside its Package Age Policy hold window is
+/// NEVER presigned. The gate returns `None` so the member falls through to the
+/// streaming cache probe, which classifies the held entry `NeedsUpstream`; the
+/// Pass-2 re-resolve then re-detects the hold on the cached entry and surfaces
+/// the 409/403 via `map_proxy_error` WITHOUT contacting upstream (see
+/// [`classify_streaming_cache_probe`] / [`classify_stream_upstream`]).
 async fn try_member_cache_redirect(
     state: &AppState,
     proxy: &ProxyService,
@@ -550,6 +557,16 @@ async fn try_member_cache_redirect(
     let storage = proxy.cache_storage_backend();
     let cache_key = ProxyService::cache_storage_key(&member.key, path).ok()?;
     if !(storage.supports_redirect() && proxy.is_cache_fresh(&member.key, path).await) {
+        return None;
+    }
+    // #2075: gate the redirect on the hold window (mirrors the gate in
+    // `proxy_fetch_or_redirect`). A held entry must not be handed out as a
+    // 302; falling through routes it onto the quarantine-surfacing path.
+    if proxy
+        .cache_quarantine_gate(&member.key, path)
+        .await
+        .is_err()
+    {
         return None;
     }
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
@@ -675,6 +692,15 @@ pub async fn proxy_fetch_or_redirect(
     if presigned_enabled {
         let storage = proxy_service.cache_storage_backend();
         if storage.supports_redirect() && proxy_service.is_cache_fresh(repo_key, path).await {
+            // #2075: a fresh cache entry may still be inside its Package Age
+            // Policy hold window. The buffered/streaming fetch paths enforce
+            // that hold via check_quarantine_until; the presigned-redirect fast
+            // path must gate on it too, or a held object would be handed out as
+            // a 302 on redirect-capable backends. Gate BEFORE signing; a hold
+            // surfaces as the same 409/403 (no redirect, no upstream refetch).
+            if let Err(e) = proxy_service.cache_quarantine_gate(repo_key, path).await {
+                return Err(map_proxy_error(repo_key, path, e));
+            }
             // proxy-cache content is stored without the global key prefix,
             // so it must be signed through the proxy's own (no-prefix)
             // backend, not the prefixed repo handle, or the signed key
@@ -3365,6 +3391,14 @@ pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, 
     .fetch_one(db)
     .await
     .map_err(|e| internal_error("Database", e))?;
+
+    // Apply the upload-time quarantine hold at the shared chokepoint used by the
+    // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
+    // rpm, huggingface). Scoped to hosted repositories so proxy/remote cache
+    // inserts — which carry their own sidecar quarantine state — are not
+    // double-held. Best-effort: never fails the insert.
+    crate::services::quarantine_service::apply_upload_hold_hosted(db, art.repository_id, id).await;
+
     Ok(id)
 }
 
@@ -7581,6 +7615,236 @@ mod tests {
             registry_storage.presigned_calls.load(Ordering::SeqCst),
             0,
             "registry backend must NOT presign proxy-cache keys (#1555)"
+        );
+
+        db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;
+        db_helpers::cleanup(&pool, member_id, Uuid::nil()).await;
+    }
+
+    /// Redirect-capable proxy-cache backend for the #2075 quarantine-gate
+    /// tests. Serves a single fresh, positive cache entry whose sidecar carries
+    /// the supplied Package Age Policy hold (`quarantine_until`), and records
+    /// every presign attempt so a test can assert a HELD entry is never signed
+    /// (and therefore never handed out as a 302). Mirrors `FreshProxyCacheStorage`
+    /// but parameterizes the hold and counts `get_presigned_url` calls.
+    struct QuarantineRedirectStorage {
+        quarantine_until: Option<chrono::DateTime<Utc>>,
+        presign_calls: StdArc<AtomicUsize>,
+    }
+
+    impl QuarantineRedirectStorage {
+        fn new(quarantine_until: Option<chrono::DateTime<Utc>>) -> Self {
+            Self {
+                quarantine_until,
+                presign_calls: StdArc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for QuarantineRedirectStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            if key.ends_with("__cache_meta__.json") {
+                let meta = crate::services::proxy_service::CacheMetadata {
+                    cached_at: Utc::now(),
+                    upstream_etag: None,
+                    storage_etag: None,
+                    last_modified: None,
+                    negative_cached_until: None,
+                    quarantine_until: self.quarantine_until,
+                    expires_at: Utc::now() + chrono::Duration::seconds(3600),
+                    content_type: Some("application/octet-stream".to_string()),
+                    size_bytes: 9,
+                    checksum_sha256: "deadbeef".to_string(),
+                };
+                Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
+            } else {
+                Err(crate::error::AppError::NotFound(key.to_string()))
+            }
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> crate::error::Result<u64> {
+            Ok(9)
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            self.presign_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::storage::PresignedUrl {
+                url: format!("https://signed.example.com/{}", key),
+                expires_in,
+                source: crate::storage::PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    /// Build a `ProxyService` whose no-prefix cache backend is the supplied
+    /// mock, over a lazy DB pool that is never dialed (the redirect fast path
+    /// does not touch the database). Shared by the #2075 `proxy_fetch_or_redirect`
+    /// tests.
+    fn build_proxy_with_cache_backend(backend: StdArc<QuarantineRedirectStorage>) -> ProxyService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        ProxyService::new(
+            pool,
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                backend,
+            )),
+        )
+    }
+
+    /// #2075: a fresh proxy-cache entry that is still inside its Package Age
+    /// Policy hold window MUST NOT be handed out as a presigned 302 on a
+    /// redirect-capable backend. `proxy_fetch_or_redirect` must return the same
+    /// 409 the buffered/streaming paths return, and MUST NOT sign the object.
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_blocks_held_entry_2075() {
+        let held = StdArc::new(QuarantineRedirectStorage::new(Some(
+            Utc::now() + chrono::Duration::minutes(30),
+        )));
+        let proxy = build_proxy_with_cache_backend(held.clone());
+        // The registry-side backend is irrelevant to the fast path; presigned
+        // downloads must be enabled on the state config.
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
+
+        let err = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            Uuid::nil(),
+            "npm-proxy",
+            "https://upstream.example.test",
+            "lodash",
+        )
+        .await
+        .expect_err("a held cache entry must not resolve to a redirect");
+
+        assert_eq!(
+            err.status(),
+            StatusCode::CONFLICT,
+            "a held entry must surface as 409, matching the buffered/streaming gate"
+        );
+        assert_eq!(
+            held.presign_calls.load(Ordering::SeqCst),
+            0,
+            "a held entry must NEVER be presigned/redirected (#2075)"
+        );
+    }
+
+    /// #2075 non-regression: a fresh proxy-cache entry with NO active hold must
+    /// still take the presigned-redirect fast path (302), exactly as before the
+    /// gate was added.
+    #[tokio::test]
+    async fn test_proxy_fetch_or_redirect_redirects_when_not_held_2075() {
+        let fresh = StdArc::new(QuarantineRedirectStorage::new(/* quarantine = */ None));
+        let proxy = build_proxy_with_cache_backend(fresh.clone());
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
+
+        let resp = super::proxy_fetch_or_redirect(
+            &proxy,
+            &state,
+            Uuid::nil(),
+            "npm-proxy",
+            "https://upstream.example.test",
+            "lodash",
+        )
+        .await
+        .expect("a fresh, non-held entry must resolve to a redirect");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "a fresh, non-held entry must still 302 to the presigned URL"
+        );
+        assert_eq!(
+            fresh.presign_calls.load(Ordering::SeqCst),
+            1,
+            "the non-held fast path must sign exactly once"
+        );
+    }
+
+    /// #2075: the virtual-member redirect fast path (`try_member_cache_redirect`
+    /// inside the #2069 two-phase resolver) must apply the same hold gate as
+    /// `proxy_fetch_or_redirect`. A held member entry on a redirect-capable
+    /// backend must surface as 409 — routed through the resolver's quarantine
+    /// channel (Pass-1 `NeedsUpstream` -> Pass-2 re-detect, no upstream
+    /// contact) — never a 302 to the cached object, and must not sign.
+    ///
+    /// DB-gated like the sibling #1555 redirect test: skips without a live
+    /// Postgres, runs in CI where one is provisioned.
+    #[tokio::test]
+    async fn test_resolve_virtual_download_streaming_blocks_held_entry_2075() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+
+        let (virtual_id, _, _) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (member_id, _member_key, _) = db_helpers::create_repo(&pool, "remote", "pypi").await;
+        db_helpers::link_member(&pool, virtual_id, member_id, 0).await;
+
+        let registry_storage = StdArc::new(RecordingStorage::new(/* supports = */ true));
+        let state =
+            db_helpers::build_state_presigned(pool.clone(), "s3-test", registry_storage.clone());
+
+        let held = StdArc::new(QuarantineRedirectStorage::new(Some(
+            Utc::now() + chrono::Duration::minutes(30),
+        )));
+        let proxy = ProxyService::new(
+            pool.clone(),
+            StdArc::new(crate::services::storage_service::StorageService::new(
+                held.clone(),
+            )),
+        );
+
+        let err = resolve_virtual_download_streaming(
+            &state,
+            Some(&proxy),
+            virtual_id,
+            "pkg/pkg-1.0.0-py3-none-any.whl",
+            "application/octet-stream",
+            None,
+            |_id, _loc| async {
+                panic!("local_fetch must NOT run: the held entry must 409 before any fallback");
+                #[allow(unreachable_code)]
+                Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            },
+        )
+        .await
+        .expect_err("a held member cache entry must not resolve to a redirect");
+
+        assert_eq!(
+            err.status(),
+            StatusCode::CONFLICT,
+            "a held member entry must surface as 409 (#2075)"
+        );
+        assert_eq!(
+            held.presign_calls.load(Ordering::SeqCst),
+            0,
+            "a held member entry must NEVER be presigned/redirected (#2075)"
         );
 
         db_helpers::cleanup(&pool, virtual_id, Uuid::nil()).await;

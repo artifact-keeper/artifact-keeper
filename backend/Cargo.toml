@@ -111,7 +111,7 @@ rand08 = { package = "rand", version = "0.8" }
 pgp = "0.14.2"
 
 # Format parsing
-quick-xml = { version = "0.39", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 flate2 = "1.0"
 tar = "0.4"
 xz2 = "0.1"

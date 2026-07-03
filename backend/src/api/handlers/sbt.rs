@@ -304,6 +304,9 @@ async fn upload_artifact(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     let _ = sqlx::query!(
         r#"
         INSERT INTO artifact_metadata (artifact_id, format, metadata)

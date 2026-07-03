@@ -990,6 +990,9 @@ async fn push_package(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Store metadata.
     let _ = sqlx::query!(
         r#"

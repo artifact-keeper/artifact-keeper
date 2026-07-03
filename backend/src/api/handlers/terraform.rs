@@ -567,6 +567,9 @@ async fn upload_module(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Store metadata
     let metadata = serde_json::json!({
         "kind": "module",
@@ -964,6 +967,9 @@ async fn upload_provider(
     .fetch_one(&state.db)
     .await
     .map_err(crate::api::handlers::db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Store metadata
     let metadata = serde_json::json!({

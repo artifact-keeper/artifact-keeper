@@ -3141,6 +3141,9 @@ async fn store_conda_package(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     // Extract metadata from package contents
     let extracted = extract_conda_metadata(&content, filename);
 
