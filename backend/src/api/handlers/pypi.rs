@@ -2421,8 +2421,9 @@ fn merge_local_into_remote_simple_json(
     serde_json::to_string(&doc).ok()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
 

@@ -7467,8 +7467,9 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
     get(version_check)
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
@@ -11055,8 +11056,9 @@ mod token_claims_isactive_regression_tests {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod blob_pull_streaming_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -11147,8 +11149,9 @@ mod blob_pull_streaming_tests {
 // after `authenticate` runs against a real user row.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod token_lockout_regression_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12103,8 +12106,9 @@ mod manifest_digest_fallback_tests {
 // report vacuous success; skips cleanly when no database is available locally.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod manifest_digest_db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12615,8 +12619,9 @@ mod manifest_digest_db_tests {
 // vacuous success without exercising the DB-backed upload path.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod oci_blob_upload_streaming_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;

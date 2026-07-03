@@ -824,8 +824,9 @@ pub async fn create_download_ticket(
 )]
 pub struct AuthApiDoc;
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
     use axum::http::header::{COOKIE, SET_COOKIE};
