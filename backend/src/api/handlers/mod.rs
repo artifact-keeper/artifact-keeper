@@ -293,6 +293,7 @@ pub mod wasm_proxy;
 pub mod webhooks;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
 

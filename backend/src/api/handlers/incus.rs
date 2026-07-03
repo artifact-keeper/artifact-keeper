@@ -3282,6 +3282,7 @@ mod cross_repo_session_regression_tests {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod streaming_pipeline_regression_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;

@@ -373,6 +373,7 @@ async fn download_cookbook(
 // POST /chef/{repo_key}/api/v1/cookbooks — Upload cookbook (multipart)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_cookbook(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -396,6 +397,7 @@ async fn upload_cookbook(
         match field_name.as_str() {
             "tarball" => {
                 tarball = Some(field.bytes().await.map_err(|e| {
+                    // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                     (
                         StatusCode::BAD_REQUEST,
                         format!("Failed to read tarball: {}", e),
@@ -404,6 +406,8 @@ async fn upload_cookbook(
                 })?);
             }
             "cookbook" => {
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 let data = field.bytes().await.map_err(|e| {
                     (
                         StatusCode::BAD_REQUEST,

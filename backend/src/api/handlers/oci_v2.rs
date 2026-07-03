@@ -644,11 +644,13 @@ async fn collect_request_body(body: Body, limit: usize) -> Result<Bytes, Respons
     collect_request_body_with_exact_limit(body, limit).await
 }
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn collect_request_body_with_exact_limit(
     body: Body,
     limit: usize,
 ) -> Result<Bytes, Response> {
     to_bytes(body, limit).await.map_err(|e| {
+        // STREAMING-EXEMPT: bounded body collector with explicit LengthLimitError guard (OCI large uploads use the chunked path); #1608
         if error_chain_contains::<http_body_util::LengthLimitError>(&e) {
             return oci_error(
                 StatusCode::BAD_REQUEST,
@@ -7466,6 +7468,7 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
@@ -11053,6 +11056,7 @@ mod token_claims_isactive_regression_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod blob_pull_streaming_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -11144,6 +11148,7 @@ mod blob_pull_streaming_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod token_lockout_regression_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12099,6 +12104,7 @@ mod manifest_digest_fallback_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod manifest_digest_db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12610,6 +12616,7 @@ mod manifest_digest_db_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod oci_blob_upload_streaming_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;

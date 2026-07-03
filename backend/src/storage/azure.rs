@@ -553,6 +553,8 @@ impl AzureBackend {
                 fallback = %fallback_key,
                 "Found artifact range at Artifactory fallback path"
             );
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
             let bytes = response
                 .bytes()
                 .await
@@ -1157,6 +1159,8 @@ impl StorageBackend for AzureBackend {
                                 fallback = %fallback_key,
                                 "Found artifact at Artifactory fallback path"
                             );
+                            #[allow(clippy::disallowed_methods)]
+                            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
                             let bytes = fallback_response.bytes().await.map_err(|e| {
                                 AppError::Storage(format!("Failed to read response: {}", e))
                             })?;
@@ -1173,6 +1177,8 @@ impl StorageBackend for AzureBackend {
             )));
         }
 
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
         let bytes = response
             .bytes()
             .await
@@ -1191,6 +1197,8 @@ impl StorageBackend for AzureBackend {
         let response = self.authorized_get_range(&url, &range_header).await?;
 
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
             return response
                 .bytes()
                 .await

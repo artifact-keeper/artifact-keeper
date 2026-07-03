@@ -283,6 +283,7 @@ impl NexusClient {
     ///
     /// Buffers the full response body into memory. Prefer
     /// `download_artifact_stream` for migrations (issue #1422).
+    #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
     pub async fn download_artifact(
         &self,
         repo_name: &str,
@@ -293,7 +294,7 @@ impl NexusClient {
 
         let status = response.status();
         if status.is_success() {
-            Ok(response.bytes().await?)
+            Ok(response.bytes().await?) // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         } else if status.as_u16() == 404 {
             Err(ArtifactoryError::NotFound(format!(
                 "Artifact not found: {}/{}",

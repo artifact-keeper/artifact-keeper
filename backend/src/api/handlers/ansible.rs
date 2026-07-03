@@ -397,6 +397,7 @@ async fn download_collection(
 // POST /ansible/{repo_key}/api/v3/artifacts/collections/ — Upload collection (multipart)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -430,6 +431,7 @@ async fn upload_collection(
         if field_name == "file" {
             file_name = field.file_name().map(|s| s.to_string());
             tarball = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read file: {}", e),
@@ -445,6 +447,8 @@ async fn upload_collection(
                     .into_response()
             })?);
         } else if field_name == "collection" || field_name == "metadata" {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data = field.bytes().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,

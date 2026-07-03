@@ -3278,6 +3278,7 @@ pub async fn find_local_by_filename_suffix(
 /// `json_field_names` lists the form-field names to accept for the JSON
 /// payload (Ansible accepts both `collection` and `metadata`; Puppet uses
 /// `module`). The first matching field wins. Unknown fields are ignored.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 pub async fn parse_multipart_file_with_json(
     mut multipart: axum::extract::Multipart,
     json_field_names: &[&str],
@@ -3293,6 +3294,7 @@ pub async fn parse_multipart_file_with_json(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             tarball = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read file: {}", e),
@@ -3300,6 +3302,8 @@ pub async fn parse_multipart_file_with_json(
                     .into_response()
             })?);
         } else if json_field_names.iter().any(|n| *n == field_name) {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data = field.bytes().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -3559,6 +3563,7 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 mod tests {
     use super::*;
     use axum::http::StatusCode;

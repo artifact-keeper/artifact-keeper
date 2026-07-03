@@ -433,6 +433,7 @@ async fn download_chart(
 // POST /helm/{repo_key}/api/charts -- Upload chart (ChartMuseum-compatible)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_chart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -457,6 +458,7 @@ async fn upload_chart(
         let name = field.name().unwrap_or("").to_string();
         if name == "chart" {
             chart_content = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (StatusCode::BAD_REQUEST, format!("Invalid file: {}", e)).into_response()
             })?);
         }

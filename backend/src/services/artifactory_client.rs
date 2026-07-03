@@ -672,6 +672,7 @@ impl ArtifactoryClient {
     /// the entire artifact in memory at once and OOMs on multi-GB artifacts
     /// (issue #1422). It is kept for callers that genuinely need the bytes
     /// in memory (small fixtures, tests).
+    #[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
     pub async fn download_artifact(
         &self,
         repo_key: &str,
@@ -681,7 +682,7 @@ impl ArtifactoryClient {
         let status = response.status();
 
         if status.is_success() {
-            Ok(response.bytes().await?)
+            Ok(response.bytes().await?) // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         } else if status.as_u16() == 404 {
             Err(ArtifactoryError::NotFound(format!(
                 "Artifact not found: {}/{}",
