@@ -650,3 +650,27 @@ pub fn build_state_with_proxy_presigned(
     state.set_proxy_service(proxy);
     Arc::new(state)
 }
+
+/// Repoint a fixture's Remote repository at `upstream_url` and build a
+/// [`SharedState`] wired with a real [`ProxyService`] whose proxy cache lives in
+/// a fresh temp dir (returned so the caller keeps it alive for the request).
+///
+/// Shared by the format handlers' `remote download streams upstream blob`
+/// regression tests (#1608 Phase 4): they mount a wiremock upstream, call this
+/// to wire the proxy in, then drive the handler router end-to-end to exercise
+/// the streaming pull-through branch (`proxy_fetch_streaming`).
+pub async fn rewire_remote_proxy(
+    fx: &Fixture,
+    upstream_url: &str,
+) -> (crate::api::SharedState, tempfile::TempDir) {
+    sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+        .bind(upstream_url)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("update upstream_url");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proxy = build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+    let state = build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+    (state, dir)
+}

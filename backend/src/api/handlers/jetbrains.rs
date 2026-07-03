@@ -177,22 +177,19 @@ async fn download_plugin(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("plugin/download/{}/{}", name, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #1608 Phase 4: stream the plugin archive to the client
+                    // while teeing to the proxy cache, instead of buffering the
+                    // whole plugin in memory. Single-flight via the merged
+                    // coordinator (#1609).
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/octet-stream",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
             // Virtual repo: try each member in priority order
@@ -693,6 +690,46 @@ fn extract_plugin_from_multipart(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn test_remote_plugin_download_streams_upstream_blob_1608() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "jetbrains").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A small deterministic body stands in for a large artifact; the point
+        // is to exercise the streaming pull-through branch (proxy_fetch_streaming)
+        // added in #1608 Phase 4, not the body size.
+        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        Mock::given(method("GET"))
+            .and(path("/plugin/download/my.plugin/1.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{key}/plugin/download/my.plugin/1.0.0",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from streamed remote download, got {status}");
+        }
+        assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
+        teardown().await;
+    }
     use super::*;
 
     // -----------------------------------------------------------------------
