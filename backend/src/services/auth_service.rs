@@ -798,8 +798,21 @@ pub fn prune_stale_user_token_invalidations() -> usize {
 /// token re-verifies against the database (one extra bcrypt per token, a
 /// bounded and acceptable cost for a rare event).
 pub fn flush_all_api_token_cache_entries() -> usize {
-    // TDD skeleton: implemented together with the cache-invalidation listener.
-    0
+    let mut flushed = 0;
+    if let Ok(mut registry) = auth_token_cache_registry().write() {
+        registry.retain(|weak| {
+            if let Some(cache_arc) = weak.upgrade() {
+                if let Ok(mut cache) = cache_arc.write() {
+                    flushed += cache.len();
+                    cache.clear();
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+    flushed
 }
 
 /// Returns true if a cache entry inserted at `cached_at` should be rejected

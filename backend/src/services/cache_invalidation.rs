@@ -25,15 +25,24 @@
 //! disconnected, the TTL remains the final safety bound.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use metrics::counter;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::api::RepoCache;
+use crate::services::auth_service;
 use crate::services::permission_service::PermissionService;
+
+/// Upper bound for the reconnect backoff. Long enough to avoid hammering a
+/// database that is down, short enough that a recovered database is picked
+/// up quickly (until then the TTLs bound staleness).
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Postgres notification channel the triggers publish on and the listener
 /// subscribes to. Versioned so a future incompatible payload schema can move
@@ -87,29 +96,79 @@ pub struct CacheInvalidationHandles {
 /// than [`CACHE_INVALIDATION_VERSION`]; the caller must treat any `Err` as a
 /// signal to conservatively flush all affected caches rather than silently
 /// ignoring a payload it cannot understand.
-pub fn parse_invalidation_payload(_payload: &str) -> Result<InvalidationEvent, String> {
-    // TDD skeleton: implemented together with the listener.
-    Err("cache-invalidation payload parsing not implemented yet".to_string())
+pub fn parse_invalidation_payload(payload: &str) -> Result<InvalidationEvent, String> {
+    let envelope: InvalidationEnvelope =
+        serde_json::from_str(payload).map_err(|e| format!("malformed payload: {e}"))?;
+    if envelope.v != CACHE_INVALIDATION_VERSION {
+        return Err(format!(
+            "unsupported payload version {} (expected {})",
+            envelope.v, CACHE_INVALIDATION_VERSION
+        ));
+    }
+    Ok(envelope.event)
 }
 
-/// Apply one event to this process's caches, idempotently.
+/// Apply one event to this process's caches, idempotently. Each arm reuses
+/// the same invalidation helper the originating replica calls locally, so
+/// same-replica and cross-replica behavior cannot drift apart.
 pub async fn apply_invalidation_event(
-    _handles: &CacheInvalidationHandles,
-    _event: &InvalidationEvent,
+    handles: &CacheInvalidationHandles,
+    event: &InvalidationEvent,
 ) {
-    // TDD skeleton: implemented together with the listener.
+    match event {
+        InvalidationEvent::ApiTokenRevoked { token_id } => {
+            auth_service::mark_api_token_revoked(*token_id);
+        }
+        InvalidationEvent::UserApiTokensInvalidated { user_id } => {
+            auth_service::invalidate_user_token_cache_entries(*user_id);
+        }
+        InvalidationEvent::RepositoryChanged { old_key, new_key } => {
+            let mut cache = handles.repo_cache.write().await;
+            cache.remove(old_key);
+            cache.remove(new_key);
+        }
+        InvalidationEvent::RepositoryDeleted { key } => {
+            handles.repo_cache.write().await.remove(key);
+        }
+        InvalidationEvent::PermissionsChanged => {
+            handles.permission_service.invalidate_cache();
+        }
+    }
 }
 
 /// Conservatively flush every cache family this module manages. Used on
 /// listener startup, on reconnect, and on any payload that fails to parse.
-pub async fn conservative_flush_all(_handles: &CacheInvalidationHandles) {
-    // TDD skeleton: implemented together with the listener.
+pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
+    let flushed_token_entries = auth_service::flush_all_api_token_cache_entries();
+    handles.repo_cache.write().await.clear();
+    handles.permission_service.invalidate_cache();
+    counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
+    tracing::info!(
+        flushed_token_entries,
+        "conservatively flushed authorization caches (listener start/reconnect or bad payload)"
+    );
 }
 
 /// Handle one raw notification payload: apply it if it parses, otherwise
-/// log and conservatively flush.
-pub async fn handle_notification_payload(_handles: &CacheInvalidationHandles, _payload: &str) {
-    // TDD skeleton: implemented together with the listener.
+/// log and conservatively flush. Failing closed on unparseable payloads
+/// means a newer schema (or a corrupted payload) degrades to an extra cache
+/// refill instead of a silently retained stale authorization.
+pub async fn handle_notification_payload(handles: &CacheInvalidationHandles, payload: &str) {
+    match parse_invalidation_payload(payload) {
+        Ok(event) => {
+            counter!("ak_cache_invalidation_events_total").increment(1);
+            tracing::debug!(?event, "applying cache-invalidation event");
+            apply_invalidation_event(handles, &event).await;
+        }
+        Err(reason) => {
+            counter!("ak_cache_invalidation_parse_errors_total").increment(1);
+            tracing::warn!(
+                %reason,
+                "unparseable cache-invalidation payload; conservatively flushing caches"
+            );
+            conservative_flush_all(handles).await;
+        }
+    }
 }
 
 /// Connect a dedicated [`sqlx::postgres::PgListener`], `LISTEN` on
@@ -122,16 +181,102 @@ pub async fn handle_notification_payload(_handles: &CacheInvalidationHandles, _p
 /// (degraded to TTL-bound staleness) while the listener is down. The task
 /// exits when `shutdown` is cancelled.
 ///
-/// When the initial connection cannot be established the function still
-/// returns `Ok`: the spawned task keeps retrying in the background so a
+/// When the initial connection cannot be established the handle is still
+/// returned: the spawned task keeps retrying in the background so a
 /// temporarily unreachable database at boot does not abort startup.
 pub async fn start_cache_invalidation_listener(
-    _pool: PgPool,
-    _handles: CacheInvalidationHandles,
-    _shutdown: CancellationToken,
+    pool: PgPool,
+    handles: CacheInvalidationHandles,
+    shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    // TDD skeleton: implemented together with the migration-141 triggers.
-    tokio::spawn(async {})
+    // Establish the first LISTEN before returning so callers know that any
+    // event committed after this function resolves will be observed (or, if
+    // the database is unreachable at boot, the task below keeps retrying
+    // while the process serves requests under TTL-bound staleness).
+    let initial = connect_and_flush(&pool, &handles).await;
+
+    tokio::spawn(async move {
+        let mut listener = initial;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let mut current = match listener.take() {
+                Some(l) => l,
+                None => {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    match connect_and_flush(&pool, &handles).await {
+                        Some(l) => l,
+                        None => continue,
+                    }
+                }
+            };
+            backoff = Duration::from_secs(1);
+
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    received = current.try_recv() => match received {
+                        Ok(Some(notification)) => {
+                            handle_notification_payload(&handles, notification.payload()).await;
+                        }
+                        // sqlx re-established the connection under the hood;
+                        // LISTEN is active again but anything committed in
+                        // the gap was missed.
+                        Ok(None) => {
+                            counter!("ak_cache_invalidation_reconnects_total").increment(1);
+                            tracing::warn!(
+                                "cache-invalidation listener reconnected; flushing caches"
+                            );
+                            conservative_flush_all(&handles).await;
+                        }
+                        // Reconnect failed inside sqlx: drop this listener and
+                        // go back to explicit connect-with-backoff so the
+                        // conservative flush runs only once LISTEN is truly
+                        // re-established (flushing earlier would let a cache
+                        // refill go stale again before we are listening).
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "cache-invalidation listener lost; reconnecting with backoff"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Open a dedicated listener connection, `LISTEN`, then conservatively flush
+/// the local caches: anything committed while this process was not listening
+/// was missed, so every cached authorization is suspect. Returns `None` (after
+/// logging) when the connection or `LISTEN` fails.
+async fn connect_and_flush(
+    pool: &PgPool,
+    handles: &CacheInvalidationHandles,
+) -> Option<PgListener> {
+    let mut listener = match PgListener::connect_with(pool).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "cache-invalidation listener connect failed");
+            return None;
+        }
+    };
+    if let Err(e) = listener.listen(CACHE_INVALIDATION_CHANNEL).await {
+        tracing::warn!(error = %e, "cache-invalidation LISTEN failed");
+        return None;
+    }
+    counter!("ak_cache_invalidation_reconnects_total").increment(1);
+    conservative_flush_all(handles).await;
+    tracing::info!(
+        channel = CACHE_INVALIDATION_CHANNEL,
+        "cache-invalidation listener established"
+    );
+    Some(listener)
 }
 
 #[cfg(test)]
