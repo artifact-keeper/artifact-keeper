@@ -3834,6 +3834,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns the configured bytes for any `get` call, simulating a healthy
@@ -3859,6 +3866,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns a non-`NotFound` storage error for every `get`, simulating an
@@ -3882,6 +3896,13 @@ mod tests {
 
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -3950,6 +3971,13 @@ mod tests {
 
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -4149,6 +4177,13 @@ mod tests {
                 .expect("deletes mutex")
                 .push(key.to_string());
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 

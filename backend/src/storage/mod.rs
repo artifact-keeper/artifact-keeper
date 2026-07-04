@@ -227,36 +227,20 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Store content from a byte stream, computing a SHA-256 checksum
-    /// incrementally as data arrives. The default implementation collects
-    /// the stream into memory and delegates to `put()`.
+    /// incrementally as data arrives.
+    ///
+    /// This is a **required** method: it deliberately has no default body so
+    /// that a new backend (or a wrapper that forgets to forward the call)
+    /// cannot silently inherit in-memory buffering of a full artifact body —
+    /// the exact multi-GB OOM hazard Phase-4 removed (#1608). Every backend
+    /// must explicitly choose real streaming or opt into the named buffered
+    /// fallback via [`buffered_put_stream_fallback`]. This turns "accidentally
+    /// buffers a whole body" into a compile error.
     async fn put_stream(
         &self,
         key: &str,
         stream: BoxStream<'static, Result<Bytes>>,
-    ) -> Result<PutStreamResult> {
-        use futures::StreamExt;
-        use sha2::{Digest, Sha256};
-
-        tracing::debug!(key, "put_stream falling back to in-memory buffering");
-
-        let mut hasher = Sha256::new();
-        let mut buf = Vec::new();
-        let mut total: u64 = 0;
-
-        tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hasher.update(&chunk);
-            total += chunk.len() as u64;
-            buf.extend_from_slice(&chunk);
-        }
-
-        self.put(key, Bytes::from(buf)).await?;
-        Ok(PutStreamResult {
-            checksum_sha256: format!("{:x}", hasher.finalize()),
-            bytes_written: total,
-        })
-    }
+    ) -> Result<PutStreamResult>;
 
     /// Perform a lightweight connectivity probe against the storage backend.
     ///
@@ -266,6 +250,50 @@ pub trait StorageBackend: Send + Sync {
     async fn health_check(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Buffered `put_stream` implementation of last resort.
+///
+/// This carries the body that used to be the `StorageBackend::put_stream`
+/// trait default (removed in #1608 Phase-6 so no backend can inherit it by
+/// omission). It collects the whole stream into memory, computes a SHA-256
+/// checksum incrementally, and delegates to [`StorageBackend::put`]. Because
+/// it buffers the entire body, it is only appropriate for small/in-memory
+/// backends (test doubles, tiny fixtures) that explicitly opt in — production
+/// backends stream to disk/object storage in their own `put_stream` override.
+///
+/// Currently every non-test `StorageBackend` streams, so the only callers are
+/// in-memory test doubles (compiled under `#[cfg(test)]`); the `allow` keeps
+/// this named opt-in available to a future small backend without tripping
+/// `dead_code` in production builds.
+#[allow(dead_code)]
+pub(crate) async fn buffered_put_stream_fallback<B: StorageBackend + ?Sized>(
+    backend: &B,
+    key: &str,
+    stream: BoxStream<'static, Result<Bytes>>,
+) -> Result<PutStreamResult> {
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    tracing::debug!(key, "put_stream falling back to in-memory buffering");
+
+    let mut hasher = Sha256::new();
+    let mut buf = Vec::new();
+    let mut total: u64 = 0;
+
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        total += chunk.len() as u64;
+        buf.extend_from_slice(&chunk);
+    }
+
+    backend.put(key, Bytes::from(buf)).await?;
+    Ok(PutStreamResult {
+        checksum_sha256: format!("{:x}", hasher.finalize()),
+        bytes_written: total,
+    })
 }
 
 #[cfg(test)]
@@ -366,6 +394,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<PutStreamResult> {
+            buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     #[test]
@@ -437,36 +472,49 @@ mod tests {
         assert_eq!(collected, b"test");
     }
 
+    /// Records every `put` so tests can assert what content/key reached the
+    /// backend. `get` returns a fixed body for the `copy` default-path test.
+    /// `put_stream` delegates to the shared buffered fallback (#1608 Phase-6),
+    /// so this double also exercises `buffered_put_stream_fallback` end to end.
+    struct CopyBackend {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<(String, Bytes)>>>,
+    }
+
+    #[async_trait]
+    impl StorageBackend for CopyBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.writes.lock().unwrap().push((key.to_string(), content));
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            assert_eq!(key, "source-key");
+            Ok(Bytes::from_static(b"copied bytes"))
+        }
+
+        // `copy` routes through get_stream/put_stream and the fallback only
+        // touches `put`; these are never called on either path, so fail loudly
+        // if that ever changes.
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            unreachable!("copy/put_stream fallback path must not call exists")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<()> {
+            unreachable!("copy/put_stream fallback path must not call delete")
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: BoxStream<'static, Result<Bytes>>,
+        ) -> Result<PutStreamResult> {
+            buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
     #[tokio::test]
     async fn test_default_copy_reads_source_and_writes_dest() {
         use std::sync::{Arc, Mutex};
-
-        struct CopyBackend {
-            writes: Arc<Mutex<Vec<(String, Bytes)>>>,
-        }
-
-        #[async_trait]
-        impl StorageBackend for CopyBackend {
-            async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-                self.writes.lock().unwrap().push((key.to_string(), content));
-                Ok(())
-            }
-
-            async fn get(&self, key: &str) -> Result<Bytes> {
-                assert_eq!(key, "source-key");
-                Ok(Bytes::from_static(b"copied bytes"))
-            }
-
-            // `copy` routes through get_stream/put_stream only; these are never
-            // touched by this test, so fail loudly if that ever changes.
-            async fn exists(&self, _key: &str) -> Result<bool> {
-                unreachable!("copy default path must not call exists")
-            }
-
-            async fn delete(&self, _key: &str) -> Result<()> {
-                unreachable!("copy default path must not call delete")
-            }
-        }
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let backend = CopyBackend {
@@ -573,6 +621,44 @@ mod tests {
             result.checksum_sha256,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// #1608 Phase-6: `put_stream` is now a required trait method and the old
+    /// buffering default lives in `buffered_put_stream_fallback`. Prove the
+    /// named fallback still round-trips the exact bytes to `put` (behavior
+    /// preserved) and reports the correct digest + length. `CopyBackend` from
+    /// `test_default_copy_reads_source_and_writes_dest` records writes and now
+    /// delegates `put_stream` to the fallback exactly like every in-memory
+    /// test double, so we drive it directly here.
+    #[tokio::test]
+    async fn test_buffered_put_stream_fallback_round_trips_bytes_to_put() {
+        use std::sync::{Arc, Mutex};
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let backend = CopyBackend {
+            writes: writes.clone(),
+        };
+
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream = Box::pin(futures::stream::iter(chunks)) as BoxStream<'static, Result<Bytes>>;
+
+        let result = buffered_put_stream_fallback(&backend, "cas-key", stream)
+            .await
+            .unwrap();
+
+        assert_eq!(result.bytes_written, 11);
+        assert_eq!(
+            result.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "cas-key");
+        assert_eq!(writes[0].1, Bytes::from_static(b"hello world"));
     }
 
     // -------------------------------------------------------------------
