@@ -97,6 +97,9 @@ futures.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true
 bytes.workspace = true
+# Streaming multipart reader (nuget push: parse the dotnet client's
+# multipart/form-data envelope off the body stream without buffering).
+multer = "3.1"
 
 # CLI
 clap.workspace = true

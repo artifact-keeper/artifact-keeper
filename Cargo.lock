@@ -222,6 +222,7 @@ dependencies = [
  "mimalloc",
  "mime_guess",
  "moka",
+ "multer",
  "native-tls",
  "object_store",
  "once_cell",

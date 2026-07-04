@@ -23,7 +23,6 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
@@ -1846,7 +1845,8 @@ async fn upload(
     let mut action: Option<String> = None;
     let mut pkg_name: Option<String> = None;
     let mut pkg_version: Option<String> = None;
-    let mut file_content: Option<Bytes> = None;
+    let mut staged_content: Option<proxy_helpers::StagedUpload> = None;
+    let mut content_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut file_name: Option<String> = None;
     let mut sha256_digest: Option<String> = None;
     let mut _md5_digest: Option<String> = None;
@@ -1898,10 +1898,12 @@ async fn upload(
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                file_content = Some(field.bytes().await.map_err(|e| {
-                    // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                    AppError::Validation(format!("Invalid file: {}", e)).into_response()
-                })?);
+                // Spool the wheel straight to a bounded scratch file while
+                // computing SHA-256/SHA-1/MD5 incrementally — never buffered.
+                let (s, d) =
+                    proxy_helpers::stage_upload_field_content_addressed(&state, field).await?;
+                staged_content = Some(s);
+                content_digests = Some(d);
             }
             // Capture other metadata fields
             _ => {
@@ -1942,7 +1944,10 @@ async fn upload(
     let pkg_version = pkg_version.ok_or_else(|| {
         AppError::Validation("Missing 'version' field".to_string()).into_response()
     })?;
-    let content = file_content.ok_or_else(|| {
+    let staged_content = staged_content.ok_or_else(|| {
+        AppError::Validation("Missing 'content' field".to_string()).into_response()
+    })?;
+    let digests = content_digests.ok_or_else(|| {
         AppError::Validation("Missing 'content' field".to_string()).into_response()
     })?;
     let filename = file_name.ok_or_else(|| {
@@ -1951,10 +1956,8 @@ async fn upload(
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // SHA-256 was computed incrementally while the body was spooled to disk.
+    let computed_sha256 = digests.sha256.clone();
 
     // Verify digest if provided
     if let Some(ref expected) = sha256_digest {
@@ -2008,7 +2011,7 @@ async fn upload(
     let content_type = pypi_content_type(&filename);
 
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
-    let size_bytes = content.len() as i64;
+    let size_bytes = staged_content.size_bytes();
 
     // No pre-cleanup here: this path persists through
     // `artifact_service::upload_with_sync_options`, whose release-immutability
@@ -2021,19 +2024,26 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
+    // Re-read the staged scratch file as a `'static` stream; the service does the
+    // dedup `exists()` check first and only streams into storage on a miss.
+    let content_stream = proxy_helpers::open_staged_upload_stream(&staged_content).await?;
     let artifact = artifact_service
-        .upload_with_sync_options(
+        .upload_stream_with_sync_options(
             repo.id,
             &artifact_path,
             &normalized,
             Some(&pkg_version),
             content_type,
-            content,
+            content_stream,
+            digests,
+            size_bytes,
             Some(user_id),
             should_enqueue_pypi_sync_tasks(&headers),
         )
         .await
         .map_err(|e| e.into_response())?;
+    // Scratch file no longer needed once the service has consumed the stream.
+    drop(staged_content);
 
     artifact_service
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
@@ -2437,6 +2447,7 @@ fn merge_local_into_remote_simple_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
