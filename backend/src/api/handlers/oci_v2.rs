@@ -1909,12 +1909,17 @@ pub async fn record_manifest_blob_refs(
 /// record `oci_manifest_refs` (parent→child edges); `Image` bodies record
 /// `manifest_blob_refs` (config + layer edges).
 ///
-/// TODO(#1610): the residual sub-grace-period TOCTOU between a concurrent
-/// re-push of an already-existing >24h-old blob and `run_blob_gc` is NOT
-/// closed here — it is bounded by the grace window + readiness gate +
-/// opt-in `BLOB_GC_ENABLED` and tracked as a follow-up. The push-side
-/// `SELECT ... FOR UPDATE` on `oci_blobs` that would close it would go
-/// inside this transaction, before the ref insert.
+/// #1610: the sub-grace-period TOCTOU between a concurrent re-push of an
+/// already-existing blob and `run_blob_gc` is closed here for `Image`
+/// manifests. Before the `manifest_blob_refs` insert, this transaction takes
+/// a `SELECT ... FOR UPDATE` lock on the `oci_blobs` rows for the digests
+/// being referenced — the SAME rows GC's [`is_blob_still_orphan`] locks
+/// `FOR UPDATE` before deciding to delete. That makes the ref-insert and the
+/// GC orphan re-check serialize on those rows: GC either blocks until this
+/// push commits (then observes the ref and skips the delete) or this push
+/// blocks until GC commits (then GC has already re-checked), so a referenced
+/// blob can never be deleted out from under a concurrent push. The lock stays
+/// inside the existing narrow tx and adds no network/storage I/O.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_tag_and_refs(
     pool: &PgPool,
@@ -1969,6 +1974,34 @@ pub(crate) async fn persist_tag_and_refs(
         ManifestClass::Image => {
             let refs = extract_blob_refs(manifest_body);
             if let Some((blob_digests, kinds)) = blob_refs_to_columns(&refs) {
+                // 2a. (#1610) Serialize this ref-insert against blob GC's
+                //     orphan re-check. Lock the `oci_blobs` rows for the
+                //     digests we are about to reference, taking the SAME
+                //     `FOR UPDATE` lock that `is_blob_still_orphan` acquires
+                //     before it decides to delete. Without this, GC can lock
+                //     the row, observe zero refs, and delete the blob while
+                //     this transaction inserts a live ref — a
+                //     deleted-but-referenced blob (broken pull). With it, the
+                //     two transactions serialize on the same rows: GC either
+                //     blocks until we commit (then sees the ref and skips the
+                //     delete) or we block until GC commits (then GC has
+                //     already re-checked). Either way the referenced blob
+                //     survives. This is a pure lock acquisition on rows we
+                //     already touch — no network/storage I/O is added to the
+                //     transaction, so the narrow tx scope is preserved.
+                sqlx::query(
+                    r#"
+                    SELECT id
+                    FROM oci_blobs
+                    WHERE repository_id = $1 AND digest = ANY($2)
+                    FOR UPDATE
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(&blob_digests)
+                .fetch_all(&mut *tx)
+                .await?;
+
                 sqlx::query(
                     r#"
                     INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
@@ -18392,6 +18425,118 @@ mod proxy_manifest_artifact_indexing_tests {
         assert_eq!(
             ref_count, 0,
             "no manifest_blob_refs row may survive the rollback"
+        );
+    }
+
+    /// #1610: `persist_tag_and_refs` must serialize its `manifest_blob_refs`
+    /// insert against blob GC by taking a `FOR UPDATE` lock on the referenced
+    /// `oci_blobs` rows BEFORE recording the ref — the same rows (and the same
+    /// lock) that `run_blob_gc`'s `is_blob_still_orphan` acquires before it
+    /// decides to delete an orphan blob.
+    ///
+    /// The test proves the serialization directly: a stand-in for GC holds a
+    /// `FOR UPDATE` lock on blob `D`'s `oci_blobs` row (exactly what the GC
+    /// re-check does first), then a concurrent push that references `D` is
+    /// launched. Because the push now takes the same row lock, it MUST block
+    /// while GC holds it (before the fix it never touched `oci_blobs`, so it
+    /// would race straight through). Once the GC stand-in releases the lock,
+    /// the push completes and the live ref is recorded, so the blob is
+    /// protected and can never be deleted out from under the push.
+    #[tokio::test]
+    async fn persist_tag_and_refs_locks_referenced_blobs_against_gc() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Seed the blob D that the pushed image manifest will reference.
+        let d = format!("sha256:{}", "a".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(123_i64)
+        .bind(format!("{repo_id}/blobs/{d}"))
+        .execute(&pool)
+        .await
+        .expect("seed blob");
+
+        // Stand in for GC: hold the FOR UPDATE lock on D's oci_blobs row that
+        // `is_blob_still_orphan` takes before deciding to delete.
+        let mut gc_tx = pool.begin().await.expect("begin gc tx");
+        sqlx::query("SELECT id FROM oci_blobs WHERE repository_id = $1 AND digest = $2 FOR UPDATE")
+            .bind(repo_id)
+            .bind(&d)
+            .fetch_all(&mut *gc_tx)
+            .await
+            .expect("gc holds blob lock");
+
+        // Launch a concurrent push that references D. It upserts the tag, then
+        // must block on the FOR UPDATE it now takes on D's oci_blobs row.
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{d}","size":2}}]}}"#
+        );
+        let pool_push = pool.clone();
+        let push = tokio::spawn(async move {
+            persist_tag_and_refs(
+                &pool_push,
+                repo_id,
+                "app",
+                "v1",
+                "sha256:deadbeef",
+                "application/vnd.oci.image.manifest.v1+json",
+                &ManifestClass::Image,
+                body_str.as_bytes(),
+            )
+            .await
+        });
+
+        // While GC holds the lock, the push cannot make progress: the ref
+        // insert is serialized behind GC's row lock.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        let blocked = !push.is_finished();
+
+        // Release GC's lock; the push now proceeds and records the ref.
+        gc_tx.rollback().await.expect("rollback gc tx");
+        let push_result = tokio::time::timeout(std::time::Duration::from_secs(15), push)
+            .await
+            .expect("push completes once GC releases the blob lock")
+            .expect("push task join");
+
+        let ref_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND blob_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("count refs");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            blocked,
+            "the push must block on the oci_blobs FOR UPDATE lock held by GC: \
+             without the push-side lock the ref insert would race the GC re-check"
+        );
+        push_result.expect("persist_tag_and_refs must succeed once the lock is free");
+        assert_eq!(
+            ref_count, 1,
+            "the referenced blob must have a live manifest_blob_refs row after \
+             the push commits, so GC's orphan predicate is false and the blob survives"
         );
     }
 
