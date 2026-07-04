@@ -512,14 +512,19 @@ impl StorageGcService {
     /// grace period covers the typical push window without serializing push
     /// throughput on a global lock.
     ///
-    /// Per-row deletion runs in its own transaction with a `FOR UPDATE`
-    /// lock on the `oci_blobs` row and a re-check of the orphan predicate
-    /// inside the tx (#1180 style). A residual TOCTOU still exists if a new
-    /// manifest's `INSERT manifest_blob_refs` interleaves with this flow at
-    /// sub-grace-period speeds; closing it fully would require the
-    /// manifest-push path to take `SELECT ... FOR UPDATE` on `oci_blobs`
-    /// rows before writing `manifest_blob_refs`. That is left as a follow-up
-    /// to keep this change focused.
+    /// Deletion is **two-phase mark-and-sweep** (#1660): [`run_blob_gc_mark`]
+    /// stamps `pending_delete_at` on aged orphan candidates under a per-row
+    /// `FOR UPDATE` lock (no storage I/O), and [`run_blob_gc_sweep`] later
+    /// deletes the storage object then the row (still under the lock) for
+    /// blobs marked past the sweep-grace window and still orphan. The mark and
+    /// the push-path resurrection (which clears the marker) serialize on the
+    /// same `oci_blobs` row lock the push takes (#1610/#2190), so a blob
+    /// re-adopted in the mark→sweep window is un-marked and skipped by the
+    /// sweep — closing the commit-then-delete TOCTOU without moving storage
+    /// deletion outside a row lock. This convenience wrapper runs both phases
+    /// back-to-back with a zero sweep-grace so a single call still reclaims an
+    /// aged orphan; the scheduler drives the phases on independent cadences
+    /// with a real grace window.
     ///
     /// SAFETY: callers (the scheduler) must additionally gate the live pass
     /// behind
@@ -527,7 +532,53 @@ impl StorageGcService {
     /// an explicit operator opt-in; this method itself only enforces the
     /// grace window and the per-row locked re-check. Every deletion is
     /// audit-logged at INFO with the digest and freed byte count.
+    ///
+    /// [`run_blob_gc_mark`]: Self::run_blob_gc_mark
+    /// [`run_blob_gc_sweep`]: Self::run_blob_gc_sweep
     pub async fn run_blob_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
+        if dry_run {
+            // Dry-run is strictly read-only: report the candidate orphan set
+            // (Phase A's would-mark set) without writing or clearing any
+            // marker and without any storage I/O.
+            return self.run_blob_gc_mark(true).await;
+        }
+
+        // Apply mode: mark aged orphans, then immediately sweep with a zero
+        // grace so a single call reclaims a steady orphan (the mark commits
+        // before the sweep selects, so its `pending_delete_at` is already in
+        // the past). The two passes go through the marker so the crash-safety
+        // and push-resurrection invariants hold even on this combined path.
+        let mark = self.run_blob_gc_mark(false).await?;
+        let mut result = self.run_blob_gc_sweep(false, 0).await?;
+        // Surface any marking errors alongside the sweep's. The reclaimed
+        // counters stay the sweep's (marking deletes nothing), so
+        // `storage_keys_deleted` keeps meaning "objects actually removed".
+        result.errors.extend(mark.errors);
+        Ok(result)
+    }
+
+    /// Phase A of two-phase blob GC — **mark**. Selects aged orphan
+    /// candidates ([`select_orphan_blobs`]) and, under the same per-row
+    /// `FOR UPDATE` lock the push path takes (#1610/#2190), re-checks
+    /// orphan-ness and stamps `pending_delete_at = NOW()`. It performs **no
+    /// storage I/O**: the object stays present, so a marked-but-not-yet-swept
+    /// blob is never a dangling reference, and the blob is orphan so nothing
+    /// pulls it anyway.
+    ///
+    /// A concurrent re-push that re-adopts a marked blob clears the marker
+    /// under the same lock (`persist_tag_and_refs` / finalize
+    /// `ON CONFLICT DO UPDATE`, #1660 PR1), so a blob that becomes live again
+    /// is resurrected and the later sweep skips it. Marking and resurrection
+    /// therefore strictly serialize on the row lock, which is what lets the
+    /// sweep keep storage deletion under a normal row lock without reopening
+    /// the commit-then-delete TOCTOU. `pending_delete_at IS NULL` in the mark
+    /// UPDATE keeps an existing (older) mark's timestamp, so the sweep grace
+    /// is measured from the first mark and a re-mark is a no-op.
+    ///
+    /// Dry-run reports the candidate set and writes nothing.
+    ///
+    /// [`select_orphan_blobs`]: Self::select_orphan_blobs
+    pub async fn run_blob_gc_mark(&self, dry_run: bool) -> Result<StorageGcResult> {
         // Apply mode: first prune `manifest_blob_refs` of manifests that are no
         // longer live (tag overwrite / lifecycle expiry / index or manifest
         // deletion), so their config + layer blobs become eligible in this same
@@ -556,7 +607,7 @@ impl StorageGcService {
                 tracing::info!(
                     digest = digest.as_str(),
                     size_bytes = bytes,
-                    "Blob GC (dry-run): would reclaim orphan blob"
+                    "Blob GC (dry-run): would mark orphan blob for deletion"
                 );
                 accumulate_dry_run(&mut result, bytes, 1);
             }
@@ -564,6 +615,148 @@ impl StorageGcService {
         }
 
         for row in &orphans {
+            let digest: String = row.try_get("digest").unwrap_or_default();
+            let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+            let repository_id: Uuid = match row.try_get("repository_id") {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format_gc_error("read repo id", &digest, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+            let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+
+            let mut tx = match self.db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg =
+                        format_gc_error("begin blob gc mark tx", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            // Re-check orphan-ness under the per-row `FOR UPDATE` lock so a
+            // concurrent push that just referenced this blob is observed and
+            // the blob is not marked (mark phase ignores the marker itself).
+            match is_blob_still_orphan(&mut tx, repository_id, &digest, false).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = tx.rollback().await;
+                    tracing::debug!(
+                        digest = digest.as_str(),
+                        "Blob GC mark skipped digest: no longer orphan after row-lock re-check"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error("re-check blob orphan", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            // Stamp the marker while still holding the lock. No storage I/O.
+            // `pending_delete_at IS NULL` keeps an existing (earlier) mark's
+            // timestamp untouched, so the sweep grace is always measured from
+            // the FIRST mark and a re-mark affects zero rows — we only count /
+            // log a blob that was NEWLY marked this pass.
+            let newly_marked = match sqlx::query(
+                r#"
+                UPDATE oci_blobs
+                SET pending_delete_at = NOW()
+                WHERE repository_id = $1
+                  AND digest = $2
+                  AND pending_delete_at IS NULL
+                "#,
+            )
+            .bind(repository_id)
+            .bind(&digest)
+            .execute(&mut *tx)
+            .await
+            {
+                Ok(res) => res.rows_affected() > 0,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("mark blob pending delete", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            if let Err(e) = tx.commit().await {
+                let msg = format_gc_error("commit blob gc mark tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if newly_marked {
+                tracing::debug!(
+                    digest = digest.as_str(),
+                    size_bytes = bytes,
+                    "Blob GC: marked orphan blob pending deletion"
+                );
+                record_gc_success(&mut result, bytes, 1);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Phase B of two-phase blob GC — **sweep**. Deletes blobs marked
+    /// (`pending_delete_at`) at least `sweep_grace_secs` ago that are STILL
+    /// orphan ([`select_pending_delete_blobs`]). For each row, under the same
+    /// per-row `FOR UPDATE` lock the push path and Phase A take, it re-checks
+    /// that the blob is still marked AND still orphan, deletes the storage
+    /// object (idempotent — `NotFound` is treated as success, #1660 PR1), then
+    /// deletes the row, then commits.
+    ///
+    /// Storage deletion runs UNDER the row lock, so a concurrent re-push
+    /// either cleared the marker before this sweep locked the row (the
+    /// re-check then skips the now-live blob) or blocks on the lock and, once
+    /// the sweep commits the row delete, re-inserts a fresh row with
+    /// `pending_delete_at = NULL` — not eligible for a sweep until re-marked.
+    /// A crash between the storage delete and the row delete leaves the row
+    /// marked and the object gone; because the blob is orphan nothing pulls
+    /// it, and the next sweep re-runs the (idempotent) storage delete and
+    /// removes the row — a re-collectable orphan, never a live dangling
+    /// reference.
+    ///
+    /// Dry-run reports the sweepable set and deletes nothing.
+    ///
+    /// [`select_pending_delete_blobs`]: Self::select_pending_delete_blobs
+    pub async fn run_blob_gc_sweep(
+        &self,
+        dry_run: bool,
+        sweep_grace_secs: i64,
+    ) -> Result<StorageGcResult> {
+        let pending = self.select_pending_delete_blobs(sweep_grace_secs).await?;
+
+        let mut result = empty_gc_result(dry_run);
+
+        if dry_run {
+            for row in &pending {
+                let digest: String = row.try_get("digest").unwrap_or_default();
+                let bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+                tracing::info!(
+                    digest = digest.as_str(),
+                    size_bytes = bytes,
+                    "Blob GC (dry-run): would sweep marked orphan blob"
+                );
+                accumulate_dry_run(&mut result, bytes, 1);
+            }
+            return Ok(result);
+        }
+
+        for row in &pending {
             let digest: String = row.try_get("digest").unwrap_or_default();
             let storage_key: String = row.try_get("storage_key").unwrap_or_default();
             let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
@@ -596,38 +789,44 @@ impl StorageGcService {
             let mut tx = match self.db.begin().await {
                 Ok(t) => t,
                 Err(e) => {
-                    let msg = format_gc_error("begin blob gc tx", &storage_key, &e.to_string());
+                    let msg =
+                        format_gc_error("begin blob gc sweep tx", &storage_key, &e.to_string());
                     tracing::warn!("{}", msg);
                     result.errors.push(msg);
                     continue;
                 }
             };
 
-            match is_blob_still_orphan(&mut tx, repository_id, &digest).await {
+            // Re-check UNDER the lock that the blob is still marked AND still
+            // orphan. `require_pending = true` makes a blob whose marker a
+            // concurrent push cleared (resurrection) fail the check, so the
+            // sweep skips it and the now-live blob survives.
+            match is_blob_still_orphan(&mut tx, repository_id, &digest, true).await {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = tx.rollback().await;
                     tracing::debug!(
                         digest = digest.as_str(),
-                        "Blob GC skipped digest: no longer orphan after row-lock re-check"
+                        "Blob GC sweep skipped digest: resurrected or no longer orphan after \
+                         row-lock re-check"
                     );
                     continue;
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
-                    let msg = format_gc_error("re-check blob orphan", &storage_key, &e.to_string());
+                    let msg = format_gc_error("re-check blob sweep", &storage_key, &e.to_string());
                     tracing::warn!("{}", msg);
                     result.errors.push(msg);
                     continue;
                 }
             }
 
-            // Deleting an already-absent object is success (#1660): a retry
-            // after a crash between the storage delete and the row delete must
-            // reclaim the orphan row, not roll back forever and leak it. The
-            // cloud backends already map NotFound to Ok (s3.rs, gcs.rs,
-            // azure.rs); the filesystem backend returns NotFound, so tolerate
-            // it here the same way the cleanup-journal sweeps below do.
+            // Storage delete first, still under the row lock. Deleting an
+            // already-absent object is success (#1660): a retry after a crash
+            // between this delete and the row delete must reclaim the marked
+            // orphan, not roll back forever and leak it. The cloud backends
+            // already map NotFound to Ok (s3.rs, gcs.rs, azure.rs); the
+            // filesystem backend returns NotFound, so tolerate it here too.
             match storage.delete(&storage_key).await {
                 Ok(()) | Err(AppError::NotFound(_)) => {}
                 Err(e) => {
@@ -639,12 +838,18 @@ impl StorageGcService {
                 }
             }
 
-            if let Err(e) =
-                sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1 AND digest = $2")
-                    .bind(repository_id)
-                    .bind(&digest)
-                    .execute(&mut *tx)
-                    .await
+            // Delete only while still marked: belt-and-suspenders against ever
+            // removing a resurrected (un-marked) row. We hold the lock and the
+            // re-check already proved the marker is set, so this always
+            // matches here; it also makes the DELETE self-documenting.
+            if let Err(e) = sqlx::query(
+                "DELETE FROM oci_blobs \
+                 WHERE repository_id = $1 AND digest = $2 AND pending_delete_at IS NOT NULL",
+            )
+            .bind(repository_id)
+            .bind(&digest)
+            .execute(&mut *tx)
+            .await
             {
                 let _ = tx.rollback().await;
                 let msg = format_gc_error("delete oci_blobs row", &storage_key, &e.to_string());
@@ -654,7 +859,7 @@ impl StorageGcService {
             }
 
             if let Err(e) = tx.commit().await {
-                let msg = format_gc_error("commit blob gc tx", &storage_key, &e.to_string());
+                let msg = format_gc_error("commit blob gc sweep tx", &storage_key, &e.to_string());
                 tracing::warn!("{}", msg);
                 result.errors.push(msg);
                 continue;
@@ -667,14 +872,14 @@ impl StorageGcService {
                 digest = digest.as_str(),
                 size_bytes = bytes,
                 storage_key = storage_key.as_str(),
-                "Blob GC: reclaimed orphan blob"
+                "Blob GC: swept marked orphan blob"
             );
             record_gc_success(&mut result, bytes, 1);
         }
 
         if result.storage_keys_deleted > 0 {
             tracing::info!(
-                "Blob GC: deleted {} blob objects, freed {} bytes",
+                "Blob GC: swept {} blob objects, freed {} bytes",
                 result.storage_keys_deleted,
                 result.bytes_freed
             );
@@ -743,6 +948,43 @@ impl StorageGcService {
         );
         sqlx::query(&sql)
             .bind(MIN_BLOB_AGE_SECS as i64)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))
+    }
+
+    /// Phase B selection: `oci_blobs` rows marked `pending_delete_at` at least
+    /// `sweep_grace_secs` in the past that are STILL orphan (no in-scope
+    /// `manifest_blob_refs`). Reuses [`BLOB_PROTECTED_BY_REFS_SQL`] so the
+    /// sweep predicate cannot drift from the mark/scan predicate. The
+    /// sweep-grace window is a second safety margin after the mark: it gives a
+    /// re-push time to resurrect a blob (clear the marker) before its storage
+    /// object is deleted. The per-row locked re-check ([`is_blob_still_orphan`]
+    /// with the marker clause) remains the authoritative gate; this scan only
+    /// narrows the candidate set, and the partial index
+    /// `oci_blobs_pending_delete_idx` keeps it off the healthy, unmarked rows.
+    async fn select_pending_delete_blobs(
+        &self,
+        sweep_grace_secs: i64,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let sql = format!(
+            r#"
+            SELECT ob.repository_id,
+                   ob.digest,
+                   ob.size_bytes,
+                   ob.storage_key,
+                   r.storage_backend,
+                   r.storage_path
+            FROM oci_blobs ob
+            JOIN repositories r ON r.id = ob.repository_id
+            WHERE ob.pending_delete_at IS NOT NULL
+              AND ob.pending_delete_at < NOW() - make_interval(secs => $1::BIGINT)
+              AND NOT {protected}
+            "#,
+            protected = BLOB_PROTECTED_BY_REFS_SQL,
+        );
+        sqlx::query(&sql)
+            .bind(sweep_grace_secs)
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
@@ -1543,10 +1785,19 @@ async fn is_still_orphan(
 ///
 /// `bool_and` collapses to a single value; an empty result (row gone)
 /// returns `false` so the caller skips the delete.
+///
+/// `require_pending_mark` selects the phase (#1660): Phase A (**mark**)
+/// passes `false` and ignores the marker; Phase B (**sweep**) passes `true`
+/// and additionally requires the row to still carry a `pending_delete_at`
+/// marker, so a blob a concurrent push resurrected (marker cleared under this
+/// same lock) fails the check and is not swept. The `FOR UPDATE` lock in
+/// step 1 is taken unconditionally in both phases, so the mark/sweep/resurrect
+/// operations serialize on the row regardless of the marker filter.
 async fn is_blob_still_orphan(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: Uuid,
     digest: &str,
+    require_pending_mark: bool,
 ) -> sqlx::Result<bool> {
     // Step 1: lock the (repo, digest) row so a racing pusher cannot
     // re-reference this blob between the re-check and the delete.
@@ -1565,19 +1816,23 @@ async fn is_blob_still_orphan(
     // Step 2: join the locked row back to its repository so the shared
     // `ob`/`r`-correlated fragment can resolve the row's backend and
     // storage_path; this keeps the re-check identical in scope to the
-    // initial scan.
+    // initial scan. When `require_pending_mark` ($3) is true, a row whose
+    // marker a racer cleared is filtered out, `bool_and` over the empty set
+    // collapses to the COALESCE default `false`, and the sweep skips it.
     let sql = format!(
         r#"
         SELECT COALESCE(bool_and(NOT {protected}), false) AS still_orphan
         FROM oci_blobs ob
         JOIN repositories r ON r.id = ob.repository_id
         WHERE ob.repository_id = $1 AND ob.digest = $2
+          AND (NOT $3 OR ob.pending_delete_at IS NOT NULL)
         "#,
         protected = BLOB_PROTECTED_BY_REFS_SQL,
     );
     let row = sqlx::query(&sql)
         .bind(repository_id)
         .bind(digest)
+        .bind(require_pending_mark)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -4338,6 +4593,8 @@ mod tests {
     async fn test_run_blob_gc_flags_orphan_blob() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -4374,6 +4631,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_blob_gc_keeps_blob_referenced_by_manifest_blob_refs() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
 
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
@@ -4423,6 +4682,7 @@ mod tests {
     /// first orphan row and destroyed a shared blob (57 blobs / 85 tags).
     #[tokio::test]
     async fn test_run_blob_gc_keeps_blob_referenced_from_another_repo() {
+        let _gc_guard = crate::api::handlers::test_db_helpers::blob_gc_serial_lock().await;
         let Some((fixture_a, fixture_b, shared_digest)) = setup_two_repos_one_ref('9').await else {
             return;
         };
@@ -4453,6 +4713,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_blob_gc_apply_deletes_orphan_blob() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
 
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
@@ -4519,6 +4781,8 @@ mod tests {
     async fn test_run_blob_gc_reclaims_orphan_with_absent_object() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -4568,6 +4832,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_blob_gc_apply_keeps_referenced_blob() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
 
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
@@ -4668,6 +4934,8 @@ mod tests {
     async fn test_run_blob_gc_prunes_orphan_ref_and_reclaims_blob() {
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -4759,6 +5027,8 @@ mod tests {
         // race documented on run_blob_gc.
         use crate::api::handlers::test_db_helpers as tdh;
 
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
         let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
             return;
         };
@@ -4797,6 +5067,7 @@ mod tests {
         // protect repo B's independent copy (otherwise B's orphan file would
         // leak forever), while repo A's own copy stays protected. The
         // predicate is backend-aware, not unconditionally global.
+        let _gc_guard = crate::api::handlers::test_db_helpers::blob_gc_serial_lock().await;
         let Some((fixture_a, fixture_b, shared_digest)) = setup_two_repos_one_ref('7').await else {
             return;
         };
@@ -4819,6 +5090,446 @@ mod tests {
         assert!(
             !flagged_a,
             "repo A's own copy must remain protected by its own manifest_blob_refs entry"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-phase mark-and-sweep (#1660 PR2). These DB-backed tests exercise the
+    // load-bearing races the mark/sweep split is designed to close: the
+    // push-adopt resurrection race, the crash-after-mark and
+    // crash-between-storage-and-row-delete recovery paths, the sweep-grace
+    // timing, and the "referenced blob is never marked" invariant.
+    // -----------------------------------------------------------------------
+
+    /// Read a blob's `pending_delete_at` marker (NULL when unmarked).
+    async fn blob_pending_delete_at(
+        pool: &PgPool,
+        repo_id: Uuid,
+        digest: &str,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        sqlx::query_scalar(
+            "SELECT pending_delete_at FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .fetch_one(pool)
+        .await
+        .expect("read pending_delete_at")
+    }
+
+    /// Count the `oci_blobs` rows for one (repo, digest).
+    async fn blob_row_count(pool: &PgPool, repo_id: Uuid, digest: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .fetch_one(pool)
+        .await
+        .expect("count oci_blobs")
+    }
+
+    /// Write an orphan blob object + row and return the resolved filesystem
+    /// backend so the caller can assert on the storage object. Shared by the
+    /// mark/sweep tests so they do not duplicate the fixture wiring.
+    async fn seed_orphan_blob_object(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+        digest: &str,
+        storage_key: &str,
+        body: &Bytes,
+    ) -> Arc<dyn StorageBackend> {
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        let storage = fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend");
+        storage
+            .put(storage_key, body.clone())
+            .await
+            .expect("write blob to storage");
+        insert_old_blob(
+            &fixture.pool,
+            fixture.repo_id,
+            digest,
+            storage_key,
+            body.len() as i64,
+        )
+        .await;
+        storage
+    }
+
+    /// (e) A still-referenced blob is NEVER marked. Phase A must leave
+    /// `pending_delete_at` NULL for a blob a live (tagged) manifest still
+    /// references, so it can never become sweep-eligible.
+    #[tokio::test]
+    async fn test_run_blob_gc_mark_skips_referenced_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_digest = format!("sha256:{}", "a".repeat(64));
+        let blob_digest = format!("sha256:{}", "b".repeat(64));
+        let storage_key = format!("oci-blobs/{}", blob_digest);
+        let body = Bytes::from_static(b"referenced-not-marked");
+        let _storage = seed_orphan_blob_object(&fixture, &blob_digest, &storage_key, &body).await;
+
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+             VALUES ($1, $2, $3, 'layer')",
+        )
+        .bind(&manifest_digest)
+        .bind(&blob_digest)
+        .bind(fixture.repo_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert manifest_blob_refs row");
+        // Tag the manifest so its ref is LIVE (mark prunes refs of dead
+        // manifests first, so an untagged manifest's ref would be removed).
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'keep-img', 'latest', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fixture.repo_id)
+        .bind(&manifest_digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("tag referencing manifest");
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        service
+            .run_blob_gc_mark(false)
+            .await
+            .expect("mark succeeds");
+
+        let marked = blob_pending_delete_at(&fixture.pool, fixture.repo_id, &blob_digest).await;
+
+        fixture.teardown().await;
+
+        assert!(
+            marked.is_none(),
+            "a blob referenced by a live manifest must never be marked pending_delete_at"
+        );
+    }
+
+    /// (a) The push-adopt race. GC marks blob `D`; before the sweep runs, a
+    /// concurrent re-push resurrects `D` (clears the marker under the push-path
+    /// row lock, exactly what the finalize `ON CONFLICT DO UPDATE` /
+    /// `persist_tag_and_refs` un-mark do). The sweep's marker-aware re-check
+    /// (`require_pending = true`) must then SKIP `D`: its row and storage
+    /// object survive. This is the TOCTOU a naive commit-then-delete reorder
+    /// would reopen.
+    #[tokio::test]
+    async fn test_run_blob_gc_sweep_skips_resurrected_blob() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let body = Bytes::from_static(b"resurrected-payload");
+        let storage = seed_orphan_blob_object(&fixture, &digest, &storage_key, &body).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        // Phase A: mark the orphan.
+        service
+            .run_blob_gc_mark(false)
+            .await
+            .expect("mark succeeds");
+        assert!(
+            blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+                .await
+                .is_some(),
+            "mark phase must stamp pending_delete_at on the orphan"
+        );
+
+        // Concurrent re-push resurrects D: the finalize upsert clears the
+        // marker under the push-path lock (#1660 PR1). We issue the same
+        // marker-clearing UPDATE here.
+        sqlx::query(
+            "UPDATE oci_blobs SET pending_delete_at = NULL \
+             WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(fixture.repo_id)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("resurrect (clear marker)");
+
+        // Phase B: sweep with zero grace. The resurrected (un-marked) blob
+        // must be skipped by the marker-aware re-check.
+        service
+            .run_blob_gc_sweep(false, 0)
+            .await
+            .expect("sweep succeeds");
+
+        let row_remaining = blob_row_count(&fixture.pool, fixture.repo_id, &digest).await;
+        let file_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 1,
+            "a blob resurrected (marker cleared) before the sweep must survive: the sweep's \
+             marker-aware re-check skips it"
+        );
+        assert!(
+            file_exists,
+            "a resurrected blob's storage object must not be deleted by the sweep"
+        );
+    }
+
+    /// (d) + grace timing. A freshly-marked orphan younger than the sweep
+    /// grace stays marked but is NOT swept; once past the grace it is swept
+    /// (storage object + row both gone). Mirrors the mark->sweep cadence the
+    /// scheduler drives.
+    #[tokio::test]
+    async fn test_run_blob_gc_sweep_respects_grace_then_deletes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "d".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let body = Bytes::from_static(b"grace-then-delete");
+        let storage = seed_orphan_blob_object(&fixture, &digest, &storage_key, &body).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        service
+            .run_blob_gc_mark(false)
+            .await
+            .expect("mark succeeds");
+
+        // Sweep with a 1h grace: the blob was just marked, so it is younger
+        // than the grace and must stay marked, storage + row intact.
+        service
+            .run_blob_gc_sweep(false, 3600)
+            .await
+            .expect("in-grace sweep succeeds");
+        assert_eq!(
+            blob_row_count(&fixture.pool, fixture.repo_id, &digest).await,
+            1,
+            "a blob still inside the sweep grace must not be swept"
+        );
+        assert!(
+            blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+                .await
+                .is_some(),
+            "an in-grace blob must remain marked for a later sweep"
+        );
+        assert!(
+            storage.exists(&storage_key).await.expect("exists check"),
+            "an in-grace blob's storage object must survive"
+        );
+
+        // Sweep with zero grace: now eligible, so the blob is swept.
+        service
+            .run_blob_gc_sweep(false, 0)
+            .await
+            .expect("post-grace sweep succeeds");
+
+        let row_remaining = blob_row_count(&fixture.pool, fixture.repo_id, &digest).await;
+        let file_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 0,
+            "a genuinely-orphan blob past the sweep grace must have its row reclaimed"
+        );
+        assert!(
+            !file_exists,
+            "a genuinely-orphan blob past the sweep grace must have its storage object deleted"
+        );
+    }
+
+    /// (b) Crash after mark, before sweep. A blob left marked by a mark pass
+    /// that then crashed must be completed by the next sweep: it stays marked
+    /// (object intact, orphan so unpullable) and a later sweep deletes both.
+    #[tokio::test]
+    async fn test_run_blob_gc_sweep_completes_after_crash_between_mark_and_sweep() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let body = Bytes::from_static(b"crash-after-mark");
+        let storage = seed_orphan_blob_object(&fixture, &digest, &storage_key, &body).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        // Phase A commits the marker, then "crash" — no sweep runs. State:
+        // row marked, object present.
+        service
+            .run_blob_gc_mark(false)
+            .await
+            .expect("mark succeeds");
+        assert!(
+            blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+                .await
+                .is_some(),
+            "after a mark-then-crash the row stays marked"
+        );
+        assert!(
+            storage.exists(&storage_key).await.expect("exists check"),
+            "after a mark-then-crash the storage object is intact (no dangling ref possible)"
+        );
+
+        // The next sweep completes the deletion.
+        service
+            .run_blob_gc_sweep(false, 0)
+            .await
+            .expect("recovery sweep succeeds");
+
+        let row_remaining = blob_row_count(&fixture.pool, fixture.repo_id, &digest).await;
+        let file_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 0,
+            "the next sweep must complete a marked-but-unswept blob"
+        );
+        assert!(
+            !file_exists,
+            "the recovery sweep must delete the storage object"
+        );
+    }
+
+    /// (c) Crash between storage-delete and row-delete. The object is already
+    /// gone but the row is still marked. The next sweep must idempotently
+    /// re-run `storage.delete` (NotFound -> Ok) and remove the row — a
+    /// re-collectable orphan, never a leaked object or a dangling row — and
+    /// must not record an error.
+    #[tokio::test]
+    async fn test_run_blob_gc_sweep_recollects_after_crash_mid_delete() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "f".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let body = Bytes::from_static(b"crash-mid-delete");
+        let storage = seed_orphan_blob_object(&fixture, &digest, &storage_key, &body).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        service
+            .run_blob_gc_mark(false)
+            .await
+            .expect("mark succeeds");
+
+        // Simulate the crash: the sweep's storage.delete succeeded but the
+        // row delete never committed. The object is gone; the row stays
+        // marked.
+        storage
+            .delete(&storage_key)
+            .await
+            .expect("remove object (crash point)");
+        assert!(
+            blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+                .await
+                .is_some(),
+            "post-crash the marked row still exists"
+        );
+
+        // The re-sweep must idempotently complete: NotFound from storage.delete
+        // is success, the marked row is removed, no error recorded.
+        let result = service
+            .run_blob_gc_sweep(false, 0)
+            .await
+            .expect("re-sweep succeeds even when the object is already absent");
+
+        let row_remaining = blob_row_count(&fixture.pool, fixture.repo_id, &digest).await;
+        let file_exists = storage.exists(&storage_key).await.expect("exists check");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 0,
+            "a re-sweep after a crash between storage-delete and row-delete must reclaim the row"
+        );
+        assert!(
+            !file_exists,
+            "the storage object stays gone (no leaked object)"
+        );
+        assert!(
+            result.errors.is_empty(),
+            "a NotFound during the recovery sweep must not be recorded as an error; got {:?}",
+            result.errors
+        );
+    }
+
+    /// A re-mark of an already-marked blob is a no-op: the `pending_delete_at
+    /// IS NULL` guard leaves the ORIGINAL timestamp untouched, so the sweep
+    /// grace is always measured from the first mark (a blob cannot dodge the
+    /// sweep by being re-marked every tick).
+    #[tokio::test]
+    async fn test_run_blob_gc_mark_is_idempotent_and_preserves_timestamp() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+        let body = Bytes::from_static(b"idempotent-mark");
+        let _storage = seed_orphan_blob_object(&fixture, &digest, &storage_key, &body).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+
+        service.run_blob_gc_mark(false).await.expect("first mark");
+        let first = blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+            .await
+            .expect("first mark must stamp the marker");
+
+        // A second mark pass must NOT overwrite the timestamp.
+        service.run_blob_gc_mark(false).await.expect("second mark");
+        let second = blob_pending_delete_at(&fixture.pool, fixture.repo_id, &digest)
+            .await
+            .expect("blob is still marked after a second pass");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            first, second,
+            "re-marking an already-marked blob must preserve the original pending_delete_at \
+             so the sweep grace is measured from the first mark"
         );
     }
 }

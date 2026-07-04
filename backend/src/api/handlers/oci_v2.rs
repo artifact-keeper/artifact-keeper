@@ -19097,6 +19097,8 @@ mod proxy_manifest_artifact_indexing_tests {
             return;
         };
 
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
         let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
 
         // Seed blob D already MARKED for deletion by GC (Phase A).
@@ -19168,6 +19170,8 @@ mod proxy_manifest_artifact_indexing_tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
 
         let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
 

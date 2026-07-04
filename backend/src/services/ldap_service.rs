@@ -779,6 +779,7 @@ mod tests {
             otel_service_name: "test".into(),
             gc_schedule: "0 0 * * * *".into(),
             blob_gc_enabled: false,
+            blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,

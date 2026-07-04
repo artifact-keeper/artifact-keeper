@@ -403,18 +403,64 @@ pub fn spawn_all(
                     }
                 }
 
-                match service.run_blob_gc(blob_gc_dry_run_this_tick).await {
+                // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
+                // candidates (`pending_delete_at`, a pure row update with no
+                // storage I/O) every tick; Phase B sweeps blobs marked at
+                // least `blob_gc_sweep_grace_secs` ago that are still orphan,
+                // deleting storage then row under the same push-path row lock.
+                // Splitting the phases keeps storage deletion out of the
+                // commit-then-delete TOCTOU: a re-push in the mark->sweep
+                // window resurrects the blob (clears the marker under the lock)
+                // so the sweep skips it. Both phases honour the dry-run /
+                // readiness gate above — in dry-run neither writes nor clears a
+                // marker and nothing is deleted.
+                match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
                     Ok(result) => {
                         if result.dry_run && result.storage_keys_deleted > 0 {
                             tracing::info!(
-                                "Blob GC (dry-run): would reclaim {} blob objects, {} bytes \
+                                "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
+                                 (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
+                                result.storage_keys_deleted,
+                            );
+                        } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC: marked {} orphan blobs pending deletion",
+                                result.storage_keys_deleted,
+                            );
+                        }
+                        if !result.errors.is_empty() {
+                            tracing::warn!(
+                                "Blob GC mark completed with {} errors",
+                                result.errors.len()
+                            );
+                            for err in &result.errors {
+                                tracing::warn!(gc_error = %err, "Blob GC mark error");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Blob GC mark pass failed: {}", e);
+                    }
+                }
+
+                match service
+                    .run_blob_gc_sweep(
+                        blob_gc_dry_run_this_tick,
+                        config_clone.blob_gc_sweep_grace_secs as i64,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
                                  (set BLOB_GC_ENABLED=true to delete)",
                                 result.storage_keys_deleted,
                                 result.bytes_freed
                             );
                         } else if !result.dry_run && result.storage_keys_deleted > 0 {
                             tracing::info!(
-                                "Blob GC: deleted {} blob objects, freed {} bytes",
+                                "Blob GC: swept {} blob objects, freed {} bytes",
                                 result.storage_keys_deleted,
                                 result.bytes_freed
                             );
@@ -424,14 +470,17 @@ pub fn spawn_all(
                             );
                         }
                         if !result.errors.is_empty() {
-                            tracing::warn!("Blob GC completed with {} errors", result.errors.len());
+                            tracing::warn!(
+                                "Blob GC sweep completed with {} errors",
+                                result.errors.len()
+                            );
                             for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Blob GC error");
+                                tracing::warn!(gc_error = %err, "Blob GC sweep error");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Blob garbage collection failed: {}", e);
+                        tracing::warn!("Blob GC sweep pass failed: {}", e);
                     }
                 }
             }
