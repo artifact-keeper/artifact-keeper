@@ -2039,6 +2039,30 @@ pub(crate) async fn persist_tag_and_refs(
                 .fetch_all(&mut *tx)
                 .await?;
 
+                // 2b. (#1660) Resurrect any of these blobs that blob GC has
+                //     marked `pending_delete_at`. We already hold the same
+                //     `FOR UPDATE` lock GC's mark/sweep takes, so clearing the
+                //     marker here strictly serializes against GC: either we
+                //     clear it before GC's sweep re-check (sweep then skips the
+                //     now-referenced blob) or GC's mark runs first and we clear
+                //     it under the lock we now hold. A blob that is being
+                //     re-referenced by this live push must not be swept, so the
+                //     marker is dropped. No-op for the common case (marker
+                //     already NULL) and adds no storage I/O to the tx.
+                sqlx::query(
+                    r#"
+                    UPDATE oci_blobs
+                    SET pending_delete_at = NULL
+                    WHERE repository_id = $1
+                      AND digest = ANY($2)
+                      AND pending_delete_at IS NOT NULL
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(&blob_digests)
+                .execute(&mut *tx)
+                .await?;
+
                 sqlx::query(
                     r#"
                     INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
@@ -4199,9 +4223,14 @@ async fn handle_start_upload(
             );
         }
 
-        // Record in oci_blobs
+        // Record in oci_blobs. On conflict the blob already exists; clear any
+        // `pending_delete_at` marker (#1660) so re-uploading a blob that GC had
+        // marked for deletion resurrects it. The push path holds no row lock
+        // here, but the sweep re-check re-reads `pending_delete_at` under its
+        // own `FOR UPDATE`, so a marker cleared before that re-check protects
+        // the blob and one cleared after is re-marked on the next mark pass.
         if let Err(e) = sqlx::query!(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
             repo_id, canonical_digest.as_str(), put_result.bytes_written as i64, key
         )
         .execute(&state.db)
@@ -5579,8 +5608,11 @@ async fn handle_complete_upload(
             );
         }
     };
+    // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
+    // chunked upload of a blob GC had marked resurrects it, mirroring the
+    // monolithic-upload path above.
     if let Err(e) = sqlx::query(
-        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
     )
     .bind(session.repository_id)
     .bind(&digest)
@@ -19051,6 +19083,140 @@ mod proxy_manifest_artifact_indexing_tests {
             ref_count, 1,
             "the referenced blob must have a live manifest_blob_refs row after \
              the push commits, so GC's orphan predicate is false and the blob survives"
+        );
+    }
+
+    /// #1660: a push that re-references a blob GC has marked
+    /// `pending_delete_at` must RESURRECT it — clear the marker under the same
+    /// `FOR UPDATE` lock the push already takes — so the two-phase sweep skips
+    /// a blob that has become live again. Proves the resurrection UPDATE added
+    /// to `persist_tag_and_refs` clears the marker for the referenced digest.
+    #[tokio::test]
+    async fn persist_tag_and_refs_resurrects_pending_delete_blob() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Seed blob D already MARKED for deletion by GC (Phase A).
+        let d = format!("sha256:{}", "b".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, pending_delete_at) \
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(123_i64)
+        .bind(format!("{repo_id}/blobs/{d}"))
+        .execute(&pool)
+        .await
+        .expect("seed marked blob");
+
+        // A push that references D re-adopts it.
+        let cfg = format!("sha256:{}", "e".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{d}","size":2}}]}}"#
+        );
+        persist_tag_and_refs(
+            &pool,
+            repo_id,
+            "app",
+            "v1",
+            "sha256:feedface",
+            "application/vnd.oci.image.manifest.v1+json",
+            &ManifestClass::Image,
+            body_str.as_bytes(),
+        )
+        .await
+        .expect("push persists");
+
+        let pending: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT pending_delete_at FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("read pending_delete_at");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            pending.is_none(),
+            "a push that re-references a marked blob must clear pending_delete_at \
+             (resurrect it) so the sweep skips the now-live blob"
+        );
+    }
+
+    /// #1660: re-uploading a blob whose `oci_blobs` row is marked
+    /// `pending_delete_at` must clear the marker via the finalize
+    /// `INSERT ... ON CONFLICT DO UPDATE SET pending_delete_at = NULL`. This
+    /// asserts the ON CONFLICT clause used by both the monolithic and chunked
+    /// finalize paths resurrects a marked blob.
+    #[tokio::test]
+    async fn blob_finalize_on_conflict_clears_pending_delete() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        let d = format!("sha256:{}", "c".repeat(64));
+        let key = format!("{repo_id}/blobs/{d}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, pending_delete_at) \
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(7_i64)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("seed marked blob");
+
+        // Same statement the finalize paths issue on re-upload.
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(7_i64)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("re-upload upsert");
+
+        let pending: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT pending_delete_at FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("read pending_delete_at");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            pending.is_none(),
+            "re-uploading a marked blob must clear pending_delete_at via ON CONFLICT DO UPDATE"
         );
     }
 

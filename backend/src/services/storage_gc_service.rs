@@ -365,13 +365,21 @@ impl StorageGcService {
                 // Storage delete is not transactional, but it happens while
                 // the row lock is still held by `tx`. A racing pusher cannot
                 // begin re-using this storage key until we commit/rollback.
-                if let Err(e) = storage.delete(&storage_key).await {
-                    let _ = tx.rollback().await;
-                    let msg = format_gc_error("delete storage key", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    // Skip DB cleanup if storage delete fails
-                    continue;
+                // An already-absent object is treated as success (#1660) so a
+                // retry after a crash mid-delete still reclaims the soft-deleted
+                // row instead of erroring every pass — matching the cloud
+                // backends' NotFound→Ok mapping.
+                match storage.delete(&storage_key).await {
+                    Ok(()) | Err(AppError::NotFound(_)) => {}
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        let msg =
+                            format_gc_error("delete storage key", &storage_key, &e.to_string());
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        // Skip DB cleanup if storage delete fails
+                        continue;
+                    }
                 }
 
                 // Delete promotion_approvals (no CASCADE on this FK)
@@ -614,12 +622,21 @@ impl StorageGcService {
                 }
             }
 
-            if let Err(e) = storage.delete(&storage_key).await {
-                let _ = tx.rollback().await;
-                let msg = format_gc_error("delete blob storage", &storage_key, &e.to_string());
-                tracing::warn!("{}", msg);
-                result.errors.push(msg);
-                continue;
+            // Deleting an already-absent object is success (#1660): a retry
+            // after a crash between the storage delete and the row delete must
+            // reclaim the orphan row, not roll back forever and leak it. The
+            // cloud backends already map NotFound to Ok (s3.rs, gcs.rs,
+            // azure.rs); the filesystem backend returns NotFound, so tolerate
+            // it here the same way the cleanup-journal sweeps below do.
+            match storage.delete(&storage_key).await {
+                Ok(()) | Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg = format_gc_error("delete blob storage", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
             }
 
             if let Err(e) =
@@ -4488,6 +4505,59 @@ mod tests {
         assert!(
             !file_still_exists,
             "live blob GC must delete the storage object for an orphan digest"
+        );
+    }
+
+    /// #1660: idempotent GC storage-delete. When the storage object is already
+    /// absent (e.g. a retry after a crash between the storage delete and the
+    /// `oci_blobs` row delete), `run_blob_gc` must treat the `NotFound` from
+    /// `storage.delete` as success and still hard-delete the orphan row —
+    /// otherwise the orphan leaks forever. The filesystem backend returns
+    /// `NotFound` for a missing key (unlike the cloud backends' `Ok`), so this
+    /// exercises the NotFound tolerance added at the blob-GC delete site.
+    #[tokio::test]
+    async fn test_run_blob_gc_reclaims_orphan_with_absent_object() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let digest = format!("sha256:{}", "4".repeat(64));
+        let storage_key = format!("oci-blobs/{}", digest);
+
+        // Insert the orphan row but DO NOT write the storage object: this is
+        // the post-crash state where the object is already gone but the row
+        // remains. GC's storage.delete will hit NotFound.
+        insert_old_blob(&fixture.pool, fixture.repo_id, &digest, &storage_key, 42).await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let result = service
+            .run_blob_gc(false)
+            .await
+            .expect("apply succeeds even when the storage object is already absent");
+
+        let row_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(fixture.repo_id)
+        .bind(&digest)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count oci_blobs");
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            row_remaining, 0,
+            "an orphan blob whose storage object is already absent must still be reclaimed \
+             (NotFound from storage.delete is treated as success, not a rollback)"
+        );
+        assert!(
+            result.errors.is_empty(),
+            "a NotFound storage delete must not be recorded as a GC error; got {:?}",
+            result.errors
         );
     }
 
