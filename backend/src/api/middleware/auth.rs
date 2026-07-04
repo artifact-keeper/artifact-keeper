@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
+use crate::models::access_scope::AccessScope;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::permission_service::PermissionService;
@@ -96,13 +97,23 @@ impl AuthExtension {
         }
     }
 
+    /// Repo-scope authorization decision for this principal, as an explicit
+    /// [`AccessScope`].
+    ///
+    /// Bridges the legacy `allowed_repo_ids` field to the enum: a `None`
+    /// restriction maps to [`AccessScope::Admin`] (grants all repositories),
+    /// and `Some(v)` maps to [`AccessScope::Restricted`] (deny-by-default
+    /// allowlist). This is the single place the `Option<Vec<Uuid>>` shape is
+    /// interpreted for repo-scope decisions (#1617, Phase 4).
+    pub fn access_scope(&self) -> AccessScope {
+        AccessScope::from(&self.allowed_repo_ids)
+    }
+
     /// Check whether this auth context has access to a specific repository.
-    /// Returns true if unrestricted or if the repo is in the allowed set.
+    /// Returns true if unrestricted (admin scope) or if the repo is in the
+    /// allowed set.
     pub fn can_access_repo(&self, repo_id: Uuid) -> bool {
-        match &self.allowed_repo_ids {
-            None => true,
-            Some(ids) => ids.contains(&repo_id),
-        }
+        self.access_scope().grants(repo_id)
     }
 
     /// Return an authorization error if scope check fails.

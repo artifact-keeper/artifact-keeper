@@ -1,6 +1,7 @@
 //! SBOM (Software Bill of Materials) generation and management service.
 
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{
     CveHistoryEntry, CveStatus, CveTimelineEntry, CveTrends, LicensePolicy, SbomComponent,
     SbomDocument, SbomFormat, SbomSummary,
@@ -1044,10 +1045,12 @@ impl SbomService {
     ///   `auth.allowed_repo_ids.as_deref()` through unchanged: if auth said
     ///   "no restriction", the service trusts that decision.
     ///
-    /// This is a footgun-prone shape. Tracked for refactor to an explicit
-    /// `enum AccessScope { Admin, Restricted(Vec<Uuid>) }` post v1.2.0 (see
-    /// #1390 follow-up). Until then, treat `None` as a load-bearing comment
-    /// that must read "admin-only".
+    /// This is a footgun-prone shape. Internally it is now interpreted through
+    /// the explicit [`crate::models::access_scope::AccessScope`] enum
+    /// (`None -> Admin`, `Some(v) -> Restricted(v)`), so the "admin-only when
+    /// `None`" contract is exhaustively matched rather than relying on this
+    /// comment (#1617, Phase 4). The public signature still takes
+    /// `Option<&[Uuid]>` while the incremental migration continues.
     ///
     /// Returns an empty vec when the CVE is not present (200 OK, [] body); a
     /// missing CVE is not a 404 in this contract.
@@ -1075,9 +1078,11 @@ impl SbomService {
             .await?;
         // Enforce the repo filter on scan-derived entries (they are synthesized
         // on the fly, so the filter cannot live in the SQL `WHERE`).
-        let mut entries = match allowed_repo_ids {
-            None => scan_entries,
-            Some(repo_ids) => {
+        // `Admin` (legacy `None`) = full cross-repo read; `Restricted` applies
+        // the allowlist, so an empty allowlist filters everything out (#1617).
+        let mut entries = match AccessScope::from(allowed_repo_ids) {
+            AccessScope::Admin => scan_entries,
+            AccessScope::Restricted(repo_ids) => {
                 let allowed: HashSet<Uuid> = repo_ids.iter().copied().collect();
                 self.filter_entries_by_repo(scan_entries, &allowed).await?
             }
@@ -1249,8 +1254,11 @@ impl SbomService {
         id: Uuid,
         allowed_repo_ids: Option<&[Uuid]>,
     ) -> Result<Option<(Uuid, String)>> {
-        let pairs: Vec<(Uuid, String)> = match allowed_repo_ids {
-            None => {
+        // `Admin` (legacy `None`) resolves across every repo; `Restricted`
+        // constrains the candidate set to the allowlist, so an empty allowlist
+        // yields no candidates (deny-by-default) (#1617).
+        let pairs: Vec<(Uuid, String)> = match AccessScope::from(allowed_repo_ids) {
+            AccessScope::Admin => {
                 sqlx::query_as(
                     r#"
                 SELECT DISTINCT sf.artifact_id, sf.cve_id
@@ -1263,7 +1271,7 @@ impl SbomService {
                 .fetch_all(&self.db)
                 .await?
             }
-            Some(repo_ids) => {
+            AccessScope::Restricted(repo_ids) => {
                 sqlx::query_as(
                     r#"
                 SELECT DISTINCT sf.artifact_id, sf.cve_id
