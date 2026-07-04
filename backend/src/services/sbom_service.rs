@@ -4934,9 +4934,8 @@ mod tests {
         seed_finding(&pool, scan_a, artifact_a, "CVE-2024-5150", "high").await;
 
         let service = SbomService::new(pool.clone());
-        let sees_artifact = |entries: &[CveHistoryEntry]| {
-            entries.iter().any(|e| e.artifact_id == artifact_a)
-        };
+        let sees_artifact =
+            |entries: &[CveHistoryEntry]| entries.iter().any(|e| e.artifact_id == artifact_a);
 
         // Admin: full cross-repo read even though repo_a was never listed.
         let admin = service
@@ -4947,20 +4946,14 @@ mod tests {
 
         // Restricted to the owning repo: visible.
         let scoped = service
-            .get_cve_history_by_cve_id(
-                "CVE-2024-5150",
-                AccessScope::Restricted(vec![repo_a]),
-            )
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Restricted(vec![repo_a]))
             .await
             .expect("in-scope read must succeed");
         assert!(sees_artifact(&scoped), "in-scope repo must see the finding");
 
         // Restricted to a different repo: denied.
         let other = service
-            .get_cve_history_by_cve_id(
-                "CVE-2024-5150",
-                AccessScope::Restricted(vec![repo_b]),
-            )
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Restricted(vec![repo_b]))
             .await
             .expect("out-of-scope read must still return Ok([])");
         assert!(
