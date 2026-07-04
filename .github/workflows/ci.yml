@@ -712,7 +712,10 @@ jobs:
       #     rejection regression),
       #     sso_oidc_login_callback_e2e_tests (#1617 OIDC login/callback
       #     regression harness; drives the real sso handlers against an
-      #     in-process wiremock IdP bound to a non-loopback interface).
+      #     in-process wiremock IdP bound to a non-loopback interface),
+      #     sso_saml_acs_e2e_tests (#2212 SAML ACS regression harness; drives
+      #     the real saml_login/saml_acs handlers against bergshamra-signed
+      #     assertions — no outbound fetch, so no wiremock/SSRF dance).
       #
       # Deliberately excluded (would panic on first .expect() without
       # extra infra, so `--ignored` stays the right gate):
@@ -749,6 +752,7 @@ jobs:
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
             --test sso_oidc_login_callback_e2e_tests \
+            --test sso_saml_acs_e2e_tests \
             -- --ignored --test-threads=1
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
