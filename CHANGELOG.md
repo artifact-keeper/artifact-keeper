@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Webhook retry deliveries are claimed atomically before the re-POST** (#2219): with multiple backend replicas sharing one database, every replica's retry tick selected the same due deliveries, so one failed delivery could be re-POSTed once per replica per tick — and exhausting `max_attempts` could fire the dead-letter auto-disable notifier once per replica. Due deliveries are now claimed in a single `FOR UPDATE SKIP LOCKED` statement with a per-claim token (the same `cluster_work` pattern as the #2275 sync-task claim), the claim is re-extended immediately before each send, and success/retry/dead-letter updates are token-guarded so a stale owner cannot clobber a re-claimed delivery. A crashed replica's claim simply expires, making the delivery due again with no operator action.
+
 ## [1.5.3] - 2026-07-12
 
 Security hotfix: closes a systemic cross-repository authorization gap where artifact/repository-scoped routes returned (and in some cases mutated) another repository's data for any authenticated non-member. Found by red-team; the HIGH-impact subset (vulnerability/SBOM data) is fixed here, with the remaining medium/low routes tracked for the next feature release (#2443).
