@@ -1,5 +1,6 @@
 //! gRPC server implementations for SBOM services.
 
+use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{CveStatus, SbomFormat};
 use crate::services::sbom_service::{DependencyInfo, SbomService};
 use sqlx::PgPool;
@@ -312,10 +313,10 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
 
         let entry = self
             .service
-            // `None` repo scope: the gRPC surface is an admin/system path
+            // Admin repo scope: the gRPC surface is an admin/system path
             // (no per-call repo restriction), so synth-id resolution (#1561)
-            // runs unrestricted, matching the admin-when-`None` contract.
-            .update_cve_status(id, status, None, Some(&req.reason), None)
+            // runs unrestricted, matching the admin contract.
+            .update_cve_status(id, status, None, Some(&req.reason), AccessScope::Admin)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

@@ -891,7 +891,7 @@ async fn get_cve_history(
         }
         CveHistoryPath::Cve(cve_id) => {
             let entries = service
-                .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+                .get_cve_history_by_cve_id(&cve_id, auth.access_scope())
                 .await?;
             Ok(Json(entries))
         }
@@ -972,7 +972,7 @@ async fn get_cve_history_by_cve(
     }
     let service = SbomService::new(state.db.clone());
     let entries = service
-        .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+        .get_cve_history_by_cve_id(&cve_id, auth.access_scope())
         .await?;
     Ok(Json(entries))
 }
@@ -1020,7 +1020,7 @@ async fn update_cve_status(
             status,
             Some(auth.user_id),
             body.reason.as_deref(),
-            auth.allowed_repo_ids.as_deref(),
+            auth.access_scope(),
         )
         .await
         .map_err(|e| match e {

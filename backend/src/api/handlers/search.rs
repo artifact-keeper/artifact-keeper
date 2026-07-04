@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::search_service::{SearchFacets, SearchQuery, SearchResult, SearchService};
 
 // ---------------------------------------------------------------------------
@@ -191,25 +192,28 @@ pub(crate) fn resolve_checksum_column(algorithm: &str) -> Result<&'static str> {
 ///
 /// The returned value is passed directly to SearchService methods as the
 /// `accessible_repo_ids` parameter.
-/// Intersect a user-visible repo set with an API token's repository scope
-/// (`allowed_repo_ids`), so a token scoped to repo X cannot enumerate other
-/// repos via search (#1803).
+/// Intersect a user-visible repo set with an API token's repository
+/// [`AccessScope`], so a token scoped to repo X cannot enumerate other repos
+/// via search (#1803).
 ///
-/// * `visible = None` means "no filter" (admin). A repo-scoped token narrows
+/// * `visible = Admin` means "no filter" (admin). A repo-scoped token narrows
 ///   this to exactly its scoped ids.
-/// * `visible = Some(ids)` is intersected with the token scope.
-/// * `token_scope = None` (unrestricted / JWT / anonymous) leaves `visible`
+/// * `visible = Restricted(ids)` is intersected with the token scope.
+/// * `token_scope = Admin` (unrestricted / JWT / anonymous) leaves `visible`
 ///   unchanged.
+///
+/// Deny-by-default is preserved by the type: a `Restricted([])` token scope
+/// intersects to `Restricted([])` (nothing visible), it never falls open.
 pub(crate) fn intersect_token_scope(
-    visible: Option<Vec<Uuid>>,
-    token_scope: Option<&[Uuid]>,
-) -> Option<Vec<Uuid>> {
+    visible: AccessScope,
+    token_scope: &AccessScope,
+) -> AccessScope {
     match token_scope {
-        None => visible,
-        Some(scope) => match visible {
+        AccessScope::Admin => visible,
+        AccessScope::Restricted(scope) => match visible {
             // Admin (no filter) restricted to the token's scoped repos.
-            None => Some(scope.to_vec()),
-            Some(ids) => Some(
+            AccessScope::Admin => AccessScope::Restricted(scope.clone()),
+            AccessScope::Restricted(ids) => AccessScope::Restricted(
                 ids.into_iter()
                     .filter(|id| scope.contains(id))
                     .collect::<Vec<_>>(),
@@ -221,10 +225,16 @@ pub(crate) fn intersect_token_scope(
 async fn resolve_accessible_repos(
     db: &PgPool,
     auth: &Option<AuthExtension>,
-) -> Result<Option<Vec<Uuid>>> {
+) -> Result<AccessScope> {
     let visible = resolve_visible_repos(db, auth).await?;
-    let token_scope = auth.as_ref().and_then(|a| a.allowed_repo_ids.as_deref());
-    Ok(intersect_token_scope(visible, token_scope))
+    let token_scope = auth
+        .as_ref()
+        .map(|a| a.access_scope())
+        .unwrap_or(AccessScope::Admin);
+    Ok(intersect_token_scope(
+        AccessScope::from(visible),
+        &token_scope,
+    ))
 }
 
 /// Resolve the caller's *visibility* set (public + role grants), ignoring any
@@ -366,7 +376,8 @@ pub async fn quick_search(
         }));
     }
 
-    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+    let accessible_repo_ids: Option<Vec<Uuid>> =
+        resolve_accessible_repos(&state.db, &auth).await?.into();
 
     let search_query = SearchQuery {
         q: Some(query_text),
@@ -439,7 +450,8 @@ pub async fn advanced_search(
     // per_page=0 is an explicit request for zero results: return an empty
     // page with the right total so paginated UIs still render counts.
     if matches!(params.per_page, Some(0)) {
-        let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+        let accessible_repo_ids: Option<Vec<Uuid>> =
+            resolve_accessible_repos(&state.db, &auth).await?.into();
         let count_query = SearchQuery {
             q: params.query.clone(),
             format: params.format.clone(),
@@ -471,7 +483,8 @@ pub async fn advanced_search(
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+    let accessible_repo_ids: Option<Vec<Uuid>> =
+        resolve_accessible_repos(&state.db, &auth).await?.into();
 
     let search_query = SearchQuery {
         q: params.query.clone(),
@@ -600,7 +613,7 @@ pub async fn checksum_search(
 
     let rows: Vec<ChecksumRow> = sqlx::query_as(&sql)
         .bind(&checksum)
-        .bind(&accessible_repo_ids)
+        .bind(accessible_repo_ids.as_allowed_repo_ids())
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -680,11 +693,11 @@ pub async fn suggest(
     }
     let limit = clamp_positive_limit(params.limit, 10, 1, 50);
 
-    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+    let scope = resolve_accessible_repos(&state.db, &auth).await?;
 
     let service = SearchService::new(state.db.clone());
     let suggestions = service
-        .suggest(&params.prefix, limit, accessible_repo_ids.as_deref(), false)
+        .suggest(&params.prefix, limit, scope.as_allowed_repo_ids(), false)
         .await?;
 
     Ok(Json(SuggestResponse { suggestions }))
@@ -721,11 +734,11 @@ pub async fn trending(
     }
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
-    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+    let scope = resolve_accessible_repos(&state.db, &auth).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .trending(days, limit, false, accessible_repo_ids.as_deref())
+        .trending(days, limit, false, scope.as_allowed_repo_ids())
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
@@ -764,11 +777,11 @@ pub async fn recent(
     }
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
-    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+    let scope = resolve_accessible_repos(&state.db, &auth).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .recent(limit, false, accessible_repo_ids.as_deref())
+        .recent(limit, false, scope.as_allowed_repo_ids())
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
@@ -1354,27 +1367,35 @@ mod tests {
         assert_eq!(classify_repo_access(&auth), RepoAccessMode::PublicOnly);
     }
 
-    // intersect_token_scope (pure function) — #1803 search scope tightening
+    // intersect_token_scope (pure function) — #1803 search scope tightening,
+    // now expressed over the AccessScope enum (#1617, Phase 4).
     #[test]
     fn test_intersect_unrestricted_token_leaves_visible_unchanged() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        let visible = Some(vec![a, b]);
+        let visible = AccessScope::Restricted(vec![a, b]);
         assert_eq!(
-            intersect_token_scope(visible.clone(), None),
+            intersect_token_scope(visible.clone(), &AccessScope::Admin),
             visible,
             "no token scope means no intersection"
         );
-        // Admin no-filter stays no-filter when token is unrestricted.
-        assert_eq!(intersect_token_scope(None, None), None);
+        // Admin no-filter stays no-filter when the token is unrestricted, i.e.
+        // an admin (None-origin) principal keeps access to every repo.
+        assert_eq!(
+            intersect_token_scope(AccessScope::Admin, &AccessScope::Admin),
+            AccessScope::Admin
+        );
     }
 
     #[test]
     fn test_intersect_narrows_admin_no_filter_to_token_scope() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        // Admin (None = all repos) with a repo-scoped token is clamped to scope.
-        assert_eq!(intersect_token_scope(None, Some(&[a, b])), Some(vec![a, b]));
+        // Admin (all repos) with a repo-scoped token is clamped to scope.
+        assert_eq!(
+            intersect_token_scope(AccessScope::Admin, &AccessScope::Restricted(vec![a, b])),
+            AccessScope::Restricted(vec![a, b])
+        );
     }
 
     #[test]
@@ -1382,9 +1403,13 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        // Visible {a,b,c}, token scoped to {a,c}, out-of-scope b dropped.
-        let out = intersect_token_scope(Some(vec![a, b, c]), Some(&[a, c]));
-        assert_eq!(out, Some(vec![a, c]));
+        // Visible {a,b,c}, token scoped to {a,c}, out-of-scope b dropped. The
+        // in-scope repos (a, c) are granted; the unlisted repo (b) is not.
+        let out = intersect_token_scope(
+            AccessScope::Restricted(vec![a, b, c]),
+            &AccessScope::Restricted(vec![a, c]),
+        );
+        assert_eq!(out, AccessScope::Restricted(vec![a, c]));
     }
 
     #[test]
@@ -1393,8 +1418,29 @@ mod tests {
         let b = Uuid::new_v4();
         // Token scoped to a repo not in the visible set -> nothing visible.
         assert_eq!(
-            intersect_token_scope(Some(vec![a]), Some(&[b])),
-            Some(vec![])
+            intersect_token_scope(
+                AccessScope::Restricted(vec![a]),
+                &AccessScope::Restricted(vec![b]),
+            ),
+            AccessScope::Restricted(vec![])
+        );
+    }
+
+    #[test]
+    fn test_intersect_empty_token_scope_denies_all() {
+        // Deny-by-default: an empty token allowlist grants nothing, even when
+        // the visible set is Admin (all repos). It must never fall open (#1617).
+        let a = Uuid::new_v4();
+        assert_eq!(
+            intersect_token_scope(AccessScope::Admin, &AccessScope::Restricted(vec![])),
+            AccessScope::Restricted(vec![])
+        );
+        assert_eq!(
+            intersect_token_scope(
+                AccessScope::Restricted(vec![a]),
+                &AccessScope::Restricted(vec![]),
+            ),
+            AccessScope::Restricted(vec![])
         );
     }
 
