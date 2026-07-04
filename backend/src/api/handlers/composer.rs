@@ -27,6 +27,7 @@ use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::formats::composer::ComposerHandler;
 use crate::models::repository::RepositoryType;
@@ -440,6 +441,304 @@ fn build_version_entry(
 }
 
 // ---------------------------------------------------------------------------
+// Remote proxy dist-URL rewriting + resolution (#1652)
+//
+// A Remote composer repo proxies packagist's `p2` (and legacy `p`) metadata
+// document. That document carries the *real* `dist.url` on an off-registry host
+// (a GitHub zipball, a CDN mirror, ...). Serving it verbatim makes
+// `composer install` pull the archive straight from upstream, bypassing our
+// proxy cache entirely — only the metadata `.json` was ever cached, never the
+// package zip.
+//
+// The fix mirrors the proven PyPI remote pattern (`resolve_pypi_remote_fetch_target`
+// + `fetch_from_pypi_remote_streaming`): rewrite every served `dist.url` back to
+// our in-registry `/composer/{key}/dist/...` form (preserving `reference` /
+// `shasum`), then in `download_archive` resolve the real upstream dist URL from
+// the (warm-cached) metadata, SSRF-check it, and stream+tee it into the proxy
+// cache keyed by the content digest.
+//
+// The small URL-split helper is kept LOCAL to this handler on purpose: composer.rs
+// is jscpd-exempt (see `.jscpd.json`), and the shared `proxy_helpers` module is
+// owned by an in-flight PR, so a local copy avoids parallel-merge drift.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the `dist.url` of a single composer version entry to the relative
+/// in-registry download path, preserving every other field (notably
+/// `dist.reference` and `dist.shasum`). Entries without a `dist.url` (e.g. the
+/// delta rows of the "minified" format) are left untouched. `version_hint` is
+/// used when the entry itself omits a `version` field (the v1 wire shape keys
+/// versions by the map key rather than an inline field).
+fn rewrite_dist_url_in_entry(
+    repo_key: &str,
+    name: &str,
+    version_hint: &str,
+    entry: &mut serde_json::Value,
+) {
+    let version = entry
+        .get("version")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| version_hint.to_string());
+
+    let Some(dist) = entry.get_mut("dist").and_then(|d| d.as_object_mut()) else {
+        return;
+    };
+    if !dist.contains_key("url") {
+        return;
+    }
+
+    // Prefer the immutable git `reference` for the download path; fall back to
+    // `shasum`, then the version, so the URL always has a stable last segment
+    // even when the upstream omits `reference`.
+    let reference = dist
+        .get("reference")
+        .and_then(|r| r.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            dist.get("shasum")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| version.clone());
+
+    dist.insert(
+        "url".to_string(),
+        serde_json::Value::String(format!(
+            "/composer/{}/dist/{}/{}/{}.zip",
+            repo_key, name, version, reference
+        )),
+    );
+}
+
+/// Rewrite every `packages.*[].dist.url` in a proxied composer metadata document
+/// so the composer client fetches the archive back through us rather than the
+/// upstream host directly. Handles both wire shapes: the v2 `packages` map of
+/// version *arrays* and the v1 map of version *objects*. Pure + DB-free so it is
+/// unit-testable (#1652).
+fn rewrite_remote_dist_urls(repo_key: &str, doc: &mut serde_json::Value) {
+    let Some(packages) = doc.get_mut("packages").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    for (name, versions) in packages.iter_mut() {
+        match versions {
+            serde_json::Value::Array(arr) => {
+                for entry in arr.iter_mut() {
+                    rewrite_dist_url_in_entry(repo_key, name, "dev-main", entry);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (ver, entry) in map.iter_mut() {
+                    let hint = ver.clone();
+                    rewrite_dist_url_in_entry(repo_key, name, &hint, entry);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse a proxied composer metadata document, rewrite its dist URLs, and
+/// re-serialize. On any JSON parse failure the original bytes are returned
+/// unchanged so a non-JSON (or unexpected) upstream body is still served
+/// verbatim rather than dropped. Pure so the transform is unit-testable (#1652).
+fn rewrite_remote_metadata_body(repo_key: &str, content: &Bytes) -> Bytes {
+    match serde_json::from_slice::<serde_json::Value>(content) {
+        Ok(mut doc) => {
+            rewrite_remote_dist_urls(repo_key, &mut doc);
+            match serde_json::to_vec(&doc) {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(_) => content.clone(),
+            }
+        }
+        Err(_) => content.clone(),
+    }
+}
+
+/// Split a URL into its base (scheme + authority) and path components, e.g.
+/// `https://api.github.com/repos/x/y/zipball/ref` →
+/// `("https://api.github.com", "repos/x/y/zipball/ref")`. Returns `None` for a
+/// non-http(s) scheme or an empty path. Kept local to this jscpd-exempt handler
+/// to avoid editing the shared `proxy_helpers` module (#1652).
+fn split_url_base_and_path(url_str: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url_str).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let base = format!("{}://{}", parsed.scheme(), parsed.authority());
+    let path = parsed.path().strip_prefix('/').unwrap_or(parsed.path());
+    if path.is_empty() {
+        return None;
+    }
+    Some((base, path.to_string()))
+}
+
+/// Locate the real upstream `dist.url` (+ optional non-empty `shasum`) for a
+/// specific version/reference inside a proxied composer metadata document.
+/// Matches the version entry by `dist.reference == reference` first, then falls
+/// back to `version` match. Pure + DB-free for unit testing (#1652).
+fn find_remote_dist(
+    doc: &serde_json::Value,
+    full_name: &str,
+    version: &str,
+    reference: &str,
+) -> Option<(String, Option<String>)> {
+    let versions = doc.get("packages")?.get(full_name)?;
+    let entries: Vec<&serde_json::Value> = match versions {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        serde_json::Value::Object(map) => map.values().collect(),
+        _ => return None,
+    };
+
+    let pick = entries
+        .iter()
+        .find(|e| {
+            e.get("dist")
+                .and_then(|d| d.get("reference"))
+                .and_then(|r| r.as_str())
+                == Some(reference)
+        })
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.get("version").and_then(|v| v.as_str()) == Some(version))
+        })?;
+
+    let url = pick
+        .get("dist")
+        .and_then(|d| d.get("url"))
+        .and_then(|u| u.as_str())?
+        .to_string();
+    let shasum = pick
+        .get("dist")
+        .and_then(|d| d.get("shasum"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Some((url, shasum))
+}
+
+/// Content-addressed proxy-cache key for a remote composer dist. Prefers the
+/// `dist.shasum` digest so identical archives dedup across versions / mirror
+/// rotation and the key stays stable across upstream URL churn (packagist dist
+/// URLs rotate hosts and carry expiring query params — never key the cache by
+/// the URL). Falls back to the immutable git `reference` when no shasum is
+/// present. Pure (#1652).
+fn composer_dist_cache_path(
+    full_name: &str,
+    version: &str,
+    reference: &str,
+    shasum: Option<&str>,
+) -> String {
+    match shasum {
+        Some(s) => format!("dist/{}/{}.zip", full_name, s),
+        None => format!("dist/{}/{}/{}.zip", full_name, version, reference),
+    }
+}
+
+/// Resolved fetch target for a remote composer dist archive.
+#[derive(Debug)]
+struct ComposerRemoteDistTarget {
+    /// `scheme://authority` of the REAL upstream dist URL.
+    fetch_base: String,
+    /// Path (+query) of the REAL upstream dist URL, relative to `fetch_base`.
+    fetch_path: String,
+    /// Stable, content-addressed proxy-cache key (independent of the volatile URL).
+    cache_path: String,
+}
+
+/// Turn a parsed composer metadata document into a [`ComposerRemoteDistTarget`]:
+/// find the real dist URL for the requested version/reference, run it through
+/// the outbound SSRF allowlist, then split it into base/path and derive the
+/// content-addressed cache key. Pure (no IO), so the SSRF-rejection, URL-split
+/// and cache-key logic are all unit-testable without a DB or proxy (#1652).
+// The small `Ok` variant makes the boxed-Response `Err` dominate the `Result`
+// size; the whole handler family returns `Result<_, Response>` this way (see
+// pypi.rs `resolve_pypi_remote_fetch_target`).
+#[allow(clippy::result_large_err)]
+fn build_remote_dist_target(
+    doc: &serde_json::Value,
+    full_name: &str,
+    version: &str,
+    reference: &str,
+) -> Result<ComposerRemoteDistTarget, Response> {
+    let (real_url, shasum) =
+        find_remote_dist(doc, full_name, version, reference).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Package version not found in upstream metadata",
+            )
+                .into_response()
+        })?;
+
+    // SSRF guard: a hostile or compromised upstream could point `dist.url` at a
+    // loopback / link-local / cloud-metadata address (169.254.169.254,
+    // 127.0.0.1, a cluster service name, ...). Refuse before any outbound fetch,
+    // exactly as the PyPI remote path does (pypi.rs).
+    validate_outbound_url(&real_url, "Composer upstream dist URL").map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Upstream metadata contains a disallowed dist URL: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let (fetch_base, fetch_path) = split_url_base_and_path(&real_url).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream dist URL is not a valid http(s) URL",
+        )
+            .into_response()
+    })?;
+
+    let cache_path = composer_dist_cache_path(full_name, version, reference, shasum.as_deref());
+
+    Ok(ComposerRemoteDistTarget {
+        fetch_base,
+        fetch_path,
+        cache_path,
+    })
+}
+
+/// Resolve the real upstream dist archive URL for a Remote composer repo by
+/// re-reading the (warm proxy-cached) `p2` metadata document — the composer
+/// client fetched that same document microseconds ago, so this is a cache hit —
+/// and running it through [`build_remote_dist_target`]. Mirrors
+/// `resolve_pypi_remote_fetch_target` (pypi.rs) (#1652).
+#[allow(clippy::result_large_err)]
+async fn resolve_composer_remote_dist_target(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    full_name: &str,
+    version: &str,
+    reference: &str,
+) -> Result<ComposerRemoteDistTarget, Response> {
+    let upstream_path = composer_v2_upstream_path(full_name);
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await?;
+
+    let doc: serde_json::Value = serde_json::from_slice(&content).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream composer metadata was not valid JSON",
+        )
+            .into_response()
+    })?;
+
+    build_remote_dist_target(&doc, full_name, version, reference)
+}
+
+// ---------------------------------------------------------------------------
 // GET /composer/{repo_key}/packages.json - Root packages index
 // ---------------------------------------------------------------------------
 
@@ -538,6 +837,13 @@ async fn metadata_v2(
                     proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
+                // #1652: rewrite the upstream `dist.url`s to our in-registry
+                // `/composer/{key}/dist/...` form so `composer install` fetches
+                // the archive back through us (and we can proxy-cache it),
+                // instead of pulling it straight from the off-registry host. The
+                // proxy cache still stores the original upstream bytes; only the
+                // served copy is transformed.
+                let content = rewrite_remote_metadata_body(&repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
         }
@@ -598,6 +904,9 @@ async fn metadata_v1(
                     proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
+                // #1652: rewrite upstream `dist.url`s to route dist downloads
+                // back through us (see metadata_v2 for the rationale).
+                let content = rewrite_remote_metadata_body(&repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
         }
@@ -659,19 +968,33 @@ async fn download_archive(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path =
-                        format!("dist/{}/{}/{}/{}.zip", vendor, package, version, reference);
-                    // #1608 Phase 4: stream the composer dist archive (.zip)
-                    // straight to the client while teeing to the proxy cache,
-                    // instead of buffering the whole package in memory.
-                    // Single-flight via the merged coordinator (#1609).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    // #1652: the real dist archive lives on an off-registry host
+                    // named only inside the `p2` metadata (a GitHub zipball, a
+                    // CDN mirror, ...), NOT under packagist's own base — so the
+                    // old synthesized `{upstream_url}/dist/...` path 404'd. Read
+                    // the (warm-cached) metadata to recover the real dist URL,
+                    // SSRF-check it, then stream+tee it into the proxy cache
+                    // under a content-addressed key. #1608 Phase 4 streaming /
+                    // #1609 single-flight semantics are preserved by reusing the
+                    // shared streaming primitive.
+                    let target = resolve_composer_remote_dist_target(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
-                        &upstream_path,
-                        "application/octet-stream",
+                        &full_name,
+                        &version,
+                        reference,
+                    )
+                    .await?;
+                    return proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        &target.fetch_base,
+                        &target.fetch_path,
+                        &target.cache_path,
+                        "application/zip",
                     )
                     .await;
                 }
@@ -1124,8 +1447,12 @@ async fn upload(
 #[cfg(test)]
 mod tests {
 
+    /// #1652: a Remote composer repo must rewrite the upstream `dist.url` in the
+    /// proxied `p2` metadata to our in-registry `/composer/{key}/dist/...` form
+    /// so `composer install` fetches the archive back through us (and we can
+    /// proxy-cache it). `reference`, `shasum` and `minified` are preserved.
     #[tokio::test]
-    async fn test_remote_dist_download_streams_upstream_blob_1608() {
+    async fn test_remote_metadata_v2_rewrites_dist_url_1652() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1134,19 +1461,106 @@ mod tests {
             return;
         };
         let server = MockServer::start().await;
-        // A small deterministic body stands in for a large artifact; the point
-        // is to exercise the streaming pull-through branch (proxy_fetch_streaming)
-        // added in #1608 Phase 4, not the body size.
-        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        // Packagist-shaped p2 document whose dist.url points at an off-registry
+        // host (a GitHub zipball) — the exact shape the old code proxied verbatim.
+        let doc = serde_json::json!({
+            "minified": "composer/2.0",
+            "packages": {
+                "monolog/monolog": [{
+                    "name": "monolog/monolog",
+                    "version": "2.0.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc123",
+                        "reference": "abc123",
+                        "shasum": "deadbeef"
+                    }
+                }]
+            }
+        });
         Mock::given(method("GET"))
-            .and(path("/dist/monolog/monolog/2.0.0/abc123.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .and(path("/p2/monolog/monolog.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(doc.to_string()),
+            )
             .mount(&server)
             .await;
 
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
         let app = tdh::router_anon(super::router(), state);
         let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{key}/p2/monolog/monolog.json", key = fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from remote metadata proxy, got {status}");
+        }
+        let served: serde_json::Value =
+            serde_json::from_slice(&body).expect("served metadata must be JSON");
+        let entry = &served["packages"]["monolog/monolog"][0];
+        let expected_url = format!(
+            "/composer/{key}/dist/monolog/monolog/2.0.0/abc123.zip",
+            key = fx.repo_key
+        );
+        let ok = entry["dist"]["url"] == serde_json::json!(expected_url)
+            && entry["dist"]["reference"] == serde_json::json!("abc123")
+            && entry["dist"]["shasum"] == serde_json::json!("deadbeef")
+            && served["minified"] == serde_json::json!("composer/2.0");
+        teardown().await;
+        assert!(
+            ok,
+            "remote metadata dist.url must be rewritten in-registry with reference/shasum/minified preserved, got: {}",
+            serde_json::to_string(&served).unwrap()
+        );
+    }
+
+    /// #1652: when the metadata resolves a dist to a loopback / link-local
+    /// address, the download must be refused by the outbound SSRF guard and the
+    /// upstream dist never contacted.
+    #[tokio::test]
+    async fn test_remote_dist_download_refuses_ssrf_1652() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let doc = serde_json::json!({
+            "minified": "composer/2.0",
+            "packages": {
+                "monolog/monolog": [{
+                    "name": "monolog/monolog",
+                    "version": "2.0.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "http://169.254.169.254/latest/meta-data/",
+                        "reference": "abc123",
+                        "shasum": "deadbeef"
+                    }
+                }]
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/p2/monolog/monolog.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(doc.to_string()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
             app,
             tdh::get(format!(
                 "/{key}/dist/monolog/monolog/2.0.0/abc123",
@@ -1156,12 +1570,12 @@ mod tests {
         .await;
 
         let teardown = || async { fx.teardown().await };
-        if status != axum::http::StatusCode::OK {
-            teardown().await;
-            panic!("expected 200 from streamed remote download, got {status}");
-        }
-        assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
+        let refused = status.is_client_error();
         teardown().await;
+        assert!(
+            refused,
+            "SSRF-blocked upstream dist URL must be refused with a 4xx, got {status}"
+        );
     }
     use super::*;
 
@@ -2398,6 +2812,7 @@ mod upload_db_tests {
 
 #[cfg(test)]
 mod metadata_db_tests {
+    use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
     use uuid::Uuid;
 
@@ -2832,5 +3247,208 @@ mod metadata_db_tests {
         let _ = std::fs::remove_dir_all(d1);
         let _ = std::fs::remove_dir_all(d2);
         vf.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1652: remote dist-URL rewrite + resolve (pure, DB-free)
+    // -----------------------------------------------------------------------
+
+    fn packagist_v2_doc() -> serde_json::Value {
+        serde_json::json!({
+            "minified": "composer/2.0",
+            "packages": {
+                "monolog/monolog": [{
+                    "name": "monolog/monolog",
+                    "version": "2.0.0",
+                    "require": {"php": ">=7.2"},
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/aaa111",
+                        "reference": "aaa111",
+                        "shasum": "sha1digest"
+                    }
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn test_rewrite_remote_dist_urls_v2_array() {
+        let mut doc = packagist_v2_doc();
+        rewrite_remote_dist_urls("php-remote", &mut doc);
+        let entry = &doc["packages"]["monolog/monolog"][0];
+        assert_eq!(
+            entry["dist"]["url"],
+            "/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
+        );
+        // reference, shasum, minified, and unrelated fields preserved.
+        assert_eq!(entry["dist"]["reference"], "aaa111");
+        assert_eq!(entry["dist"]["shasum"], "sha1digest");
+        assert_eq!(entry["dist"]["type"], "zip");
+        assert_eq!(entry["require"]["php"], ">=7.2");
+        assert_eq!(doc["minified"], "composer/2.0");
+    }
+
+    #[test]
+    fn test_rewrite_remote_dist_urls_v1_object() {
+        // Legacy v1 wire shape: packages -> name -> {version -> entry}.
+        let mut doc = serde_json::json!({
+            "packages": {
+                "monolog/monolog": {
+                    "1.0.0": {
+                        "version": "1.0.0",
+                        "dist": {
+                            "type": "zip",
+                            "url": "https://codeload.github.com/x/y/zip/bbb222",
+                            "reference": "bbb222",
+                            "shasum": ""
+                        }
+                    }
+                }
+            }
+        });
+        rewrite_remote_dist_urls("legacy", &mut doc);
+        let entry = &doc["packages"]["monolog/monolog"]["1.0.0"];
+        assert_eq!(
+            entry["dist"]["url"],
+            "/composer/legacy/dist/monolog/monolog/1.0.0/bbb222.zip"
+        );
+        assert_eq!(entry["dist"]["reference"], "bbb222");
+    }
+
+    #[test]
+    fn test_rewrite_remote_dist_urls_entry_without_dist_untouched() {
+        let mut doc = serde_json::json!({
+            "packages": {
+                "vendor/pkg": [{"name": "vendor/pkg", "version": "9.9.9"}]
+            }
+        });
+        rewrite_remote_dist_urls("k", &mut doc);
+        assert!(doc["packages"]["vendor/pkg"][0].get("dist").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_remote_metadata_body_non_json_passthrough() {
+        let raw = bytes::Bytes::from_static(b"<html>not json</html>");
+        let out = rewrite_remote_metadata_body("k", &raw);
+        assert_eq!(out, raw, "non-JSON upstream body is served verbatim");
+    }
+
+    #[test]
+    fn test_rewrite_remote_metadata_body_rewrites() {
+        let raw = bytes::Bytes::from(packagist_v2_doc().to_string());
+        let out = rewrite_remote_metadata_body("php-remote", &raw);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["packages"]["monolog/monolog"][0]["dist"]["url"],
+            "/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
+        );
+    }
+
+    #[test]
+    fn test_find_remote_dist_by_reference() {
+        let doc = packagist_v2_doc();
+        let (url, shasum) = find_remote_dist(&doc, "monolog/monolog", "2.0.0", "aaa111").unwrap();
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/Seldaek/monolog/zipball/aaa111"
+        );
+        assert_eq!(shasum.as_deref(), Some("sha1digest"));
+    }
+
+    #[test]
+    fn test_find_remote_dist_by_version_fallback() {
+        let doc = packagist_v2_doc();
+        // reference does not match any entry, but version does.
+        let (url, _) = find_remote_dist(&doc, "monolog/monolog", "2.0.0", "no-such-ref").unwrap();
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/Seldaek/monolog/zipball/aaa111"
+        );
+    }
+
+    #[test]
+    fn test_find_remote_dist_missing_returns_none() {
+        let doc = packagist_v2_doc();
+        assert!(find_remote_dist(&doc, "no/pkg", "1.0.0", "x").is_none());
+    }
+
+    #[test]
+    fn test_find_remote_dist_empty_shasum_is_none() {
+        let doc = serde_json::json!({
+            "packages": {"v/p": [{"version": "1.0.0", "dist": {"url": "https://h/z", "reference": "r", "shasum": ""}}]}
+        });
+        let (_url, shasum) = find_remote_dist(&doc, "v/p", "1.0.0", "r").unwrap();
+        assert!(shasum.is_none(), "empty shasum must be treated as absent");
+    }
+
+    #[test]
+    fn test_split_url_base_and_path() {
+        let (base, path) =
+            split_url_base_and_path("https://api.github.com/repos/x/y/zipball/ref").unwrap();
+        assert_eq!(base, "https://api.github.com");
+        assert_eq!(path, "repos/x/y/zipball/ref");
+    }
+
+    #[test]
+    fn test_split_url_base_and_path_rejects_non_http() {
+        assert!(split_url_base_and_path("ftp://h/f.zip").is_none());
+        assert!(split_url_base_and_path("not-a-url").is_none());
+        assert!(split_url_base_and_path("https://api.github.com").is_none());
+    }
+
+    #[test]
+    fn test_composer_dist_cache_path_prefers_shasum() {
+        assert_eq!(
+            composer_dist_cache_path("monolog/monolog", "2.0.0", "aaa111", Some("sha1digest")),
+            "dist/monolog/monolog/sha1digest.zip"
+        );
+    }
+
+    #[test]
+    fn test_composer_dist_cache_path_falls_back_to_reference() {
+        assert_eq!(
+            composer_dist_cache_path("monolog/monolog", "2.0.0", "aaa111", None),
+            "dist/monolog/monolog/2.0.0/aaa111.zip"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_dist_target_happy_path() {
+        let doc = packagist_v2_doc();
+        let target = build_remote_dist_target(&doc, "monolog/monolog", "2.0.0", "aaa111")
+            .expect("public github dist URL must resolve");
+        assert_eq!(target.fetch_base, "https://api.github.com");
+        assert_eq!(target.fetch_path, "repos/Seldaek/monolog/zipball/aaa111");
+        // shasum present -> content-addressed cache key.
+        assert_eq!(target.cache_path, "dist/monolog/monolog/sha1digest.zip");
+    }
+
+    #[test]
+    fn test_build_remote_dist_target_rejects_link_local_ssrf() {
+        let doc = serde_json::json!({
+            "packages": {"v/p": [{"version": "1.0.0", "dist": {"url": "http://169.254.169.254/latest/meta-data/", "reference": "r"}}]}
+        });
+        let err = build_remote_dist_target(&doc, "v/p", "1.0.0", "r")
+            .expect_err("link-local dist URL must be refused");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_build_remote_dist_target_rejects_loopback_ssrf() {
+        let doc = serde_json::json!({
+            "packages": {"v/p": [{"version": "1.0.0", "dist": {"url": "http://127.0.0.1:8080/x.zip", "reference": "r"}}]}
+        });
+        let err = build_remote_dist_target(&doc, "v/p", "1.0.0", "r")
+            .expect_err("loopback dist URL must be refused");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_build_remote_dist_target_missing_version_404() {
+        let doc = packagist_v2_doc();
+        let err = build_remote_dist_target(&doc, "monolog/monolog", "9.9.9", "nope")
+            .expect_err("absent version/reference must 404");
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }
