@@ -295,12 +295,13 @@ async fn fetch_remote_simple_root(
     let proxy = state.proxy_service.as_ref()?;
 
     let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
-    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+    let (content, _content_type) = match proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await
     {
@@ -608,7 +609,7 @@ async fn simple_project(
                 let (content, content_type) = if wants_json {
                     // Request the PEP 691 JSON form from upstream, cached under a
                     // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -616,15 +617,17 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 };
@@ -765,7 +768,7 @@ async fn simple_project(
                 let (effective_upstream, upstream_path) =
                     pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let result = if wants_json {
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         member.id,
                         &member.key,
@@ -773,15 +776,17 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 };
@@ -1610,13 +1615,19 @@ async fn fetch_from_pypi_remote(
         resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
             .await?;
 
-    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
+    // Bound the buffered cache-recovery read (#1608 Phase 4b / #2181). This is
+    // the recovery closure for `get_remote_cached_or_refetch_stream`, which
+    // needs the full body to write it back to storage; the primary download
+    // path streams via `fetch_from_pypi_remote_streaming`. Use the 16 MiB
+    // ceiling since the payload is a package file rather than small metadata.
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
         proxy,
         repo_id,
         repo_key,
         &target.fetch_base,
         &target.fetch_path,
         &target.cache_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await?;
 

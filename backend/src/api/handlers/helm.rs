@@ -243,8 +243,15 @@ async fn fetch_chart_via_index(
     version: &str,
     filename: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let (index_bytes, _) =
-        proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, "index.yaml").await?;
+    let (index_bytes, _) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        "index.yaml",
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
 
     let yaml_str = String::from_utf8(index_bytes.to_vec()).map_err(|_| {
         (
@@ -273,13 +280,14 @@ async fn fetch_chart_via_index(
 
     let fetch_url = resolve_chart_url(upstream_url, &chart_url);
     let cache_path = format!("charts/{}", filename);
-    proxy_helpers::proxy_fetch_with_cache_key(
+    proxy_helpers::proxy_fetch_capped_with_cache_key(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &fetch_url,
         &cache_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await
 }

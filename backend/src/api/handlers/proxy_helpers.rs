@@ -19,6 +19,9 @@ use crate::models::repository::{
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
+// Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
+// #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
+pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
 use crate::storage::StorageLocation;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -417,6 +420,48 @@ pub async fn proxy_fetch_with_accept(
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_artifact_with_accept(&repo, path, accept)
+            .await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch`] (#1608 Phase 4b / #2181).
+///
+/// Identical to [`proxy_fetch`] except the buffered upstream *metadata* read is
+/// capped at `max` bytes: a hostile or broken upstream that streams more than
+/// `max` yields a 502 instead of an unbounded buffer that OOMs the pod, and no
+/// truncated body is ever cached. Callers pass the per-format ceiling
+/// ([`DEFAULT_METADATA_MAX_BYTES`] for most formats, [`LARGE_METADATA_MAX_BYTES`]
+/// for formats with legitimately large metadata documents). This is the
+/// buffered-metadata path only — large binaries must use [`proxy_fetch_streaming`].
+pub async fn proxy_fetch_capped(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_artifact_capped(&repo, path, max).await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
+/// #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_with_accept_capped(&repo, path, accept, max)
             .await
     })
     .await
@@ -1017,6 +1062,60 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
         |repo| async move {
             proxy_service
                 .fetch_artifact_with_cache_path_and_accept(&repo, fetch_path, cache_path, accept)
+                .await
+        },
+    )
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key`] (#1608 Phase
+/// 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+                .await
+        },
+    )
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key_and_accept`]
+/// (#1608 Phase 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_and_accept_capped(
+                    &repo, fetch_path, cache_path, accept, max,
+                )
                 .await
         },
     )

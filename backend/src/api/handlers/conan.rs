@@ -467,7 +467,16 @@ async fn search_recipes_from_remote(
 ) -> Vec<String> {
     let encoded = urlencoding::encode(pattern);
     let upstream_path = format!("v2/conans/search?q={}", encoded);
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(v) => v
                 .get("results")
@@ -641,7 +650,16 @@ async fn recipe_revisions_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions",
         name, version, user, channel
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_recipe_revisions_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -675,7 +693,16 @@ async fn package_search_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/search",
         name, version, user, channel, revision
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_package_search_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -702,7 +729,16 @@ async fn recipe_latest_from_remote(
     channel: &str,
 ) -> Option<String> {
     let upstream_path = format!("v2/conans/{}/{}/{}/{}/latest", name, version, user, channel);
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -733,7 +769,16 @@ async fn package_revisions_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_package_revisions_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -764,7 +809,16 @@ async fn package_latest_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/latest",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
         Err(_e) => {
             tracing::debug!(

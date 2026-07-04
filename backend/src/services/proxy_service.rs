@@ -34,6 +34,20 @@ use crate::services::storage_service::StorageService;
 /// Default cache TTL in seconds (24 hours)
 pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 
+/// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
+/// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
+/// broken upstream cannot stream an unbounded body into memory and OOM the pod.
+/// Blob/artifact bodies never take the buffered path — they stream (Phase 4) —
+/// so this ceiling only ever applies to metadata documents.
+pub const DEFAULT_METADATA_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Larger byte ceiling for formats whose metadata documents are legitimately
+/// large and would be truncated by the 8 MiB default: npm packument/meta,
+/// composer packument, pypi simple-index, maven-metadata, and the protobuf
+/// bundle. Matches the existing npm/goproxy capped reads (npm.rs:308/391,
+/// goproxy.rs:295).
+pub const LARGE_METADATA_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
 
@@ -1418,6 +1432,7 @@ impl UpstreamClient {
         url: &str,
         repo_id: Uuid,
         accept: Option<&str>,
+        max: usize,
     ) -> Result<UpstreamResponse> {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
@@ -1467,7 +1482,7 @@ impl UpstreamClient {
                 })
                 .await?
             {
-                return Self::read_upstream_response(retry_response, url).await;
+                return Self::read_upstream_response_capped(retry_response, url, max).await;
             }
 
             return Err(AppError::Storage(format!(
@@ -1476,15 +1491,26 @@ impl UpstreamClient {
             )));
         }
 
-        Self::read_upstream_response(response, url).await
+        Self::read_upstream_response_capped(response, url, max).await
     }
 
     /// Extract content, content-type, etag, effective URL, and Link header from
-    /// an upstream HTTP response. Callers are responsible for handling 401 before
-    /// invoking. Relocated verbatim from `ProxyService::read_upstream_response`.
-    async fn read_upstream_response(
+    /// an upstream HTTP response, buffering the body under a hard `max`-byte
+    /// ceiling (#1608 Phase 4b / #2181). Callers are responsible for handling
+    /// 401 before invoking.
+    ///
+    /// The body is accumulated chunk-by-chunk from `response.bytes_stream()`
+    /// with a running size guard rather than `response.bytes()` /
+    /// `axum::body::to_bytes` — those buffer the whole body before any bound is
+    /// applied, which is exactly the OOM vector this closes. As soon as the
+    /// accumulated size would exceed `max` the read is abandoned and an
+    /// `AppError::BadGateway` (-> 502) is returned; NOTHING is buffered past the
+    /// ceiling and, because the error propagates before the caller reaches its
+    /// cache write, no truncated/partial body or sidecar is ever persisted.
+    async fn read_upstream_response_capped(
         response: reqwest::Response,
         url: &str,
+        max: usize,
     ) -> Result<UpstreamResponse> {
         let status = response.status();
         let effective_url = response.url().to_string();
@@ -1520,14 +1546,32 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        #[allow(clippy::disallowed_methods)]
-        // STREAMING-EXEMPT: proxy upstream fetch buffered; tracked for streaming copy to storage in a later #1608 phase
-        let content = response.bytes().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to read upstream response: {}",
-                e.without_url()
-            ))
-        })?;
+        // Running-bounded accumulation: pull one body frame at a time and
+        // reject the moment the total would exceed `max`. No un-bounded
+        // full-body read (`response.bytes()`) is ever issued.
+        let mut stream = response.bytes_stream();
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to read upstream response: {}",
+                    e.without_url()
+                ))
+            })?;
+            if buf.len().saturating_add(chunk.len()) > max {
+                tracing::warn!(
+                    "Upstream metadata body from {} exceeded the {}-byte ceiling; aborting buffered read",
+                    redact_url_for_diagnostics(url),
+                    max
+                );
+                return Err(AppError::BadGateway(format!(
+                    "Upstream metadata response exceeded the {}-byte limit",
+                    max
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let content = buf.freeze();
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
@@ -1626,8 +1670,8 @@ impl UpstreamClient {
     /// "Upstream returned error status" error, exactly as before).
     ///
     /// CRITICAL — this helper deliberately returns the raw response and does
-    /// NOT read the body: the caller picks `read_upstream_response` (buffered,
-    /// fully buffered) vs `read_upstream_response_streaming` (streaming, bounded
+    /// NOT read the body: the caller picks `read_upstream_response_capped`
+    /// (buffered, bounded) vs `read_upstream_response_streaming` (streaming, bounded
     /// memory). Reading the body here would collapse streaming into buffering
     /// and break its bounded-memory guarantee (#1618 S8 review).
     ///
@@ -1695,7 +1739,7 @@ impl UpstreamClient {
     }
 
     /// Stream the upstream HTTP response body without buffering. Mirrors
-    /// the shape of [`Self::read_upstream_response`] but returns the body
+    /// the shape of [`Self::read_upstream_response_capped`] but returns the body
     /// as a stream. Status/header validation happens up front; the
     /// stream itself yields one [`Bytes`] chunk per `reqwest` body
     /// frame. Relocated verbatim from
@@ -2021,6 +2065,46 @@ impl ProxyService {
         self.fetch_artifact_with_cache_path(repo, path, path).await
     }
 
+    /// Byte-ceiling-aware sibling of [`Self::fetch_artifact`] (#1608 Phase 4b /
+    /// #2181). Bounds the buffered upstream metadata read at `max` bytes.
+    pub async fn fetch_artifact_capped(
+        &self,
+        repo: &Repository,
+        path: &str,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, None, max)
+            .await
+    }
+
+    /// Byte-ceiling-aware sibling of [`Self::fetch_artifact_with_accept`]
+    /// (#1608 Phase 4b / #2181).
+    pub async fn fetch_artifact_with_accept_capped(
+        &self,
+        repo: &Repository,
+        path: &str,
+        accept: Option<&str>,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(repo, path, path, accept, max)
+            .await
+    }
+
+    /// Byte-ceiling-aware sibling of
+    /// [`Self::fetch_artifact_with_cache_path`] (#1608 Phase 4b / #2181).
+    pub async fn fetch_artifact_with_cache_path_capped(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(
+            repo, fetch_path, cache_path, None, max,
+        )
+        .await
+    }
+
     /// Variant of [`Self::fetch_artifact`] that forwards a client-supplied
     /// `Accept` header to the upstream request.
     ///
@@ -2198,6 +2282,31 @@ impl ProxyService {
         cache_path: &str,
         accept: Option<&str>,
     ) -> Result<(Bytes, Option<String>)> {
+        self.fetch_artifact_with_cache_path_and_accept_capped(
+            repo,
+            fetch_path,
+            cache_path,
+            accept,
+            DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await
+    }
+
+    /// Byte-ceiling-aware sibling of
+    /// [`Self::fetch_artifact_with_cache_path_and_accept`] (#1608 Phase 4b /
+    /// #2181). `max` bounds the buffered upstream metadata read: a body that
+    /// would exceed it yields `AppError::BadGateway` (-> 502) and NOTHING is
+    /// written to the proxy cache. Callers pass the per-format ceiling
+    /// ([`DEFAULT_METADATA_MAX_BYTES`] or [`LARGE_METADATA_MAX_BYTES`]); the
+    /// non-capped wrappers delegate here with the 8 MiB default.
+    pub async fn fetch_artifact_with_cache_path_and_accept_capped(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        accept: Option<&str>,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
         let upstream_url = Self::remote_target(repo)?;
 
         // Cache keys use the caller-supplied cache_path
@@ -2266,7 +2375,7 @@ impl ProxyService {
             || async {
                 let full_url = Self::build_upstream_url(upstream_url, fetch_path);
                 let upstream_result = self
-                    .fetch_from_upstream_with_accept(&full_url, repo.id, accept)
+                    .fetch_from_upstream_with_accept(&full_url, repo.id, accept, max)
                     .await;
 
                 match upstream_result {
@@ -2864,7 +2973,9 @@ impl ProxyService {
         let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
-        let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
+        let resp = self
+            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .await?;
         Ok((resp.content, resp.content_type, resp.effective_url))
     }
 
@@ -2881,7 +2992,9 @@ impl ProxyService {
         let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
-        let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
+        let resp = self
+            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .await?;
         Ok((resp.content, resp.content_type, resp.link))
     }
 
@@ -3828,8 +3941,13 @@ impl ProxyService {
     /// a token from the indicated realm and retries the request. Tokens are
     /// cached in memory with their advertised TTL so subsequent requests to
     /// the same registry/scope don't repeat the exchange.
-    async fn fetch_from_upstream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamResponse> {
-        self.fetch_from_upstream_with_accept(url, repo_id, None)
+    async fn fetch_from_upstream(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        max: usize,
+    ) -> Result<UpstreamResponse> {
+        self.fetch_from_upstream_with_accept(url, repo_id, None, max)
             .await
     }
 
@@ -3845,9 +3963,10 @@ impl ProxyService {
         url: &str,
         repo_id: Uuid,
         accept: Option<&str>,
+        max: usize,
     ) -> Result<UpstreamResponse> {
         self.upstream_client
-            .fetch_buffered(url, repo_id, accept)
+            .fetch_buffered(url, repo_id, accept, max)
             .await
     }
 
@@ -10546,7 +10665,7 @@ SHA256:
         assert!(matches!(err, AppError::Storage(_)));
     }
 
-    // -- fetch_buffered + read_upstream_response (success / error) -----------
+    // -- fetch_buffered + read_upstream_response_capped (success / error) ----
 
     #[tokio::test]
     async fn test_fetch_buffered_returns_body_headers_and_etag() {
@@ -10576,7 +10695,7 @@ SHA256:
         let url = format!("{}/pkg/file.bin", server.uri());
 
         let resp = proxy
-            .fetch_from_upstream(&url, Uuid::new_v4())
+            .fetch_from_upstream(&url, Uuid::new_v4(), DEFAULT_METADATA_MAX_BYTES)
             .await
             .expect("buffered fetch of a 200 upstream must succeed");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -10611,7 +10730,9 @@ SHA256:
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let url = format!("{}/missing", server.uri());
 
-        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let result = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4(), DEFAULT_METADATA_MAX_BYTES)
+            .await;
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
             result.is_err(),
@@ -10640,7 +10761,9 @@ SHA256:
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let url = format!("{}/down", server.uri());
 
-        let result = proxy.fetch_from_upstream(&url, Uuid::new_v4()).await;
+        let result = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4(), DEFAULT_METADATA_MAX_BYTES)
+            .await;
         let _ = std::fs::remove_dir_all(&tmp);
         let err = result
             .err()
@@ -10648,6 +10771,169 @@ SHA256:
         assert!(
             matches!(err, AppError::ServiceUnavailable(_)),
             "5xx upstream must map to ServiceUnavailable, got {err:?}",
+        );
+    }
+
+    // -- read_upstream_response_capped: byte-ceiling enforcement (#2181) ------
+
+    #[tokio::test]
+    async fn test_capped_read_accepts_body_at_or_below_max() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Body is exactly `max` bytes -> the running guard never trips.
+        let max = 4096usize;
+        let body = vec![b'a'; max];
+        Mock::given(method("GET"))
+            .and(path("/atmax"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("cap-atmax-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/atmax", server.uri());
+
+        let resp = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4(), max)
+            .await
+            .expect("a body exactly at the ceiling must be accepted");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(resp.content.len(), max);
+    }
+
+    #[tokio::test]
+    async fn test_capped_read_rejects_over_cap_with_bad_gateway() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Body is one byte over the ceiling -> the running guard trips.
+        let max = 4096usize;
+        let body = vec![b'a'; max + 1];
+        Mock::given(method("GET"))
+            .and(path("/overcap"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("cap-over-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let url = format!("{}/overcap", server.uri());
+
+        let err = proxy
+            .fetch_from_upstream(&url, Uuid::new_v4(), max)
+            .await
+            .err()
+            .expect("a body exceeding the ceiling must error, not OOM");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // BadGateway maps to HTTP 502 (see error::AppError::status_and_code and
+        // proxy_helpers::map_proxy_error).
+        assert!(
+            matches!(err, AppError::BadGateway(_)),
+            "over-cap must surface as BadGateway (502), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capped_fetch_over_cap_writes_nothing_to_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let max = 2048usize;
+        let body = vec![b'z'; max * 4]; // comfortably over the ceiling
+        Mock::given(method("GET"))
+            .and(path("/big.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("cap-nocache-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("cap-nocache", &server.uri(), tmp.to_str().unwrap());
+
+        let result = proxy.fetch_artifact_capped(&repo, "big.json", max).await;
+        assert!(
+            result.is_err(),
+            "an over-cap upstream body must fail the fetch",
+        );
+
+        // The over-cap read aborts before any cache write, so NO truncated body
+        // or sidecar may be persisted: a follow-up cache probe must miss.
+        let cached = proxy
+            .get_cached_artifact_by_path(&repo.key, "big.json")
+            .await
+            .expect("cache probe must not error");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            cached.is_none(),
+            "over-cap fetch must leave the proxy cache empty (no partial write)",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_metadata_9mib_ok_but_17mib_rejected_under_16mib_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // A 9 MiB "packument" is under the 16 MiB LARGE ceiling; a 17 MiB body
+        // is over it.
+        let ok_body = vec![b'n'; 9 * 1024 * 1024];
+        let over_body = vec![b'n'; 17 * 1024 * 1024];
+        Mock::given(method("GET"))
+            .and(path("/packument-ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ok_body))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/packument-huge"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(over_body))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("cap-large-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let ok_url = format!("{}/packument-ok", server.uri());
+        let huge_url = format!("{}/packument-huge", server.uri());
+
+        let ok = proxy
+            .fetch_from_upstream(&ok_url, Uuid::new_v4(), LARGE_METADATA_MAX_BYTES)
+            .await
+            .expect("a 9 MiB packument must succeed under the 16 MiB ceiling");
+        assert_eq!(ok.content.len(), 9 * 1024 * 1024);
+
+        let err = proxy
+            .fetch_from_upstream(&huge_url, Uuid::new_v4(), LARGE_METADATA_MAX_BYTES)
+            .await
+            .err()
+            .expect("a 17 MiB body must be rejected by the 16 MiB ceiling");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(err, AppError::BadGateway(_)),
+            "a 17 MiB over-cap body must surface as BadGateway (502), got {err:?}",
         );
     }
 
@@ -10991,7 +11277,7 @@ SHA256:
         let url = format!("{}/v2/lib/img/manifests/latest", server.uri());
 
         let err = proxy
-            .fetch_from_upstream(&url, Uuid::new_v4())
+            .fetch_from_upstream(&url, Uuid::new_v4(), DEFAULT_METADATA_MAX_BYTES)
             .await
             .err()
             .expect("a Bearer realm pointing at an internal address must be rejected");
@@ -11028,7 +11314,7 @@ SHA256:
         let url = format!("{}/private", server.uri());
 
         let err = proxy
-            .fetch_from_upstream(&url, Uuid::new_v4())
+            .fetch_from_upstream(&url, Uuid::new_v4(), DEFAULT_METADATA_MAX_BYTES)
             .await
             .err()
             .expect("a non-Bearer 401 must surface as an error");

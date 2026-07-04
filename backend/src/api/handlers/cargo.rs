@@ -126,10 +126,16 @@ async fn resolve_upstream_dl_url(
 
     // Fetch config.json from upstream.
     let proxy = state.proxy_service.as_ref()?;
-    let config_bytes =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, "config.json")
-            .await
-            .ok()?;
+    let config_bytes = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        base_url,
+        "config.json",
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
 
     let config: serde_json::Value = serde_json::from_slice(&config_bytes.0).ok()?;
     let dl_url = config.get("dl")?.as_str()?.to_string();
@@ -870,15 +876,17 @@ async fn download(
                     // upstream URL was resolved so that subsequent requests hit
                     // the proxy cache even after a config.json TTL change.
                     let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
-                    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        &dl_base,
-                        &dl_path,
-                        &cache_path,
-                    )
-                    .await?;
+                    let (content, _content_type) =
+                        proxy_helpers::proxy_fetch_capped_with_cache_key(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            &dl_base,
+                            &dl_path,
+                            &cache_path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        )
+                        .await?;
 
                     let filename = format!("{}-{}.crate", name_lower, version);
 
@@ -1164,7 +1172,15 @@ async fn try_remote_index(
 
     let base_url = repo.index_upstream_url.as_deref().unwrap_or(upstream_url);
     let index_path = cargo_sparse_index_path_upstream(name_lower);
-    let result = proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, &index_path).await;
+    let result = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        base_url,
+        &index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await;
 
     Some(match result {
         Ok((content, content_type)) => {
@@ -1295,12 +1311,13 @@ async fn try_virtual_index(
                 let base_url =
                     resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
 
-                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch(
+                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     member.id,
                     &member.key,
                     &base_url,
                     &index_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await
                 {

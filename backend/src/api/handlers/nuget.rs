@@ -402,12 +402,13 @@ async fn registration_index(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -431,12 +432,13 @@ async fn registration_index(
                     let Some(upstream_url) = member.upstream_url.as_deref() else {
                         continue;
                     };
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -571,12 +573,13 @@ async fn flatcontainer_versions(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -600,12 +603,13 @@ async fn flatcontainer_versions(
                     let Some(upstream_url) = member.upstream_url.as_deref() else {
                         continue;
                     };
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -678,12 +682,13 @@ async fn flatcontainer_download(
                         "v3/flatcontainer/{}/{}/{}",
                         package_id_lower, version, filename
                     );
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await?;
                     return Ok(Response::builder()
@@ -773,12 +778,13 @@ async fn flatcontainer_download(
                                 "v3/flatcontainer/{}/{}/{}",
                                 package_id_lower, version, filename
                             );
-                            let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                            let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
                                 proxy,
                                 repo.id,
                                 &repo_key,
                                 upstream_url,
                                 &upstream_path,
+                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                             )
                             .await?;
                             Ok(bytes)

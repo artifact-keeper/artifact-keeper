@@ -2604,12 +2604,13 @@ pub async fn resolve_virtual_blob(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_blob_path(&image, digest);
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -2717,15 +2718,17 @@ pub async fn resolve_virtual_manifest(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_manifest_path(&image, reference);
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_with_accept(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        upstream_url,
-                        &upstream_path,
-                        accept,
-                    )
-                    .await
+                    if let Ok((content, content_type)) =
+                        proxy_helpers::proxy_fetch_capped_with_accept(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            &upstream_path,
+                            accept,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        )
+                        .await
                     {
                         // #1348 round 1, concern #3 (CRITICAL):
                         // When the manifest reference is itself a digest
@@ -3074,13 +3077,14 @@ async fn try_upstream_fetch_with_accept(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
-    proxy_helpers::proxy_fetch_with_accept(
+    proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         accept,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await
     .ok()
