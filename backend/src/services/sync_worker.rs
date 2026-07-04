@@ -9,6 +9,7 @@
 //! file in a single HTTP request. This prevents timeouts and memory exhaustion
 //! when syncing large Docker images, ML models, etc.
 
+use crate::services::cluster_work::{Claimed, WorkerIdentity};
 use crate::storage::{StorageLocation, StorageRegistry};
 use chrono::{NaiveTime, Timelike, Utc};
 use sqlx::PgPool;
@@ -125,6 +126,36 @@ pub(crate) const DEFAULT_SYNC_TASK_RETRY_BACKOFF_MAX_SECS: u64 = 300;
 /// Default maximum retries for sync tasks (matches migration default).
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MAX_RETRIES: i32 = 3;
+
+/// Second key (lock *class*) for the per-peer claim advisory lock, keeping it in
+/// a distinct namespace from other two-key `pg_advisory_xact_lock` users such as
+/// the scan-result preparer (`scan_result_service`). The first key is the peer
+/// id folded to an `i32` (`fold_uuid_to_lock_key`), so the lock is granular
+/// per peer: different peers' claim ticks never serialize against each other.
+const SYNC_TASK_CLAIM_LOCK_CLASS: i32 = 0x5317;
+
+/// Default TTL for a sync-task claim (`sync_tasks.claim_expires_at`).
+///
+/// A claim proves one replica owns a task's side effects. If the owner dies
+/// mid-transfer, the task stays invisible to other replicas until the claim
+/// expires, so the TTL bounds crash-recovery latency. Chunked transfers
+/// extend the claim after every uploaded chunk, so the TTL only has to cover
+/// the longest single chunk (50 MB default) plus the request timeout, not the
+/// whole artifact.
+///
+/// Override with `SYNC_TASK_CLAIM_TTL_SECS` (positive integer).
+const DEFAULT_SYNC_TASK_CLAIM_TTL_SECS: u64 = 1800;
+
+/// Read the configured sync-task claim TTL from `SYNC_TASK_CLAIM_TTL_SECS`,
+/// falling back to [`DEFAULT_SYNC_TASK_CLAIM_TTL_SECS`]. Non-positive values
+/// are rejected so claims can never be born expired.
+pub(crate) fn sync_task_claim_ttl_secs() -> u64 {
+    std::env::var("SYNC_TASK_CLAIM_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SYNC_TASK_CLAIM_TTL_SECS)
+}
 
 /// Check whether the current tick should trigger a stale peer detection run.
 ///
@@ -583,6 +614,252 @@ async fn get_local_peer_id(db: &PgPool) -> Option<Uuid> {
         .flatten()
 }
 
+// ── Cluster-wide task claims (RowClaimedQueue) ──────────────────────────────
+
+/// Atomically claim up to `available_slots` due pending tasks for one peer.
+///
+/// This is the reference `RowClaimedQueue` implementation described in
+/// [`crate::services::cluster_work`]: candidates are selected with
+/// `FOR UPDATE SKIP LOCKED` and flipped `pending -> in_progress` with a fresh
+/// `claim_token` in the same statement, so two replicas ticking concurrently
+/// drain disjoint rows instead of double-executing the same peer push/delete.
+///
+/// The effective batch size is additionally capped, inside the statement, by
+/// `concurrent_limit` minus the number of live (unexpired) `in_progress`
+/// claims for the peer. That derives per-peer concurrency from claimed rows
+/// rather than trusting the racy `peer_instances.active_transfers` counter
+/// alone, which each replica reads before the others increment it. To make that
+/// cap hold even when two replicas' claim statements overlap exactly (where the
+/// in-statement count alone is racy under READ COMMITTED), the whole claim runs
+/// under a per-peer transaction-scoped advisory lock (see the body).
+async fn claim_pending_sync_tasks(
+    db: &PgPool,
+    peer_id: Uuid,
+    available_slots: i64,
+    concurrent_limit: i64,
+    max_retries: i32,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> Result<Vec<Claimed<TaskRow>>, String> {
+    use crate::services::scan_result_service::fold_uuid_to_lock_key;
+    use sqlx::{FromRow, Row};
+
+    // Serialize the *claim step* per peer with a transaction-scoped advisory
+    // lock. The in-statement live-claim count below caps a single claimer, but
+    // under READ COMMITTED it is racy across replicas: two claim statements that
+    // truly overlap each read a live count that excludes the other's not-yet-
+    // committed claim, so each grabs up to `concurrent_limit` rows on disjoint
+    // (SKIP LOCKED) candidates — collectively oversubscribing the peer by
+    // replica count. Holding a per-peer lock across the claim forces the second
+    // claimer to observe the first's committed claims before counting, making
+    // the cap hard. The lock is released on commit/rollback; different peers use
+    // different keys and never block one another.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to open claim transaction for peer {peer_id}: {e}"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(fold_uuid_to_lock_key(peer_id))
+        .bind(SYNC_TASK_CLAIM_LOCK_CLASS)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to take claim lock for peer {peer_id}: {e}"))?;
+
+    let rows = sqlx::query(
+        r#"
+        WITH candidate AS (
+            SELECT st.id
+            FROM sync_tasks st
+            JOIN artifacts a ON a.id = st.artifact_id
+            WHERE st.peer_instance_id = $1
+              AND st.status = 'pending'
+              AND (st.claim_expires_at IS NULL OR st.claim_expires_at <= NOW())
+              AND (st.task_type = 'delete' OR a.is_deleted = false)
+            ORDER BY st.priority DESC, st.created_at ASC
+            LIMIT LEAST(
+                $2,
+                GREATEST(
+                    $3 - (
+                        SELECT COUNT(*)
+                        FROM sync_tasks
+                        WHERE peer_instance_id = $1
+                          AND status = 'in_progress'
+                          AND claim_token IS NOT NULL
+                          AND claim_expires_at > NOW()
+                    ),
+                    0
+                )
+            )
+            FOR UPDATE OF st SKIP LOCKED
+        ),
+        claimed AS (
+            UPDATE sync_tasks st
+            SET status = 'in_progress',
+                started_at = NOW(),
+                claimed_by = $5,
+                claim_token = gen_random_uuid(),
+                claim_expires_at = NOW() + make_interval(secs => $6)
+            FROM candidate
+            WHERE st.id = candidate.id
+            RETURNING st.*
+        )
+        SELECT
+            c.id,
+            c.peer_instance_id,
+            c.artifact_id,
+            c.priority,
+            a.storage_key,
+            a.size_bytes AS artifact_size,
+            a.name AS artifact_name,
+            a.version AS artifact_version,
+            a.path AS artifact_path,
+            am.format AS artifact_metadata_format,
+            am.metadata AS artifact_metadata,
+            am.properties AS artifact_metadata_properties,
+            CASE
+                WHEN p.version = a.version THEN p.description
+                ELSE NULL
+            END AS package_description,
+            CASE
+                WHEN p.version = a.version THEN p.metadata
+                ELSE NULL
+            END AS package_metadata,
+            r.key AS repository_key,
+            r.id AS repository_id,
+            r.storage_backend AS repository_storage_backend,
+            r.storage_path AS repository_storage_path,
+            a.content_type,
+            a.checksum_sha256,
+            c.task_type,
+            prs.replication_filter,
+            c.retry_count,
+            GREATEST(c.max_retries, $4)::INT AS max_retries,
+            c.claim_token,
+            c.claimed_by,
+            c.claim_expires_at
+        FROM claimed c
+        JOIN artifacts a ON a.id = c.artifact_id
+        JOIN repositories r ON r.id = a.repository_id
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        LEFT JOIN packages p
+            ON p.repository_id = r.id
+           AND p.name = a.name
+        LEFT JOIN peer_repo_subscriptions prs
+            ON prs.peer_instance_id = c.peer_instance_id
+           AND prs.repository_id = r.id
+        ORDER BY c.priority DESC, c.created_at ASC
+        "#,
+    )
+    .bind(peer_id)
+    .bind(available_slots)
+    .bind(concurrent_limit)
+    .bind(max_retries)
+    .bind(claimed_by)
+    .bind(claim_ttl_secs)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to claim tasks for peer {peer_id}: {e}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit claim for peer {peer_id}: {e}"))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let task =
+                TaskRow::from_row(&row).map_err(|e| format!("Failed to decode task row: {e}"))?;
+            let claim_token: Uuid = row
+                .try_get("claim_token")
+                .map_err(|e| format!("Failed to decode claim_token: {e}"))?;
+            let claimed_by: String = row
+                .try_get("claimed_by")
+                .map_err(|e| format!("Failed to decode claimed_by: {e}"))?;
+            let claim_expires_at: chrono::DateTime<Utc> = row
+                .try_get("claim_expires_at")
+                .map_err(|e| format!("Failed to decode claim_expires_at: {e}"))?;
+            Ok(Claimed::from_claim_row(
+                task,
+                claim_token,
+                claimed_by,
+                claim_expires_at,
+            ))
+        })
+        .collect()
+}
+
+/// Reset expired `in_progress` claims to `pending` so tasks abandoned by a
+/// crashed replica become retryable, and walk back the per-peer
+/// `active_transfers` counter the dead owner never decremented.
+///
+/// The counter compensation is best-effort bookkeeping (an owner that died
+/// between claiming and incrementing walks the counter toward zero, which the
+/// `GREATEST(..., 0)` clamp absorbs); correctness against double execution
+/// rests on the claim token, not the counter.
+async fn recover_expired_sync_task_claims(db: &PgPool) -> Result<u64, String> {
+    let result = sqlx::query(
+        r#"
+        WITH recovered AS (
+            UPDATE sync_tasks
+            SET status = 'pending',
+                started_at = NULL,
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE status = 'in_progress'
+              AND (
+                  claim_token IS NULL
+                  OR claimed_by IS NULL
+                  OR claim_expires_at IS NULL
+                  OR claim_expires_at <= NOW()
+              )
+            RETURNING peer_instance_id
+        ),
+        counts AS (
+            SELECT peer_instance_id, COUNT(*)::INT AS n
+            FROM recovered
+            GROUP BY peer_instance_id
+        )
+        UPDATE peer_instances p
+        SET active_transfers = GREATEST(p.active_transfers - counts.n, 0),
+            updated_at = NOW()
+        FROM counts
+        WHERE p.id = counts.peer_instance_id
+        RETURNING counts.n
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("Failed to recover expired sync task claims: {e}"))?;
+
+    use sqlx::Row;
+    let recovered: i64 = result
+        .iter()
+        .map(|row| row.try_get::<i32, _>("n").unwrap_or(0) as i64)
+        .sum();
+    Ok(recovered.max(0) as u64)
+}
+
+/// Extend the caller's claim on a task. Chunked transfers call this after
+/// every uploaded chunk so a healthy long transfer keeps its lease while a
+/// crashed one lapses within one TTL. Best-effort: a lost claim surfaces at
+/// the token-guarded finalize, not here.
+async fn extend_sync_task_claim(db: &PgPool, task: &Claimed<TaskRow>, claim_ttl_secs: f64) {
+    let _ = sqlx::query(
+        r#"
+        UPDATE sync_tasks
+        SET claim_expires_at = NOW() + make_interval(secs => $2)
+        WHERE id = $1
+          AND status = 'in_progress'
+          AND claim_token = $3
+        "#,
+    )
+    .bind(task.id)
+    .bind(claim_ttl_secs)
+    .bind(task.claim_token())
+    .execute(db)
+    .await;
+}
+
 // ── Core logic ──────────────────────────────────────────────────────────────
 
 /// Process all eligible peers and their pending sync tasks.
@@ -592,6 +869,14 @@ async fn process_pending_tasks(
     storage_registry: Arc<StorageRegistry>,
     retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
+    // Reset in_progress tasks whose claim lapsed (owner crashed or lost its
+    // DB connection mid-transfer) so they become claimable again.
+    match recover_expired_sync_task_claims(db).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("Recovered {} sync task(s) with expired claims", n),
+        Err(e) => tracing::warn!("{e}"),
+    }
+
     // Fetch non-local peers that are online or syncing and not in backoff.
     let peers: Vec<PeerRow> = sqlx::query_as(
         r#"
@@ -622,7 +907,8 @@ async fn process_pending_tasks(
     let retried = sqlx::query(
         r#"
         UPDATE sync_tasks
-        SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL
+        SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL,
+            claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
         WHERE status = 'failed'
           AND retry_count < GREATEST(max_retries, $1)
           AND EXISTS (
@@ -687,63 +973,22 @@ async fn process_pending_tasks(
             continue;
         }
 
-        // ── Fetch pending tasks ─────────────────────────────────────────
-        let tasks: Vec<TaskRow> = sqlx::query_as(
-            r#"
-            SELECT
-                st.id,
-                st.peer_instance_id,
-                st.artifact_id,
-                st.priority,
-                a.storage_key,
-                a.size_bytes AS artifact_size,
-                a.name AS artifact_name,
-                a.version AS artifact_version,
-                a.path AS artifact_path,
-                am.format AS artifact_metadata_format,
-                am.metadata AS artifact_metadata,
-                am.properties AS artifact_metadata_properties,
-                CASE
-                    WHEN p.version = a.version THEN p.description
-                    ELSE NULL
-                END AS package_description,
-                CASE
-                    WHEN p.version = a.version THEN p.metadata
-                    ELSE NULL
-                END AS package_metadata,
-                r.key AS repository_key,
-                r.id AS repository_id,
-                r.storage_backend AS repository_storage_backend,
-                r.storage_path AS repository_storage_path,
-                a.content_type,
-                a.checksum_sha256,
-                st.task_type,
-                prs.replication_filter,
-                st.retry_count,
-                GREATEST(st.max_retries, $3)::INT AS max_retries
-            FROM sync_tasks st
-            JOIN artifacts a ON a.id = st.artifact_id
-            JOIN repositories r ON r.id = a.repository_id
-            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-            LEFT JOIN packages p
-                ON p.repository_id = r.id
-               AND p.name = a.name
-            LEFT JOIN peer_repo_subscriptions prs
-                ON prs.peer_instance_id = st.peer_instance_id
-               AND prs.repository_id = r.id
-            WHERE st.peer_instance_id = $1
-              AND st.status = 'pending'
-              AND (st.task_type = 'delete' OR a.is_deleted = false)
-            ORDER BY st.priority DESC, st.created_at ASC
-            LIMIT $2
-            "#,
+        // ── Claim pending tasks (RowClaimedQueue) ───────────────────────
+        // Claiming (not just selecting) is what stops a second replica from
+        // executing the same task in this window; the in-statement live-claim
+        // count additionally stops N replicas from collectively oversubscribing
+        // the peer through the stale `active_transfers` snapshot above.
+        let tasks = claim_pending_sync_tasks(
+            db,
+            peer.id,
+            available_slots as i64,
+            peer.concurrent_transfers_limit.unwrap_or(5) as i64,
+            retry_policy.max_retries,
+            WorkerIdentity::for_process().as_str(),
+            sync_task_claim_ttl_secs() as f64,
         )
-        .bind(peer.id)
-        .bind(available_slots as i64)
-        .bind(retry_policy.max_retries)
-        .fetch_all(db)
         .await
-        .map_err(|e| format!("Failed to fetch tasks for peer '{}': {e}", peer.name))?;
+        .map_err(|e| format!("Failed to claim tasks for peer '{}': {e}", peer.name))?;
 
         if tasks.is_empty() {
             continue;
@@ -769,9 +1014,13 @@ async fn process_pending_tasks(
                     peer.name
                 );
                 let _ = sqlx::query(
-                    "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+                    "UPDATE sync_tasks \
+                     SET status = 'completed', completed_at = NOW(), \
+                         claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+                     WHERE id = $1 AND status = 'in_progress' AND claim_token = $2",
                 )
                 .bind(task.id)
+                .bind(task.claim_token())
                 .execute(db)
                 .await;
                 continue;
@@ -814,29 +1063,22 @@ async fn process_pending_tasks(
     Ok(())
 }
 
-/// Execute a single sync task (push or delete) to a remote peer.
+/// Execute a single claimed sync task (push or delete) to a remote peer.
+///
+/// Takes [`Claimed<TaskRow>`], not a bare row: the caller must have won the
+/// atomic claim (which already flipped the task `in_progress`), and every
+/// finalizer below re-asserts the claim token before writing.
 async fn execute_transfer(
     db: &PgPool,
     client: &reqwest::Client,
     storage_registry: Arc<StorageRegistry>,
-    task: &TaskRow,
+    task: &Claimed<TaskRow>,
     peer_endpoint: &str,
     peer_api_key: &str,
     retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
-    // 1. Mark task as in_progress, increment active_transfers.
-    sqlx::query(
-        r#"
-        UPDATE sync_tasks
-        SET status = 'in_progress', started_at = NOW()
-        WHERE id = $1
-        "#,
-    )
-    .bind(task.id)
-    .execute(db)
-    .await
-    .map_err(|e| format!("Failed to mark task in_progress: {e}"))?;
-
+    // 1. Increment active_transfers (the claim already marked the task
+    //    in_progress and stamped the claim columns).
     sqlx::query(
         r#"
         UPDATE peer_instances
@@ -938,7 +1180,7 @@ async fn execute_chunked_transfer(
     db: &PgPool,
     client: &reqwest::Client,
     storage_registry: &StorageRegistry,
-    task: &TaskRow,
+    task: &Claimed<TaskRow>,
     peer_endpoint: &str,
     peer_api_key: &str,
     retry_policy: SyncRetryPolicy,
@@ -1045,6 +1287,10 @@ async fn execute_chunked_transfer(
         match upload_result {
             Ok(resp) if resp.status().is_success() => {
                 bytes_transferred += *byte_length as i64;
+                // Keep the claim alive: a healthy multi-chunk transfer must
+                // not lapse mid-flight, while a crashed one expires within
+                // one TTL of its last completed chunk.
+                extend_sync_task_claim(db, task, sync_task_claim_ttl_secs() as f64).await;
                 tracing::debug!(
                     "Chunk {}/{} uploaded for task {} ({} bytes)",
                     chunk_index + 1,
@@ -1123,7 +1369,7 @@ async fn execute_chunked_transfer(
 async fn execute_delete(
     db: &PgPool,
     client: &reqwest::Client,
-    task: &TaskRow,
+    task: &Claimed<TaskRow>,
     peer_endpoint: &str,
     peer_api_key: &str,
     retry_policy: SyncRetryPolicy,
@@ -1245,19 +1491,43 @@ async fn read_artifact_chunk_from_storage(
 }
 
 /// Handle a successful transfer: mark task completed, update peer counters.
-async fn handle_transfer_success(db: &PgPool, task: &TaskRow, bytes_transferred: i64) {
-    // Mark task completed.
-    let _ = sqlx::query(
+///
+/// The completion is token-guarded: if this worker's claim expired and the
+/// task was recovered (and possibly re-claimed) elsewhere, the UPDATE matches
+/// zero rows and the peer counters are left for the current owner to settle.
+async fn handle_transfer_success(db: &PgPool, task: &Claimed<TaskRow>, bytes_transferred: i64) {
+    // Mark task completed (owner only).
+    let finalized = sqlx::query(
         r#"
         UPDATE sync_tasks
-        SET status = 'completed', completed_at = NOW(), bytes_transferred = $2
+        SET status = 'completed', completed_at = NOW(), bytes_transferred = $2,
+            claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
         WHERE id = $1
+          AND status = 'in_progress'
+          AND claim_token = $3
         "#,
     )
     .bind(task.id)
     .bind(bytes_transferred)
+    .bind(task.claim_token())
     .execute(db)
     .await;
+
+    match finalized {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => {
+            tracing::warn!(
+                "Sync task {} finished but its claim was lost (expired and recovered); \
+                 leaving task/peer state to the current owner",
+                task.id
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to mark sync task {} completed: {e}", task.id);
+            return;
+        }
+    }
 
     // Update peer instance counters.
     let _ = sqlx::query(
@@ -1366,28 +1636,53 @@ pub(crate) fn format_retry_log(
 /// `pending` once the peer's backoff expires.
 async fn handle_transfer_failure(
     db: &PgPool,
-    task: &TaskRow,
+    task: &Claimed<TaskRow>,
     error_message: &str,
     retry_policy: SyncRetryPolicy,
 ) {
     let decision = evaluate_task_failure(task.retry_count, task.max_retries);
 
-    // Mark task as failed with updated retry count.
-    let _ = sqlx::query(
+    // Mark task as failed with updated retry count (owner only). If the claim
+    // was lost, the current owner drives the task's fate; skip the peer
+    // backoff/counter updates too so this stale worker cannot double-penalize
+    // the peer for one logical attempt.
+    let failed = sqlx::query(
         r#"
         UPDATE sync_tasks
         SET status = 'failed',
             completed_at = NOW(),
             error_message = $2,
-            retry_count = $3
+            retry_count = $3,
+            claimed_by = NULL,
+            claim_token = NULL,
+            claim_expires_at = NULL
         WHERE id = $1
+          AND status = 'in_progress'
+          AND claim_token = $4
         "#,
     )
     .bind(task.id)
     .bind(error_message)
     .bind(decision.new_retry_count())
+    .bind(task.claim_token())
     .execute(db)
     .await;
+
+    match failed {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => {
+            tracing::warn!(
+                "Sync task {} failed here but its claim was lost (expired and recovered); \
+                 skipping task/peer failure bookkeeping",
+                task.id
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to mark sync task {} failed: {e}", task.id);
+            return;
+        }
+    }
 
     let log_msg = format_retry_log(task.id, &decision, error_message);
     if decision.is_retriable() {
@@ -1845,6 +2140,10 @@ fn parse_utc_offset_secs(tz: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::repo_selector_service::RepoSelector;
+    use crate::services::sync_policy_service::{
+        ArtifactFilter, CreateSyncPolicyRequest, PeerSelector, SyncPolicyService,
+    };
     use bytes::Bytes;
     use chrono::NaiveTime;
     use futures::stream::BoxStream;
@@ -3821,5 +4120,441 @@ mod tests {
             DEFAULT_PEER_CONNECT_TIMEOUT_SECS
         );
         std::env::remove_var("SYNC_PEER_CONNECT_TIMEOUT_SECS");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster-wide task claims (Tier-2: no-op without DATABASE_URL)
+    // -----------------------------------------------------------------------
+
+    /// Peer + repo + N artifacts + N pending sync tasks, torn down by
+    /// [`teardown_claim_fixture`].
+    struct ClaimFixture {
+        pool: sqlx::PgPool,
+        peer_id: Uuid,
+        repo_id: Uuid,
+        user_id: Uuid,
+        task_ids: Vec<Uuid>,
+    }
+
+    async fn setup_claim_fixture(tasks: usize) -> Option<ClaimFixture> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::try_pool().await?;
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _path) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "sync-claim", "t").await;
+
+        let mut task_ids = Vec::with_capacity(tasks);
+        for i in 0..tasks {
+            let tag = Uuid::new_v4();
+            let Ok(artifact_id) = crate::api::handlers::proxy_helpers::insert_artifact(
+                &pool,
+                crate::api::handlers::proxy_helpers::NewArtifact {
+                    repository_id: repo_id,
+                    path: &format!("claim-test/{tag}/{i}.bin"),
+                    name: &format!("claim-test-{tag}-{i}"),
+                    version: "1.0.0",
+                    size_bytes: 3,
+                    checksum_sha256: "claim-test",
+                    content_type: "application/octet-stream",
+                    storage_key: &format!("claim-test/{tag}/{i}"),
+                    uploaded_by: user_id,
+                },
+            )
+            .await
+            else {
+                panic!("insert artifact");
+            };
+
+            let task_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO sync_tasks (peer_instance_id, artifact_id, status, priority) \
+                 VALUES ($1, $2, 'pending', 0) RETURNING id",
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("insert sync task");
+            task_ids.push(task_id);
+        }
+
+        Some(ClaimFixture {
+            pool,
+            peer_id,
+            repo_id,
+            user_id,
+            task_ids,
+        })
+    }
+
+    async fn teardown_claim_fixture(f: &ClaimFixture) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _ = sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = $1")
+            .bind(f.peer_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(f.peer_id)
+            .execute(&f.pool)
+            .await;
+        tdh::cleanup(&f.pool, f.repo_id, f.user_id).await;
+    }
+
+    async fn claim_all(
+        f: &ClaimFixture,
+        slots: i64,
+        limit: i64,
+        worker: &str,
+        ttl: f64,
+    ) -> Vec<Claimed<TaskRow>> {
+        claim_pending_sync_tasks(&f.pool, f.peer_id, slots, limit, 3, worker, ttl)
+            .await
+            .expect("claim query ok")
+    }
+
+    /// Two claimers drain disjoint rows; a claimed row is never handed out
+    /// twice while its claim is live — the exactly-once core of the fix.
+    #[tokio::test]
+    async fn claim_pending_sync_tasks_is_exactly_once() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+
+        let first = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        assert_eq!(first.len(), 1, "single pending task must be claimable");
+        assert_eq!(first[0].id, f.task_ids[0]);
+        assert_eq!(first[0].claimed_by(), "worker-a");
+
+        // Second claimer sees nothing: the row is in_progress with a live claim.
+        let second = claim_all(&f, 5, 5, "worker-b", 60.0).await;
+        assert!(
+            second.is_empty(),
+            "a claimed task must not be claimable again while the claim is live"
+        );
+
+        // Owner completes; the terminal state is visible and claim columns clear.
+        handle_transfer_success(&f.pool, &first[0], 3).await;
+        let (status, token): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("fetch task");
+        assert_eq!(status, "completed");
+        assert!(token.is_none(), "completion must clear the claim");
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// The in-statement live-claim count caps the batch at the peer's
+    /// concurrency limit even when the stale active_transfers snapshot
+    /// suggests more slots are free.
+    #[tokio::test]
+    async fn claim_pending_sync_tasks_caps_at_live_concurrency() {
+        let Some(f) = setup_claim_fixture(3).await else {
+            return;
+        };
+
+        // available_slots (from the stale counter) says 5, but the true peer
+        // limit is 2: the claim must hand out at most 2.
+        let batch = claim_all(&f, 5, 2, "worker-a", 60.0).await;
+        assert_eq!(batch.len(), 2, "claim must honor the concurrency limit");
+
+        // With 2 live claims outstanding the peer is saturated.
+        let extra = claim_all(&f, 5, 2, "worker-b", 60.0).await;
+        assert!(extra.is_empty(), "saturated peer must yield no more claims");
+
+        // Completing one frees a slot for the remaining task.
+        handle_transfer_success(&f.pool, &batch[0], 3).await;
+        let refill = claim_all(&f, 5, 2, "worker-b", 60.0).await;
+        assert_eq!(refill.len(), 1, "finished claim must free one slot");
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// Expired claims are recovered to pending (crash recovery), and a stale
+    /// owner's token can no longer finalize the row afterwards.
+    #[tokio::test]
+    async fn expired_sync_task_claims_recover_and_fence_stale_owner() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+
+        // Claim with an already-expired TTL to simulate a dead owner.
+        let stale = claim_all(&f, 5, 5, "worker-dead", -1.0).await;
+        assert_eq!(stale.len(), 1);
+
+        let recovered = recover_expired_sync_task_claims(&f.pool)
+            .await
+            .expect("recovery query ok");
+        assert_eq!(recovered, 1, "expired claim must be recovered");
+
+        let (status, token): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT status::TEXT, claim_token FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("fetch task");
+        assert_eq!(status, "pending", "recovered task must be pending again");
+        assert!(token.is_none(), "recovery must clear the claim");
+
+        // A new owner claims the recovered task...
+        let fresh = claim_all(&f, 5, 5, "worker-new", 60.0).await;
+        assert_eq!(fresh.len(), 1);
+
+        // ...and the dead owner's finalizers are fenced by the token check.
+        handle_transfer_success(&f.pool, &stale[0], 999).await;
+        let (status, bytes): (String, i64) =
+            sqlx::query_as("SELECT status::TEXT, bytes_transferred FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("fetch task");
+        assert_eq!(
+            status, "in_progress",
+            "stale owner must not complete a re-claimed task"
+        );
+        assert_eq!(bytes, 0, "stale owner must not write bytes_transferred");
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// Rows left `in_progress` by pre-claim code have no claim token or expiry.
+    /// They must not occupy peer capacity forever after the claim columns land.
+    #[tokio::test]
+    async fn legacy_in_progress_sync_task_without_claim_metadata_recovers() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE sync_tasks
+            SET status = 'in_progress',
+                started_at = NOW(),
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE id = $1
+            "#,
+        )
+        .bind(f.task_ids[0])
+        .execute(&f.pool)
+        .await
+        .expect("seed legacy in_progress task");
+        sqlx::query("UPDATE peer_instances SET active_transfers = 1 WHERE id = $1")
+            .bind(f.peer_id)
+            .execute(&f.pool)
+            .await
+            .expect("seed active transfer counter");
+
+        let recovered = recover_expired_sync_task_claims(&f.pool)
+            .await
+            .expect("recovery query ok");
+        assert_eq!(recovered, 1, "legacy in_progress task must recover");
+
+        let (status, token, claim_expires_at, active_transfers): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<Utc>>,
+            i32,
+        ) = sqlx::query_as(
+            r#"
+            SELECT st.status::TEXT, st.claim_token, st.claim_expires_at, p.active_transfers
+            FROM sync_tasks st
+            JOIN peer_instances p ON p.id = st.peer_instance_id
+            WHERE st.id = $1
+            "#,
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("fetch recovered task");
+
+        assert_eq!(status, "pending");
+        assert!(token.is_none(), "recovery must clear claim_token");
+        assert!(
+            claim_expires_at.is_none(),
+            "recovery must clear claim_expires_at"
+        );
+        assert_eq!(
+            active_transfers, 0,
+            "recovery must compensate the peer transfer counter"
+        );
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// Policy re-evaluation must not reset a live claimed row back to
+    /// `pending`; otherwise the owner later loses its token-fenced finalizer
+    /// and leaks the peer's active transfer counter.
+    #[tokio::test]
+    async fn sync_policy_reevaluation_preserves_live_claim_and_finalizes() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+
+        let svc = SyncPolicyService::new(f.pool.clone());
+        let policy = svc
+            .create_policy(CreateSyncPolicyRequest {
+                name: format!("sync-claim-policy-{}", Uuid::new_v4()),
+                description: "preserve live sync task claims".to_string(),
+                enabled: true,
+                repo_selector: RepoSelector {
+                    match_repos: vec![f.repo_id],
+                    ..Default::default()
+                },
+                peer_selector: PeerSelector {
+                    match_peers: vec![f.peer_id],
+                    ..Default::default()
+                },
+                replication_mode: "push".to_string(),
+                priority: 0,
+                artifact_filter: ArtifactFilter::default(),
+                precedence: 100,
+            })
+            .await
+            .expect("create sync policy");
+
+        let claimed = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        assert_eq!(claimed.len(), 1, "task must be claimable");
+        let task = &claimed[0];
+        let claim_token = task.claim_token();
+
+        sqlx::query("UPDATE peer_instances SET active_transfers = 1 WHERE id = $1")
+            .bind(f.peer_id)
+            .execute(&f.pool)
+            .await
+            .expect("seed active transfer counter");
+
+        svc.evaluate_for_artifact(task.artifact_id)
+            .await
+            .expect("re-evaluate artifact policy");
+
+        let (status, token, claimed_by): (String, Option<Uuid>, Option<String>) = sqlx::query_as(
+            "SELECT status::TEXT, claim_token, claimed_by FROM sync_tasks WHERE id = $1",
+        )
+        .bind(task.id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("fetch task after policy re-evaluation");
+        assert_eq!(status, "in_progress");
+        assert_eq!(token, Some(claim_token), "policy must preserve claim token");
+        assert_eq!(
+            claimed_by.as_deref(),
+            Some("worker-a"),
+            "policy must preserve claimed_by"
+        );
+
+        handle_transfer_success(&f.pool, task, 3).await;
+
+        let (status, token, active_transfers, bytes_transferred): (String, Option<Uuid>, i32, i64) =
+            sqlx::query_as(
+                r#"
+            SELECT st.status::TEXT, st.claim_token, p.active_transfers, st.bytes_transferred
+            FROM sync_tasks st
+            JOIN peer_instances p ON p.id = st.peer_instance_id
+            WHERE st.id = $1
+            "#,
+            )
+            .bind(task.id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("fetch finalized task");
+        assert_eq!(status, "completed");
+        assert!(
+            token.is_none(),
+            "successful finalize must clear claim token"
+        );
+        assert_eq!(
+            active_transfers, 0,
+            "successful finalize must decrement active_transfers"
+        );
+        assert_eq!(bytes_transferred, 3);
+
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&f.pool)
+            .await;
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// Fire `workers` claimers at one peer as concurrently as the runtime
+    /// allows — a [`tokio::sync::Barrier`] releases them together — and return
+    /// how many tasks each one claimed. Every claimer uses `available_slots`
+    /// and `concurrent_limit`, mirroring N replicas ticking at the same instant
+    /// off the same stale `active_transfers` snapshot.
+    async fn claim_counts_concurrently(
+        f: &ClaimFixture,
+        workers: usize,
+        slots: i64,
+        limit: i64,
+        ttl: f64,
+    ) -> Vec<usize> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+        for i in 0..workers {
+            let pool = f.pool.clone();
+            let peer_id = f.peer_id;
+            let barrier = barrier.clone();
+            let worker = format!("worker-{i}");
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                claim_pending_sync_tasks(&pool, peer_id, slots, limit, 3, &worker, ttl)
+                    .await
+                    .expect("claim query ok")
+                    .len()
+            }));
+        }
+        let mut counts = Vec::with_capacity(workers);
+        for h in handles {
+            counts.push(h.await.expect("claim task join"));
+        }
+        counts
+    }
+
+    /// Two replicas racing for the same single pending task: exactly one wins
+    /// it, never both. The sequential `claim_pending_sync_tasks_is_exactly_once`
+    /// cannot exercise this — there the first claim commits (flipping the row
+    /// `in_progress`) before the second even selects candidates, so the race
+    /// window never opens.
+    #[tokio::test]
+    async fn claim_pending_sync_tasks_exactly_once_under_concurrency() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+
+        let counts = claim_counts_concurrently(&f, 2, 5, 5, 60.0).await;
+        let total: usize = counts.iter().sum();
+        assert_eq!(
+            total, 1,
+            "one pending task must be claimed by exactly one of two concurrent \
+             replicas, never both (per-worker claims: {counts:?})"
+        );
+
+        teardown_claim_fixture(&f).await;
+    }
+
+    /// Two replicas ticking together, each believing from the stale
+    /// `active_transfers` snapshot that all 5 slots are free, must not
+    /// collectively exceed the peer's true concurrency limit of 2. The per-peer
+    /// claim advisory lock makes the live-claim cap hold even when the two claim
+    /// statements overlap exactly (where the in-statement `COUNT(*)` alone is
+    /// racy under READ COMMITTED and would let each grab 2 on disjoint rows).
+    #[tokio::test]
+    async fn claim_pending_sync_tasks_caps_peer_under_concurrency() {
+        let Some(f) = setup_claim_fixture(4).await else {
+            return;
+        };
+
+        // available_slots = 5 (stale/over-optimistic), true peer limit = 2.
+        let counts = claim_counts_concurrently(&f, 2, 5, 2, 60.0).await;
+        let total: usize = counts.iter().sum();
+        assert_eq!(
+            total, 2,
+            "two concurrent replicas must claim exactly the 2 available slots \
+             and never oversubscribe the peer (per-worker claims: {counts:?})"
+        );
+
+        teardown_claim_fixture(&f).await;
     }
 }

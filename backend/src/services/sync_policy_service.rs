@@ -896,7 +896,13 @@ impl SyncPolicyService {
                 INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
                 VALUES ($1, $2, 0, 'push')
                 ON CONFLICT (peer_instance_id, artifact_id, task_type)
-                DO UPDATE SET status = 'pending', priority = GREATEST(sync_tasks.priority, 0)
+                DO UPDATE SET
+                    status = 'pending',
+                    priority = GREATEST(sync_tasks.priority, 0),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE sync_tasks.status != 'in_progress'
                 "#,
             )
             .bind(peer_id)
@@ -929,7 +935,13 @@ impl SyncPolicyService {
                 INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
                 VALUES ($1, $2, 0, 'delete')
                 ON CONFLICT (peer_instance_id, artifact_id, task_type)
-                DO UPDATE SET status = 'pending', priority = GREATEST(sync_tasks.priority, 0)
+                DO UPDATE SET
+                    status = 'pending',
+                    priority = GREATEST(sync_tasks.priority, 0),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
+                WHERE sync_tasks.status != 'in_progress'
                 "#,
             )
             .bind(peer_id)
