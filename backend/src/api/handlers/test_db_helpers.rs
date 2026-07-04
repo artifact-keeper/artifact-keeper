@@ -38,6 +38,9 @@ pub async fn try_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(3)
+        // llvm-cov + nextest runs DB-backed lib tests in parallel processes.
+        // Keep each per-test pool small, but give Postgres pressure a chance
+        // to clear instead of turning transient contention into PoolTimedOut.
         .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&url)
         .await
