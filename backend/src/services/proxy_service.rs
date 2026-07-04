@@ -2973,8 +2973,14 @@ impl ProxyService {
         let upstream_url = Self::remote_target(repo)?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
+        // #2192 / #1608 Phase 4c: use the 16 MiB LARGE ceiling, not the 8 MiB
+        // DEFAULT. The sole caller is the PyPI download-URL-resolution simple-
+        // index fetch (`resolve_pypi_remote_fetch_target`); its *primary*
+        // simple-index path already reads at LARGE_METADATA_MAX_BYTES, so the
+        // secondary path here inherited a mismatched 8 MiB cap that could 502 a
+        // large simple-index page. Align the two.
         let resp = self
-            .fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            .fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
             .await?;
         Ok((resp.content, resp.content_type, resp.effective_url))
     }
@@ -10975,6 +10981,45 @@ SHA256:
             effective.ends_with("/simple/foo/"),
             "effective url: {effective}"
         );
+    }
+
+    // #2192 / #1608 Phase 4c: the direct (uncached) PyPI simple-index fetch must
+    // read up to the 16 MiB LARGE ceiling, not the old 8 MiB DEFAULT. A body
+    // between the two caps must succeed (it would have 502'd at 8 MiB).
+    #[tokio::test]
+    async fn test_fetch_upstream_direct_uses_large_cap_for_secondary_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // 9 MiB: above DEFAULT_METADATA_MAX_BYTES (8 MiB), below
+        // LARGE_METADATA_MAX_BYTES (16 MiB).
+        let big = vec![0x2eu8; 9 * 1024 * 1024];
+        assert!(big.len() > DEFAULT_METADATA_MAX_BYTES && big.len() < LARGE_METADATA_MAX_BYTES);
+        Mock::given(method("GET"))
+            .and(path("/simple/foo/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(big.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-direct-large-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s8-direct-large", &server.uri(), tmp.to_str().unwrap());
+
+        let outcome = proxy.fetch_upstream_direct(&repo, "simple/foo/").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct, _effective) =
+            outcome.expect("a 9 MiB simple index must succeed under the 16 MiB cap");
+        assert_eq!(body.len(), big.len());
     }
 
     #[tokio::test]

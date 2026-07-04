@@ -365,6 +365,37 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .expect("grant developer role");
 }
 
+/// Recursively find the largest file (in bytes) under `dir`, or 0 if none.
+fn dir_max_file_size(dir: &std::path::Path) -> u64 {
+    let mut max = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            max = max.max(dir_max_file_size(&path));
+        } else if let Ok(meta) = std::fs::metadata(&path) {
+            max = max.max(meta.len());
+        }
+    }
+    max
+}
+
+/// Poll `dir` until a file of at least `min_size` bytes appears (the committed
+/// proxy-cache blob) or a bounded timeout elapses. The streaming write-back tee
+/// commits the cache asynchronously after the response body drains, so tests
+/// that assert a WARM second request must wait for the commit deterministically
+/// instead of racing it (#2192 / #1608 Phase 4c).
+pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
+    for _ in 0..200 {
+        if dir_max_file_size(dir) >= min_size {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)

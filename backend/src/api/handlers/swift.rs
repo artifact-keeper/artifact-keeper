@@ -513,23 +513,21 @@ async fn download_archive(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("{}/{}/{}.zip", scope, name, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                    // #2192 / #1608 Phase 4c: the release `.zip` is a package
+                    // BLOB, not metadata. The buffered fallback (#2181) capped it
+                    // at DEFAULT_METADATA_MAX_BYTES and 502'd an archive larger
+                    // than the cap. Stream it (teed into the proxy cache) so a
+                    // large release archive succeeds with 200 and subsequent
+                    // requests are served warm.
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        "application/octet-stream",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
@@ -1479,5 +1477,83 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+
+    // #2192 / #1608 Phase 4c: a Swift release archive larger than the old
+    // buffered cap (DEFAULT_METADATA_MAX_BYTES = 8 MiB) must now STREAM with 200
+    // instead of 502, and the second request must be served WARM from the teed
+    // proxy cache without a second upstream round-trip.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_remote_download_streams_large_archive_and_warms_cache() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "swift").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        // 9 MiB > 8 MiB DEFAULT_METADATA_MAX_BYTES: 502s on the buffered path.
+        let zip_bytes = vec![0x50u8; 9 * 1024 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path("/apple/swift-nio/2.40.0.zip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/zip")
+                    .set_body_bytes(zip_bytes.clone()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&fx.storage_dir, zip_bytes.len() as u64).await;
+            }
+            let result = super::download_archive(
+                state.clone(),
+                &fx.repo_key,
+                "apple",
+                "swift-nio",
+                "2.40.0",
+            )
+            .await;
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+                    let _ = std::fs::remove_dir_all(&fx.storage_dir);
+                    panic!("large archive must stream with 200, got {status}");
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read streamed body");
+            assert_eq!(body_bytes.len(), zip_bytes.len());
+        }
+
+        drop(mock_server);
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
     }
 }
