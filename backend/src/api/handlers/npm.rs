@@ -309,6 +309,7 @@ fn is_definitive_missing_status(status: StatusCode) -> bool {
 /// Error responses and non-JSON passthroughs are returned unchanged via
 /// `Err` and left uncached; an authoritative 404/410 additionally evicts the
 /// package's cached variants (see [`is_definitive_missing_status`]).
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
 async fn compute_and_store_packument(
     state: &SharedState,
     cache: &NpmPackumentCache,
@@ -348,6 +349,7 @@ async fn compute_and_store_packument(
         return Err(response);
     }
 
+    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=32 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
     let body_bytes = axum::body::to_bytes(response.into_body(), NPM_PACKUMENT_BUFFER_CAP)
         .await
         .map_err(|e| {
@@ -5503,6 +5505,8 @@ mod tests {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
