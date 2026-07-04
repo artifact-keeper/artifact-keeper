@@ -513,12 +513,13 @@ async fn download_archive(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("{}/{}/{}.zip", scope, name, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await?;
                     return Ok(Response::builder()

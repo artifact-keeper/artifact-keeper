@@ -41,6 +41,13 @@ use std::path::{Path, PathBuf};
 /// is now parsed from a single on-disk tar entry and the body is streamed to
 /// storage via `put_artifact_stream`, removing the 1 exempt site in helm.rs:
 /// 33 -> 32.
+///
+/// Phase 4b (#1608 / #2181) capped the last unbounded buffered upstream read.
+/// `ProxyService::read_upstream_response` (the single proxy_service.rs exempt
+/// site) is replaced by `read_upstream_response_capped`, which accumulates
+/// `response.bytes_stream()` under a running byte ceiling instead of calling
+/// `response.bytes()`. With no gated call left, the proxy_service.rs row is
+/// removed: 32 -> 31.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 5),
@@ -54,7 +61,6 @@ const ALLOWLIST: &[(&str, usize)] = &[
     ("src/main.rs", 1),
     ("src/services/artifactory_client.rs", 1),
     ("src/services/nexus_client.rs", 1),
-    ("src/services/proxy_service.rs", 1),
     ("src/services/scheduler_service.rs", 2),
     ("src/storage/azure.rs", 4),
     ("src/storage/gcs.rs", 4),
@@ -409,7 +415,8 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 32,
-        "expected 32 exempt sites after #1608 Phase 3 (helm streamed); got {total}"
+        total, 31,
+        "expected 31 exempt sites after #1608 Phase 4b (proxy_service buffered \
+         metadata read capped via running-bounded bytes_stream); got {total}"
     );
 }

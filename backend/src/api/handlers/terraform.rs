@@ -1314,12 +1314,13 @@ async fn fetch_upstream_json(
     repo_key: &str,
     path: &str,
 ) -> Result<serde_json::Value, Response> {
-    let (content, _ct) = proxy_helpers::proxy_fetch(
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
         remote.proxy,
         remote.repo.id,
         repo_key,
         &remote.upstream_url,
         path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await?;
     serde_json::from_slice(&content).map_err(|e| {

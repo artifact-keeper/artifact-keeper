@@ -384,8 +384,15 @@ where
             continue;
         };
 
-        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
-            .await
+        match proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
         {
             Ok((content, content_type)) => {
                 return Ok(build_composer_proxy_response(content, content_type));
@@ -522,12 +529,13 @@ async fn metadata_v2(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let upstream_path = composer_v2_upstream_path(&full_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(build_composer_proxy_response(content, content_type));
@@ -581,12 +589,13 @@ async fn metadata_v1(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let upstream_path = composer_v1_upstream_path(&full_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(build_composer_proxy_response(content, content_type));

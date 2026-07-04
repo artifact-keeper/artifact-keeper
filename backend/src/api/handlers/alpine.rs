@@ -357,9 +357,15 @@ async fn apk_index(
             (&repo.upstream_url, &state.proxy_service)
         {
             let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
 
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -390,12 +396,13 @@ async fn apk_index(
                 continue;
             };
 
-            let result = proxy_helpers::proxy_fetch(
+            let result = proxy_helpers::proxy_fetch_capped(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 &upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
             )
             .await;
 
