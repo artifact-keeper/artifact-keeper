@@ -1,6 +1,7 @@
 //! SBOM (Software Bill of Materials) generation and management service.
 
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{
     CveHistoryEntry, CveStatus, CveTimelineEntry, CveTrends, LicensePolicy, SbomComponent,
     SbomDocument, SbomFormat, SbomSummary,
@@ -1044,10 +1045,11 @@ impl SbomService {
     ///   `auth.allowed_repo_ids.as_deref()` through unchanged: if auth said
     ///   "no restriction", the service trusts that decision.
     ///
-    /// This is a footgun-prone shape. Tracked for refactor to an explicit
-    /// `enum AccessScope { Admin, Restricted(Vec<Uuid>) }` post v1.2.0 (see
-    /// #1390 follow-up). Until then, treat `None` as a load-bearing comment
-    /// that must read "admin-only".
+    /// This is a footgun-prone shape, so the repo scope is now carried as the
+    /// explicit [`crate::models::access_scope::AccessScope`] enum
+    /// ([`AccessScope::Admin`] = full cross-repo read; [`AccessScope::Restricted`]
+    /// = deny-by-default allowlist), matched exhaustively rather than relying on
+    /// this comment (#1617, Phase 4).
     ///
     /// Returns an empty vec when the CVE is not present (200 OK, [] body); a
     /// missing CVE is not a 404 in this contract.
@@ -1057,7 +1059,7 @@ impl SbomService {
     pub async fn get_cve_history_by_cve_id(
         &self,
         cve_id: &str,
-        allowed_repo_ids: Option<&[Uuid]>,
+        scope: AccessScope,
     ) -> Result<Vec<CveHistoryEntry>> {
         // Normalize: NVD shape is upper-case; lower-case is a common typo.
         // Schema does not constrain `cve_id` case in either `cve_history` or
@@ -1075,9 +1077,11 @@ impl SbomService {
             .await?;
         // Enforce the repo filter on scan-derived entries (they are synthesized
         // on the fly, so the filter cannot live in the SQL `WHERE`).
-        let mut entries = match allowed_repo_ids {
-            None => scan_entries,
-            Some(repo_ids) => {
+        // `Admin` (legacy `None`) = full cross-repo read; `Restricted` applies
+        // the allowlist, so an empty allowlist filters everything out (#1617).
+        let mut entries = match scope {
+            AccessScope::Admin => scan_entries,
+            AccessScope::Restricted(repo_ids) => {
                 let allowed: HashSet<Uuid> = repo_ids.iter().copied().collect();
                 self.filter_entries_by_repo(scan_entries, &allowed).await?
             }
@@ -1185,18 +1189,18 @@ impl SbomService {
     ///   3. If neither matches, surface the original `RowNotFound` so the
     ///      handler still maps a genuinely-unknown id to 404.
     ///
-    /// `allowed_repo_ids` follows the same admin-when-`None` contract as
-    /// [`Self::get_cve_history_by_cve_id`]: `None` means no repo restriction
-    /// (admin/system callers); `Some(&[...])` scopes the synth-id resolution
-    /// to those repositories so a non-admin caller cannot acknowledge a CVE on
-    /// an artifact they cannot see.
+    /// `scope` follows the same admin-vs-allowlist contract as
+    /// [`Self::get_cve_history_by_cve_id`]: [`AccessScope::Admin`] means no repo
+    /// restriction (admin/system callers); [`AccessScope::Restricted`] scopes the
+    /// synth-id resolution to those repositories so a non-admin caller cannot
+    /// acknowledge a CVE on an artifact they cannot see.
     pub async fn update_cve_status(
         &self,
         id: Uuid,
         status: CveStatus,
         user_id: Option<Uuid>,
         reason: Option<&str>,
-        allowed_repo_ids: Option<&[Uuid]>,
+        scope: AccessScope,
     ) -> Result<CveHistoryEntry> {
         let curated = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
@@ -1223,8 +1227,7 @@ impl SbomService {
 
         // No curated `cve_history` row: treat `id` as a synthetic id derived
         // from `scan_findings` and resolve it back to (artifact_id, cve_id).
-        if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, allowed_repo_ids).await?
-        {
+        if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, scope).await? {
             return self
                 .update_cve_status_by_artifact_cve(artifact_id, &cve_id, status, user_id, reason)
                 .await;
@@ -1240,17 +1243,20 @@ impl SbomService {
     /// hash for every distinct `scan_findings` pair and matching `id`.
     ///
     /// The synth id is a one-way hash, so reversal is by recomputation, not
-    /// arithmetic. `allowed_repo_ids` scopes the candidate set to artifacts in
-    /// the listed repositories (`None` = no restriction; admin-only, same
-    /// contract as [`Self::get_cve_history_by_cve_id`]). Returns `None` when
-    /// no `scan_findings` pair hashes to `id`. (#1561)
+    /// arithmetic. `scope` constrains the candidate set to artifacts the caller
+    /// can access ([`AccessScope::Admin`] = no restriction; same contract as
+    /// [`Self::get_cve_history_by_cve_id`]). Returns `None` when no
+    /// `scan_findings` pair hashes to `id`. (#1561)
     pub(crate) async fn resolve_synth_cve_id(
         &self,
         id: Uuid,
-        allowed_repo_ids: Option<&[Uuid]>,
+        scope: AccessScope,
     ) -> Result<Option<(Uuid, String)>> {
-        let pairs: Vec<(Uuid, String)> = match allowed_repo_ids {
-            None => {
+        // `Admin` resolves across every repo; `Restricted` constrains the
+        // candidate set to the allowlist, so an empty allowlist yields no
+        // candidates (deny-by-default) (#1617).
+        let pairs: Vec<(Uuid, String)> = match scope {
+            AccessScope::Admin => {
                 sqlx::query_as(
                     r#"
                 SELECT DISTINCT sf.artifact_id, sf.cve_id
@@ -1263,7 +1269,7 @@ impl SbomService {
                 .fetch_all(&self.db)
                 .await?
             }
-            Some(repo_ids) => {
+            AccessScope::Restricted(repo_ids) => {
                 sqlx::query_as(
                     r#"
                 SELECT DISTINCT sf.artifact_id, sf.cve_id
@@ -4790,7 +4796,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("ack via legacy synth-id endpoint"),
-                None,
+                AccessScope::Admin,
             )
             .await
             .expect("synth-id ack must succeed via scan_findings fallback");
@@ -4829,7 +4835,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("nope"),
-                None,
+                AccessScope::Admin,
             )
             .await
             .expect_err("unknown id must 404");
@@ -4866,7 +4872,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("cross-repo attempt"),
-                Some(&[repo_b]),
+                AccessScope::Restricted(vec![repo_b]),
             )
             .await
             .expect_err("synth id outside repo scope must 404");
@@ -4878,6 +4884,20 @@ mod tests {
             .expect("finding present");
         assert!(!ack, "ack must not persist for out-of-scope caller");
 
+        // Empty allowlist (Restricted([])) is deny-by-default: it must resolve
+        // nothing, never fall open to the whole instance (#1617).
+        let err = service
+            .update_cve_status(
+                synth_id,
+                CveStatus::Acknowledged,
+                None,
+                Some("empty-scope attempt"),
+                AccessScope::Restricted(vec![]),
+            )
+            .await
+            .expect_err("empty scope must deny (404)");
+        assert!(matches!(err, AppError::Sqlx(sqlx::Error::RowNotFound)));
+
         // Scoped to repo_a: now it resolves and persists.
         let entry = service
             .update_cve_status(
@@ -4885,11 +4905,71 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("in-scope ack"),
-                Some(&[repo_a]),
+                AccessScope::Restricted(vec![repo_a]),
             )
             .await
             .expect("in-scope synth id must resolve");
         assert_eq!(entry.status, "acknowledged");
+
+        teardown(&pool, repo_a).await;
+        teardown(&pool, repo_b).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_cve_history_by_cve_id_respects_access_scope() {
+        // The read path now takes an AccessScope (#1617, Phase 4). Prove the
+        // three load-bearing cases at the converted call site:
+        //   - Admin (None-origin) grants a repo it was never explicitly listed
+        //     for;
+        //   - Restricted([repo_a]) grants repo_a but Restricted([repo_b]) does
+        //     not (grants r1 not r2);
+        //   - Restricted([]) denies everything (deny-by-default).
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let repo_a = seed_repo(&pool).await;
+        let repo_b = seed_repo(&pool).await;
+        let artifact_a = seed_artifact(&pool, repo_a).await;
+        let scan_a = seed_scan_result(&pool, artifact_a, repo_a).await;
+        seed_finding(&pool, scan_a, artifact_a, "CVE-2024-5150", "high").await;
+
+        let service = SbomService::new(pool.clone());
+        let sees_artifact =
+            |entries: &[CveHistoryEntry]| entries.iter().any(|e| e.artifact_id == artifact_a);
+
+        // Admin: full cross-repo read even though repo_a was never listed.
+        let admin = service
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Admin)
+            .await
+            .expect("admin read must succeed");
+        assert!(sees_artifact(&admin), "admin scope must see the finding");
+
+        // Restricted to the owning repo: visible.
+        let scoped = service
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Restricted(vec![repo_a]))
+            .await
+            .expect("in-scope read must succeed");
+        assert!(sees_artifact(&scoped), "in-scope repo must see the finding");
+
+        // Restricted to a different repo: denied.
+        let other = service
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Restricted(vec![repo_b]))
+            .await
+            .expect("out-of-scope read must still return Ok([])");
+        assert!(
+            !sees_artifact(&other),
+            "out-of-scope repo must not see the finding"
+        );
+
+        // Restricted([]): deny-by-default, nothing visible.
+        let empty = service
+            .get_cve_history_by_cve_id("CVE-2024-5150", AccessScope::Restricted(vec![]))
+            .await
+            .expect("empty-scope read must return Ok([])");
+        assert!(
+            !sees_artifact(&empty),
+            "empty scope must deny (deny-by-default), never fall open"
+        );
 
         teardown(&pool, repo_a).await;
         teardown(&pool, repo_b).await;

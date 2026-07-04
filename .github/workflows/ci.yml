@@ -87,6 +87,13 @@ jobs:
       - name: Pin token-minting endpoint surface
         run: ./scripts/ci/check-token-mint-surface.sh
 
+      # Auth-event audit completeness (#1617 Phase 1): every token mint/revoke
+      # handler must emit an ApiTokenCreated/ApiTokenRevoked audit event, and
+      # every federated (OIDC/SAML/LDAP) login must audit its Login/LoginFailed
+      # outcome. Guards the compliance audit trail against silent regression.
+      - name: Check auth-event audit coverage
+        run: ./scripts/ci/check-auth-event-audit.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
@@ -702,7 +709,13 @@ jobs:
       #     virtual_members_atomicity_test, virtual_members_duplicate_test,
       #     grpc_sbom_tests (in-process gRPC, no HTTP server),
       #     oci_chunked_upload_cross_repo_tests (#1317 cross-repo session
-      #     rejection regression).
+      #     rejection regression),
+      #     sso_oidc_login_callback_e2e_tests (#1617 OIDC login/callback
+      #     regression harness; drives the real sso handlers against an
+      #     in-process wiremock IdP bound to a non-loopback interface),
+      #     sso_saml_acs_e2e_tests (#2212 SAML ACS regression harness; drives
+      #     the real saml_login/saml_acs handlers against bergshamra-signed
+      #     assertions — no outbound fetch, so no wiremock/SSRF dance).
       #
       # Deliberately excluded (would panic on first .expect() without
       # extra infra, so `--ignored` stays the right gate):
@@ -738,6 +751,8 @@ jobs:
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
+            --test sso_oidc_login_callback_e2e_tests \
+            --test sso_saml_acs_e2e_tests \
             -- --ignored --test-threads=1
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`

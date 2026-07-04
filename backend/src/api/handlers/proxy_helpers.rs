@@ -16,11 +16,15 @@ use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use crate::services::proxy_hydration::coordinate_proxy_hydration;
+use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
+// Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
+// #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
+pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
 use crate::storage::StorageLocation;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -416,6 +420,48 @@ pub async fn proxy_fetch_with_accept(
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_artifact_with_accept(&repo, path, accept)
+            .await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch`] (#1608 Phase 4b / #2181).
+///
+/// Identical to [`proxy_fetch`] except the buffered upstream *metadata* read is
+/// capped at `max` bytes: a hostile or broken upstream that streams more than
+/// `max` yields a 502 instead of an unbounded buffer that OOMs the pod, and no
+/// truncated body is ever cached. Callers pass the per-format ceiling
+/// ([`DEFAULT_METADATA_MAX_BYTES`] for most formats, [`LARGE_METADATA_MAX_BYTES`]
+/// for formats with legitimately large metadata documents). This is the
+/// buffered-metadata path only — large binaries must use [`proxy_fetch_streaming`].
+pub async fn proxy_fetch_capped(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_artifact_capped(&repo, path, max).await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
+/// #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_with_accept_capped(&repo, path, accept, max)
             .await
     })
     .await
@@ -866,10 +912,13 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    let _ = db;
     let hydration_lease_key = format!("artifact-repair:{}", storage_key);
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
+    // #1609: single-flight the missing-file repair CLUSTER-WIDE (was per-process)
+    // via the config-selected advisory-lock coordinator, so concurrent replicas
+    // do not each re-download and write back the same object.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
         || async {
             match storage.get(storage_key).await {
                 Ok(content) => Ok(Some(content)),
@@ -902,8 +951,8 @@ where
             )
                 .into_response()
         },
-    )
-    .await
+        )
+        .await
 }
 
 /// Serialise concurrent reads for a locally-stored artifact whose physical
@@ -925,43 +974,45 @@ pub(crate) async fn coordinated_retry_get(
     storage_key: &str,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
-    let _ = db;
     let hydration_lease_key = format!("artifact-read-retry:{}", storage_key);
     tracing::warn!(
         artifact_id = %artifact_id,
         storage_key = %storage_key,
         "storage miss on local artifact; coordinating re-read"
     );
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
-        || async {
-            match storage.get(storage_key).await {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(crate::error::AppError::NotFound(_)) => Ok(None),
-                Err(e) => Err(map_storage_err(e)),
-            }
-        },
-        || async {
-            tracing::error!(
-                artifact_id = %artifact_id,
-                storage_key = %storage_key,
-                "artifact file still absent after coordinated retry; returning 507"
-            );
-            Err((
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response())
-        },
-        || {
-            (
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response()
-        },
-    )
-    .await
+    // #1609: coordinate the re-read CLUSTER-WIDE (was per-process) via the
+    // config-selected advisory-lock coordinator.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
+            || async {
+                match storage.get(storage_key).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(crate::error::AppError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(map_storage_err(e)),
+                }
+            },
+            || async {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    storage_key = %storage_key,
+                    "artifact file still absent after coordinated retry; returning 507"
+                );
+                Err((
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response())
+            },
+            || {
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response()
+            },
+        )
+        .await
 }
 
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
@@ -1011,6 +1062,60 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
         |repo| async move {
             proxy_service
                 .fetch_artifact_with_cache_path_and_accept(&repo, fetch_path, cache_path, accept)
+                .await
+        },
+    )
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key`] (#1608 Phase
+/// 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+                .await
+        },
+    )
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key_and_accept`]
+/// (#1608 Phase 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_and_accept_capped(
+                    &repo, fetch_path, cache_path, accept, max,
+                )
                 .await
         },
     )
@@ -3278,6 +3383,7 @@ pub async fn find_local_by_filename_suffix(
 /// `json_field_names` lists the form-field names to accept for the JSON
 /// payload (Ansible accepts both `collection` and `metadata`; Puppet uses
 /// `module`). The first matching field wins. Unknown fields are ignored.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 pub async fn parse_multipart_file_with_json(
     mut multipart: axum::extract::Multipart,
     json_field_names: &[&str],
@@ -3293,6 +3399,7 @@ pub async fn parse_multipart_file_with_json(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             tarball = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read file: {}", e),
@@ -3300,6 +3407,8 @@ pub async fn parse_multipart_file_with_json(
                     .into_response()
             })?);
         } else if json_field_names.iter().any(|n| *n == field_name) {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data = field.bytes().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -3348,6 +3457,298 @@ pub async fn put_artifact_bytes(
         .await
         .map_err(|e| internal_error("Storage", e))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming artifact uploads (#1608 Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Light-format upload handlers (chef, ansible, pub, ...) historically buffered
+// the entire artifact body in memory via `Field::bytes()` before handing it to
+// `put_artifact_bytes` -> `storage.put(Bytes)`. `stage_upload_field` +
+// `put_artifact_stream` replace that with a memory-bounded path: the multipart
+// field is spooled chunk-by-chunk to a scratch temp file (peak RAM =
+// STREAM_STAGE_CHUNK), then streamed into the repo's `StorageBackend` through
+// its native `put_stream` primitive (S3 multipart / GCS resumable / Azure
+// block-blob / filesystem temp-and-rename), which computes the SHA-256
+// incrementally as it copies. Mirrors the incus monolithic-upload pattern
+// (`stream_body_to_file` + `open_temp_file_as_stream`). `put_artifact_bytes`
+// is retained for the small metadata writers that still need the bytes in hand.
+//
+// This pair is the shared entry point later #1608 phases (helm/pypi/nuget)
+// build on: `stage_upload_field` decouples the (borrowed, non-`'static`)
+// multipart field lifetime from the `'static` stream `put_stream` requires,
+// and lets a handler parse archive metadata off the staged file before the
+// storage key is known.
+
+/// Chunk size for reading a staged scratch file back into `put_stream`.
+const STREAM_STAGE_CHUNK: usize = 256 * 1024;
+
+/// A multipart upload body spooled to a bounded scratch file on local disk.
+///
+/// The scratch file is removed on drop (RAII), so every early return — a
+/// mid-receive stream error, a `?`-propagated failure, or a storage failure in
+/// [`put_artifact_stream`] — unlinks it instead of leaking an orphan (#1573).
+/// The file is staged under the shared upload staging root, so the orphan
+/// sweep reaps it as a backstop if the process dies mid-request.
+pub struct StagedUpload {
+    path: PathBuf,
+    size_bytes: i64,
+}
+
+impl StagedUpload {
+    /// On-disk path of the staged scratch file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of bytes spooled to disk (== the eventual artifact size).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// Whether the spooled body is empty (no bytes received).
+    pub fn is_empty(&self) -> bool {
+        self.size_bytes == 0
+    }
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        // Synchronous best-effort unlink: Drop can't await and the file is
+        // local scratch, so a blocking unlink is negligible.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spool one multipart field to a bounded scratch temp file, aborting with
+/// `413 Payload Too Large` once `max_upload_size_bytes` is exceeded (a value of
+/// 0 disables the limit, matching the `DefaultBodyLimit` config semantics).
+///
+/// Never buffers the whole field in memory: chunks are written straight to
+/// disk. The returned [`StagedUpload`] owns the scratch file and removes it on
+/// drop. Feed it to [`put_artifact_stream`] once the storage key is known.
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field(
+    state: &crate::api::SharedState,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<StagedUpload, Response> {
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload body: {e}"),
+        )
+            .into_response()
+    })? {
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok(staged)
+}
+
+/// Stream a [`StagedUpload`] scratch file into the repository's configured
+/// `StorageBackend` via its native `put_stream`, computing the SHA-256
+/// checksum incrementally as it copies (no separate hashing pass over a
+/// buffered body). Returns the incremental checksum + byte count for building
+/// the artifact row.
+///
+/// Consumes the `StagedUpload`: the scratch file is removed when this returns,
+/// on success or on error.
+#[allow(clippy::result_large_err)]
+pub async fn put_artifact_stream(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    staged: StagedUpload,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let stream = open_staged_stream(staged.path()).await?;
+    let result = storage
+        .put_stream(storage_key, stream)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    Ok(result)
+    // `staged` drops here -> scratch file removed.
+}
+
+/// Open a staged scratch file as a `'static` byte stream ready to feed
+/// `StorageBackend::put_stream`. A buffered `ReaderStream` keeps the
+/// disk->backend copy bounded to `STREAM_STAGE_CHUNK`.
+#[allow(clippy::result_large_err)]
+async fn open_staged_stream(
+    path: &Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| internal_error("Staging reopen", e))?;
+    let reader = BufReader::with_capacity(STREAM_STAGE_CHUNK, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_STAGE_CHUNK)
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("staged read: {e}"))));
+    Ok(Box::pin(stream))
+}
+
+/// Spool an arbitrary byte stream to a bounded scratch temp file while computing
+/// SHA-256, SHA-1, and MD5 incrementally. Aborts with `413 Payload Too Large`
+/// once `max_upload_size_bytes` is exceeded (a value of 0 disables the limit,
+/// matching `DefaultBodyLimit`). Never buffers the whole body in memory.
+///
+/// This is the shared content-addressed staging primitive: pypi feeds it an axum
+/// multipart [`Field`](axum::extract::multipart::Field) (via
+/// [`stage_upload_field_content_addressed`]); nuget feeds it a `multer` field
+/// (streaming multipart) or the raw request-body data stream. Hand the returned
+/// [`StagedUpload`] to [`open_staged_upload_stream`] and the
+/// [`ContentDigests`](crate::services::artifact_service::ContentDigests) to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+#[allow(clippy::result_large_err)]
+pub async fn stage_stream_content_addressed<S, E>(
+    state: &crate::api::SharedState,
+    stream: S,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut hasher = crate::services::artifact_service::MultiHasher::new();
+    let mut written: u64 = 0;
+
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read upload body: {e}"),
+            )
+                .into_response()
+        })?;
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok((staged, hasher.finalize()))
+}
+
+/// Content-addressed variant of [`stage_upload_field`]: spool one axum multipart
+/// field to scratch while computing SHA-256 / SHA-1 / MD5. Thin wrapper over
+/// [`stage_stream_content_addressed`] (axum's `Field` is itself a byte stream).
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field_content_addressed(
+    state: &crate::api::SharedState,
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    stage_stream_content_addressed(state, field).await
+}
+
+/// Re-open a [`StagedUpload`] scratch file as a `'static` byte stream ready to
+/// hand to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+///
+/// The caller must keep the [`StagedUpload`] alive until the consumer finishes:
+/// the returned stream holds an independent open file handle, and the scratch
+/// file is only unlinked when the `StagedUpload` drops.
+#[allow(clippy::result_large_err)]
+pub async fn open_staged_upload_stream(
+    staged: &StagedUpload,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    open_staged_stream(staged.path()).await
 }
 
 /// Borrowed handle to the columns required to insert a new artifact row.
@@ -3558,6 +3959,8 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4989,6 +5392,13 @@ mod tests {
                 source: crate::storage::PresignedUrlSource::S3,
             }))
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     // Facade-trait impl so `RecordingStorage` can be driven directly through
@@ -5192,6 +5602,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             *self.content.lock().await = None;
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -6042,6 +6459,7 @@ mod tests {
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
                 blob_gc_enabled: false,
+                blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
@@ -6089,6 +6507,9 @@ mod tests {
                 password_min_strength: 0,
                 presigned_downloads_enabled: false,
                 presigned_download_expiry_secs: 300,
+                proxy_singleflight_advisory_locks_enabled: false,
+                proxy_singleflight_lock_poll_interval_ms: 200,
+                proxy_singleflight_lock_wait_timeout_secs: 65,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
@@ -6599,6 +7020,108 @@ mod tests {
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── stage_upload_field + put_artifact_stream (#1608 Phase 2) ─────────
+
+    /// Encode a single-field (`file`) multipart/form-data body.
+    fn one_field_multipart(boundary: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"f.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Extract the first multipart field from an in-memory body.
+    async fn first_field(body: Vec<u8>) -> axum::extract::Multipart {
+        use axum::extract::FromRequest;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "multipart/form-data; boundary=BND")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stage_and_put_artifact_stream_roundtrip() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "chef").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+        };
+
+        let payload = b"streamed-artifact-body".repeat(64);
+        let mut mp = first_field(one_field_multipart("BND", &payload)).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(!staged.is_empty());
+        assert_eq!(staged.size_bytes(), payload.len() as i64);
+        // Field bytes really landed on disk (spooled, not buffered).
+        assert_eq!(tokio::fs::read(staged.path()).await.unwrap(), payload);
+        let scratch = staged.path().to_path_buf();
+
+        let put = put_artifact_stream(&state, &repo, "chef/x/1.0/x.tar.gz", staged)
+            .await
+            .expect("put_stream");
+
+        // Checksum computed incrementally by put_stream matches a direct hash.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        assert_eq!(put.checksum_sha256, format!("{:x}", hasher.finalize()));
+        assert_eq!(put.bytes_written, payload.len() as u64);
+
+        // Scratch file removed once the StagedUpload dropped.
+        assert!(!scratch.exists());
+
+        // Bytes are retrievable from the backend under the storage key.
+        let storage = state.storage_for_repo(&repo.storage_location()).unwrap();
+        let got = storage.get("chef/x/1.0/x.tar.gz").await.unwrap();
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_upload_field_reports_empty_body() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "pub").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let mut mp = first_field(one_field_multipart("BND", b"")).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(staged.is_empty());
+        assert_eq!(staged.size_bytes(), 0);
+        // Even an empty spool leaves a scratch file that is cleaned up on drop.
+        let scratch = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!scratch.exists());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
     }
 
     // ── record_artifact_metadata ────────────────────────────────────────

@@ -8,6 +8,7 @@
 //!   S3_SECRET_ACCESS_KEY=... \
 //!   cargo test --test s3_integration -- --ignored --nocapture
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use artifact_keeper_backend::storage::s3::{S3Backend, S3Config};
 use artifact_keeper_backend::storage::StorageBackend;
 use bytes::Bytes;

@@ -610,6 +610,7 @@ fn empty_audits_quick_response() -> Response {
 /// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
 /// well-formed response so the audit degrades gracefully instead of failing
 /// the client command. See issue #1400.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_audit_post(
     upstream_url: &str,
     path: &str,
@@ -633,7 +634,10 @@ async fn proxy_npm_audit_post(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            match resp.bytes().await {
+            // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
+            match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024)
+                .await
+            {
                 Ok(bytes) => {
                     if !status.is_success() {
                         debug!(
@@ -682,6 +686,7 @@ async fn proxy_npm_audit_post(
 /// Returns the upstream status + body verbatim. On any transport error (DNS,
 /// TLS, timeout) returns `None` so the caller can fall through to the local
 /// fallback.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
     let base = upstream_url.trim_end_matches('/');
     // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
@@ -712,7 +717,8 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
         .unwrap_or("application/json")
         .to_string();
 
-    match resp.bytes().await {
+    // STREAMING-EXEMPT: capped metadata read (upstream npm registry packument/meta JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap falls through to local fallback; tracked under #1608
+    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
         Ok(bytes) => Some(
             Response::builder()
                 .status(status)
@@ -1153,12 +1159,13 @@ async fn get_package_metadata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     repo_key,
                     upstream_url,
                     &encoded_name,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
 
@@ -1218,12 +1225,13 @@ async fn get_package_metadata(
             };
 
             let encoded_name = encode_package_name_for_upstream(package_name);
-            let result = proxy_helpers::proxy_fetch(
+            let result = proxy_helpers::proxy_fetch_capped(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 &encoded_name,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
             )
             .await;
 
@@ -1306,6 +1314,8 @@ async fn get_package_version_metadata(
             &serde_json::Map::new(),
             false,
         )?;
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| {
@@ -1351,8 +1361,15 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &encoded_name).await?;
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &encoded_name,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await?;
     let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
         AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
     })?;
@@ -1389,6 +1406,8 @@ async fn fetch_virtual_packument(
                     &serde_json::Map::new(),
                     false,
                 )?;
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
                 let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
                     .await
                     .map_err(|e| {
@@ -1414,9 +1433,15 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result =
-            proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, &encoded_name)
-                .await;
+        let result = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            &encoded_name,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await;
 
         match result {
             Ok((content, _ct)) => {
@@ -1450,32 +1475,6 @@ async fn fetch_virtual_packument(
 /// generation, Trivy, Grype) rely on it to decide how to extract and scan the
 /// artifact contents.
 const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
-
-/// Build an HTTP response for an npm tarball download.
-///
-/// All three download paths (remote, virtual, local) return the same response
-/// shape: the tarball bytes with `application/gzip` content type, a
-/// `Content-Disposition` attachment header, and the content length. This helper
-/// eliminates the repeated response-builder blocks.
-fn build_tarball_response(
-    content: Bytes,
-    filename: &str,
-    content_type: Option<String>,
-) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
-        )
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap()
-}
 
 /// Build a streaming tarball response from a storage stream.
 fn build_tarball_response_stream(
@@ -1687,9 +1686,21 @@ async fn serve_tarball(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
-                    .await?;
+            // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
+            // metadata. The buffered fallback (#2181) capped it at
+            // LARGE_METADATA_MAX_BYTES and 502'd a tarball larger than the cap
+            // even though other download paths already stream. Stream it (teed
+            // into the proxy cache under `upstream_path`) so a large tarball
+            // succeeds with 200 and subsequent pulls are served warm.
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                &upstream_path,
+                &upstream_path,
+            )
+            .await?;
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
@@ -1697,7 +1708,16 @@ async fn serve_tarball(
             // security scanners can identify the file as a gzip archive.
             correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
 
-            return Ok(build_tarball_response(content, filename, None));
+            // Force the outbound Content-Type to application/gzip regardless of
+            // what the upstream advertised — parity with the buffered path
+            // (build_tarball_response(None)) and the virtual path
+            // (npm_virtual_tarball_content_type).
+            return Ok(build_tarball_response_stream(
+                result.body,
+                filename,
+                npm_virtual_tarball_content_type(result.content_type),
+                result.content_length,
+            ));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
     }
@@ -2240,6 +2260,8 @@ async fn dist_tags_get(
     if !resp.status().is_success() {
         return Ok(resp);
     }
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
     let body_bytes = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| {
@@ -2529,6 +2551,8 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     )
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4397,6 +4421,104 @@ mod tests {
             .expect("read body");
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
+        cleanup().await;
+    }
+
+    // #2192 / #1608 Phase 4c: an npm tarball larger than the old buffered cap
+    // (LARGE_METADATA_MAX_BYTES = 16 MiB) must now STREAM with 200 instead of
+    // 502, the outbound Content-Type must still be forced to application/gzip,
+    // and the second request must be served WARM from the teed proxy cache
+    // without a second upstream round-trip.
+    #[tokio::test]
+    async fn test_remote_proxy_streams_large_tarball_and_warms_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        // 17 MiB > 16 MiB LARGE_METADATA_MAX_BYTES: 502s on the buffered path.
+        let mut tarball_bytes = vec![0x1fu8, 0x8b, 0x08];
+        tarball_bytes.resize(17 * 1024 * 1024, 0x7e);
+
+        Mock::given(method("GET"))
+            .and(path("/bigpkg/-/bigpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.clone()),
+            )
+            // Warm-cache proof: fetched from upstream at most once across the
+            // two requests below.
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&fx.storage_dir, tarball_bytes.len() as u64).await;
+            }
+            let result = super::download_tarball(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    "bigpkg".to_string(),
+                    "bigpkg-1.0.0.tgz".to_string(),
+                )),
+            )
+            .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    cleanup().await;
+                    panic!("large tarball must stream with 200, got {status}");
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(NPM_TARBALL_CONTENT_TYPE),
+                "outbound tarball content type must be forced to application/gzip"
+            );
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read streamed body");
+            assert_eq!(body_bytes.len(), tarball_bytes.len());
+        }
+
+        // `.expect(1)` on the mock is verified on server drop.
+        drop(mock_server);
         cleanup().await;
     }
 

@@ -9,6 +9,7 @@
 #![allow(unused_imports)]
 
 pub mod fixtures;
+pub mod sso_support;
 
 use axum::Router;
 use sqlx::PgPool;

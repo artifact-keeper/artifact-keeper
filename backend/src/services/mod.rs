@@ -11,6 +11,7 @@ pub mod auth_service;
 pub mod backup_service;
 pub mod build_service;
 pub mod cache_classifier;
+pub mod cluster_lock;
 pub mod declared_dependencies;
 pub mod dependency_track_service;
 pub mod email_dispatcher;

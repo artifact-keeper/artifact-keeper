@@ -17,8 +17,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
@@ -243,9 +241,18 @@ async fn fetch_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
-) -> Result<(Bytes, Option<String>), Response> {
-    let (index_bytes, _) =
-        proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, "index.yaml").await?;
+) -> Result<Response, Response> {
+    // The `index.yaml` lookup stays buffered/capped by design: it is a small
+    // metadata document that must be parsed in-process.
+    let (index_bytes, _) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        "index.yaml",
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
 
     let yaml_str = String::from_utf8(index_bytes.to_vec()).map_err(|_| {
         (
@@ -274,7 +281,13 @@ async fn fetch_chart_via_index(
 
     let fetch_url = resolve_chart_url(upstream_url, &chart_url);
     let cache_path = format!("charts/{}", filename);
-    proxy_helpers::proxy_fetch_with_cache_key(
+    // #2192 / #1608 Phase 4c: the chart itself is a package BLOB, not metadata.
+    // The buffered fallback (#2181) capped it at DEFAULT_METADATA_MAX_BYTES and
+    // 502'd charts larger than the cap even though the primary download path
+    // streams. Route the chart download through the streaming helper (teed into
+    // the proxy cache under the same stable `charts/{filename}` key) so large
+    // charts succeed with 200 and subsequent requests are served warm.
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
         repo_id,
         repo_key,
@@ -282,7 +295,8 @@ async fn fetch_chart_via_index(
         &fetch_url,
         &cache_path,
     )
-    .await
+    .await?;
+    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(filename))
 }
 
 /// Attempt to download a chart from a Remote or Virtual repo by resolving the
@@ -306,7 +320,7 @@ async fn download_chart_via_index(
         let Some(upstream_url) = repo.upstream_url.as_deref() else {
             return Ok(None);
         };
-        let (content, content_type) = fetch_chart_via_index(
+        let response = fetch_chart_via_index(
             proxy,
             repo.id,
             &repo.key,
@@ -316,12 +330,7 @@ async fn download_chart_via_index(
             filename,
         )
         .await?;
-        return Ok(Some(proxy_helpers::build_download_response(
-            content,
-            content_type,
-            "application/gzip",
-            Some(filename),
-        )));
+        return Ok(Some(response));
     }
 
     if repo.repo_type == RepositoryType::Virtual {
@@ -362,13 +371,8 @@ async fn download_chart_via_index(
             )
             .await
             {
-                Ok((content, content_type)) => {
-                    return Ok(Some(proxy_helpers::build_download_response(
-                        content,
-                        content_type,
-                        "application/gzip",
-                        Some(filename),
-                    )));
+                Ok(response) => {
+                    return Ok(Some(response));
                 }
                 Err(_) => {
                     tracing::debug!(
@@ -433,6 +437,7 @@ async fn download_chart(
 // POST /helm/{repo_key}/api/charts -- Upload chart (ChartMuseum-compatible)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload_chart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -448,40 +453,37 @@ async fn upload_chart(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Extract chart file from multipart form (field name: "chart")
-    let mut chart_content: Option<Bytes> = None;
-
+    // Spool the .tgz straight to a bounded scratch file instead of buffering
+    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         if name == "chart" {
-            chart_content = Some(field.bytes().await.map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid file: {}", e)).into_response()
-            })?);
+            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+            break;
         }
     }
 
-    let content = chart_content
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
+    let staged =
+        staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
 
-    // Extract and validate Chart.yaml from the package
-    let chart_yaml = HelmHandler::extract_chart_yaml(&content).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid chart package: {}", e),
-        )
-            .into_response()
-    })?;
+    // Extract and validate Chart.yaml from the staged archive on disk, reading
+    // only the Chart.yaml entry (bounded memory) rather than the whole package.
+    let chart_yaml = extract_chart_yaml_from_staged(staged.path())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chart package: {}", e),
+            )
+                .into_response()
+        })?;
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;
     let filename = format!("{}-{}.tgz", chart_name, chart_version);
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
 
     // Build artifact path
     let artifact_path = format!("{}/{}/{}", chart_name, chart_version, filename);
@@ -493,10 +495,13 @@ async fn upload_chart(
     proxy_helpers::ensure_unique_artifact_path(&state.db, repo.id, &artifact_path, &conflict_msg)
         .await?;
 
+    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
+    // which computes the SHA-256 incrementally as it copies (no re-hash pass).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, content.clone()).await?;
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let computed_sha256 = put.checksum_sha256;
 
-    let size_bytes = content.len() as i64;
+    let size_bytes = put.bytes_written as i64;
 
     // Insert artifact record
     let artifact_id = proxy_helpers::insert_artifact(
@@ -547,6 +552,21 @@ async fn upload_chart(
             .unwrap(),
         ))
         .unwrap())
+}
+
+/// Extract Chart.yaml from a staged .tgz archive on disk. The blocking
+/// flate2/tar decode runs on a blocking thread so it never stalls the async
+/// runtime, and only the Chart.yaml entry is read (bounded memory).
+async fn extract_chart_yaml_from_staged(path: &std::path::Path) -> Result<ChartYaml, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        HelmHandler::extract_chart_yaml_from_reader(std::io::BufReader::new(file))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("chart extraction task failed: {}", e))?
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +644,57 @@ async fn delete_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Build a gzip-compressed tar (`.tgz`) holding a single `path`/`body`
+    /// entry, matching the on-disk layout the upload staging path reads.
+    fn build_tgz(path: &str, body: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&tar_buf).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_chart_yaml_from_staged_parses_metadata() {
+        let tgz = build_tgz(
+            "nginx/Chart.yaml",
+            b"apiVersion: v2\nname: nginx\nversion: 9.8.7\n",
+        );
+        let dir = std::env::temp_dir().join(format!("helm-staged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chart.tgz");
+        std::fs::write(&path, &tgz).unwrap();
+
+        let chart = extract_chart_yaml_from_staged(&path).await.unwrap();
+        assert_eq!(chart.name, "nginx");
+        assert_eq!(chart.version, "9.8.7");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_extract_chart_yaml_from_staged_malformed_errors() {
+        let dir = std::env::temp_dir().join(format!("helm-staged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.tgz");
+        std::fs::write(&path, b"this is not a gzip archive").unwrap();
+
+        assert!(extract_chart_yaml_from_staged(&path).await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // -----------------------------------------------------------------------
     // resolve_chart_url
@@ -906,6 +977,8 @@ entries:
     // the DB. Tests that return before any HTTP call can use a fake lazy pool.
 
     #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
     async fn test_fetch_chart_via_index_success_relative_url() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -948,12 +1021,26 @@ entries:
         let _ = std::fs::remove_dir_all(&tmp);
 
         match result {
-            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()
+                        .get("content-disposition")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("attachment; filename=\"mychart-1.0.0.tgz\"")
+                );
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect streamed chart body");
+                assert_eq!(&body[..], chart_bytes);
+            }
             Err(_) => panic!("fetch_chart_via_index should succeed"),
         }
     }
 
     #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
     async fn test_fetch_chart_via_index_success_absolute_url() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -997,9 +1084,93 @@ entries:
         let _ = std::fs::remove_dir_all(&tmp);
 
         match result {
-            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect streamed chart body");
+                assert_eq!(&body[..], chart_bytes);
+            }
             Err(_) => panic!("fetch_chart_via_index (absolute URL) should succeed"),
         }
+    }
+
+    // #2192 / #1608 Phase 4c: a chart larger than the old buffered cap
+    // (DEFAULT_METADATA_MAX_BYTES = 8 MiB) must now STREAM with 200 instead of
+    // 502, and the second request must be served WARM from the teed proxy cache
+    // without a second upstream round-trip for the chart blob.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_fetch_chart_via_index_streams_large_chart_and_warms_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = make_index_yaml("big", "3.0.0", "charts/big-3.0.0.tgz");
+        // 9 MiB > 8 MiB DEFAULT_METADATA_MAX_BYTES: would 502 on the buffered path.
+        let chart_bytes = vec![0x42u8; 9 * 1024 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/big-3.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes.clone()))
+            // Cache warm proof: the chart blob is fetched from upstream at most
+            // once across the two requests below.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&tmp, chart_bytes.len() as u64).await;
+            }
+            let result = fetch_chart_via_index(
+                &proxy,
+                repo_id,
+                "helm-proxy-big",
+                &upstream_url,
+                "big",
+                "3.0.0",
+                "big-3.0.0.tgz",
+            )
+            .await;
+            match result {
+                Ok(resp) => {
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    assert_eq!(
+                        resp.headers()
+                            .get("content-disposition")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("attachment; filename=\"big-3.0.0.tgz\"")
+                    );
+                    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .expect("collect streamed chart body");
+                    assert_eq!(body.len(), chart_bytes.len());
+                }
+                Err(_) => panic!("large chart must stream with 200, not 502"),
+            }
+        }
+
+        // `.expect(1)` on the chart mock is verified on server drop.
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

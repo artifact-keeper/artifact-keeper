@@ -291,7 +291,14 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let body = upstream_resp.bytes().await.map_err(|e| {
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped metadata read (upstream sumdb checksum-database response, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap -> 502; tracked under #1608
+    let body = axum::body::to_bytes(
+        Body::from_stream(upstream_resp.bytes_stream()),
+        16 * 1024 * 1024,
+    )
+    .await
+    .map_err(|e| {
         tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
         (
             StatusCode::BAD_GATEWAY,
@@ -364,9 +371,15 @@ async fn try_proxy_go_metadata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok((content, content_type)) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path)
-                    .await
+            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await
             {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -643,12 +656,13 @@ async fn get_mod_file(
                 {
                     let encoded = encode_module_path(module);
                     let upstream_path = format!("{}/@v/{}.mod", encoded, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await?;
                     return Ok(Response::builder()

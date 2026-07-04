@@ -129,8 +129,15 @@ async fn try_proxy_repodata(
         _ => return Ok(None),
     };
 
-    let (content, upstream_ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path).await?;
+    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
     Ok(Some(
@@ -1221,6 +1228,8 @@ fn xml_escape(s: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,6 @@
 //! Database models (SQLx).
 
+pub mod access_scope;
 pub mod api_token;
 pub mod artifact;
 pub mod audit_log;

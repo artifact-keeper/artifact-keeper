@@ -1056,12 +1056,13 @@ async fn channeldata_json(
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
+                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     "channeldata.json",
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await
                 {
@@ -1432,12 +1433,13 @@ async fn serve_repodata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
+                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await
                 {
@@ -2322,12 +2324,13 @@ async fn download_package(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("{}/{}", subdir, filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await?;
                     return Ok(Response::builder()

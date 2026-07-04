@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
+use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
 use crate::services::auth_service::AuthService;
 
 use super::users::{ApiTokenCreatedResponse, ApiTokenListResponse, ApiTokenResponse};
@@ -90,6 +91,18 @@ async fn create_access_token(
         .generate_api_token(auth.user_id, &payload.name, scopes, payload.expires_in_days)
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            token_id,
+            Some(&payload.name),
+            "profile",
+        ),
+    )
+    .await;
+
     Ok(Json(ApiTokenCreatedResponse {
         id: token_id,
         name: payload.name,
@@ -107,6 +120,19 @@ async fn revoke_access_token(
     auth_service
         .revoke_api_token(token_id, auth.user_id)
         .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "profile",
+        ),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -277,5 +303,103 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "new-token");
         assert_eq!(json["token"], "ak_secret_token_value");
+    }
+}
+
+/// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(test)]
+mod audit_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+        )
+        .bind(token_id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("audit_log count query")
+    }
+
+    /// `POST /profile/access-tokens` must emit `API_TOKEN_CREATED`, and the
+    /// matching revoke must emit `API_TOKEN_REVOKED`.
+    #[tokio::test]
+    async fn profile_token_mint_and_revoke_emit_audit_events() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+
+        let body = json!({ "name": "profile-audit", "scopes": ["read"] }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/access-tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "profile mint failed: {}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            1,
+            "profile mint MUST write one API_TOKEN_CREATED row"
+        );
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/access-tokens/{}", token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state, auth), req).await;
+        assert!(
+            status.is_success(),
+            "profile revoke should succeed: {status}"
+        );
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            1,
+            "profile revoke MUST write one API_TOKEN_REVOKED row"
+        );
+
+        cleanup(&pool, user_id).await;
     }
 }

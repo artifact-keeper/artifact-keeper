@@ -556,9 +556,15 @@ impl<'a> DebianProxy<'a> {
             _ => return Ok(()),
         };
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
-        let (content, upstream_ct) =
-            proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
-                .await?;
+        let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo.id,
+            self.repo_key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?;
         Err(build_dists_response(content, upstream_ct, content_type))
     }
 
@@ -812,8 +818,15 @@ async fn try_virtual_dists(
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
-        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
-            .await
+        match proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await
         {
             Ok((content, upstream_ct)) => {
                 return Ok(Some(build_dists_response(
@@ -1287,8 +1300,15 @@ async fn dists_proxy_catchall(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
-    let (content, upstream_ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
+    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
 

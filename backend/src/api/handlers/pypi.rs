@@ -23,7 +23,6 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
@@ -295,12 +294,13 @@ async fn fetch_remote_simple_root(
     let proxy = state.proxy_service.as_ref()?;
 
     let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
-    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+    let (content, _content_type) = match proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await
     {
@@ -608,7 +608,7 @@ async fn simple_project(
                 let (content, content_type) = if wants_json {
                     // Request the PEP 691 JSON form from upstream, cached under a
                     // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -616,15 +616,17 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 };
@@ -765,7 +767,7 @@ async fn simple_project(
                 let (effective_upstream, upstream_path) =
                     pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let result = if wants_json {
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         member.id,
                         &member.key,
@@ -773,15 +775,17 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 };
@@ -1219,7 +1223,7 @@ async fn serve_file(
             // logic for remote members because external registries (e.g.
             // pypi.org) host files on a different domain than the simple
             // index. We iterate members manually and delegate to
-            // fetch_from_pypi_remote for each remote member.
+            // fetch_from_pypi_remote_streaming for each remote member.
             if repo.repo_type == RepositoryType::Virtual {
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
@@ -1387,10 +1391,10 @@ async fn serve_file(
             (&repo.upstream_url, &state.proxy_service)
         {
             get_remote_cached_or_refetch_stream(
-                storage.as_ref(),
+                storage.clone(),
                 &artifact.storage_key,
                 || async move {
-                    fetch_from_pypi_remote(
+                    fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
                         repo_key,
@@ -1444,18 +1448,24 @@ async fn serve_file(
 }
 
 /// Streaming variant of the PyPI proxy cache read. Streams a cache hit
-/// straight from storage; on a miss it re-fetches the wheel from upstream
-/// (buffered, since the recovery payload must also be written back to the
-/// cache to avoid a thundering herd) and re-wraps the recovered bytes as a
-/// one-shot stream so the caller always receives a `BoxStream`.
+/// straight from storage; on a miss it re-fetches the wheel from upstream and
+/// STREAMS it to the caller while teeing it back into storage so the next
+/// request is served warm.
+///
+/// #2192 / #1608 Phase 4c: the previous recovery path buffered the refetch
+/// (capped at 16 MiB by #2181) and 502'd a wheel larger than the cap even
+/// though the primary download path streams. The refetch now yields a
+/// [`StreamingFetchResult`] (via `fetch_from_pypi_remote_streaming`) and the
+/// body is teed into `storage_key` as it flows to the client — preserving the
+/// thundering-herd write-back (PR #1283) without ever buffering the whole wheel.
 async fn get_remote_cached_or_refetch_stream<F, Fut>(
-    storage: &dyn crate::storage::StorageBackend,
+    storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
     storage_key: &str,
     refetch: F,
 ) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Response>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<Bytes, Response>>,
+    Fut: Future<Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>>,
 {
     match storage.get_stream(storage_key).await {
         Ok(stream) => Ok(stream
@@ -1464,27 +1474,117 @@ where
         Err(AppError::NotFound(_)) => {
             tracing::warn!(
                 storage_key = %storage_key,
-                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
+                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream (streaming)"
             );
-            let bytes = refetch().await?;
-            // Best-effort write-back: persist the refetched payload so the
-            // next request hits the cache instead of re-traversing the
-            // simple index and re-downloading from upstream. Without this,
-            // N concurrent `uv` clients each issue a fresh upstream fetch
-            // for the same wheel (thundering herd; see PR #1283 review).
-            // We swallow write errors to keep serving the current request,
-            // but log them so operators can spot a broken backend.
-            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
-                tracing::warn!(
-                    storage_key = %storage_key,
-                    error = %e,
-                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
-                );
-            }
-            Ok(futures::stream::once(async { Ok(bytes) }).boxed())
+            let result = refetch().await?;
+            Ok(tee_refetch_to_storage(
+                storage,
+                storage_key.to_string(),
+                result.content_length,
+                result.body,
+            ))
         }
         Err(e) => Err(map_storage_err(e)),
     }
+}
+
+/// Tee a streaming refetch body into repo storage at `storage_key` while
+/// forwarding it to the caller (#2192 / #1608 Phase 4c).
+///
+/// Replaces the buffered `storage.put(storage_key, bytes)` write-back the
+/// recovery path used to perform, without buffering the whole payload:
+///
+/// * The body is forwarded to the client verbatim.
+/// * A clone of each chunk is streamed, in order and with backpressure, to a
+///   background `put_stream` so the cached blob is byte-exact.
+/// * The client stream awaits the write-back at EOF, so a subsequent request
+///   deterministically observes the warmed entry.
+/// * Best-effort: a write failure is logged but never fails the in-flight
+///   download. A truncated write-back (client disconnect, short read, or upstream
+///   error mid-stream) is detected against `expected_len` and the partial cache
+///   entry is deleted so no corrupt blob is ever served warm.
+fn tee_refetch_to_storage(
+    storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
+    storage_key: String,
+    expected_len: Option<u64>,
+    upstream: BoxStream<'static, crate::error::Result<Bytes>>,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    // Bounded channel: a slow backend applies backpressure to the upstream read
+    // instead of letting chunks pile up in memory. Order is preserved and no
+    // chunk is dropped, so the written-back blob matches the served bytes.
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::error::Result<Bytes>>(16);
+    let writer_key = storage_key.clone();
+    let writer = tokio::spawn(async move {
+        let rx_stream =
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) });
+        match storage.put_stream(&writer_key, Box::pin(rx_stream)).await {
+            Ok(w) => {
+                // Compensate for a partial write (the default put_stream commits
+                // whatever it received when the channel closes cleanly): if the
+                // written length does not match the advertised length, delete the
+                // truncated entry so it is never served as a warm hit.
+                if let Some(expected) = expected_len {
+                    if w.bytes_written != expected {
+                        tracing::warn!(
+                            storage_key = %writer_key,
+                            expected,
+                            written = w.bytes_written,
+                            "streaming write-back of refetched PyPI payload was truncated; \
+                             deleting partial cache entry"
+                        );
+                        let _ = storage.delete(&writer_key).await;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    storage_key = %writer_key,
+                    error = %e,
+                    "streaming write-back of refetched PyPI payload failed; \
+                     subsequent requests will re-fetch from upstream"
+                );
+            }
+        }
+    });
+
+    futures::stream::unfold(
+        (upstream, Some(tx), Some(writer)),
+        |(mut upstream, mut tx, mut writer)| async move {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    if let Some(sender) = tx.as_ref() {
+                        // Backpressure on the writer; drop the tee (not the
+                        // client stream) if the writer has gone away.
+                        if sender.send(Ok(bytes.clone())).await.is_err() {
+                            tx = None;
+                        }
+                    }
+                    Some((Ok(bytes), (upstream, tx, writer)))
+                }
+                Some(Err(e)) => {
+                    // Propagate the error to the writer so the default put_stream
+                    // aborts (no partial commit), then stop teeing.
+                    if let Some(sender) = tx.as_ref() {
+                        let _ = sender
+                            .send(Err(crate::error::AppError::Internal(e.to_string())))
+                            .await;
+                    }
+                    let io_err = std::io::Error::other(e.to_string());
+                    Some((Err(io_err), (upstream, None, writer)))
+                }
+                None => {
+                    // EOF: closing the channel lets put_stream commit; await it so
+                    // a subsequent request observes the warmed entry.
+                    drop(tx);
+                    if let Some(handle) = writer.take() {
+                        let _ = handle.await;
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed()
 }
 
 /// Resolved upstream download target for a PyPI remote file, produced by
@@ -1590,39 +1690,6 @@ async fn resolve_pypi_remote_fetch_target(
     })
 }
 
-/// Fetch a file from a remote PyPI upstream using the format-specific URL
-/// resolution logic, buffering the whole body in memory.
-///
-/// **Prefer [`fetch_from_pypi_remote_streaming`] on download paths.** This
-/// buffered variant exists only for callers that genuinely need the full
-/// `Bytes` in-process — currently the cache-recovery closure in
-/// [`get_remote_cached_or_refetch_stream`], which must write the refetched
-/// payload back to storage.
-async fn fetch_from_pypi_remote(
-    proxy: &crate::services::proxy_service::ProxyService,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    project: &str,
-    filename: &str,
-) -> Result<Bytes, Response> {
-    let target =
-        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
-            .await?;
-
-    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
-        proxy,
-        repo_id,
-        repo_key,
-        &target.fetch_base,
-        &target.fetch_path,
-        &target.cache_path,
-    )
-    .await?;
-
-    Ok(content)
-}
-
 /// #1555: presigned-redirect fast path for a fresh proxy-cache hit on a remote
 /// PyPI member. Returns `Some(307 redirect)` only when presigned downloads are
 /// enabled and the cache is fresh, signing the cache key through the proxy's own
@@ -1664,11 +1731,14 @@ async fn pypi_proxy_cache_redirect(
     .await
 }
 
-/// Streaming sibling of [`fetch_from_pypi_remote`] (#895 OOM relief).
+/// Fetch a PyPI package file from a remote upstream as a stream (#895 OOM
+/// relief).
 ///
-/// Resolves the real download URL via the simple index exactly like the
-/// buffered variant, then streams the package file from upstream — teed
-/// into the proxy cache — instead of buffering it in memory. Large wheels
+/// Resolves the real download URL via the simple index (buffered, in-process),
+/// then streams the package file from upstream — teed into the proxy cache —
+/// instead of buffering it in memory. This is the single fetch path for remote
+/// PyPI downloads, including the cache-recovery write-back in
+/// [`get_remote_cached_or_refetch_stream`]. Large wheels
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
@@ -1814,6 +1884,7 @@ fn extract_metadata_from_sdist(content: &[u8]) -> Option<String> {
 // POST /pypi/{repo_key}/ — Twine upload
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1834,7 +1905,8 @@ async fn upload(
     let mut action: Option<String> = None;
     let mut pkg_name: Option<String> = None;
     let mut pkg_version: Option<String> = None;
-    let mut file_content: Option<Bytes> = None;
+    let mut staged_content: Option<proxy_helpers::StagedUpload> = None;
+    let mut content_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut file_name: Option<String> = None;
     let mut sha256_digest: Option<String> = None;
     let mut _md5_digest: Option<String> = None;
@@ -1886,9 +1958,12 @@ async fn upload(
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                file_content = Some(field.bytes().await.map_err(|e| {
-                    AppError::Validation(format!("Invalid file: {}", e)).into_response()
-                })?);
+                // Spool the wheel straight to a bounded scratch file while
+                // computing SHA-256/SHA-1/MD5 incrementally — never buffered.
+                let (s, d) =
+                    proxy_helpers::stage_upload_field_content_addressed(&state, field).await?;
+                staged_content = Some(s);
+                content_digests = Some(d);
             }
             // Capture other metadata fields
             _ => {
@@ -1929,7 +2004,10 @@ async fn upload(
     let pkg_version = pkg_version.ok_or_else(|| {
         AppError::Validation("Missing 'version' field".to_string()).into_response()
     })?;
-    let content = file_content.ok_or_else(|| {
+    let staged_content = staged_content.ok_or_else(|| {
+        AppError::Validation("Missing 'content' field".to_string()).into_response()
+    })?;
+    let digests = content_digests.ok_or_else(|| {
         AppError::Validation("Missing 'content' field".to_string()).into_response()
     })?;
     let filename = file_name.ok_or_else(|| {
@@ -1938,10 +2016,8 @@ async fn upload(
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // SHA-256 was computed incrementally while the body was spooled to disk.
+    let computed_sha256 = digests.sha256.clone();
 
     // Verify digest if provided
     if let Some(ref expected) = sha256_digest {
@@ -1995,7 +2071,7 @@ async fn upload(
     let content_type = pypi_content_type(&filename);
 
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
-    let size_bytes = content.len() as i64;
+    let size_bytes = staged_content.size_bytes();
 
     // No pre-cleanup here: this path persists through
     // `artifact_service::upload_with_sync_options`, whose release-immutability
@@ -2008,19 +2084,26 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
+    // Re-read the staged scratch file as a `'static` stream; the service does the
+    // dedup `exists()` check first and only streams into storage on a miss.
+    let content_stream = proxy_helpers::open_staged_upload_stream(&staged_content).await?;
     let artifact = artifact_service
-        .upload_with_sync_options(
+        .upload_stream_with_sync_options(
             repo.id,
             &artifact_path,
             &normalized,
             Some(&pkg_version),
             content_type,
-            content,
+            content_stream,
+            digests,
+            size_bytes,
             Some(user_id),
             should_enqueue_pypi_sync_tasks(&headers),
         )
         .await
         .map_err(|e| e.into_response())?;
+    // Scratch file no longer needed once the service has consumed the stream.
+    drop(staged_content);
 
     artifact_service
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
@@ -2419,9 +2502,12 @@ fn merge_local_into_remote_simple_json(
     serde_json::to_string(&doc).ok()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -3700,6 +3786,18 @@ mod tests {
         Bytes::from(buf)
     }
 
+    /// Wrap static bytes as a one-shot [`StreamingFetchResult`] so the recovery
+    /// tests can drive the streaming refetch closure (#2192).
+    fn one_shot_result(
+        content: &'static [u8],
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: Some(content.len() as u64),
+        }
+    }
+
     /// Storage double that reports the entry as missing on every `get`, and
     /// records every `put` so tests can assert the write-back path persists
     /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
@@ -3736,6 +3834,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns the configured bytes for any `get` call, simulating a healthy
@@ -3761,6 +3866,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns a non-`NotFound` storage error for every `get`, simulating an
@@ -3785,27 +3897,35 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
         // Streaming refetch path is DB-free (storage doubles only), so this runs
         // in Tier-1 `cargo test --lib` without a live Postgres.
-        let storage = MissingStorage::new();
+        let storage = std::sync::Arc::new(MissingStorage::new());
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let stream = super::get_remote_cached_or_refetch_stream(&storage, storage_key, move || {
-            let refetch_calls_clone = refetch_calls_clone.clone();
-            async move {
-                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(Bytes::from_static(b"refetched-bytes"))
-            }
-        })
-        .await
-        .expect("refetch should succeed");
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), storage_key, move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(one_shot_result(b"refetched-bytes"))
+                }
+            })
+            .await
+            .expect("refetch should succeed");
         let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
@@ -3852,6 +3972,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     #[tokio::test]
@@ -3860,11 +3987,11 @@ mod tests {
         // disk is full or read-only the user still gets their wheel; the
         // next request will simply re-fetch from upstream until the backend
         // recovers.
-        let storage = WriteFailingStorage;
+        let storage = std::sync::Arc::new(WriteFailingStorage);
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
-            move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
+            move || async move { Ok(one_shot_result(b"refetched-when-disk-full")) },
         )
         .await
         .expect("write-back failures must not fail the current request");
@@ -3877,20 +4004,20 @@ mod tests {
     async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
         // Happy path: cache hits should return the stored bytes verbatim and
         // must NEVER invoke the upstream refetch closure.
-        let storage = PresentStorage {
+        let storage = std::sync::Arc::new(PresentStorage {
             bytes: Bytes::from_static(b"cached-wheel-bytes"),
-        };
+        });
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"should-not-be-used"))
+                    Ok(one_shot_result(b"should-not-be-used"))
                 }
             },
         )
@@ -3911,18 +4038,18 @@ mod tests {
         // A storage backend error that is NOT `NotFound` (e.g. permission
         // denied, I/O error) must be surfaced as a 500 instead of silently
         // re-fetching, otherwise we mask infra issues from operators.
-        let storage = BrokenStorage;
+        let storage = std::sync::Arc::new(BrokenStorage);
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"never-reached"))
+                    Ok(one_shot_result(b"never-reached"))
                 }
             },
         )
@@ -3947,12 +4074,12 @@ mod tests {
         // When the cache is stale AND the upstream refetch also fails, the
         // upstream error response must reach the caller untouched so the
         // client sees the correct upstream status (e.g. 502).
-        let storage = MissingStorage::new();
+        let storage = std::sync::Arc::new(MissingStorage::new());
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
@@ -3984,20 +4111,20 @@ mod tests {
         // still a cache hit and must be returned without triggering a
         // refetch. This guards against accidentally treating empty bodies
         // as "missing".
-        let storage = PresentStorage {
+        let storage = std::sync::Arc::new(PresentStorage {
             bytes: Bytes::new(),
-        };
+        });
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"unexpected"))
+                    Ok(one_shot_result(b"unexpected"))
                 }
             },
         )
@@ -4010,6 +4137,116 @@ mod tests {
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "empty cached payload is a cache hit, not a stale miss"
+        );
+    }
+
+    /// Storage double that reports missing on `get` but records both `put`
+    /// (write-back) and `delete` (truncation compensation).
+    struct RecordingStorage {
+        puts: std::sync::Mutex<Vec<(String, Bytes)>>,
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStorage {
+        fn new() -> Self {
+            Self {
+                puts: std::sync::Mutex::new(Vec::new()),
+                deletes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for RecordingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.puts
+                .lock()
+                .expect("puts mutex")
+                .push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.deletes
+                .lock()
+                .expect("deletes mutex")
+                .push(key.to_string());
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    fn multi_chunk_result(
+        chunks: Vec<&'static [u8]>,
+        content_length: Option<u64>,
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))))
+                .boxed(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length,
+        }
+    }
+
+    /// #2192: a multi-chunk streaming refetch must serve every chunk to the
+    /// caller AND write the full, byte-exact payload back for the next request.
+    #[tokio::test]
+    async fn test_streaming_refetch_tees_multi_chunk_body_to_cache() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/big/big-9.9.9-py3-none-any.whl/__content__";
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
+                Ok(multi_chunk_result(vec![b"aaaa", b"bbbb", b"cc"], Some(10)))
+            })
+            .await
+            .expect("streaming refetch should succeed");
+        let content = collect_stream(stream).await;
+
+        assert_eq!(content, Bytes::from_static(b"aaaabbbbcc"));
+        let puts = storage.puts.lock().expect("puts mutex");
+        assert_eq!(puts.len(), 1, "full body must be written back exactly once");
+        assert_eq!(puts[0].0, key);
+        assert_eq!(puts[0].1, Bytes::from_static(b"aaaabbbbcc"));
+        assert!(
+            storage.deletes.lock().expect("deletes mutex").is_empty(),
+            "a complete write-back must not be deleted"
+        );
+    }
+
+    /// #2192: if the written-back length does not match the advertised
+    /// `content_length` (truncation / short read), the partial cache entry must
+    /// be deleted so it is never served as a corrupt warm hit.
+    #[tokio::test]
+    async fn test_streaming_refetch_deletes_truncated_writeback() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/trunc/trunc-1.0.0-py3-none-any.whl/__content__";
+        // Advertise 100 bytes but only deliver 4: the guard must delete.
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
+                Ok(multi_chunk_result(vec![b"abcd"], Some(100)))
+            })
+            .await
+            .expect("streaming refetch should succeed even when truncated");
+        let content = collect_stream(stream).await;
+
+        // The caller still receives whatever bytes arrived.
+        assert_eq!(content, Bytes::from_static(b"abcd"));
+        let deletes = storage.deletes.lock().expect("deletes mutex");
+        assert_eq!(
+            deletes.as_slice(),
+            &[key.to_string()],
+            "a truncated write-back must be deleted, not served warm"
         );
     }
 

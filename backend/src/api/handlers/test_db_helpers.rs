@@ -12,6 +12,9 @@
 //!     let Some(pool) = tdh::try_pool().await else { return; };
 
 #![allow(dead_code)]
+// streaming-invariant: test scaffolding exempt — buffering response bodies in
+// DB-backed handler tests is not an artifact path (#1608).
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +96,55 @@ pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     ScanDedupSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
+///
+/// Distinct from [`SCAN_DEDUP_TEST_LOCK_KEY`] and from the application
+/// advisory locks, so the blob-GC test cluster serializes only against
+/// itself.
+const BLOB_GC_TEST_LOCK_KEY: i64 = 0x424C_1660; // "BL" + issue #1660
+
+/// Cross-process serialization guard for the DB-backed blob-GC tests (#1660).
+///
+/// The blob-GC service operates on the WHOLE database: `select_orphan_blobs`,
+/// `select_pending_delete_blobs`, `prune_orphan_blob_refs` and the mark/sweep
+/// loops are not scoped to a single repository. Under the coverage job's
+/// process-per-test parallelism (`cargo nextest`), one test's apply-mode pass
+/// would mark/sweep another test's freshly-seeded orphan blob, or prune a peer
+/// test's still-referenced-but-untagged `manifest_blob_refs` row, before that
+/// peer asserts on it. A Postgres *session* advisory lock — mirroring
+/// [`scan_dedup_serial_lock`] — makes every blob-GC test contend for one key,
+/// so only one runs its seed → GC → assert critical section at a time. The
+/// lock releases when the guard drops (connection closes), including on panic.
+pub struct BlobGcSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide blob-GC test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
+/// test and bind the result for the whole test body.
+pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return BlobGcSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return BlobGcSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(BLOB_GC_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return BlobGcSerialGuard { _conn: None };
+    }
+    BlobGcSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
@@ -146,6 +198,7 @@ fn cfg(storage_path: &str) -> Config {
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         blob_gc_enabled: false,
+        blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
@@ -193,6 +246,9 @@ fn cfg(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        proxy_singleflight_advisory_locks_enabled: false,
+        proxy_singleflight_lock_poll_interval_ms: 200,
+        proxy_singleflight_lock_wait_timeout_secs: 65,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
@@ -361,6 +417,37 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .execute(pool)
     .await
     .expect("grant developer role");
+}
+
+/// Recursively find the largest file (in bytes) under `dir`, or 0 if none.
+fn dir_max_file_size(dir: &std::path::Path) -> u64 {
+    let mut max = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            max = max.max(dir_max_file_size(&path));
+        } else if let Ok(meta) = std::fs::metadata(&path) {
+            max = max.max(meta.len());
+        }
+    }
+    max
+}
+
+/// Poll `dir` until a file of at least `min_size` bytes appears (the committed
+/// proxy-cache blob) or a bounded timeout elapses. The streaming write-back tee
+/// commits the cache asynchronously after the response body drains, so tests
+/// that assert a WARM second request must wait for the commit deterministically
+/// instead of racing it (#2192 / #1608 Phase 4c).
+pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
+    for _ in 0..200 {
+        if dir_max_file_size(dir) >= min_size {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
@@ -647,4 +734,28 @@ pub fn build_state_with_proxy_presigned(
     let mut state = app_state_with(config, pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
+}
+
+/// Repoint a fixture's Remote repository at `upstream_url` and build a
+/// [`SharedState`] wired with a real [`ProxyService`] whose proxy cache lives in
+/// a fresh temp dir (returned so the caller keeps it alive for the request).
+///
+/// Shared by the format handlers' `remote download streams upstream blob`
+/// regression tests (#1608 Phase 4): they mount a wiremock upstream, call this
+/// to wire the proxy in, then drive the handler router end-to-end to exercise
+/// the streaming pull-through branch (`proxy_fetch_streaming`).
+pub async fn rewire_remote_proxy(
+    fx: &Fixture,
+    upstream_url: &str,
+) -> (crate::api::SharedState, tempfile::TempDir) {
+    sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+        .bind(upstream_url)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("update upstream_url");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proxy = build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+    let state = build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+    (state, dir)
 }

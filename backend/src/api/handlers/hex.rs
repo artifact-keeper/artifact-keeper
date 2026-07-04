@@ -91,12 +91,13 @@ async fn package_info(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let upstream_path = format!("packages/{}", name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -506,9 +507,15 @@ async fn list_names(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "names")
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "names",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(
@@ -591,9 +598,15 @@ async fn list_versions(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "versions")
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "versions",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(
@@ -998,6 +1011,8 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
     None
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

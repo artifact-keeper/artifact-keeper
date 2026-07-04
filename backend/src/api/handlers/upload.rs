@@ -701,7 +701,7 @@ async fn complete(
         PackageService::new(state.db.clone())
             .try_create_or_update_from_artifact(
                 session.repository_id,
-                package_name,
+                &package_name,
                 package_version,
                 session.total_size,
                 &session.checksum_sha256,
@@ -947,21 +947,91 @@ fn completed_format_artifact_version(
     Some(format!("sha256-{}", suffix))
 }
 
+fn replicated_maven_artifact_metadata(
+    session: &upload_service::UploadSession,
+) -> Option<&serde_json::Value> {
+    match session.artifact_metadata_format.as_deref() {
+        Some(format) if format.eq_ignore_ascii_case("maven") => session.artifact_metadata.as_ref(),
+        _ => None,
+    }
+}
+
+fn maven_package_name_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    let group_id = metadata.get("groupId")?.as_str()?.trim();
+    let artifact_id = metadata.get("artifactId")?.as_str()?.trim();
+    if group_id.is_empty() || artifact_id.is_empty() {
+        return None;
+    }
+    Some(format!("{group_id}:{artifact_id}"))
+}
+
+fn replicated_maven_artifact_is_pom(session: &upload_service::UploadSession) -> bool {
+    let metadata_extension_is_pom = replicated_maven_artifact_metadata(session)
+        .and_then(|metadata| metadata.get("extension"))
+        .and_then(|extension| extension.as_str())
+        .map(|extension| extension.eq_ignore_ascii_case("pom"))
+        .unwrap_or(false);
+
+    metadata_extension_is_pom || session.artifact_path.ends_with(".pom")
+}
+
+fn maven_package_metadata_from_artifact_metadata(
+    session: &upload_service::UploadSession,
+) -> Option<serde_json::Value> {
+    if !replicated_maven_artifact_is_pom(session) {
+        return None;
+    }
+
+    let metadata = replicated_maven_artifact_metadata(session)?;
+    let group_id = metadata.get("groupId")?.as_str()?.trim();
+    let artifact_id = metadata.get("artifactId")?.as_str()?.trim();
+    if group_id.is_empty() || artifact_id.is_empty() {
+        return None;
+    }
+
+    let mut catalog = serde_json::json!({
+        "format": "maven",
+        "groupId": group_id,
+        "artifactId": artifact_id,
+    });
+
+    for key in ["name", "description", "url", "dependencies"] {
+        if let Some(value) = metadata.get(key) {
+            catalog[key] = value.clone();
+        }
+    }
+
+    Some(catalog)
+}
+
 fn completed_package_catalog_entry(
     session: &upload_service::UploadSession,
-) -> Option<(&str, &str)> {
+) -> Option<(String, &str)> {
     let version = completed_artifact_version(session)?;
-    Some((completed_artifact_name(session), version))
+    let name = replicated_maven_artifact_metadata(session)
+        .and_then(maven_package_name_from_metadata)
+        .unwrap_or_else(|| completed_artifact_name(session).to_string());
+    Some((name, version))
 }
 
 fn completed_package_description(session: &upload_service::UploadSession) -> Option<&str> {
-    session.package_description.as_deref()
+    session.package_description.as_deref().or_else(|| {
+        if !replicated_maven_artifact_is_pom(session) {
+            return None;
+        }
+        replicated_maven_artifact_metadata(session)?
+            .get("description")?
+            .as_str()
+    })
 }
 
 fn completed_package_metadata(
     session: &upload_service::UploadSession,
 ) -> Option<serde_json::Value> {
-    session.package_metadata.clone()
+    session
+        .package_metadata
+        .clone()
+        .or_else(|| maven_package_metadata_from_artifact_metadata(session))
 }
 
 async fn cleanup_completed_upload_session(db: &sqlx::PgPool, session_id: Uuid) {
@@ -1065,6 +1135,8 @@ fn replication_session_metadata_from_request<'a>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[allow(clippy::io_other_error, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
@@ -1346,8 +1418,68 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session),
-            Some(("large-check", "20260603T082854Z"))
+            Some(("large-check".to_string(), "20260603T082854Z"))
         );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_uses_replicated_maven_metadata() {
+        let mut session = test_upload_session(
+            "org/example/ak/maven/ak-core/1.0.0/ak-core-1.0.0.pom",
+            Some("ak-core"),
+            Some("1.0.0"),
+        );
+        session.artifact_metadata_format = Some("maven".to_string());
+        session.artifact_metadata = Some(serde_json::json!({
+            "format": "maven",
+            "groupId": "org.example.ak.maven",
+            "artifactId": "ak-core",
+            "version": "1.0.0",
+            "extension": "pom",
+            "description": "Replicated Maven package",
+            "dependencies": [
+                {"groupId": "com.example", "artifactId": "dep", "version": "2.0.0"}
+            ]
+        }));
+
+        assert_eq!(
+            completed_package_catalog_entry(&session),
+            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+        );
+        assert_eq!(
+            completed_package_description(&session),
+            Some("Replicated Maven package")
+        );
+        let metadata = completed_package_metadata(&session).expect("maven package metadata");
+        assert_eq!(metadata["format"], "maven");
+        assert_eq!(metadata["groupId"], "org.example.ak.maven");
+        assert_eq!(metadata["artifactId"], "ak-core");
+        assert_eq!(metadata["description"], "Replicated Maven package");
+        assert_eq!(metadata["dependencies"][0]["artifactId"], "dep");
+    }
+
+    #[test]
+    fn test_completed_package_metadata_does_not_synthesize_for_replicated_maven_jar() {
+        let mut session = test_upload_session(
+            "org/example/ak/maven/ak-core/1.0.0/ak-core-1.0.0.jar",
+            Some("ak-core"),
+            Some("1.0.0"),
+        );
+        session.artifact_metadata_format = Some("maven".to_string());
+        session.artifact_metadata = Some(serde_json::json!({
+            "format": "maven",
+            "groupId": "org.example.ak.maven",
+            "artifactId": "ak-core",
+            "version": "1.0.0",
+            "extension": "jar"
+        }));
+
+        assert_eq!(
+            completed_package_catalog_entry(&session),
+            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+        );
+        assert_eq!(completed_package_description(&session), None);
+        assert_eq!(completed_package_metadata(&session), None);
     }
 
     #[test]
@@ -2541,6 +2673,71 @@ mod tests {
         (sessions, chunks)
     }
 
+    fn sha256_hex(payload: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        hex::encode(hasher.finalize())
+    }
+
+    async fn complete_replication_upload(
+        f: &tdh::Fixture,
+        create_body: serde_json::Value,
+        payload: &[u8],
+    ) -> Uuid {
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let create_req = create_replication_session_req(&create_body);
+        let (status, body) = tdh::send(app, create_req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create_session must preserve replication metadata; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id: Uuid =
+            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", session_id))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "chunk PATCH must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .header("x-artifact-keeper-replication", "true")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "complete must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        session_id
+    }
+
     #[tokio::test]
     async fn create_replication_session_removes_stale_replication_session_for_same_path() {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
@@ -2877,81 +3074,35 @@ mod tests {
         };
 
         let payload: &[u8] = b"replicated-debian-package-bytes";
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(payload);
-        let checksum = hex::encode(hasher.finalize());
+        let checksum = sha256_hex(payload);
 
         let artifact_path = "pool/main/a/app/app_1_amd64.deb";
-        let auth = tdh::make_auth(f.user_id, &f.username);
-        let app = upload_router_with_auth(f.state.clone(), auth);
-        let create_req = create_replication_session_req(&serde_json::json!({
-            "repository_key": f.repo_key,
-            "artifact_path": artifact_path,
-            "artifact_name": "app",
-            "artifact_version": "1",
-            "artifact_metadata_format": "debian",
-            "artifact_metadata": {
-                "format": "debian",
-                "architecture": "amd64",
-                "component": "main"
-            },
-            "artifact_metadata_properties": {"source": "lux"},
-            "package_description": "replicated Debian package",
-            "package_metadata": {
-                "format": "debian",
-                "component": "main"
-            },
-            "total_size": payload.len() as i64,
-            "checksum_sha256": checksum,
-            "chunk_size": 1024 * 1024_i64,
-        }));
-        let (status, body) = tdh::send(app, create_req).await;
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "create_session must preserve replication metadata; body: {}",
-            String::from_utf8_lossy(&body)
-        );
-        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let session_id: Uuid =
-            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
-
-        let auth = tdh::make_auth(f.user_id, &f.username);
-        let app = upload_router_with_auth(f.state.clone(), auth);
-        let req = axum::http::Request::builder()
-            .method("PATCH")
-            .uri(format!("/{}", session_id))
-            .header(
-                "content-range",
-                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
-            )
-            .header("content-type", "application/octet-stream")
-            .body(axum::body::Body::from(payload.to_vec()))
-            .unwrap();
-        let (status, body) = tdh::send(app, req).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "chunk PATCH must succeed; body: {}",
-            String::from_utf8_lossy(&body)
-        );
-
-        let auth = tdh::make_auth(f.user_id, &f.username);
-        let app = upload_router_with_auth(f.state.clone(), auth);
-        let req = axum::http::Request::builder()
-            .method("PUT")
-            .uri(format!("/{}/complete", session_id))
-            .header("x-artifact-keeper-replication", "true")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let (status, body) = tdh::send(app, req).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "complete must succeed; body: {}",
-            String::from_utf8_lossy(&body)
-        );
+        let session_id = complete_replication_upload(
+            &f,
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "app",
+                "artifact_version": "1",
+                "artifact_metadata_format": "debian",
+                "artifact_metadata": {
+                    "format": "debian",
+                    "architecture": "amd64",
+                    "component": "main"
+                },
+                "artifact_metadata_properties": {"source": "lux"},
+                "package_description": "replicated Debian package",
+                "package_metadata": {
+                    "format": "debian",
+                    "component": "main"
+                },
+                "total_size": payload.len() as i64,
+                "checksum_sha256": checksum,
+                "chunk_size": 1024 * 1024_i64,
+            }),
+            payload,
+        )
+        .await;
         assert_eq!(
             upload_session_row_counts(&f.pool, session_id).await,
             (0, 0),
@@ -2988,6 +3139,84 @@ mod tests {
         assert_eq!(pkg.0, "1");
         assert_eq!(pkg.1.as_deref(), Some("replicated Debian package"));
         assert_eq!(pkg.2.expect("package metadata")["component"], "main");
+
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_materializes_maven_replication_package_catalog_from_metadata() {
+        let Some(f) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let payload: &[u8] = br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.ak.maven</groupId>
+  <artifactId>ak-core</artifactId>
+  <version>1.0.0</version>
+  <description>Replicated Maven package</description>
+</project>"#;
+        let checksum = sha256_hex(payload);
+
+        let artifact_path = "org/example/ak/maven/ak-core/1.0.0/ak-core-1.0.0.pom";
+        let session_id = complete_replication_upload(
+            &f,
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "ak-core",
+                "artifact_version": "1.0.0",
+                "artifact_metadata_format": "maven",
+                "artifact_metadata": {
+                    "format": "maven",
+                    "groupId": "org.example.ak.maven",
+                    "artifactId": "ak-core",
+                    "version": "1.0.0",
+                    "extension": "pom",
+                    "description": "Replicated Maven package"
+                },
+                "total_size": payload.len() as i64,
+                "checksum_sha256": checksum,
+                "chunk_size": 1024 * 1024_i64,
+                "content_type": "text/xml",
+            }),
+            payload,
+        )
+        .await;
+
+        let artifact: (String, String) = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query replicated Maven artifact");
+        assert_eq!(artifact.0, "ak-core");
+        assert_eq!(artifact.1, "1.0.0");
+
+        let package: (String, String, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT name, version, description, metadata FROM packages WHERE repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query replicated Maven package catalog");
+        assert_eq!(package.0, "org.example.ak.maven:ak-core");
+        assert_eq!(package.1, "1.0.0");
+        assert_eq!(package.2.as_deref(), Some("Replicated Maven package"));
+        let metadata = package.3.expect("Maven package metadata");
+        assert_eq!(metadata["format"], "maven");
+        assert_eq!(metadata["groupId"], "org.example.ak.maven");
+        assert_eq!(metadata["artifactId"], "ak-core");
 
         let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
             .bind(session_id)

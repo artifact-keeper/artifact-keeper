@@ -1073,6 +1073,8 @@ async fn assert_connect_info_wired(app: Router) {
         "ConnectInfo<SocketAddr> wiring is not active: boot probe returned {status} \
          (expected the serve path's connect_info_make_service to inject the peer)"
     );
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: 64-byte boot self-probe body; not an artifact path (#1608)
     let body = axum::body::to_bytes(response.into_body(), 64)
         .await
         .expect("probe body");

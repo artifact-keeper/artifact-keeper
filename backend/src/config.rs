@@ -308,6 +308,17 @@ pub struct Config {
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
 
+    /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
+    /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
+    /// only physically *swept* (storage + row delete) in a later pass once it
+    /// has stayed marked for at least this long AND is still orphan. The
+    /// window gives a concurrent re-push time to resurrect a re-adopted blob
+    /// (clear the marker under the push-path row lock) before its bytes are
+    /// deleted, so no live blob is ever swept. Defaults to 3600 (1 hour); set
+    /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
+    /// next pass with no extra delay.
+    pub blob_gc_sweep_grace_secs: u64,
+
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
 
@@ -560,6 +571,26 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    // -- Proxy pull-through cache cross-replica single-flight (#1609) --
+    /// Enable the cross-replica single-flight coordinator for pull-through cache
+    /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
+    /// replica cold-fetches a given object cluster-wide instead of up to N (which
+    /// flaps the storage ETag under readers → `Stale file handle` / truncated
+    /// `.sha1`, #1606). Opt-in HA feature (like `presigned_downloads_enabled`):
+    /// default `false` keeps the unchanged per-process single-flight for
+    /// single-replica installs. Multi-replica deployments should set
+    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
+    pub proxy_singleflight_advisory_locks_enabled: bool,
+
+    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
+    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    pub proxy_singleflight_lock_poll_interval_ms: u64,
+
+    /// Upper bound (seconds) a follower waits for the leader's commit before
+    /// falling back to its own bounded fetch, when advisory locks are enabled.
+    /// Default: 65.
+    pub proxy_singleflight_lock_wait_timeout_secs: u64,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -652,6 +683,7 @@ redacted_debug!(Config {
     show otel_service_name,
     show gc_schedule,
     show blob_gc_enabled,
+    show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -695,6 +727,9 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show proxy_singleflight_advisory_locks_enabled,
+    show proxy_singleflight_lock_poll_interval_ms,
+    show proxy_singleflight_lock_wait_timeout_secs,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -751,6 +786,7 @@ impl Default for Config {
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
             blob_gc_enabled: false,
+            blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -797,6 +833,9 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            proxy_singleflight_advisory_locks_enabled: false,
+            proxy_singleflight_lock_poll_interval_ms: 200,
+            proxy_singleflight_lock_wait_timeout_secs: 65,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -925,6 +964,11 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
+            // so a fat-fingered enormous value can't silently disable the
+            // sweep forever; `0` is allowed (sweep on the next pass).
+            blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
+                .min(7 * 24 * 60 * 60),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -1055,6 +1099,18 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            proxy_singleflight_advisory_locks_enabled: matches!(
+                env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            proxy_singleflight_lock_poll_interval_ms: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS",
+                200,
+            ),
+            proxy_singleflight_lock_wait_timeout_secs: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
+                65,
+            ),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -2751,6 +2807,39 @@ mod tests {
         env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
         let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
         assert_eq!(expiry, 300);
+    }
+
+    // ── proxy cross-replica single-flight config tests (#1609) ────────────
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+        let config = Config::from_env().expect("config should load");
+        assert!(!config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 200);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 65);
+    }
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_opt_in() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED", "true");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS", "125");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS", "42");
+        let config = Config::from_env().expect("config should load");
+        assert!(config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 125);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 42);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
     }
 
     #[test]

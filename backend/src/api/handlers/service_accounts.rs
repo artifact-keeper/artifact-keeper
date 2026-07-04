@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
@@ -171,10 +172,6 @@ pub struct TokenListResponse {
 // Helper
 // ---------------------------------------------------------------------------
 
-pub(crate) fn require_admin(auth: &AuthExtension) -> Result<()> {
-    auth.require_admin()
-}
-
 pub(crate) fn validate_create_token_exclusivity(
     repo_selector: &Option<serde_json::Value>,
     repository_ids: &Option<Vec<Uuid>>,
@@ -255,7 +252,7 @@ pub async fn list_service_accounts(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<ServiceAccountListResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     let svc = ServiceAccountService::new(state.db.clone());
     let accounts = svc.list(true).await?;
@@ -284,7 +281,7 @@ pub async fn create_service_account(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateServiceAccountRequest>,
 ) -> Result<Json<ServiceAccountResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     let svc = ServiceAccountService::new(state.db.clone());
     let user = svc
@@ -325,7 +322,7 @@ pub async fn get_service_account(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ServiceAccountResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     let svc = ServiceAccountService::new(state.db.clone());
     let user = svc.get(id).await?;
@@ -360,7 +357,7 @@ pub async fn update_service_account(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateServiceAccountRequest>,
 ) -> Result<Json<ServiceAccountResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     // Pre-mark the cache invalidation BEFORE the SQL UPDATE so any concurrent
     // request that might still hit the cache during the update is rejected.
@@ -411,7 +408,7 @@ pub async fn delete_service_account(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     // Pre-mark the cache invalidation BEFORE the SQL DELETE. Hard-deleting a
     // service account must also evict cached API-token validations for that
@@ -448,7 +445,7 @@ pub async fn list_tokens(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TokenListResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     // Verify the service account exists
     let svc = ServiceAccountService::new(state.db.clone());
@@ -533,7 +530,7 @@ pub async fn create_token(
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     // Validate mutual exclusivity
     validate_create_token_exclusivity(&payload.repo_selector, &payload.repository_ids)?;
@@ -581,6 +578,18 @@ pub async fn create_token(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            token_id,
+            Some(&payload.name),
+            "service_account",
+        ),
+    )
+    .await;
+
     Ok(Json(CreateTokenResponse {
         id: token_id,
         token,
@@ -610,7 +619,7 @@ pub async fn preview_repo_selector(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<PreviewRepoSelectorRequest>,
 ) -> Result<Json<PreviewRepoSelectorResponse>> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
 
@@ -657,7 +666,7 @@ pub async fn revoke_token(
     Extension(auth): Extension<AuthExtension>,
     Path((id, token_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode> {
-    require_admin(&auth)?;
+    auth.require_admin()?;
 
     // Verify the service account exists
     let svc = ServiceAccountService::new(state.db.clone());
@@ -665,6 +674,18 @@ pub async fn revoke_token(
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "service_account",
+        ),
+    )
+    .await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -757,17 +778,100 @@ mod tests {
     #[test]
     fn test_require_admin_allows_admin() {
         let auth = admin_auth();
-        assert!(require_admin(&auth).is_ok());
+        assert!(auth.require_admin().is_ok());
     }
 
     #[test]
     fn test_require_admin_rejects_non_admin() {
         let auth = non_admin_auth();
-        let err = require_admin(&auth).unwrap_err();
+        let err = auth.require_admin().unwrap_err();
         match err {
             AppError::Authorization(msg) => assert_eq!(msg, "Admin access required"),
             other => panic!("Expected Authorization error, got: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin gate is enforced at the top of every route handler
+    // -----------------------------------------------------------------------
+
+    // Every service-account handler calls `auth.require_admin()?` before any
+    // database access, so a non-admin caller is rejected with the canonical
+    // 403 even against a lazy (never-connected) pool.
+    fn expect_forbidden<T>(res: Result<T>) {
+        match res {
+            Err(AppError::Authorization(msg)) => assert_eq!(msg, "Admin access required"),
+            Err(other) => panic!("expected admin denial, got error: {other}"),
+            Ok(_) => panic!("expected admin denial, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_denied_on_every_service_account_route() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let dir = std::env::temp_dir().join(format!("ph-svc-acct-{}", Uuid::new_v4()));
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let auth = non_admin_auth();
+        let id = Uuid::new_v4();
+
+        expect_forbidden(
+            list_service_accounts(State(state.clone()), Extension(auth.clone())).await,
+        );
+        expect_forbidden(
+            create_service_account(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(serde_json::from_value(serde_json::json!({"name": "ci"})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            get_service_account(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            update_service_account(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(serde_json::from_value(serde_json::json!({})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            delete_service_account(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            list_tokens(State(state.clone()), Extension(auth.clone()), Path(id)).await,
+        );
+        expect_forbidden(
+            create_token(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(id),
+                Json(
+                    serde_json::from_value(serde_json::json!({"name": "t", "scopes": ["read"]}))
+                        .unwrap(),
+                ),
+            )
+            .await,
+        );
+        expect_forbidden(
+            preview_repo_selector(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(serde_json::from_value(serde_json::json!({"repo_selector": {}})).unwrap()),
+            )
+            .await,
+        );
+        expect_forbidden(
+            revoke_token(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((id, Uuid::new_v4())),
+            )
+            .await,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1967,5 +2071,104 @@ mod tests {
         assert!(resp.display_name.is_none());
         assert_eq!(resp.token_count, 0);
         assert_eq!(resp.username, "svc-disabled");
+    }
+}
+
+/// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(test)]
+mod audit_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+        )
+        .bind(token_id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("audit_log count query")
+    }
+
+    /// `POST /service-accounts/:id/tokens` must emit `API_TOKEN_CREATED`, and
+    /// the matching revoke must emit `API_TOKEN_REVOKED`, attributed to the
+    /// acting admin.
+    #[tokio::test]
+    async fn service_account_token_mint_and_revoke_emit_audit_events() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+
+        // Create a service account to mint a token for.
+        let sa = ServiceAccountService::new(pool.clone())
+            .create(&format!("audit-sa-{}", Uuid::new_v4()), None)
+            .await
+            .expect("create service account");
+
+        let body = json!({ "name": "sa-audit", "scopes": ["read"] }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", sa.id))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "service-account mint failed: {}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            1,
+            "SA mint MUST write one API_TOKEN_CREATED row"
+        );
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{}", sa.id, token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state, auth), req).await;
+        assert!(status.is_success(), "SA revoke should succeed: {status}");
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            1,
+            "SA revoke MUST write one API_TOKEN_REVOKED row"
+        );
+
+        // Cleanup: token, service account, admin.
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(sa.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
     }
 }

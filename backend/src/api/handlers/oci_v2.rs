@@ -537,6 +537,19 @@ fn upload_progress_range(bytes_received: i64) -> String {
     }
 }
 
+/// Whether a completion-PUT body is *known up front* to be empty, from its
+/// `http_body::Body::size_hint().exact()`.
+///
+/// `Some(0)` — a declared zero-length body (`Content-Length: 0`) — is skipped
+/// without ever touching storage. `None` (an unknown length, e.g. a chunked
+/// transfer-encoding final PUT with no `Content-Length`) is *not* known-empty:
+/// it must still be streamed, because it may carry the last bytes of the blob.
+/// A `None` body that turns out to have written zero bytes is dropped at the
+/// call site, matching the `Some(0)` skip without risking data loss.
+fn final_part_body_is_known_empty(exact_len: Option<u64>) -> bool {
+    exact_len == Some(0)
+}
+
 fn upload_patch_accepted_response(
     image_name: &str,
     session_id: Uuid,
@@ -644,11 +657,13 @@ async fn collect_request_body(body: Body, limit: usize) -> Result<Bytes, Respons
     collect_request_body_with_exact_limit(body, limit).await
 }
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn collect_request_body_with_exact_limit(
     body: Body,
     limit: usize,
 ) -> Result<Bytes, Response> {
     to_bytes(body, limit).await.map_err(|e| {
+        // STREAMING-EXEMPT: bounded body collector with explicit LengthLimitError guard (OCI large uploads use the chunked path); #1608
         if error_chain_contains::<http_body_util::LengthLimitError>(&e) {
             return oci_error(
                 StatusCode::BAD_REQUEST,
@@ -883,6 +898,30 @@ async fn clear_oci_upload_cleanup_key_best_effort(db: &PgPool, storage_key: &str
             error = %e,
             "Failed to clear OCI upload cleanup-key row after blob became referenced"
         );
+    }
+}
+
+/// GC-4: drop the completion-only cleanup-journal rows once a chunked upload has
+/// durably committed. The final PATCH-less part object and the concatenated
+/// completion temp object have already been deleted on the success path, so
+/// their journal rows are redundant; clearing them inline avoids leaving them
+/// for the 24-48h unreferenced sweep (which would issue a redundant NotFound
+/// storage delete for each). Best-effort: a lost delete simply falls back to
+/// that sweep.
+///
+/// MUST be called only after the `oci_blobs` INSERT and the session DELETE have
+/// COMMITTED — clearing a journal row before its temp object is durably
+/// unreferenced could let the sweep skip a still-referenced object.
+async fn clear_completion_cleanup_journal_rows(
+    db: &PgPool,
+    final_part_key: Option<&str>,
+    completion_temp_key: Option<&str>,
+) {
+    if let Some(key) = final_part_key {
+        clear_oci_upload_cleanup_key_best_effort(db, key).await;
+    }
+    if let Some(key) = completion_temp_key {
+        clear_oci_upload_cleanup_key_best_effort(db, key).await;
     }
 }
 
@@ -1907,12 +1946,17 @@ pub async fn record_manifest_blob_refs(
 /// record `oci_manifest_refs` (parent→child edges); `Image` bodies record
 /// `manifest_blob_refs` (config + layer edges).
 ///
-/// TODO(#1610): the residual sub-grace-period TOCTOU between a concurrent
-/// re-push of an already-existing >24h-old blob and `run_blob_gc` is NOT
-/// closed here — it is bounded by the grace window + readiness gate +
-/// opt-in `BLOB_GC_ENABLED` and tracked as a follow-up. The push-side
-/// `SELECT ... FOR UPDATE` on `oci_blobs` that would close it would go
-/// inside this transaction, before the ref insert.
+/// #1610: the sub-grace-period TOCTOU between a concurrent re-push of an
+/// already-existing blob and `run_blob_gc` is closed here for `Image`
+/// manifests. Before the `manifest_blob_refs` insert, this transaction takes
+/// a `SELECT ... FOR UPDATE` lock on the `oci_blobs` rows for the digests
+/// being referenced — the SAME rows GC's [`is_blob_still_orphan`] locks
+/// `FOR UPDATE` before deciding to delete. That makes the ref-insert and the
+/// GC orphan re-check serialize on those rows: GC either blocks until this
+/// push commits (then observes the ref and skips the delete) or this push
+/// blocks until GC commits (then GC has already re-checked), so a referenced
+/// blob can never be deleted out from under a concurrent push. The lock stays
+/// inside the existing narrow tx and adds no network/storage I/O.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_tag_and_refs(
     pool: &PgPool,
@@ -1967,6 +2011,58 @@ pub(crate) async fn persist_tag_and_refs(
         ManifestClass::Image => {
             let refs = extract_blob_refs(manifest_body);
             if let Some((blob_digests, kinds)) = blob_refs_to_columns(&refs) {
+                // 2a. (#1610) Serialize this ref-insert against blob GC's
+                //     orphan re-check. Lock the `oci_blobs` rows for the
+                //     digests we are about to reference, taking the SAME
+                //     `FOR UPDATE` lock that `is_blob_still_orphan` acquires
+                //     before it decides to delete. Without this, GC can lock
+                //     the row, observe zero refs, and delete the blob while
+                //     this transaction inserts a live ref — a
+                //     deleted-but-referenced blob (broken pull). With it, the
+                //     two transactions serialize on the same rows: GC either
+                //     blocks until we commit (then sees the ref and skips the
+                //     delete) or we block until GC commits (then GC has
+                //     already re-checked). Either way the referenced blob
+                //     survives. This is a pure lock acquisition on rows we
+                //     already touch — no network/storage I/O is added to the
+                //     transaction, so the narrow tx scope is preserved.
+                sqlx::query(
+                    r#"
+                    SELECT id
+                    FROM oci_blobs
+                    WHERE repository_id = $1 AND digest = ANY($2)
+                    FOR UPDATE
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(&blob_digests)
+                .fetch_all(&mut *tx)
+                .await?;
+
+                // 2b. (#1660) Resurrect any of these blobs that blob GC has
+                //     marked `pending_delete_at`. We already hold the same
+                //     `FOR UPDATE` lock GC's mark/sweep takes, so clearing the
+                //     marker here strictly serializes against GC: either we
+                //     clear it before GC's sweep re-check (sweep then skips the
+                //     now-referenced blob) or GC's mark runs first and we clear
+                //     it under the lock we now hold. A blob that is being
+                //     re-referenced by this live push must not be swept, so the
+                //     marker is dropped. No-op for the common case (marker
+                //     already NULL) and adds no storage I/O to the tx.
+                sqlx::query(
+                    r#"
+                    UPDATE oci_blobs
+                    SET pending_delete_at = NULL
+                    WHERE repository_id = $1
+                      AND digest = ANY($2)
+                      AND pending_delete_at IS NOT NULL
+                    "#,
+                )
+                .bind(repo_id)
+                .bind(&blob_digests)
+                .execute(&mut *tx)
+                .await?;
+
                 sqlx::query(
                     r#"
                     INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind)
@@ -2602,12 +2698,20 @@ pub async fn resolve_virtual_blob(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_blob_path(&image, digest);
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    // #2192 / #1608 Phase 4c: this virtual-member blob fallback
+                    // stays BUFFERED (unlike the plain-Remote blob download,
+                    // which now streams). `finalize_upstream_blob` below
+                    // content-address-verifies the whole body against the
+                    // requested digest before serving — a security-critical
+                    // check that requires the complete payload in memory, so it
+                    // cannot be streamed without sacrificing verification.
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -2715,15 +2819,23 @@ pub async fn resolve_virtual_manifest(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_manifest_path(&image, reference);
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_with_accept(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        upstream_url,
-                        &upstream_path,
-                        accept,
-                    )
-                    .await
+                    // #2192 / #1608 Phase 4c: manifest fallbacks stay BUFFERED
+                    // and capped by design. A manifest is a small parsed-JSON
+                    // document (blob-ref resolution) that must be read in-process,
+                    // and there is no streaming `_with_accept` sibling; when the
+                    // reference is a digest, `finalize_upstream_manifest` below
+                    // content-address-verifies the whole body before serving.
+                    if let Ok((content, content_type)) =
+                        proxy_helpers::proxy_fetch_capped_with_accept(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            &upstream_path,
+                            accept,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        )
+                        .await
                     {
                         // #1348 round 1, concern #3 (CRITICAL):
                         // When the manifest reference is itself a digest
@@ -3072,13 +3184,20 @@ async fn try_upstream_fetch_with_accept(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
-    proxy_helpers::proxy_fetch_with_accept(
+    // #2192 / #1608 Phase 4c: the manifest GET/HEAD fallback stays BUFFERED and
+    // capped by design — a manifest is a small parsed-JSON document that must be
+    // read in-process for blob-ref resolution, and there is no streaming
+    // `_with_accept` sibling that could forward the content-negotiation `Accept`
+    // header. Blob downloads no longer flow through here: the Remote GET-blob
+    // path streams via `try_upstream_fetch_streaming_blob`.
+    proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         accept,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await
     .ok()
@@ -3207,6 +3326,72 @@ fn build_oci_proxy_response(
         .header(CONTENT_LENGTH, content.len().to_string())
         .header(CONTENT_TYPE, ct)
         .body(body)
+        .unwrap()
+}
+
+/// Streaming sibling of [`try_upstream_fetch`] for BLOB downloads (#2192 /
+/// #1608 Phase 4c).
+///
+/// A blob is an opaque image layer that can legitimately exceed the buffered
+/// per-caller cap (#2181). Route the Remote-repo blob download through the
+/// streaming proxy helper — teed into the proxy cache — so a >cap layer returns
+/// 200 (streamed) instead of 502, and subsequent pulls are served warm.
+///
+/// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
+/// path: they are parsed JSON (blob-ref resolution) and, when referenced by
+/// digest, content-address-verified before serving, so they must be buffered.
+async fn try_upstream_fetch_streaming_blob(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    digest: &str,
+) -> Option<Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+    let image = normalize_docker_image(&repo.image, upstream_url);
+    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        &upstream_path,
+    )
+    .await
+    .ok()?;
+    Some(build_oci_streaming_proxy_response(
+        result,
+        digest,
+        "application/octet-stream",
+    ))
+}
+
+/// Streaming sibling of [`build_oci_proxy_response`] for blob GETs (#2192 /
+/// #1608 Phase 4c). Preserves the mandatory `Docker-Content-Digest` header and
+/// forwards the upstream content-type / content-length while driving the body
+/// straight from the streaming fetch, never buffering the layer in heap.
+fn build_oci_streaming_proxy_response(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    digest: &str,
+    default_ct: &str,
+) -> Response {
+    let ct = result
+        .content_type
+        .unwrap_or_else(|| default_ct.to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Docker-Content-Digest", digest)
+        .header(CONTENT_TYPE, ct);
+    if let Some(len) = result.content_length {
+        builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    builder
+        .body(Body::from_stream(result.body.map(|chunk| {
+            chunk.map_err(|e| std::io::Error::other(e.to_string()))
+        })))
         .unwrap()
 }
 
@@ -3870,11 +4055,17 @@ async fn handle_get_blob(
         }
     }
 
-    // For remote repos, try fetching blob from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
-    {
-        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", true);
+    // For remote repos, STREAM the blob from upstream. Blobs are opaque
+    // binaries (image layers) that routinely reach many GiB; the buffered
+    // fallback (#2181) capped them at DEFAULT_METADATA_MAX_BYTES and 502'd a
+    // layer larger than the cap even though the CAS-hit path already streams.
+    // Route the download through the streaming proxy helper (teed into the
+    // proxy cache) so large blobs succeed with 200 and later pulls are served
+    // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
+    // content-address-verify the digest before serving, so streaming
+    // introduces no verification regression. (#2192 / #1608 Phase 4c)
+    if let Some(resp) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+        return resp;
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -4032,9 +4223,14 @@ async fn handle_start_upload(
             );
         }
 
-        // Record in oci_blobs
+        // Record in oci_blobs. On conflict the blob already exists; clear any
+        // `pending_delete_at` marker (#1660) so re-uploading a blob that GC had
+        // marked for deletion resurrects it. The push path holds no row lock
+        // here, but the sweep re-check re-reads `pending_delete_at` under its
+        // own `FOR UPDATE`, so a marker cleared before that re-check protects
+        // the blob and one cleared after is re-marked on the next mark pass.
         if let Err(e) = sqlx::query!(
-            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
             repo_id, canonical_digest.as_str(), put_result.bytes_written as i64, key
         )
         .execute(&state.db)
@@ -4060,6 +4256,14 @@ async fn handle_start_upload(
         // the `oci_blobs` EXISTS guard.
         clear_oci_upload_cleanup_key_best_effort(&state.db, &key).await;
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
+        // GC-LOW-3: the streamed temp object has now been deleted and the
+        // `oci_blobs` row is durable, so the temp key's cleanup-journal row is
+        // redundant. Drop it inline instead of leaving it for the 24-48h
+        // unreferenced sweep. Safe only here, strictly after the blob copy and
+        // the `oci_blobs` INSERT have both succeeded and the temp object itself
+        // has been removed above — clearing it any earlier could let the sweep
+        // skip a still-referenced temp object.
+        clear_oci_upload_cleanup_key_best_effort(&state.db, &temp_key).await;
 
         return Response::builder()
             .status(StatusCode::CREATED)
@@ -4300,6 +4504,14 @@ async fn handle_patch_upload(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // F1: the part's cleanup-key row is marked committed here, on the pool,
+    // BEFORE the `oci_upload_parts` INSERT below (which runs in its own
+    // transaction). That ordering is safe only because the unreferenced-cleanup
+    // sweep gates on the 24h TTL: if this request dies between marking the key
+    // committed and inserting the part row, the part object is briefly
+    // journaled-but-unreferenced, and the sweep will not reclaim it until the
+    // TTL elapses — long after a healthy request has either inserted the part
+    // row or compensated by deleting the object on an error path.
     if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &part_key).await {
         delete_storage_key_best_effort(&storage, &part_key, "PATCH cleanup mark failed").await;
         return resp;
@@ -4802,7 +5014,7 @@ async fn handle_complete_upload(
 
     let final_part_key =
         upload_part_storage_key(&session.storage_temp_key, i32::MAX, &Uuid::new_v4());
-    let final_part = if body.size_hint().exact() == Some(0) {
+    let final_part = if final_part_body_is_known_empty(body.size_hint().exact()) {
         None
     } else {
         if let Err(resp) = register_oci_upload_cleanup_key(
@@ -4834,6 +5046,25 @@ async fn handle_complete_upload(
         )
         .await
         {
+            Ok(result) if result.bytes_written == 0 => {
+                // The body length was unknown up front (`size_hint().exact() ==
+                // None`, e.g. a chunked-transfer-encoding final PUT with no
+                // Content-Length) and turned out to carry no bytes. Drop the
+                // empty part exactly as the `Some(0)` fast-skip above would
+                // have, instead of threading a 0-byte part through the
+                // concatenation: delete the just-written empty object and its
+                // cleanup-journal row. The journal row is cleared only after the
+                // object is deleted, and the object is never referenced by any
+                // committed row, so this cannot orphan storage.
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "empty final upload part skipped",
+                )
+                .await;
+                clear_oci_upload_cleanup_key_best_effort(&state.db, &final_part_key).await;
+                None
+            }
             Ok(result) => {
                 if let Err(resp) =
                     mark_oci_upload_cleanup_key_committed(&state.db, &final_part_key).await
@@ -4937,8 +5168,11 @@ async fn handle_complete_upload(
     if let Some((part, _checksum)) = final_part.as_ref() {
         parts.push(part.clone());
     }
-    let size_bytes: i64 = parts.iter().map(|part| part.size_bytes).sum();
     let blob_key = blob_storage_key(&digest);
+    // GC-4: the concatenated completion temp object's cleanup-journal row is
+    // cleared inline on the confirmed success path below (post-commit). It is
+    // created inside the multi-part branch, so carry its key out here.
+    let mut completion_temp_journal_key: Option<String> = None;
 
     // Single-part fast path: one streamed part whose digest was already computed
     // and cached during PATCH/POST and already equals the client's requested
@@ -4948,7 +5182,12 @@ async fn handle_complete_upload(
     // be redundant). All three conditions are required: a non-empty final PUT
     // body, a part count other than exactly one, or a stale/absent cached digest
     // must fall through to the re-verifying path.
-    if final_part.is_none()
+    //
+    // The branch evaluates to the authoritative `size_bytes` recorded on the
+    // `oci_blobs` row: for the concat path that is the digest-verified
+    // `bytes_written` of the concatenated put, not `sum(parts.size_bytes)`
+    // (which could drift from a stale part row).
+    let size_bytes: i64 = if final_part.is_none()
         && parts.len() == 1
         && session.computed_digest.as_ref() == Some(&requested_digest)
     {
@@ -5004,6 +5243,10 @@ async fn handle_complete_upload(
                 &e.to_string(),
             );
         }
+        // The single streamed part is promoted verbatim; its recorded size is
+        // the digest-verified `bytes_written` cached at PATCH/POST time, and
+        // `sum()` over exactly one part is identical to it.
+        parts[0].size_bytes
     } else {
         if final_part.is_none() {
             if let Some(computed) = session.computed_digest.as_ref() {
@@ -5038,6 +5281,9 @@ async fn handle_complete_upload(
         // stay ordered before the `put_stream` below — never reorder it after.
         let completion_temp_key =
             format!("{}.complete.{}", session.storage_temp_key, Uuid::new_v4());
+        // Remember the key so its cleanup-journal row can be cleared inline on
+        // the post-commit success path (GC-4).
+        completion_temp_journal_key = Some(completion_temp_key.clone());
         if let Err(resp) = register_oci_upload_cleanup_key(
             &state.db,
             session.repository_id,
@@ -5305,7 +5551,11 @@ async fn handle_complete_upload(
         }
         delete_storage_key_best_effort(&storage, &completion_temp_key, "completion temp promoted")
             .await;
-    }
+        // Authoritative blob size = bytes actually written by the digest-verified
+        // concatenated put, rather than `sum(parts.size_bytes)` (which could
+        // drift from a stale part row).
+        put_result.bytes_written as i64
+    };
     // Last fast-fail before the commit transaction. This atomic flag is only an
     // optimization: it is NOT re-checked across `tx.begin()`/`tx.commit()`
     // below. The authoritative lease guard is the `state_token` predicate on the
@@ -5358,8 +5608,11 @@ async fn handle_complete_upload(
             );
         }
     };
+    // On conflict clear any `pending_delete_at` marker (#1660): finalizing a
+    // chunked upload of a blob GC had marked resurrects it, mirroring the
+    // monolithic-upload path above.
     if let Err(e) = sqlx::query(
-        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO NOTHING",
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
     )
     .bind(session.repository_id)
     .bind(&digest)
@@ -5475,6 +5728,12 @@ async fn handle_complete_upload(
                     )
                     .await;
                 }
+                clear_completion_cleanup_journal_rows(
+                    &state.db,
+                    final_part.as_ref().map(|_| final_part_key.as_str()),
+                    completion_temp_journal_key.as_deref(),
+                )
+                .await;
                 warn!(
                     session_id = %session_id,
                     digest = %digest,
@@ -5525,6 +5784,12 @@ async fn handle_complete_upload(
     for key in cleanup_keys {
         delete_storage_key_best_effort(&storage, &key, "upload completed").await;
     }
+    clear_completion_cleanup_journal_rows(
+        &state.db,
+        final_part.as_ref().map(|_| final_part_key.as_str()),
+        completion_temp_journal_key.as_deref(),
+    )
+    .await;
 
     info!(
         "Completed blob upload {}: {} ({} bytes)",
@@ -7465,6 +7730,8 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
     get(version_check)
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8637,6 +8904,19 @@ mod tests {
         assert_eq!(upload_progress_range(1), "0-0");
         assert_eq!(upload_progress_range(2), "0-1");
         assert_eq!(upload_progress_range(4435), "0-4434");
+    }
+
+    #[test]
+    fn test_final_part_body_is_known_empty() {
+        // A declared zero-length body is known-empty and skipped up front.
+        assert!(final_part_body_is_known_empty(Some(0)));
+        // A body of unknown length (chunked, no Content-Length) is NOT
+        // known-empty: it must be streamed, then dropped only if it wrote 0
+        // bytes. Treating it as empty up front would drop real data.
+        assert!(!final_part_body_is_known_empty(None));
+        // Any known non-zero length is streamed.
+        assert!(!final_part_body_is_known_empty(Some(1)));
+        assert!(!final_part_body_is_known_empty(Some(4096)));
     }
 
     #[tokio::test]
@@ -11052,6 +11332,8 @@ mod token_claims_isactive_regression_tests {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod blob_pull_streaming_tests {
     use super::*;
@@ -11138,11 +11420,160 @@ mod blob_pull_streaming_tests {
 }
 
 // ---------------------------------------------------------------------------
+// #2192 / #1608 Phase 4c: the Remote-repo blob DOWNLOAD fallback streams (so a
+// >cap layer is 200, not 502) while the manifest fallback stays buffered/capped.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod remote_blob_streaming_fallback_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn remote_repo(key: &str, upstream_url: &str, image: &str) -> OciRepoInfo {
+        OciRepoInfo {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: "/data/docker".to_string(),
+            },
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+            is_public: true,
+            image: image.to_string(),
+        }
+    }
+
+    /// A blob larger than the old buffered cap (DEFAULT_METADATA_MAX_BYTES =
+    /// 8 MiB) must STREAM with 200 (Docker-Content-Digest preserved) instead of
+    /// 502, and the second request must be served WARM from the teed proxy cache
+    /// without a second upstream round-trip.
+    #[tokio::test]
+    async fn remote_blob_streams_large_layer_and_warms_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let digest = format!("sha256:{}", "d".repeat(64));
+        // 9 MiB > 8 MiB DEFAULT_METADATA_MAX_BYTES: 502s on the buffered path.
+        let layer = vec![0x5au8; 9 * 1024 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myorg/app/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            // Warm-cache proof: fetched from upstream at most once.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-blob-stream-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&tmp, layer.len() as u64).await;
+            }
+            let resp = super::try_upstream_fetch_streaming_blob(&repo, &state, &digest)
+                .await
+                .expect("large blob must stream with 200, not 502");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("Docker-Content-Digest")
+                    .and_then(|v| v.to_str().ok()),
+                Some(digest.as_str())
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("collect streamed layer");
+            assert_eq!(body.len(), layer.len());
+        }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The manifest fallback stays BUFFERED and capped by design: a manifest
+    /// larger than DEFAULT_METADATA_MAX_BYTES must NOT be served (the capped
+    /// buffered fetch fails, yielding `None`), proving it is not routed through
+    /// the streaming path. A small manifest still parses (returns `Some`).
+    #[tokio::test]
+    async fn remote_manifest_fallback_stays_buffered_and_capped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // Small manifest: buffered fetch succeeds.
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/small"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(br#"{"schemaVersion":2}"#.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        // Oversized "manifest": 9 MiB > 8 MiB cap. The buffered+capped fetch
+        // rejects it (502 -> None); a streaming path would have returned it.
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/huge"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(vec![0x20u8; 9 * 1024 * 1024]),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-manifest-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        let small =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None).await;
+        assert!(small.is_some(), "a small manifest must still be served");
+
+        let huge =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None).await;
+        assert!(
+            huge.is_none(),
+            "an over-cap manifest must be rejected by the buffered/capped fallback, \
+             proving manifests are NOT streamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `docker login -p $API_TOKEN` regression: API-token-as-password must not
 // bump `failed_login_attempts`. DB-backed because the bug is observable only
 // after `authenticate` runs against a real user row.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod token_lockout_regression_tests {
     use super::*;
@@ -12098,6 +12529,8 @@ mod manifest_digest_fallback_tests {
 // report vacuous success; skips cleanly when no database is available locally.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod manifest_digest_db_tests {
     use super::*;
@@ -12609,6 +13042,8 @@ mod manifest_digest_db_tests {
 // vacuous success without exercising the DB-backed upload path.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod oci_blob_upload_streaming_tests {
     use super::*;
@@ -13110,6 +13545,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct DeferredCommitFailureTrigger {
@@ -13351,6 +13793,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct LockProbeStorage {
@@ -13578,6 +14027,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct DeleteRepoOnCopyStorage {
@@ -13648,6 +14104,13 @@ mod oci_blob_upload_streaming_tests {
                 .map_err(AppError::from)?;
 
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -13753,6 +14216,13 @@ mod oci_blob_upload_streaming_tests {
             .map_err(AppError::from)?;
 
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -13942,7 +14412,7 @@ mod oci_blob_upload_streaming_tests {
         );
 
         let parts = sqlx::query(
-            "SELECT part_index, storage_key, size_bytes FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
+            "SELECT part_index, storage_key, size_bytes, digest_sha256 FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
         )
         .bind(upload_uuid)
         .fetch_all(&f.inner.pool)
@@ -13952,11 +14422,20 @@ mod oci_blob_upload_streaming_tests {
         let first_index: i32 = parts[0].try_get("part_index").unwrap();
         let first_key: String = parts[0].try_get("storage_key").unwrap();
         let first_size: i64 = parts[0].try_get("size_bytes").unwrap();
+        // TQ-3: migration 117 makes `digest_sha256` nullable so the synthesized
+        // legacy first part is stored with a NULL per-part digest (there is no
+        // honest per-part SHA-256 for a body streamed before parts were tracked),
+        // rather than the dishonest '' sentinel.
+        let first_digest: Option<String> = parts[0].try_get("digest_sha256").unwrap();
         let second_index: i32 = parts[1].try_get("part_index").unwrap();
         let second_size: i64 = parts[1].try_get("size_bytes").unwrap();
         assert_eq!(first_index, 0);
         assert_eq!(first_key, temp_key);
         assert_eq!(first_size, initial.len() as i64);
+        assert!(
+            first_digest.is_none(),
+            "synthesized legacy first part must have a NULL digest_sha256, got {first_digest:?}"
+        );
         assert_eq!(second_index, 1);
         assert_eq!(second_size, next.len() as i64);
 
@@ -16212,6 +16691,118 @@ mod oci_blob_upload_streaming_tests {
     }
 
     #[tokio::test]
+    async fn completion_with_unknown_length_empty_final_put_skips_zero_byte_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let digest = compute_sha256(b"hello world");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        // PATCH the entire blob body as a single part.
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello world"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        // Final PUT with an UNKNOWN-LENGTH body (empty stream, no Content-Length),
+        // so `size_hint().exact() == None` — the case that item 2 targets. The
+        // handler must stream it, observe zero bytes, and drop the empty final
+        // part instead of threading a 0-byte part through the concatenation.
+        let empty_stream =
+            futures::stream::iter(Vec::<Result<Bytes, std::convert::Infallible>>::new());
+        let final_req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/{}/image/blobs/uploads/{}?digest={}",
+                f.inner.repo_key, upload_uuid, digest
+            ))
+            .header(AUTHORIZATION, &f.authorization)
+            .body(Body::from_stream(empty_stream))
+            .expect("build streaming final PUT");
+        let (status, _headers, body) = send(app.clone(), final_req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "empty unknown-length final PUT should complete: {:?}",
+            body
+        );
+
+        // The finalized blob is exactly the PATCHed bytes: the empty final PUT
+        // contributed nothing and did not corrupt the digest-verified content.
+        assert_eq!(
+            f.storage()
+                .get(&blob_storage_key(&digest))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello world"
+        );
+        let (size, _key): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("blob row");
+        assert_eq!(size, 11, "recorded size must be the PATCHed bytes only");
+
+        // No 0-byte final part was materialized: its cleanup-journal row
+        // (keyed under the `.part.<i32::MAX>.` prefix) must not exist.
+        let final_part_journal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key LIKE $1",
+        )
+        .bind(format!(
+            "{}.part.{}.%",
+            upload_storage_key(&upload_uuid),
+            i32::MAX
+        ))
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count final-part journal rows");
+        assert_eq!(
+            final_part_journal, 0,
+            "empty final PUT must not leave a 0-byte final-part cleanup-journal row"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
     async fn delete_upload_cancels_session_and_removes_temp_storage() {
         let Some(f) = OciUploadFixture::setup().await else {
             return;
@@ -18380,6 +18971,256 @@ mod proxy_manifest_artifact_indexing_tests {
         assert_eq!(
             ref_count, 0,
             "no manifest_blob_refs row may survive the rollback"
+        );
+    }
+
+    /// #1610: `persist_tag_and_refs` must serialize its `manifest_blob_refs`
+    /// insert against blob GC by taking a `FOR UPDATE` lock on the referenced
+    /// `oci_blobs` rows BEFORE recording the ref — the same rows (and the same
+    /// lock) that `run_blob_gc`'s `is_blob_still_orphan` acquires before it
+    /// decides to delete an orphan blob.
+    ///
+    /// The test proves the serialization directly: a stand-in for GC holds a
+    /// `FOR UPDATE` lock on blob `D`'s `oci_blobs` row (exactly what the GC
+    /// re-check does first), then a concurrent push that references `D` is
+    /// launched. Because the push now takes the same row lock, it MUST block
+    /// while GC holds it (before the fix it never touched `oci_blobs`, so it
+    /// would race straight through). Once the GC stand-in releases the lock,
+    /// the push completes and the live ref is recorded, so the blob is
+    /// protected and can never be deleted out from under the push.
+    #[tokio::test]
+    async fn persist_tag_and_refs_locks_referenced_blobs_against_gc() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Seed the blob D that the pushed image manifest will reference.
+        let d = format!("sha256:{}", "a".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(123_i64)
+        .bind(format!("{repo_id}/blobs/{d}"))
+        .execute(&pool)
+        .await
+        .expect("seed blob");
+
+        // Stand in for GC: hold the FOR UPDATE lock on D's oci_blobs row that
+        // `is_blob_still_orphan` takes before deciding to delete.
+        let mut gc_tx = pool.begin().await.expect("begin gc tx");
+        sqlx::query("SELECT id FROM oci_blobs WHERE repository_id = $1 AND digest = $2 FOR UPDATE")
+            .bind(repo_id)
+            .bind(&d)
+            .fetch_all(&mut *gc_tx)
+            .await
+            .expect("gc holds blob lock");
+
+        // Launch a concurrent push that references D. It upserts the tag, then
+        // must block on the FOR UPDATE it now takes on D's oci_blobs row.
+        let cfg = format!("sha256:{}", "c".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{d}","size":2}}]}}"#
+        );
+        let pool_push = pool.clone();
+        let push = tokio::spawn(async move {
+            persist_tag_and_refs(
+                &pool_push,
+                repo_id,
+                "app",
+                "v1",
+                "sha256:deadbeef",
+                "application/vnd.oci.image.manifest.v1+json",
+                &ManifestClass::Image,
+                body_str.as_bytes(),
+            )
+            .await
+        });
+
+        // While GC holds the lock, the push cannot make progress: the ref
+        // insert is serialized behind GC's row lock.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        let blocked = !push.is_finished();
+
+        // Release GC's lock; the push now proceeds and records the ref.
+        gc_tx.rollback().await.expect("rollback gc tx");
+        let push_result = tokio::time::timeout(std::time::Duration::from_secs(15), push)
+            .await
+            .expect("push completes once GC releases the blob lock")
+            .expect("push task join");
+
+        let ref_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND blob_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("count refs");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            blocked,
+            "the push must block on the oci_blobs FOR UPDATE lock held by GC: \
+             without the push-side lock the ref insert would race the GC re-check"
+        );
+        push_result.expect("persist_tag_and_refs must succeed once the lock is free");
+        assert_eq!(
+            ref_count, 1,
+            "the referenced blob must have a live manifest_blob_refs row after \
+             the push commits, so GC's orphan predicate is false and the blob survives"
+        );
+    }
+
+    /// #1660: a push that re-references a blob GC has marked
+    /// `pending_delete_at` must RESURRECT it — clear the marker under the same
+    /// `FOR UPDATE` lock the push already takes — so the two-phase sweep skips
+    /// a blob that has become live again. Proves the resurrection UPDATE added
+    /// to `persist_tag_and_refs` clears the marker for the referenced digest.
+    #[tokio::test]
+    async fn persist_tag_and_refs_resurrects_pending_delete_blob() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Seed blob D already MARKED for deletion by GC (Phase A).
+        let d = format!("sha256:{}", "b".repeat(64));
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, pending_delete_at) \
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(123_i64)
+        .bind(format!("{repo_id}/blobs/{d}"))
+        .execute(&pool)
+        .await
+        .expect("seed marked blob");
+
+        // A push that references D re-adopts it.
+        let cfg = format!("sha256:{}", "e".repeat(64));
+        let body_str = format!(
+            r#"{{"schemaVersion":2,"config":{{"digest":"{cfg}","size":1}},"layers":[{{"digest":"{d}","size":2}}]}}"#
+        );
+        persist_tag_and_refs(
+            &pool,
+            repo_id,
+            "app",
+            "v1",
+            "sha256:feedface",
+            "application/vnd.oci.image.manifest.v1+json",
+            &ManifestClass::Image,
+            body_str.as_bytes(),
+        )
+        .await
+        .expect("push persists");
+
+        let pending: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT pending_delete_at FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("read pending_delete_at");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            pending.is_none(),
+            "a push that re-references a marked blob must clear pending_delete_at \
+             (resurrect it) so the sweep skips the now-live blob"
+        );
+    }
+
+    /// #1660: re-uploading a blob whose `oci_blobs` row is marked
+    /// `pending_delete_at` must clear the marker via the finalize
+    /// `INSERT ... ON CONFLICT DO UPDATE SET pending_delete_at = NULL`. This
+    /// asserts the ON CONFLICT clause used by both the monolithic and chunked
+    /// finalize paths resurrects a marked blob.
+    #[tokio::test]
+    async fn blob_finalize_on_conflict_clears_pending_delete() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        let d = format!("sha256:{}", "c".repeat(64));
+        let key = format!("{repo_id}/blobs/{d}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key, pending_delete_at) \
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(7_i64)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("seed marked blob");
+
+        // Same statement the finalize paths issue on re-upload.
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .bind(7_i64)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("re-upload upsert");
+
+        let pending: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT pending_delete_at FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&d)
+        .fetch_one(&pool)
+        .await
+        .expect("read pending_delete_at");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            pending.is_none(),
+            "re-uploading a marked blob must clear pending_delete_at via ON CONFLICT DO UPDATE"
         );
     }
 

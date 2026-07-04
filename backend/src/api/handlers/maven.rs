@@ -920,9 +920,15 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                        .await?;
+                let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/plain")
@@ -953,12 +959,13 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
                             proxy,
                             member.id,
                             &member.key,
                             upstream_url,
                             &path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                         )
                         .await
                         {
@@ -1012,10 +1019,16 @@ async fn fetch_remote_member_metadata(
     }
     let upstream_url = member.upstream_url.as_deref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let (content, _) =
-        proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, path)
-            .await
-            .ok()?;
+    let (content, _) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
     std::str::from_utf8(&content).ok().map(|s| s.to_string())
 }
 
@@ -1032,8 +1045,15 @@ async fn fetch_maven_metadata_bytes(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, path).await?;
+            let (content, _) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                path,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(content);
         }
         return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
@@ -1215,6 +1235,16 @@ async fn fetch_maven_metadata_bytes(
     if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
         if let Ok(xml) =
             generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await
+        {
+            return Ok(Bytes::from(xml));
+        }
+    }
+
+    if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+        let entries =
+            collect_snapshot_entries(&state.db, repo.id, &group_id, &artifact_id, &version).await;
+        if let Some(xml) =
+            generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &entries)
         {
             return Ok(Bytes::from(xml));
         }
@@ -2089,6 +2119,8 @@ async fn upload(
         .unwrap())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3093,6 +3125,70 @@ mod tests {
         let xml = r#"<metadata><groupId>g</groupId><artifactId>a</artifactId></metadata>"#;
         let parsed = parse_snapshot_versions_xml(xml);
         assert!(parsed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hosted_snapshot_metadata_generated_from_replicated_timestamped_rows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let router = fx.router_with_auth(super::router());
+        let base = "org/example/ak/maven/ak-snapshot/1.0-SNAPSHOT";
+        let timestamped = "1.0-20260702.120000-1";
+        let uploads = [
+            (
+                format!("{base}/ak-snapshot-{timestamped}.jar"),
+                bytes::Bytes::from_static(b"snapshot jar bytes"),
+            ),
+            (
+                format!("{base}/ak-snapshot-{timestamped}.pom"),
+                bytes::Bytes::from_static(
+                    br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.ak.maven</groupId>
+  <artifactId>ak-snapshot</artifactId>
+  <version>1.0-SNAPSHOT</version>
+</project>"#,
+                ),
+            ),
+        ];
+
+        for (path, body) in uploads {
+            let (status, response_body) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), body),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "Maven PUT must create {path}; body={}",
+                String::from_utf8_lossy(&response_body)
+            );
+        }
+
+        let metadata_path = format!("/{}/{}/maven-metadata.xml", fx.repo_key, base);
+        let (status, body) = tdh::send(router, tdh::get(metadata_path.clone())).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "hosted target peer must synthesize SNAPSHOT metadata from replicated timestamped rows; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = String::from_utf8(body.to_vec()).expect("metadata is utf-8");
+        assert!(xml.contains("<groupId>org.example.ak.maven</groupId>"));
+        assert!(xml.contains("<artifactId>ak-snapshot</artifactId>"));
+        assert!(xml.contains("<version>1.0-SNAPSHOT</version>"));
+        assert!(xml.contains("<extension>jar</extension>"));
+        assert!(xml.contains("<extension>pom</extension>"));
+        assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
     }
 
     // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──

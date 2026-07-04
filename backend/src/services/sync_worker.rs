@@ -1916,6 +1916,13 @@ mod tests {
             let end = start.saturating_add(length).min(self.data.len());
             Ok(self.data.slice(start..end))
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     fn test_task(storage_backend: &str) -> TaskRow {
@@ -2024,6 +2031,13 @@ mod tests {
             _length: usize,
         ) -> crate::error::Result<Bytes> {
             Err(crate::error::AppError::Storage("boom-range".to_string()))
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
