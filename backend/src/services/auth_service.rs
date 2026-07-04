@@ -189,8 +189,10 @@ pub fn mark_api_token_revoked(token_id: Uuid) {
     }
 }
 
-/// Check whether an API token has been marked as revoked.
-fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
+/// Check whether an API token has been marked as revoked. `pub(crate)` so the
+/// cache-invalidation listener's tests can observe the effect of applying an
+/// `api_token_revoked` event without a database round-trip.
+pub(crate) fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
     if let Ok(set) = revoked_api_token_set().read() {
         return set.contains_key(&token_id);
     }
@@ -784,6 +786,33 @@ pub fn prune_stale_user_token_invalidations() -> usize {
     } else {
         0
     }
+}
+
+/// Drop every entry from every registered long-lived API-token cache,
+/// returning how many entries were flushed. Dead `Weak`s are pruned on the
+/// way through, mirroring [`invalidate_user_token_cache_entries`].
+///
+/// Called by the cache-invalidation listener on startup and after every
+/// reconnect: notifications may have been missed while this process was not
+/// listening, so every cached validation is suspect and the next request per
+/// token re-verifies against the database (one extra bcrypt per token, a
+/// bounded and acceptable cost for a rare event).
+pub fn flush_all_api_token_cache_entries() -> usize {
+    let mut flushed = 0;
+    if let Ok(mut registry) = auth_token_cache_registry().write() {
+        registry.retain(|weak| {
+            if let Some(cache_arc) = weak.upgrade() {
+                if let Ok(mut cache) = cache_arc.write() {
+                    flushed += cache.len();
+                    cache.clear();
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+    flushed
 }
 
 /// Returns true if a cache entry inserted at `cached_at` should be rejected
@@ -3914,44 +3943,53 @@ mod tests {
         assert!(cache.read().unwrap().is_empty());
     }
 
+    /// Build a minimal cache entry for token-cache tests. Shared so each test
+    /// does not repeat the full `User` literal.
+    fn dummy_cached_entry(
+        user_id: Uuid,
+        username: &str,
+        scopes: Vec<String>,
+    ) -> CachedApiTokenEntry {
+        CachedApiTokenEntry {
+            validation: ApiTokenValidation {
+                user: User {
+                    id: user_id,
+                    username: username.to_string(),
+                    email: format!("{username}@example.com"),
+                    password_hash: None,
+                    display_name: None,
+                    auth_provider: AuthProvider::Local,
+                    external_id: None,
+                    is_admin: false,
+                    is_active: true,
+                    is_service_account: false,
+                    must_change_password: false,
+                    totp_secret: None,
+                    totp_enabled: false,
+                    totp_backup_codes: None,
+                    totp_verified_at: None,
+                    failed_login_attempts: 0,
+                    locked_until: None,
+                    last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
+                    last_login_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                scopes,
+                allowed_repo_ids: None,
+            },
+            token_id: Uuid::nil(),
+            expires_at: None,
+        }
+    }
+
     #[test]
     fn test_token_cache_insert_and_read() {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
-        let validation = ApiTokenValidation {
-            user: User {
-                id: Uuid::nil(),
-                username: "testuser".to_string(),
-                email: "test@example.com".to_string(),
-                password_hash: None,
-                display_name: None,
-                auth_provider: AuthProvider::Local,
-                external_id: None,
-                is_admin: false,
-                is_active: true,
-                is_service_account: false,
-                must_change_password: false,
-                totp_secret: None,
-                totp_enabled: false,
-                totp_backup_codes: None,
-                totp_verified_at: None,
-                failed_login_attempts: 0,
-                locked_until: None,
-                last_failed_login_at: None,
-                password_changed_at: Utc::now(),
-                last_login_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            scopes: vec!["read:artifacts".to_string()],
-            allowed_repo_ids: None,
-        };
-        let entry = CachedApiTokenEntry {
-            validation,
-            token_id: Uuid::nil(),
-            expires_at: None,
-        };
+        let entry = dummy_cached_entry(Uuid::nil(), "testuser", vec!["read:artifacts".to_string()]);
         cache
             .write()
             .unwrap()
@@ -3968,39 +4006,7 @@ mod tests {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
-        let validation = ApiTokenValidation {
-            user: User {
-                id: Uuid::nil(),
-                username: "stale".to_string(),
-                email: "stale@example.com".to_string(),
-                password_hash: None,
-                display_name: None,
-                auth_provider: AuthProvider::Local,
-                external_id: None,
-                is_admin: false,
-                is_active: true,
-                is_service_account: false,
-                must_change_password: false,
-                totp_secret: None,
-                totp_enabled: false,
-                totp_backup_codes: None,
-                totp_verified_at: None,
-                failed_login_attempts: 0,
-                locked_until: None,
-                last_failed_login_at: None,
-                password_changed_at: Utc::now(),
-                last_login_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            scopes: vec![],
-            allowed_repo_ids: None,
-        };
-        let entry = CachedApiTokenEntry {
-            validation,
-            token_id: Uuid::nil(),
-            expires_at: None,
-        };
+        let entry = dummy_cached_entry(Uuid::nil(), "stale", vec![]);
 
         // Insert with a backdated timestamp
         let expired_at =
@@ -4017,6 +4023,45 @@ mod tests {
             .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
 
         assert!(cache.read().unwrap().get(&key).is_none());
+    }
+
+    /// The cache-invalidation listener flushes every registered cache on
+    /// startup/reconnect because notifications may have been missed while
+    /// this process was not listening.
+    #[test]
+    fn test_flush_all_api_token_cache_entries_clears_registered_caches() {
+        let cache: Arc<TokenCacheMap> = Arc::new(RwLock::new(HashMap::new()));
+        cache.write().unwrap().insert(
+            "flush-all-key-a".to_string(),
+            (
+                dummy_cached_entry(Uuid::new_v4(), "flush-a", vec![]),
+                Instant::now(),
+            ),
+        );
+        cache.write().unwrap().insert(
+            "flush-all-key-b".to_string(),
+            (
+                dummy_cached_entry(Uuid::new_v4(), "flush-b", vec![]),
+                Instant::now(),
+            ),
+        );
+        auth_token_cache_registry()
+            .write()
+            .unwrap()
+            .push(Arc::downgrade(&cache));
+
+        let flushed = flush_all_api_token_cache_entries();
+
+        assert!(
+            cache.read().unwrap().is_empty(),
+            "every entry in a registered cache must be flushed"
+        );
+        // The registry is process-global, so other tests may have registered
+        // caches of their own: assert a lower bound, not an exact count.
+        assert!(
+            flushed >= 2,
+            "expected at least the two inserted entries to be counted, got {flushed}"
+        );
     }
 
     #[test]

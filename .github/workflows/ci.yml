@@ -753,6 +753,7 @@ jobs:
             --test oci_chunked_upload_cross_repo_tests \
             --test sso_oidc_login_callback_e2e_tests \
             --test sso_saml_acs_e2e_tests \
+            --test cache_invalidation_fanout_tests \
             -- --ignored --test-threads=1
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`

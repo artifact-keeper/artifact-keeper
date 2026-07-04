@@ -1593,15 +1593,6 @@ pub async fn update_repository(
         )
         .await?;
 
-    // Invalidate the in-memory repo cache so that visibility changes take
-    // effect immediately instead of waiting for the TTL to expire. Remove
-    // both the old key and the new key (in case the key was renamed).
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-        cache.remove(&repo.key);
-    }
-
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
@@ -1669,6 +1660,19 @@ pub async fn update_repository(
             )
             .await?;
         }
+    }
+
+    // Invalidate the in-memory repo cache so that visibility changes take
+    // effect immediately instead of waiting for the TTL to expire. Remove
+    // both the old key and the new key (in case the key was renamed). This
+    // must run AFTER every repository/config write above: evicting before
+    // the repository_config upserts let a concurrent request repopulate the
+    // entry with the old index_upstream_url mid-update. Cross-replica
+    // eviction is handled by the migration-142 repository_changed trigger.
+    {
+        let mut cache = state.repo_cache.write().await;
+        cache.remove(&key);
+        cache.remove(&repo.key);
     }
 
     let storage_used = service.get_storage_usage(repo.id).await?;

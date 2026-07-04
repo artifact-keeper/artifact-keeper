@@ -47,6 +47,7 @@ use artifact_keeper_backend::{
     },
     services::{
         auth_service::AuthService,
+        cache_invalidation,
         dependency_track_service::DependencyTrackService,
         metrics_service,
         opensearch_service::OpenSearchService,
@@ -741,6 +742,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
+
+    // Fan out authorization-cache invalidations from other replicas via
+    // Postgres LISTEN/NOTIFY (migration 142 triggers +
+    // services/cache_invalidation.rs). Awaited so the initial LISTEN and the
+    // conservative startup flush complete before requests are served; if the
+    // connection fails the spawned task retries with backoff while requests
+    // proceed under TTL-bound staleness.
+    // Detached deliberately: lifecycle is governed by the shutdown token.
+    let _cache_invalidation_task = cache_invalidation::start_cache_invalidation_listener(
+        db_pool.clone(),
+        cache_invalidation::CacheInvalidationHandles {
+            repo_cache: state.repo_cache.clone(),
+            permission_service: state.permission_service.clone(),
+        },
+        runtime_shutdown_token.clone(),
+    )
+    .await;
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
