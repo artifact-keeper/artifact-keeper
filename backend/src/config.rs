@@ -308,6 +308,17 @@ pub struct Config {
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
 
+    /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
+    /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
+    /// only physically *swept* (storage + row delete) in a later pass once it
+    /// has stayed marked for at least this long AND is still orphan. The
+    /// window gives a concurrent re-push time to resurrect a re-adopted blob
+    /// (clear the marker under the push-path row lock) before its bytes are
+    /// deleted, so no live blob is ever swept. Defaults to 3600 (1 hour); set
+    /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
+    /// next pass with no extra delay.
+    pub blob_gc_sweep_grace_secs: u64,
+
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
 
@@ -643,6 +654,7 @@ redacted_debug!(Config {
     show otel_service_name,
     show gc_schedule,
     show blob_gc_enabled,
+    show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -741,6 +753,7 @@ impl Default for Config {
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
             blob_gc_enabled: false,
+            blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -912,6 +925,11 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
+            // so a fat-fingered enormous value can't silently disable the
+            // sweep forever; `0` is allowed (sweep on the next pass).
+            blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
+                .min(7 * 24 * 60 * 60),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",

@@ -96,6 +96,55 @@ pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     ScanDedupSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
+///
+/// Distinct from [`SCAN_DEDUP_TEST_LOCK_KEY`] and from the application
+/// advisory locks, so the blob-GC test cluster serializes only against
+/// itself.
+const BLOB_GC_TEST_LOCK_KEY: i64 = 0x424C_1660; // "BL" + issue #1660
+
+/// Cross-process serialization guard for the DB-backed blob-GC tests (#1660).
+///
+/// The blob-GC service operates on the WHOLE database: `select_orphan_blobs`,
+/// `select_pending_delete_blobs`, `prune_orphan_blob_refs` and the mark/sweep
+/// loops are not scoped to a single repository. Under the coverage job's
+/// process-per-test parallelism (`cargo nextest`), one test's apply-mode pass
+/// would mark/sweep another test's freshly-seeded orphan blob, or prune a peer
+/// test's still-referenced-but-untagged `manifest_blob_refs` row, before that
+/// peer asserts on it. A Postgres *session* advisory lock — mirroring
+/// [`scan_dedup_serial_lock`] — makes every blob-GC test contend for one key,
+/// so only one runs its seed → GC → assert critical section at a time. The
+/// lock releases when the guard drops (connection closes), including on panic.
+pub struct BlobGcSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide blob-GC test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
+/// test and bind the result for the whole test body.
+pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return BlobGcSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return BlobGcSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(BLOB_GC_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return BlobGcSerialGuard { _conn: None };
+    }
+    BlobGcSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
@@ -149,6 +198,7 @@ fn cfg(storage_path: &str) -> Config {
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         blob_gc_enabled: false,
+        blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
