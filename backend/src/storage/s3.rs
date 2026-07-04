@@ -256,6 +256,112 @@ async fn abort_s3_multipart(
     }
 }
 
+/// RAII guard that aborts an in-progress S3 multipart upload unless it is
+/// explicitly finished.
+///
+/// It closes the cancellation window called out in [`S3Backend::put_stream`]:
+/// if the `put_stream` future is dropped after `create_multipart` but before
+/// completion (client disconnect, request timeout, task cancellation), the
+/// server-side multipart upload would otherwise linger until a bucket
+/// `AbortIncompleteMultipartUpload` lifecycle rule reclaimed it. On drop while
+/// still armed, the guard spawns a best-effort `AbortMultipartUpload` (a `Drop`
+/// impl cannot `await`).
+///
+/// Exit paths that handle the upload themselves defuse the guard first:
+/// - [`abort_now`](Self::abort_now) awaits an inline abort (used on the existing
+///   error paths, so exactly one abort is issued — not a redundant second one).
+/// - [`disarm`](Self::disarm) is called after a successful completion so a
+///   COMPLETED upload is never aborted.
+struct MultipartAbortGuard {
+    store: AmazonS3,
+    path: ObjectPath,
+    key: String,
+    /// `Some` while an upload is in flight and not yet finished; `None` once the
+    /// guard has been defused (completed or already aborted).
+    upload_id: Option<object_store::MultipartId>,
+}
+
+impl MultipartAbortGuard {
+    /// Create a disarmed guard; call [`arm`](Self::arm) once the multipart
+    /// upload has actually been created.
+    fn new(store: AmazonS3, path: ObjectPath, key: String) -> Self {
+        Self {
+            store,
+            path,
+            key,
+            upload_id: None,
+        }
+    }
+
+    /// Arm the guard with the id of a freshly created multipart upload.
+    fn arm(&mut self, upload_id: object_store::MultipartId) {
+        self.upload_id = Some(upload_id);
+    }
+
+    /// Defuse the guard without aborting: the upload completed successfully.
+    fn disarm(&mut self) {
+        self.upload_id = None;
+    }
+
+    /// Defuse the guard and abort the upload inline (awaited). No-op if the
+    /// guard is not armed (no multipart upload was ever created).
+    async fn abort_now(&mut self) {
+        if let Some(upload_id) = self.upload_id.take() {
+            abort_s3_multipart(&self.store, &self.path, &upload_id, &self.key).await;
+        }
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        let Some(upload_id) = self.upload_id.take() else {
+            return;
+        };
+        // A completed/aborted upload defuses the guard above, so reaching here
+        // means the future was dropped mid-upload. Drop can't await, so spawn a
+        // detached best-effort abort. Guard against running outside a Tokio
+        // runtime (e.g. a synchronous drop in a plain test) to avoid a panic.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                key = %self.key,
+                upload_id = %upload_id,
+                "S3 multipart upload dropped with no Tokio runtime to abort it"
+            );
+            return;
+        };
+        let store = self.store.clone();
+        let path = self.path.clone();
+        let key = std::mem::take(&mut self.key);
+        handle.spawn(async move {
+            abort_s3_multipart(&store, &path, &upload_id, &key).await;
+        });
+    }
+}
+
+/// Cross-check a streamed large-object copy against the source content.
+///
+/// The `>5 GiB` copy path streams the source through [`S3Backend::put_stream`],
+/// which returns the SHA-256 of the bytes it wrote. `put_stream`'s result is
+/// otherwise discarded, so a truncated or corrupted transfer would go unnoticed.
+/// This compares that digest against the SHA-256 computed independently over the
+/// source stream and rejects any mismatch. Pure so the mismatch branch is
+/// unit-testable without S3.
+fn ensure_copy_digest_matches(
+    source: &str,
+    dest: &str,
+    source_sha256: &str,
+    result: &PutStreamResult,
+) -> Result<()> {
+    if result.checksum_sha256 != source_sha256 {
+        return Err(AppError::Storage(format!(
+            "S3 streamed copy of '{}' -> '{}' failed integrity check: source SHA-256 {} \
+             but copied object hashed to {}",
+            source, dest, source_sha256, result.checksum_sha256
+        )));
+    }
+    Ok(())
+}
+
 /// S3 storage backend configuration
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -1317,12 +1423,11 @@ impl super::StorageBackend for S3Backend {
     ///
     /// Cancellation note: if this future is dropped after the multipart upload
     /// is created but before it finishes (client disconnect, request timeout,
-    /// task cancellation), the in-flight part tasks are aborted but the
-    /// server-side multipart upload is NOT explicitly aborted — it is reclaimed
-    /// by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule (set one
-    /// in deployment). The OCI upload path issues each PATCH chunk as its own
-    /// short-lived `put_stream` to a discrete key, so the cancellation window is
-    /// small.
+    /// task cancellation), the in-flight part tasks are aborted and a
+    /// [`MultipartAbortGuard`] spawns a best-effort server-side
+    /// `AbortMultipartUpload` on drop, so the upload does not linger until the
+    /// bucket's `AbortIncompleteMultipartUpload` lifecycle rule reclaims it. A
+    /// successfully completed upload defuses the guard and is never aborted.
     async fn put_stream(
         &self,
         key: &str,
@@ -1331,6 +1436,11 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
+        // Aborts the multipart upload if this future is dropped mid-flight.
+        // Armed once `create_multipart` succeeds; defused on completion or by
+        // the inline abort on an error path.
+        let mut abort_guard =
+            MultipartAbortGuard::new(self.store.clone(), path.clone(), key.to_string());
         let mut upload_id: Option<object_store::MultipartId> = None;
         let mut upload_tasks: JoinSet<S3PartUploadResult> = JoinSet::new();
         let mut uploaded_parts: Vec<(usize, PartId)> = Vec::new();
@@ -1355,6 +1465,7 @@ impl super::StorageBackend for S3Backend {
                                 key, e
                             ))
                         })?;
+                        abort_guard.arm(id.clone());
                         upload_id = Some(id);
                     }
                     let mut data = data;
@@ -1384,10 +1495,8 @@ impl super::StorageBackend for S3Backend {
                             )
                             .await
                             {
-                                if let Some(upload_id) = upload_id.as_ref() {
-                                    upload_tasks.shutdown().await;
-                                    abort_s3_multipart(&self.store, &path, upload_id, key).await;
-                                }
+                                upload_tasks.shutdown().await;
+                                abort_guard.abort_now().await;
                                 return Err(e);
                             }
                             continue;
@@ -1415,10 +1524,8 @@ impl super::StorageBackend for S3Backend {
                             )
                             .await
                             {
-                                if let Some(upload_id) = upload_id.as_ref() {
-                                    upload_tasks.shutdown().await;
-                                    abort_s3_multipart(&self.store, &path, upload_id, key).await;
-                                }
+                                upload_tasks.shutdown().await;
+                                abort_guard.abort_now().await;
                                 return Err(e);
                             }
                         }
@@ -1427,10 +1534,8 @@ impl super::StorageBackend for S3Backend {
                 Err(e) => {
                     // Abort the multipart upload on stream error to avoid
                     // leaving partial objects in S3.
-                    if let Some(upload_id) = upload_id.as_ref() {
-                        upload_tasks.shutdown().await;
-                        abort_s3_multipart(&self.store, &path, upload_id, key).await;
-                    }
+                    upload_tasks.shutdown().await;
+                    abort_guard.abort_now().await;
                     return Err(e);
                 }
             }
@@ -1453,14 +1558,14 @@ impl super::StorageBackend for S3Backend {
                 .await
                 {
                     upload_tasks.shutdown().await;
-                    abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                    abort_guard.abort_now().await;
                     return Err(e);
                 }
             }
             if let Err(e) = drain_s3_part_uploads(&mut upload_tasks, &mut uploaded_parts, key).await
             {
                 upload_tasks.shutdown().await;
-                abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                abort_guard.abort_now().await;
                 return Err(e);
             }
             uploaded_parts.sort_by_key(|(part_index, _)| *part_index);
@@ -1473,12 +1578,14 @@ impl super::StorageBackend for S3Backend {
                 .complete_multipart(&path, &upload_id, parts)
                 .await
             {
-                abort_s3_multipart(&self.store, &path, &upload_id, key).await;
+                abort_guard.abort_now().await;
                 return Err(AppError::Storage(format!(
                     "Failed to complete multipart upload for '{}': {}",
                     key, e
                 )));
             }
+            // Upload completed: defuse the guard so drop never aborts it.
+            abort_guard.disarm();
         } else {
             self.put(key, Bytes::new()).await?;
         }
@@ -1529,7 +1636,35 @@ impl S3Backend {
                 "S3 source is too large for CopyObject; streaming through multipart upload"
             );
             let stream = <Self as super::StorageBackend>::get_stream(self, source).await?;
-            <Self as super::StorageBackend>::put_stream(self, dest, stream).await?;
+
+            // Hash the source bytes as they stream past so the copied object's
+            // digest (returned by `put_stream`) can be cross-checked end-to-end
+            // instead of silently discarded. The hasher is shared with the
+            // stream adapter and read back after the transfer completes.
+            let source_hasher = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
+            let tap = source_hasher.clone();
+            let hashing_stream = stream
+                .map(move |chunk| {
+                    if let Ok(ref bytes) = chunk {
+                        tap.lock()
+                            .expect("source hash mutex poisoned")
+                            .update(bytes);
+                    }
+                    chunk
+                })
+                .boxed();
+
+            let result =
+                <Self as super::StorageBackend>::put_stream(self, dest, hashing_stream).await?;
+            let source_sha256 = format!(
+                "{:x}",
+                source_hasher
+                    .lock()
+                    .expect("source hash mutex poisoned")
+                    .clone()
+                    .finalize()
+            );
+            ensure_copy_digest_matches(source, dest, &source_sha256, &result)?;
             return Ok(());
         }
 
@@ -3644,6 +3779,145 @@ mod tests {
                 .iter()
                 .any(|request| request.headers.contains_key("x-amz-copy-source")),
             "large copy must not use single-request S3 CopyObject"
+        );
+    }
+
+    // ---- ensure_copy_digest_matches (pure large-copy integrity check) ----
+
+    #[test]
+    fn test_ensure_copy_digest_matches_ok_when_equal() {
+        let result = PutStreamResult {
+            checksum_sha256: "deadbeef".to_string(),
+            bytes_written: 42,
+        };
+        ensure_copy_digest_matches("src", "dst", "deadbeef", &result)
+            .expect("matching digests must pass the integrity check");
+    }
+
+    #[test]
+    fn test_ensure_copy_digest_matches_errors_on_mismatch() {
+        let result = PutStreamResult {
+            checksum_sha256: "0000".to_string(),
+            bytes_written: 42,
+        };
+        let err = ensure_copy_digest_matches("src", "dst", "ffff", &result)
+            .expect_err("a digest mismatch must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("integrity check"), "unexpected error: {msg}");
+        assert!(msg.contains("ffff") && msg.contains("0000"), "err: {msg}");
+    }
+
+    // ---- MultipartAbortGuard (abort-on-drop for cancelled multipart copies) ----
+
+    /// Poll the mock's DELETE (AbortMultipartUpload) count until it reaches
+    /// `expected`, giving the guard's detached abort task time to run. Returns
+    /// the final observed count.
+    async fn wait_for_abort_count(guard: &wiremock::MockGuard, expected: usize) -> usize {
+        for _ in 0..50 {
+            let n = guard.received_requests().await.len();
+            if n >= expected {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        guard.received_requests().await.len()
+    }
+
+    #[tokio::test]
+    async fn test_multipart_abort_guard_aborts_on_drop() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let abort_mock = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "drop-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        {
+            let mut guard = MultipartAbortGuard::new(
+                backend.store.clone(),
+                "dropped/object".into(),
+                "dropped/object".to_string(),
+            );
+            guard.arm("drop-upload-id".to_string());
+            // guard dropped here while still armed -> spawns AbortMultipartUpload
+        }
+
+        let count = wait_for_abort_count(&abort_mock, 1).await;
+        assert_eq!(count, 1, "dropping an armed guard must abort the multipart");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_abort_guard_disarmed_does_not_abort() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let abort_mock = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "done-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        {
+            let mut guard = MultipartAbortGuard::new(
+                backend.store.clone(),
+                "completed/object".into(),
+                "completed/object".to_string(),
+            );
+            guard.arm("done-upload-id".to_string());
+            // A completed upload defuses the guard.
+            guard.disarm();
+        }
+
+        // Give any (erroneously) spawned abort a chance to land before asserting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            abort_mock.received_requests().await.len(),
+            0,
+            "a completed (disarmed) upload must never be aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multipart_abort_guard_abort_now_aborts_once() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let abort_mock = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "err-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        {
+            let mut guard = MultipartAbortGuard::new(
+                backend.store.clone(),
+                "errored/object".into(),
+                "errored/object".to_string(),
+            );
+            guard.arm("err-upload-id".to_string());
+            // The error path aborts inline and defuses the guard...
+            guard.abort_now().await;
+            assert_eq!(
+                abort_mock.received_requests().await.len(),
+                1,
+                "abort_now must issue exactly one AbortMultipartUpload"
+            );
+            // ...so the subsequent drop must NOT abort a second time.
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            abort_mock.received_requests().await.len(),
+            1,
+            "drop after abort_now must not issue a redundant abort"
         );
     }
 

@@ -89,6 +89,43 @@ struct RewriteResponse {
     rewrite_token: Option<String>,
 }
 
+/// Default ceiling on GCS server-side rewrite continuations before `copy()`
+/// gives up. GCS rewrite is paginated: each `rewriteTo` continuation copies as
+/// much as GCS chooses and is a fast sub-second metadata op, so even a 5 TiB
+/// object (GCS's max) completes in far fewer than this cap. The cap is purely a
+/// defensive backstop against a non-conformant endpoint that never reports
+/// `done`, matching the explicit limits on the S3 part / Azure block loops. It
+/// is overridable per-backend (see [`GcsBackend::max_rewrite_iterations`]) so
+/// the ceiling branch can be exercised by a unit test.
+const GCS_MAX_REWRITE_ITERATIONS: usize = 100_000;
+
+/// One step of the paginated GCS rewrite loop, derived purely from a
+/// [`RewriteResponse`] so the control flow can be unit-tested without HTTP.
+#[derive(Debug, PartialEq, Eq)]
+enum RewriteStep {
+    /// The rewrite finished; the object has been fully copied.
+    Done,
+    /// The rewrite is incomplete; continue with this `rewriteToken`.
+    Continue(String),
+}
+
+/// Interpret a GCS rewrite response into the next [`RewriteStep`].
+///
+/// A `done` response finishes the copy. An incomplete response must carry a
+/// `rewriteToken` to continue; a missing token is a protocol violation and is
+/// surfaced as an error rather than looping forever.
+fn interpret_rewrite_step(rewrite: RewriteResponse) -> Result<RewriteStep> {
+    if rewrite.done {
+        return Ok(RewriteStep::Done);
+    }
+    match rewrite.rewrite_token {
+        Some(token) => Ok(RewriteStep::Continue(token)),
+        None => Err(AppError::Storage(
+            "GCS rewrite response missing rewriteToken".to_string(),
+        )),
+    }
+}
+
 /// Chunk size for the resumable upload protocol. GCS requires every
 /// non-final chunk to be an exact multiple of 256 KiB. 32 MiB satisfies that
 /// (32 MiB = 128 * 256 KiB) and keeps the in-flight heap footprint bounded
@@ -188,6 +225,17 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+/// Whether a cached token must be refreshed. A token is considered stale once
+/// it is within 60s of expiry (or absent), leaving a margin so a long-running
+/// caller that re-checks each iteration always holds a token valid for the next
+/// request. Pure so the refresh boundary can be unit-tested without a clock.
+fn token_needs_refresh(cached: Option<&CachedToken>, now: Instant) -> bool {
+    match cached {
+        Some(cached) => cached.expires_at <= now + Duration::from_secs(60),
+        None => true,
+    }
+}
+
 /// Where tokens come from.
 enum TokenSource {
     /// Self-signed JWT exchanged at Google's token endpoint (service account key).
@@ -220,20 +268,16 @@ impl GcsTokenProvider {
         // Fast path: read lock
         {
             let cache = self.cache.read().await;
-            if let Some(ref cached) = *cache {
-                if cached.expires_at > Instant::now() + Duration::from_secs(60) {
-                    return Ok(cached.token.clone());
-                }
+            if !token_needs_refresh(cache.as_ref(), Instant::now()) {
+                return Ok(cache.as_ref().expect("fresh token present").token.clone());
             }
         }
 
         // Slow path: write lock
         let mut cache = self.cache.write().await;
         // Double-check: another task may have refreshed while we waited
-        if let Some(ref cached) = *cache {
-            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
-                return Ok(cached.token.clone());
-            }
+        if !token_needs_refresh(cache.as_ref(), Instant::now()) {
+            return Ok(cache.as_ref().expect("fresh token present").token.clone());
         }
 
         let (token, expires_in) = match &self.source {
@@ -253,6 +297,13 @@ impl GcsTokenProvider {
         });
 
         Ok(token)
+    }
+
+    /// Drop any cached token so the next [`get_token`](Self::get_token) forces a
+    /// fresh fetch. Used when a request is rejected as `401 Unauthorized`
+    /// mid-operation (e.g. a token revoked or expired earlier than advertised).
+    async fn invalidate(&self) {
+        *self.cache.write().await = None;
     }
 
     /// Mint a self-signed JWT and exchange it for an access token.
@@ -471,6 +522,11 @@ pub struct GcsBackend {
     path_format: StoragePathFormat,
     /// API base URL (overridable in tests via `with_base_url`).
     base_url: String,
+    /// Ceiling on GCS rewrite continuations in [`copy`](Self::copy). Defaults to
+    /// [`GCS_MAX_REWRITE_ITERATIONS`]; overridable (via
+    /// [`with_max_rewrite_iterations`](Self::with_max_rewrite_iterations)) so a
+    /// unit test can drive the loop into its ceiling branch cheaply.
+    max_rewrite_iterations: usize,
 }
 
 impl GcsBackend {
@@ -538,7 +594,16 @@ impl GcsBackend {
             auth,
             path_format,
             base_url: GCS_BASE_URL.to_string(),
+            max_rewrite_iterations: GCS_MAX_REWRITE_ITERATIONS,
         })
+    }
+
+    /// Builder (test-only): override the rewrite-iteration ceiling used by
+    /// [`copy`](Self::copy) so the ceiling branch can be exercised cheaply.
+    #[cfg(test)]
+    fn with_max_rewrite_iterations(mut self, max: usize) -> Self {
+        self.max_rewrite_iterations = max;
+        self
     }
 
     /// Return the bucket name this backend is configured to use.
@@ -554,6 +619,16 @@ impl GcsBackend {
         match &self.auth {
             GcsAuthMode::ServiceAccountKey { provider, .. } => provider.get_token().await,
             GcsAuthMode::Adc { provider } => provider.get_token().await,
+        }
+    }
+
+    /// Drop the cached bearer token so the next [`get_bearer_token`](Self::get_bearer_token)
+    /// re-fetches. Called when a bearer-authed request is rejected with
+    /// `401 Unauthorized` so the operation can retry with a fresh token.
+    async fn invalidate_bearer_token(&self) {
+        match &self.auth {
+            GcsAuthMode::ServiceAccountKey { provider, .. } => provider.invalidate().await,
+            GcsAuthMode::Adc { provider } => provider.invalidate().await,
         }
     }
 
@@ -836,9 +911,36 @@ impl GcsBackend {
         Ok(all_keys)
     }
 
-    /// Copy an object within the same bucket.
-    pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+    /// Issue a single GCS `rewriteTo` POST with a freshly obtained bearer token.
+    ///
+    /// The token is fetched per call via [`get_bearer_token`](Self::get_bearer_token),
+    /// which returns the cached token and only performs a network refresh when it
+    /// is within 60s of expiry. A small single-iteration copy therefore fetches
+    /// exactly one token (unchanged behavior), while a long multi-iteration
+    /// rewrite of a large object transparently picks up a refreshed token before
+    /// the old one can expire.
+    async fn send_rewrite(&self, url: &str) -> Result<reqwest::Response> {
         let token = self.get_bearer_token().await?;
+        self.client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))
+    }
+
+    /// Copy an object within the same bucket.
+    ///
+    /// GCS server-side rewrite is paginated: each continuation copies as much as
+    /// GCS chooses (we set no `maxBytesRewrittenPerCall`) and is a fast
+    /// sub-second metadata op. The bearer token is (re)validated on every
+    /// iteration (see [`send_rewrite`](Self::send_rewrite)); if a request is
+    /// nonetheless rejected as `401 Unauthorized` mid-rewrite (a token revoked
+    /// or expired earlier than advertised), the cached token is dropped and the
+    /// iteration retried once with a fresh token, so a pathologically long
+    /// multi-iteration rewrite of a large object cannot outlive its token.
+    pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let bucket_enc = urlencoding::encode(&self.config.bucket);
         let base_url = format!(
             "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
@@ -850,56 +952,34 @@ impl GcsBackend {
         );
         let mut rewrite_token: Option<String> = None;
 
-        // GCS server-side rewrite is paginated: each continuation copies as much
-        // as GCS chooses (we set no `maxBytesRewrittenPerCall`) and is a fast
-        // sub-second metadata op, so even a 5 TiB object (GCS's max) completes in
-        // far fewer than this cap, reusing the single bearer token fetched above
-        // well within its lifetime. The cap is purely a defensive backstop
-        // against a non-conformant endpoint that never reports `done` (or rotates
-        // a token without progressing), matching the explicit limits on the S3
-        // part / Azure block loops.
-        const MAX_REWRITE_ITERATIONS: usize = 100_000;
-
-        for _ in 0..MAX_REWRITE_ITERATIONS {
+        for _ in 0..self.max_rewrite_iterations {
             let url = match rewrite_token.as_deref() {
                 Some(token) => format!("{}?rewriteToken={}", base_url, urlencoding::encode(token)),
                 None => base_url.clone(),
             };
 
-            let response = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Content-Length", "0")
-                .send()
-                .await
-                .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))?;
+            let mut response = self.send_rewrite(&url).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                // The token was rejected mid-rewrite; drop it and retry once
+                // with a freshly minted one before surfacing the failure.
+                self.invalidate_bearer_token().await;
+                response = self.send_rewrite(&url).await?;
+            }
 
             let response = require_success(response, "GCS rewrite failed").await?;
             let rewrite: RewriteResponse = response.json().await.map_err(|e| {
                 AppError::Storage(format!("Failed to parse GCS rewrite response: {}", e))
             })?;
 
-            if rewrite.done {
-                return Ok(());
-            }
-
-            rewrite_token = rewrite.rewrite_token;
-            if rewrite_token.is_none() {
-                tracing::warn!(
-                    source = %source,
-                    dest = %dest,
-                    "GCS rewrite response was incomplete and did not include rewriteToken"
-                );
-                return Err(AppError::Storage(
-                    "GCS rewrite response missing rewriteToken".to_string(),
-                ));
+            match interpret_rewrite_step(rewrite)? {
+                RewriteStep::Done => return Ok(()),
+                RewriteStep::Continue(token) => rewrite_token = Some(token),
             }
         }
 
         Err(AppError::Storage(format!(
             "GCS rewrite of '{}' -> '{}' did not complete within {} iterations",
-            source, dest, MAX_REWRITE_ITERATIONS
+            source, dest, self.max_rewrite_iterations
         )))
     }
 
@@ -2564,6 +2644,7 @@ mod tests {
             auth: GcsAuthMode::Adc { provider },
             path_format,
             base_url: base_url.to_string(),
+            max_rewrite_iterations: GCS_MAX_REWRITE_ITERATIONS,
         }
     }
 
@@ -3475,6 +3556,254 @@ mod tests {
             "continuation request must forward rewriteToken=t1, got {}",
             requests[1].url
         );
+    }
+
+    // ---- interpret_rewrite_step (pure rewrite-loop control flow) ----
+
+    #[test]
+    fn test_interpret_rewrite_step_done() {
+        let step = interpret_rewrite_step(RewriteResponse {
+            done: true,
+            rewrite_token: None,
+        })
+        .expect("a done response is valid");
+        assert_eq!(step, RewriteStep::Done);
+    }
+
+    #[test]
+    fn test_interpret_rewrite_step_continue() {
+        let step = interpret_rewrite_step(RewriteResponse {
+            done: false,
+            rewrite_token: Some("next-token".to_string()),
+        })
+        .expect("an incomplete response with a token continues");
+        assert_eq!(step, RewriteStep::Continue("next-token".to_string()));
+    }
+
+    #[test]
+    fn test_interpret_rewrite_step_missing_token_errors() {
+        let err = interpret_rewrite_step(RewriteResponse {
+            done: false,
+            rewrite_token: None,
+        })
+        .expect_err("an incomplete response without a token is a protocol error");
+        assert!(
+            err.to_string().contains("rewriteToken"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- token refresh boundary (pure) ----
+
+    #[test]
+    fn test_token_needs_refresh_when_absent() {
+        assert!(token_needs_refresh(None, Instant::now()));
+    }
+
+    #[test]
+    fn test_token_needs_refresh_when_near_expiry() {
+        let now = Instant::now();
+        // Expires in 30s, inside the 60s refresh margin.
+        let cached = CachedToken {
+            token: "stale".to_string(),
+            expires_at: now + Duration::from_secs(30),
+        };
+        assert!(token_needs_refresh(Some(&cached), now));
+    }
+
+    #[test]
+    fn test_token_fresh_outside_margin() {
+        let now = Instant::now();
+        // Expires in 10 minutes, well outside the 60s refresh margin.
+        let cached = CachedToken {
+            token: "fresh".to_string(),
+            expires_at: now + Duration::from_secs(600),
+        };
+        assert!(!token_needs_refresh(Some(&cached), now));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_bearer_token_clears_cache() {
+        // A backend with a pre-seeded token cache; invalidation must clear it so
+        // the next fetch re-mints (the 401-recovery path in copy()).
+        let backend = mock_backend("https://example.invalid").await;
+        let GcsAuthMode::Adc { provider } = &backend.auth else {
+            panic!("mock backend is ADC mode");
+        };
+        assert!(
+            provider.cache.read().await.is_some(),
+            "mock backend starts with a seeded token"
+        );
+        backend.invalidate_bearer_token().await;
+        assert!(
+            provider.cache.read().await.is_none(),
+            "invalidate must drop the cached token"
+        );
+    }
+
+    // ---- copy() rewrite-iteration ceiling (injectable cap) ----
+
+    #[tokio::test]
+    async fn test_copy_hits_rewrite_iteration_ceiling() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A non-conformant endpoint that always reports "not done" but keeps
+        // handing back a continuation token, so the loop can only terminate at
+        // the ceiling.
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "never-done"
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri())
+            .await
+            .with_max_rewrite_iterations(3);
+        let err = backend
+            .copy("src.txt", "dest.txt")
+            .await
+            .expect_err("an endpoint that never reports done must hit the ceiling");
+        assert!(
+            err.to_string()
+                .contains("did not complete within 3 iterations"),
+            "unexpected error: {err}"
+        );
+
+        // Exactly `max_rewrite_iterations` POSTs were issued before giving up.
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(
+            requests.len(),
+            3,
+            "copy must stop at the injected iteration ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_invalidates_token_and_retries_on_401() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The rewrite endpoint rejects the (cached) bearer token as expired.
+        // copy() must drop the cached token and retry the iteration with a fresh
+        // one; in this test the ADC token source is unreachable, so the retry
+        // fails — but only after the cached token has been invalidated.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let GcsAuthMode::Adc { provider } = &backend.auth else {
+            panic!("mock backend is ADC mode");
+        };
+        assert!(
+            provider.cache.read().await.is_some(),
+            "backend starts with a seeded token"
+        );
+
+        let result = backend.copy("src.txt", "dest.txt").await;
+        assert!(
+            result.is_err(),
+            "a 401 with no reachable token source must ultimately fail"
+        );
+        assert!(
+            provider.cache.read().await.is_none(),
+            "a 401 must invalidate the cached bearer token before retrying"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_single_iteration_small_object_unchanged() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A small object completes in a single rewrite: exactly one POST, done.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        backend
+            .copy("src.txt", "dest.txt")
+            .await
+            .expect("a small single-iteration copy must still succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a small copy must issue exactly one rewrite POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_refetches_bearer_token_each_iteration() {
+        use wiremock::matchers::{header_exists, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Two-iteration rewrite: assert every request (including the
+        // continuation) carries a freshly obtained bearer token, i.e. the token
+        // is (re)validated inside the loop rather than fetched once up front.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "t1"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        backend
+            .copy("src.txt", "dest.txt")
+            .await
+            .expect("multi-iteration copy with a bearer token on each call succeeds");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(requests.len(), 2, "expected two rewrite POSTs");
+        for request in &requests {
+            assert!(
+                request.headers.contains_key("authorization"),
+                "every rewrite iteration must carry a bearer token"
+            );
+        }
     }
 
     #[tokio::test]
