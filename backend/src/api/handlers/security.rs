@@ -887,9 +887,10 @@ async fn list_policies(
 )]
 async fn create_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CreatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     let p = svc
         .create_policy(
@@ -949,10 +950,11 @@ async fn get_policy(
 )]
 async fn update_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     // PUT is partial-update friendly: any field client omits is left at its
     // current DB value via COALESCE in the service layer. See #1374.
@@ -989,9 +991,10 @@ async fn update_policy(
 )]
 async fn delete_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     svc.delete_policy(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -1236,6 +1239,32 @@ mod tests {
                 body_of(reader).contains("require_visible("),
                 "{} must call require_visible (xtenant)",
                 reader
+            );
+        }
+    }
+
+    /// Admin gate on the GLOBAL security-policy write handlers. The global
+    /// /api/v1/security/policies write endpoints must be admin-only, matching
+    /// every sibling governance endpoint; otherwise any authenticated user can
+    /// disable/delete org-wide scan policies. String-grep because the handlers
+    /// need a full DB-backed `SharedState` to run.
+    #[test]
+    fn test_global_policy_write_handlers_require_admin() {
+        let source = include_str!("security.rs");
+        let body_of = |handler: &str| -> &str {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        for writer in ["create_policy", "update_policy", "delete_policy"] {
+            assert!(
+                body_of(writer).contains("require_admin("),
+                "{} must call require_admin (global policy write is admin-only)",
+                writer
             );
         }
     }
