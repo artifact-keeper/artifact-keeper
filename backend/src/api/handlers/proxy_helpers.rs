@@ -3634,6 +3634,123 @@ async fn open_staged_stream(
     Ok(Box::pin(stream))
 }
 
+/// Spool an arbitrary byte stream to a bounded scratch temp file while computing
+/// SHA-256, SHA-1, and MD5 incrementally. Aborts with `413 Payload Too Large`
+/// once `max_upload_size_bytes` is exceeded (a value of 0 disables the limit,
+/// matching `DefaultBodyLimit`). Never buffers the whole body in memory.
+///
+/// This is the shared content-addressed staging primitive: pypi feeds it an axum
+/// multipart [`Field`](axum::extract::multipart::Field) (via
+/// [`stage_upload_field_content_addressed`]); nuget feeds it a `multer` field
+/// (streaming multipart) or the raw request-body data stream. Hand the returned
+/// [`StagedUpload`] to [`open_staged_upload_stream`] and the
+/// [`ContentDigests`](crate::services::artifact_service::ContentDigests) to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+#[allow(clippy::result_large_err)]
+pub async fn stage_stream_content_addressed<S, E>(
+    state: &crate::api::SharedState,
+    stream: S,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut hasher = crate::services::artifact_service::MultiHasher::new();
+    let mut written: u64 = 0;
+
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read upload body: {e}"),
+            )
+                .into_response()
+        })?;
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok((staged, hasher.finalize()))
+}
+
+/// Content-addressed variant of [`stage_upload_field`]: spool one axum multipart
+/// field to scratch while computing SHA-256 / SHA-1 / MD5. Thin wrapper over
+/// [`stage_stream_content_addressed`] (axum's `Field` is itself a byte stream).
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field_content_addressed(
+    state: &crate::api::SharedState,
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    stage_stream_content_addressed(state, field).await
+}
+
+/// Re-open a [`StagedUpload`] scratch file as a `'static` byte stream ready to
+/// hand to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+///
+/// The caller must keep the [`StagedUpload`] alive until the consumer finishes:
+/// the returned stream holds an independent open file handle, and the scratch
+/// file is only unlinked when the `StagedUpload` drops.
+#[allow(clippy::result_large_err)]
+pub async fn open_staged_upload_stream(
+    staged: &StagedUpload,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    open_staged_stream(staged.path()).await
+}
+
 /// Borrowed handle to the columns required to insert a new artifact row.
 /// The lifetime ties the supplied string slices to the surrounding scope so
 /// the helper can avoid extra allocations.

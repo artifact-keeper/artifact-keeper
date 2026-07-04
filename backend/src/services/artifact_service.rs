@@ -58,6 +58,60 @@ const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
                       AND prs.replication_mode::text IN ('push', 'mirror')
                     "#;
 
+/// The three content digests persisted on every artifact row.
+///
+/// Registry clients look artifacts up by any of SHA-256, SHA-1, or MD5 (Maven
+/// `.sha1` sidecars, PyPI MD5 digests, ...), so all three are stored. The
+/// streaming upload path computes them incrementally while spooling the body to
+/// a scratch file and hands them to [`ArtifactService::upload_stream_with_sync_options`].
+/// `storage.put_stream` only computes SHA-256, so SHA-1 / MD5 MUST be supplied
+/// here out-of-band or checksum-search by those two algorithms regresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentDigests {
+    /// Lowercase-hex SHA-256 (also the content-addressed storage key).
+    pub sha256: String,
+    /// Lowercase-hex SHA-1.
+    pub sha1: String,
+    /// Lowercase-hex MD5.
+    pub md5: String,
+}
+
+/// Incremental SHA-256 + SHA-1 + MD5 accumulator.
+///
+/// Feed chunks with [`MultiHasher::update`], then [`MultiHasher::finalize`] into
+/// a [`ContentDigests`]. Extracted as a pure, side-effect-free helper so the
+/// streaming ingest path and its unit tests share one hashing implementation and
+/// the three-way finalize is covered without a live storage backend.
+#[derive(Default)]
+pub struct MultiHasher {
+    sha256: Sha256,
+    sha1: sha1::Sha1,
+    md5: md5::Md5,
+}
+
+impl MultiHasher {
+    /// Create an empty accumulator.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold `data` into all three running digests.
+    pub fn update(&mut self, data: &[u8]) {
+        Digest::update(&mut self.sha256, data);
+        sha1::Digest::update(&mut self.sha1, data);
+        md5::Digest::update(&mut self.md5, data);
+    }
+
+    /// Finish hashing and produce the lowercase-hex [`ContentDigests`].
+    pub fn finalize(self) -> ContentDigests {
+        ContentDigests {
+            sha256: format!("{:x}", self.sha256.finalize()),
+            sha1: format!("{:x}", sha1::Digest::finalize(self.sha1)),
+            md5: format!("{:x}", md5::Digest::finalize(self.md5)),
+        }
+    }
+}
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
@@ -280,6 +334,148 @@ impl ArtifactService {
     ) -> Result<Artifact> {
         let size_bytes = data.len() as i64;
 
+        // Calculate checksums.
+        //
+        // We persist SHA-256, SHA-1, and MD5 so the checksum-search endpoint can
+        // locate an artifact by any of the three (registry clients lean heavily
+        // on SHA-1 and MD5 for legacy reasons). All three are lowercase hex.
+        let checksum_sha256 = Self::calculate_sha256(&data);
+        let checksum_sha1 = Self::calculate_sha1(&data);
+        let checksum_md5 = Self::calculate_md5(&data);
+        let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
+
+        // Quota, plugin BeforeUpload hook, live-overwrite check, and the
+        // release-immutability backstop — shared with the streaming path.
+        self.preflight_upload(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            size_bytes,
+            &checksum_sha256,
+            uploaded_by,
+        )
+        .await?;
+
+        // Check if content already exists (deduplication)
+        let content_exists = self.storage.exists(&storage_key).await?;
+
+        if !content_exists {
+            // Store the actual content
+            self.storage.put(&storage_key, data).await?;
+        }
+
+        self.finalize_upload(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            size_bytes,
+            &checksum_sha256,
+            &checksum_sha1,
+            &checksum_md5,
+            &storage_key,
+            uploaded_by,
+            enqueue_sync_tasks,
+        )
+        .await
+    }
+
+    /// Stream an artifact's content into content-addressed storage, mirroring
+    /// [`Self::upload_with_sync_options`] but never buffering the whole body in
+    /// memory. The caller spools the body to a bounded scratch file (computing
+    /// the three digests incrementally) and hands the digests + a `'static`
+    /// re-read stream of that file here.
+    ///
+    /// Every semantic of the buffered path is preserved: quota, plugin hooks,
+    /// the release-immutability backstop, `ON CONFLICT` tombstone resurrection,
+    /// packages-table population, quarantine hold, and sync fan-out. The
+    /// dedup `exists()` check runs FIRST and the `put_stream` write is SKIPPED on
+    /// a hit so a warm content-addressed blob is never rewritten.
+    ///
+    /// `put_stream` only computes SHA-256; the row's SHA-1 / MD5 come from
+    /// `digests`, so checksum-search by those algorithms does not regress.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_stream_with_sync_options(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+        digests: ContentDigests,
+        size_bytes: i64,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+    ) -> Result<Artifact> {
+        let storage_key = Self::storage_key_from_checksum(&digests.sha256);
+
+        self.preflight_upload(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            size_bytes,
+            &digests.sha256,
+            uploaded_by,
+        )
+        .await?;
+
+        // Dedup check FIRST: skip `put_stream` on a warm blob so we never
+        // rewrite content that is already present under its content-addressed
+        // key (== its SHA-256).
+        let content_exists = self.storage.exists(&storage_key).await?;
+
+        if !content_exists {
+            let put = self.storage.put_stream(&storage_key, stream).await?;
+            // `put_stream` computes only SHA-256; guard the content-addressed
+            // invariant that the streamed bytes hash to the key we stored them
+            // under (SHA-1 / MD5 for the row come from `digests`).
+            if !put.checksum_sha256.eq_ignore_ascii_case(&digests.sha256) {
+                return Err(AppError::Validation(format!(
+                    "Streamed content SHA-256 {} does not match staged digest {}",
+                    put.checksum_sha256, digests.sha256
+                )));
+            }
+        }
+
+        self.finalize_upload(
+            repository_id,
+            path,
+            name,
+            version,
+            content_type,
+            size_bytes,
+            &digests.sha256,
+            &digests.sha1,
+            &digests.md5,
+            &storage_key,
+            uploaded_by,
+            enqueue_sync_tasks,
+        )
+        .await
+    }
+
+    /// Pre-storage validation shared by the buffered and streaming upload paths:
+    /// quota enforcement, the plugin `BeforeUpload` hook (which may reject the
+    /// upload), the live-overwrite immutability check, and the
+    /// soft-delete-aware release-immutability backstop.
+    #[allow(clippy::too_many_arguments)]
+    async fn preflight_upload(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        size_bytes: i64,
+        checksum_sha256: &str,
+        uploaded_by: Option<Uuid>,
+    ) -> Result<()> {
         // Check quota
         if !self
             .repo_service
@@ -291,25 +487,6 @@ impl ArtifactService {
             ));
         }
 
-        // Calculate checksums.
-        //
-        // We persist SHA-256, SHA-1, and MD5 so that the checksum-search
-        // endpoint can locate an artifact by any of the three (registry
-        // clients lean heavily on SHA-1 and MD5 for legacy reasons: Maven
-        // central distributes .sha1 sidecar files, PyPI publishes MD5
-        // digests in package metadata, etc.). Prior to this change only
-        // SHA-256 was written, so SHA-1 / MD5 lookups always returned
-        // empty results. See fix/search-checksum-sha1-md5-case.
-        //
-        // All three are stored as lowercase hex (the `{:x}` format
-        // specifier in `calculate_*` produces lowercase) so the search
-        // handler's `to_lowercase()` normalization of the input parameter
-        // yields a direct byte-wise match against the column.
-        let checksum_sha256 = Self::calculate_sha256(&data);
-        let checksum_sha1 = Self::calculate_sha1(&data);
-        let checksum_md5 = Self::calculate_md5(&data);
-        let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
-
         // Build artifact info for plugin hooks (before artifact is created)
         let pre_artifact_info = ArtifactInfo {
             id: Uuid::nil(), // Will be set after creation
@@ -318,7 +495,7 @@ impl ArtifactService {
             name: name.to_string(),
             version: version.map(String::from),
             size_bytes,
-            checksum_sha256: checksum_sha256.clone(),
+            checksum_sha256: checksum_sha256.to_string(),
             content_type: content_type.to_string(),
             uploaded_by,
         };
@@ -385,8 +562,7 @@ impl ArtifactService {
                     let is_released = prior.version.is_some()
                         || crate::services::cache_classifier::classify(&repo.format, path)
                             .is_immutable();
-                    if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(&checksum_sha256)
-                    {
+                    if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
                         return Err(AppError::Conflict(
                             "Artifact version already exists and is immutable".to_string(),
                         ));
@@ -395,14 +571,31 @@ impl ArtifactService {
             }
         }
 
-        // Check if content already exists (deduplication)
-        let content_exists = self.storage.exists(&storage_key).await?;
+        Ok(())
+    }
 
-        if !content_exists {
-            // Store the actual content
-            self.storage.put(&storage_key, data).await?;
-        }
-
+    /// Persist the artifact row and run every post-storage side effect shared by
+    /// the buffered and streaming upload paths: `ON CONFLICT` insert/resurrect,
+    /// quarantine hold, quota-warning telemetry, packages-table population, the
+    /// `AfterUpload` hook, peer sync fan-out, scan-on-upload, quality checks, and
+    /// OpenSearch indexing. The content bytes are already in storage under
+    /// `storage_key`; the three checksums are supplied by the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_upload(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version: Option<&str>,
+        content_type: &str,
+        size_bytes: i64,
+        checksum_sha256: &str,
+        checksum_sha1: &str,
+        checksum_md5: &str,
+        storage_key: &str,
+        uploaded_by: Option<Uuid>,
+        enqueue_sync_tasks: bool,
+    ) -> Result<Artifact> {
         // Create artifact record.
         //
         // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
@@ -1355,6 +1548,56 @@ mod tests {
             key,
             "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MultiHasher: incremental SHA-256 + SHA-1 + MD5 finalize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_hasher_matches_one_shot_helpers() {
+        // Feeding the payload in several chunks must yield the same digests as
+        // the one-shot `calculate_*` helpers over the whole buffer.
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let mut hasher = MultiHasher::new();
+        hasher.update(&payload[..10]);
+        hasher.update(&payload[10..25]);
+        hasher.update(&payload[25..]);
+        let digests = hasher.finalize();
+
+        assert_eq!(digests.sha256, ArtifactService::calculate_sha256(payload));
+        assert_eq!(digests.sha1, ArtifactService::calculate_sha1(payload));
+        assert_eq!(digests.md5, ArtifactService::calculate_md5(payload));
+    }
+
+    #[test]
+    fn test_multi_hasher_empty_input() {
+        let digests = MultiHasher::new().finalize();
+        assert_eq!(digests.sha256, ArtifactService::calculate_sha256(b""));
+        assert_eq!(digests.sha1, ArtifactService::calculate_sha1(b""));
+        assert_eq!(digests.md5, ArtifactService::calculate_md5(b""));
+        // Well-known empty-input digests.
+        assert_eq!(
+            digests.sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(digests.sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(digests.md5, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn test_multi_hasher_lowercase_hex_lengths() {
+        let mut hasher = MultiHasher::new();
+        hasher.update(b"content-addressed");
+        let d = hasher.finalize();
+        assert_eq!(d.sha256.len(), 64);
+        assert_eq!(d.sha1.len(), 40);
+        assert_eq!(d.md5.len(), 32);
+        for s in [&d.sha256, &d.sha1, &d.md5] {
+            assert!(s
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
     }
 
     // -----------------------------------------------------------------------
