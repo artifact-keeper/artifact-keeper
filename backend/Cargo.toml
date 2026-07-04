@@ -197,3 +197,4 @@ tonic-build.workspace = true
 tokio-test = "0.4"
 axum-test = "18"
 wiremock = "0.6"
+metrics-util = "0.20"
