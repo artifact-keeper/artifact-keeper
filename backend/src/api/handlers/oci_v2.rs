@@ -537,6 +537,19 @@ fn upload_progress_range(bytes_received: i64) -> String {
     }
 }
 
+/// Whether a completion-PUT body is *known up front* to be empty, from its
+/// `http_body::Body::size_hint().exact()`.
+///
+/// `Some(0)` — a declared zero-length body (`Content-Length: 0`) — is skipped
+/// without ever touching storage. `None` (an unknown length, e.g. a chunked
+/// transfer-encoding final PUT with no `Content-Length`) is *not* known-empty:
+/// it must still be streamed, because it may carry the last bytes of the blob.
+/// A `None` body that turns out to have written zero bytes is dropped at the
+/// call site, matching the `Some(0)` skip without risking data loss.
+fn final_part_body_is_known_empty(exact_len: Option<u64>) -> bool {
+    exact_len == Some(0)
+}
+
 fn upload_patch_accepted_response(
     image_name: &str,
     session_id: Uuid,
@@ -885,6 +898,30 @@ async fn clear_oci_upload_cleanup_key_best_effort(db: &PgPool, storage_key: &str
             error = %e,
             "Failed to clear OCI upload cleanup-key row after blob became referenced"
         );
+    }
+}
+
+/// GC-4: drop the completion-only cleanup-journal rows once a chunked upload has
+/// durably committed. The final PATCH-less part object and the concatenated
+/// completion temp object have already been deleted on the success path, so
+/// their journal rows are redundant; clearing them inline avoids leaving them
+/// for the 24-48h unreferenced sweep (which would issue a redundant NotFound
+/// storage delete for each). Best-effort: a lost delete simply falls back to
+/// that sweep.
+///
+/// MUST be called only after the `oci_blobs` INSERT and the session DELETE have
+/// COMMITTED — clearing a journal row before its temp object is durably
+/// unreferenced could let the sweep skip a still-referenced object.
+async fn clear_completion_cleanup_journal_rows(
+    db: &PgPool,
+    final_part_key: Option<&str>,
+    completion_temp_key: Option<&str>,
+) {
+    if let Some(key) = final_part_key {
+        clear_oci_upload_cleanup_key_best_effort(db, key).await;
+    }
+    if let Some(key) = completion_temp_key {
+        clear_oci_upload_cleanup_key_best_effort(db, key).await;
     }
 }
 
@@ -4099,6 +4136,14 @@ async fn handle_start_upload(
         // the `oci_blobs` EXISTS guard.
         clear_oci_upload_cleanup_key_best_effort(&state.db, &key).await;
         delete_storage_key_best_effort(&storage, &temp_key, "monolithic upload completed").await;
+        // GC-LOW-3: the streamed temp object has now been deleted and the
+        // `oci_blobs` row is durable, so the temp key's cleanup-journal row is
+        // redundant. Drop it inline instead of leaving it for the 24-48h
+        // unreferenced sweep. Safe only here, strictly after the blob copy and
+        // the `oci_blobs` INSERT have both succeeded and the temp object itself
+        // has been removed above — clearing it any earlier could let the sweep
+        // skip a still-referenced temp object.
+        clear_oci_upload_cleanup_key_best_effort(&state.db, &temp_key).await;
 
         return Response::builder()
             .status(StatusCode::CREATED)
@@ -4339,6 +4384,14 @@ async fn handle_patch_upload(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // F1: the part's cleanup-key row is marked committed here, on the pool,
+    // BEFORE the `oci_upload_parts` INSERT below (which runs in its own
+    // transaction). That ordering is safe only because the unreferenced-cleanup
+    // sweep gates on the 24h TTL: if this request dies between marking the key
+    // committed and inserting the part row, the part object is briefly
+    // journaled-but-unreferenced, and the sweep will not reclaim it until the
+    // TTL elapses — long after a healthy request has either inserted the part
+    // row or compensated by deleting the object on an error path.
     if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &part_key).await {
         delete_storage_key_best_effort(&storage, &part_key, "PATCH cleanup mark failed").await;
         return resp;
@@ -4841,7 +4894,7 @@ async fn handle_complete_upload(
 
     let final_part_key =
         upload_part_storage_key(&session.storage_temp_key, i32::MAX, &Uuid::new_v4());
-    let final_part = if body.size_hint().exact() == Some(0) {
+    let final_part = if final_part_body_is_known_empty(body.size_hint().exact()) {
         None
     } else {
         if let Err(resp) = register_oci_upload_cleanup_key(
@@ -4873,6 +4926,25 @@ async fn handle_complete_upload(
         )
         .await
         {
+            Ok(result) if result.bytes_written == 0 => {
+                // The body length was unknown up front (`size_hint().exact() ==
+                // None`, e.g. a chunked-transfer-encoding final PUT with no
+                // Content-Length) and turned out to carry no bytes. Drop the
+                // empty part exactly as the `Some(0)` fast-skip above would
+                // have, instead of threading a 0-byte part through the
+                // concatenation: delete the just-written empty object and its
+                // cleanup-journal row. The journal row is cleared only after the
+                // object is deleted, and the object is never referenced by any
+                // committed row, so this cannot orphan storage.
+                delete_storage_key_best_effort(
+                    &storage,
+                    &final_part_key,
+                    "empty final upload part skipped",
+                )
+                .await;
+                clear_oci_upload_cleanup_key_best_effort(&state.db, &final_part_key).await;
+                None
+            }
             Ok(result) => {
                 if let Err(resp) =
                     mark_oci_upload_cleanup_key_committed(&state.db, &final_part_key).await
@@ -4976,8 +5048,11 @@ async fn handle_complete_upload(
     if let Some((part, _checksum)) = final_part.as_ref() {
         parts.push(part.clone());
     }
-    let size_bytes: i64 = parts.iter().map(|part| part.size_bytes).sum();
     let blob_key = blob_storage_key(&digest);
+    // GC-4: the concatenated completion temp object's cleanup-journal row is
+    // cleared inline on the confirmed success path below (post-commit). It is
+    // created inside the multi-part branch, so carry its key out here.
+    let mut completion_temp_journal_key: Option<String> = None;
 
     // Single-part fast path: one streamed part whose digest was already computed
     // and cached during PATCH/POST and already equals the client's requested
@@ -4987,7 +5062,12 @@ async fn handle_complete_upload(
     // be redundant). All three conditions are required: a non-empty final PUT
     // body, a part count other than exactly one, or a stale/absent cached digest
     // must fall through to the re-verifying path.
-    if final_part.is_none()
+    //
+    // The branch evaluates to the authoritative `size_bytes` recorded on the
+    // `oci_blobs` row: for the concat path that is the digest-verified
+    // `bytes_written` of the concatenated put, not `sum(parts.size_bytes)`
+    // (which could drift from a stale part row).
+    let size_bytes: i64 = if final_part.is_none()
         && parts.len() == 1
         && session.computed_digest.as_ref() == Some(&requested_digest)
     {
@@ -5043,6 +5123,10 @@ async fn handle_complete_upload(
                 &e.to_string(),
             );
         }
+        // The single streamed part is promoted verbatim; its recorded size is
+        // the digest-verified `bytes_written` cached at PATCH/POST time, and
+        // `sum()` over exactly one part is identical to it.
+        parts[0].size_bytes
     } else {
         if final_part.is_none() {
             if let Some(computed) = session.computed_digest.as_ref() {
@@ -5077,6 +5161,9 @@ async fn handle_complete_upload(
         // stay ordered before the `put_stream` below — never reorder it after.
         let completion_temp_key =
             format!("{}.complete.{}", session.storage_temp_key, Uuid::new_v4());
+        // Remember the key so its cleanup-journal row can be cleared inline on
+        // the post-commit success path (GC-4).
+        completion_temp_journal_key = Some(completion_temp_key.clone());
         if let Err(resp) = register_oci_upload_cleanup_key(
             &state.db,
             session.repository_id,
@@ -5344,7 +5431,11 @@ async fn handle_complete_upload(
         }
         delete_storage_key_best_effort(&storage, &completion_temp_key, "completion temp promoted")
             .await;
-    }
+        // Authoritative blob size = bytes actually written by the digest-verified
+        // concatenated put, rather than `sum(parts.size_bytes)` (which could
+        // drift from a stale part row).
+        put_result.bytes_written as i64
+    };
     // Last fast-fail before the commit transaction. This atomic flag is only an
     // optimization: it is NOT re-checked across `tx.begin()`/`tx.commit()`
     // below. The authoritative lease guard is the `state_token` predicate on the
@@ -5514,6 +5605,12 @@ async fn handle_complete_upload(
                     )
                     .await;
                 }
+                clear_completion_cleanup_journal_rows(
+                    &state.db,
+                    final_part.as_ref().map(|_| final_part_key.as_str()),
+                    completion_temp_journal_key.as_deref(),
+                )
+                .await;
                 warn!(
                     session_id = %session_id,
                     digest = %digest,
@@ -5564,6 +5661,12 @@ async fn handle_complete_upload(
     for key in cleanup_keys {
         delete_storage_key_best_effort(&storage, &key, "upload completed").await;
     }
+    clear_completion_cleanup_journal_rows(
+        &state.db,
+        final_part.as_ref().map(|_| final_part_key.as_str()),
+        completion_temp_journal_key.as_deref(),
+    )
+    .await;
 
     info!(
         "Completed blob upload {}: {} ({} bytes)",
@@ -8678,6 +8781,19 @@ mod tests {
         assert_eq!(upload_progress_range(1), "0-0");
         assert_eq!(upload_progress_range(2), "0-1");
         assert_eq!(upload_progress_range(4435), "0-4434");
+    }
+
+    #[test]
+    fn test_final_part_body_is_known_empty() {
+        // A declared zero-length body is known-empty and skipped up front.
+        assert!(final_part_body_is_known_empty(Some(0)));
+        // A body of unknown length (chunked, no Content-Length) is NOT
+        // known-empty: it must be streamed, then dropped only if it wrote 0
+        // bytes. Treating it as empty up front would drop real data.
+        assert!(!final_part_body_is_known_empty(None));
+        // Any known non-zero length is streamed.
+        assert!(!final_part_body_is_known_empty(Some(1)));
+        assert!(!final_part_body_is_known_empty(Some(4096)));
     }
 
     #[tokio::test]
@@ -13991,7 +14107,7 @@ mod oci_blob_upload_streaming_tests {
         );
 
         let parts = sqlx::query(
-            "SELECT part_index, storage_key, size_bytes FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
+            "SELECT part_index, storage_key, size_bytes, digest_sha256 FROM oci_upload_parts WHERE upload_session_id = $1 ORDER BY part_index",
         )
         .bind(upload_uuid)
         .fetch_all(&f.inner.pool)
@@ -14001,11 +14117,20 @@ mod oci_blob_upload_streaming_tests {
         let first_index: i32 = parts[0].try_get("part_index").unwrap();
         let first_key: String = parts[0].try_get("storage_key").unwrap();
         let first_size: i64 = parts[0].try_get("size_bytes").unwrap();
+        // TQ-3: migration 117 makes `digest_sha256` nullable so the synthesized
+        // legacy first part is stored with a NULL per-part digest (there is no
+        // honest per-part SHA-256 for a body streamed before parts were tracked),
+        // rather than the dishonest '' sentinel.
+        let first_digest: Option<String> = parts[0].try_get("digest_sha256").unwrap();
         let second_index: i32 = parts[1].try_get("part_index").unwrap();
         let second_size: i64 = parts[1].try_get("size_bytes").unwrap();
         assert_eq!(first_index, 0);
         assert_eq!(first_key, temp_key);
         assert_eq!(first_size, initial.len() as i64);
+        assert!(
+            first_digest.is_none(),
+            "synthesized legacy first part must have a NULL digest_sha256, got {first_digest:?}"
+        );
         assert_eq!(second_index, 1);
         assert_eq!(second_size, next.len() as i64);
 
@@ -16255,6 +16380,118 @@ mod oci_blob_upload_streaming_tests {
                 .unwrap()
                 .as_ref(),
             b"hello world"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_with_unknown_length_empty_final_put_skips_zero_byte_part() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let app = f.app();
+        let digest = compute_sha256(b"hello world");
+
+        let (status, headers, body) = send(
+            app.clone(),
+            request(
+                Method::POST,
+                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start upload failed: {:?}",
+            body
+        );
+        let upload_uuid = headers
+            .get("Docker-Upload-UUID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .expect("Docker-Upload-UUID");
+
+        // PATCH the entire blob body as a single part.
+        let (status, _headers, body) = send(
+            app.clone(),
+            request(
+                Method::PATCH,
+                format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                &f.authorization,
+                Bytes::from_static(b"hello world"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "patch upload failed: {:?}",
+            body
+        );
+
+        // Final PUT with an UNKNOWN-LENGTH body (empty stream, no Content-Length),
+        // so `size_hint().exact() == None` — the case that item 2 targets. The
+        // handler must stream it, observe zero bytes, and drop the empty final
+        // part instead of threading a 0-byte part through the concatenation.
+        let empty_stream =
+            futures::stream::iter(Vec::<Result<Bytes, std::convert::Infallible>>::new());
+        let final_req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/{}/image/blobs/uploads/{}?digest={}",
+                f.inner.repo_key, upload_uuid, digest
+            ))
+            .header(AUTHORIZATION, &f.authorization)
+            .body(Body::from_stream(empty_stream))
+            .expect("build streaming final PUT");
+        let (status, _headers, body) = send(app.clone(), final_req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "empty unknown-length final PUT should complete: {:?}",
+            body
+        );
+
+        // The finalized blob is exactly the PATCHed bytes: the empty final PUT
+        // contributed nothing and did not corrupt the digest-verified content.
+        assert_eq!(
+            f.storage()
+                .get(&blob_storage_key(&digest))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello world"
+        );
+        let (size, _key): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(f.inner.repo_id)
+        .bind(&digest)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("blob row");
+        assert_eq!(size, 11, "recorded size must be the PATCHed bytes only");
+
+        // No 0-byte final part was materialized: its cleanup-journal row
+        // (keyed under the `.part.<i32::MAX>.` prefix) must not exist.
+        let final_part_journal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_upload_cleanup_keys WHERE storage_key LIKE $1",
+        )
+        .bind(format!(
+            "{}.part.{}.%",
+            upload_storage_key(&upload_uuid),
+            i32::MAX
+        ))
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count final-part journal rows");
+        assert_eq!(
+            final_part_journal, 0,
+            "empty final PUT must not leave a 0-byte final-part cleanup-journal row"
         );
 
         f.teardown().await;
