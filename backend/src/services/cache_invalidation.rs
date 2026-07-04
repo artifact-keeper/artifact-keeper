@@ -11,7 +11,7 @@
 //! or group-membership change) is invisible to replicas B..N until their local
 //! TTL expires, leaving a 30–300 s stale-authorization window.
 //!
-//! This module closes that window: database triggers (migration 141) call
+//! This module closes that window: database triggers (migration 142) call
 //! `pg_notify` on the [`CACHE_INVALIDATION_CHANNEL`] whenever one of those
 //! writes commits, and every backend process runs a listener task that maps
 //! each received [`InvalidationEvent`] onto the existing process-local
@@ -52,7 +52,7 @@ pub const CACHE_INVALIDATION_CHANNEL: &str = "ak_cache_invalidation_v1";
 /// Payload schema version expected inside each notification envelope.
 pub const CACHE_INVALIDATION_VERSION: u8 = 1;
 
-/// A single cache-invalidation event, JSON-encoded by the migration-141
+/// A single cache-invalidation event, JSON-encoded by the migration-142
 /// trigger functions as `{"v":1,"kind":"<snake_case_kind>",...fields}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -335,7 +335,7 @@ mod tests {
 
     /// Round-trip every known variant through the envelope JSON the triggers
     /// emit. The serialized form is also asserted structurally so the SQL
-    /// trigger payloads (written by hand in migration 141) and this parser
+    /// trigger payloads (written by hand in migration 142) and this parser
     /// cannot silently drift apart.
     #[test]
     fn parse_round_trips_every_known_variant() {

@@ -10,7 +10,7 @@
 //!
 //! Two layers are covered:
 //!
-//! 1. **Trigger emission contract** — the migration-141 triggers must emit
+//! 1. **Trigger emission contract** — the migration-142 triggers must emit
 //!    exactly one versioned JSON event on the `ak_cache_invalidation_v1`
 //!    channel for each security-relevant write (API-token revocation, user
 //!    deactivation/delete, repository auth-metadata change/delete, permission

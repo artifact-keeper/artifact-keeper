@@ -744,7 +744,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let state = Arc::new(app_state);
 
     // Fan out authorization-cache invalidations from other replicas via
-    // Postgres LISTEN/NOTIFY (migration 141 triggers +
+    // Postgres LISTEN/NOTIFY (migration 142 triggers +
     // services/cache_invalidation.rs). Awaited so the initial LISTEN and the
     // conservative startup flush complete before requests are served; if the
     // connection fails the spawned task retries with backoff while requests

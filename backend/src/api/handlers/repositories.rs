@@ -1668,7 +1668,7 @@ pub async fn update_repository(
     // must run AFTER every repository/config write above: evicting before
     // the repository_config upserts let a concurrent request repopulate the
     // entry with the old index_upstream_url mid-update. Cross-replica
-    // eviction is handled by the migration-141 repository_changed trigger.
+    // eviction is handled by the migration-142 repository_changed trigger.
     {
         let mut cache = state.repo_cache.write().await;
         cache.remove(&key);
