@@ -2674,6 +2674,13 @@ pub async fn resolve_virtual_blob(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_blob_path(&image, digest);
+                    // #2192 / #1608 Phase 4c: this virtual-member blob fallback
+                    // stays BUFFERED (unlike the plain-Remote blob download,
+                    // which now streams). `finalize_upstream_blob` below
+                    // content-address-verifies the whole body against the
+                    // requested digest before serving — a security-critical
+                    // check that requires the complete payload in memory, so it
+                    // cannot be streamed without sacrificing verification.
                     if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
@@ -2788,6 +2795,12 @@ pub async fn resolve_virtual_manifest(
             {
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_manifest_path(&image, reference);
+                    // #2192 / #1608 Phase 4c: manifest fallbacks stay BUFFERED
+                    // and capped by design. A manifest is a small parsed-JSON
+                    // document (blob-ref resolution) that must be read in-process,
+                    // and there is no streaming `_with_accept` sibling; when the
+                    // reference is a digest, `finalize_upstream_manifest` below
+                    // content-address-verifies the whole body before serving.
                     if let Ok((content, content_type)) =
                         proxy_helpers::proxy_fetch_capped_with_accept(
                             proxy,
@@ -3147,6 +3160,12 @@ async fn try_upstream_fetch_with_accept(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
+    // #2192 / #1608 Phase 4c: the manifest GET/HEAD fallback stays BUFFERED and
+    // capped by design — a manifest is a small parsed-JSON document that must be
+    // read in-process for blob-ref resolution, and there is no streaming
+    // `_with_accept` sibling that could forward the content-negotiation `Accept`
+    // header. Blob downloads no longer flow through here: the Remote GET-blob
+    // path streams via `try_upstream_fetch_streaming_blob`.
     proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
@@ -3283,6 +3302,72 @@ fn build_oci_proxy_response(
         .header(CONTENT_LENGTH, content.len().to_string())
         .header(CONTENT_TYPE, ct)
         .body(body)
+        .unwrap()
+}
+
+/// Streaming sibling of [`try_upstream_fetch`] for BLOB downloads (#2192 /
+/// #1608 Phase 4c).
+///
+/// A blob is an opaque image layer that can legitimately exceed the buffered
+/// per-caller cap (#2181). Route the Remote-repo blob download through the
+/// streaming proxy helper — teed into the proxy cache — so a >cap layer returns
+/// 200 (streamed) instead of 502, and subsequent pulls are served warm.
+///
+/// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
+/// path: they are parsed JSON (blob-ref resolution) and, when referenced by
+/// digest, content-address-verified before serving, so they must be buffered.
+async fn try_upstream_fetch_streaming_blob(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    digest: &str,
+) -> Option<Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+    let image = normalize_docker_image(&repo.image, upstream_url);
+    let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        &upstream_path,
+    )
+    .await
+    .ok()?;
+    Some(build_oci_streaming_proxy_response(
+        result,
+        digest,
+        "application/octet-stream",
+    ))
+}
+
+/// Streaming sibling of [`build_oci_proxy_response`] for blob GETs (#2192 /
+/// #1608 Phase 4c). Preserves the mandatory `Docker-Content-Digest` header and
+/// forwards the upstream content-type / content-length while driving the body
+/// straight from the streaming fetch, never buffering the layer in heap.
+fn build_oci_streaming_proxy_response(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    digest: &str,
+    default_ct: &str,
+) -> Response {
+    let ct = result
+        .content_type
+        .unwrap_or_else(|| default_ct.to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Docker-Content-Digest", digest)
+        .header(CONTENT_TYPE, ct);
+    if let Some(len) = result.content_length {
+        builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    builder
+        .body(Body::from_stream(result.body.map(|chunk| {
+            chunk.map_err(|e| std::io::Error::other(e.to_string()))
+        })))
         .unwrap()
 }
 
@@ -3946,11 +4031,17 @@ async fn handle_get_blob(
         }
     }
 
-    // For remote repos, try fetching blob from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
-    {
-        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", true);
+    // For remote repos, STREAM the blob from upstream. Blobs are opaque
+    // binaries (image layers) that routinely reach many GiB; the buffered
+    // fallback (#2181) capped them at DEFAULT_METADATA_MAX_BYTES and 502'd a
+    // layer larger than the cap even though the CAS-hit path already streams.
+    // Route the download through the streaming proxy helper (teed into the
+    // proxy cache) so large blobs succeed with 200 and later pulls are served
+    // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
+    // content-address-verify the digest before serving, so streaming
+    // introduces no verification regression. (#2192 / #1608 Phase 4c)
+    if let Some(resp) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+        return resp;
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -11293,6 +11384,153 @@ mod blob_pull_streaming_tests {
             &body_bytes[..],
             "streamed body must round-trip the stored blob bytes"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2192 / #1608 Phase 4c: the Remote-repo blob DOWNLOAD fallback streams (so a
+// >cap layer is 200, not 502) while the manifest fallback stays buffered/capped.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod remote_blob_streaming_fallback_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn remote_repo(key: &str, upstream_url: &str, image: &str) -> OciRepoInfo {
+        OciRepoInfo {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: "/data/docker".to_string(),
+            },
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream_url.to_string()),
+            is_public: true,
+            image: image.to_string(),
+        }
+    }
+
+    /// A blob larger than the old buffered cap (DEFAULT_METADATA_MAX_BYTES =
+    /// 8 MiB) must STREAM with 200 (Docker-Content-Digest preserved) instead of
+    /// 502, and the second request must be served WARM from the teed proxy cache
+    /// without a second upstream round-trip.
+    #[tokio::test]
+    async fn remote_blob_streams_large_layer_and_warms_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let digest = format!("sha256:{}", "d".repeat(64));
+        // 9 MiB > 8 MiB DEFAULT_METADATA_MAX_BYTES: 502s on the buffered path.
+        let layer = vec![0x5au8; 9 * 1024 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myorg/app/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            // Warm-cache proof: fetched from upstream at most once.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-blob-stream-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&tmp, layer.len() as u64).await;
+            }
+            let resp = super::try_upstream_fetch_streaming_blob(&repo, &state, &digest)
+                .await
+                .expect("large blob must stream with 200, not 502");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("Docker-Content-Digest")
+                    .and_then(|v| v.to_str().ok()),
+                Some(digest.as_str())
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("collect streamed layer");
+            assert_eq!(body.len(), layer.len());
+        }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The manifest fallback stays BUFFERED and capped by design: a manifest
+    /// larger than DEFAULT_METADATA_MAX_BYTES must NOT be served (the capped
+    /// buffered fetch fails, yielding `None`), proving it is not routed through
+    /// the streaming path. A small manifest still parses (returns `Some`).
+    #[tokio::test]
+    async fn remote_manifest_fallback_stays_buffered_and_capped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // Small manifest: buffered fetch succeeds.
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/small"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(br#"{"schemaVersion":2}"#.as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        // Oversized "manifest": 9 MiB > 8 MiB cap. The buffered+capped fetch
+        // rejects it (502 -> None); a streaming path would have returned it.
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/huge"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(vec![0x20u8; 9 * 1024 * 1024]),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-manifest-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
+
+        let small =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None).await;
+        assert!(small.is_some(), "a small manifest must still be served");
+
+        let huge =
+            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None).await;
+        assert!(
+            huge.is_none(),
+            "an over-cap manifest must be rejected by the buffered/capped fallback, \
+             proving manifests are NOT streamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

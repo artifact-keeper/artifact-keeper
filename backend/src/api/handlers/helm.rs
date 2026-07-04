@@ -17,7 +17,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
 use sqlx::{PgPool, Row};
 use tracing::info;
 
@@ -242,7 +241,9 @@ async fn fetch_chart_via_index(
     name: &str,
     version: &str,
     filename: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<Response, Response> {
+    // The `index.yaml` lookup stays buffered/capped by design: it is a small
+    // metadata document that must be parsed in-process.
     let (index_bytes, _) = proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,
@@ -280,16 +281,22 @@ async fn fetch_chart_via_index(
 
     let fetch_url = resolve_chart_url(upstream_url, &chart_url);
     let cache_path = format!("charts/{}", filename);
-    proxy_helpers::proxy_fetch_capped_with_cache_key(
+    // #2192 / #1608 Phase 4c: the chart itself is a package BLOB, not metadata.
+    // The buffered fallback (#2181) capped it at DEFAULT_METADATA_MAX_BYTES and
+    // 502'd charts larger than the cap even though the primary download path
+    // streams. Route the chart download through the streaming helper (teed into
+    // the proxy cache under the same stable `charts/{filename}` key) so large
+    // charts succeed with 200 and subsequent requests are served warm.
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &fetch_url,
         &cache_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await
+    .await?;
+    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(filename))
 }
 
 /// Attempt to download a chart from a Remote or Virtual repo by resolving the
@@ -313,7 +320,7 @@ async fn download_chart_via_index(
         let Some(upstream_url) = repo.upstream_url.as_deref() else {
             return Ok(None);
         };
-        let (content, content_type) = fetch_chart_via_index(
+        let response = fetch_chart_via_index(
             proxy,
             repo.id,
             &repo.key,
@@ -323,12 +330,7 @@ async fn download_chart_via_index(
             filename,
         )
         .await?;
-        return Ok(Some(proxy_helpers::build_download_response(
-            content,
-            content_type,
-            "application/gzip",
-            Some(filename),
-        )));
+        return Ok(Some(response));
     }
 
     if repo.repo_type == RepositoryType::Virtual {
@@ -369,13 +371,8 @@ async fn download_chart_via_index(
             )
             .await
             {
-                Ok((content, content_type)) => {
-                    return Ok(Some(proxy_helpers::build_download_response(
-                        content,
-                        content_type,
-                        "application/gzip",
-                        Some(filename),
-                    )));
+                Ok(response) => {
+                    return Ok(Some(response));
                 }
                 Err(_) => {
                     tracing::debug!(
@@ -980,6 +977,8 @@ entries:
     // the DB. Tests that return before any HTTP call can use a fake lazy pool.
 
     #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
     async fn test_fetch_chart_via_index_success_relative_url() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1022,12 +1021,26 @@ entries:
         let _ = std::fs::remove_dir_all(&tmp);
 
         match result {
-            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()
+                        .get("content-disposition")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("attachment; filename=\"mychart-1.0.0.tgz\"")
+                );
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect streamed chart body");
+                assert_eq!(&body[..], chart_bytes);
+            }
             Err(_) => panic!("fetch_chart_via_index should succeed"),
         }
     }
 
     #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
     async fn test_fetch_chart_via_index_success_absolute_url() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1071,9 +1084,93 @@ entries:
         let _ = std::fs::remove_dir_all(&tmp);
 
         match result {
-            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect streamed chart body");
+                assert_eq!(&body[..], chart_bytes);
+            }
             Err(_) => panic!("fetch_chart_via_index (absolute URL) should succeed"),
         }
+    }
+
+    // #2192 / #1608 Phase 4c: a chart larger than the old buffered cap
+    // (DEFAULT_METADATA_MAX_BYTES = 8 MiB) must now STREAM with 200 instead of
+    // 502, and the second request must be served WARM from the teed proxy cache
+    // without a second upstream round-trip for the chart blob.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_fetch_chart_via_index_streams_large_chart_and_warms_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = make_index_yaml("big", "3.0.0", "charts/big-3.0.0.tgz");
+        // 9 MiB > 8 MiB DEFAULT_METADATA_MAX_BYTES: would 502 on the buffered path.
+        let chart_bytes = vec![0x42u8; 9 * 1024 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/big-3.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes.clone()))
+            // Cache warm proof: the chart blob is fetched from upstream at most
+            // once across the two requests below.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cached_blob(&tmp, chart_bytes.len() as u64).await;
+            }
+            let result = fetch_chart_via_index(
+                &proxy,
+                repo_id,
+                "helm-proxy-big",
+                &upstream_url,
+                "big",
+                "3.0.0",
+                "big-3.0.0.tgz",
+            )
+            .await;
+            match result {
+                Ok(resp) => {
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    assert_eq!(
+                        resp.headers()
+                            .get("content-disposition")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("attachment; filename=\"big-3.0.0.tgz\"")
+                    );
+                    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .expect("collect streamed chart body");
+                    assert_eq!(body.len(), chart_bytes.len());
+                }
+                Err(_) => panic!("large chart must stream with 200, not 502"),
+            }
+        }
+
+        // `.expect(1)` on the chart mock is verified on server drop.
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
