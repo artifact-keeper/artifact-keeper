@@ -1065,6 +1065,13 @@ mod tests {
         async fn health_check(&self) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Mock storage backend that reports unhealthy.
@@ -1088,6 +1095,13 @@ mod tests {
             Err(crate::error::AppError::Storage(
                 "connection refused".to_string(),
             ))
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 

@@ -13513,6 +13513,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct DeferredCommitFailureTrigger {
@@ -13754,6 +13761,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct LockProbeStorage {
@@ -13981,6 +13995,13 @@ mod oci_blob_upload_streaming_tests {
                 .insert(dest.to_string(), content);
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     struct DeleteRepoOnCopyStorage {
@@ -14051,6 +14072,13 @@ mod oci_blob_upload_streaming_tests {
                 .map_err(AppError::from)?;
 
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -14156,6 +14184,13 @@ mod oci_blob_upload_streaming_tests {
             .map_err(AppError::from)?;
 
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 

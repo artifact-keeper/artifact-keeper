@@ -5392,6 +5392,13 @@ mod tests {
                 source: crate::storage::PresignedUrlSource::S3,
             }))
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     // Facade-trait impl so `RecordingStorage` can be driven directly through
@@ -5595,6 +5602,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             *self.content.lock().await = None;
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 

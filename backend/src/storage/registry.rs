@@ -117,6 +117,14 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<()> {
             Ok(())
         }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, Result<Bytes>>,
+        ) -> Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     fn make_registry() -> StorageRegistry {
