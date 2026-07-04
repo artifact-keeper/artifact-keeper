@@ -1685,51 +1685,103 @@ pub async fn update_repository(
     Ok(Json(response))
 }
 
-/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
-/// objects from storage before the repository row is deleted.
+/// Batch size for [`collect_repo_oci_upload_temp_keys`]: the union of a
+/// repository's cleanup-key/session/part storage keys is drained in bounded
+/// chunks of this size instead of one unbounded query, so a repository with a
+/// very large cleanup-key backlog cannot force a single pathological SELECT
+/// (#1533 F2).
+const OCI_UPLOAD_TEMP_KEY_BATCH: i64 = 1000;
+
+/// Collect the storage keys of a repository's in-flight / abandoned OCI upload
+/// temp objects: the `oci_upload_cleanup_keys` journal plus (belt-and-braces)
+/// the session `storage_temp_key`s and per-part `storage_key`s, in case a
+/// storage write predated its journal row.
 ///
-/// `oci_upload_cleanup_keys`, `oci_upload_sessions`, and `oci_upload_parts` all
-/// `ON DELETE CASCADE` with `repositories`, so once the repo row is gone their
-/// storage objects lose their only discoverable owner and become permanent
-/// orphans that storage-GC can never reclaim. We delete them up front. Failures
-/// are logged but never block repository deletion.
-async fn purge_repo_oci_upload_temp_objects(
+/// This MUST run BEFORE the repository row is deleted. `oci_upload_cleanup_keys`
+/// and `oci_upload_sessions` both `ON DELETE CASCADE` with `repositories` (and
+/// `oci_upload_parts` cascades from the session), so once the repo row is gone
+/// these rows are too and the storage keys are no longer discoverable. The
+/// caller purges the returned keys from storage only AFTER a successful delete
+/// (see [`purge_oci_upload_temp_objects`]), so a delete that fails leaves the
+/// temp objects in place to be retried (#1533 GC-LOW-2).
+///
+/// The (deduplicated) union is drained with keyset pagination in bounded
+/// batches of [`OCI_UPLOAD_TEMP_KEY_BATCH`] so a repository with a very large
+/// backlog never issues one unbounded query (#1533 F2). A DB error is logged
+/// and ends collection.
+async fn collect_repo_oci_upload_temp_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    // Keyset cursor over storage_key (unique within the union set); "" precedes
+    // every real key ("oci-uploads/…"), so the first page starts at the top.
+    let mut after = String::new();
+    loop {
+        let batch: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM ( \
+                 SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
+                 UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
+                 UNION SELECT p.storage_key FROM oci_upload_parts p \
+                   JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
+                  WHERE s.repository_id = $1 \
+             ) AS temp_keys \
+             WHERE storage_key > $2 \
+             ORDER BY storage_key \
+             LIMIT $3",
+        )
+        .bind(repo_id)
+        .bind(&after)
+        .bind(OCI_UPLOAD_TEMP_KEY_BATCH)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list OCI upload temp keys to purge for repository delete"
+            );
+            Vec::new()
+        });
+        let full_page = batch.len() as i64 == OCI_UPLOAD_TEMP_KEY_BATCH;
+        if let Some(last) = batch.last() {
+            after = last.clone();
+        }
+        keys.extend(batch);
+        // A short (or empty) page means the backlog is drained.
+        if !full_page {
+            break;
+        }
+    }
+    keys
+}
+
+/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
+/// objects from storage, given the keys previously gathered by
+/// [`collect_repo_oci_upload_temp_keys`].
+///
+/// Called AFTER a successful `service.delete(repo.id)`: purging only once the
+/// delete has committed means a delete that fails does not prematurely destroy
+/// an in-flight upload's temp objects while the repository survives (#1533
+/// GC-LOW-2). Failures (storage resolution and per-object deletes) are logged
+/// but never propagated — the repository is already gone.
+async fn purge_oci_upload_temp_objects(
     state: &SharedState,
     repo_id: Uuid,
     location: &crate::storage::StorageLocation,
+    keys: Vec<String>,
 ) {
+    if keys.is_empty() {
+        return;
+    }
     let storage = match state.storage_for_repo(location) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 repo_id = %repo_id,
                 error = %e,
-                "Could not resolve storage to purge OCI upload temp objects before repository delete"
+                "Could not resolve storage to purge OCI upload temp objects after repository delete"
             );
             return;
         }
     };
-    // The cleanup-key journal records every temp/part/completion storage key
-    // written for this repo's uploads; union in the session/part keys as
-    // belt-and-suspenders in case a write predated its journal row.
-    let keys: Vec<String> = sqlx::query_scalar(
-        "SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
-         UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
-         UNION SELECT p.storage_key FROM oci_upload_parts p \
-           JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
-          WHERE s.repository_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            repo_id = %repo_id,
-            error = %e,
-            "Failed to list OCI upload temp keys to purge before repository delete"
-        );
-        Vec::new()
-    });
     for key in keys {
         match storage.delete(&key).await {
             Ok(()) | Err(AppError::NotFound(_)) => {}
@@ -1737,7 +1789,7 @@ async fn purge_repo_oci_upload_temp_objects(
                 repo_id = %repo_id,
                 storage_key = %key,
                 error = %e,
-                "Failed to purge OCI upload temp object before repository delete"
+                "Failed to purge OCI upload temp object after repository delete"
             ),
         }
     }
@@ -1877,10 +1929,13 @@ pub async fn delete_repository(
         }
     }
 
-    // Purge this repo's in-flight / abandoned OCI upload temp objects from
-    // storage BEFORE the repository row is deleted (see the helper). Best-effort:
-    // never blocks the delete.
-    purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
+    // Gather this repo's in-flight / abandoned OCI upload temp storage keys
+    // BEFORE the repository row is deleted — the journal/session/part rows
+    // CASCADE away with it, so the keys must be captured up front. The actual
+    // storage purge is deferred until AFTER a successful delete (below) so a
+    // failed delete does not prematurely destroy temp objects the surviving
+    // repository may still retry (#1533 GC-LOW-2). Best-effort throughout.
+    let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
 
     // Purge this repo's committed artifact objects from storage BEFORE the
     // repository row is deleted (the artifacts rows CASCADE away with it). The
@@ -1913,6 +1968,18 @@ pub async fn delete_repository(
     }
 
     service.delete(repo.id).await?;
+
+    // The repository row is now gone (and its OCI upload journal/session/part
+    // rows CASCADED away). Only now purge the temp objects gathered above from
+    // storage: had the delete failed, this is skipped and the objects survive
+    // to be retried (#1533 GC-LOW-2). Best-effort: never blocks.
+    purge_oci_upload_temp_objects(
+        &state,
+        repo.id,
+        &repo.storage_location(),
+        oci_upload_temp_keys,
+    )
+    .await;
 
     // Remove the deleted repo from the in-memory cache.
     {
@@ -10917,10 +10984,11 @@ mod tests {
             );
         }
 
-        // The repo-delete purge must remove the journaled temp/session/part
-        // objects up front (once the repo row is deleted their owner rows CASCADE
-        // away), but must leave the committed blob untouched.
-        purge_repo_oci_upload_temp_objects(&state, fx.repo_id, &location).await;
+        // The repo-delete flow collects the journaled temp/session/part keys
+        // (while the owner rows still exist) and then purges them from storage;
+        // it must remove those objects but leave the committed blob untouched.
+        let keys = collect_repo_oci_upload_temp_keys(&state, fx.repo_id).await;
+        purge_oci_upload_temp_objects(&state, fx.repo_id, &location, keys).await;
 
         for k in [&temp_key, &session_temp_key, &part_key] {
             assert!(
@@ -10934,6 +11002,193 @@ mod tests {
                 .await
                 .expect("blob exists after purge"),
             "purge must NOT delete the committed content-addressed blob {blob_key}"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Seed one in-flight OCI upload temp object into `storage` and register its
+    /// `oci_upload_cleanup_keys` journal row for `repo_id`; returns the key.
+    /// Shared by the ordering tests below so the seeding boilerplate lives in
+    /// one place.
+    async fn seed_oci_upload_temp_object(
+        pool: &sqlx::PgPool,
+        storage: &std::sync::Arc<dyn crate::storage::StorageBackend>,
+        repo_id: Uuid,
+    ) -> String {
+        let key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(&key, bytes::Bytes::from_static(b"in-flight upload bytes"))
+            .await
+            .expect("write temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+             VALUES ($1, $2, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("register cleanup key");
+        key
+    }
+
+    /// GC-LOW-2 (ordering, success path): a SUCCESSFUL `delete_repository`
+    /// purges the repo's in-flight OCI upload temp objects from storage — even
+    /// though the journal rows CASCADE away with the repo row, because the keys
+    /// are collected *before* the delete and purged *after* it commits.
+    #[tokio::test]
+    async fn delete_repository_success_purges_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let temp_key = seed_oci_upload_temp_object(&fx.pool, &storage, fx.repo_id).await;
+        assert!(
+            storage.exists(&temp_key).await.expect("exists"),
+            "precondition: temp object present"
+        );
+
+        // Admin auth so the delete-authorization gates pass without a per-repo
+        // admin grant.
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        delete_repository(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path(fx.repo_key.clone()),
+        )
+        .await
+        .expect("repository delete must succeed");
+
+        assert!(
+            !storage
+                .exists(&temp_key)
+                .await
+                .expect("exists after delete"),
+            "a successful repository delete must purge the OCI upload temp object"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// GC-LOW-2 (ordering, failure path): a `delete_repository` whose underlying
+    /// `service.delete` FAILS must NOT purge the repo's in-flight OCI upload temp
+    /// objects — they survive to be retried. The row delete is forced to fail by
+    /// a `BEFORE DELETE` trigger scoped (via its `WHEN` clause) to this one repo,
+    /// so `DELETE FROM repositories` raises and the handler returns before the
+    /// (post-delete) purge step.
+    #[tokio::test]
+    async fn delete_repository_failed_delete_keeps_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let temp_key = seed_oci_upload_temp_object(&fx.pool, &storage, fx.repo_id).await;
+
+        // A trigger name/function unique to this repo so concurrent DB tests
+        // sharing the `repositories` table never collide.
+        let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
+        let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
+        sqlx::query(&format!(
+            "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
+             $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create blocking trigger function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
+             FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
+            fx.repo_id
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create blocking trigger");
+
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        let res = delete_repository(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path(fx.repo_key.clone()),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "the repository delete must fail (blocking trigger present)"
+        );
+
+        assert!(
+            storage
+                .exists(&temp_key)
+                .await
+                .expect("exists after failed delete"),
+            "a FAILED repository delete must NOT purge the OCI upload temp object"
+        );
+
+        // Drop the trigger (and function) so the fixture can tear down cleanly.
+        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
+            .execute(&fx.pool)
+            .await
+            .expect("drop blocking trigger");
+        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+            .execute(&fx.pool)
+            .await
+            .expect("drop blocking trigger function");
+        let _ = storage.delete(&temp_key).await;
+        fx.teardown().await;
+    }
+
+    /// F2 (batching): a cleanup-key backlog larger than one batch must be fully
+    /// collected — the batched keyset query loops until the backlog is drained
+    /// rather than issuing a single unbounded SELECT.
+    #[tokio::test]
+    async fn collect_repo_oci_upload_temp_keys_drains_large_backlog() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // One more than the batch size guarantees at least two query pages, so a
+        // non-looping implementation would miss the overflow key.
+        let total = (OCI_UPLOAD_TEMP_KEY_BATCH + 1) as usize;
+        let mut expected: Vec<String> = Vec::with_capacity(total);
+        for _ in 0..total {
+            let key = format!("oci-uploads/{}", Uuid::new_v4());
+            sqlx::query(
+                "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+                 VALUES ($1, $2, NOW())",
+            )
+            .bind(fx.repo_id)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("register cleanup key");
+            expected.push(key);
+        }
+
+        let mut got = collect_repo_oci_upload_temp_keys(&fx.state, fx.repo_id).await;
+        got.sort();
+        got.dedup();
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "the batched collector must return every key in a large backlog"
         );
 
         fx.teardown().await;
