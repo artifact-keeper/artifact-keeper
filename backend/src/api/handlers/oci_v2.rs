@@ -7398,6 +7398,33 @@ async fn handle_delete_manifest(
         return resp;
     }
 
+    // Promotion-only release repositories: deleting a manifest is the symmetric
+    // mutation to the (already-gated) direct push and would let a plain
+    // repo-write principal permanently destroy a released image, bypassing the
+    // promotion/approval controls. Reject it for non-approvers; admins are the
+    // release-approvers (approve_promotion requires is_admin) and retain the
+    // retraction escape hatch. The promotion service writes via its own RAW SQL
+    // path and is unaffected. Mirrors the manifest-PUT promotion_only gate.
+    let promotion_only = sqlx::query_scalar!(
+        "SELECT promotion_only FROM repositories WHERE id = $1",
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_delete(
+        promotion_only,
+        claims.is_admin,
+    ) {
+        return oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow",
+        );
+    }
+
     // Resolve the digest the reference (tag name or digest) maps to. For a
     // hosted repo a digest reference is deletable even with no surviving tag
     // row, as long as this repo has committed metadata for it (#1681); the
@@ -13311,6 +13338,149 @@ mod oci_blob_upload_streaming_tests {
             allowed_status,
             StatusCode::BAD_REQUEST,
             "manifest PUT to a normal repo must pass the gate (degenerate -> 400, not 409)"
+        );
+    }
+
+    /// #2237: a direct manifest DELETE on a `promotion_only` release repository
+    /// must be rejected for a non-admin (non-approver) with 403 + OCI code
+    /// DENIED — symmetric with the manifest-PUT gate. Admins (release-approvers)
+    /// keep the retraction escape hatch (delete proceeds), and a normal
+    /// (non-promotion_only) repo is unaffected for the same non-admin caller.
+    #[tokio::test]
+    async fn delete_manifest_gated_on_promotion_only_repo() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let seed_tag = |tag: &'static str| {
+            let pool = f.inner.pool.clone();
+            let repo_id = f.inner.repo_id;
+            let digest = digest.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+                     VALUES ($1, 'app', $2, $3, 'application/vnd.oci.image.manifest.v1+json')",
+                )
+                .bind(repo_id)
+                .bind(tag)
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("seed tag");
+            }
+        };
+
+        // (a) promotion_only=true, non-admin (default fixture token, is_admin=false):
+        //     DELETE must be rejected 403 DENIED and leave the tag intact.
+        f.inner.set_promotion_only(true).await;
+        seed_tag("rel").await;
+        let (blocked_status, _h, blocked_body) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/rel", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let surviving: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND tag = 'rel'",
+        )
+        .bind(f.inner.repo_id)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count rel tag");
+
+        // (b) promotion_only=true, admin: the retraction escape hatch — the same
+        //     DELETE now proceeds (202) and removes the tag.
+        let admin_auth = {
+            sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+                .bind(f.inner.user_id)
+                .execute(&f.inner.pool)
+                .await
+                .expect("promote user to admin");
+            let auth_service = AuthService::new(
+                f.inner.state.db.clone(),
+                Arc::new(f.inner.state.config.clone()),
+            );
+            let user = sqlx::query_as::<_, crate::models::user::User>(
+                r#"SELECT id, username, email, password_hash, display_name, auth_provider,
+                          external_id, is_admin, is_active, is_service_account, must_change_password,
+                          totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                          failed_login_attempts, locked_until, last_failed_login_at,
+                          password_changed_at, last_login_at, created_at, updated_at
+                   FROM users WHERE id = $1"#,
+            )
+            .bind(f.inner.user_id)
+            .fetch_one(&f.inner.pool)
+            .await
+            .expect("fetch admin user");
+            format!(
+                "Bearer {}",
+                auth_service
+                    .generate_tokens(&user)
+                    .expect("mint admin token")
+                    .access_token
+            )
+        };
+        let (admin_status, _ah, _ab) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/rel", f.inner.repo_key),
+                &admin_auth,
+                Bytes::new(),
+            ),
+        )
+        .await;
+
+        // (c) promotion_only=false, non-admin: unaffected — the same delete
+        //     proceeds. Reset the user back to non-admin so the token identity is
+        //     irrelevant; the default fixture token is still non-admin.
+        sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
+            .bind(f.inner.user_id)
+            .execute(&f.inner.pool)
+            .await
+            .expect("demote user");
+        f.inner.set_promotion_only(false).await;
+        seed_tag("rel2").await;
+        let (normal_status, _nh, _nb) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/rel2", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "non-admin manifest DELETE on a promotion_only repo must return 403"
+        );
+        assert!(
+            String::from_utf8_lossy(&blocked_body).contains("DENIED"),
+            "403 body must carry the OCI DENIED code; got: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_eq!(
+            surviving, 1,
+            "a blocked delete must leave the released tag intact"
+        );
+        assert_eq!(
+            admin_status,
+            StatusCode::ACCEPTED,
+            "an admin (release-approver) retains the retraction escape hatch (202)"
+        );
+        assert_eq!(
+            normal_status,
+            StatusCode::ACCEPTED,
+            "delete on a normal (non-promotion_only) repo must be unaffected (202)"
         );
     }
 

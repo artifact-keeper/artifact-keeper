@@ -199,6 +199,47 @@ pub fn reject_direct_upload_if_promotion_only(
     }
 }
 
+/// Decide whether a direct user delete must be rejected because the target
+/// repository is flagged `promotion_only`.
+///
+/// A `promotion_only` repository is a release/production repository whose
+/// contents may only be mutated through the promotion workflow (staging ->
+/// promotion -> approval). The write gate already blocks direct uploads to
+/// such repos; a direct DELETE is the symmetric mutation and would let a
+/// principal with plain repo-write access permanently destroy a released
+/// artifact, bypassing the same controls.
+///
+/// Unlike the upload gate, delete keeps an escape hatch for release-approvers
+/// (`is_admin` == approver here: `approve_promotion` requires `is_admin`) so a
+/// genuinely bad release can still be retracted through the API — mirroring the
+/// admin exemption in `delete_blocked_by_immutability`. Non-admins are rejected.
+///
+/// The promotion service writes through its own RAW SQL path, which does not
+/// traverse the HTTP delete handlers, so promotions are unaffected. A repo with
+/// `promotion_only = false` is never affected (no-op for all callers).
+pub fn promotion_only_blocks_direct_delete(promotion_only: bool, is_admin: bool) -> bool {
+    promotion_only && !is_admin
+}
+
+/// 403 plain-text response for a rejected direct delete on a `promotion_only`
+/// repository. Provided for `Response`-returning call sites so both delete
+/// handlers share one message/shape.
+#[allow(clippy::result_large_err)]
+pub fn reject_direct_delete_if_promotion_only(
+    promotion_only: bool,
+    is_admin: bool,
+) -> Result<(), Response> {
+    if promotion_only_blocks_direct_delete(promotion_only, is_admin) {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow",
+        )
+            .into_response())
+    } else {
+        Ok(())
+    }
+}
+
 /// Strip query strings and fragments before logging a proxy path. Some
 /// split-path proxy callers fetch absolute, signed upstream URLs while caching
 /// under a stable local key; the fetch target must remain raw for the outbound
@@ -4680,6 +4721,46 @@ mod tests {
         let repo = promo_repo_info(false);
         assert!(repo.reject_if_promotion_only(false).is_ok());
         assert!(repo.reject_if_promotion_only(true).is_ok());
+    }
+
+    // ── promotion_only direct-delete gate ───────────────────────────
+
+    #[test]
+    fn test_promotion_only_blocks_non_admin_direct_delete() {
+        // Non-admin (non-approver) + promotion_only repo => delete blocked.
+        assert!(promotion_only_blocks_direct_delete(true, false));
+    }
+
+    #[test]
+    fn test_promotion_only_admin_retains_delete_escape_hatch() {
+        // Admins are the release-approvers and keep the retraction escape hatch,
+        // unlike the upload gate: (promotion_only=true, is_admin=true) => allowed.
+        assert!(!promotion_only_blocks_direct_delete(true, true));
+    }
+
+    #[test]
+    fn test_promotion_only_delete_normal_repo_not_blocked() {
+        // promotion_only = false => never blocked, for any caller (no regression
+        // for normal repos).
+        assert!(!promotion_only_blocks_direct_delete(false, false));
+        assert!(!promotion_only_blocks_direct_delete(false, true));
+    }
+
+    #[test]
+    fn test_reject_direct_delete_if_promotion_only_returns_403() {
+        // Non-admin delete on a promotion_only repo is rejected 403 FORBIDDEN.
+        let err = reject_direct_delete_if_promotion_only(true, false)
+            .expect_err("non-admin direct delete on promotion_only repo must be rejected");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_reject_direct_delete_if_promotion_only_admin_and_normal_ok() {
+        // Admin delete on a promotion_only repo passes (retraction hatch); a
+        // normal repo is a no-op for any caller.
+        assert!(reject_direct_delete_if_promotion_only(true, true).is_ok());
+        assert!(reject_direct_delete_if_promotion_only(false, false).is_ok());
+        assert!(reject_direct_delete_if_promotion_only(false, true).is_ok());
     }
 
     // ── LocalLookup dispatch tests ──────────────────────────────────

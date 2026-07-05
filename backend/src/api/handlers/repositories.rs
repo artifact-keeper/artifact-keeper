@@ -4530,6 +4530,23 @@ pub async fn delete_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
 
+    // Promotion-only release repositories: a direct DELETE is the symmetric
+    // mutation to the (already-gated) direct upload and would let a principal
+    // with plain repo-write permanently destroy a released artifact, bypassing
+    // the promotion/approval controls. Reject it for non-approvers. Admins are
+    // the release-approvers (approve_promotion requires is_admin) and keep the
+    // retraction escape hatch; trusted service accounts (e.g. peer replication)
+    // are exempt too, mirroring the immutability guard's exemptions below. The
+    // promotion service writes via its own RAW SQL path and is unaffected.
+    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_delete(
+        repo.promotion_only,
+        auth.is_admin || auth.is_service_account,
+    ) {
+        return Err(AppError::Authorization(
+            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow".to_string(),
+        ));
+    }
+
     // Release immutability: a versioned (immutable) artifact must never be
     // mutated after publication. Deleting one would re-open its coordinates for
     // a different-bytes re-upload (the upload path already rejects an existing
@@ -8483,6 +8500,118 @@ mod tests {
             remaining.as_deref(),
             Some(original_sha.as_str()),
             "the released content must be unchanged after a blocked swap"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2237: a direct DELETE on a `promotion_only` release repository is
+    /// rejected for a non-admin (non-approver) with 403 FORBIDDEN, while an
+    /// admin (release-approver) retains the retraction escape hatch, and a
+    /// normal (non-promotion_only) repo is unaffected for the same non-admin.
+    #[tokio::test]
+    async fn delete_artifact_gated_on_promotion_only_repo_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let mut admin_ext = tdh::make_auth(user_id, &username);
+        admin_ext.is_admin = true;
+        let admin = Some(admin_ext);
+
+        let set_promotion_only = |value: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE repositories SET promotion_only = $1 WHERE id = $2")
+                    .bind(value)
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .expect("set promotion_only");
+            }
+        };
+
+        // Publish a release artifact (generic classifies this coordinate mutable,
+        // so the immutability guard is a no-op — the promotion gate is the only
+        // control under test).
+        let path = "app/1.0.0/app-1.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"RELEASE-BYTES"),
+        )
+        .await
+        .expect("initial publish must succeed");
+
+        // (1) promotion_only=true, non-admin -> 403 FORBIDDEN, artifact intact.
+        set_promotion_only(true).await;
+        let blocked = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(blocked, Err(AppError::Authorization(_))),
+            "non-admin DELETE on a promotion_only repo must be rejected 403, got: {blocked:?}"
+        );
+        let surviving: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            surviving, 1,
+            "a blocked delete must leave the release intact"
+        );
+
+        // (2) promotion_only=true, admin -> retraction escape hatch: proceeds.
+        let admin_del = delete_artifact(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            admin_del.is_ok(),
+            "an admin (release-approver) must retain the retraction path, got: {admin_del:?}"
+        );
+
+        // (3) promotion_only=false, non-admin -> unaffected: proceeds.
+        set_promotion_only(false).await;
+        let path2 = "app/2.0.0/app-2.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path2.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"NORMAL-REPO-BYTES"),
+        )
+        .await
+        .expect("publish to normal repo must succeed");
+        let normal_del = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path2.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            normal_del.is_ok(),
+            "delete on a normal (non-promotion_only) repo must be unaffected, got: {normal_del:?}"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
