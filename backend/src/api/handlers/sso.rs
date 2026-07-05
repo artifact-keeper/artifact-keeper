@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::extractors::{trusted_external_url, RequestBaseUrl};
+use crate::api::extractors::{request_scheme_is_https, trusted_external_url, RequestBaseUrl};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -314,8 +315,10 @@ pub async fn oidc_callback(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
+    headers: HeaderMap,
     base_url: RequestBaseUrl,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
@@ -342,6 +345,7 @@ pub async fn oidc_callback(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
+        client_is_https,
     )
     .await
 }
@@ -355,8 +359,10 @@ pub async fn oidc_callback(
 pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
+    headers: HeaderMap,
     base_url: RequestBaseUrl,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
     let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
@@ -370,6 +376,7 @@ pub async fn oidc_callback_generic(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
+        client_is_https,
     )
     .await
 }
@@ -383,6 +390,7 @@ async fn oidc_callback_inner(
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
     base_url: RequestBaseUrl,
+    client_is_https: bool,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -571,6 +579,7 @@ async fn oidc_callback_inner(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     )
 }
 
@@ -603,8 +612,10 @@ pub struct LdapLoginRequest {
 pub async fn ldap_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<LdapLoginRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Get decrypted LDAP config
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
 
@@ -684,6 +695,7 @@ pub async fn ldap_login(
         &tokens.access_token,
         &tokens.refresh_token,
         3600,
+        client_is_https,
     );
     Ok(response)
 }
@@ -831,8 +843,10 @@ pub struct SamlAcsForm {
 pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -927,6 +941,7 @@ pub async fn saml_acs(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     )
 }
 
@@ -960,8 +975,10 @@ struct ExchangeCodeResponse {
 )]
 pub async fn exchange_code(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     let (access_token, refresh_token) =
         AuthConfigService::exchange_code(&state.db, &req.code).await?;
 
@@ -973,7 +990,13 @@ pub async fn exchange_code(
 
     // Default expires_in for SSO tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
-    set_auth_cookies(response.headers_mut(), &access_token, &refresh_token, 3600);
+    set_auth_cookies(
+        response.headers_mut(),
+        &access_token,
+        &refresh_token,
+        3600,
+        client_is_https,
+    );
     Ok(response)
 }
 
@@ -1035,6 +1058,7 @@ pub(crate) fn build_sso_callback_redirect(
     access_token: &str,
     refresh_token: &str,
     expires_in: u64,
+    client_is_https: bool,
 ) -> Result<Response> {
     let mut response = Redirect::temporary(frontend_url).into_response();
     set_auth_cookies(
@@ -1042,6 +1066,7 @@ pub(crate) fn build_sso_callback_redirect(
         access_token,
         refresh_token,
         expires_in,
+        client_is_https,
     );
     Ok(response)
 }
@@ -1835,6 +1860,7 @@ mod tests {
             "access_token_value",
             "refresh_token_value",
             3600,
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         assert_eq!(
@@ -1861,6 +1887,7 @@ mod tests {
             "the_access_token",
             "the_refresh_token",
             7200,
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         let cookies: Vec<String> = response
@@ -1913,6 +1940,7 @@ mod tests {
             "at",
             "rt",
             1800, // 30 minutes
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         let access_cookie = response

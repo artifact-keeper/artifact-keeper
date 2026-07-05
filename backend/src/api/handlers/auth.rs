@@ -14,7 +14,7 @@ use axum::{
 // 400 VALIDATION_ERROR (structured envelope) instead of Axum's stock 422
 // + plain-text body. Drop-in for both request extraction and responses
 // (#1783 LOW: POST /auth/login returned 422 for missing `username`).
-use crate::api::extractors::Json;
+use crate::api::extractors::{request_scheme_is_https, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -46,9 +46,14 @@ async fn audit_auth(
 }
 
 /// Build a login/refresh response with auth cookies set.
+///
+/// `client_is_https` carries the per-request HTTPS signal (see
+/// [`request_scheme_is_https`]) so the cookie `Secure` flag auto-follows a
+/// TLS-terminating reverse proxy.
 fn login_response(
     tokens: &crate::services::auth_service::TokenPair,
     must_change_password: bool,
+    client_is_https: bool,
 ) -> Response {
     let body = LoginResponse {
         access_token: tokens.access_token.clone(),
@@ -65,6 +70,7 @@ fn login_response(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     );
     response
 }
@@ -265,8 +271,10 @@ async fn enforce_local_login_sso_policy(
 )]
 pub async fn login(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // The bcrypt-bound auth-concurrency cap (#991, #1088) is enforced
     // inside `AuthService::verify_password` itself, so every entry point
     // that runs bcrypt (local login, API-token verify, basic-auth
@@ -330,7 +338,11 @@ pub async fn login(
     }
     audit_auth(&state, AuditAction::Login, Some(user.id), login_details).await;
 
-    Ok(login_response(&tokens, user.must_change_password))
+    Ok(login_response(
+        &tokens,
+        user.must_change_password,
+        client_is_https,
+    ))
 }
 
 /// Logout current session
@@ -382,7 +394,7 @@ pub async fn logout(
     }
 
     let mut response = ().into_response();
-    clear_auth_cookies(response.headers_mut());
+    clear_auth_cookies(response.headers_mut(), request_scheme_is_https(&headers));
     Ok(response)
 }
 
@@ -421,7 +433,11 @@ pub async fn refresh_token(
     )
     .await;
 
-    Ok(login_response(&tokens, user.must_change_password))
+    Ok(login_response(
+        &tokens,
+        user.must_change_password,
+        request_scheme_is_https(&headers),
+    ))
 }
 
 /// Get current user info
@@ -552,21 +568,32 @@ pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&
 /// Returns the `Secure;` cookie flag for the auth cookies, or `""` when the
 /// cookie must be sent over plain HTTP.
 ///
-/// The `Secure` attribute is only emitted when HTTPS is *explicitly* enabled
-/// via `AK_ENFORCE_HTTPS` (truthy = "true"/"1"), mirroring the web `#2222`
-/// tradeoff: a default deployment (unset flag) works over plain HTTP out of
-/// the box, and TLS/ingress deployments opt in to hardened cookies by setting
-/// `AK_ENFORCE_HTTPS=true`.
+/// The `Secure` attribute is emitted when the request is NOT in `development`
+/// mode AND either:
+/// * `AK_ENFORCE_HTTPS` is truthy ("true"/"1") — the static override for
+///   proxies that terminate TLS but do NOT set `X-Forwarded-Proto`; or
+/// * `client_is_https` is true — the request reached the trusted edge over
+///   HTTPS, as signalled per-request by `X-Forwarded-Proto: https` (see
+///   [`request_scheme_is_https`]).
 ///
-/// This is a deliberate, security-relevant default change (#2233): previously
-/// any non-`development` ENVIRONMENT emitted `Secure`, which made login
-/// impossible over HTTP because the browser accepted but never resent the
-/// cookie (login 200 → /auth/me 401). Development mode remains non-`Secure`
-/// regardless of the flag (backwards compat: dev works on localhost HTTP).
+/// This auto-detects HTTPS behind a TLS-terminating reverse proxy (#2233
+/// follow-up): the app receives requests over internal HTTP but honours the
+/// SAME `X-Forwarded-Proto` signal that base-URL construction already trusts,
+/// so `Secure` cookies work without remembering to set a static flag. A plain
+/// HTTP request (no header, no flag) still yields non-`Secure` cookies so a
+/// default deployment works out of the box; `#2233` made this impossible over
+/// HTTP when any non-`development` ENVIRONMENT unconditionally emitted `Secure`
+/// (login 200 → /auth/me 401). Development mode remains non-`Secure`
+/// regardless (backwards compat: dev works on localhost HTTP).
 ///
-/// NOTE: production HTTPS deployments MUST set `AK_ENFORCE_HTTPS=true` (wired
-/// on the iac/chart side for TLS ingress) to keep `Secure` cookies.
-fn secure_flag() -> &'static str {
+/// SECURITY: trusting `X-Forwarded-Proto` is the SAME trust posture the
+/// base-URL logic already has — it assumes a trusted proxy that OVERWRITES
+/// (not appends) client-supplied `X-Forwarded-Proto`. A client spoofing
+/// `X-Forwarded-Proto: https` over a real HTTP connection only makes their OWN
+/// cookie `Secure` (which the browser then won't resend over that HTTP
+/// connection) — self-defeating, not a privilege escalation. Operators
+/// terminating TLS at a proxy MUST have the proxy overwrite `X-Forwarded-Proto`.
+fn secure_flag(client_is_https: bool) -> &'static str {
     let is_development = std::env::var("ENVIRONMENT").unwrap_or_default() == "development";
     let enforce_https = matches!(
         std::env::var("AK_ENFORCE_HTTPS")
@@ -575,7 +602,7 @@ fn secure_flag() -> &'static str {
             .as_str(),
         "true" | "1"
     );
-    if enforce_https && !is_development {
+    if !is_development && (enforce_https || client_is_https) {
         " Secure;"
     } else {
         ""
@@ -583,13 +610,19 @@ fn secure_flag() -> &'static str {
 }
 
 /// Set httpOnly auth cookies on a response.
+///
+/// `client_is_https` is the per-request HTTPS signal (see
+/// [`request_scheme_is_https`]); it feeds [`secure_flag`] so the `Secure`
+/// attribute auto-follows a TLS-terminating reverse proxy. `HttpOnly` and
+/// `SameSite=Strict` are always set.
 pub(crate) fn set_auth_cookies(
     headers: &mut HeaderMap,
     access_token: &str,
     refresh_token: &str,
     expires_in: u64,
+    client_is_https: bool,
 ) {
-    let flag = secure_flag();
+    let flag = secure_flag(client_is_https);
     let access_cookie = format!(
         "ak_access_token={}; HttpOnly;{} SameSite=Strict; Path=/; Max-Age={}",
         access_token, flag, expires_in
@@ -604,8 +637,12 @@ pub(crate) fn set_auth_cookies(
 }
 
 /// Clear auth cookies by setting Max-Age=0.
-fn clear_auth_cookies(headers: &mut HeaderMap) {
-    let flag = secure_flag();
+///
+/// The cleared cookies carry the same attributes as the ones they replace, so
+/// `client_is_https` gates their `Secure` flag identically to
+/// [`set_auth_cookies`].
+fn clear_auth_cookies(headers: &mut HeaderMap, client_is_https: bool) {
+    let flag = secure_flag(client_is_https);
     let clear_access = format!(
         "ak_access_token=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0",
         flag
@@ -1329,7 +1366,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_adds_two_cookies() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "access_tok", "refresh_tok", 3600);
+        set_auth_cookies(&mut headers, "access_tok", "refresh_tok", 3600, false);
         let cookies: Vec<_> = headers.get_all(SET_COOKIE).iter().collect();
         assert_eq!(cookies.len(), 2);
     }
@@ -1337,7 +1374,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_access_token_format() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "myaccess", "myrefresh", 3600);
+        set_auth_cookies(&mut headers, "myaccess", "myrefresh", 3600, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1357,7 +1394,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_refresh_token_path() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "acc", "ref", 1800);
+        set_auth_cookies(&mut headers, "acc", "ref", 1800, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1374,13 +1411,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // secure_flag / cookie Secure gating (#2233)
+    // secure_flag / cookie Secure gating (#2233 + X-Forwarded-Proto follow-up)
     //
-    // The `Secure` attribute must be an *explicit* HTTPS opt-in
-    // (`AK_ENFORCE_HTTPS`), not coupled to `development` mode, so a default
-    // plain-HTTP deployment can actually keep users logged in. Env is
-    // process-global, so these tests serialize on a local mutex and
-    // set-and-restore ENVIRONMENT + AK_ENFORCE_HTTPS around each case.
+    // The `Secure` attribute is emitted when NOT in `development` AND either
+    // `AK_ENFORCE_HTTPS` is truthy (static override) OR the per-request
+    // `client_is_https` signal (from `X-Forwarded-Proto: https`) is set. This
+    // keeps a default plain-HTTP deployment logged in while auto-hardening
+    // cookies behind a TLS-terminating proxy. Env is process-global, so the
+    // env-dependent tests serialize on a local mutex and set-and-restore
+    // ENVIRONMENT + AK_ENFORCE_HTTPS around each case.
     // -----------------------------------------------------------------------
 
     /// Serializes env-dependent secure_flag tests (env is process-global).
@@ -1413,10 +1452,10 @@ mod tests {
         // non-development ENVIRONMENT) must NOT emit Secure, so the browser
         // resends the cookie over plain HTTP.
         with_secure_env(None, None, || {
-            assert_eq!(secure_flag(), "");
+            assert_eq!(secure_flag(false), "");
         });
         with_secure_env(Some("production"), None, || {
-            assert_eq!(secure_flag(), "");
+            assert_eq!(secure_flag(false), "");
         });
     }
 
@@ -1425,7 +1464,7 @@ mod tests {
         for truthy in ["true", "TRUE", "1"] {
             with_secure_env(Some("production"), Some(truthy), || {
                 assert_eq!(
-                    secure_flag(),
+                    secure_flag(false),
                     " Secure;",
                     "AK_ENFORCE_HTTPS={truthy} must enable Secure"
                 );
@@ -1438,10 +1477,10 @@ mod tests {
         // Development stays non-Secure even if HTTPS enforcement is requested
         // (localhost HTTP), preserving backwards-compatible dev behavior.
         with_secure_env(Some("development"), None, || {
-            assert_eq!(secure_flag(), "");
+            assert_eq!(secure_flag(false), "");
         });
         with_secure_env(Some("development"), Some("true"), || {
-            assert_eq!(secure_flag(), "");
+            assert_eq!(secure_flag(false), "");
         });
     }
 
@@ -1450,7 +1489,7 @@ mod tests {
         for falsey in ["false", "0", "", "no"] {
             with_secure_env(Some("production"), Some(falsey), || {
                 assert_eq!(
-                    secure_flag(),
+                    secure_flag(false),
                     "",
                     "AK_ENFORCE_HTTPS={falsey} must not enable Secure"
                 );
@@ -1464,7 +1503,7 @@ mod tests {
         // always present; Secure follows the AK_ENFORCE_HTTPS toggle.
         with_secure_env(Some("production"), None, || {
             let mut headers = HeaderMap::new();
-            set_auth_cookies(&mut headers, "a", "r", 3600);
+            set_auth_cookies(&mut headers, "a", "r", 3600, false);
             for v in headers.get_all(SET_COOKIE).iter() {
                 let c = v.to_str().unwrap();
                 assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
@@ -1480,7 +1519,7 @@ mod tests {
         });
         with_secure_env(Some("production"), Some("true"), || {
             let mut headers = HeaderMap::new();
-            set_auth_cookies(&mut headers, "a", "r", 3600);
+            set_auth_cookies(&mut headers, "a", "r", 3600, false);
             for v in headers.get_all(SET_COOKIE).iter() {
                 let c = v.to_str().unwrap();
                 assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
@@ -1497,13 +1536,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // X-Forwarded-Proto auto-detection (follow-up to #2233)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_secure_flag_forwarded_https_enables_secure_without_flag() {
+        // Behind a TLS-terminating proxy (X-Forwarded-Proto: https) the cookie
+        // is Secure even when AK_ENFORCE_HTTPS is unset.
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(
+                secure_flag(true),
+                " Secure;",
+                "X-Forwarded-Proto: https must enable Secure without the flag"
+            );
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_no_forwarded_no_flag_is_not_secure() {
+        // Plain HTTP: no X-Forwarded-Proto and no flag stays non-Secure so the
+        // browser resends the cookie over HTTP.
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(secure_flag(false), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_enforce_https_overrides_missing_forwarded() {
+        // AK_ENFORCE_HTTPS=true forces Secure regardless of the per-request
+        // scheme (for proxies that terminate TLS but don't set the header).
+        with_secure_env(Some("production"), Some("true"), || {
+            assert_eq!(secure_flag(false), " Secure;");
+            assert_eq!(secure_flag(true), " Secure;");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_development_never_secure_even_with_forwarded_https() {
+        // Development stays non-Secure even when the client is HTTPS, so local
+        // dev over localhost keeps working.
+        with_secure_env(Some("development"), None, || {
+            assert_eq!(secure_flag(true), "");
+        });
+        with_secure_env(Some("development"), Some("true"), || {
+            assert_eq!(secure_flag(true), "");
+        });
+    }
+
+    #[test]
+    fn test_set_auth_cookies_secure_follows_forwarded_proto() {
+        // End-to-end through set_auth_cookies: client_is_https=true yields
+        // Secure (no flag needed); false yields non-Secure. HttpOnly +
+        // SameSite=Strict are always present in both cases.
+        with_secure_env(Some("production"), None, || {
+            let mut secure_headers = HeaderMap::new();
+            set_auth_cookies(&mut secure_headers, "a", "r", 3600, true);
+            for v in secure_headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    c.contains("Secure"),
+                    "X-Forwarded-Proto: https must be Secure: {c}"
+                );
+            }
+
+            let mut plain_headers = HeaderMap::new();
+            set_auth_cookies(&mut plain_headers, "a", "r", 3600, false);
+            for v in plain_headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(!c.contains("Secure"), "plain HTTP must be non-Secure: {c}");
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // clear_auth_cookies
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_clear_auth_cookies_sets_max_age_zero() {
         let mut headers = HeaderMap::new();
-        clear_auth_cookies(&mut headers);
+        clear_auth_cookies(&mut headers, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1522,7 +1644,7 @@ mod tests {
     #[test]
     fn test_clear_auth_cookies_empties_values() {
         let mut headers = HeaderMap::new();
-        clear_auth_cookies(&mut headers);
+        clear_auth_cookies(&mut headers, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()

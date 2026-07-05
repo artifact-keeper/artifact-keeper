@@ -225,6 +225,30 @@ pub fn request_base_url_from_request(headers: &HeaderMap, uri: Option<&Uri>) -> 
     }
 }
 
+/// Returns `true` when the incoming request reached the trusted edge over
+/// HTTPS, as signalled by `X-Forwarded-Proto: https` (case-insensitive).
+///
+/// This reuses the SAME `X-Forwarded-Proto` signal that
+/// [`request_base_url_from_request`] already trusts for external-URL
+/// construction, so the auth-cookie `Secure` decision and the base-URL
+/// derivation stay consistent behind a TLS-terminating reverse proxy.
+///
+/// SECURITY: trusting `X-Forwarded-Proto` here is the SAME trust posture the
+/// base-URL logic already has — it assumes a trusted reverse proxy that
+/// OVERWRITES (not appends) the header on ingress. A client spoofing
+/// `X-Forwarded-Proto: https` over a real plain-HTTP connection only makes
+/// their OWN cookie `Secure`, which the browser then refuses to resend over
+/// that same HTTP connection — self-defeating, not a privilege escalation.
+/// Operators terminating TLS at a proxy MUST configure the proxy to overwrite
+/// `X-Forwarded-Proto` on requests it forwards.
+pub fn request_scheme_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|proto| proto.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
@@ -332,6 +356,33 @@ mod tests {
             request_base_url_from_request(&headers, Some(&uri)),
             "https://external.example.com"
         );
+    }
+
+    #[test]
+    fn test_request_scheme_is_https_forwarded_https() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(request_scheme_is_https(&headers));
+    }
+
+    #[test]
+    fn test_request_scheme_is_https_case_insensitive_and_trimmed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static(" HTTPS "));
+        assert!(request_scheme_is_https(&headers));
+    }
+
+    #[test]
+    fn test_request_scheme_is_https_forwarded_http() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!request_scheme_is_https(&headers));
+    }
+
+    #[test]
+    fn test_request_scheme_is_https_absent_header() {
+        let headers = HeaderMap::new();
+        assert!(!request_scheme_is_https(&headers));
     }
 
     #[tokio::test]

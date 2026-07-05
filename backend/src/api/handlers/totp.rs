@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::post,
     Extension, Json, Router,
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::api::extractors::request_scheme_is_https;
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::middleware::auth::{AuthExtension, TokenIat};
 use crate::api::SharedState;
@@ -329,8 +331,10 @@ pub struct TotpVerifyRequest {
 )]
 pub async fn verify_totp(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(payload): Json<TotpVerifyRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     // Validate the pending token, then atomically consume its `jti` so it is
@@ -481,6 +485,7 @@ pub async fn verify_totp(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     );
     Ok(response)
 }
@@ -1385,6 +1390,7 @@ mod totp_verify_hardening_tests {
 
         let first = verify_totp(
             State(state.clone()),
+            HeaderMap::new(),
             Json(TotpVerifyRequest {
                 totp_token: pending.clone(),
                 code: code.clone(),
@@ -1397,6 +1403,7 @@ mod totp_verify_hardening_tests {
         let code2 = totp.generate_current().expect("code");
         let replay = verify_totp(
             State(state.clone()),
+            HeaderMap::new(),
             Json(TotpVerifyRequest {
                 totp_token: pending,
                 code: code2,
@@ -1455,6 +1462,7 @@ mod totp_verify_hardening_tests {
             handles.push(tokio::spawn(async move {
                 verify_totp(
                     State(st),
+                    HeaderMap::new(),
                     Json(TotpVerifyRequest {
                         totp_token: token,
                         code: "1YUU-4B8U".to_string(),
