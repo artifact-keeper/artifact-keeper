@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,\n                critical_count, high_count, medium_count, low_count,\n                acknowledged_count, last_scan_at, calculated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                score = EXCLUDED.score,\n                grade = EXCLUDED.grade,\n                total_findings = EXCLUDED.total_findings,\n                critical_count = EXCLUDED.critical_count,\n                high_count = EXCLUDED.high_count,\n                medium_count = EXCLUDED.medium_count,\n                low_count = EXCLUDED.low_count,\n                acknowledged_count = EXCLUDED.acknowledged_count,\n                last_scan_at = EXCLUDED.last_scan_at,\n                calculated_at = NOW()\n            RETURNING id, repository_id, score, grade, total_findings,\n                      critical_count, high_count, medium_count, low_count,\n                      acknowledged_count, last_scan_at, calculated_at\n            ",
+  "query": "\n            INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,\n                critical_count, high_count, medium_count, low_count,\n                acknowledged_count, last_scan_at, has_failed_scan, calculated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                score = EXCLUDED.score,\n                grade = EXCLUDED.grade,\n                total_findings = EXCLUDED.total_findings,\n                critical_count = EXCLUDED.critical_count,\n                high_count = EXCLUDED.high_count,\n                medium_count = EXCLUDED.medium_count,\n                low_count = EXCLUDED.low_count,\n                acknowledged_count = EXCLUDED.acknowledged_count,\n                last_scan_at = EXCLUDED.last_scan_at,\n                has_failed_scan = EXCLUDED.has_failed_scan,\n                calculated_at = NOW()\n            RETURNING id, repository_id, score, grade, total_findings,\n                      critical_count, high_count, medium_count, low_count,\n                      acknowledged_count, last_scan_at, has_failed_scan, calculated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,11 @@
       },
       {
         "ordinal": 11,
+        "name": "has_failed_scan",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
         "name": "calculated_at",
         "type_info": "Timestamptz"
       }
@@ -75,7 +80,8 @@
         "Int4",
         "Int4",
         "Int4",
-        "Timestamptz"
+        "Timestamptz",
+        "Bool"
       ]
     },
     "nullable": [
@@ -90,8 +96,9 @@
       false,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "a30caddd4dfdf12e17baceffc245d4a0d2ce86f041da4d7f47c4fff160225c41"
+  "hash": "da16b39f9feafe83d9a9442fae47131c3d17f21dd81c69f371574cfae86c6b76"
 }

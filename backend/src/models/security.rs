@@ -215,6 +215,13 @@ pub struct RepoSecurityScore {
     pub acknowledged_count: i32,
     pub last_scan_at: Option<DateTime<Utc>>,
     pub calculated_at: DateTime<Utc>,
+    /// True when the LATEST applicable scan for some artifact in this repo is
+    /// `status='failed'` (a scanner errored) and no newer `completed` scan
+    /// supersedes it (#2167). While set, the repo fails closed: the persisted
+    /// `grade` is floored to `F` so a scan error can never present as clean.
+    /// A repo with zero scan rows is NOT flagged (absence of scans is not a
+    /// failure).
+    pub has_failed_scan: bool,
 }
 
 /// A scan policy that can block downloads based on findings.

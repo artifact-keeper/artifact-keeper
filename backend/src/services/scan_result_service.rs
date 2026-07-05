@@ -1812,6 +1812,49 @@ impl ScanResultService {
 
         let (score, grade) = compute_security_score(critical, high, medium, low);
 
+        // #2167 fail-closed: detect whether the LATEST scan for any artifact in
+        // this repo is `status='failed'` (a scanner errored: trivy DB
+        // UNAUTHORIZED, grype "unexpected EOF", etc.) with no newer terminal
+        // row superseding it. Mirrors the latest_scans window shape but WITHOUT
+        // the `status='completed'` filter so all statuses compete to be the
+        // latest — a failed row (fail_scan sets completed_at=NOW()) is ordered
+        // against completed rows correctly, and a later `completed` rescan wins
+        // the DISTINCT ON and clears the flag.
+        //
+        // Scoping (regression guard): a repo with ZERO scan rows yields
+        // `EXISTS = false` and is unchanged — absence of scans is NOT a
+        // failure. Only an actual `failed` latest row flags the repo.
+        let has_failed_scan = sqlx::query_scalar!(
+            r#"
+            WITH latest_status AS (
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.status
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE a.repository_id = $1
+                  AND NOT a.is_deleted
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            )
+            SELECT EXISTS (
+                SELECT 1 FROM latest_status WHERE status = 'failed'
+            ) AS "has_failed!"
+            "#,
+            repository_id,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Grade floor: while a failed scan is unsuperseded, the repo must never
+        // present as clean. Force grade F so both the dashboard and the
+        // release-gate treat "scan errored" as NOT clean, regardless of the
+        // (necessarily incomplete) finding counts from the completed rows.
+        let grade_char = if has_failed_scan {
+            'F'
+        } else {
+            grade.as_char()
+        };
+
         let last_scan_at = sqlx::query_scalar!(
             r#"
             SELECT MAX(completed_at) as "last_scan_at"
@@ -1829,8 +1872,8 @@ impl ScanResultService {
             r#"
             INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,
                 critical_count, high_count, medium_count, low_count,
-                acknowledged_count, last_scan_at, calculated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                acknowledged_count, last_scan_at, has_failed_scan, calculated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
             ON CONFLICT (repository_id)
             DO UPDATE SET
                 score = EXCLUDED.score,
@@ -1842,14 +1885,15 @@ impl ScanResultService {
                 low_count = EXCLUDED.low_count,
                 acknowledged_count = EXCLUDED.acknowledged_count,
                 last_scan_at = EXCLUDED.last_scan_at,
+                has_failed_scan = EXCLUDED.has_failed_scan,
                 calculated_at = NOW()
             RETURNING id, repository_id, score, grade, total_findings,
                       critical_count, high_count, medium_count, low_count,
-                      acknowledged_count, last_scan_at, calculated_at
+                      acknowledged_count, last_scan_at, has_failed_scan, calculated_at
             "#,
             repository_id,
             score,
-            grade.as_char().to_string(),
+            grade_char.to_string(),
             total,
             critical,
             high,
@@ -1857,6 +1901,7 @@ impl ScanResultService {
             low,
             acknowledged,
             last_scan_at,
+            has_failed_scan,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1876,7 +1921,7 @@ impl ScanResultService {
             r#"
             SELECT id, repository_id, score, grade, total_findings,
                    critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, calculated_at
+                   acknowledged_count, last_scan_at, has_failed_scan, calculated_at
             FROM repo_security_scores
             WHERE repository_id = $1
             "#,
@@ -1896,7 +1941,7 @@ impl ScanResultService {
             r#"
             SELECT id, repository_id, score, grade, total_findings,
                    critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, calculated_at
+                   acknowledged_count, last_scan_at, has_failed_scan, calculated_at
             FROM repo_security_scores
             ORDER BY score ASC, critical_count DESC
             "#,
@@ -3179,6 +3224,105 @@ mod tests {
             assert_eq!(score2.id, score.id);
 
             cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #2167 fail-closed: a repo whose LATEST applicable scan is
+        /// `status='failed'` (the scanner errored — trivy DB UNAUTHORIZED,
+        /// grype "unexpected EOF") must NEVER be graded clean. Historically it
+        /// contributed 0 findings and was graded A, so a malicious image whose
+        /// scanner failed passed as CLEAN. recalculate_score now sets
+        /// `has_failed_scan=true` and floors the grade to F. A superseding
+        /// `completed` rescan clears the flag; a repo with zero scans stays A.
+        #[tokio::test]
+        async fn recalculate_score_fails_closed_on_failed_latest_scan() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            // --- A single failed scan -> has_failed_scan + grade F (NOT A) ---
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "img").await;
+            let started = chrono::Utc::now();
+            let scan = svc
+                .create_scan_result(aid, repo_id, "image")
+                .await
+                .expect("create scan");
+            svc.fail_scan(
+                scan.id,
+                "trivy DB UNAUTHORIZED",
+                Some("trivy-0.50"),
+                started,
+            )
+            .await
+            .expect("fail scan");
+
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score with failed scan");
+            // THE load-bearing security assertion: a failed scan cannot be A.
+            assert!(
+                score.has_failed_scan,
+                "a failed latest scan must set has_failed_scan=true"
+            );
+            assert_ne!(
+                score.grade, "A",
+                "a repo whose latest scan errored must never be graded clean (A)"
+            );
+            assert_eq!(score.grade, "F", "the grade must be floored to F");
+
+            // --- A superseding completed rescan clears the flag -> grade A ---
+            let started2 = chrono::Utc::now();
+            let rescan = svc
+                .create_scan_result(aid, repo_id, "image")
+                .await
+                .expect("create rescan");
+            svc.complete_scan(
+                rescan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("trivy-0.50"),
+                started2,
+                "complete",
+            )
+            .await
+            .expect("complete rescan");
+
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score after rescan");
+            assert!(
+                !score2.has_failed_scan,
+                "a superseding completed scan must clear has_failed_scan"
+            );
+            assert_eq!(
+                score2.grade, "A",
+                "a clean superseding scan recomputes to grade A"
+            );
+
+            cleanup_repo(&pool, repo_id).await;
+
+            // --- Regression guard: a repo with ZERO scans stays grade A ------
+            let empty_repo = insert_test_repo(&pool).await;
+            let empty_score = svc
+                .recalculate_score(empty_repo)
+                .await
+                .expect("recalculate_score empty repo");
+            assert!(
+                !empty_score.has_failed_scan,
+                "absence of scans is NOT a failure; must not flag"
+            );
+            assert_eq!(
+                empty_score.grade, "A",
+                "a repo with no scan rows must stay grade A"
+            );
+            cleanup_repo(&pool, empty_repo).await;
         }
 
         // ===================================================================

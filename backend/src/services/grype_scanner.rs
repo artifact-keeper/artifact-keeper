@@ -239,6 +239,85 @@ fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
     }
 }
 
+/// Conservatively classify Grype stderr as evidence of a *fatal* scan failure
+/// even when Grype exited 0.
+///
+/// #2167 (fail-closed): Grype can hit an unrecoverable OCI-layer read/catalog
+/// error (`unexpected EOF` mid-stream, `failed to catalog image`) yet still
+/// exit 0 with an empty `matches: []` set. Treated naively, that empty report
+/// is indistinguishable from a genuinely clean image and the artifact is graded
+/// A — a malicious image passes as CLEAN. This classifier lets the exit-0 path
+/// detect those fatal markers and fail closed instead.
+///
+/// **Regression trap (the reason this set is deliberately tight):** Grype logs
+/// benign progress / DB-load / cataloging *progress* lines to stderr *by
+/// design* (see the `run_grype_target` comment on why we do not pass `-q`). If
+/// this matched a benign token, *every* scan would start failing (an
+/// availability regression plus everything showing not-clean). Only add a
+/// marker here if it exclusively denotes an unrecoverable failure. Matching is
+/// case-insensitive.
+fn grype_output_indicates_failure(stderr: &str) -> bool {
+    // Fatal, unrecoverable failure markers only. Each must be a phrase Grype
+    // emits solely on a hard failure — never on a normal/progress line.
+    const FATAL_MARKERS: &[&str] = &[
+        "unexpected eof",
+        "failed to catalog",
+        "unable to load image",
+        "failed to determine image source",
+        "failed to read image",
+        "could not fetch image",
+    ];
+    let lower = stderr.to_lowercase();
+    FATAL_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Turn a completed Grype invocation into a [`GrypeReport`], failing closed on
+/// both non-zero exits and exit-0-with-fatal-stderr (#2167).
+///
+/// Split out from `run_grype_target` as a pure function so the exit-0 error
+/// classification is unit-testable without spawning the real `grype` binary.
+fn parse_grype_output(
+    success: bool,
+    status_display: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<GrypeReport> {
+    let stderr_str = String::from_utf8_lossy(stderr);
+
+    if !success {
+        // Include a stdout tail too: Grype writes its progress/ETUI to
+        // stderr, but a hard failure during JSON encoding can leave a
+        // partial payload on stdout that is the only clue to the cause.
+        // Cap each stream at 4 KiB so a runaway log does not produce a
+        // megabyte-class AppError message.
+        let stderr_tail = truncate_stream(&stderr_str, 4096);
+        let stdout_str = String::from_utf8_lossy(stdout);
+        let stdout_tail = truncate_stream(&stdout_str, 4096);
+        return Err(AppError::Internal(format!(
+            "Grype scan failed ({}): stderr={:?} stdout={:?}",
+            status_display, stderr_tail, stdout_tail
+        )));
+    }
+
+    // #2167 fail-closed: a zero exit is not sufficient. Grype can log a fatal
+    // OCI-layer read/catalog error to stderr and still exit 0 with an empty
+    // match set. Returning `Ok(empty)` there would grade a malicious image as
+    // clean, so classify the stderr and fail closed on the tight fatal-marker
+    // set. This routes through the same `fail_scan` path as a non-zero exit.
+    if grype_output_indicates_failure(&stderr_str) {
+        let stderr_tail = truncate_stream(&stderr_str, 4096);
+        return Err(AppError::Internal(format!(
+            "Grype exited 0 but reported a fatal error on stderr; the scan is \
+             not trustworthy and is failing closed instead of reporting clean: \
+             stderr={:?}",
+            stderr_tail
+        )));
+    }
+
+    serde_json::from_slice(stdout)
+        .map_err(|e| AppError::Internal(format!("Failed to parse Grype output: {}", e)))
+}
+
 /// Resolve the registry host string Grype's `registry:` mode targets. The
 /// first non-empty source wins, in priority order:
 ///   1. `AK_GRYPE_REGISTRY_HOST` — explicit override (full URL accepted).
@@ -953,24 +1032,12 @@ impl GrypeScanner {
             .await
             .map_err(|e| classify_grype_spawn_error(&e))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Include a stdout tail too: Grype writes its progress/ETUI to
-            // stderr, but a hard failure during JSON encoding can leave a
-            // partial payload on stdout that is the only clue to the cause.
-            // Cap each stream at 4 KiB so a runaway log does not produce a
-            // megabyte-class AppError message.
-            let stderr_tail = truncate_stream(&stderr, 4096);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stdout_tail = truncate_stream(&stdout, 4096);
-            return Err(AppError::Internal(format!(
-                "Grype scan failed ({}): stderr={:?} stdout={:?}",
-                output.status, stderr_tail, stdout_tail
-            )));
-        }
-
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Grype output: {}", e)))
+        parse_grype_output(
+            output.status.success(),
+            &output.status.to_string(),
+            &output.stdout,
+            &output.stderr,
+        )
     }
 
     /// Convert Grype matches into `RawFinding` values.
@@ -1420,6 +1487,87 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    // ---- #2167: grype exit-0 fatal-stderr fail-closed --------------------
+
+    #[test]
+    fn test_grype_output_indicates_failure_fires_on_fatal_markers() {
+        // The exit-0-but-errored signal is on stderr. Each of these is a hard,
+        // unrecoverable failure that Grype can emit while still exiting 0.
+        for line in [
+            "[0000]  WARN unexpected EOF",
+            "unexpected EOF",
+            "failed to catalog image docker.io/library/evil:latest",
+            "unable to load image",
+            "failed to determine image source for evil:latest",
+            "failed to read image from registry",
+            "could not fetch image manifest",
+            // Case-insensitivity guard.
+            "UNEXPECTED EOF",
+            "Failed To Catalog image",
+        ] {
+            assert!(
+                grype_output_indicates_failure(line),
+                "expected fatal-marker classifier to FIRE on: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grype_output_indicates_failure_no_fire_on_benign_stderr() {
+        // Regression guard (highest-risk item in the fix): Grype writes benign
+        // progress / DB-load / cataloging lines to stderr BY DESIGN (that is
+        // why `run_grype_target` deliberately does not pass `-q`). The
+        // classifier MUST NOT fire on any of these, or every scan would start
+        // failing closed.
+        for line in [
+            "",
+            "[0000] INFO loaded DB",
+            "[0000] INFO cataloging image",
+            " ├── ✔ Parsed image",
+            " ├── ✔ Cataloged packages       [42 packages]",
+            "[0001] INFO vulnerability DB is current",
+            "New version of grype is available",
+            "Scanning image for vulnerabilities...",
+            "loading vulnerability database",
+        ] {
+            assert!(
+                !grype_output_indicates_failure(line),
+                "classifier must NOT fire on benign grype stderr: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_grype_output_exit0_with_fatal_stderr_is_err() {
+        // Exit 0 but a fatal `unexpected EOF` on stderr and an empty match set
+        // on stdout: this MUST fail closed, not return Ok(empty). An Ok(empty)
+        // here would grade a malicious image as clean (#2167).
+        let stdout = br#"{"matches":[]}"#;
+        let stderr = b"[0000]  WARN unexpected EOF reading layer sha256:deadbeef";
+        let result = parse_grype_output(true, "exit status: 0", stdout, stderr);
+        assert!(
+            result.is_err(),
+            "exit-0 with fatal stderr must be Err, got Ok(empty) -> false clean"
+        );
+    }
+
+    #[test]
+    fn test_parse_grype_output_exit0_clean_stderr_is_ok() {
+        // Exit 0 with only benign stderr and valid JSON parses to a report.
+        let stdout = br#"{"matches":[]}"#;
+        let stderr = b"[0000] INFO loaded DB\n[0000] INFO cataloged 12 packages";
+        let report = parse_grype_output(true, "exit status: 0", stdout, stderr)
+            .expect("benign exit-0 scan must parse to Ok");
+        assert!(report.matches.is_empty());
+    }
+
+    #[test]
+    fn test_parse_grype_output_nonzero_exit_is_err() {
+        // Non-zero exit remains a failure regardless of stderr contents.
+        let result = parse_grype_output(false, "exit status: 1", b"", b"some error");
+        assert!(result.is_err());
     }
 
     #[test]

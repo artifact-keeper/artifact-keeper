@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH latest_status AS (\n                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.status\n                FROM scan_results sr\n                JOIN artifacts a ON a.id = sr.artifact_id\n                WHERE a.repository_id = $1\n                  AND NOT a.is_deleted\n                ORDER BY sr.artifact_id, sr.scan_type,\n                         sr.completed_at DESC NULLS LAST, sr.created_at DESC\n            )\n            SELECT EXISTS (\n                SELECT 1 FROM latest_status WHERE status = 'failed'\n            ) AS \"has_failed!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "has_failed!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9cee8f416f4694c27a285269bffcd459c3ea8cf1023738a66b5a9b90d0ab1478"
+}
