@@ -3433,10 +3433,16 @@ mod tests {
             let username = format!("conan-test-u-{}", id);
             let password = "conan-test-pw".to_string();
             let hash = bcrypt::hash(&password, 4).expect("bcrypt hash failed");
+            // Watermark columns backdated 60s: conan tests login via the
+            // real endpoint, whose token must not race the DB-clock-stamped
+            // creation watermark across node clock skew.
             sqlx::query(
                 r#"
-                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
-                VALUES ($1, $2, $3, $4, 'local', false, true)
+                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active,
+                                   password_changed_at, privileges_changed_at, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, 'local', false, true,
+                        NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds',
+                        NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')
                 "#,
             )
             .bind(id)

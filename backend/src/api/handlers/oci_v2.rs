@@ -19715,10 +19715,16 @@ mod cross_repo_session_regression_tests {
         let username = format!("oci1317-{}", id);
         let password = "pushpass".to_string();
         let hash = bcrypt::hash(&password, 4).expect("bcrypt hash");
+        // Watermark columns backdated 60s: the Basic-auth flow mints a
+        // token on this process's clock; the DB-clock watermark must sit
+        // strictly before it even across node clock skew.
         sqlx::query(
             r#"
-            INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
-            VALUES ($1, $2, $3, $4, 'local', true, true)
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active,
+                               password_changed_at, privileges_changed_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 'local', true, true,
+                    NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds',
+                    NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')
             "#,
         )
         .bind(id)
@@ -20708,9 +20714,17 @@ mod oci_write_authz_and_size_tests {
     async fn create_oci_user(pool: &PgPool, is_admin: bool) -> Uuid {
         let id = Uuid::new_v4();
         let username = format!("oci-authz-{}", id);
+        // Backdate the credential-change watermark columns (incl.
+        // privileges_changed_at, migration 131) 60s: the bearer minted right
+        // after this insert must not race the watermark, which is stamped by
+        // the DB server's clock and can sit ahead of this process's clock
+        // when the test DB runs on another node.
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
-             VALUES ($1, $2, $3, 'unused', 'local', $4, true)",
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active, \
+                                password_changed_at, privileges_changed_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', $4, true, \
+                     NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')",
         )
         .bind(id)
         .bind(&username)
