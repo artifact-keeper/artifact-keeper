@@ -168,9 +168,13 @@ pub(crate) fn classify_versions_for_metadata_listing(
 
 /// Validate `min_age_days` is within the allowed range (mirrors DB CHECK).
 pub fn validate_min_age_days(min_age_days: i32) -> Result<()> {
-    if !(1..=3650).contains(&min_age_days) {
+    // 0 is the trusted-remote setting from #1558: no age delay, but explicit
+    // rejections still block and the review queue stays under admin control —
+    // which `age_gate_enabled = false` does NOT provide (a disabled gate also
+    // stops honoring rejections).
+    if !(0..=3650).contains(&min_age_days) {
         return Err(AppError::Validation(
-            "min_age_days must be between 1 and 3650".to_string(),
+            "min_age_days must be between 0 and 3650".to_string(),
         ));
     }
     Ok(())
@@ -1844,9 +1848,13 @@ mod tests {
 
     #[test]
     fn validate_min_age_days_range() {
+        assert!(
+            validate_min_age_days(0).is_ok(),
+            "0 is the trusted-remote setting: no delay, rejections still block"
+        );
         assert!(validate_min_age_days(1).is_ok());
         assert!(validate_min_age_days(3650).is_ok());
-        assert!(validate_min_age_days(0).is_err());
+        assert!(validate_min_age_days(-1).is_err());
         assert!(validate_min_age_days(3651).is_err());
     }
 

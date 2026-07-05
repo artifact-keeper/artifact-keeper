@@ -3,8 +3,10 @@
 
 ALTER TABLE repositories
     ADD COLUMN IF NOT EXISTS age_gate_enabled BOOLEAN NOT NULL DEFAULT false,
+    -- 0 is the trusted-remote setting (#1558): no age delay, but explicit
+    -- rejections still block and the review queue stays admin-controlled.
     ADD COLUMN IF NOT EXISTS age_gate_min_age_days INT NOT NULL DEFAULT 7
-        CHECK (age_gate_min_age_days BETWEEN 1 AND 3650);
+        CHECK (age_gate_min_age_days BETWEEN 0 AND 3650);
 
 CREATE TABLE age_gate_reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
