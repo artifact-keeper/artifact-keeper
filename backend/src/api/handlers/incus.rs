@@ -1582,14 +1582,21 @@ async fn run_finalize(
     Ok(artifact_id)
 }
 
-/// Run [`run_finalize`] and record its outcome on the upload session, then
-/// remove the staged temp file. The client already received `202`, so a
-/// failed backend push must be observable: on success the session flips to
+/// Run [`run_finalize`], remove the staged temp file, and only then record
+/// the outcome on the upload session. The client already received `202`, so
+/// a failed backend push must be observable: on success the session flips to
 /// `completed` with the new `artifact_id`; on failure it flips to `failed`
 /// with the error string, which `GET /incus/{repo}/uploads/{id}` surfaces.
+///
+/// Ordering matters: the terminal status is the only signal observers have
+/// that finalize is done, so staging cleanup must happen before the status
+/// flips — otherwise a poller can see `completed` while the temp file still
+/// exists.
 async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizeParams) {
     let session_id = params.session_id;
-    match run_finalize(&state, &repo, &params).await {
+    let outcome = run_finalize(&state, &repo, &params).await;
+    let _ = tokio::fs::remove_file(&params.temp_path).await;
+    match outcome {
         Ok(artifact_id) => {
             tracing::info!(
                 session = %session_id,
@@ -1627,7 +1634,6 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
             .await;
         }
     }
-    let _ = tokio::fs::remove_file(&params.temp_path).await;
 }
 
 // ===========================================================================
