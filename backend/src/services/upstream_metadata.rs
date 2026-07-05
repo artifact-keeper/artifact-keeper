@@ -13,6 +13,15 @@ use crate::services::http_client;
 
 const PYPI_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Hard ceiling on distinct `(repository, project)` publish-time entries held
+/// in process. Each entry is small (one version->timestamp map), but the key
+/// space is attacker-influenced — any project name requested through an
+/// age-gated repo creates one — so growth must be bounded (#1607 lesson).
+/// At the cap, expired entries are dropped first; if everything is somehow
+/// still fresh, the map is cleared: a rare burst of cache misses is cheaper
+/// than unbounded memory.
+const PYPI_CACHE_MAX_ENTRIES: usize = 4096;
+
 type PublishTimeMap = HashMap<String, DateTime<Utc>>;
 
 #[derive(Clone)]
@@ -99,6 +108,14 @@ impl UpstreamMetadataCache {
 
     fn set_pypi_cached(&self, key: (Uuid, String), times: PublishTimeMap) {
         if let Ok(mut guard) = self.pypi.write() {
+            if guard.len() >= PYPI_CACHE_MAX_ENTRIES {
+                guard.retain(|_, entry| {
+                    is_pypi_cache_fresh(entry.fetched_at.elapsed(), PYPI_CACHE_TTL)
+                });
+                if guard.len() >= PYPI_CACHE_MAX_ENTRIES {
+                    guard.clear();
+                }
+            }
             guard.insert(
                 key,
                 CacheEntry {
@@ -359,5 +376,26 @@ mod tests {
             .fetch_pypi_publish_times(&client, Uuid::new_v4(), &server.uri(), "bad-json")
             .await
             .is_err());
+    }
+
+    #[test]
+    fn pypi_cache_growth_is_bounded() {
+        let cache = UpstreamMetadataCache::new();
+        let repo = Uuid::new_v4();
+        for i in 0..PYPI_CACHE_MAX_ENTRIES {
+            cache.set_pypi_cached((repo, format!("pkg-{i}")), PublishTimeMap::new());
+        }
+        assert_eq!(
+            cache.pypi.read().unwrap().len(),
+            PYPI_CACHE_MAX_ENTRIES,
+            "cache fills to the cap"
+        );
+
+        // Every entry is still fresh, so the next insert must clear the map
+        // rather than grow past the cap.
+        cache.set_pypi_cached((repo, "overflow".to_string()), PublishTimeMap::new());
+        let guard = cache.pypi.read().unwrap();
+        assert_eq!(guard.len(), 1, "cap enforced even when nothing is stale");
+        assert!(guard.contains_key(&(repo, "overflow".to_string())));
     }
 }
