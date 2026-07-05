@@ -31,6 +31,19 @@ func NewServer(cfg *Config) *Server {
 // MarkReady flips the readiness gate on (called after a successful version probe).
 func (s *Server) MarkReady() { s.ready.Store(true) }
 
+// markReadyIfDBPresent flips readiness on only when dbReady reports a loaded
+// vuln DB, and reports whether it did. Extracted as a seam so the DB-presence
+// readiness gate is unit-testable without a real trivy cache. A missing DB
+// keeps the adapter not-ready so the backend fails every scan closed rather than
+// dispatching to a scanner that would exit 0 with empty (false-clean) results.
+func (s *Server) markReadyIfDBPresent(dbReady func() bool) bool {
+	if dbReady() {
+		s.MarkReady()
+		return true
+	}
+	return false
+}
+
 // Handler returns the adapter's HTTP router.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()

@@ -19,23 +19,43 @@ func main() {
 	cfg := LoadConfig()
 	srv := NewServer(cfg)
 
-	// Probe the trivy version at startup (unless pinned via env). Readiness is
-	// gated on a successful probe so the backend does not dispatch scans to an
+	// Probe the trivy version at startup (unless pinned via env). A failed probe
+	// leaves the adapter not-ready so the backend does not dispatch scans to an
 	// adapter whose trivy binary is missing/broken.
+	versionOK := true
 	if cfg.ScannerVersion == "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		version, err := ProbeVersion(ctx, cfg)
 		cancel()
 		if err != nil {
 			log.Printf("trivy version probe failed (staying not-ready): %v", err)
+			versionOK = false
 		} else {
 			cfg.ScannerVersion = version
 			log.Printf("trivy version probed: %s", version)
-			srv.MarkReady()
 		}
 	} else {
 		log.Printf("trivy version pinned via env: %s", cfg.ScannerVersion)
-		srv.MarkReady()
+	}
+
+	// DB-presence readiness gate (#2167): do NOT advertise ready until the trivy
+	// vuln DB is actually loaded. Without a DB, trivy exits 0 with empty Results
+	// (a FALSE CLEAN); staying not-ready makes the backend fail every scan closed
+	// instead. When DB updates are enabled, download it now so it is present
+	// before the readiness flag flips (rather than racing the first scan).
+	if versionOK {
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ScanTimeout)
+		if !cfg.SkipDBUpdate {
+			if err := DownloadDB(ctx, cfg); err != nil {
+				log.Printf("trivy DB download failed (staying not-ready): %v", err)
+			}
+		}
+		cancel()
+		if srv.markReadyIfDBPresent(func() bool { return DBReady(cfg) }) {
+			log.Printf("trivy vuln DB present; adapter ready (trivy=%s)", cfg.ScannerVersion)
+		} else {
+			log.Printf("trivy vuln DB not present in %s (staying not-ready)", cfg.CacheDir)
+		}
 	}
 
 	stop := make(chan struct{})
