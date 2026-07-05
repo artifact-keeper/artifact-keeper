@@ -457,6 +457,143 @@ async fn pypi_simple_index_withholds_young_version_via_real_anchors() {
     );
 }
 
+/// A rewritten PEP 691 JSON simple index as `rewrite_upstream_simple_json`
+/// produces it: proxied `url`s plus whatever PEP 700 `upload-time` values the
+/// upstream provided (`None` omits the field, as non-Warehouse upstreams do).
+fn pypi_simple_index_json(
+    repo_key: &str,
+    pkg: &str,
+    versions: &[(&str, Option<&str>)],
+) -> serde_json::Value {
+    let files: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|(v, upload_time)| {
+            let file = format!("{pkg}-{v}-py3-none-any.whl");
+            let mut entry = serde_json::json!({
+                "filename": file,
+                "url": format!("/pypi/{repo_key}/simple/{pkg}/{file}"),
+                "hashes": { "sha256": "deadbeefcafe" },
+            });
+            if let Some(ts) = upload_time {
+                entry["upload-time"] = serde_json::json!(ts);
+            }
+            entry
+        })
+        .collect();
+    serde_json::json!({
+        "meta": { "api-version": "1.1" },
+        "name": pkg,
+        "files": files,
+        "versions": versions.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn pep691_json_index_withholds_young_version_using_document_upload_times() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+
+    let pkg = "agegatejsonpkg";
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let old = (Utc::now() - Duration::days(3650)).to_rfc3339();
+
+    // Every file carries PEP 700 upload-time, so the filter must decide from
+    // the document alone — no upstream JSON metadata fetch (the upstream URL
+    // below would fail any attempted fetch, which is the point).
+    let repo_id = create_remote_pypi_repo(&pool, "json-listing", "http://127.0.0.1:9", 7).await;
+    let params = pypi_repo_params(repo_id, 7);
+
+    let mut index = pypi_simple_index_json(
+        "age-gate-pypi",
+        pkg,
+        &[
+            ("1.0.0", Some(old.as_str())),
+            ("9.9.9", Some(young.as_str())),
+        ],
+    );
+    svc.filter_pypi_simple_json(&params, pkg, "http://127.0.0.1:9", &mut index)
+        .await
+        .expect("filter PEP 691 simple index");
+
+    let listed: Vec<&str> = index["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![format!("{pkg}-1.0.0-py3-none-any.whl")],
+        "young version must be withheld from the JSON index, aged one kept"
+    );
+    assert_eq!(
+        index["versions"],
+        serde_json::json!(["1.0.0"]),
+        "PEP 700 versions list must not reveal the withheld version"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, pkg, "9.9.9").await,
+        "pending",
+        "the withheld young version must be queued for review"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL; run with --ignored"]
+async fn pep691_json_index_falls_back_to_upstream_json_for_missing_upload_times() {
+    let pool = connect_db().await;
+    let bus = Arc::new(EventBus::new(16));
+    let svc = AgeGateService::new(pool.clone(), bus);
+
+    let pkg = "agegatejsonfallbackpkg";
+    let young = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let old = (Utc::now() - Duration::days(3650)).to_rfc3339();
+
+    // Upstream that serves a PEP 691 index WITHOUT upload-time: the filter
+    // must fall back to the JSON metadata endpoint for publish times, like
+    // the HTML path always does.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/pypi/{pkg}/json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "info": { "version": "9.9.9" },
+            "releases": {
+                "1.0.0": [{ "upload_time_iso_8601": old }],
+                "9.9.9": [{ "upload_time_iso_8601": young }],
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let repo_id = create_remote_pypi_repo(&pool, "json-fallback", &server.uri(), 7).await;
+    let params = pypi_repo_params(repo_id, 7);
+
+    let mut index =
+        pypi_simple_index_json("age-gate-pypi", pkg, &[("1.0.0", None), ("9.9.9", None)]);
+    svc.filter_pypi_simple_json(&params, pkg, &server.uri(), &mut index)
+        .await
+        .expect("filter PEP 691 simple index with fallback times");
+
+    let listed: Vec<&str> = index["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![format!("{pkg}-1.0.0-py3-none-any.whl")],
+        "fallback publish times must drive the same withholding as document times"
+    );
+    assert_eq!(
+        review_status(&pool, repo_id, pkg, "9.9.9").await,
+        "pending",
+        "the withheld young version must be queued for review"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL; run with --ignored"]
 async fn npm_packument_withholds_young_keeps_old_and_reconciles_tags() {

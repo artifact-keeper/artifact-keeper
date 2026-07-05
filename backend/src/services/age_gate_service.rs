@@ -390,6 +390,63 @@ impl AgeGateService {
         Ok(rebuild_pypi_simple_index_html(html, &spans, &blocked))
     }
 
+    /// Filter a proxied PEP 691 JSON simple index, removing `files` entries
+    /// and PEP 700 `versions` entries for versions blocked by the age gate.
+    ///
+    /// This is the JSON twin of [`Self::filter_pypi_simple_index`]: the proxy
+    /// path negotiates `application/vnd.pypi.simple.v1+json` (#1944) and
+    /// modern pip prefers it, so an HTML-only filter would withhold a young
+    /// version from the HTML index while serving it to every JSON client.
+    /// Publish times come from the document's own PEP 700 `upload-time`
+    /// fields where present (a version is as old as its earliest file); only
+    /// versions with no `upload-time` fall back to the upstream JSON metadata
+    /// fetch the HTML path always pays. A fallback fetch failure leaves those
+    /// versions timeless, and [`Self::meets_age_threshold`] treats a missing
+    /// publish time as not meeting the threshold, so they are withheld rather
+    /// than leaked.
+    pub async fn filter_pypi_simple_json(
+        &self,
+        repo: &AgeGateRepoParams,
+        project: &str,
+        upstream_url: &str,
+        index: &mut serde_json::Value,
+    ) -> Result<()> {
+        if !Self::is_applicable(repo) {
+            return Ok(());
+        }
+
+        let mut versions = collect_pypi_simple_json_versions(index);
+        if versions.is_empty() {
+            return Ok(());
+        }
+
+        if versions.iter().any(|(_, ts)| ts.is_none()) {
+            if let Ok(client) = crate::services::upstream_metadata::metadata_http_client() {
+                if let Ok(times) = self
+                    .metadata_cache
+                    .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+                    .await
+                {
+                    fill_missing_publish_times(&mut versions, &times);
+                }
+            }
+        }
+
+        let blocked = self
+            .evaluate_versions_batch(repo, project, &versions)
+            .await?;
+
+        if !blocked.is_empty() {
+            metrics_service::record_age_gate_filtered_metadata(
+                &repo.key,
+                format_label(&repo.format),
+            );
+        }
+
+        apply_pypi_simple_json_blocks(index, &blocked);
+        Ok(())
+    }
+
     /// Batch age-gate evaluation for every version in a package metadata document.
     /// Returns the set of versions to withhold from clients.
     ///
@@ -1007,8 +1064,106 @@ fn extract_href_filename(anchor: &str) -> Option<String> {
 fn pypi_anchor_version(anchor: &str) -> Option<String> {
     extract_href_filename(anchor)
         .as_deref()
-        .and_then(|f| crate::formats::pypi::PypiHandler::parse_filename(f).ok())
+        .and_then(pypi_filename_version)
+}
+
+/// Extract the package version encoded in a PyPI distribution filename, if
+/// any. Shared by the HTML anchor parser and the PEP 691 JSON `files` walker
+/// so both representations classify a filename identically.
+fn pypi_filename_version(filename: &str) -> Option<String> {
+    crate::formats::pypi::PypiHandler::parse_filename(filename)
+        .ok()
         .and_then(|info| info.version)
+}
+
+/// Collect deduped `(version, earliest upload-time)` pairs from a PEP 691
+/// JSON simple index's `files` array. A version is as old as its earliest
+/// file's PEP 700 `upload-time`; files without one contribute `None` (to be
+/// filled from a fallback source). Files whose names don't parse to a
+/// version are skipped here and kept by [`apply_pypi_simple_json_blocks`],
+/// matching the HTML path's treatment of unparseable anchors.
+pub(crate) fn collect_pypi_simple_json_versions(
+    index: &serde_json::Value,
+) -> Vec<(String, Option<DateTime<Utc>>)> {
+    let Some(files) = index.get("files").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut times: std::collections::HashMap<String, DateTime<Utc>> =
+        std::collections::HashMap::new();
+
+    for file in files {
+        let Some(version) = file
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .and_then(pypi_filename_version)
+        else {
+            continue;
+        };
+        if let Some(ts) = file
+            .get("upload-time")
+            .and_then(|t| t.as_str())
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        {
+            let ts = ts.with_timezone(&Utc);
+            times
+                .entry(version.clone())
+                .and_modify(|earliest| {
+                    if ts < *earliest {
+                        *earliest = ts;
+                    }
+                })
+                .or_insert(ts);
+        }
+        if seen.insert(version.clone()) {
+            order.push(version);
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|version| {
+            let ts = times.get(&version).copied();
+            (version, ts)
+        })
+        .collect()
+}
+
+/// Fill publish times that are still `None` from a fallback map, without
+/// overwriting times the document itself carried.
+pub(crate) fn fill_missing_publish_times(
+    versions: &mut [(String, Option<DateTime<Utc>>)],
+    fallback: &std::collections::HashMap<String, DateTime<Utc>>,
+) {
+    for (version, ts) in versions {
+        if ts.is_none() {
+            *ts = fallback.get(version).copied();
+        }
+    }
+}
+
+/// Remove blocked versions from a PEP 691 JSON simple index: their `files`
+/// entries and their PEP 700 `versions` list entries. Files that don't parse
+/// to a version are kept, matching [`rebuild_pypi_simple_index_html`]'s
+/// treatment of unparseable anchors.
+pub(crate) fn apply_pypi_simple_json_blocks(
+    index: &mut serde_json::Value,
+    blocked: &std::collections::HashSet<String>,
+) {
+    if let Some(files) = index.get_mut("files").and_then(|f| f.as_array_mut()) {
+        files.retain(|file| {
+            file.get("filename")
+                .and_then(|f| f.as_str())
+                .and_then(pypi_filename_version)
+                .map(|version| !blocked.contains(&version))
+                .unwrap_or(true)
+        });
+    }
+    if let Some(versions) = index.get_mut("versions").and_then(|v| v.as_array_mut()) {
+        versions.retain(|v| v.as_str().map(|s| !blocked.contains(s)).unwrap_or(true));
+    }
 }
 
 /// Map a repository format to the bounded Prometheus label used on age-gate
@@ -1780,6 +1935,91 @@ mod tests {
         );
         assert!(!rebuilt.contains("demo-1.0.0"));
         assert!(rebuilt.contains("missing close"));
+    }
+
+    #[test]
+    fn collect_pypi_simple_json_versions_dedupes_and_takes_earliest_upload_time() {
+        let early = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        let index = serde_json::json!({
+            "meta": { "api-version": "1.1" },
+            "name": "demo",
+            "files": [
+                { "filename": "demo-1.0.0.tar.gz",
+                  "upload-time": late.to_rfc3339() },
+                { "filename": "demo-1.0.0-py3-none-any.whl",
+                  "upload-time": early.to_rfc3339() },
+                { "filename": "demo-2.0.0.tar.gz" },
+                { "filename": "not-a-parseable-dist" },
+            ],
+            "versions": ["1.0.0", "2.0.0"],
+        });
+
+        let versions = collect_pypi_simple_json_versions(&index);
+        assert_eq!(
+            versions,
+            vec![
+                ("1.0.0".to_string(), Some(early)),
+                ("2.0.0".to_string(), None),
+            ],
+            "one entry per version, earliest file upload-time wins, \
+             unparseable filenames are skipped"
+        );
+
+        // Documents with no files array contribute nothing.
+        assert!(collect_pypi_simple_json_versions(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn fill_missing_publish_times_never_overwrites_document_times() {
+        let doc_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let fallback_time = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut versions = vec![
+            ("1.0.0".to_string(), Some(doc_time)),
+            ("2.0.0".to_string(), None),
+            ("3.0.0".to_string(), None),
+        ];
+        let fallback = std::collections::HashMap::from([
+            ("1.0.0".to_string(), fallback_time),
+            ("2.0.0".to_string(), fallback_time),
+        ]);
+        fill_missing_publish_times(&mut versions, &fallback);
+        assert_eq!(versions[0].1, Some(doc_time), "document time kept");
+        assert_eq!(versions[1].1, Some(fallback_time), "gap filled");
+        assert_eq!(versions[2].1, None, "absent from fallback stays None");
+    }
+
+    #[test]
+    fn apply_pypi_simple_json_blocks_removes_files_and_versions_entries() {
+        let mut index = serde_json::json!({
+            "name": "demo",
+            "files": [
+                { "filename": "demo-1.0.0.tar.gz", "url": "u1" },
+                { "filename": "demo-2.0.0.tar.gz", "url": "u2" },
+                { "filename": "demo-2.0.0-py3-none-any.whl", "url": "u3" },
+                { "filename": "not-a-parseable-dist", "url": "u4" },
+            ],
+            "versions": ["1.0.0", "2.0.0"],
+        });
+        let blocked = std::collections::HashSet::from(["2.0.0".to_string()]);
+        apply_pypi_simple_json_blocks(&mut index, &blocked);
+
+        let files: Vec<&str> = index["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["filename"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["demo-1.0.0.tar.gz", "not-a-parseable-dist"],
+            "blocked version's files removed, unparseable filename kept"
+        );
+        assert_eq!(
+            index["versions"],
+            serde_json::json!(["1.0.0"]),
+            "PEP 700 versions entry for the blocked version removed"
+        );
     }
 
     #[test]

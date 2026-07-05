@@ -685,6 +685,14 @@ async fn simple_project(
                     if let Some(json) =
                         rewrite_upstream_simple_json(&content, &repo_key, &normalized)
                     {
+                        let json = filter_pypi_simple_json_response(
+                            &state,
+                            &repo,
+                            &effective_upstream,
+                            &project,
+                            json,
+                        )
+                        .await;
                         return Ok(Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
@@ -1225,6 +1233,45 @@ fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
 
 fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> String {
     format!("simple/{}/{}", normalized_project, filename)
+}
+
+/// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
+/// index (#1944). The JSON and HTML representations of one index must
+/// withhold the same young versions, or a JSON-negotiating client (modern
+/// pip) sees everything the HTML filter hides. Mirrors the HTML hook in
+/// `simple_project`: a filter failure serves the unfiltered listing rather
+/// than failing the request — the download path re-checks every version
+/// independently and fails closed, so enforcement never rests on this
+/// listing-side filter.
+async fn filter_pypi_simple_json_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    effective_upstream: &str,
+    project: &str,
+    json: String,
+) -> String {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return json;
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return json;
+    }
+    let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&json) else {
+        // `rewrite_upstream_simple_json` only returns JSON it serialized
+        // itself, so this branch is unreachable in practice.
+        return json;
+    };
+    if svc
+        .filter_pypi_simple_json(&params, project, effective_upstream, &mut index)
+        .await
+        .is_ok()
+    {
+        if let Ok(filtered) = serde_json::to_string(&index) {
+            return filtered;
+        }
+    }
+    json
 }
 
 async fn apply_pypi_download_age_gate(
