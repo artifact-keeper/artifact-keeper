@@ -46,7 +46,7 @@ pub async fn try_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(3)
-        .acquire_timeout(std::time::Duration::from_secs(3))
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&url)
         .await
         .ok()
