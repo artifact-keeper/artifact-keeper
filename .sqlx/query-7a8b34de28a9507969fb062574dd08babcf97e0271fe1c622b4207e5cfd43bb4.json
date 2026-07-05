@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, repository_id, score, grade, total_findings,\n                   critical_count, high_count, medium_count, low_count,\n                   acknowledged_count, last_scan_at, calculated_at\n            FROM repo_security_scores\n            ORDER BY score ASC, critical_count DESC\n            ",
+  "query": "\n            SELECT id, repository_id, score, grade, total_findings,\n                   critical_count, high_count, medium_count, low_count,\n                   acknowledged_count, last_scan_at, has_failed_scan, calculated_at\n            FROM repo_security_scores\n            ORDER BY score ASC, critical_count DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,11 @@
       },
       {
         "ordinal": 11,
+        "name": "has_failed_scan",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
         "name": "calculated_at",
         "type_info": "Timestamptz"
       }
@@ -79,8 +84,9 @@
       false,
       false,
       true,
+      false,
       false
     ]
   },
-  "hash": "98c20d565653ec239f6e9448ad5c0ce21317de2bbb7bee6f02afaede2cdc10cf"
+  "hash": "7a8b34de28a9507969fb062574dd08babcf97e0271fe1c622b4207e5cfd43bb4"
 }

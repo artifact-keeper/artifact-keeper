@@ -86,6 +86,12 @@ pub struct ScoreResponse {
     pub acknowledged_count: i32,
     pub last_scan_at: Option<chrono::DateTime<chrono::Utc>>,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
+    /// True when the latest applicable scan for this repo errored (#2167).
+    /// The `grade` is floored to `F` while this holds, so clients and the
+    /// release-gate must treat the repo as NOT clean regardless of the numeric
+    /// finding counts. Cleared automatically once a `completed` rescan
+    /// supersedes the failed scan.
+    pub has_failed_scan: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -285,6 +291,7 @@ impl From<crate::models::security::RepoSecurityScore> for ScoreResponse {
             acknowledged_count: s.acknowledged_count,
             last_scan_at: s.last_scan_at,
             calculated_at: s.calculated_at,
+            has_failed_scan: s.has_failed_scan,
         }
     }
 }
@@ -2338,6 +2345,7 @@ mod tests {
             acknowledged_count: 1,
             last_scan_at: Some(now),
             calculated_at: now,
+            has_failed_scan: false,
         };
         assert_eq!(resp.score, 85);
         assert_eq!(resp.grade, "A");
@@ -2360,6 +2368,7 @@ mod tests {
             acknowledged_count: 0,
             last_scan_at: None,
             calculated_at: chrono::Utc::now(),
+            has_failed_scan: false,
         };
         assert_eq!(resp.score, 0);
         assert_eq!(resp.grade, "F");
@@ -2408,6 +2417,7 @@ mod tests {
                 acknowledged_count: 0,
                 last_scan_at: Some(now),
                 calculated_at: now,
+                has_failed_scan: false,
             }),
         };
         assert!(resp.config.is_some());
@@ -2508,6 +2518,7 @@ mod tests {
             acknowledged_count: 1,
             last_scan_at: Some(now),
             calculated_at: now,
+            has_failed_scan: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["score"], 75);
