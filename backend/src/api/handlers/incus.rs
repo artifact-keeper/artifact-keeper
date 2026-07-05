@@ -3306,9 +3306,12 @@ mod streaming_pipeline_regression_tests {
     use tower::ServiceExt;
 
     /// Poll `GET /{repo}/uploads/{id}` until the async finalize reaches a
-    /// terminal status, returning the final progress JSON. Panics on timeout.
+    /// terminal status, returning the final progress JSON. Panics after ~60s:
+    /// the budget must exceed the 30s the finalize task's DB work may
+    /// legitimately spend just acquiring a pool connection under parallel
+    /// coverage runs (a 10s budget timed out at 16 test threads).
     async fn await_finalize(f: &tdh::Fixture, session_id: Uuid) -> serde_json::Value {
-        for _ in 0..400 {
+        for _ in 0..2400 {
             let app = f.router_with_auth(router());
             let req = axum::http::Request::builder()
                 .method("GET")
