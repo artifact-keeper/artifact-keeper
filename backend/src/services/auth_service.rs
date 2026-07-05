@@ -4288,13 +4288,16 @@ mod tests {
         let url = std::env::var("DATABASE_URL").ok()?;
         let pool = sqlx::PgPool::connect(&url).await.ok()?;
         let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
+        // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
+        // watermark GREATEST; without this backdate the 120s aging of the
+        // other columns is silently defeated and minted-now tokens race it.
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
              is_admin, is_active, failed_login_attempts, password_changed_at, \
-             created_at, updated_at) \
+             privileges_changed_at, created_at, updated_at) \
              VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
              NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', \
-             NOW() - INTERVAL '120 seconds')",
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds')",
         )
         .bind(user_id)
         .bind(&username)
@@ -5243,20 +5246,25 @@ mod tests {
     /// the password is set at user creation, not at token issuance.
     async fn insert_test_user(pool: &sqlx::PgPool, username: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, username, email, password_hash, auth_provider,
-                               is_active, is_admin, password_changed_at,
-                               failed_login_attempts, created_at, updated_at)
-            VALUES ($1, $2, $3, 'unused', 'local', true, false,
-                    NOW() - INTERVAL '60 seconds', 0,
-                    NOW() - INTERVAL '60 seconds',
-                    NOW() - INTERVAL '60 seconds')
-            "#,
-            id,
-            username,
-            format!("{username}@test.com"),
+        // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
+        // watermark GREATEST; backdate it with the rest or the premise above
+        // (watermark strictly before any minted token's `iat`) is violated.
+        // Runtime `sqlx::query` (not `query!`) keeps SQLX_OFFLINE builds
+        // working without regenerating .sqlx metadata for a test-only insert.
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                                is_active, is_admin, password_changed_at, \
+                                privileges_changed_at, failed_login_attempts, \
+                                created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', 0, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds')",
         )
+        .bind(id)
+        .bind(username)
+        .bind(format!("{username}@test.com"))
         .execute(pool)
         .await
         .expect("insert test user");

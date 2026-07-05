@@ -462,24 +462,30 @@ mod tests {
         let auth_service = Arc::new(AuthService::new(pool.clone(), cfg.clone()));
 
         // Insert a real user so the DB watermark check has a row to consult.
-        // Backdate the credential-bearing columns so the token's `iat` is
-        // strictly after them and the async validator accepts.
+        // Backdate ALL credential-bearing columns so the token's `iat` is
+        // strictly after them and the async validator accepts. This must
+        // include `privileges_changed_at` (migration 131, DEFAULT NOW()): it
+        // is folded into the credential-change watermark GREATEST(...), so
+        // omitting it pins the watermark to insert time and the token minted
+        // microseconds later intermittently 401s under parallel test load.
+        // Runtime `sqlx::query` (not `query!`) keeps SQLX_OFFLINE builds
+        // working without regenerating .sqlx metadata for a test-only insert.
         let user_id = uuid::Uuid::new_v4();
         let username = format!("guest_jwt_{}", &user_id.to_string()[..8]);
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, username, email, password_hash, auth_provider,
-                               is_active, is_admin, password_changed_at,
-                               failed_login_attempts, created_at, updated_at)
-            VALUES ($1, $2, $3, 'unused', 'local', true, false,
-                    NOW() - INTERVAL '60 seconds', 0,
-                    NOW() - INTERVAL '60 seconds',
-                    NOW() - INTERVAL '60 seconds')
-            "#,
-            user_id,
-            username,
-            format!("{username}@test.com"),
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                                is_active, is_admin, password_changed_at, \
+                                privileges_changed_at, failed_login_attempts, \
+                                created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', 0, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds')",
         )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.com"))
         .execute(&pool)
         .await
         .expect("insert test user");
