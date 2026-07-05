@@ -549,13 +549,36 @@ pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&
         })
 }
 
-/// Returns the `Secure;` cookie flag unless running in development mode,
-/// where cookies must work over plain HTTP on localhost.
+/// Returns the `Secure;` cookie flag for the auth cookies, or `""` when the
+/// cookie must be sent over plain HTTP.
+///
+/// The `Secure` attribute is only emitted when HTTPS is *explicitly* enabled
+/// via `AK_ENFORCE_HTTPS` (truthy = "true"/"1"), mirroring the web `#2222`
+/// tradeoff: a default deployment (unset flag) works over plain HTTP out of
+/// the box, and TLS/ingress deployments opt in to hardened cookies by setting
+/// `AK_ENFORCE_HTTPS=true`.
+///
+/// This is a deliberate, security-relevant default change (#2233): previously
+/// any non-`development` ENVIRONMENT emitted `Secure`, which made login
+/// impossible over HTTP because the browser accepted but never resent the
+/// cookie (login 200 → /auth/me 401). Development mode remains non-`Secure`
+/// regardless of the flag (backwards compat: dev works on localhost HTTP).
+///
+/// NOTE: production HTTPS deployments MUST set `AK_ENFORCE_HTTPS=true` (wired
+/// on the iac/chart side for TLS ingress) to keep `Secure` cookies.
 fn secure_flag() -> &'static str {
-    if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
-        ""
-    } else {
+    let is_development = std::env::var("ENVIRONMENT").unwrap_or_default() == "development";
+    let enforce_https = matches!(
+        std::env::var("AK_ENFORCE_HTTPS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "1"
+    );
+    if enforce_https && !is_development {
         " Secure;"
+    } else {
+        ""
     }
 }
 
@@ -1348,6 +1371,129 @@ mod tests {
         assert!(refresh_cookie.contains("Path=/api/v1/auth/refresh"));
         // 7 days in seconds
         assert!(refresh_cookie.contains("Max-Age=604800"));
+    }
+
+    // -----------------------------------------------------------------------
+    // secure_flag / cookie Secure gating (#2233)
+    //
+    // The `Secure` attribute must be an *explicit* HTTPS opt-in
+    // (`AK_ENFORCE_HTTPS`), not coupled to `development` mode, so a default
+    // plain-HTTP deployment can actually keep users logged in. Env is
+    // process-global, so these tests serialize on a local mutex and
+    // set-and-restore ENVIRONMENT + AK_ENFORCE_HTTPS around each case.
+    // -----------------------------------------------------------------------
+
+    /// Serializes env-dependent secure_flag tests (env is process-global).
+    static SECURE_FLAG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set-and-restore helper: applies the given ENVIRONMENT / AK_ENFORCE_HTTPS
+    /// values (None = unset), runs `f`, then restores the prior values.
+    fn with_secure_env(environment: Option<&str>, enforce_https: Option<&str>, f: impl FnOnce()) {
+        let _guard = SECURE_FLAG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_env = std::env::var("ENVIRONMENT").ok();
+        let prev_https = std::env::var("AK_ENFORCE_HTTPS").ok();
+        let apply = |key: &str, val: Option<&str>| match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        };
+        apply("ENVIRONMENT", environment);
+        apply("AK_ENFORCE_HTTPS", enforce_https);
+
+        f();
+
+        apply("ENVIRONMENT", prev_env.as_deref());
+        apply("AK_ENFORCE_HTTPS", prev_https.as_deref());
+    }
+
+    #[test]
+    fn test_secure_flag_default_no_env_is_not_secure() {
+        // Default HTTP-safe deployment: neither flag set (and a realistic
+        // non-development ENVIRONMENT) must NOT emit Secure, so the browser
+        // resends the cookie over plain HTTP.
+        with_secure_env(None, None, || {
+            assert_eq!(secure_flag(), "");
+        });
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(secure_flag(), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_enforce_https_enables_secure() {
+        for truthy in ["true", "TRUE", "1"] {
+            with_secure_env(Some("production"), Some(truthy), || {
+                assert_eq!(
+                    secure_flag(),
+                    " Secure;",
+                    "AK_ENFORCE_HTTPS={truthy} must enable Secure"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_secure_flag_development_never_secure() {
+        // Development stays non-Secure even if HTTPS enforcement is requested
+        // (localhost HTTP), preserving backwards-compatible dev behavior.
+        with_secure_env(Some("development"), None, || {
+            assert_eq!(secure_flag(), "");
+        });
+        with_secure_env(Some("development"), Some("true"), || {
+            assert_eq!(secure_flag(), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_falsey_values_not_secure() {
+        for falsey in ["false", "0", "", "no"] {
+            with_secure_env(Some("production"), Some(falsey), || {
+                assert_eq!(
+                    secure_flag(),
+                    "",
+                    "AK_ENFORCE_HTTPS={falsey} must not enable Secure"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_set_auth_cookies_secure_gated_by_enforce_https() {
+        // End-to-end through set_auth_cookies: HttpOnly + SameSite=Strict are
+        // always present; Secure follows the AK_ENFORCE_HTTPS toggle.
+        with_secure_env(Some("production"), None, || {
+            let mut headers = HeaderMap::new();
+            set_auth_cookies(&mut headers, "a", "r", 3600);
+            for v in headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    !c.contains("Secure"),
+                    "default deploy must be non-Secure: {c}"
+                );
+            }
+        });
+        with_secure_env(Some("production"), Some("true"), || {
+            let mut headers = HeaderMap::new();
+            set_auth_cookies(&mut headers, "a", "r", 3600);
+            for v in headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    c.contains("Secure"),
+                    "AK_ENFORCE_HTTPS=true must be Secure: {c}"
+                );
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
