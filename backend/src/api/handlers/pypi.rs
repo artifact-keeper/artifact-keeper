@@ -1375,6 +1375,15 @@ async fn serve_file(
                     {
                         let lkg_cache_path =
                             build_pypi_proxy_cache_path(&normalized, &lkg_filename);
+                        // #1555 ordering holds on the LKG fallback too:
+                        // presigned redirect on a fresh cache hit BEFORE the
+                        // streaming cache check, so a cached LKG wheel is not
+                        // streamed through the backend.
+                        if let Some(redirect) =
+                            pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
+                        {
+                            return Ok(redirect);
+                        }
                         if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                             proxy,
                             repo.id,
