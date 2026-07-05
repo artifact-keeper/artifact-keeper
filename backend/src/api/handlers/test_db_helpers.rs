@@ -450,6 +450,64 @@ pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
     }
 }
 
+/// True when `dir` holds a committed proxy-cache entry of at least
+/// `min_size` bytes: a `{base}__content__` object of that size whose
+/// matching `{base}__cache_meta__.json` sidecar exists.
+fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if committed_cache_entry_exists(&path, min_size) {
+                return true;
+            }
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(base) = name.strip_suffix("__content__") else {
+            continue;
+        };
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < min_size {
+            continue;
+        }
+        if path
+            .with_file_name(format!("{base}__cache_meta__.json"))
+            .exists()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll `dir` until the proxy streaming write-back has fully COMMITTED a
+/// cache entry of at least `min_size` bytes, or panic after ~10s.
+///
+/// The tee (`ProxyService::tee_stream`) commits in three ordered steps:
+/// content object (`{base}__content__`), storage-ETag pin (a backend HEAD),
+/// then the metadata sidecar (`{base}__cache_meta__.json`) — and only the
+/// sidecar makes the next lookup a cache HIT. [`wait_for_cached_blob`]'s
+/// size-only condition becomes true at step one, so warm-cache tests gating
+/// on it race the sidecar write and observe a second upstream fetch under
+/// parallel test load. This waits for the matching sidecar as well — the
+/// same commit marker the production hit path requires.
+pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
+    for _ in 0..400 {
+        if committed_cache_entry_exists(dir, min_size) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "proxy cache never committed (content + __cache_meta__.json sidecar) under {}",
+        dir.display()
+    );
+}
+
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)
