@@ -38,10 +38,12 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{DebControl, DebianHandler};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
 use crate::services::artifact_service::ArtifactService;
+use crate::services::cache_classifier;
 use crate::services::package_service::PackageService;
+use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::SigningService;
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
@@ -538,6 +540,7 @@ impl<'a> DebianProxy<'a> {
                 self.state,
                 repo.id,
                 self.repo_key,
+                self.distribution,
                 &upstream_path,
                 content_type,
             )
@@ -556,6 +559,12 @@ impl<'a> DebianProxy<'a> {
             _ => return Ok(()),
         };
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+
+        // Epoch-based lazy invalidation: if the cached file is older
+        // than the release epoch, invalidate it so the streaming fetch
+        // treats it as a cache miss and re-fetches from upstream.
+        maybe_invalidate_by_epoch(proxy, self.repo_key, self.distribution, &upstream_path).await;
+
         let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
             proxy,
             repo.id,
@@ -568,14 +577,13 @@ impl<'a> DebianProxy<'a> {
         Err(build_dists_response(content, upstream_ct, content_type))
     }
 
-    /// Variant of `dists` that also detects whether the upstream content
-    /// changed since the last cached copy. When it has, sibling Packages
-    /// caches under the same distribution are invalidated so subsequent
-    /// `apt-get update` requests refetch them and the Release SHA-256
-    /// list matches what apt sees (#1147).
+    /// Variant of `dists` that uses TTL + conditional-request +
+    /// epoch-based lazy invalidation for Release/InRelease files.
     ///
-    /// Used by the Release / InRelease handlers, where stale Packages
-    /// caches manifest as `Hash Sum mismatch` errors on the client.
+    /// Sibling files compare their own `cached_at` against the release
+    /// epoch timestamp to decide freshness at read time.
+    ///
+    /// Used by the Release / InRelease handlers.
     async fn dists_detecting_change(
         &self,
         suffix: &str,
@@ -584,10 +592,7 @@ impl<'a> DebianProxy<'a> {
     ) -> Result<(), Response> {
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
 
-        // Virtual: iterate Remote members. Whichever member serves the
-        // Release also owns the sibling Packages caches we may need to
-        // invalidate, so we run the change-detection probe against that
-        // specific member before returning.
+        // Virtual: iterate Remote members.
         if repo.repo_type == RepositoryType::Virtual {
             if let Some(resp) = try_virtual_dists_detecting_change(
                 self.state,
@@ -614,14 +619,16 @@ impl<'a> DebianProxy<'a> {
 
         let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, self.repo_key, upstream_url);
         let (content, upstream_ct, changed) = proxy
-            .fetch_dists_detecting_change(&pseudo_repo, &upstream_path)
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                &upstream_path,
+                self.distribution,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
             .await
             .map_err(map_proxy_err)?;
 
-        if let Some(text) = release_invalidation_payload(changed, &content) {
-            proxy
-                .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
-                .await;
+        if changed {
             // Drop any signed-Release entries for this dist; the next
             // InRelease / Release.gpg fetch will re-sign against the new
             // content (#1236).
@@ -663,19 +670,6 @@ fn remote_member_upstream(member: &crate::models::repository::Repository) -> Opt
     member.upstream_url.as_deref()
 }
 
-/// Pure helper that decides whether an upstream Release body should
-/// trigger sibling-Packages cache invalidation (#1147). Returns the
-/// decoded UTF-8 body when the caller should invalidate, `None` when
-/// the body either didn't change or isn't valid UTF-8. Factoring this
-/// out makes the change-detection branch testable without a real
-/// proxy fetch.
-fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
-    if !changed {
-        return None;
-    }
-    std::str::from_utf8(content).ok()
-}
-
 // ---------------------------------------------------------------------------
 // Signed-Release cache helpers (#1236)
 //
@@ -684,8 +678,8 @@ fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
 // by SHA-256(unsigned Release || key fingerprint). The fingerprint is in the
 // key so that a key rotation naturally invalidates the prior signature, and
 // the content prefix means any Release flip rotates the key without needing
-// an explicit invalidation pass — though we also evict eagerly from the
-// change-detect path to keep the cache from growing unboundedly.
+// an explicit invalidation pass — though we also evict from the revalidation
+// path to keep the cache from growing unboundedly.
 // ---------------------------------------------------------------------------
 
 /// Variant tag included in cache keys so InRelease and Release.gpg cannot
@@ -759,9 +753,9 @@ async fn signed_release_cache_put(
 }
 
 /// Evict all signed-Release entries belonging to the given
-/// `(repo_key, distribution)`. Called from the change-detection paths so
-/// that an upstream Release flip drops the matching signed copies in
-/// lock-step with the sibling-Packages eviction in `proxy_service`.
+/// `(repo_key, distribution)`. Called from the revalidation path so
+/// that an upstream Release flip drops the matching signed copies
+/// when content changes.
 async fn signed_release_cache_invalidate(state: &SharedState, repo_key: &str, distribution: &str) {
     let key = (repo_key.to_string(), distribution.to_string());
     let drained = {
@@ -801,11 +795,13 @@ async fn require_active_signing_key(
 }
 
 /// Iterate the virtual repo's Remote members for `upstream_path` and
-/// return the first successful response.
+/// return the first successful response. Checks the release epoch for
+/// lazy invalidation before attempting the streaming fetch.
 async fn try_virtual_dists(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
+    distribution: &str,
     upstream_path: &str,
     default_content_type: &'static str,
 ) -> Result<Option<Response>, Response> {
@@ -818,6 +814,10 @@ async fn try_virtual_dists(
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
+
+        // Epoch-based lazy invalidation for this member's cache entry
+        maybe_invalidate_by_epoch(proxy, &member.key, distribution, upstream_path).await;
+
         match proxy_helpers::proxy_fetch_capped(
             proxy,
             member.id,
@@ -844,10 +844,41 @@ async fn try_virtual_dists(
     Ok(None)
 }
 
-/// Change-detection variant of [`try_virtual_dists`]. Used for
-/// Release/InRelease so that any upstream change invalidates the matching
-/// member's sibling `Packages*` caches before the client tries to fetch
-/// them (#1147).
+/// Check the release epoch and invalidate the cache entry if stale.
+/// Dependent files are invalidated on demand when next requested,
+/// not eagerly when Release changes.
+async fn maybe_invalidate_by_epoch(
+    proxy: &ProxyService,
+    repo_key: &str,
+    distribution: &str,
+    path: &str,
+) {
+    // Immutable paths (by-hash, pool/) never need epoch invalidation —
+    // their content is pinned, so a Release change cannot affect them.
+    if cache_classifier::classify(&RepositoryFormat::Debian, path).is_immutable() {
+        return;
+    }
+
+    let metadata_key = match ProxyService::cache_metadata_key(repo_key, path) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let metadata = match proxy.load_cache_metadata_pub(&metadata_key).await {
+        Some(m) => m,
+        None => return,
+    };
+
+    if proxy
+        .is_dists_epoch_expired(repo_key, distribution, metadata.cached_at)
+        .await
+    {
+        let _ = proxy.invalidate_cache_by_key(repo_key, path).await;
+    }
+}
+
+/// Change-detection variant of [`try_virtual_dists`]. Uses TTL +
+/// conditional-request + epoch-based lazy invalidation for virtual repo
+/// members' Release/InRelease files.
 async fn try_virtual_dists_detecting_change(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
@@ -867,14 +898,16 @@ async fn try_virtual_dists_detecting_change(
         };
         let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
         match proxy
-            .fetch_dists_detecting_change(&pseudo_repo, upstream_path)
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                upstream_path,
+                distribution,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
             .await
         {
             Ok((content, upstream_ct, changed)) => {
-                if let Some(text) = release_invalidation_payload(changed, &content) {
-                    proxy
-                        .invalidate_dist_packages_cache(&member.key, distribution, text)
-                        .await;
+                if changed {
                     signed_release_cache_invalidate(state, &member.key, distribution).await;
                 }
                 return Ok(Some(build_dists_response(
@@ -895,7 +928,7 @@ fn map_proxy_err(e: crate::error::AppError) -> Response {
 }
 
 /// Pure helper that decides the HTTP status and message for an
-/// `AppError` returned from `ProxyService::fetch_dists_detecting_change`.
+/// `AppError` returned from `ProxyService::fetch_dists_with_revalidation`.
 /// Factored out of [`map_proxy_err`] so the mapping table can be unit
 /// tested without constructing an `axum::Response`.
 fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, String) {
@@ -1002,8 +1035,8 @@ async fn release_gpg(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     // Release.gpg is the detached signature of Release. We do not need
-    // change-detection here because the matching Release fetch (called
-    // by apt before Release.gpg) already drove invalidation.
+    // revalidation here because the matching Release fetch (called
+    // by apt before Release.gpg) already drove epoch invalidation.
     proxy
         .dists("Release.gpg", "application/pgp-signature", &repo)
         .await?;
@@ -1284,6 +1317,7 @@ async fn dists_proxy_catchall(
             &state,
             repo.id,
             &repo_key,
+            &distribution,
             &upstream_path,
             "text/plain; charset=utf-8",
         )
@@ -1299,6 +1333,10 @@ async fn dists_proxy_catchall(
         (Some(u), Some(p)) => (u, p),
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
+
+    // Epoch-based lazy invalidation for mutable dists/ paths.
+    // Immutable paths (by-hash) are skipped by maybe_invalidate_by_epoch.
+    maybe_invalidate_by_epoch(proxy, &repo_key, &distribution, &upstream_path).await;
 
     let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
         proxy,
@@ -2049,40 +2087,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // release_invalidation_payload (#1147)
-    //
-    // Pure helper that gates sibling-Packages cache invalidation on both
-    // the change flag AND UTF-8 decodability of the body.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_release_invalidation_payload_skips_when_unchanged() {
-        // Even a perfectly valid Release body must not trigger cache
-        // invalidation when the upstream content was identical to the
-        // cached copy. Otherwise apt-get update would needlessly
-        // churn sibling caches on every poll.
-        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
-        assert!(release_invalidation_payload(false, release).is_none());
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_returns_text_when_changed() {
-        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
-        let got = release_invalidation_payload(true, release);
-        assert!(got.is_some());
-        assert!(got.unwrap().contains("main/binary-amd64/Packages"));
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_skips_non_utf8_body() {
-        // A malicious or corrupted upstream that serves binary garbage
-        // under the `Release` URL must not crash the handler; the
-        // invalidation step is silently skipped.
-        let garbage: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
-        assert!(release_invalidation_payload(true, garbage).is_none());
-    }
-
-    // -----------------------------------------------------------------------
     // Router construction
     //
     // Regression guard for #832: axum's matchit router panics at startup
@@ -2807,21 +2811,6 @@ mod tests {
         // is None so the caller proxies to upstream.
         assert!(parse_packages_request("main/binary-amd64/Packages.bz2").is_none());
         assert!(parse_packages_request("main/binary-amd64/Release").is_none());
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_changed() {
-        // Non-empty bytes + changed -> Some(snippet) so the caller emits
-        // a webhook payload. Empty bytes still returns Some but with the
-        // empty string.
-        let payload = release_invalidation_payload(true, b"foo bar baz");
-        assert!(payload.is_some());
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_unchanged_is_none() {
-        // changed = false -> None; no webhook fires.
-        assert!(release_invalidation_payload(false, b"any content").is_none());
     }
 
     // ---------------------------------------------------------------------

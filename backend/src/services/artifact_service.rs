@@ -2184,4 +2184,160 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(*map.get(&id).unwrap(), 10);
     }
+
+    // -----------------------------------------------------------------------
+    // Release-immutability backstop × Debian classifier semantics
+    // -----------------------------------------------------------------------
+
+    /// Soft-delete an artifact row so the next upload exercises the
+    /// tombstone-aware release-immutability backstop in `preflight_upload`.
+    async fn tombstone(pool: &sqlx::PgPool, repo_id: Uuid, path: &str) {
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .execute(pool)
+        .await
+        .expect("tombstone artifact");
+    }
+
+    /// Locks in the intended hosted-Debian overwrite semantics introduced by
+    /// the `Debian` arm of `cache_classifier::is_explicitly_mutable_index`:
+    ///
+    /// * `dists/…` index coordinates (Release, Packages, …) are genuinely
+    ///   rewritten in place by every APT publish — like `maven-metadata.xml`
+    ///   or an npm packument — so the tombstone/overwrite guard must be
+    ///   SKIPPED: a delete + re-push with different bytes succeeds.
+    /// * `pool/…` packages and `by-hash/…` indices are release coordinates
+    ///   (version-pinned / content-addressed) and must stay PROTECTED: a
+    ///   delete + re-push with different bytes is rejected with Conflict.
+    ///
+    /// A future change to either direction should fail this test rather than
+    /// silently flipping the semantics.
+    #[tokio::test]
+    async fn test_debian_dists_tombstone_overwrite_allowed_pool_and_by_hash_protected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "debian").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+
+        // -- (a) dists/… index coordinate: overwrite after tombstone ALLOWED --
+        let dists_path = "dists/bookworm/main/binary-amd64/Packages";
+        svc.upload_with_sync_options(
+            repo_id,
+            dists_path,
+            "Packages",
+            None,
+            "application/octet-stream",
+            Bytes::from_static(b"packages-index-v1"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("initial dists index upload must succeed");
+
+        tombstone(&pool, repo_id, dists_path).await;
+
+        let republished = svc
+            .upload_with_sync_options(
+                repo_id,
+                dists_path,
+                "Packages",
+                None,
+                "application/octet-stream",
+                Bytes::from_static(b"packages-index-v2-DIFFERENT"),
+                Some(user_id),
+                false,
+            )
+            .await
+            .expect("dists index is an in-place-rewritten index: re-push with different bytes must succeed");
+        assert_eq!(
+            republished.checksum_sha256,
+            ArtifactService::calculate_sha256(b"packages-index-v2-DIFFERENT"),
+            "re-pushed dists index must carry the new content"
+        );
+
+        // -- (b1) pool/… package: overwrite after tombstone REJECTED ---------
+        let pool_path = "pool/main/a/apt/apt_2.5.3_amd64.deb";
+        svc.upload_with_sync_options(
+            repo_id,
+            pool_path,
+            "apt",
+            Some("2.5.3"),
+            "application/vnd.debian.binary-package",
+            Bytes::from_static(b"deb-content-v1"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("initial pool package upload must succeed");
+
+        tombstone(&pool, repo_id, pool_path).await;
+
+        let swap = svc
+            .upload_with_sync_options(
+                repo_id,
+                pool_path,
+                "apt",
+                Some("2.5.3"),
+                "application/vnd.debian.binary-package",
+                Bytes::from_static(b"deb-content-v2-DIFFERENT"),
+                Some(user_id),
+                false,
+            )
+            .await;
+        assert!(
+            matches!(swap, Err(AppError::Conflict(_))),
+            "pool/ coordinate is a release coordinate: tombstone + different-bytes re-push must be rejected, got {:?}",
+            swap.map(|a| a.path)
+        );
+
+        // -- (b2) by-hash/… index: overwrite after tombstone REJECTED --------
+        let by_hash_path =
+            "dists/bookworm/main/binary-amd64/by-hash/SHA256/0f343b0931126a20f133d67c2b018a3b";
+        svc.upload_with_sync_options(
+            repo_id,
+            by_hash_path,
+            "Packages",
+            None,
+            "application/octet-stream",
+            Bytes::from_static(b"by-hash-content-v1"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("initial by-hash upload must succeed");
+
+        tombstone(&pool, repo_id, by_hash_path).await;
+
+        let swap = svc
+            .upload_with_sync_options(
+                repo_id,
+                by_hash_path,
+                "Packages",
+                None,
+                "application/octet-stream",
+                Bytes::from_static(b"by-hash-content-v2-DIFFERENT"),
+                Some(user_id),
+                false,
+            )
+            .await;
+        assert!(
+            matches!(swap, Err(AppError::Conflict(_))),
+            "by-hash/ coordinate is content-addressed: tombstone + different-bytes re-push must be rejected, got {:?}",
+            swap.map(|a| a.path)
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
 }

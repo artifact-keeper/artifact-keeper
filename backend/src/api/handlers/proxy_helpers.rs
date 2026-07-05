@@ -3932,7 +3932,7 @@ pub(crate) fn build_download_response(
 /// Visible to other handler modules so they can construct a stand-in
 /// `Repository` value for `ProxyService` calls that need more than just
 /// the fields carried on the thin `RepoInfo` struct, e.g.
-/// `ProxyService::fetch_dists_detecting_change` in the Debian handler.
+/// `ProxyService::fetch_dists_with_revalidation` in the Debian handler.
 pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
     Repository {
         id,

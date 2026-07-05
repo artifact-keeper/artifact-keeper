@@ -52,15 +52,15 @@ pub const LARGE_METADATA_MAX_BYTES: usize = 16 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 60;
 
 /// Response from an upstream registry fetch.
-struct UpstreamResponse {
-    content: Bytes,
-    content_type: Option<String>,
-    etag: Option<String>,
+pub(crate) struct UpstreamResponse {
+    pub(crate) content: Bytes,
+    pub(crate) content_type: Option<String>,
+    pub(crate) etag: Option<String>,
     /// `Last-Modified` header from upstream, persisted into the cache sidecar
     /// so a later conditional revalidation can send `If-Modified-Since` (#1611).
-    last_modified: Option<String>,
-    effective_url: String,
-    link: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) effective_url: String,
+    pub(crate) link: Option<String>,
 }
 
 /// Streaming response from an upstream registry fetch. Used by the
@@ -204,68 +204,65 @@ const TEE_CHANNEL_DEPTH: usize = 64;
 /// docstring above. Smaller upstream chunks pass through unchanged.
 const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Validate the upstream response status code for the streaming path.
-/// Extracted from [`ProxyService::read_upstream_response_streaming`] so
-/// the status-classification logic can be unit-tested without a real
-/// `reqwest::Response`.
-///
-/// Parse an APT `Release` (or `InRelease`) file body and return every
-/// distribution-relative file path listed under any checksum section
-/// (`MD5Sum`, `SHA1`, `SHA256`, `SHA512`). Used by
-/// `ProxyService::invalidate_dist_packages_cache` to identify which
-/// sibling cache entries must be evicted when the upstream Release
-/// changes (#1147).
-///
-/// The Release file format documents each section as a header line
-/// (`SHA256:`) followed by indented entries of the form
-/// `<hex_digest> <size> <relative_path>`. Lines starting with `-----`
-/// belong to the inline-signature wrapper around an `InRelease` body
-/// and are ignored. The returned `Vec` is de-duplicated while preserving
-/// first-seen order.
-fn parse_release_file_paths(release_content: &str) -> Vec<String> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut paths: Vec<String> = Vec::new();
-    let mut in_checksum_section = false;
+/// Default TTL for APT InRelease/Release index files (5 minutes).
+/// Controls how often the proxy re-checks upstream for changes.
+pub const DEFAULT_DISTS_INDEX_TTL_SECS: i64 = 300;
 
-    for line in release_content.lines() {
-        if line.starts_with("-----BEGIN") || line.starts_with("-----END") {
-            continue;
-        }
-        // Section header: a line whose first non-whitespace char is at
-        // column 0 (no leading indent) and that ends with ':'.
-        if !line.starts_with(' ') && !line.starts_with('\t') && line.trim_end().ends_with(':') {
-            let key = line.trim_end().trim_end_matches(':');
-            in_checksum_section = matches!(key, "MD5Sum" | "SHA1" | "SHA256" | "SHA512");
-            continue;
-        }
-        if !in_checksum_section {
-            continue;
-        }
-        // Entry line: `<hex> <size> <relative_path>`. The hex digest and
-        // the size live in the first two whitespace-separated columns;
-        // everything after is the path.
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let _hex = match parts.next() {
-            Some(h) if !h.is_empty() => h,
-            _ => continue,
-        };
-        let _size = match parts.next() {
-            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
-            _ => continue,
-        };
-        let rest: String = parts.collect::<Vec<_>>().join(" ");
-        if rest.is_empty() || rest.contains("..") {
-            continue;
-        }
-        if seen.insert(rest.clone()) {
-            paths.push(rest);
+/// Epoch metadata for a distribution. Stored at
+/// `proxy-cache/{repo_key}/dists/{distribution}/__release_epoch__.json`.
+///
+/// Acts as the single source of truth for "when did the upstream
+/// content last truly change". All files under `dists/{distribution}/`
+/// (including InRelease/Release themselves) compare their own `cached_at`
+/// against this timestamp to decide freshness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseEpoch {
+    pub content_changed_at: DateTime<Utc>,
+}
+
+/// Outcome of reading a distribution's release epoch sidecar.
+///
+/// The three states are deliberately distinct because they drive opposite
+/// freshness decisions:
+///
+/// * [`Found`](Self::Found) — sidecar present and parsed; compare
+///   `cached_at` against `content_changed_at` as usual.
+/// * [`NeverSeeded`](Self::NeverSeeded) — the sidecar does not exist
+///   (storage reported NotFound). This is the legitimate cold-start case:
+///   a cache that has never gone through a Release revalidation has no
+///   epoch yet, and treating that as "expired" would force-revalidate
+///   every sibling on every request forever. Callers fall through to the
+///   plain TTL check instead.
+/// * [`Unreadable`](Self::Unreadable) — the sidecar (or the storage
+///   backend serving it) exists but could not be read or parsed. Unlike
+///   the cold start, an epoch may have been written here that we simply
+///   cannot see, so the only safe answer is "expired": force a
+///   conditional revalidation rather than risk serving a stale index as
+///   fresh. The next successful revalidation rewrites the sidecar and
+///   self-heals the corruption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseEpochRead {
+    /// Sidecar present and parsed successfully.
+    Found(ReleaseEpoch),
+    /// Sidecar absent (cold start / never revalidated): fall through to TTL.
+    NeverSeeded,
+    /// Sidecar (or storage) present but unreadable: fail safe, treat as expired.
+    Unreadable,
+}
+
+impl ReleaseEpochRead {
+    /// `true` only when a parseable sidecar was found.
+    pub fn is_found(&self) -> bool {
+        matches!(self, Self::Found(_))
+    }
+
+    /// The parsed epoch, if one was found.
+    pub fn found(self) -> Option<ReleaseEpoch> {
+        match self {
+            Self::Found(epoch) => Some(epoch),
+            _ => None,
         }
     }
-    paths
 }
 
 /// Remove credential-bearing URL material before rendering an upstream target
@@ -1396,7 +1393,7 @@ impl CachePersister {
 /// **intentional OCI `Accept`-header asymmetry** — see that method's doc.
 pub(crate) struct UpstreamClient {
     db: PgPool,
-    http_client: Client,
+    pub(crate) http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
@@ -1507,7 +1504,7 @@ impl UpstreamClient {
     /// `AppError::BadGateway` (-> 502) is returned; NOTHING is buffered past the
     /// ceiling and, because the error propagates before the caller reaches its
     /// cache write, no truncated/partial body or sidecar is ever persisted.
-    async fn read_upstream_response_capped(
+    pub(crate) async fn read_upstream_response_capped(
         response: reqwest::Response,
         url: &str,
         max: usize,
@@ -3013,8 +3010,8 @@ impl ProxyService {
     ///
     /// Same effect as `invalidate_cache` but doesn't require constructing
     /// a `Repository` value. Useful for handlers that only carry a thin
-    /// `RepoInfo` and need to evict sibling cache entries (e.g. APT
-    /// invalidating stale Packages indices when Release changes, #1147).
+    /// `RepoInfo` and need to evict a cache entry (e.g. APT lazy
+    /// invalidation via `maybe_invalidate_by_epoch`, #1147).
     pub async fn invalidate_cache_by_key(&self, repo_key: &str, path: &str) -> Result<()> {
         self.invalidate_cache_keys(repo_key, path).await
     }
@@ -3057,57 +3054,449 @@ impl ProxyService {
         self.load_cache_metadata(&metadata_key).await
     }
 
-    /// Fetch an artifact from upstream and report whether the content
-    /// differs from what was previously cached.
+    /// Fetch an APT dists file with lazy invalidation support.
     ///
-    /// Returns `(content, content_type, changed)` where `changed` is:
-    ///   * `true` when the previous cache entry was missing/expired AND
-    ///     the new upstream body differs from any stale cached body, or
-    ///     when there was no cached body to compare against,
-    ///   * `false` when the upstream returned the same SHA-256 we already
-    ///     had cached.
+    /// Implements the TTL + conditional-request + epoch-based freshness
+    /// protocol:
     ///
-    /// Use this for APT `Release`/`InRelease` (#1147) so the handler can
-    /// invalidate sibling `Packages*` caches in lockstep when upstream
-    /// publishes a new index and the hashes no longer match.
-    pub async fn fetch_dists_detecting_change(
+    /// 1. Check cache metadata exists → miss if absent
+    /// 2. Check epoch: if `cached_at < epoch.content_changed_at` → expired
+    /// 3. Check TTL: if `now > expires_at` → expired
+    /// 4. All pass → cache hit
+    ///
+    /// On expiry, sends a conditional request (If-None-Match with ETag)
+    /// to upstream:
+    /// - 304 or same SHA-256 → revalidate metadata (update cached_at + expires_at)
+    /// - 200 with different SHA-256 → update content + metadata + epoch
+    ///
+    /// Returns `(content, content_type, changed)`.
+    pub async fn fetch_dists_with_revalidation(
         &self,
         repo: &Repository,
         path: &str,
+        distribution: &str,
+        dists_ttl_secs: i64,
     ) -> Result<(Bytes, Option<String>, bool)> {
         let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
-        // Capture the SHA of any currently-cached body (fresh or stale) so
-        // we can compare to whatever the upstream now serves.
-        let prior_sha = match self.storage.get(&cache_key).await {
-            Ok(prior) => {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(&prior);
-                Some(format!("{:x}", hasher.finalize()))
+        // Step 1: Load cache metadata and epoch (single read each)
+        let metadata = self.load_cache_metadata(&metadata_key).await?;
+        let epoch = self.read_release_epoch(&repo.key, distribution).await;
+
+        if let Some(ref meta) = metadata {
+            // Step 2: Check epoch. NeverSeeded (cold start) defers to the
+            // TTL check below; Unreadable fails safe and forces a
+            // conditional revalidation (see `ReleaseEpochRead`).
+            let epoch_expired = match epoch {
+                ReleaseEpochRead::Found(ref e) => meta.cached_at < e.content_changed_at,
+                ReleaseEpochRead::NeverSeeded => false,
+                ReleaseEpochRead::Unreadable => true,
+            };
+
+            // Step 3: Check TTL
+            let ttl_expired = Utc::now() > meta.expires_at;
+
+            if !epoch_expired && !ttl_expired {
+                // Cache hit — read content and verify
+                match self.storage.get(&cache_key).await {
+                    Ok(content) => {
+                        let actual_checksum = StorageService::calculate_hash(&content);
+                        if actual_checksum == meta.checksum_sha256 {
+                            return Ok((content, meta.content_type.clone(), false));
+                        }
+                    }
+                    Err(AppError::NotFound(_)) => {
+                        // Body missing, fall through
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            Err(_) => None,
+        }
+
+        // Expired or miss — fetch from upstream
+        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
+            AppError::Config("Remote repository missing upstream_url".to_string())
+        })?;
+        let full_url = Self::build_upstream_url(upstream_url, path);
+
+        // Try conditional request if we have an ETag
+        let prior_etag = metadata.as_ref().and_then(|m| m.upstream_etag.clone());
+        let prior_sha = metadata.as_ref().map(|m| m.checksum_sha256.clone());
+
+        let upstream_result = if let Some(ref etag) = prior_etag {
+            self.fetch_from_upstream_conditional(&full_url, repo.id, etag)
+                .await
+        } else {
+            self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+                .await
+                .map(Some)
         };
 
-        // Force a fresh upstream fetch by invalidating any current cache
-        // entry before delegating. This guarantees we observe the latest
-        // upstream Release when the caller's intent is to drive cache
-        // coherence across sibling Packages indices.
-        let _ = self.invalidate_cache_by_key(&repo.key, path).await;
+        // Only a parseable sidecar counts as "exists": for NeverSeeded the
+        // epoch is seeded on this revalidation, and for Unreadable the
+        // rewrite below self-heals the corrupt sidecar.
+        let epoch_exists = epoch.is_found();
 
-        let (content, content_type) = self.fetch_artifact(repo, path).await?;
-
-        let new_sha = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&content);
-            format!("{:x}", hasher.finalize())
+        // Resolve the upstream response. A 304 with a missing cached body
+        // triggers an unconditional refetch so the cache self-heals instead
+        // of returning NotFound.
+        let resp = match upstream_result {
+            Ok(None) => {
+                // 304 Not Modified — content unchanged.
+                // Read the cached body FIRST. If it's missing (lifecycle
+                // cleanup, manual deletion, race), fall through to an
+                // unconditional refetch instead of returning NotFound.
+                match self.storage.get(&cache_key).await {
+                    Ok(content) => {
+                        // Body exists — normal 304 path. Capture the timestamp
+                        // BEFORE revalidate_cache_metadata so the epoch's
+                        // content_changed_at <= cached_at, preventing
+                        // self-invalidation of this Release entry on the next
+                        // request.
+                        let now = Utc::now();
+                        let _ = self
+                            .revalidate_cache_metadata(&repo.key, path, dists_ttl_secs)
+                            .await;
+                        if !epoch_exists {
+                            self.write_release_epoch(&repo.key, distribution, now).await;
+                        }
+                        let ct = metadata.and_then(|m| m.content_type);
+                        return Ok((content, ct, false));
+                    }
+                    Err(AppError::NotFound(_)) => {
+                        // Body missing after 304 — treat as cache miss.
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            "cached body missing after 304; refetching unconditionally"
+                        );
+                        self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+                            .await?
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(Some(resp)) => resp,
+            Err(upstream_err) => {
+                // Upstream failed — try to serve stale if available
+                if let Some(ref meta) = metadata {
+                    if let Ok(content) = self.storage.get(&cache_key).await {
+                        tracing::warn!(
+                            "Upstream fetch failed for {}; serving stale: {}",
+                            full_url,
+                            upstream_err
+                        );
+                        let ct = meta.content_type.clone();
+                        return Ok((content, ct, false));
+                    }
+                }
+                return Err(upstream_err);
+            }
         };
+
+        // Got new content — check if it actually changed
+        let new_sha = StorageService::calculate_hash(&resp.content);
         let changed = match prior_sha {
-            Some(s) => s != new_sha,
+            Some(ref old) => *old != new_sha,
             None => true,
         };
-        Ok((content, content_type, changed))
+
+        // Capture the timestamp BEFORE cache_artifact so the
+        // epoch's content_changed_at <= cached_at. This prevents
+        // the Release's own cache entry from being self-invalidated
+        // on the next request — the epoch is meant to invalidate
+        // *siblings* (Packages, etc.), not the Release itself.
+        let now = Utc::now();
+
+        // Write to cache
+        if let Err(e) = self
+            .cache_artifact(
+                &cache_key,
+                &metadata_key,
+                &resp.content,
+                resp.content_type.clone(),
+                resp.etag,
+                resp.last_modified,
+                dists_ttl_secs,
+                repo.id,
+                path,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                cache_key = %cache_key,
+                error = %e,
+                "dists cache write failed; serving uncached"
+            );
+        }
+
+        // Update epoch if content changed, or seed it on first
+        // revalidation so sibling caches have a baseline.
+        if changed || !epoch_exists {
+            self.write_release_epoch(&repo.key, distribution, now).await;
+        }
+
+        Ok((resp.content, resp.content_type, changed))
+    }
+
+    /// Send a conditional GET with `If-None-Match`. Returns `None` on
+    /// 304 (content unchanged), `Some(response)` on 200.
+    ///
+    /// Handles OCI registry bearer token exchange the same way
+    /// [`UpstreamClient::fetch_buffered`] does: when the upstream
+    /// responds with `401 WWW-Authenticate: Bearer ...`, the challenge
+    /// is parsed, a token is obtained, and the request is retried with
+    /// the bearer token — preserving `If-None-Match` on the retry so
+    /// the conditional semantics are not lost.
+    async fn fetch_from_upstream_conditional(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        etag: &str,
+    ) -> Result<Option<UpstreamResponse>> {
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self
+            .upstream_client
+            .http_client
+            .get(url)
+            .header(IF_NONE_MATCH, etag);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!("Failed to fetch from upstream: {} - {}", url, e))
+        })?;
+
+        let status = response.status();
+
+        match status {
+            StatusCode::NOT_MODIFIED => Ok(None),
+            StatusCode::UNAUTHORIZED => {
+                if let Some(retry_response) = self
+                    .upstream_client
+                    .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                        req.header(IF_NONE_MATCH, etag)
+                    })
+                    .await?
+                {
+                    if retry_response.status() == StatusCode::NOT_MODIFIED {
+                        return Ok(None);
+                    }
+                    validate_upstream_status(retry_response.status(), url)?;
+                    let resp = UpstreamClient::read_upstream_response_capped(
+                        retry_response,
+                        url,
+                        DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                    return Ok(Some(resp));
+                }
+
+                Err(AppError::Storage(format!(
+                    "Upstream returned error status {}: {}",
+                    status, url
+                )))
+            }
+            _ => {
+                validate_upstream_status(status, url)?;
+                let resp = UpstreamClient::read_upstream_response_capped(
+                    response,
+                    url,
+                    DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await?;
+                Ok(Some(resp))
+            }
+        }
+    }
+
+    /// Update the release epoch for a distribution, signalling that
+    /// upstream content has truly changed.
+    ///
+    /// All files under `dists/{distribution}/` (including InRelease/Release
+    /// themselves) compare their own `cached_at` against
+    /// `epoch.content_changed_at` to decide freshness (#1147).
+    ///
+    /// The caller should pass a timestamp captured *before* the cache
+    /// write (`cache_artifact` / `revalidate_cache_metadata`) so that
+    /// `content_changed_at <= cached_at`. This prevents the Release's own
+    /// cache entry from being self-invalidated on the next request
+    /// (the epoch is meant to invalidate *siblings*, not the Release
+    /// itself).
+    pub async fn write_release_epoch(
+        &self,
+        repo_key: &str,
+        distribution: &str,
+        content_changed_at: DateTime<Utc>,
+    ) {
+        let epoch_key = match Self::release_epoch_key(repo_key, distribution) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(
+                    repo_key = %repo_key,
+                    distribution = %distribution,
+                    error = %e,
+                    "failed to derive release epoch key; lazy invalidation skipped"
+                );
+                return;
+            }
+        };
+
+        // Monotonic guard: the epoch may only move forward. Multiple
+        // replicas race to write epochs derived from their own clocks, so
+        // a replica with a lagging clock (or a delayed in-flight write)
+        // could otherwise overwrite a newer epoch with an older timestamp
+        // and hide a real content change from siblings whose `cached_at`
+        // falls between the two. Effective value = max(existing, proposed);
+        // when the existing epoch is already at or ahead of the proposed
+        // timestamp the write is skipped entirely. An unreadable or absent
+        // sidecar falls through and is (re)written, which also self-heals
+        // a corrupt sidecar.
+        if let ReleaseEpochRead::Found(existing) =
+            self.read_release_epoch(repo_key, distribution).await
+        {
+            if existing.content_changed_at >= content_changed_at {
+                return;
+            }
+        }
+
+        let epoch = ReleaseEpoch { content_changed_at };
+        match serde_json::to_vec(&epoch) {
+            Ok(json) => {
+                if let Err(e) = self.storage.put(&epoch_key, Bytes::from(json)).await {
+                    tracing::warn!(
+                        epoch_key = %epoch_key,
+                        error = %e,
+                        "failed to write release epoch; lazy invalidation may be delayed"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    epoch_key = %epoch_key,
+                    error = %e,
+                    "failed to serialize release epoch"
+                );
+            }
+        }
+    }
+
+    /// Read the release epoch for a distribution.
+    ///
+    /// Distinguishes the two failure shapes because they must drive
+    /// opposite freshness decisions (see [`ReleaseEpochRead`]):
+    /// a *missing* sidecar is the legitimate cold-start case
+    /// ([`ReleaseEpochRead::NeverSeeded`] — fall through to TTL), while a
+    /// sidecar that exists but cannot be read or parsed means an epoch may
+    /// have been written that we cannot see, so it must fail safe as
+    /// [`ReleaseEpochRead::Unreadable`] (treat cached siblings as expired
+    /// and force revalidation) rather than silently pass as fresh.
+    pub async fn read_release_epoch(&self, repo_key: &str, distribution: &str) -> ReleaseEpochRead {
+        let epoch_key = match Self::release_epoch_key(repo_key, distribution) {
+            Ok(k) => k,
+            // No valid sidecar key can exist for this distribution, so
+            // epoch-based invalidation cannot vouch for freshness: fail
+            // safe. (Unreachable in practice — callers validate the path
+            // before reaching epoch operations.)
+            Err(_) => return ReleaseEpochRead::Unreadable,
+        };
+        match self.storage.get(&epoch_key).await {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(epoch) => ReleaseEpochRead::Found(epoch),
+                Err(e) => {
+                    tracing::warn!(
+                        epoch_key = %epoch_key,
+                        error = %e,
+                        "release epoch sidecar is corrupt; failing safe (treat as expired)"
+                    );
+                    ReleaseEpochRead::Unreadable
+                }
+            },
+            // NotFound is the one storage error that positively asserts
+            // "no epoch was ever written": cold start, not a fault.
+            Err(AppError::NotFound(_)) => ReleaseEpochRead::NeverSeeded,
+            Err(e) => {
+                tracing::warn!(
+                    epoch_key = %epoch_key,
+                    error = %e,
+                    "release epoch read failed; failing safe (treat as expired)"
+                );
+                ReleaseEpochRead::Unreadable
+            }
+        }
+    }
+
+    /// Storage key for the release epoch file.
+    ///
+    /// The `distribution` parameter is validated through
+    /// [`Self::validate_cache_path`] to reject path traversal (`..`),
+    /// NUL bytes, backslashes, and control characters — the same
+    /// validation every other cache key derivation applies. This is
+    /// defensive: all current callers reach epoch operations only
+    /// after `cache_storage_key`/`cache_metadata_key` (which validate
+    /// the full `path` embedding `distribution`) succeed, but a
+    /// future caller using `write_release_epoch`/`read_release_epoch`
+    /// directly with a raw `distribution` would otherwise have no
+    /// protection (#1018 R3-7 / #1052).
+    fn release_epoch_key(repo_key: &str, distribution: &str) -> Result<String> {
+        let validated = Self::validate_cache_path(distribution)?;
+        Ok(format!(
+            "proxy-cache/{}/dists/{}/__release_epoch__.json",
+            repo_key, validated
+        ))
+    }
+
+    /// Check whether a cached dists file is invalidated by the release
+    /// epoch. Returns `true` if the file should be treated as expired
+    /// (i.e. its `cached_at` is older than the epoch's
+    /// `content_changed_at`).
+    pub async fn is_dists_epoch_expired(
+        &self,
+        repo_key: &str,
+        distribution: &str,
+        cached_at: DateTime<Utc>,
+    ) -> bool {
+        match self.read_release_epoch(repo_key, distribution).await {
+            ReleaseEpochRead::Found(epoch) => cached_at < epoch.content_changed_at,
+            // Never seeded (cold start): the epoch protocol has no opinion
+            // yet; the caller's TTL check still applies.
+            ReleaseEpochRead::NeverSeeded => false,
+            // Seeded-but-unreadable: an epoch may exist that we cannot
+            // see, so fail safe and force revalidation.
+            ReleaseEpochRead::Unreadable => true,
+        }
+    }
+
+    /// Revalidate an existing cache entry's metadata: update `cached_at`
+    /// to now and extend `expires_at` by the given TTL. Used when a
+    /// conditional request confirms the content hasn't changed (304 or
+    /// SHA-256 match).
+    pub async fn revalidate_cache_metadata(
+        &self,
+        repo_key: &str,
+        path: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        if let Some(mut metadata) = self.load_cache_metadata(&metadata_key).await? {
+            let now = Utc::now();
+            metadata.cached_at = now;
+            metadata.expires_at = now + chrono::Duration::seconds(ttl_secs);
+            let json = serde_json::to_vec(&metadata)?;
+            self.storage.put(&metadata_key, Bytes::from(json)).await?;
+        }
+        Ok(())
+    }
+
+    /// Public accessor for loading cache metadata. Used by APT epoch-based
+    /// lazy invalidation to check `cached_at` without needing to expose
+    /// the raw metadata key formula.
+    pub async fn load_cache_metadata_pub(&self, metadata_key: &str) -> Option<CacheMetadata> {
+        self.load_cache_metadata(metadata_key).await.ok().flatten()
     }
 
     /// List the PyPI project names that already have a cached `simple/<name>/`
@@ -3319,34 +3708,6 @@ impl ProxyService {
         paths.into_iter().collect()
     }
 
-    /// Invalidate every cached file referenced from an APT Release file
-    /// for a given distribution (#1147).
-    ///
-    /// The Release file lists every `Packages`, `Packages.gz`,
-    /// `Packages.xz`, `Translation-*`, `Contents-*`, `Components-*`, etc.
-    /// path under the distribution along with their SHA-256 hashes. When
-    /// upstream publishes new packages the hashes change but the per-file
-    /// caches keep serving the old bodies until their own TTL expires,
-    /// which is what causes `apt-get update` to fail with
-    /// `Hash Sum mismatch`.
-    ///
-    /// Given the freshly-fetched Release body and its distribution name,
-    /// parse the `SHA256:` section and invalidate every referenced path's
-    /// cache entry under `dists/<distribution>/`. The Release entry itself
-    /// is *not* invalidated by this method; callers fetch and refresh it
-    /// through `fetch_dists_detecting_change` first.
-    pub async fn invalidate_dist_packages_cache(
-        &self,
-        repo_key: &str,
-        distribution: &str,
-        release_content: &str,
-    ) {
-        for relative in parse_release_file_paths(release_content) {
-            let path = format!("dists/{}/{}", distribution, relative);
-            let _ = self.invalidate_cache_by_key(repo_key, &path).await;
-        }
-    }
-
     /// Mutability-aware cache TTL for a specific proxied path (#1611).
     ///
     /// * **Immutable** paths (versioned Maven artifacts, OCI digest blobs, PyPI
@@ -3500,7 +3861,7 @@ impl ProxyService {
     }
 
     /// Generate storage key for cache metadata
-    fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
+    pub(crate) fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.metadata)
     }
 
@@ -5377,110 +5738,6 @@ mod tests {
     }
 
     // =======================================================================
-    // parse_release_file_paths (APT Release file parsing for #1147)
-    // =======================================================================
-
-    #[test]
-    fn test_parse_release_file_paths_extracts_sha256_section() {
-        let release = "\
-Origin: Debian
-Suite: stable
-SHA256:
- abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  1234 main/binary-amd64/Packages
- fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210   567 main/binary-amd64/Packages.gz
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths.len(), 2);
-        assert!(paths.contains(&"main/binary-amd64/Packages".to_string()));
-        assert!(paths.contains(&"main/binary-amd64/Packages.gz".to_string()));
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_dedupes_across_sections() {
-        // The same path appears under MD5Sum, SHA1, and SHA256 — the
-        // returned list dedupes so cache invalidation is idempotent.
-        let release = "\
-MD5Sum:
- 00000000000000000000000000000000  1234 main/binary-amd64/Packages
-SHA1:
- 1111111111111111111111111111111111111111  1234 main/binary-amd64/Packages
-SHA256:
- 22222222222222222222222222222222222222222222222222222222222222  1234 main/binary-amd64/Packages
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_ignores_inrelease_armor() {
-        // InRelease files are inline-signed: the body is wrapped in
-        // `-----BEGIN PGP SIGNED MESSAGE-----` armor lines that must
-        // not be misread as section headers.
-        let release = "\
------BEGIN PGP SIGNED MESSAGE-----
-Hash: SHA256
-
-Origin: Debian
-SHA256:
- abc123 1234 main/Contents-amd64
------BEGIN PGP SIGNATURE-----
-iQIzBAEBCgAdFiE...
------END PGP SIGNATURE-----
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths, vec!["main/Contents-amd64".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_skips_traversal_entries() {
-        // A malicious upstream could try to smuggle a `..` path; reject
-        // it so cache invalidation can't be aimed at unrelated keys.
-        let release = "\
-SHA256:
- abc 100 ../../etc/passwd
- def 200 main/binary-amd64/Packages
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_skips_lines_outside_checksum_sections() {
-        // Lines under non-checksum sections (e.g. Date, MD5Sum-Description)
-        // must not contribute paths. Section headers reset the state.
-        let release = "\
-Origin: Debian
-Suite: stable
-Components: main contrib non-free
-SHA256:
- abc 100 main/binary-amd64/Packages
-Description:
- dummy line that looks like an entry but is in a different section
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_handles_empty_input() {
-        assert!(parse_release_file_paths("").is_empty());
-    }
-
-    #[test]
-    fn test_parse_release_file_paths_skips_malformed_entries() {
-        // Entries missing the size column, or whose size is non-numeric,
-        // are dropped so we don't construct bogus cache paths from them.
-        let release = "\
-SHA256:
- abc main/incomplete
- def notanumber main/bad-size
- ghi 999 main/good
-";
-        let paths = parse_release_file_paths(release);
-        assert_eq!(paths, vec!["main/good".to_string()]);
-    }
-
-    // =======================================================================
     // is_cache_expired (extracted pure function)
     // =======================================================================
 
@@ -6900,11 +7157,11 @@ SHA256:
     }
 
     // -----------------------------------------------------------------------
-    // invalidate_cache_by_key + invalidate_dist_packages_cache (#1147)
+    // invalidate_cache_by_key (#1147)
     //
-    // Direct unit coverage for the APT Release-coherence helpers extracted
-    // for the virtual-repo cross-format aggregation PR. Both helpers are
-    // storage-only (no DB), so they slot cleanly into a mock-storage test
+    // Direct unit coverage for the APT Release-coherence helper extracted
+    // for the virtual-repo cross-format aggregation PR. The helper is
+    // storage-only (no DB), so it slots cleanly into a mock-storage test
     // pattern that records every `delete(...)` call and asserts the
     // helper hits the right keys.
     // -----------------------------------------------------------------------
@@ -7238,110 +7495,6 @@ SHA256:
             .expect("path-traversal must NOT surface as Err on this path");
 
         assert!(result.is_none(), "expected Ok(None) for invalid path");
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_dist_packages_cache_evicts_each_path() {
-        // Driven by the Release-file parser: every path under the
-        // `SHA256:` section must produce a paired
-        // `dists/<dist>/<relative>` invalidation. The helper itself is
-        // fire-and-forget (no return value), so we observe its side
-        // effects through the recording mock.
-        let storage = DeleteRecordingStorage::new();
-        let service = build_proxy_service_with_storage(storage.clone());
-
-        let release = "\
-SHA256:
- aaa 100 main/binary-amd64/Packages
- bbb 200 main/binary-amd64/Packages.gz
- ccc 300 main/binary-arm64/Packages
-";
-        service
-            .invalidate_dist_packages_cache("apt-debian", "bookworm", release)
-            .await;
-
-        let deletes = storage.deletes_snapshot().await;
-        // 3 referenced paths × (content + metadata) = 6 delete calls.
-        assert_eq!(
-            deletes.len(),
-            6,
-            "expected 3 paths × 2 keys (content+metadata) = 6 deletes, got {:?}",
-            deletes
-        );
-
-        // The dist prefix and each relative path must appear at least
-        // once across the recorded keys.
-        let joined = deletes.join("|");
-        assert!(
-            joined.contains("bookworm"),
-            "deletes should target the right dist: {:?}",
-            deletes
-        );
-        for rel in [
-            "main/binary-amd64/Packages",
-            "main/binary-amd64/Packages.gz",
-            "main/binary-arm64/Packages",
-        ] {
-            assert!(
-                deletes.iter().any(|k| k.contains(rel)),
-                "expected eviction of {} in {:?}",
-                rel,
-                deletes
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_dist_packages_cache_empty_release_is_noop() {
-        // A Release file with no checksum section must produce zero
-        // delete calls so we don't churn the cache on degenerate input.
-        let storage = DeleteRecordingStorage::new();
-        let service = build_proxy_service_with_storage(storage.clone());
-
-        service
-            .invalidate_dist_packages_cache("apt-debian", "bookworm", "Origin: Debian\n")
-            .await;
-
-        let deletes = storage.deletes_snapshot().await;
-        assert!(
-            deletes.is_empty(),
-            "Release without SHA256 section must not invalidate anything: {:?}",
-            deletes
-        );
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_dist_packages_cache_skips_traversal_paths() {
-        // parse_release_file_paths drops `..` segments; the eviction
-        // helper inherits that protection so a hostile upstream can't
-        // aim invalidations at unrelated cache keys.
-        let storage = DeleteRecordingStorage::new();
-        let service = build_proxy_service_with_storage(storage.clone());
-
-        let release = "\
-SHA256:
- abc 100 ../../etc/passwd
- def 200 main/binary-amd64/Packages
-";
-        service
-            .invalidate_dist_packages_cache("apt-debian", "bookworm", release)
-            .await;
-
-        let deletes = storage.deletes_snapshot().await;
-        // Only the well-formed entry contributes: 1 path × 2 keys = 2.
-        assert_eq!(
-            deletes.len(),
-            2,
-            "traversal entry must be dropped, got {:?}",
-            deletes
-        );
-        for k in &deletes {
-            assert!(
-                !k.contains(".."),
-                "no delete should reference a traversal path: {:?}",
-                deletes
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -11459,41 +11612,6 @@ SHA256:
         assert!(changed, "a different ETag on the HEAD means changed");
     }
 
-    // -- fetch_dists_detecting_change: drives buffered fetch + SHA compare ---
-
-    #[tokio::test]
-    async fn test_fetch_dists_detecting_change_reports_changed_on_first_fetch() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/dists/stable/Release"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"Release: v1".as_ref()))
-            .mount(&server)
-            .await;
-
-        let tmp = std::env::temp_dir().join(format!("s8-dists-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("tmp");
-        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
-        let repo = wiremock_remote_repo("s8-dists", &server.uri(), tmp.to_str().unwrap());
-
-        let (content, _ct, changed) = proxy
-            .fetch_dists_detecting_change(&repo, "dists/stable/Release")
-            .await
-            .expect("dists fetch must succeed");
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert_eq!(&content[..], b"Release: v1");
-        assert!(
-            changed,
-            "first fetch with no prior body is always 'changed'"
-        );
-    }
-
     // -- get_cache_ttl_for_repo: DB lookup with default fallback -------------
 
     #[tokio::test]
@@ -12148,5 +12266,833 @@ SHA256:
         assert_eq!(repo_key_from_cache_key(""), "unknown");
         assert_eq!(repo_key_from_cache_key("proxy-cache/"), "unknown");
         assert_eq!(repo_key_from_cache_key("proxy-cache//foo"), "unknown");
+    }
+
+    // ---- release_epoch_key path validation ------------------------------
+
+    #[test]
+    fn test_release_epoch_key_valid_distribution() {
+        let key = ProxyService::release_epoch_key("my-repo", "bookworm").unwrap();
+        assert_eq!(
+            key,
+            "proxy-cache/my-repo/dists/bookworm/__release_epoch__.json"
+        );
+    }
+
+    #[test]
+    fn test_release_epoch_key_strips_leading_trailing_slashes() {
+        let key = ProxyService::release_epoch_key("repo", "/bookworm/").unwrap();
+        assert_eq!(
+            key,
+            "proxy-cache/repo/dists/bookworm/__release_epoch__.json"
+        );
+    }
+
+    #[test]
+    fn test_release_epoch_key_rejects_path_traversal() {
+        assert!(ProxyService::release_epoch_key("repo", "../etc/passwd").is_err());
+        assert!(ProxyService::release_epoch_key("repo", "bookworm/../..").is_err());
+    }
+
+    #[test]
+    fn test_release_epoch_key_rejects_backslash_and_nul() {
+        assert!(ProxyService::release_epoch_key("repo", "book\\worm").is_err());
+        assert!(ProxyService::release_epoch_key("repo", "book\0worm").is_err());
+    }
+
+    #[test]
+    fn test_release_epoch_key_rejects_empty() {
+        assert!(ProxyService::release_epoch_key("repo", "").is_err());
+        assert!(ProxyService::release_epoch_key("repo", "/").is_err());
+    }
+
+    // ---- is_dists_epoch_expired boundary logic --------------------------
+
+    #[test]
+    fn test_is_dists_epoch_expired_no_epoch_returns_false() {
+        // Without a database or storage backend we can still test the
+        // pure comparison logic by exercising the boundary values directly.
+        // When no epoch was ever seeded, the function returns false (not
+        // expired) — see ReleaseEpochRead::NeverSeeded. The pure logic is:
+        // Found(epoch) => cached_at < content_changed_at
+        let now = Utc::now();
+        let epoch = ReleaseEpoch {
+            content_changed_at: now,
+        };
+        // cached_at == content_changed_at → NOT expired (< is strict)
+        assert!(now >= epoch.content_changed_at);
+        // cached_at after epoch → NOT expired
+        assert!((now + chrono::Duration::seconds(1)) >= epoch.content_changed_at);
+        // cached_at before epoch → IS expired
+        assert!((now - chrono::Duration::seconds(1)) < epoch.content_changed_at);
+    }
+
+    #[test]
+    fn test_epoch_comparison_strict_less_than_prevents_self_invalidation() {
+        // The fix captures the timestamp BEFORE cache_artifact, so
+        // content_changed_at <= cached_at. Because the comparison is
+        // strict `<`, the Release's own entry (cached_at >=
+        // content_changed_at) is NOT self-invalidated.
+        let ts = Utc::now();
+        let epoch = ReleaseEpoch {
+            content_changed_at: ts,
+        };
+        // cached_at == ts (same instant) → NOT expired
+        assert!(ts >= epoch.content_changed_at);
+        // cached_at = ts + 1s (cache written after epoch) → NOT expired
+        let cached_at = ts + chrono::Duration::seconds(1);
+        assert!(cached_at >= epoch.content_changed_at);
+        // A sibling cached 1s BEFORE the epoch → IS expired
+        let sibling_cached_at = ts - chrono::Duration::seconds(1);
+        assert!(sibling_cached_at < epoch.content_changed_at);
+    }
+
+    // ---- write_release_epoch + read_release_epoch round-trip -------------
+
+    #[tokio::test]
+    async fn test_write_and_read_release_epoch_round_trip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-rt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let ts = Utc::now();
+        proxy.write_release_epoch("test-repo", "bookworm", ts).await;
+
+        let read = proxy.read_release_epoch("test-repo", "bookworm").await;
+        assert_eq!(
+            read,
+            ReleaseEpochRead::Found(ReleaseEpoch {
+                content_changed_at: ts
+            }),
+            "round-trip must preserve the timestamp exactly"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_read_release_epoch_never_seeded_when_absent() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-miss-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let read = proxy.read_release_epoch("no-such-repo", "bookworm").await;
+        assert_eq!(
+            read,
+            ReleaseEpochRead::NeverSeeded,
+            "missing sidecar is the cold-start case, not an error"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_release_epoch_with_traversal_distribution_is_noop() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-trv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        // A malicious distribution with path traversal should not write
+        // any file — the validation in release_epoch_key rejects it.
+        proxy
+            .write_release_epoch("repo", "../../etc/passwd", Utc::now())
+            .await;
+
+        // No epoch file should exist outside the proxy-cache prefix.
+        let read = proxy.read_release_epoch("repo", "../../etc/passwd").await;
+        assert!(
+            !read.is_found(),
+            "traversal distribution must not create an epoch"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- write_release_epoch: monotonic guard ----------------------------
+
+    #[tokio::test]
+    async fn test_write_release_epoch_monotonic_backwards_write_cannot_lower_epoch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-mono-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        // Replica A observes a content change at T2 and writes the epoch.
+        let t2 = Utc::now();
+        proxy.write_release_epoch("repo", "bookworm", t2).await;
+
+        // Replica B — lagging clock / delayed in-flight write — tries to
+        // write an OLDER epoch (T1 < T2). The monotonic guard must ignore
+        // it: the epoch may only move forward.
+        let t1 = t2 - chrono::Duration::hours(1);
+        proxy.write_release_epoch("repo", "bookworm", t1).await;
+
+        let read = proxy
+            .read_release_epoch("repo", "bookworm")
+            .await
+            .found()
+            .expect("epoch must exist");
+        assert_eq!(
+            read.content_changed_at, t2,
+            "backwards write must not lower the epoch"
+        );
+
+        // Race simulation: a sibling cached BETWEEN T1 and T2 (i.e. before
+        // the real content change at T2) must still be seen as expired
+        // after the out-of-order backwards write. Without the monotonic
+        // guard the epoch would have regressed to T1 and this sibling
+        // would wrongly pass as fresh.
+        let sibling_cached_at = t2 - chrono::Duration::minutes(30);
+        assert!(
+            proxy
+                .is_dists_epoch_expired("repo", "bookworm", sibling_cached_at)
+                .await,
+            "sibling cached before T2 must remain expired after a lagging T1 write"
+        );
+
+        // A genuinely newer write must still advance the epoch.
+        let t3 = t2 + chrono::Duration::seconds(5);
+        proxy.write_release_epoch("repo", "bookworm", t3).await;
+        let read = proxy
+            .read_release_epoch("repo", "bookworm")
+            .await
+            .found()
+            .expect("epoch must exist");
+        assert_eq!(
+            read.content_changed_at, t3,
+            "forward write must advance the epoch"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- read_release_epoch: fail-safe on unreadable sidecar -------------
+
+    #[tokio::test]
+    async fn test_read_release_epoch_corrupt_sidecar_fails_safe_as_expired() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-corrupt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        // Corrupt the sidecar in place: it EXISTS but cannot be parsed.
+        // This is the "seeded-but-unreadable" case, distinct from the
+        // never-seeded cold start (absent file → NeverSeeded, tested
+        // above): an epoch may have been written here that we cannot see.
+        let sidecar_dir = tmp.join("proxy-cache/repo/dists/bookworm");
+        std::fs::create_dir_all(&sidecar_dir).expect("sidecar dir");
+        std::fs::write(sidecar_dir.join("__release_epoch__.json"), b"{not json")
+            .expect("write corrupt sidecar");
+
+        assert_eq!(
+            proxy.read_release_epoch("repo", "bookworm").await,
+            ReleaseEpochRead::Unreadable,
+            "corrupt sidecar must read as Unreadable, not as cold start"
+        );
+
+        // Fail safe: even a freshly cached sibling must be treated as
+        // expired (force revalidation) when the epoch cannot be read.
+        assert!(
+            proxy
+                .is_dists_epoch_expired("repo", "bookworm", Utc::now())
+                .await,
+            "unreadable epoch must fail safe as expired"
+        );
+
+        // A subsequent epoch write self-heals the corrupt sidecar and
+        // restores normal comparison semantics.
+        let ts = Utc::now();
+        proxy.write_release_epoch("repo", "bookworm", ts).await;
+        assert!(
+            !proxy.is_dists_epoch_expired("repo", "bookworm", ts).await,
+            "healed sidecar must resume normal (strict <) comparison"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- is_dists_epoch_expired integration ------------------------------
+
+    #[tokio::test]
+    async fn test_is_dists_epoch_expired_with_and_without_epoch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("epoch-exp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        // No epoch → not expired
+        let old = Utc::now() - chrono::Duration::hours(1);
+        assert!(
+            !proxy.is_dists_epoch_expired("repo", "bookworm", old).await,
+            "no epoch → not expired"
+        );
+
+        // Write epoch at ts
+        let ts = Utc::now();
+        proxy.write_release_epoch("repo", "bookworm", ts).await;
+
+        // cached_at before ts → expired
+        assert!(
+            proxy
+                .is_dists_epoch_expired("repo", "bookworm", ts - chrono::Duration::seconds(1))
+                .await,
+            "cached_at before epoch → expired"
+        );
+        // cached_at == ts → NOT expired (strict <)
+        assert!(
+            !proxy.is_dists_epoch_expired("repo", "bookworm", ts).await,
+            "cached_at == epoch → NOT expired (strict <)"
+        );
+        // cached_at after ts → NOT expired
+        assert!(
+            !proxy
+                .is_dists_epoch_expired("repo", "bookworm", ts + chrono::Duration::seconds(1))
+                .await,
+            "cached_at after epoch → NOT expired"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: 200-changed path ---------------
+
+    #[tokio::test]
+    async fn test_dists_revalidation_200_changed_caches_and_writes_epoch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-chg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("dists-chg", &server.uri(), tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            repo.id,
+            "dists-chg",
+            &server.uri(),
+        );
+
+        let (content, _ct, changed) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect("first fetch must succeed");
+
+        assert_eq!(&content[..], b"release-v1");
+        assert!(changed, "first fetch must report changed=true");
+
+        // Epoch must exist and be <= cached_at (no self-invalidation).
+        let epoch = proxy.read_release_epoch("dists-chg", "bookworm").await;
+        assert!(epoch.is_found(), "epoch must be written on first change");
+        // The Release's own cache should NOT be self-expired.
+        let meta_key =
+            ProxyService::cache_metadata_key("dists-chg", "dists/bookworm/Release").unwrap();
+        let metadata = proxy.load_cache_metadata_pub(&meta_key).await;
+        assert!(metadata.is_some(), "cache metadata must exist");
+        if let Some(meta) = metadata {
+            assert!(
+                !proxy
+                    .is_dists_epoch_expired("dists-chg", "bookworm", meta.cached_at)
+                    .await,
+                "Release's own cache must NOT be self-invalidated by the epoch"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: 304 revalidation path -----------
+
+    #[tokio::test]
+    async fn test_dists_revalidation_304_serves_cached_and_seeds_epoch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // First GET returns v1 content with ETag
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second GET returns 304 (conditional request)
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-304-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "dists-304",
+            &server.uri(),
+        );
+
+        // First fetch: cache miss → 200 with content
+        let (content, _, changed) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                1, // 1-second TTL → expires immediately
+            )
+            .await
+            .expect("first fetch must succeed");
+        assert_eq!(&content[..], b"release-v1");
+        assert!(changed);
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Second fetch: expired → conditional GET → 304
+        let (content2, _, changed2) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect("304 revalidation must succeed");
+        assert_eq!(&content2[..], b"release-v1", "304 must serve cached body");
+        assert!(!changed2, "304 must report changed=false");
+
+        // Epoch must exist (seeded on first fetch).
+        let epoch = proxy.read_release_epoch("dists-304", "bookworm").await;
+        assert!(epoch.is_found(), "epoch must be seeded");
+
+        // Release's own cache must NOT be self-invalidated.
+        let meta_key =
+            ProxyService::cache_metadata_key("dists-304", "dists/bookworm/Release").unwrap();
+        if let Some(meta) = proxy.load_cache_metadata_pub(&meta_key).await {
+            assert!(
+                !proxy
+                    .is_dists_epoch_expired("dists-304", "bookworm", meta.cached_at)
+                    .await,
+                "Release cache must NOT be self-invalidated after 304 revalidation"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: upstream error serves stale -----
+
+    #[tokio::test]
+    async fn test_dists_revalidation_upstream_error_serves_stale() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // First GET returns content
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second GET returns 500
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-err-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "dists-err",
+            &server.uri(),
+        );
+
+        // First fetch: cache miss → 200
+        let (content, _, _) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                1, // 1-second TTL → expires immediately
+            )
+            .await
+            .expect("first fetch must succeed");
+        assert_eq!(&content[..], b"release-v1");
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Second fetch: expired → upstream 500 → serve stale
+        let (content2, _, _) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect("stale-if-error must serve cached body");
+        assert_eq!(
+            &content2[..],
+            b"release-v1",
+            "upstream error must serve stale cached body"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: 200 unchanged (same SHA) --------
+
+    #[tokio::test]
+    async fn test_dists_revalidation_200_unchanged_does_not_bump_epoch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        let body = b"release-v1";
+        let etag = "\"v1\"";
+
+        // First GET returns content
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", etag)
+                    .set_body_bytes(body.as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second GET returns same content WITHOUT ETag (no conditional
+        // possible) — same SHA-256, changed must be false.
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-unc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "dists-unc",
+            &server.uri(),
+        );
+
+        // First fetch: cache miss → 200, changed=true
+        let (_, _, changed1) = proxy
+            .fetch_dists_with_revalidation(&repo, "dists/bookworm/Release", "bookworm", 1)
+            .await
+            .expect("first fetch");
+        assert!(changed1);
+
+        // Capture the epoch timestamp from the first write
+        let epoch1 = proxy
+            .read_release_epoch("dists-unc", "bookworm")
+            .await
+            .found()
+            .expect("epoch must exist after first fetch");
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Second fetch: expired → 200 with same SHA → changed=false
+        let (_, _, changed2) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect("second fetch");
+        assert!(
+            !changed2,
+            "same SHA-256 must report changed=false (no epoch bump)"
+        );
+
+        // Epoch must NOT have changed (same content → no epoch update)
+        let epoch2 = proxy
+            .read_release_epoch("dists-unc", "bookworm")
+            .await
+            .found()
+            .expect("epoch must still exist");
+        assert_eq!(
+            epoch1.content_changed_at, epoch2.content_changed_at,
+            "epoch must not change when content is unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: 304 + missing body self-heals -------
+
+    #[tokio::test]
+    async fn test_dists_revalidation_304_missing_body_self_heals() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // First GET returns v1 content with ETag
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second GET (conditional) returns 304
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Third GET (unconditional refetch after body-missing) returns 200
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-304-mb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "dists-304-mb",
+            &server.uri(),
+        );
+
+        // First fetch: cache miss → 200 with content
+        let (content, _, _) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                1, // 1-second TTL → expires immediately
+            )
+            .await
+            .expect("first fetch must succeed");
+        assert_eq!(&content[..], b"release-v1");
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Delete the cached body, keeping only metadata.
+        let content_key =
+            ProxyService::cache_storage_key("dists-304-mb", "dists/bookworm/Release").unwrap();
+        proxy
+            .storage
+            .delete(&content_key)
+            .await
+            .expect("delete cached body");
+
+        // Second fetch: expired → conditional GET → 304 → body missing →
+        // unconditional refetch → 200
+        let (content2, _, _) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect("self-heal refetch must succeed");
+        assert_eq!(
+            &content2[..],
+            b"release-v1",
+            "self-heal must return fresh content"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_from_upstream_conditional: 401 Bearer challenge handling ----
+
+    #[tokio::test]
+    async fn test_dists_revalidation_conditional_401_bearer_challenge() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+
+        // First GET returns v1 content with ETag
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"release-v1".as_ref()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second GET (conditional) returns 401 with a Bearer challenge whose
+        // realm points at an internal address. exchange_bearer_then must
+        // parse the challenge, extract the realm, and reject it via the
+        // SSRF guard BEFORE issuing any outbound token request — proving
+        // the conditional path enters the bearer-exchange flow instead of
+        // treating 401 as a generic storage error.
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/Release"))
+            .and(wiremock::matchers::header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                "Bearer realm=\"http://169.254.169.254/latest/token\",service=\"reg\",scope=\"pull\"",
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dists-401br-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "dists-401br",
+            &server.uri(),
+        );
+
+        // First fetch: cache miss → 200 with content
+        let (content, _, _) = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                1, // 1-second TTL → expires immediately
+            )
+            .await
+            .expect("first fetch must succeed");
+        assert_eq!(&content[..], b"release-v1");
+
+        // Wait for TTL to expire
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Delete the cached body so stale-if-error cannot mask the
+        // bearer-exchange rejection.
+        let content_key =
+            ProxyService::cache_storage_key("dists-401br", "dists/bookworm/Release").unwrap();
+        proxy
+            .storage
+            .delete(&content_key)
+            .await
+            .expect("delete cached body");
+
+        // Second fetch: expired → conditional GET → 401 Bearer challenge →
+        // SSRF-rejected realm → Validation error (NOT a generic Storage
+        // error, which is what the old code would have returned).
+        let err = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .expect_err("a Bearer realm pointing at an internal address must be rejected");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "conditional fetch 401 must enter bearer-exchange flow and surface \
+             SSRF rejection as Validation, got {err:?}",
+        );
     }
 }

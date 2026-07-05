@@ -206,6 +206,15 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // immutable.
         RepositoryFormat::Cargo => classify_cargo(&lower),
 
+        // -- Debian / APT ---------------------------------------------------
+        // by-hash indices are content-addressed (hash in URL). pool/ packages
+        // are version-pinned per the Debian Repository Format spec ("A
+        // repository must not include different packages (different content)
+        // with the same package name, version, and architecture"). dists/
+        // index files (Release, Packages, Sources, Translation, Contents) are
+        // rewritten in place by upstream.
+        RepositoryFormat::Debian => classify_debian(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -251,7 +260,8 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         | RepositoryFormat::Oras
         | RepositoryFormat::WasmOci
         | RepositoryFormat::HelmOci
-        | RepositoryFormat::Cargo => !classify(format, &lower).is_immutable(),
+        | RepositoryFormat::Cargo
+        | RepositoryFormat::Debian => !classify(format, &lower).is_immutable(),
 
         // Conan revision-file coordinates
         // (`.../revisions/{rev}/files/{file}`) are legitimately rewritten in
@@ -263,7 +273,7 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
-        // Default-format families (Generic, Nuget, Composer, Go, Rpm, Debian,
+        // Default-format families (Generic, Nuget, Composer, Go, Rpm,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate.
         _ => false,
@@ -362,6 +372,29 @@ fn classify_cargo(lower: &str) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// Debian §2.1: by-hash indices and pool/ packages are immutable; dists/
+/// index files are mutable.
+///
+/// See <https://wiki.debian.org/DebianRepository/Format>:
+/// - **by-hash**: The hash is part of the URL path, making the file
+///   content-addressed. A content change produces a different URL.
+/// - **pool/**: The Debian Repository Format spec mandates "A repository must
+///   not include different packages (different content) with the same package
+///   name, version, and architecture." The path encodes name+version+arch, so
+///   content is pinned. Covers `.deb`, `.udeb`, `.dsc`, `.orig.tar.*`,
+///   `.debian.tar.*`.
+/// - **dists/**: Release, InRelease, Packages, Sources, Translation, Contents,
+///   dep11, etc. are rewritten in place by upstream on each publish.
+fn classify_debian(lower: &str) -> Mutability {
+    if lower.contains("/by-hash/") {
+        return Mutability::Immutable;
+    }
+    if lower.starts_with("pool/") || lower.contains("/pool/") {
+        return Mutability::Immutable;
+    }
+    Mutability::mutable_default()
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -426,9 +459,23 @@ mod tests {
             &Conan,
             "relib/1.0/_/_/revisions/rev1/files/conanfile.py"
         ));
+        // Debian: dists/ indices are mutable indexes; pool/ and by-hash/
+        // artifacts are protected release coordinates.
+        assert!(is_explicitly_mutable_index(
+            &Debian,
+            "dists/bookworm/main/binary-amd64/Packages"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Debian,
+            "pool/main/a/apt/apt_2.5.3_amd64.deb"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Debian,
+            "dists/bookworm/by-hash/SHA256/abc123def"
+        ));
         // Default-format families have NO in-place index at a coordinate; every
         // stored path is a release coordinate -> always false (protected).
-        for f in [Generic, Nuget, Composer, Go, Rpm, Debian, Helm] {
+        for f in [Generic, Nuget, Composer, Go, Rpm, Helm] {
             assert!(
                 !is_explicitly_mutable_index(&f, "anything/1.0.0/file.bin"),
                 "{f:?} coordinates must be treated as release coordinates"
@@ -507,6 +554,29 @@ mod tests {
             // A segment that merely ends in `crates` must not be mistaken for
             // the crate store via a loose substring match: revalidate.
             (Cargo, "mycrates/serde-1.0.0.crate", false),
+            // Debian: by-hash and pool immutable; dists indices mutable.
+            (Debian, "dists/bookworm/by-hash/SHA256/abc123def456", true),
+            (
+                Debian,
+                "dists/bookworm/main/binary-amd64/by-hash/SHA256/abc",
+                true,
+            ),
+            (Debian, "pool/main/a/apt/apt_2.5.3_amd64.deb", true),
+            (Debian, "pool/main/a/apt/apt_2.5.3.dsc", true),
+            (Debian, "pool/main/a/apt/apt_2.5.3.orig.tar.xz", true),
+            (Debian, "pool/main/a/apt/apt_2.5.3.debian.tar.xz", true),
+            (Debian, "dists/bookworm/InRelease", false),
+            (Debian, "dists/bookworm/Release", false),
+            (Debian, "dists/bookworm/Release.gpg", false),
+            (Debian, "dists/bookworm/main/binary-amd64/Packages", false),
+            (
+                Debian,
+                "dists/bookworm/main/binary-amd64/Packages.gz",
+                false,
+            ),
+            (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
+            (Debian, "dists/bookworm/main/source/Sources.xz", false),
+            (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),

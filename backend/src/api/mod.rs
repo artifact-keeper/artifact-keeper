@@ -80,13 +80,13 @@ pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
 /// on every refresh. Caching by content hash means the signature is reused
 /// across requests until the underlying Release content actually changes,
 /// at which point the cache key naturally rotates. The `(repo_key,
-/// distribution) -> set of cache keys` reverse index lets the change-detect
+/// distribution) -> set of cache keys` reverse index lets the revalidation
 /// path purge stale entries when an upstream Release flip is detected
-/// (mirroring how sibling Packages caches are invalidated for #1147).
+/// (mirroring the epoch-based lazy invalidation for #1147).
 pub type SignedReleaseCache = Arc<RwLock<HashMap<String, Bytes>>>;
 
 /// Reverse index from (repo_key, distribution) to the set of cache keys
-/// installed under that scope. Lets the change-detect path drop just the
+/// installed under that scope. Lets the revalidation path drop just the
 /// signed-Release entries that belong to the changed distribution without
 /// scanning the entire cache.
 pub type SignedReleaseCacheIndex = Arc<RwLock<HashMap<(String, String), Vec<String>>>>;
@@ -134,7 +134,7 @@ pub struct AppState {
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
     pub signed_release_cache: SignedReleaseCache,
-    /// Reverse index for `signed_release_cache` so the change-detect path
+    /// Reverse index for `signed_release_cache` so the revalidation path
     /// can evict just the entries belonging to a specific
     /// `(repo_key, distribution)` when the underlying Release flips.
     pub signed_release_cache_index: SignedReleaseCacheIndex,
