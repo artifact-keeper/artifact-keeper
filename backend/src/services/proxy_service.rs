@@ -11173,20 +11173,16 @@ SHA256:
         }
         assert_eq!(collected, b"wheel-body");
 
-        // The tee writes the cache in a background task after the client
-        // stream drains; poll briefly for the content object to land.
+        // The tee commits the cache (content object, then sidecar) on a
+        // background task after the client stream drains. Wait for the full
+        // commit rather than the content file's existence: reading on first
+        // sight can observe a created-but-unwritten file and collect 0 bytes.
+        tdh::wait_for_cache_commit(&tmp, collected.len() as u64).await;
         let content_rel = CacheKeys::derive("pypi-split", cache_path)
             .expect("derive")
             .content;
         let content_file = tmp.join(&content_rel);
-        let mut cached = Vec::new();
-        for _ in 0..50 {
-            if let Ok(bytes) = std::fs::read(&content_file) {
-                cached = bytes;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let cached = std::fs::read(&content_file).unwrap_or_default();
         assert_eq!(
             cached, b"wheel-body",
             "cache body must land under the cache_path-derived key"

@@ -485,7 +485,11 @@ fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
 }
 
 /// Poll `dir` until the proxy streaming write-back has fully COMMITTED a
-/// cache entry of at least `min_size` bytes, or panic after ~10s.
+/// cache entry of at least `min_size` bytes, or panic after ~60s. The budget
+/// must absorb worst-case parallel-run latency: the tee's ETag pin and
+/// sidecar write sit behind the same runtime and DB pool as every other
+/// concurrent test, and pool acquire alone is allowed 30s. A ~10s budget
+/// expired spuriously at 16 coverage test threads.
 ///
 /// The tee (`ProxyService::tee_stream`) commits in three ordered steps:
 /// content object (`{base}__content__`), storage-ETag pin (a backend HEAD),
@@ -496,7 +500,7 @@ fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
 /// parallel test load. This waits for the matching sidecar as well — the
 /// same commit marker the production hit path requires.
 pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
-    for _ in 0..400 {
+    for _ in 0..2400 {
         if committed_cache_entry_exists(dir, min_size) {
             return;
         }
