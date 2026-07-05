@@ -5507,12 +5507,26 @@ mod tests {
         .await
         .expect("insert fresh user");
 
-        // Token iat_ms captured AFTER the INSERT, in the same wall-clock second
-        // as user creation. In production this is `POST /users` followed
-        // immediately by `POST /auth/login`. With full-ms watermarks the login
-        // is strictly later than `password_changed_at DEFAULT NOW()`, so its
-        // `iat_ms` exceeds the creation watermark and is accepted.
-        let iat_same_second_ms = Utc::now().timestamp_millis();
+        // Token iat_ms one millisecond AFTER the creation watermark — the
+        // "created then immediately logged in" production scenario. Derive it
+        // from the DB's own clock rather than `Utc::now()`: the watermark is
+        // stamped by Postgres (DEFAULT NOW()) while the app clock lives on
+        // another node in CI, and millisecond NTP skew (DB ahead) made the
+        // app-clock capture land BEFORE the watermark intermittently. Single
+        // clock domain makes the strictly-after premise deterministic while
+        // still guarding the #1248 strict-< comparator this test exists for.
+        let (watermark_ms,): (i64,) = sqlx::query_as(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM GREATEST( \
+                 password_changed_at, \
+                 COALESCE(totp_verified_at, password_changed_at), \
+                 privileges_changed_at \
+             )) * 1000)::BIGINT FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch creation watermark");
+        let iat_same_second_ms = watermark_ms + 1;
         let rejected = is_token_invalidated_replica_safe(&pool, id, iat_same_second_ms)
             .await
             .expect("DB check must succeed");
