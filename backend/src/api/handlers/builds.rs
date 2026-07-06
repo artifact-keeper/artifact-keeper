@@ -160,14 +160,19 @@ pub struct BuildListResponse {
     context_path = "/api/v1/builds",
     tag = "builds",
     params(ListBuildsQuery),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "List of builds", body = BuildListResponse),
+        (status = 401, description = "Authentication required"),
     )
 )]
 pub async fn list_builds(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListBuildsQuery>,
 ) -> Result<Json<BuildListResponse>> {
+    let _auth = require_auth(auth)?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -261,15 +266,20 @@ pub async fn list_builds(
     params(
         ("id" = Uuid, Path, description = "Build ID"),
     ),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Build details", body = BuildResponse),
+        (status = 401, description = "Authentication required"),
         (status = 404, description = "Build not found"),
     )
 )]
 pub async fn get_build(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BuildResponse>> {
+    let _auth = require_auth(auth)?;
+
     // Check if builds table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'builds')",
@@ -331,14 +341,19 @@ pub struct BuildDiffResponse {
     context_path = "/api/v1/builds",
     tag = "builds",
     params(BuildDiffQuery),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Diff between two builds", body = BuildDiffResponse),
+        (status = 401, description = "Authentication required"),
     )
 )]
 pub async fn get_build_diff(
     State(_state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<BuildDiffQuery>,
 ) -> Result<Json<BuildDiffResponse>> {
+    let _auth = require_auth(auth)?;
+
     // For now, return empty diff - this would require build_artifacts table
     Ok(Json(BuildDiffResponse {
         build_a: query.build_a,
@@ -603,6 +618,105 @@ mod tests {
             "Expected 'Authentication required' in error: {}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-endpoint auth-gate tests
+    //
+    // Mirrors the guard behaviour of the sibling write handlers: anonymous
+    // (None) callers must be rejected with an Authentication error before any
+    // database access, while an authenticated caller is admitted. The auth
+    // check runs first, so a lazily-connected (never-dialed) pool is enough to
+    // exercise the anon path without a live database.
+    // -----------------------------------------------------------------------
+
+    fn test_state() -> crate::api::SharedState {
+        use std::sync::Arc;
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new("/tmp/test-builds"),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(crate::api::AppState::new(
+            crate::config::Config::test_config(),
+            pool,
+            storage,
+            registry,
+        ))
+    }
+
+    fn sample_auth() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "builder".to_string(),
+            email: "builder@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_builds_rejects_anonymous() {
+        let state = test_state();
+        let query = ListBuildsQuery {
+            page: None,
+            per_page: None,
+            status: None,
+            search: None,
+            sort_by: None,
+            sort_order: None,
+        };
+        let err = list_builds(State(state), Extension(None), Query(query))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_build_rejects_anonymous() {
+        let state = test_state();
+        let err = get_build(State(state), Extension(None), Path(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_build_diff_rejects_anonymous() {
+        let state = test_state();
+        let query = BuildDiffQuery {
+            build_a: Uuid::new_v4(),
+            build_b: Uuid::new_v4(),
+        };
+        let err = get_build_diff(State(state), Extension(None), Query(query))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_build_diff_allows_authenticated() {
+        // get_build_diff performs no database access, so an authenticated call
+        // exercises the full success path and returns an (empty) diff.
+        let state = test_state();
+        let build_a = Uuid::new_v4();
+        let build_b = Uuid::new_v4();
+        let query = BuildDiffQuery { build_a, build_b };
+        let resp = get_build_diff(State(state), Extension(Some(sample_auth())), Query(query))
+            .await
+            .expect("authenticated diff should succeed");
+        assert_eq!(resp.0.build_a, build_a);
+        assert_eq!(resp.0.build_b, build_b);
+        assert!(resp.0.added.is_empty());
+        assert!(resp.0.removed.is_empty());
+        assert!(resp.0.modified.is_empty());
     }
 
     // -----------------------------------------------------------------------
