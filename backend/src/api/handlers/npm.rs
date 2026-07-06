@@ -256,13 +256,12 @@ async fn get_package_metadata_cached(
                 let repo_key = repo_key.to_string();
                 let package_name = package_name.to_string();
                 let base_url = base_url.to_string();
-                let flight = flight.clone();
                 tokio::spawn(async move {
                     // The claim dedups a stale burst within this process; the
                     // cross-replica lease inside `refresh_under_lease` dedups
                     // it across replicas sharing a cache backend (#2248).
                     let refreshed = cache
-                        .refresh_under_lease(claim, &flight, || {
+                        .refresh_under_lease(claim, || {
                             compute_and_store_packument(
                                 &state,
                                 &cache,
@@ -6011,12 +6010,17 @@ mod db_cov_tests {
 
     /// Backend wrapper reporting the cross-replica refresh lease as held by
     /// another replica (#2248), storage delegated to a real in-process map.
-    struct LeaseDeniedBackend(crate::services::npm_packument_cache::InProcessPackumentCache);
+    /// Denials are counted so the test can synchronize on "the spawned
+    /// refresh consulted the lease" instead of sleeping.
+    struct LeaseDeniedBackend {
+        store: crate::services::npm_packument_cache::InProcessPackumentCache,
+        denials: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl crate::services::npm_packument_cache::PackumentCacheBackend for LeaseDeniedBackend {
         async fn get(&self, key: &str) -> Option<crate::services::npm_packument_cache::CacheHit> {
-            self.0.get(key).await
+            self.store.get(key).await
         }
         async fn set(
             &self,
@@ -6024,16 +6028,18 @@ mod db_cov_tests {
             prefix: &str,
             entry: crate::services::npm_packument_cache::CachedPackument,
         ) {
-            self.0.set(key, prefix, entry).await
+            self.store.set(key, prefix, entry).await
         }
         async fn invalidate_prefix(&self, prefix: &str) {
-            self.0.invalidate_prefix(prefix).await
+            self.store.invalidate_prefix(prefix).await
         }
         async fn try_acquire_refresh_lease(
             &self,
             _flight_key: &str,
             _ttl: std::time::Duration,
         ) -> Option<crate::services::npm_packument_cache::RefreshLease> {
+            self.denials
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             None
         }
     }
@@ -6065,14 +6071,16 @@ mod db_cov_tests {
 
         // Zero fresh window (every warm hit classifies stale) over a backend
         // whose refresh lease is always held elsewhere.
+        let backend = std::sync::Arc::new(LeaseDeniedBackend {
+            store: crate::services::npm_packument_cache::InProcessPackumentCache::new(
+                std::time::Duration::from_secs(3600),
+            ),
+            denials: std::sync::atomic::AtomicUsize::new(0),
+        });
         let mut app_state = build_app_state_with_fresh_ttl(&fx, 0);
         app_state.npm_packument_cache = Some(std::sync::Arc::new(
             crate::services::npm_packument_cache::NpmPackumentCache::new(
-                std::sync::Arc::new(LeaseDeniedBackend(
-                    crate::services::npm_packument_cache::InProcessPackumentCache::new(
-                        std::time::Duration::from_secs(3600),
-                    ),
-                )),
+                backend.clone(),
                 std::time::Duration::ZERO,
             ),
         ));
@@ -6092,9 +6100,17 @@ mod db_cov_tests {
         assert_eq!(status, StatusCode::OK);
         assert!(stale["versions"]["1.0.0"].is_object(), "got {stale:?}");
 
-        // Give a wrongly-spawned refresh time to reach the upstream before
-        // asserting none did.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Deterministic synchronization: wait until the spawned refresh has
+        // consulted (and been denied) the lease. A regression that runs the
+        // compute without consulting the lease never increments the counter
+        // and falls through to the assertion after the full window, by which
+        // point its upstream request has landed and fails the count below.
+        for _ in 0..500 {
+            if backend.denials.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let upstream_hits = mock_server
             .received_requests()
             .await
