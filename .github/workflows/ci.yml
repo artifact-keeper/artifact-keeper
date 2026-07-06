@@ -120,11 +120,13 @@ jobs:
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
-    # core, which is what tipped it over.
+    # core, which is what tipped it over. Jobs raised 4 -> 8 with the same
+    # measured basis as the coverage job (7.9-11.0 GiB peak RSS at 8 jobs
+    # with debuginfo=0 — and this compile is lighter, no instrumentation).
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "8"
       # Disable incremental codegen (#1679): this job compiles the same
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
@@ -215,10 +217,13 @@ jobs:
           SQLX_OFFLINE: true
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        # --test-threads=1: these DB-backed suites share global tables and the
-        # blob-GC readiness gate is a cluster-wide query, so a concurrent
-        # cross-module test's transient rows can make gate/GC assertions flaky.
-        run: cargo test --workspace --lib --verbose -- --test-threads=1
+        # nextest runs each test in its own process and applies the repo's
+        # .config/nextest.toml db-serial test groups, which serialize the
+        # global-DB-state suites (stuck-scan cleanup, storage GC) that the
+        # previous single-threaded `cargo test -- --test-threads=1` run was
+        # protecting. The coverage job already executes this exact suite
+        # under nextest at 8 threads.
+        run: cargo nextest run --workspace --lib --test-threads 8
 
       # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
       - name: sccache stats
