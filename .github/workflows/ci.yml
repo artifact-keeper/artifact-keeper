@@ -341,21 +341,42 @@ jobs:
           # explicitly skips when this is set.
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         # nextest runs each test in its own process for faster scheduling.
-        # Cap test concurrency to 4 so parallel test processes don't OOM the
-        # memory-limited ARC runner (cf. the #1515 compile OOM).
-        run: cargo llvm-cov nextest --workspace --lib --lcov --output-path lcov.info --test-threads 4
+        # Test concurrency was capped at 4 to keep parallel test processes
+        # from OOMing the memory-limited ARC runner (cf. the #1515 compile
+        # OOM); raised to 8 here to measure test-phase scaling now that the
+        # per-process profraw I/O is pooled — revert to 4 if runner memory
+        # pressure appears.
+        #
+        # Profile counters are written through an LLVM %Nm merge pool instead
+        # of cargo-llvm-cov's default one-.profraw-per-test-process: with
+        # ~12k test processes the per-process files cost tens of GB of write
+        # I/O per run, while the pool online-merges the same counters into at
+        # most 32 files (~92MB) with byte-equal coverage aggregates. The
+        # explicit `clean --workspace` keeps the implicit-clean semantics the
+        # single `cargo llvm-cov nextest` invocation had.
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
+          cargo llvm-cov clean --workspace
+          cargo nextest run --workspace --lib --test-threads 8
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Coverage summary and gate
         if: steps.detect.outputs.rust_changed == 'true'
         run: |
+          # cargo llvm-cov report resolves the profile directory from the
+          # show-env environment; without it, a fresh step shell looks in
+          # the default location and misses the pooled .profraw files.
+          source <(cargo llvm-cov show-env --sh)
+
           # Total project coverage summary
           echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          cargo llvm-cov report --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
           # Total coverage floor (never let overall coverage drop below 50%)
-          cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50
+          cargo llvm-cov report --fail-under-lines 50
 
       - name: New code coverage gate
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
