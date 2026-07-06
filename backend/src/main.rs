@@ -916,14 +916,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Some(grpc_db_pool),
     );
 
-    // Include file descriptor for gRPC reflection
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/sbom_descriptor.bin"
-        )))
-        .build_v1()
-        .expect("Failed to build reflection service");
+    // Info-disclosure hardening (#2226): gRPC server reflection lets an
+    // unauthenticated peer enumerate the entire service catalog + message
+    // schemas, so it is registered only when explicitly enabled
+    // (GRPC_REFLECTION_ENABLED). Data-plane RPCs stay protected by the auth
+    // interceptor either way.
+    let grpc_reflection_enabled = config.grpc_reflection_enabled;
 
     let grpc_auth_sbom = grpc_auth.clone();
     let grpc_auth_cve = grpc_auth.clone();
@@ -937,8 +935,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
         #[allow(clippy::result_large_err)]
         let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
-        if let Err(e) = TonicServer::builder()
-            .add_service(reflection_service)
+        let mut server = TonicServer::builder()
             .add_service(SbomServiceServer::with_interceptor(
                 sbom_server,
                 sbom_interceptor,
@@ -950,7 +947,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             .add_service(SecurityPolicyServiceServer::with_interceptor(
                 security_policy_server,
                 policy_interceptor,
-            ))
+            ));
+        if grpc_reflection_enabled {
+            // Include file descriptor for gRPC reflection
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sbom_descriptor.bin"
+                )))
+                .build_v1()
+                .expect("Failed to build reflection service");
+            server = server.add_service(reflection_service);
+            tracing::info!("gRPC server reflection enabled");
+        }
+        if let Err(e) = server
             .serve_with_shutdown(grpc_addr, grpc_shutdown_token.cancelled())
             .await
         {

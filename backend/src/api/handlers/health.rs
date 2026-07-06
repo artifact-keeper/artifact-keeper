@@ -101,6 +101,31 @@ pub struct DbPoolStats {
     pub size: u32,
 }
 
+/// Apply the detailed-health disclosure gate to the operator-only fields.
+///
+/// The public `/health` (and `/healthz`) endpoint is unauthenticated
+/// (`routes.rs` registers it with no auth layer and the guest-access guard
+/// allowlists it), so anything it serializes is readable by any anonymous
+/// caller. The exact git commit SHA (`commit`), the prerelease/`dirty` flag,
+/// and the live connection-pool internals (`db_pool`) let an attacker
+/// fingerprint the precise build and observe pool pressure, so they are only
+/// emitted when `detailed` is true (operator opt-in via
+/// `EXPOSE_DETAILED_HEALTH`). When `detailed` is false, all three are `None`
+/// and skipped by `skip_serializing_if`, leaving a minimal liveness response.
+/// See #2226. Pure so the gate is unit-testable without a DB or a live pool.
+fn gate_detailed_health_fields(
+    detailed: bool,
+    pool_stats: DbPoolStats,
+    commit: Option<String>,
+    dirty: Option<bool>,
+) -> (Option<DbPoolStats>, Option<String>, Option<bool>) {
+    if detailed {
+        (Some(pool_stats), commit, dirty)
+    } else {
+        (None, None, None)
+    }
+}
+
 /// Probe an external service health endpoint and return a CheckStatus.
 async fn check_service_health(
     base_url: &str,
@@ -242,6 +267,15 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         (None, None)
     };
 
+    // Info-disclosure hardening (#2226): only surface commit SHA + db-pool
+    // internals on the unauthenticated /health when an operator opts in.
+    let (db_pool, commit, dirty) = gate_detailed_health_fields(
+        state.config.expose_detailed_health,
+        pool_stats,
+        commit,
+        dirty,
+    );
+
     let response = HealthResponse {
         status: overall_status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -253,7 +287,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
             opensearch: opensearch_check,
             ldap: ldap_check,
         },
-        db_pool: Some(pool_stats),
+        db_pool,
         commit,
         dirty,
     };
@@ -765,6 +799,73 @@ mod tests {
             active_connections: 5,
             size: 20,
         }
+    }
+
+    #[test]
+    fn test_gate_detailed_health_fields_hidden_by_default() {
+        // #2226: with detail disabled, commit/dirty/db_pool are all dropped so
+        // the anonymous /health body cannot fingerprint the build or pool.
+        let (db_pool, commit, dirty) = gate_detailed_health_fields(
+            false,
+            sample_pool_stats(),
+            Some("da0aadeab497b1482181876931ab25933a6506d9".to_string()),
+            Some(false),
+        );
+        assert!(db_pool.is_none());
+        assert!(commit.is_none());
+        assert!(dirty.is_none());
+    }
+
+    #[test]
+    fn test_gate_detailed_health_fields_shown_when_enabled() {
+        // With the operator opt-in, the detail is preserved verbatim.
+        let (db_pool, commit, dirty) = gate_detailed_health_fields(
+            true,
+            sample_pool_stats(),
+            Some("da0aadeab497b1482181876931ab25933a6506d9".to_string()),
+            Some(true),
+        );
+        let pool = db_pool.expect("db_pool should be present when detailed");
+        assert_eq!(pool.max_connections, 20);
+        assert_eq!(
+            commit.as_deref(),
+            Some("da0aadeab497b1482181876931ab25933a6506d9")
+        );
+        assert_eq!(dirty, Some(true));
+    }
+
+    #[test]
+    fn test_gate_detailed_health_fields_hidden_serializes_minimal() {
+        // End-to-end on the response: gated-off fields are omitted from JSON
+        // while status/version/checks/demo_mode remain for probes/dashboards.
+        let (db_pool, commit, dirty) = gate_detailed_health_fields(
+            false,
+            sample_pool_stats(),
+            Some("abc123".to_string()),
+            Some(false),
+        );
+        let response = HealthResponse {
+            status: STATUS_HEALTHY.to_string(),
+            version: "1.0.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                opensearch: None,
+                ldap: None,
+            },
+            db_pool,
+            commit,
+            dirty,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"status\":\"healthy\""));
+        assert!(json.contains("\"version\":\"1.0.0\""));
+        assert!(json.contains("\"database\""));
+        assert!(!json.contains("\"db_pool\""));
+        assert!(!json.contains("\"commit\""));
+        assert!(!json.contains("\"dirty\""));
     }
 
     #[test]

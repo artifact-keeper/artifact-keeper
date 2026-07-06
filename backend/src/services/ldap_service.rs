@@ -768,6 +768,8 @@ mod tests {
             scan_workspace_path: "/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            expose_detailed_health: false,
+            grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test".into(),

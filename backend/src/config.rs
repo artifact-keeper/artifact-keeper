@@ -251,6 +251,28 @@ pub struct Config {
     /// permitted so users can authenticate and clients can negotiate.
     pub guest_access_enabled: bool,
 
+    /// When true, the unauthenticated `/health` (and `/healthz`) response
+    /// includes operator-only detail: the exact git commit SHA (`commit`),
+    /// the prerelease/`dirty` flag, and live connection-pool internals
+    /// (`db_pool`: max/idle/active/size). These fields let an anonymous caller
+    /// fingerprint the precise build and observe live pool pressure, so they
+    /// default to OFF (#2226): the public probe stays minimal
+    /// (status/version/checks), and the detail is surfaced only where an
+    /// operator explicitly opts in via `EXPOSE_DETAILED_HEALTH=true`. Admins
+    /// still get pool detail from the authenticated `/metrics` /memory-stats
+    /// endpoints regardless of this flag.
+    pub expose_detailed_health: bool,
+
+    /// When true, the gRPC server registers the tonic server-reflection
+    /// service, which lets clients enumerate the full service catalog, every
+    /// RPC method, and message schemas without authentication. Reflection is
+    /// convenient for `grpcurl` exploration and the SBOM e2e tooling, but in
+    /// production it hands an anonymous network peer a complete map of the API
+    /// surface, so it defaults to OFF (#2226). Enable it in dev/CI via
+    /// `GRPC_REFLECTION_ENABLED=true`. Data-plane RPCs remain protected by the
+    /// JWT auth interceptor irrespective of this flag.
+    pub grpc_reflection_enabled: bool,
+
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
     /// (`plugin.wasm.sig`) over its raw WASM bytes that verifies against the
@@ -672,6 +694,8 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show expose_detailed_health,
+    show grpc_reflection_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -775,6 +799,8 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            expose_detailed_health: false,
+            grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -920,6 +946,18 @@ impl Config {
             guest_access_enabled: !matches!(
                 env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
                 Ok("false" | "0")
+            ),
+            // Info-disclosure hardening (#2226): the public /health response
+            // hides the git commit SHA and live db-pool internals unless an
+            // operator explicitly opts in. Default OFF; only "true"/"1" enables.
+            expose_detailed_health: parse_opt_in_flag(
+                env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
+            ),
+            // Info-disclosure hardening (#2226): gRPC server reflection exposes
+            // the whole service catalog + schemas to unauthenticated peers, so
+            // it is OFF unless explicitly enabled (dev/CI grpcurl tooling).
+            grpc_reflection_enabled: parse_opt_in_flag(
+                env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
             ),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
@@ -2128,6 +2166,113 @@ mod tests {
         // which is what test_config() relies on.
         let config = Config::default();
         assert!(config.guest_access_enabled);
+    }
+
+    #[test]
+    fn test_config_expose_detailed_health_default_false() {
+        // Info-disclosure hardening (#2226): the public /health response must
+        // hide commit SHA + db-pool internals unless explicitly opted in, so
+        // the flag defaults to false when the env var is unset.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("EXPOSE_DETAILED_HEALTH");
+
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("EXPOSE_DETAILED_HEALTH", saved_flag);
+    }
+
+    #[test]
+    fn test_config_expose_detailed_health_explicit_values() {
+        // Only an explicit, recognized affirmative enables the detail; garbage,
+        // empty, and "false"/"0" all keep it off (safe-by-default opt-in).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("EXPOSE_DETAILED_HEALTH", "true");
+        assert!(Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "1");
+        assert!(Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "false");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "0");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "yes");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("EXPOSE_DETAILED_HEALTH", saved_flag);
+    }
+
+    #[test]
+    fn test_config_grpc_reflection_enabled_default_false() {
+        // Info-disclosure hardening (#2226): gRPC reflection is off by default
+        // so an anonymous peer cannot enumerate the service catalog in prod.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_REFLECTION_ENABLED");
+
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("GRPC_REFLECTION_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_grpc_reflection_enabled_explicit_values() {
+        // Only "true"/"1" enable reflection; everything else keeps it disabled.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("GRPC_REFLECTION_ENABLED", "true");
+        assert!(Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "1");
+        assert!(Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "false");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "0");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "garbage");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("GRPC_REFLECTION_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_default_new_disclosure_flags_off() {
+        // Config::default() (used by tests + non-env construction) must also
+        // keep both hardening flags off so the safe posture is the baseline.
+        let config = Config::default();
+        assert!(!config.expose_detailed_health);
+        assert!(!config.grpc_reflection_enabled);
     }
 
     #[test]
