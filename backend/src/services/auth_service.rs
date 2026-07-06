@@ -5752,12 +5752,19 @@ mod tests {
         let username = format!("restamp_admin_{}", &Uuid::new_v4().to_string()[..8]);
         let user_id = Uuid::new_v4();
         sqlx::query(
+            // `privileges_changed_at` (migration 131, DEFAULT NOW()) MUST be
+            // backdated alongside the other timestamps. It is folded into the
+            // credential-change watermark (GREATEST(password_changed_at,
+            // totp_verified_at, privileges_changed_at)); leaving it at its NOW()
+            // default pins the watermark to insert time, which then races the
+            // freshly-minted token's `iat_ms` and intermittently rejects it with
+            // "Token invalidated by credential change" under parallel test load.
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
              is_admin, is_active, failed_login_attempts, password_changed_at, \
-             created_at, updated_at) \
+             privileges_changed_at, created_at, updated_at) \
              VALUES ($1, $2, $3, 'unused', 'local', true, true, 0, \
              NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
-             NOW() - INTERVAL '60 seconds')",
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')",
         )
         .bind(user_id)
         .bind(&username)
