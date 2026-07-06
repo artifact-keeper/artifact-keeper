@@ -46,8 +46,8 @@ pub struct AuthExtension {
     pub is_service_account: bool,
     /// Token scopes if authenticated via API token
     pub scopes: Option<Vec<String>>,
-    /// Repository IDs this token is restricted to (None = unrestricted)
-    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Repository-scope authorization decision for this principal.
+    pub allowed_repo_ids: AccessScope,
 }
 
 /// Marker request extension inserted alongside [`AuthExtension`] when the
@@ -100,13 +100,12 @@ impl AuthExtension {
     /// Repo-scope authorization decision for this principal, as an explicit
     /// [`AccessScope`].
     ///
-    /// Bridges the legacy `allowed_repo_ids` field to the enum: a `None`
-    /// restriction maps to [`AccessScope::Admin`] (grants all repositories),
-    /// and `Some(v)` maps to [`AccessScope::Restricted`] (deny-by-default
-    /// allowlist). This is the single place the `Option<Vec<Uuid>>` shape is
-    /// interpreted for repo-scope decisions (#1617, Phase 4).
+    /// Returns the principal's repository scope: [`AccessScope::Admin`] grants
+    /// all repositories, [`AccessScope::Restricted`] is a deny-by-default
+    /// allowlist. This is the single accessor callers use to reason about
+    /// repo-scope decisions (#1617, Phase 4).
     pub fn access_scope(&self) -> AccessScope {
-        AccessScope::from(&self.allowed_repo_ids)
+        self.allowed_repo_ids.clone()
     }
 
     /// Check whether this auth context has access to a specific repository.
@@ -170,7 +169,7 @@ impl From<Claims> for AuthExtension {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: claims.allowed_repo_ids,
+            allowed_repo_ids: AccessScope::from(claims.allowed_repo_ids),
         }
     }
 }
@@ -185,7 +184,7 @@ impl From<User> for AuthExtension {
             is_api_token: false,
             is_service_account: user.is_service_account,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 }
@@ -731,7 +730,7 @@ async fn validate_api_token_with_scopes(
         is_api_token: true,
         is_service_account: validation.user.is_service_account,
         scopes: Some(validation.scopes),
-        allowed_repo_ids: validation.allowed_repo_ids,
+        allowed_repo_ids: AccessScope::from(validation.allowed_repo_ids),
     })
 }
 
@@ -1888,7 +1887,7 @@ mod tests {
             is_api_token: true,
             is_service_account: false,
             scopes: Some(scopes),
-            allowed_repo_ids: repo_ids,
+            allowed_repo_ids: AccessScope::from(repo_ids),
         }
     }
 
@@ -1952,7 +1951,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(ext.has_scope("anything"));
     }
@@ -2007,7 +2006,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         let result = require_auth_basic_scope(Some(ext), "maven", "write");
         assert!(result.is_ok(), "JWT sessions must not be scope-gated");
@@ -2090,7 +2089,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(require_scope_response(Some(&ext), "write").is_ok());
         assert!(require_scope_response(Some(&ext), "delete").is_ok());
@@ -2124,7 +2123,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
 
         let cloned = ext.clone();
@@ -2188,7 +2187,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         let result = require_auth_basic(Some(ext), "maven");
         assert!(result.is_ok());
@@ -2502,6 +2501,43 @@ mod tests {
         );
     }
 
+    // Authorization invariants stated directly against the `AccessScope` field
+    // (the point of the type swap): the enum makes "no restriction" and
+    // "restricted to nothing" impossible to confuse.
+    #[test]
+    fn test_access_scope_field_admin_grants_all() {
+        let ext = make_api_token_ext(vec!["*".to_string()], None);
+        assert_eq!(ext.allowed_repo_ids, AccessScope::Admin);
+        assert_eq!(ext.access_scope(), AccessScope::Admin);
+        assert!(
+            ext.can_access_repo(Uuid::new_v4()),
+            "AccessScope::Admin must reach every repository"
+        );
+    }
+
+    #[test]
+    fn test_access_scope_field_empty_scope_denies_all() {
+        // Some(vec![]) through the helper yields Restricted([]).
+        let ext = make_api_token_ext(vec!["*".to_string()], Some(vec![]));
+        assert_eq!(ext.allowed_repo_ids, AccessScope::Restricted(vec![]));
+        assert!(
+            !ext.can_access_repo(Uuid::new_v4()),
+            "empty scope (Restricted([])) must grant nothing, never fall open"
+        );
+    }
+
+    #[test]
+    fn test_access_scope_field_restricted_grants_only_listed() {
+        let target = Uuid::new_v4();
+        let ext = make_api_token_ext(vec!["*".to_string()], Some(vec![target]));
+        assert_eq!(ext.allowed_repo_ids, AccessScope::Restricted(vec![target]));
+        assert!(ext.can_access_repo(target), "listed repo must be reachable");
+        assert!(
+            !ext.can_access_repo(Uuid::new_v4()),
+            "a repo outside the allowlist must be denied"
+        );
+    }
+
     #[test]
     fn test_can_access_repo_jwt_always_unrestricted() {
         let ext = AuthExtension {
@@ -2512,7 +2548,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         // JWT sessions have no repo restrictions (allowed_repo_ids is None).
         assert!(ext.can_access_repo(Uuid::new_v4()));
@@ -2530,7 +2566,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(ext.require_admin().is_ok());
     }
@@ -2545,7 +2581,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         let err = ext.require_admin().unwrap_err();
         assert!(err.to_string().contains("Admin access required"));
@@ -2561,7 +2597,7 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["admin".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(ext.require_admin().is_ok());
     }
@@ -2576,7 +2612,7 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["read".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(ext.require_admin().is_err());
     }
@@ -2595,7 +2631,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 
@@ -2829,7 +2865,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         // The middleware skips permission checks when is_admin is true.
         // Verify the flag is correctly detected.
@@ -2935,7 +2971,7 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["admin".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(
             ext.is_admin,
@@ -3754,7 +3790,7 @@ mod tests {
                 is_api_token: true,
                 is_service_account: true,
                 scopes: Some(vec!["read".to_string()]),
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             }
         }
 

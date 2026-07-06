@@ -901,7 +901,8 @@ mod tests {
         // Token scoped to some OTHER repo id only.
         let mut auth = tdh::make_auth(user_id, &username);
         auth.is_api_token = true;
-        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+        auth.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
         let state = tdh::build_state(pool.clone(), "/tmp");
         let app = tdh::router_with_auth(router(), state, auth);
 

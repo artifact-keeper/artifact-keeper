@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{
     CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
 };
@@ -453,7 +454,7 @@ async fn list_sboms(
         // narrow by repository or artifact. Listing all SBOMs would let
         // a token scoped to repo A enumerate dep trees of every other
         // repo. Force the caller to be explicit about the repo scope.
-        if auth.is_api_token && auth.allowed_repo_ids.is_some() {
+        if auth.is_api_token && matches!(auth.allowed_repo_ids, AccessScope::Restricted(_)) {
             return Err(AppError::Validation(
                 "Scope-restricted tokens must filter by repository_id or artifact_id".into(),
             ));
@@ -2218,7 +2219,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 
@@ -2329,7 +2330,7 @@ mod tests {
             is_api_token,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: allowed,
+            allowed_repo_ids: AccessScope::from(allowed),
         }
     }
 
@@ -3190,7 +3191,7 @@ mod tests {
         // Build an auth extension whose allowed_repo_ids does NOT include
         // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
         let mut auth = tdh::make_auth(fx.user_id, &fx.username);
-        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+        auth.allowed_repo_ids = AccessScope::Restricted(vec![Uuid::new_v4()]);
 
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),

@@ -14,6 +14,7 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
@@ -29,9 +30,12 @@ fn repo_visibility_for(auth: Option<&AuthExtension>) -> RepoVisibility {
         None => RepoVisibility::PublicOnly,
         Some(a) if a.is_admin => RepoVisibility::All,
         // Repo-scoped token: restrict strictly to the token's allowed set.
-        Some(a) if a.allowed_repo_ids.is_some() => {
-            RepoVisibility::Ids(a.allowed_repo_ids.clone().unwrap_or_default())
-        }
+        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
+            a.allowed_repo_ids
+                .as_allowed_repo_ids()
+                .unwrap_or_default()
+                .to_vec(),
+        ),
         Some(a) => RepoVisibility::User(a.user_id),
     }
 }
@@ -479,7 +483,7 @@ mod tests {
             is_api_token: allowed.is_some(),
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: allowed,
+            allowed_repo_ids: AccessScope::from(allowed),
         }
     }
 

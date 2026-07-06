@@ -1323,7 +1323,7 @@ mod tests {
             is_api_token: false,
             is_service_account,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         }
     }
 
@@ -1455,7 +1455,7 @@ mod tests {
             is_api_token: true,
             is_service_account: false,
             scopes: Some(vec!["read".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         });
         match classify_repo_access(&auth) {
             RepoAccessMode::UserScoped(uid) => assert_eq!(uid, specific_id),

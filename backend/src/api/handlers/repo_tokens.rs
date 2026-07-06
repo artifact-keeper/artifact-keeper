@@ -611,7 +611,7 @@ mod tests {
             is_api_token: scopes.is_some(),
             is_service_account: false,
             scopes,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         }
     }
 

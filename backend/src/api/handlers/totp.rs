@@ -975,7 +975,7 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         };
 
         // Token issued one minute before the change (millisecond issued-at,
@@ -1056,7 +1056,7 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         };
 
         // The caller's token was issued "now" (millisecond `iat_ms`, as the
@@ -1144,7 +1144,7 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         };
 
         let pre_change_iat = Utc::now().timestamp_millis() - 60_000;
@@ -1228,7 +1228,7 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         };
 
         let caller_iat_ms = Utc::now().timestamp_millis();

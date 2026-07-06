@@ -28,6 +28,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
+use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::cache_classifier;
@@ -1227,9 +1228,12 @@ pub async fn list_repositories(
         // allowed repositories, not every repo the owning user can reach.
         // Checked before the general `User` arm. Admin tokens are handled
         // above and bypass scope restrictions.
-        Some(a) if a.allowed_repo_ids.is_some() => {
-            RepoVisibility::Ids(a.allowed_repo_ids.clone().unwrap_or_default())
-        }
+        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
+            a.allowed_repo_ids
+                .as_allowed_repo_ids()
+                .unwrap_or_default()
+                .to_vec(),
+        ),
         Some(a) => RepoVisibility::User(a.user_id),
     };
     let service = RepositoryService::new(state.db.clone());
@@ -6614,7 +6618,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         };
         assert!(require_auth(Some(auth)).is_ok());
     }
@@ -8128,7 +8132,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: repo_ids,
+            allowed_repo_ids: AccessScope::from(repo_ids),
         }
     }
 
@@ -10086,7 +10090,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 
@@ -12319,7 +12323,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 
@@ -12526,7 +12530,7 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
         }
     }
 

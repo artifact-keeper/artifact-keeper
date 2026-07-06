@@ -1177,7 +1177,7 @@ mod tests {
             is_api_token: allowed.is_some(),
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: allowed,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::from(allowed),
         }
     }
 
