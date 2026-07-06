@@ -90,17 +90,32 @@ const FLIGHT_LEASE_NAMESPACE: &str = "npm-packument:";
 /// refresh leases (#2248).
 const REFRESH_LEASE_KEY_PREFIX: &str = "refresh-lease:";
 
-/// TTL on the cross-replica refresh lease (#2248). A live holder completes
-/// (and releases) well inside this: a refresh's compute is bounded by the
-/// same limits as the miss path, whose single-flight wait deadline is 65 s.
-/// A holder that dies without releasing only delays the next cross-replica
-/// refresh until expiry — it can never block refreshes permanently.
+/// TTL on the cross-replica refresh lease (#2248). A live holder always
+/// completes (and releases) inside this: [`NpmPackumentCache::refresh_under_lease`]
+/// bounds the refresh with [`REFRESH_LEASE_COMPUTE_TIMEOUT`], which sits
+/// under this TTL by a margin. A holder that dies without releasing (panic,
+/// runtime teardown) only delays the next cross-replica refresh until
+/// expiry — it can never block refreshes permanently.
 const REFRESH_LEASE_TTL: Duration = Duration::from_secs(90);
 
-/// Compare-and-delete for lease release: frees the lease only while `token`
-/// still owns it, so a holder that outlived its TTL cannot drop a successor
-/// replica's lease.
-const REFRESH_LEASE_RELEASE_SCRIPT: &str = r#"if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end"#;
+/// Bound on a leased background refresh. Keeping the compute strictly under
+/// [`REFRESH_LEASE_TTL`] guarantees a lease can never expire mid-refresh, so
+/// a slow holder cannot race a successor and overwrite its newer entry with
+/// an older upstream snapshot.
+const REFRESH_LEASE_COMPUTE_TIMEOUT: Duration = Duration::from_secs(80);
+
+/// How long a replica that lost the lease race keeps holding its local
+/// refresh claim before re-arming. Without this, every stale hit on a
+/// non-holder replica would spawn a task and pay a shared-backend probe for
+/// the whole duration of the holder's refresh; with it, a stale burst costs
+/// at most one probe per package per replica per window.
+const REFRESH_LEASE_DENIED_CLAIM_HOLD: Duration = Duration::from_secs(1);
+
+/// Delay before the single release retry. Slightly above
+/// [`REDIS_UNAVAILABLE_COOLDOWN`] so the retry is not swallowed by the gate
+/// the failed first attempt armed; a release that fails twice is abandoned
+/// to TTL expiry (bounded, best-effort).
+const REFRESH_LEASE_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(6);
 
 /// Bound on each Redis connection attempt, so a request never stalls behind
 /// an unreachable Redis host (the in-process layer answers instead).
@@ -263,6 +278,15 @@ fn key_invalidation_prefix(key: &str) -> String {
 /// process-local [`RefreshClaim`]: the claim dedups a stale burst within one
 /// process, this lease dedups the same burst across replicas that share a
 /// cache backend.
+///
+/// Deliberately NOT the [`crate::services::cluster_lock::ClusterLock`]
+/// advisory-lock seam: refreshes are frequent, short and fire-and-forget, so
+/// a single `SET NX` on the already-configured shared cache backend beats
+/// holding a Postgres session lock (detached connection per lease) for each
+/// one — and when no shared backend is configured there is nothing to
+/// coordinate at all. The trade-off is TTL-expiry (not session-death) as the
+/// crash-recovery mechanism, which is exactly the bounded best-effort
+/// behavior a background refresh wants.
 #[derive(Debug)]
 pub enum RefreshLease {
     /// No shared lease is held: either no shared backend is configured, or it
@@ -758,17 +782,25 @@ impl SharedCacheBackend for RedisPackumentCache {
         token: &str,
     ) -> Result<(), SharedCacheUnavailable> {
         let mut conn = self.connection().await?;
-        // Plain EVAL (the `script` cargo feature is not enabled): the release
-        // runs once per completed refresh, so re-sending the short script
-        // body costs nothing worth an EVALSHA cache.
-        let _: i64 = redis::cmd("EVAL")
-            .arg(REFRESH_LEASE_RELEASE_SCRIPT)
-            .arg(1)
-            .arg(Self::lease_key(flight_key))
-            .arg(token)
+        // GET-then-DEL rather than a Lua compare-and-delete: EVAL is refused
+        // on scripting-restricted deployments (ACLs without @scripting), and
+        // a systemically failing release would arm the cooldown gate after
+        // every refresh. The non-atomic window (lease expires and a successor
+        // acquires between the GET and the DEL) is sub-millisecond and its
+        // worst case is one duplicate refresh — strictly better than that.
+        let lease_key = Self::lease_key(flight_key);
+        let holder: Option<String> = redis::cmd("GET")
+            .arg(&lease_key)
             .query_async(&mut conn)
             .await
             .map_err(|e| self.command_error("refresh-lease-release", &e))?;
+        if holder.as_deref() == Some(token) {
+            let _: i64 = redis::cmd("DEL")
+                .arg(&lease_key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.command_error("refresh-lease-release", &e))?;
+        }
         self.note_success();
         Ok(())
     }
@@ -838,6 +870,18 @@ impl PackumentCacheBackend for LayeredPackumentCache {
 
     async fn release_refresh_lease(&self, lease: RefreshLease) {
         if let RefreshLease::Shared { flight_key, token } = lease {
+            if self
+                .shared
+                .try_release_refresh_lease(&flight_key, &token)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            // One retry after the cooldown window: a release lost to a Redis
+            // blip would otherwise orphan the lease and block every
+            // replica's refresh of this packument until TTL expiry.
+            tokio::time::sleep(REFRESH_LEASE_RELEASE_RETRY_DELAY).await;
             let _ = self
                 .shared
                 .try_release_refresh_lease(&flight_key, &token)
@@ -856,6 +900,14 @@ impl PackumentCacheBackend for LayeredPackumentCache {
 pub struct RefreshClaim {
     flights: Arc<Mutex<HashSet<String>>>,
     key: String,
+}
+
+impl RefreshClaim {
+    /// The flight key this claim covers; the cross-replica lease is keyed on
+    /// it too, so the pair can never diverge.
+    pub fn flight_key(&self) -> &str {
+        &self.key
+    }
 }
 
 impl Drop for RefreshClaim {
@@ -1034,37 +1086,56 @@ impl NpmPackumentCache {
 
     /// Run one background refresh under both dedup layers (#2248): `claim` is
     /// the process-local guard (held for the task's lifetime), and the
-    /// backend's cross-replica lease gates the actual work. When another
-    /// replica already holds the lease the refresh is skipped — that
-    /// replica's result reaches everyone through the shared cache anyway.
-    /// Returns `None` when skipped, `Some(refresh result)` otherwise.
+    /// backend's cross-replica lease — keyed on the claim's flight key —
+    /// gates the actual work. When another replica already holds the lease
+    /// the refresh is skipped (that replica's result reaches everyone through
+    /// the shared cache) and the claim is parked briefly so a stale burst
+    /// costs one shared-backend probe per window, not one per request.
+    ///
+    /// The refresh is bounded by [`REFRESH_LEASE_COMPUTE_TIMEOUT`], so a
+    /// holder can never outlive its lease and race a successor's newer
+    /// entry. A failed refresh still releases the lease, so any replica
+    /// (including a healthy one, when the holder's upstream path is broken)
+    /// can retry on the next stale hit. Only a crash mid-refresh leaves the
+    /// lease to TTL expiry — bounded, and the stale window keeps serving.
+    ///
+    /// Returns `None` when skipped or timed out, `Some(refresh result)`
+    /// otherwise.
     pub async fn refresh_under_lease<T, E, F, Fut>(
         &self,
         claim: RefreshClaim,
-        flight_key: &str,
         refresh: F,
     ) -> Option<Result<T, E>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        let _claim = claim;
         let Some(lease) = self
             .backend
-            .try_acquire_refresh_lease(flight_key, REFRESH_LEASE_TTL)
+            .try_acquire_refresh_lease(claim.flight_key(), REFRESH_LEASE_TTL)
             .await
         else {
             tracing::debug!(
-                flight_key,
+                flight_key = claim.flight_key(),
                 "npm packument refresh skipped; another replica holds the refresh lease"
             );
+            tokio::time::sleep(REFRESH_LEASE_DENIED_CLAIM_HOLD).await;
             return None;
         };
-        let result = refresh().await;
-        // Free the lease on completion (success or failure) so the next
-        // stale hit can refresh; an abandoned lease expires via its TTL.
+        let result = tokio::time::timeout(REFRESH_LEASE_COMPUTE_TIMEOUT, refresh()).await;
+        // Free the lease on completion (success, failure, or timeout) so the
+        // next stale hit can refresh; an abandoned lease expires via TTL.
         self.backend.release_refresh_lease(lease).await;
-        Some(result)
+        match result {
+            Ok(result) => Some(result),
+            Err(_elapsed) => {
+                tracing::debug!(
+                    flight_key = claim.flight_key(),
+                    "npm packument refresh abandoned; compute exceeded the lease-bounded timeout"
+                );
+                None
+            }
+        }
     }
 
     /// Serve one packument request through the cache.
@@ -1624,8 +1695,10 @@ mod tests {
         store: InProcessPackumentCache,
         lease_grants: AtomicUsize,
         lease_acquires: std::sync::Mutex<Vec<String>>,
+        /// Every release ATTEMPT (including injected failures).
         lease_releases: std::sync::Mutex<Vec<(String, String)>>,
         granted_tokens: std::sync::Mutex<Vec<String>>,
+        release_failures_remaining: AtomicUsize,
     }
 
     impl ScriptableSharedCache {
@@ -1637,6 +1710,7 @@ mod tests {
                 lease_acquires: std::sync::Mutex::new(Vec::new()),
                 lease_releases: std::sync::Mutex::new(Vec::new()),
                 granted_tokens: std::sync::Mutex::new(Vec::new()),
+                release_failures_remaining: AtomicUsize::new(0),
             }
         }
 
@@ -1646,6 +1720,11 @@ mod tests {
 
         fn set_lease_grants(&self, remaining: usize) {
             self.lease_grants.store(remaining, Ordering::SeqCst);
+        }
+
+        fn fail_next_releases(&self, count: usize) {
+            self.release_failures_remaining
+                .store(count, Ordering::SeqCst);
         }
 
         fn lease_acquires(&self) -> Vec<String> {
@@ -1722,6 +1801,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((flight_key.to_string(), token.to_string()));
+            let failed = self
+                .release_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if failed {
+                return Err(SharedCacheUnavailable);
+            }
             Ok(())
         }
     }
@@ -1815,7 +1901,7 @@ mod tests {
         let claim = cache.try_claim_refresh("flight").expect("claim");
         let ran = AtomicUsize::new(0);
         let result = cache
-            .refresh_under_lease(claim, "flight", || async {
+            .refresh_under_lease(claim, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             })
@@ -1837,7 +1923,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn refresh_under_lease_skips_when_another_replica_holds_the_lease() {
         let shared = Arc::new(ScriptableSharedCache::new(true));
         shared.set_lease_grants(0);
@@ -1845,7 +1931,7 @@ mod tests {
         let claim = cache.try_claim_refresh("flight").expect("claim");
         let ran = AtomicUsize::new(0);
         let result = cache
-            .refresh_under_lease(claim, "flight", || async {
+            .refresh_under_lease(claim, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             })
@@ -1869,7 +1955,7 @@ mod tests {
         let claim = cache.try_claim_refresh("flight").expect("claim");
         let ran = AtomicUsize::new(0);
         let result = cache
-            .refresh_under_lease(claim, "flight", || async {
+            .refresh_under_lease(claim, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             })
@@ -1892,7 +1978,7 @@ mod tests {
         let cache = lease_facade(shared.clone());
         let claim = cache.try_claim_refresh("flight").expect("claim");
         let result = cache
-            .refresh_under_lease(claim, "flight", || async { Err::<(), _>("boom") })
+            .refresh_under_lease(claim, || async { Err::<(), _>("boom") })
             .await;
         assert_eq!(result, Some(Err("boom")));
         assert_eq!(
@@ -1911,7 +1997,7 @@ mod tests {
         let claim = cache.try_claim_refresh("flight").expect("claim");
         let ran = AtomicUsize::new(0);
         let result = cache
-            .refresh_under_lease(claim, "flight", || async {
+            .refresh_under_lease(claim, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             })
@@ -1936,11 +2022,11 @@ mod tests {
         let claim_b = replica_b.try_claim_refresh("flight").expect("claim b");
         let ran = AtomicUsize::new(0);
         let (a, b) = tokio::join!(
-            replica_a.refresh_under_lease(claim_a, "flight", || async {
+            replica_a.refresh_under_lease(claim_a, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             }),
-            replica_b.refresh_under_lease(claim_b, "flight", || async {
+            replica_b.refresh_under_lease(claim_b, || async {
                 ran.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &str>(())
             }),
@@ -1957,6 +2043,81 @@ mod tests {
                 .count(),
             1,
             "exactly one replica runs the refresh, the other skips"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_under_lease_denial_parks_the_claim_before_rearming() {
+        let shared = Arc::new(ScriptableSharedCache::new(true));
+        shared.set_lease_grants(0);
+        let cache = Arc::new(lease_facade(shared.clone()));
+        let claim = cache.try_claim_refresh("flight").expect("claim");
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .refresh_under_lease(claim, || async { Ok::<_, &str>(()) })
+                    .await
+            }
+        });
+        // Mid-hold: the claim must still be parked, so a stale burst cannot
+        // spawn a second shared-backend probe inside the window.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            cache.try_claim_refresh("flight").is_none(),
+            "the claim must stay held during the denial hold"
+        );
+        assert_eq!(task.await.expect("join"), None);
+        assert!(
+            cache.try_claim_refresh("flight").is_some(),
+            "the claim re-arms once the hold elapses"
+        );
+        assert_eq!(
+            shared.lease_acquires().len(),
+            1,
+            "one denied probe, not one per stale hit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_under_lease_abandons_computes_that_outlive_the_lease_bound() {
+        let shared = Arc::new(ScriptableSharedCache::new(true));
+        let cache = lease_facade(shared.clone());
+        let claim = cache.try_claim_refresh("flight").expect("claim");
+        let result = cache
+            .refresh_under_lease(claim, || async {
+                std::future::pending::<Result<(), &str>>().await
+            })
+            .await;
+        assert!(
+            result.is_none(),
+            "a compute that outlives the lease bound must be abandoned, not              allowed to finish after a successor and overwrite its entry"
+        );
+        assert_eq!(
+            shared.lease_releases().len(),
+            1,
+            "the lease is released even when the compute is abandoned"
+        );
+        assert!(
+            cache.try_claim_refresh("flight").is_some(),
+            "the claim re-arms after the abandoned refresh"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_under_lease_retries_a_failed_release_once() {
+        let shared = Arc::new(ScriptableSharedCache::new(true));
+        shared.fail_next_releases(1);
+        let cache = lease_facade(shared.clone());
+        let claim = cache.try_claim_refresh("flight").expect("claim");
+        let result = cache
+            .refresh_under_lease(claim, || async { Ok::<_, &str>(()) })
+            .await;
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(
+            shared.lease_releases().len(),
+            2,
+            "a release lost to a shared-store blip must be retried once so              the lease is not orphaned until TTL expiry"
         );
     }
 
