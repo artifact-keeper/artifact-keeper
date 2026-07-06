@@ -730,7 +730,7 @@ async fn validate_api_token_with_scopes(
         is_api_token: true,
         is_service_account: validation.user.is_service_account,
         scopes: Some(validation.scopes),
-        allowed_repo_ids: AccessScope::from(validation.allowed_repo_ids),
+        allowed_repo_ids: validation.allowed_repo_ids,
     })
 }
 

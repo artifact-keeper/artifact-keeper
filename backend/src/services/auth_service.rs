@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::user::{AuthProvider, User};
 
 /// Federated authentication credentials
@@ -85,8 +86,9 @@ pub struct ApiTokenValidation {
     pub user: User,
     /// Token scopes (e.g. "read:artifacts", "write:artifacts", "*")
     pub scopes: Vec<String>,
-    /// Repository IDs the token is restricted to (None = unrestricted)
-    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Repository-scope authorization decision for this token.
+    /// `Admin` = unrestricted; `Restricted(v)` = allowlist; `Restricted(vec![])` = deny-all.
+    pub allowed_repo_ids: AccessScope,
 }
 
 /// JWT claims structure.
@@ -1830,7 +1832,7 @@ impl AuthService {
         let validation = ApiTokenValidation {
             user,
             scopes: stored_token.scopes,
-            allowed_repo_ids,
+            allowed_repo_ids: AccessScope::from(allowed_repo_ids),
         };
 
         // Populate cache; evict stale entries on write to keep memory bounded.
@@ -3241,6 +3243,53 @@ mod tests {
         }
     }
 
+    /// Pins the `ApiTokenValidation.allowed_repo_ids` ctor boundary
+    /// (`AccessScope::from` on the resolved `Option<Vec<Uuid>>` local in
+    /// `validate_api_token`) to today's authorization semantics: unscoped
+    /// tokens reach every repo, allowlisted tokens reach only their repos, and
+    /// an empty allowlist denies everything (never falls open).
+    #[test]
+    fn test_api_token_validation_scope_ctor_preserves_semantics() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+
+        // 1. Unrestricted (no join rows / empty selector -> None -> Admin):
+        //    reaches all repos.
+        let unrestricted = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["*".to_string()],
+            allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+        };
+        assert_eq!(unrestricted.allowed_repo_ids, AccessScope::Admin);
+        assert!(unrestricted.allowed_repo_ids.grants(repo_a));
+        assert!(unrestricted.allowed_repo_ids.grants(repo_b));
+
+        // 2. Allowlist (N join rows -> Some(ids) -> Restricted(ids)): reaches
+        //    only its repos.
+        let restricted = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(Some(vec![repo_a])),
+        };
+        assert_eq!(
+            restricted.allowed_repo_ids,
+            AccessScope::Restricted(vec![repo_a])
+        );
+        assert!(restricted.allowed_repo_ids.grants(repo_a));
+        assert!(!restricted.allowed_repo_ids.grants(repo_b));
+
+        // 3. Empty scope (selector resolves to zero ids -> Some(vec![]) ->
+        //    Restricted(vec![])): deny-by-default, reaches nothing.
+        let empty = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(Some(Vec::<Uuid>::new())),
+        };
+        assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
+        assert!(!empty.allowed_repo_ids.grants(repo_a));
+        assert!(!empty.allowed_repo_ids.grants(repo_b));
+    }
+
     // We cannot create a PgPool without a real database, so for unit tests that
     // need JWT encoding/decoding, we directly use jsonwebtoken's encode/decode
     // with the same keys the AuthService would use.
@@ -4092,7 +4141,7 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 scopes,
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             },
             token_id: Uuid::nil(),
             expires_at: None,
@@ -4222,7 +4271,7 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 scopes: vec![],
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(past),
@@ -4260,7 +4309,7 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 scopes: vec![],
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(future),
@@ -4925,7 +4974,7 @@ mod tests {
                         updated_at: Utc::now(),
                     },
                     scopes: vec![],
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: AccessScope::Admin,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -5024,7 +5073,7 @@ mod tests {
                         updated_at: Utc::now(),
                     },
                     scopes: vec![],
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: AccessScope::Admin,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
