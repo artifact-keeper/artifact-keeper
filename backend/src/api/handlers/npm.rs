@@ -256,23 +256,25 @@ async fn get_package_metadata_cached(
                 let repo_key = repo_key.to_string();
                 let package_name = package_name.to_string();
                 let base_url = base_url.to_string();
+                let flight = flight.clone();
                 tokio::spawn(async move {
-                    // Hold the claim for the task's lifetime so a stale burst
-                    // triggers exactly one refresh; dropping it (success,
-                    // failure, or cancellation) re-arms the next refresh.
-                    let _claim = claim;
-                    if compute_and_store_packument(
-                        &state,
-                        &cache,
-                        &repo_key,
-                        &package_name,
-                        &base_url,
-                        want_abbreviated,
-                        want_gzip,
-                    )
-                    .await
-                    .is_err()
-                    {
+                    // The claim dedups a stale burst within this process; the
+                    // cross-replica lease inside `refresh_under_lease` dedups
+                    // it across replicas sharing a cache backend (#2248).
+                    let refreshed = cache
+                        .refresh_under_lease(claim, &flight, || {
+                            compute_and_store_packument(
+                                &state,
+                                &cache,
+                                &repo_key,
+                                &package_name,
+                                &base_url,
+                                want_abbreviated,
+                                want_gzip,
+                            )
+                        })
+                        .await;
+                    if matches!(refreshed, Some(Err(_))) {
                         debug!(
                             repo_key,
                             package = package_name,
@@ -5877,6 +5879,15 @@ mod db_cov_tests {
         fx: &tdh::Fixture,
         fresh_ttl_secs: u64,
     ) -> crate::api::SharedState {
+        std::sync::Arc::new(build_app_state_with_fresh_ttl(fx, fresh_ttl_secs))
+    }
+
+    /// Un-shared variant of [`build_state_with_fresh_ttl`] for tests that
+    /// need to swap state fields (e.g. the packument cache) before use.
+    fn build_app_state_with_fresh_ttl(
+        fx: &tdh::Fixture,
+        fresh_ttl_secs: u64,
+    ) -> crate::api::AppState {
         let mut config = crate::config::Config::test_config();
         config.storage_path = fx.storage_dir.to_string_lossy().into_owned();
         config.npm_packument_cache_fresh_ttl_secs = fresh_ttl_secs;
@@ -5892,7 +5903,7 @@ mod db_cov_tests {
             fx.pool.clone(),
             fx.storage_dir.to_str().unwrap(),
         ));
-        std::sync::Arc::new(state)
+        state
     }
 
     /// Upstream packument body for the wiremock server.
@@ -5995,6 +6006,107 @@ mod db_cov_tests {
         assert!(
             refreshed["versions"]["2.0.0"].is_object(),
             "the background refresh must replace the stale entry; got {refreshed:?}"
+        );
+    }
+
+    /// Backend wrapper reporting the cross-replica refresh lease as held by
+    /// another replica (#2248), storage delegated to a real in-process map.
+    struct LeaseDeniedBackend(crate::services::npm_packument_cache::InProcessPackumentCache);
+
+    #[async_trait::async_trait]
+    impl crate::services::npm_packument_cache::PackumentCacheBackend for LeaseDeniedBackend {
+        async fn get(&self, key: &str) -> Option<crate::services::npm_packument_cache::CacheHit> {
+            self.0.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            prefix: &str,
+            entry: crate::services::npm_packument_cache::CachedPackument,
+        ) {
+            self.0.set(key, prefix, entry).await
+        }
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.0.invalidate_prefix(prefix).await
+        }
+        async fn try_acquire_refresh_lease(
+            &self,
+            _flight_key: &str,
+            _ttl: std::time::Duration,
+        ) -> Option<crate::services::npm_packument_cache::RefreshLease> {
+            None
+        }
+    }
+
+    /// #2248: when another replica already holds the cross-replica refresh
+    /// lease, a stale hit must serve the cached body WITHOUT spawning its own
+    /// upstream refresh (the holder's result reaches this replica through the
+    /// shared cache). The raw proxy cache is wiped after the first fetch, so
+    /// a wrongly-spawned refresh would be observable as a second upstream
+    /// request.
+    #[tokio::test]
+    async fn test_swr_refresh_skipped_when_lease_held_by_another_replica() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/leasepkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("leasepkg", "1.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // Zero fresh window (every warm hit classifies stale) over a backend
+        // whose refresh lease is always held elsewhere.
+        let mut app_state = build_app_state_with_fresh_ttl(&fx, 0);
+        app_state.npm_packument_cache = Some(std::sync::Arc::new(
+            crate::services::npm_packument_cache::NpmPackumentCache::new(
+                std::sync::Arc::new(LeaseDeniedBackend(
+                    crate::services::npm_packument_cache::InProcessPackumentCache::new(
+                        std::time::Duration::from_secs(3600),
+                    ),
+                )),
+                std::time::Duration::ZERO,
+            ),
+        ));
+        let state = std::sync::Arc::new(app_state);
+
+        // Miss: computes v1 inline — the one permitted upstream request.
+        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
+
+        // Drop the raw proxy cache so a (wrongly spawned) refresh could not
+        // be satisfied locally and would have to hit the upstream.
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // Stale hit: served from cache; the refresh must be lease-skipped.
+        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(stale["versions"]["1.0.0"].is_object(), "got {stale:?}");
+
+        // Give a wrongly-spawned refresh time to reach the upstream before
+        // asserting none did.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let upstream_hits = mock_server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            upstream_hits, 1,
+            "a denied cross-replica lease must skip the background refresh; \
+             the miss-compute is the only permitted upstream request"
         );
     }
 
