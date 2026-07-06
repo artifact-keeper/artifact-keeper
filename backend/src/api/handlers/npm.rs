@@ -511,21 +511,8 @@ pub(crate) async fn invalidate_packument_caches(
     let Some(cache) = state.npm_packument_cache.as_ref() else {
         return;
     };
-    cache.invalidate_package(repo_key, package).await;
-
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    for virtual_key in &virtual_keys {
-        cache.invalidate_package(virtual_key, package).await;
-    }
+    packument_cache::invalidate_package_and_virtuals(&state.db, cache, repo_id, repo_key, package)
+        .await;
 }
 
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;

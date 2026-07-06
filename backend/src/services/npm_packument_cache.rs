@@ -1184,6 +1184,32 @@ impl NpmPackumentCache {
     }
 }
 
+/// Drop every cached variant of `package` in the repository AND in every
+/// virtual repository containing it. Shared by the local-write invalidation
+/// path (publish, dist-tag change, delete) and the upstream feed consumer
+/// (#2249), so "a package changed" means the same thing from both directions.
+pub async fn invalidate_package_and_virtuals(
+    db: &sqlx::PgPool,
+    cache: &NpmPackumentCache,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    package: &str,
+) {
+    cache.invalidate_package(repo_key, package).await;
+    let virtual_keys: Vec<String> = sqlx::query_scalar(
+        "SELECT r.key FROM repositories r \
+         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
+         WHERE vrm.member_repo_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for virtual_key in &virtual_keys {
+        cache.invalidate_package(virtual_key, package).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -820,6 +820,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )
     .await;
 
+    // #2249: proactive packument invalidation from npm's replication feed.
+    // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
+    // via an advisory lock. Detached deliberately: lifecycle is governed by
+    // the shutdown token.
+    let _upstream_feed_task =
+        artifact_keeper_backend::services::upstream_feed::spawn_npm_feed_consumer(
+            &config,
+            db_pool.clone(),
+            state.npm_packument_cache.clone(),
+            runtime_shutdown_token.clone(),
+        );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),

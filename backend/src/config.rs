@@ -687,6 +687,19 @@ pub struct Config {
     /// so a Redis outage degrades to per-replica caching instead of failing
     /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
     pub npm_packument_cache_redis_url: Option<String>,
+
+    // -- npm upstream replication feed (#2249) --
+    /// Opt-in: subscribe to npm's public replication feed and proactively
+    /// invalidate cached computed packuments when packages change upstream,
+    /// so new releases become visible without waiting out the fresh window.
+    /// Best-effort: the packument cache TTLs remain the staleness floor. One
+    /// replica consumes cluster-wide (advisory lock). Env
+    /// `NPM_UPSTREAM_FEED_ENABLED`, default `false`.
+    pub npm_upstream_feed_enabled: bool,
+
+    /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
+    /// default `https://replicate.npmjs.com/_changes`.
+    pub npm_upstream_feed_url: String,
 }
 
 redacted_debug!(Config {
@@ -793,6 +806,8 @@ redacted_debug!(Config {
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
+    show npm_upstream_feed_enabled,
+    show npm_upstream_feed_url,
 });
 
 impl Default for Config {
@@ -906,6 +921,9 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
         }
     }
 }
@@ -1224,6 +1242,17 @@ impl Config {
             npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // Off by default; only an explicit, recognized positive enables
+            // the npm replication-feed consumer (#2249).
+            npm_upstream_feed_enabled: parse_opt_in_flag(
+                env::var("NPM_UPSTREAM_FEED_ENABLED").ok().as_deref(),
+            ),
+            npm_upstream_feed_url: env::var("NPM_UPSTREAM_FEED_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
+                }),
         };
 
         config.validate_jwt_secret()?;

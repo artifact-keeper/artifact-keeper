@@ -3540,6 +3540,9 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
             scan_token_ttl_seconds: 300,
         })
     }
