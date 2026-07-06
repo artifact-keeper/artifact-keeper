@@ -484,6 +484,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::from(allowed),
+            iat_ms: None,
         }
     }
 

@@ -742,6 +742,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -755,6 +756,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

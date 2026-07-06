@@ -6619,6 +6619,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(require_auth(Some(auth)).is_ok());
     }
@@ -8133,6 +8134,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::from(repo_ids),
+            iat_ms: None,
         }
     }
 
@@ -10091,6 +10093,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -12324,6 +12327,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -12531,6 +12535,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

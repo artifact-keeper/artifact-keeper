@@ -34,7 +34,15 @@ use crate::services::permission_service::PermissionService;
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
 /// Extension that holds authenticated user information
-#[derive(Debug, Clone)]
+///
+/// `Default` derives a deny-by-default principal (anonymous, non-admin,
+/// `allowed_repo_ids = AccessScope::default()` = `Restricted(vec![])`, and no
+/// `iat_ms`). It exists so the ~130 test fixtures and the two non-JWT
+/// production literals can spell only the fields they care about via
+/// `..Default::default()`; the JWT source of truth (`impl From<Claims>`) always
+/// sets every field explicitly. The default MUST fail CLOSED — see
+/// `AccessScope::default`.
+#[derive(Debug, Clone, Default)]
 pub struct AuthExtension {
     pub user_id: Uuid,
     pub username: String,
@@ -48,6 +56,17 @@ pub struct AuthExtension {
     pub scopes: Option<Vec<String>>,
     /// Repository-scope authorization decision for this principal.
     pub allowed_repo_ids: AccessScope,
+    /// Calling token's **millisecond** issued-at (`Claims::effective_iat_ms`).
+    ///
+    /// `Some` only on the JWT path (Bearer, cookie, or a JWT presented as a
+    /// Basic-auth password). `None` for API-key, X-API-Key, Basic
+    /// username/password, ticket, and service-account auth (there is no JWT
+    /// `iat`). Used by credential-change handlers (TOTP enable/disable) to
+    /// exempt the calling session's own token from the invalidation it just
+    /// triggered (#1370). Folded onto `AuthExtension` (from the former separate
+    /// `TokenIat` extension) so the single `From<Claims>` source stamps it
+    /// uniformly alongside the live re-derived `is_admin` (#1166, #1394).
+    pub iat_ms: Option<i64>,
 }
 
 /// Marker request extension inserted alongside [`AuthExtension`] when the
@@ -61,25 +80,16 @@ pub struct AuthExtension {
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTicketAuth;
 
-/// Calling token's `iat` (issued-at) Unix-timestamp in seconds.
-///
-/// Inserted alongside [`AuthExtension`] by [`auth_middleware`] only when the
-/// caller authenticated with a JWT (Bearer or cookie). Absent for API-key,
-/// Basic, ticket, and service-account auth (where there is no JWT iat).
-///
-/// Used by handlers that perform credential-change invalidation
-/// (TOTP enable/disable, password change) to exempt the calling session's
-/// own token from being killed by the same operation it just performed.
-/// Issue #1370.
-///
-/// Carries the calling token's **millisecond** issued-at
-/// (`Claims::effective_iat_ms`) so the exempt-caller watermark can be set with
-/// millisecond precision (`caller_iat_ms - 1`), exempting only the caller and
-/// catching every strictly-older token — including one from the same second.
-#[derive(Debug, Clone, Copy)]
-pub struct TokenIat(pub i64);
-
 impl AuthExtension {
+    /// Calling token's **millisecond** issued-at, or `None` for non-JWT
+    /// principals. See [`AuthExtension::iat_ms`]. Handlers performing a
+    /// credential-change invalidation (TOTP enable/disable) use this to exempt
+    /// the calling session's own token from the invalidation it just triggered
+    /// (#1370).
+    pub fn caller_iat_ms(&self) -> Option<i64> {
+        self.iat_ms
+    }
+
     /// Check whether this auth context has a required scope.
     /// JWT sessions (non-API-token auth) always pass since they have no scope
     /// restrictions. API tokens must explicitly include the scope (or `*`/`admin`).
@@ -161,6 +171,11 @@ impl AuthExtension {
 
 impl From<Claims> for AuthExtension {
     fn from(claims: Claims) -> Self {
+        // Single source of truth for the calling JWT's issued-at. Folded here
+        // (from the former separate `TokenIat` extension) so every JWT
+        // principal carries `iat_ms` uniformly (#1394). Computed before the
+        // partial move of `claims.allowed_repo_ids` below.
+        let iat_ms = Some(claims.effective_iat_ms());
         Self {
             user_id: claims.sub,
             username: claims.username,
@@ -170,6 +185,7 @@ impl From<Claims> for AuthExtension {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::from(claims.allowed_repo_ids),
+            iat_ms,
         }
     }
 }
@@ -185,6 +201,8 @@ impl From<User> for AuthExtension {
             is_service_account: user.is_service_account,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            // Basic username/password auth carries no JWT `iat`.
+            iat_ms: None,
         }
     }
 }
@@ -494,10 +512,11 @@ pub async fn auth_middleware(
     // 401 message stays informative when only a ?ticket= was supplied.
     let had_header_credentials = !matches!(extracted, ExtractedToken::None);
 
-    // Carry the JWT `iat` alongside the resolved AuthExtension so handlers
-    // performing credential-change invalidation (TOTP, password) can exempt
-    // the calling session's own token. Only populated on the JWT path.
-    let header_result: Result<(AuthExtension, Option<TokenIat>), &'static str> = match extracted {
+    // The resolved principal. The JWT `iat` used by credential-change
+    // invalidation (TOTP, password) to exempt the calling session's own token
+    // now travels as `AuthExtension::iat_ms`, stamped at the single
+    // `From<Claims>` source; it is `None` for non-JWT principals (#1394).
+    let header_result: Result<AuthExtension, &'static str> = match extracted {
         // Replica-safe access-token validation. The async variant consults the
         // DB credential-change watermark (#1173) so a password reset, TOTP
         // change, or deactivation on a peer replica is honoured here on the
@@ -507,12 +526,9 @@ pub async fn auth_middleware(
         // PR #1190 was supposed to close.
         ExtractedToken::Bearer(token) => {
             match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => {
-                    let iat = TokenIat(claims.effective_iat_ms());
-                    Ok((AuthExtension::from(claims), Some(iat)))
-                }
+                Ok(claims) => Ok(AuthExtension::from(claims)),
                 Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok((ext, None)),
+                    Ok(ext) => Ok(ext),
                     // Same transient bcrypt-capacity shed as the Basic branch
                     // below: a saturated cap is "retry shortly", not "wrong
                     // token". See `TokenAuthError::Overloaded`.
@@ -523,7 +539,7 @@ pub async fn auth_middleware(
         }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => Ok((ext, None)),
+                Ok(ext) => Ok(ext),
                 Err(TokenAuthError::Overloaded) => return service_unavailable_response(),
                 Err(TokenAuthError::Invalid) => Err("Invalid or expired API token"),
             }
@@ -532,7 +548,7 @@ pub async fn auth_middleware(
             None => Err("Invalid Basic auth credentials"),
             Some((username, password)) => {
                 match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _token_pair)) => Ok((AuthExtension::from(user), None)),
+                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
                     // A transient bcrypt-capacity shed must NOT be collapsed
                     // into a 401. `authenticate()` runs bcrypt(cost=12) under a
                     // process-wide concurrency cap (see
@@ -567,13 +583,11 @@ pub async fn auth_middleware(
                         // token. This enables CI/CD keyless flows (e.g. OIDC
                         // token exchange) where package managers like Maven,
                         // pip/twine, and Helm send the AK access token as the
-                        // Basic-auth password. Carry the `iat` so credential
-                        // change invalidation can exempt the calling session.
+                        // Basic-auth password. `From<Claims>` stamps `iat_ms` so
+                        // credential-change invalidation can exempt the calling
+                        // session.
                         match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => {
-                                let iat = TokenIat(claims.effective_iat_ms());
-                                Ok((AuthExtension::from(claims), Some(iat)))
-                            }
+                            Ok(claims) => Ok(AuthExtension::from(claims)),
                             Err(_) => Err("Invalid credentials"),
                         }
                     }
@@ -585,7 +599,7 @@ pub async fn auth_middleware(
     };
 
     let header_error = match header_result {
-        Ok((ext, token_iat)) => {
+        Ok(ext) => {
             // Enforce a forced password rotation (`must_change_password`).
             //
             // The flag is advisory in the token/claims, so we read the live DB
@@ -630,9 +644,6 @@ pub async fn auth_middleware(
             // See #1438 (B10).
             request.extensions_mut().insert(Some(ext.clone()));
             request.extensions_mut().insert(ext);
-            if let Some(iat) = token_iat {
-                request.extensions_mut().insert(iat);
-            }
             return next.run(request).await;
         }
         Err(msg) => msg,
@@ -731,6 +742,8 @@ async fn validate_api_token_with_scopes(
         is_service_account: validation.user.is_service_account,
         scopes: Some(validation.scopes),
         allowed_repo_ids: validation.allowed_repo_ids,
+        // API tokens are not JWTs and carry no `iat`.
+        iat_ms: None,
     })
 }
 
@@ -1843,6 +1856,7 @@ mod tests {
             scan_pull_repo: None,
         };
 
+        let effective = claims.effective_iat_ms();
         let ext = AuthExtension::from(claims);
         assert_eq!(ext.user_id, user_id);
         assert_eq!(ext.username, "testuser");
@@ -1850,6 +1864,47 @@ mod tests {
         assert!(ext.is_admin);
         assert!(!ext.is_api_token);
         assert!(ext.scopes.is_none());
+        // #1394: the folded `iat_ms` is stamped from the single `From<Claims>`
+        // source and equals the calling token's `effective_iat_ms`.
+        assert_eq!(ext.iat_ms, Some(effective));
+        assert_eq!(ext.caller_iat_ms(), Some(effective));
+    }
+
+    /// #1394: a Basic username/password principal (`From<User>`) carries no JWT
+    /// `iat`, so its folded `iat_ms` is `None` and it falls back to the
+    /// "invalidate everything" branch of `invalidate_other_sessions`.
+    #[test]
+    fn test_auth_extension_from_user_has_no_iat_ms() {
+        use crate::models::user::{AuthProvider, User};
+        let now = chrono::Utc::now();
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "basic".to_string(),
+            email: "basic@example.com".to_string(),
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: now,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let ext = AuthExtension::from(user);
+        assert_eq!(ext.iat_ms, None);
+        assert_eq!(ext.caller_iat_ms(), None);
     }
 
     #[test]
@@ -1888,6 +1943,7 @@ mod tests {
             is_service_account: false,
             scopes: Some(scopes),
             allowed_repo_ids: AccessScope::from(repo_ids),
+            iat_ms: None,
         }
     }
 
@@ -1952,6 +2008,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(ext.has_scope("anything"));
     }
@@ -2007,6 +2064,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         let result = require_auth_basic_scope(Some(ext), "maven", "write");
         assert!(result.is_ok(), "JWT sessions must not be scope-gated");
@@ -2090,6 +2148,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(require_scope_response(Some(&ext), "write").is_ok());
         assert!(require_scope_response(Some(&ext), "delete").is_ok());
@@ -2124,6 +2183,7 @@ mod tests {
             is_service_account: false,
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
 
         let cloned = ext.clone();
@@ -2188,6 +2248,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         let result = require_auth_basic(Some(ext), "maven");
         assert!(result.is_ok());
@@ -2549,6 +2610,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         // JWT sessions have no repo restrictions (allowed_repo_ids is None).
         assert!(ext.can_access_repo(Uuid::new_v4()));
@@ -2567,6 +2629,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(ext.require_admin().is_ok());
     }
@@ -2582,6 +2645,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         let err = ext.require_admin().unwrap_err();
         assert!(err.to_string().contains("Admin access required"));
@@ -2598,6 +2662,7 @@ mod tests {
             is_service_account: true,
             scopes: Some(vec!["admin".to_string()]),
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(ext.require_admin().is_ok());
     }
@@ -2613,6 +2678,7 @@ mod tests {
             is_service_account: true,
             scopes: Some(vec!["read".to_string()]),
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(ext.require_admin().is_err());
     }
@@ -2632,6 +2698,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -2866,6 +2933,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         // The middleware skips permission checks when is_admin is true.
         // Verify the flag is correctly detected.
@@ -2972,6 +3040,7 @@ mod tests {
             is_service_account: true,
             scopes: Some(vec!["admin".to_string()]),
             allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(
             ext.is_admin,
@@ -3791,6 +3860,7 @@ mod tests {
                 is_service_account: true,
                 scopes: Some(vec!["read".to_string()]),
                 allowed_repo_ids: AccessScope::Admin,
+                iat_ms: None,
             }
         }
 

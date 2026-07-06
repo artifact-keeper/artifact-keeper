@@ -612,6 +612,7 @@ mod tests {
             is_service_account: false,
             scopes,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

@@ -69,6 +69,18 @@ impl AccessScope {
     }
 }
 
+impl Default for AccessScope {
+    /// Deny-by-default: the default scope grants access to **nothing**
+    /// (`Restricted(vec![])`), never `Admin`. This is what `..Default::default()`
+    /// resolves to when an `AuthExtension` literal omits `allowed_repo_ids`
+    /// (e.g. test fixtures). If any production path ever constructs an
+    /// `AuthExtension` via `..Default::default()`, it MUST fail CLOSED — an
+    /// accidental omission can never silently grant cross-repo access.
+    fn default() -> Self {
+        AccessScope::Restricted(Vec::new())
+    }
+}
+
 impl From<Option<Vec<Uuid>>> for AccessScope {
     fn from(value: Option<Vec<Uuid>>) -> Self {
         match value {
@@ -119,6 +131,18 @@ mod tests {
         assert!(scope.grants(repo(1)));
         assert!(scope.grants(repo(2)));
         assert!(scope.grants(Uuid::nil()));
+    }
+
+    /// SECURITY-CRITICAL (#1394): the derived `Default` — reached whenever an
+    /// `AuthExtension` is built via `..Default::default()` — must fail CLOSED.
+    /// It is `Restricted(vec![])` (grants nothing), never `Admin`.
+    #[test]
+    fn default_is_deny_by_default_never_admin() {
+        let scope = AccessScope::default();
+        assert_eq!(scope, AccessScope::Restricted(Vec::new()));
+        assert_ne!(scope, AccessScope::Admin);
+        assert!(!scope.grants(repo(1)));
+        assert!(!scope.grants(Uuid::nil()));
     }
 
     #[test]

@@ -298,6 +298,28 @@ pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat_ms: i64) {
     invalidate_user_tokens_at(user_id, watermark_ms);
 }
 
+/// Invalidate every OTHER session for `user_id` on a **self-service**
+/// credential change (TOTP enable/disable), exempting the calling session's own
+/// JWT so the user is not signed out by their own action (#1370).
+///
+/// `caller_iat_ms` is the calling token's millisecond issued-at
+/// ([`Claims::effective_iat_ms`], surfaced as [`AuthExtension::iat_ms`]).
+/// `None` — a non-JWT caller (API key, Basic username/password, service
+/// account) that has no `iat` to exempt — falls back to killing ALL of the
+/// user's sessions, preserving the original #1146 semantic.
+///
+/// This is the single home for the previously-duplicated "invalidate others,
+/// keep caller" branch that lived verbatim in both `enable_totp` and
+/// `disable_totp` (#1394). It is deliberately distinct from the plain
+/// [`invalidate_user_tokens`] used by the admin-acting-on-another-user sites
+/// (deactivate / reset / SSO demotion), which have no caller session to keep.
+pub fn invalidate_other_sessions(user_id: Uuid, caller_iat_ms: Option<i64>) {
+    match caller_iat_ms {
+        Some(ms) => invalidate_user_tokens_except_caller(user_id, ms),
+        None => invalidate_user_tokens(user_id),
+    }
+}
+
 /// Set the in-memory watermark to a specific epoch **millisecond**. Shared by
 /// the "invalidate everything", "floor second" and "exempt caller" variants
 /// above.
@@ -4860,6 +4882,50 @@ mod tests {
         assert!(
             is_token_invalidated(user_id, caller_iat_ms - 5000),
             "a strictly older token must be invalidated"
+        );
+    }
+
+    /// `invalidate_other_sessions` (the extracted #1394 helper) must exempt the
+    /// calling session when a JWT `iat` is supplied and fall back to killing
+    /// ALL sessions for a non-JWT caller (`None`).
+    #[test]
+    fn test_invalidate_other_sessions_exempts_caller_with_iat() {
+        let user_id = Uuid::new_v4();
+        let caller_iat_ms = Utc::now().timestamp().saturating_mul(1000) + 421;
+
+        invalidate_other_sessions(user_id, Some(caller_iat_ms));
+
+        // Caller's own token survives; strictly-older tokens (incl. same-second)
+        // are invalidated — identical to `invalidate_user_tokens_except_caller`.
+        assert!(
+            !is_token_invalidated(user_id, caller_iat_ms),
+            "the calling session must be exempt when its iat is supplied"
+        );
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 1),
+            "an older same-second session must be invalidated"
+        );
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 5000),
+            "a strictly older session must be invalidated"
+        );
+    }
+
+    /// A non-JWT caller (`None`) has no session to exempt, so every session —
+    /// including one minted at the current instant — is invalidated (the legacy
+    /// #1146 "invalidate everything" semantic).
+    #[test]
+    fn test_invalidate_other_sessions_none_kills_all() {
+        let user_id = Uuid::new_v4();
+        // A token minted "now" (its iat is <= the NOW() watermark this helper
+        // writes for the None case).
+        let now_token_iat_ms = Utc::now().timestamp_millis();
+
+        invalidate_other_sessions(user_id, None);
+
+        assert!(
+            is_token_invalidated(user_id, now_token_iat_ms),
+            "a None (non-JWT) caller must invalidate all sessions, keeping none"
         );
     }
 

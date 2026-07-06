@@ -633,6 +633,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_ok());
     }
@@ -648,6 +649,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         let err = auth.require_admin().unwrap_err();
         assert!(
@@ -668,6 +670,7 @@ mod tests {
             is_service_account: false,
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_err());
     }
@@ -683,6 +686,7 @@ mod tests {
             is_service_account: false,
             scopes: Some(vec!["admin".to_string()]),
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_ok());
     }

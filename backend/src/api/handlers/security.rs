@@ -1959,6 +1959,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
 
         // ---- Case 1: non-admin + bypass_dedup=true -> 403 Authorization

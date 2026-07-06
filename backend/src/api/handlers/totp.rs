@@ -16,12 +16,10 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api::extractors::request_scheme_is_https;
 use crate::api::handlers::auth::set_auth_cookies;
-use crate::api::middleware::auth::{AuthExtension, TokenIat};
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::auth_service::{
-    invalidate_user_tokens, invalidate_user_tokens_except_caller, AuthService,
-};
+use crate::services::auth_service::{invalidate_other_sessions, AuthService};
 
 /// Build a TOTP instance from raw secret bytes and a username label.
 fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
@@ -181,7 +179,6 @@ pub struct TotpEnableResponse {
 pub async fn enable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<TotpEnableResponse>> {
     // Fetch stored secret
@@ -253,7 +250,7 @@ pub async fn enable_totp(
     // When the caller didn't use a JWT (no `iat`), fall back to `NOW()` so
     // the original #1146 semantic still holds for any other JWT sessions
     // this user has.
-    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    let caller_iat_ms = auth.caller_iat_ms();
     let verified_ts: DateTime<Utc> = match caller_iat_ms {
         Some(iat_ms) => DateTime::<Utc>::from_timestamp_millis(iat_ms).ok_or_else(|| {
             AppError::Internal(format!(
@@ -281,10 +278,7 @@ pub async fn enable_totp(
     // Refresh tokens are revoked via the DB on every replica below so the
     // OAuth refresh-grant cannot mint a fresh access token from a stale
     // refresh JWT — that's the original #1146 threat.
-    match caller_iat_ms {
-        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
-        None => invalidate_user_tokens(auth.user_id),
-    }
+    invalidate_other_sessions(auth.user_id, caller_iat_ms);
 
     // Refresh-token family revocation (#1146 / #1370): a refresh JWT issued
     // before TOTP was enabled stays valid until natural expiry. Mark every
@@ -514,7 +508,6 @@ pub struct TotpDisableRequest {
 pub async fn disable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpDisableRequest>,
 ) -> Result<()> {
     // Verify password
@@ -572,11 +565,7 @@ pub async fn disable_totp(
     // Invalidate prior tokens issued under the stricter (TOTP-required)
     // policy while exempting the calling session so the user is not signed
     // out by their own disable action (#1370).
-    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
-    match caller_iat_ms {
-        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
-        None => invalidate_user_tokens(auth.user_id),
-    }
+    invalidate_other_sessions(auth.user_id, auth.caller_iat_ms());
 
     // Refresh-token family revocation (#1146 / #1370): kill every refresh
     // JWT for this user across replicas so the OAuth refresh-grant cannot
@@ -976,6 +965,8 @@ mod totp_token_invalidation_regression_tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            // Non-JWT caller (API-token / basic-auth): no `iat` to exempt.
+            iat_ms: None,
         };
 
         // Token issued one minute before the change (millisecond issued-at,
@@ -993,7 +984,6 @@ mod totp_token_invalidation_regression_tests {
         let result = enable_totp(
             State(state),
             Extension(auth),
-            None,
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -1048,17 +1038,6 @@ mod totp_token_invalidation_regression_tests {
         let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
         let code = totp.generate_current().expect("generate code");
 
-        let auth = AuthExtension {
-            user_id,
-            username: format!("test-{user_id}"),
-            email: format!("test-{user_id}@example.test"),
-            is_admin: false,
-            is_api_token: false,
-            is_service_account: false,
-            scopes: None,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
-        };
-
         // The caller's token was issued "now" (millisecond `iat_ms`, as the
         // middleware now supplies via `Claims::effective_iat_ms`); tokens
         // issued before now must be killed; the caller's own token must
@@ -1068,10 +1047,23 @@ mod totp_token_invalidation_regression_tests {
         let pre_caller_iat_ms = caller_iat_ms - 60_000;
         let older_same_second_ms = caller_iat_ms - 1;
 
+        // The calling JWT's issued-at now travels on `AuthExtension::iat_ms`
+        // (folded from the former separate `TokenIat` extension, #1394).
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: Some(caller_iat_ms),
+        };
+
         let result = enable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -1145,6 +1137,7 @@ mod totp_token_invalidation_regression_tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
 
         let pre_change_iat = Utc::now().timestamp_millis() - 60_000;
@@ -1158,7 +1151,6 @@ mod totp_token_invalidation_regression_tests {
         let result = disable_totp(
             State(state),
             Extension(auth),
-            None,
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,
@@ -1220,6 +1212,12 @@ mod totp_token_invalidation_regression_tests {
         let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
         let code = totp.generate_current().expect("generate code");
 
+        let caller_iat_ms = Utc::now().timestamp_millis();
+        let pre_caller_iat_ms = caller_iat_ms - 60_000;
+        let older_same_second_ms = caller_iat_ms - 1;
+
+        // The calling JWT's issued-at now travels on `AuthExtension::iat_ms`
+        // (folded from the former separate `TokenIat` extension, #1394).
         let auth = AuthExtension {
             user_id,
             username: format!("test-{user_id}"),
@@ -1229,16 +1227,12 @@ mod totp_token_invalidation_regression_tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: Some(caller_iat_ms),
         };
-
-        let caller_iat_ms = Utc::now().timestamp_millis();
-        let pre_caller_iat_ms = caller_iat_ms - 60_000;
-        let older_same_second_ms = caller_iat_ms - 1;
 
         let result = disable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,

@@ -244,6 +244,7 @@ mod tests {
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.is_admin);
         assert!(!auth.is_api_token);
@@ -260,6 +261,7 @@ mod tests {
             is_service_account: false,
             scopes: Some(vec!["read".to_string()]),
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(!auth.is_admin);
         assert!(auth.is_api_token);
