@@ -4545,12 +4545,26 @@ mod tests {
         use crate::models::user::AuthProvider;
 
         let (user_id, username) = tdh::create_user(pool).await; // non-admin
-        sqlx::query("UPDATE users SET must_change_password = $1 WHERE id = $2")
-            .bind(must_change_password)
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("set must_change_password");
+                                                                // Backdate the credential-change watermark (both `password_changed_at`
+                                                                // and `privileges_changed_at`, the latter DEFAULT NOW() from migration
+                                                                // 131) well before the bearer minted below. `create_user` leaves both at
+                                                                // their NOW() insert-time default, which pins the DB watermark
+                                                                // (GREATEST(password_changed_at, totp_verified_at, privileges_changed_at))
+                                                                // to ~now; the token minted microseconds later then races that watermark
+                                                                // and the async validator in `auth_middleware` intermittently 401s the
+                                                                // request with "Token invalidated by credential change" under parallel
+                                                                // test load. Aging the watermark 60s removes the race deterministically.
+        sqlx::query(
+            "UPDATE users SET must_change_password = $1, \
+             password_changed_at = NOW() - INTERVAL '60 seconds', \
+             privileges_changed_at = NOW() - INTERVAL '60 seconds' \
+             WHERE id = $2",
+        )
+        .bind(must_change_password)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("set must_change_password");
 
         let now = chrono::Utc::now();
         let user = User {
