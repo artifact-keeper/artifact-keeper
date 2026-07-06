@@ -22,8 +22,9 @@
 //! Best-effort by design: the feed is a freshness optimisation, never the
 //! correctness mechanism — the packument cache's TTL/stale-while-revalidate
 //! windows remain the staleness floor if the feed is down, re-shaped, or
-//! events are missed. Actions must therefore be idempotent, and a brief
-//! dual-consumer overlap after a leader's lock connection dies is harmless.
+//! events are missed. Actions must therefore be idempotent; a dual-consumer
+//! overlap after a leader's lock connection silently dies is harmless and
+//! bounded by the leadership term (leaders step down and re-contend).
 //!
 //! Cross-replica note: with the shared (Redis) packument-cache backend an
 //! invalidation issued by the consumer propagates to every replica; with the
@@ -78,6 +79,15 @@ const FEED_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// subscription.
 const LEADER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Upper bound on one uninterrupted leadership stint: the leader steps
+/// down, releases the lock and re-contends. A Postgres session lock is
+/// freed server-side when its (detached) connection dies, and the holder
+/// has no way to notice — without a bounded term that silent loss would
+/// leave the old leader consuming alongside its successor until process
+/// restart. The term bounds any such overlap; actions are idempotent, so
+/// the overlap is harmless while it lasts.
+const LEADER_TERM: Duration = Duration::from_secs(300);
+
 /// Pacing for adapters that return an empty batch instantly (a well-behaved
 /// long-poll blocks server-side instead). Protects against a hot loop when a
 /// feed answers immediately with no changes.
@@ -103,17 +113,28 @@ pub struct FeedBatch {
 pub trait UpstreamFeedAdapter: Send + Sync {
     /// Stable identity for leadership locking and resume-state keying.
     fn feed_key(&self) -> &str;
+    /// The cursor to poll with when no persisted cursor exists. Feeds whose
+    /// natural start is their genesis (CouchDB `since=0`) MUST return a
+    /// head sentinel here: replaying an upstream's full change history on
+    /// first enablement would invalidate live cache entries for hours while
+    /// delivering no freshness benefit.
+    fn initial_cursor(&self) -> Option<String> {
+        None
+    }
     /// Run one poll round, resuming after `since` when provided. Long-poll
     /// adapters block server-side until changes exist or their timeout
     /// lapses, so an empty batch is a normal outcome, not an error.
     async fn poll(&self, since: Option<&str>) -> Result<FeedBatch>;
 }
 
-/// Action applied to each feed event. Must be idempotent and cheap: the feed
-/// is best-effort, so an action may observe duplicate or missed events.
+/// Action applied to each polled batch of events. Must be idempotent: the
+/// feed is best-effort, so an action may observe duplicate or missed events.
+/// Batch-shaped so implementations can amortise per-batch work (the default
+/// invalidation action resolves the repository set once per batch, not once
+/// per event).
 #[async_trait]
 pub trait FeedAction: Send + Sync {
-    async fn apply(&self, event: &FeedEvent);
+    async fn apply(&self, events: &[FeedEvent]);
 }
 
 /// Resume-cursor persistence seam (table `upstream_feed_state`).
@@ -194,7 +215,9 @@ impl NpmReplicationFeedAdapter {
     pub fn new(url: &str) -> Result<Self> {
         let parsed = Url::parse(url)
             .map_err(|e| AppError::Config(format!("invalid npm feed URL '{url}': {e}")))?;
-        let http = reqwest::Client::builder()
+        // The shared builder carries the custom-CA bundle and the SSRF
+        // redirect policy every outbound client in the app uses.
+        let http = crate::services::http_client::base_client_builder()
             .timeout(NPM_FEED_HTTP_TIMEOUT)
             .user_agent(concat!("artifact-keeper/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -211,6 +234,12 @@ impl NpmReplicationFeedAdapter {
 impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
     fn feed_key(&self) -> &str {
         &self.feed_key
+    }
+
+    /// CouchDB understands `since=now` on long-poll feeds: start at the
+    /// current head instead of replaying the registry's entire history.
+    fn initial_cursor(&self) -> Option<String> {
+        Some("now".to_string())
     }
 
     async fn poll(&self, since: Option<&str>) -> Result<FeedBatch> {
@@ -288,7 +317,9 @@ impl PackumentInvalidationAction {
 
 #[async_trait]
 impl FeedAction for PackumentInvalidationAction {
-    async fn apply(&self, event: &FeedEvent) {
+    async fn apply(&self, events: &[FeedEvent]) {
+        // Resolve the covered repositories (and their virtuals) once per
+        // batch; the per-event work is then pure cache invalidation.
         let repos: Vec<(uuid::Uuid, String, Option<String>)> = match sqlx::query_as(
             "SELECT id, key, upstream_url FROM repositories \
              WHERE format = 'npm'::repository_format \
@@ -310,14 +341,17 @@ impl FeedAction for PackumentInvalidationAction {
             {
                 continue;
             }
-            npm_packument_cache::invalidate_package_and_virtuals(
-                &self.db,
-                &self.cache,
-                repo_id,
-                &repo_key,
-                &event.package,
-            )
-            .await;
+            let virtual_keys = npm_packument_cache::virtual_repo_keys(&self.db, repo_id).await;
+            for event in events {
+                self.cache
+                    .invalidate_package(&repo_key, &event.package)
+                    .await;
+                for virtual_key in &virtual_keys {
+                    self.cache
+                        .invalidate_package(virtual_key, &event.package)
+                        .await;
+                }
+            }
         }
     }
 }
@@ -378,6 +412,7 @@ pub struct FeedConsumer {
     lock: Arc<dyn ClusterLock>,
     cancel: CancellationToken,
     leader_retry: Duration,
+    leader_term: Duration,
     backoff_initial: Duration,
     backoff_max: Duration,
     empty_batch_pacing: Duration,
@@ -398,6 +433,7 @@ impl FeedConsumer {
             lock,
             cancel,
             leader_retry: LEADER_RETRY_INTERVAL,
+            leader_term: LEADER_TERM,
             backoff_initial: FEED_BACKOFF_INITIAL,
             backoff_max: FEED_BACKOFF_MAX,
             empty_batch_pacing: EMPTY_BATCH_PACING,
@@ -410,11 +446,13 @@ impl FeedConsumer {
     fn with_timings(
         mut self,
         leader_retry: Duration,
+        leader_term: Duration,
         backoff_initial: Duration,
         backoff_max: Duration,
         empty_batch_pacing: Duration,
     ) -> Self {
         self.leader_retry = leader_retry;
+        self.leader_term = leader_term;
         self.backoff_initial = backoff_initial;
         self.backoff_max = backoff_max;
         self.empty_batch_pacing = empty_batch_pacing;
@@ -463,7 +501,11 @@ impl FeedConsumer {
                 feed = feed_key,
                 "upstream feed consumer: leadership acquired"
             );
-            self.consume_until_cancelled(&feed_key).await;
+            self.consume_for_one_term(&feed_key).await;
+            // Step down at term end (or cancellation) and re-contend, so a
+            // lock silently lost to a dead connection converges back to a
+            // single consumer within one term instead of persisting until
+            // process restart.
             lease.release().await;
             if self.cancel.is_cancelled() {
                 return;
@@ -471,33 +513,36 @@ impl FeedConsumer {
         }
     }
 
-    /// The leader loop: poll, apply actions, persist the cursor; back off on
-    /// feed errors. Returns only on cancellation.
-    async fn consume_until_cancelled(&self, feed_key: &str) {
+    /// One leadership term: poll, apply actions, persist the cursor; back
+    /// off on feed errors. Returns at term end or on cancellation.
+    async fn consume_for_one_term(&self, feed_key: &str) {
         let mut since = match self.state.load(feed_key).await {
-            Ok(seq) => seq,
+            Ok(Some(seq)) => Some(seq),
+            // First enablement: start at the adapter's head sentinel, never
+            // at the feed's genesis.
+            Ok(None) => self.adapter.initial_cursor(),
             Err(e) => {
-                // Consuming without a cursor replays recent events; actions
-                // are idempotent, so duplicates are harmless.
                 tracing::warn!(
                     feed = feed_key,
                     error = %e,
                     "upstream feed cursor unreadable; consuming from the feed head"
                 );
-                None
+                self.adapter.initial_cursor()
             }
         };
         let mut backoff = self.backoff_initial;
+        let term_ends = tokio::time::sleep(self.leader_term);
+        tokio::pin!(term_ends);
         loop {
             let polled = tokio::select! {
                 _ = self.cancel.cancelled() => return,
+                _ = &mut term_ends => return,
                 polled = self.adapter.poll(since.as_deref()) => polled,
             };
             match polled {
                 Ok(batch) => {
-                    backoff = self.backoff_initial;
-                    for event in &batch.events {
-                        self.action.apply(event).await;
+                    if !batch.events.is_empty() {
+                        self.action.apply(&batch.events).await;
                     }
                     let advanced = batch.last_seq.is_some() && batch.last_seq != since;
                     if let Some(last_seq) = batch.last_seq {
@@ -513,13 +558,30 @@ impl FeedConsumer {
                         }
                         since = Some(last_seq);
                     }
-                    // A well-behaved long-poll blocks server-side when idle;
-                    // pace anything that answers instantly with no progress.
-                    if batch.events.is_empty()
-                        && !advanced
-                        && cancelled_within(&self.cancel, self.empty_batch_pacing).await
-                    {
-                        return;
+                    if advanced {
+                        backoff = self.backoff_initial;
+                    } else if batch.events.is_empty() {
+                        // Idle long-poll round (a well-behaved feed already
+                        // blocked server-side): gentle fixed pacing so an
+                        // instant-empty feed cannot hot-loop.
+                        if cancelled_within(&self.cancel, self.empty_batch_pacing).await {
+                            return;
+                        }
+                    } else {
+                        // Events but no cursor progress: the next poll would
+                        // replay the same batch (e.g. a feed re-shape whose
+                        // seqs we cannot normalise). Escalating backoff
+                        // bounds the replay rate; actions stay idempotent.
+                        tracing::warn!(
+                            feed = feed_key,
+                            backoff_secs = backoff.as_secs_f32(),
+                            "upstream feed returned events without advancing the cursor; \
+                             backing off to bound the replay"
+                        );
+                        if cancelled_within(&self.cancel, backoff).await {
+                            return;
+                        }
+                        backoff = next_backoff(backoff, self.backoff_max);
                     }
                 }
                 Err(e) => {
@@ -791,10 +853,23 @@ mod tests {
         assert!(NpmReplicationFeedAdapter::new("not a url").is_err());
     }
 
+    #[test]
+    fn npm_adapter_bootstraps_at_the_feed_head() {
+        let adapter =
+            NpmReplicationFeedAdapter::new(NPM_REPLICATION_FEED_DEFAULT_URL).expect("adapter");
+        assert_eq!(
+            adapter.initial_cursor().as_deref(),
+            Some("now"),
+            "first enablement must start at the feed head, not replay the \
+             registry's entire change history from seq 0"
+        );
+    }
+
     // -- consumer ---------------------------------------------------------------
 
     struct ScriptedAdapter {
         feed_key: String,
+        initial_cursor: Option<String>,
         polls: Mutex<VecDeque<Result<FeedBatch>>>,
         sinces: Mutex<Vec<Option<String>>>,
     }
@@ -803,6 +878,16 @@ mod tests {
         fn new(polls: Vec<Result<FeedBatch>>) -> Arc<Self> {
             Arc::new(Self {
                 feed_key: "test-feed".to_string(),
+                initial_cursor: None,
+                polls: Mutex::new(polls.into()),
+                sinces: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn with_initial_cursor(polls: Vec<Result<FeedBatch>>, cursor: &str) -> Arc<Self> {
+            Arc::new(Self {
+                feed_key: "test-feed".to_string(),
+                initial_cursor: Some(cursor.to_string()),
                 polls: Mutex::new(polls.into()),
                 sinces: Mutex::new(Vec::new()),
             })
@@ -817,6 +902,9 @@ mod tests {
     impl UpstreamFeedAdapter for ScriptedAdapter {
         fn feed_key(&self) -> &str {
             &self.feed_key
+        }
+        fn initial_cursor(&self) -> Option<String> {
+            self.initial_cursor.clone()
         }
         async fn poll(&self, since: Option<&str>) -> Result<FeedBatch> {
             self.sinces
@@ -846,8 +934,9 @@ mod tests {
 
     #[async_trait]
     impl FeedAction for RecordingAction {
-        async fn apply(&self, event: &FeedEvent) {
-            self.applied.lock().unwrap().push(event.package.clone());
+        async fn apply(&self, events: &[FeedEvent]) {
+            let mut applied = self.applied.lock().unwrap();
+            applied.extend(events.iter().map(|event| event.package.clone()));
         }
     }
 
@@ -904,6 +993,7 @@ mod tests {
     ) -> FeedConsumer {
         FeedConsumer::new(adapter, action, state, lock, cancel).with_timings(
             Duration::from_millis(20),
+            Duration::from_secs(60),
             Duration::from_millis(10),
             Duration::from_millis(40),
             Duration::from_millis(10),
@@ -1141,6 +1231,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_first_run_polls_from_the_adapters_head_cursor() {
+        let adapter = ScriptedAdapter::with_initial_cursor(vec![batch(&["pkg"], "8")], "now");
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action,
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| !adapter.sinces().is_empty()).await,
+            "the consumer must start polling"
+        );
+        assert_eq!(
+            adapter.sinces()[0].as_deref(),
+            Some("now"),
+            "with no persisted cursor the first poll must use the adapter's \
+             head sentinel"
+        );
+        assert!(
+            wait_until(|| state.get("test-feed") == Some("8".to_string())).await,
+            "the first real cursor replaces the sentinel"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_backs_off_when_events_arrive_without_cursor_progress() {
+        // A feed re-shape whose seqs cannot be normalised: events keep
+        // coming but the cursor never advances. The consumer must not
+        // hot-loop replaying the same batch.
+        let stuck = FeedBatch {
+            events: vec![FeedEvent {
+                package: "stuck-pkg".to_string(),
+            }],
+            last_seq: None,
+        };
+        let adapter = ScriptedAdapter::new(vec![
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck.clone()),
+            Ok(stuck),
+        ]);
+        let action = Arc::new(RecordingAction::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            Arc::new(MemoryStateStore::default()),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| !action.applied().is_empty()).await,
+            "the stalled batch is still applied at least once"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let polls = adapter.sinces().len();
+        assert!(
+            polls <= 12,
+            "a stalled cursor must back off, not hot-loop; observed {polls} \
+             polls in 300ms with a 10ms initial backoff"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    /// A lock wrapper counting acquire attempts, so term-end re-contention
+    /// is observable without racing the release/re-acquire gap.
+    #[derive(Clone)]
+    struct CountingLock {
+        inner: InMemoryClusterLock,
+        acquires: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ClusterLock for CountingLock {
+        async fn try_acquire(
+            &self,
+            class: i32,
+            obj: i32,
+        ) -> crate::error::Result<Option<crate::services::cluster_lock::ClusterLease>> {
+            self.acquires
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.try_acquire(class, obj).await
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_steps_down_at_term_end_and_recontends() {
+        // A leader whose lock connection silently died can only discover it
+        // by re-contending; the bounded term forces that periodically. The
+        // leader is sticky (it re-acquires immediately), so the observable
+        // signal is repeated acquire attempts, not a leadership gap.
+        let lock = CountingLock {
+            inner: InMemoryClusterLock::default(),
+            acquires: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let adapter = ScriptedAdapter::new(vec![batch(&["pkg-a"], "1")]);
+        let action = Arc::new(RecordingAction::default());
+        let cancel = CancellationToken::new();
+        let consumer = FeedConsumer::new(
+            adapter.clone(),
+            action.clone(),
+            Arc::new(MemoryStateStore::default()),
+            Arc::new(lock.clone()),
+            cancel.clone(),
+        )
+        .with_timings(
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| !action.applied().is_empty()).await,
+            "the consumer leads and consumes initially"
+        );
+        let acquires = lock.acquires.clone();
+        assert!(
+            wait_until(move || acquires.load(std::sync::atomic::Ordering::SeqCst) >= 3).await,
+            "the leader must step down at term end and re-contend the lock \
+             (this is what bounds dual consumption after a silent lock loss)"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
     async fn consumer_stops_promptly_on_cancellation() {
         let adapter = ScriptedAdapter::new(vec![]);
         let cancel = CancellationToken::new();
@@ -1272,9 +1508,9 @@ mod tests {
 
         let action = PackumentInvalidationAction::new(pool.clone(), cache.clone());
         action
-            .apply(&FeedEvent {
+            .apply(&[FeedEvent {
                 package: "left-pad".to_string(),
-            })
+            }])
             .await;
 
         assert!(

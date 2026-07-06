@@ -931,7 +931,20 @@ const INVALIDATION_GENERATIONS_MAX: usize = 1_024;
 /// write cannot re-install pre-write data.
 pub struct StoreGuard {
     prefix: String,
+    epoch: u64,
     generation: u64,
+}
+
+/// Per-package invalidation generations plus a map-wide epoch. The epoch
+/// bumps whenever the map is cleared at cap, so a guard captured before the
+/// clear can never match the post-clear default generation — without it, a
+/// package invalidated and then swept out of the map would report
+/// generation 0 again, letting an in-flight pre-invalidation compute
+/// re-install the very data the invalidation dropped.
+#[derive(Default)]
+struct InvalidationGenerations {
+    epoch: u64,
+    generations: HashMap<String, u64>,
 }
 
 /// The computed-packument cache: freshness policy and refresh deduplication
@@ -942,7 +955,7 @@ pub struct NpmPackumentCache {
     refresh_flights: Arc<Mutex<HashSet<String>>>,
     /// Per-package invalidation generation, bumped by
     /// [`Self::invalidate_package`] and checked by [`Self::store_guarded`].
-    invalidation_generations: Mutex<HashMap<String, u64>>,
+    invalidation_generations: Mutex<InvalidationGenerations>,
 }
 
 impl NpmPackumentCache {
@@ -951,17 +964,20 @@ impl NpmPackumentCache {
             backend,
             fresh_ttl,
             refresh_flights: Arc::new(Mutex::new(HashSet::new())),
-            invalidation_generations: Mutex::new(HashMap::new()),
+            invalidation_generations: Mutex::new(InvalidationGenerations::default()),
         }
     }
 
-    fn generation_of(&self, prefix: &str) -> u64 {
-        self.invalidation_generations
+    /// The (epoch, per-package generation) pair a store guard must match.
+    fn generation_of(&self, prefix: &str) -> (u64, u64) {
+        let state = self
+            .invalidation_generations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(prefix)
-            .copied()
-            .unwrap_or(0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            state.epoch,
+            state.generations.get(prefix).copied().unwrap_or(0),
+        )
     }
 
     /// Build the cache described by the configuration, or `None` when the
@@ -1022,8 +1038,10 @@ impl NpmPackumentCache {
     /// Capture the package's invalidation generation before a compute starts.
     pub fn begin_store(&self, repo_key: &str, package: &str) -> StoreGuard {
         let prefix = invalidation_prefix(repo_key, package);
+        let (epoch, generation) = self.generation_of(&prefix);
         StoreGuard {
-            generation: self.generation_of(&prefix),
+            epoch,
+            generation,
             prefix,
         }
     }
@@ -1035,11 +1053,11 @@ impl NpmPackumentCache {
     /// guard is process-local — see the module docs for the bounded
     /// cross-replica window on the shared backend.)
     pub async fn store_guarded(&self, guard: &StoreGuard, key: &str, entry: CachedPackument) {
-        if self.generation_of(&guard.prefix) != guard.generation {
+        if self.generation_of(&guard.prefix) != (guard.epoch, guard.generation) {
             return;
         }
         self.backend.set(key, &guard.prefix, entry).await;
-        if self.generation_of(&guard.prefix) != guard.generation {
+        if self.generation_of(&guard.prefix) != (guard.epoch, guard.generation) {
             self.backend.invalidate_prefix(&guard.prefix).await;
         }
     }
@@ -1051,18 +1069,20 @@ impl NpmPackumentCache {
     pub async fn invalidate_package(&self, repo_key: &str, package: &str) {
         let prefix = invalidation_prefix(repo_key, package);
         {
-            let mut generations = self
+            let mut state = self
                 .invalidation_generations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if generations.len() >= INVALIDATION_GENERATIONS_MAX
-                && !generations.contains_key(&prefix)
+            if state.generations.len() >= INVALIDATION_GENERATIONS_MAX
+                && !state.generations.contains_key(&prefix)
             {
-                // Clearing is safe-conservative: any in-flight guard sees a
-                // generation change and skips its store.
-                generations.clear();
+                // Clearing is safe-conservative ONLY together with the epoch
+                // bump: a swept package would otherwise report generation 0
+                // again and in-flight guards captured at 0 would pass.
+                state.generations.clear();
+                state.epoch += 1;
             }
-            *generations.entry(prefix.clone()).or_insert(0) += 1;
+            *state.generations.entry(prefix.clone()).or_insert(0) += 1;
         }
         self.backend.invalidate_prefix(&prefix).await;
     }
@@ -1196,7 +1216,16 @@ pub async fn invalidate_package_and_virtuals(
     package: &str,
 ) {
     cache.invalidate_package(repo_key, package).await;
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
+    for virtual_key in virtual_repo_keys(db, repo_id).await {
+        cache.invalidate_package(&virtual_key, package).await;
+    }
+}
+
+/// Keys of every virtual repository containing `repo_id` as a member.
+/// Failures degrade to an empty list: the member repo itself is still
+/// invalidated, and virtual entries age out through the TTL floor.
+pub async fn virtual_repo_keys(db: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<String> {
+    sqlx::query_scalar(
         "SELECT r.key FROM repositories r \
          INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
          WHERE vrm.member_repo_id = $1",
@@ -1204,10 +1233,7 @@ pub async fn invalidate_package_and_virtuals(
     .bind(repo_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
-    for virtual_key in &virtual_keys {
-        cache.invalidate_package(virtual_key, package).await;
-    }
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2236,6 +2262,33 @@ mod tests {
         assert!(
             cache.lookup(&key).await.is_some(),
             "an unraced guarded store must land"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_guarded_skips_after_generation_map_cap_clear() {
+        // A guard captured at the default generation must not survive the
+        // cap-clear sweep: without the epoch bump, the swept map would
+        // report generation 0 again and a pre-invalidation compute could
+        // re-install exactly the data an invalidation dropped (routine once
+        // the upstream feed drives invalidations at npm-churn rates).
+        let backend = Arc::new(FixedAgeBackend::new(None));
+        let cache = NpmPackumentCache::new(backend.clone(), Duration::from_secs(300));
+        let guard = cache.begin_store("repo", "pkg");
+        cache.invalidate_package("repo", "pkg").await;
+        for i in 0..INVALIDATION_GENERATIONS_MAX {
+            cache
+                .invalidate_package("repo", &format!("sweep-{i}"))
+                .await;
+        }
+        cache
+            .store_guarded(&guard, "repo:pkg:full:identity:x", entry(b"stale"))
+            .await;
+        assert_eq!(
+            backend.sets.load(Ordering::SeqCst),
+            0,
+            "a pre-invalidation guard must never store after the map was \
+             swept at cap"
         );
     }
 
