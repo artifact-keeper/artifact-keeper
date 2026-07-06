@@ -402,7 +402,11 @@ fn parse_selector<T: serde::de::DeserializeOwned + Default>(
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_policies(State(state): State<SharedState>) -> Result<Json<SyncPolicyListResponse>> {
+async fn list_policies(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<SyncPolicyListResponse>> {
+    auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
     let policies = service.list_policies().await?;
     let items: Vec<SyncPolicyResponse> = policies.into_iter().map(policy_to_response).collect();
@@ -481,8 +485,10 @@ async fn create_policy(
 )]
 async fn get_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SyncPolicyResponse>> {
+    auth.require_admin()?;
     let service = SyncPolicyService::new(state.db.clone());
     let policy = service.get_policy(id).await?;
     Ok(Json(policy_to_response(policy)))
@@ -654,8 +660,10 @@ async fn evaluate_policies(
 )]
 async fn preview_policy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<PreviewPolicyPayload>,
 ) -> Result<Json<PreviewResultResponse>> {
+    auth.require_admin()?;
     let repo_selector: RepoSelector = parse_selector(payload.repo_selector)?;
     let peer_selector: PeerSelector = parse_selector(payload.peer_selector)?;
     let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter)?;
@@ -1112,6 +1120,29 @@ mod tests {
 
     #[test]
     fn test_policy_write_guard_allows_admin() {
+        assert!(policy_auth(true).require_admin().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin gate (reads): list_policies / get_policy / preview_policy now
+    // also call auth.require_admin()? before touching the service, matching
+    // their sibling mutations. Sync policies are a global federation-admin
+    // feature, and preview resolves repositories with no per-caller
+    // visibility scoping, so read access must be admin-only too. These tests
+    // exercise the exact guard expression those read handlers run.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_read_guard_rejects_non_admin() {
+        let err = policy_auth(false).require_admin().unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin read (list/get/preview) must be rejected with an Authorization error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_policy_read_guard_allows_admin() {
         assert!(policy_auth(true).require_admin().is_ok());
     }
 }
