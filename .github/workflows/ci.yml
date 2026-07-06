@@ -251,13 +251,18 @@ jobs:
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
     # *and* `-C debuginfo=2` — the heaviest compile in CI, which got SIGKILL'd
     # (OOM) on larger PRs. CARGO_INCREMENTAL=0 drops incremental codegen
-    # (useless in a clean checkout), CARGO_BUILD_JOBS caps parallel rustc, and
-    # dropping debuginfo cuts peak RSS the most. Coverage mapping comes from
-    # the instrumentation (`__llvm_covmap`), not DWARF, so debuginfo=0 does
-    # not affect line-coverage accuracy.
+    # (useless in a clean checkout) and dropping debuginfo cuts peak RSS the
+    # most. Coverage mapping comes from the instrumentation (`__llvm_covmap`),
+    # not DWARF, so debuginfo=0 does not affect line-coverage accuracy.
+    #
+    # CARGO_BUILD_JOBS was capped at 2 when this job ran with debuginfo and
+    # an 8Gi runner limit; both changed since (#2062 raised limits to 16Gi,
+    # debuginfo=0 above). The same instrumented compile at 8 jobs with
+    # debuginfo=0 measures 7.9-11.0 GiB peak anonymous RSS, comfortably
+    # inside 16Gi, and matches the runner's 8-cpu limit.
     env:
       CARGO_INCREMENTAL: "0"
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     services:
