@@ -76,6 +76,22 @@ async fn test_azure_shared_key_put_get_exists_delete() {
         &sas_url.url[sas_url.url.len() - 20..]
     );
 
+    // PUT (empty body) — regression for the Shared Key string-to-sign:
+    // Azure requires the Content-Length field to be empty (not "0") for a
+    // zero-length body, and OCI upload-session creation writes an empty blob.
+    let empty_key = format!("{}.empty", test_key);
+    println!("  PUT (empty) {}", empty_key);
+    backend
+        .put(&empty_key, Bytes::new())
+        .await
+        .expect("Empty-body PUT failed");
+    let empty = backend.get(&empty_key).await.expect("GET empty failed");
+    assert!(empty.is_empty(), "Empty blob should round-trip empty");
+    backend
+        .delete(&empty_key)
+        .await
+        .expect("DELETE empty failed");
+
     // DELETE
     println!("  DELETE {}", test_key);
     backend.delete(&test_key).await.expect("DELETE failed");

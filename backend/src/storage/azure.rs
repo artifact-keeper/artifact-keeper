@@ -596,6 +596,32 @@ impl AzureBackend {
         Ok(Self::append_query(url, "comp=blocklist"))
     }
 
+    /// Content-Length field for a Shared Key string-to-sign.
+    ///
+    /// For service version 2015-02-21 and later, Azure requires this field
+    /// to be an empty string when the length is zero — signing a literal
+    /// "0" produces a MAC mismatch and the request fails with 403
+    /// AuthenticationFailed.
+    fn content_length_field(content_length: u64) -> String {
+        if content_length == 0 {
+            String::new()
+        } else {
+            content_length.to_string()
+        }
+    }
+
+    /// String-to-sign for a single-shot Put Blob request in Shared Key mode.
+    fn put_blob_string_to_sign(&self, content_length: u64, date_str: &str, key: &str) -> String {
+        format!(
+            "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
+            Self::content_length_field(content_length),
+            date_str,
+            self.config.account_name,
+            self.config.container_name,
+            key
+        )
+    }
+
     /// Generate a Shared Key authorization header for a request.
     fn shared_key_auth(
         decoded_key: &[u8],
@@ -620,15 +646,8 @@ impl AzureBackend {
 
         match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => {
-                let content_length = content.len();
-                let string_to_sign = format!(
-                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
-                    content_length,
-                    date_str,
-                    self.config.account_name,
-                    self.config.container_name,
-                    key
-                );
+                let string_to_sign =
+                    self.put_blob_string_to_sign(content.len() as u64, &date_str, key);
                 let auth_header =
                     Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
 
@@ -1529,14 +1548,7 @@ impl StorageBackend for AzureBackend {
 
         let response = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => {
-                let string_to_sign = format!(
-                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
-                    content_length,
-                    date_str,
-                    self.config.account_name,
-                    self.config.container_name,
-                    key
-                );
+                let string_to_sign = self.put_blob_string_to_sign(content_length, &date_str, key);
                 let auth_header =
                     Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
 
@@ -1806,6 +1818,42 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(AzureBackend::new(config));
         assert!(result.is_err());
+    }
+
+    // ── Shared Key Put Blob string-to-sign ───────────────────────────────
+
+    #[test]
+    fn test_content_length_field_zero_is_empty() {
+        // Azure Shared Key (API >= 2015-02-21): the Content-Length field of
+        // the string-to-sign must be empty when the length is zero.
+        assert_eq!(AzureBackend::content_length_field(0), "");
+    }
+
+    #[test]
+    fn test_content_length_field_nonzero() {
+        assert_eq!(AzureBackend::content_length_field(42), "42");
+    }
+
+    #[tokio::test]
+    async fn test_put_string_to_sign_empty_body_has_empty_content_length_field() {
+        let backend = create_test_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(0, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        let fields: Vec<&str> = string_to_sign.split('\n').collect();
+        assert_eq!(
+            fields[3], "",
+            "Content-Length field must be empty for a zero-length body, not \"0\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_string_to_sign_nonempty_body_has_numeric_content_length_field() {
+        let backend = create_test_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(1234, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        let fields: Vec<&str> = string_to_sign.split('\n').collect();
+        assert_eq!(fields[3], "1234");
+        assert!(string_to_sign.ends_with("/testaccount/testcontainer/test/blob"));
     }
 
     // ── SAS URL generation (Shared Key only) ─────────────────────────────
