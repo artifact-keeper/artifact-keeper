@@ -3197,6 +3197,8 @@ mod tests {
             rate_limit_presign_per_window: 30,
 
             rate_limit_login_global_per_window: 8192,
+            rate_limit_login_per_window: 10,
+            rate_limit_login_window_secs: 900,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,

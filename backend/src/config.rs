@@ -483,6 +483,22 @@ pub struct Config {
     /// sheds rather than starves. Env var:
     /// `RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW`. Default: 8192.
     pub rate_limit_login_global_per_window: u32,
+    /// Maximum login attempts per `(username, source-IP)` per
+    /// `rate_limit_login_window_secs`. The login handler bcrypt-verifies the
+    /// submitted password (cost-12, ~187ms) and does so even for locked
+    /// accounts, so borrowing the loose general-auth budget lets a single
+    /// client drive a burst of verifies that saturates CPU. This dedicated,
+    /// tight per-key budget sheds the excess as 429 in the middleware layer,
+    /// before the verifier runs. Sized for humans (automation uses tokens or
+    /// `rate_limit_exempt_usernames`); logout/refresh/totp keep the looser
+    /// `rate_limit_auth_per_window` budget. Env var:
+    /// `RATE_LIMIT_LOGIN_PER_WINDOW`. Default: 10.
+    pub rate_limit_login_per_window: u32,
+    /// Window length for the login limiter, in seconds. Decoupled from
+    /// `rate_limit_window_secs` (typically 60) so the login bucket can use a
+    /// longer, lockout-style window (default 15 minutes). Env var:
+    /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
+    pub rate_limit_login_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -729,6 +745,8 @@ redacted_debug!(Config {
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
     show rate_limit_login_global_per_window,
+    show rate_limit_login_per_window,
+    show rate_limit_login_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -835,6 +853,8 @@ impl Default for Config {
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
             rate_limit_login_global_per_window: 8192,
+            rate_limit_login_per_window: 10,
+            rate_limit_login_window_secs: 900,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -1061,6 +1081,8 @@ impl Config {
                 "RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW",
                 8192,
             ),
+            rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
+            rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,
@@ -1510,6 +1532,26 @@ mod tests {
     }
 
     #[test]
+    fn test_config_login_rate_limit_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("RATE_LIMIT_LOGIN_PER_WINDOW", "3");
+        env::set_var("RATE_LIMIT_LOGIN_WINDOW_SECS", "600");
+        let config = Config::from_env().expect("config should load");
+        env::remove_var("RATE_LIMIT_LOGIN_PER_WINDOW");
+        env::remove_var("RATE_LIMIT_LOGIN_WINDOW_SECS");
+        assert_eq!(
+            config.rate_limit_login_per_window, 3,
+            "RATE_LIMIT_LOGIN_PER_WINDOW must override the per-key login budget"
+        );
+        assert_eq!(
+            config.rate_limit_login_window_secs, 600,
+            "RATE_LIMIT_LOGIN_WINDOW_SECS must override the login window length"
+        );
+    }
+
+    #[test]
     fn test_config_blob_gc_disabled_by_default() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_db = env::var("DATABASE_URL").ok();
@@ -1574,6 +1616,15 @@ mod tests {
         // 100+ password guesses per minute through the bcrypt verifier.
         assert_eq!(config.rate_limit_password_change_per_window, 5);
         assert_eq!(config.rate_limit_password_change_window_secs, 900);
+        // The login endpoint gets its own tight per-(username, IP) budget so a
+        // failed-login burst sheds before the bcrypt verifier runs, rather than
+        // borrowing the loose general-auth budget.
+        assert_eq!(config.rate_limit_login_per_window, 10);
+        assert_eq!(config.rate_limit_login_window_secs, 900);
+        assert!(
+            config.rate_limit_login_per_window < config.rate_limit_auth_per_window,
+            "login budget must be strictly tighter than the general-auth budget"
+        );
         assert!(
             (config.rate_limit_password_change_per_window as u64) * config.rate_limit_window_secs
                 < (config.rate_limit_api_per_window as u64)
