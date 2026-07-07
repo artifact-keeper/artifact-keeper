@@ -190,10 +190,10 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 
 /// Form body sent by Docker for the OAuth2 password-grant flow against the
 /// distribution token endpoint (`POST /v2/token`). Only `grant_type`,
-/// `username`, and `password` are used here; fields like `service`,
-/// `scope`, and `client_id` carry routing/scoping metadata that the OCI
-/// handler reads from the URL query string (`Query<TokenQuery>`) and are
-/// not used for authentication.
+/// `username`, and `password` are used here. The `service` field is read from
+/// the URL query string (`Query<TokenQuery>`) for validation; `scope` and
+/// `client_id` are not used for authentication (the issued token is derived
+/// from the identity's permissions, not the requested scope — see `TokenQuery`).
 #[derive(Deserialize, Default)]
 struct TokenForm {
     grant_type: Option<String>,
@@ -3459,8 +3459,18 @@ struct TokenQuery {
     /// `"artifact-keeper"` at the challenge site). Missing is allowed for
     /// backward compatibility with clients that pre-date the validation.
     service: Option<String>,
-    #[allow(dead_code)]
-    scope: Option<String>,
+    // NOTE: `scope` is intentionally NOT a field here. The token this endpoint
+    // issues is derived from the authenticated identity's permissions, not from
+    // the requested scope, so scope is unused for authorization. Declaring it as
+    // a single `Option<String>` made `Query<TokenQuery>` (serde_urlencoded)
+    // reject spec-compliant requests that repeat `?scope=...`: the OCI/Docker
+    // token spec permits multiple `scope` parameters, and kaniko/BuildKit send
+    // one per resource (e.g. the push target plus a base-image repo for a
+    // cross-repo blob mount). serde_urlencoded errors on the repeated known
+    // field with "400 duplicate field `scope`", breaking those pushes. Omitting
+    // the field lets serde ignore the (now unknown) repeated `scope` params
+    // instead of erroring. If scope-based authz is added later, parse it with an
+    // extractor that supports repeated keys (e.g. axum-extra's serde_html_form).
     #[allow(dead_code)]
     account: Option<String>,
     /// GET-flow equivalent of OAuth2 `access_type=offline`, per the
@@ -8071,6 +8081,27 @@ mod tests {
     use chrono::Utc;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // /v2/token: accept repeated `?scope=` query parameters (multi-scope)
+    // -----------------------------------------------------------------------
+
+    /// Regression: the OCI/Docker token spec permits multiple `scope` query
+    /// parameters, and kaniko/BuildKit send one per resource (the push target
+    /// plus a base-image repo for a cross-repo blob mount). `Query<TokenQuery>`
+    /// deserializes with serde_urlencoded, which errors on a repeated *known*
+    /// struct field ("duplicate field `scope`", surfaced as 400) — so
+    /// `TokenQuery` must not declare `scope`. This locks that in: parsing a
+    /// query with two `scope=` params must succeed and still read `service`.
+    #[test]
+    fn token_query_accepts_repeated_scope_params() {
+        let q = "service=artifact-keeper\
+                 &scope=repository:containers/app:push,pull\
+                 &scope=repository:docker-hub/library/alpine:pull";
+        let parsed: TokenQuery =
+            serde_urlencoded::from_str(q).expect("repeated ?scope= must not error");
+        assert_eq!(parsed.service.as_deref(), Some("artifact-keeper"));
+    }
 
     // -----------------------------------------------------------------------
     // enforce_scan_pull_scope (#2093)
