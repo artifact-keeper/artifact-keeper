@@ -13,6 +13,16 @@
 #     — the `test_run_gc_*` tests run a cluster-wide GC reap and assert on the
 #     exact set of keys collected. A concurrent GC test reaps another's fixtures
 #     first, failing e.g. "GC result should include the upload temp and part keys".
+#   * `sync_worker.rs` `recover_expired_sync_task_claims` — the
+#     `expired_sync_task_claims_recover_and_fence_stale_owner` and
+#     `legacy_in_progress_sync_task_without_claim_metadata_recovers` tests seed an
+#     expired / legacy `in_progress` `sync_tasks` row, then call the recovery
+#     sweep, which UPDATEs *every* stale claim in the DB (no peer scope) and assert
+#     on the exact global count (`recovered == 1`). A sibling test's stale row is
+#     swept in the same pass, failing the count/fence assertions. (The peer-scoped
+#     `claim_pending_sync_tasks` concurrency tests only touch their own unique
+#     peer's rows via `WHERE peer_instance_id = $1` and hold live-TTL claims the
+#     sweep cannot match, so they stay parallel.)
 #
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
@@ -24,11 +34,13 @@
 # Pin every test that mutates this shared DB state to a single-threaded test
 # group so nextest never runs two of them at once, restoring the serialization
 # the in-process mutexes provide under `cargo test`. Add new tests that take
-# STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()` to the matching filter below.
+# STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, or that call
+# `recover_expired_sync_task_claims` and assert on its global result, to the
+# matching filter below.
 
 [test-groups]
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers)'
 test-group = 'db-serial'
