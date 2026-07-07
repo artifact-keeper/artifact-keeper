@@ -318,6 +318,16 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_login_global_per_window,
         state.config.rate_limit_window_secs,
     ));
+    // Dedicated tight per-(username, IP) bucket for the login endpoint. The
+    // login handler bcrypt-verifies the submitted password (and does so even
+    // for locked accounts), so borrowing the loose general-auth budget lets a
+    // single client drive a burst of verifies that saturates CPU. This budget
+    // sheds excess login attempts as 429 in the middleware layer, before the
+    // verifier runs. Default: 10 attempts / 15 minutes per (username, IP).
+    let login_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_login_per_window,
+        state.config.rate_limit_login_window_secs,
+    ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
@@ -343,12 +353,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
-    // Login-only state: keys the shared auth limiter per-(username, IP) and
-    // gates it behind the global shedding backstop. Applied only to /login so
-    // /logout and /refresh keep the plain IP-keyed limiter.
+    // Login-only state: keys the dedicated tight login limiter per-(username,
+    // IP) and gates it behind the global shedding backstop. Applied only to
+    // /login so /logout and /refresh keep the looser auth limiter.
     let login_rate_limit_state = LoginRateLimitState {
         inner: RateLimitState {
-            limiter: Arc::clone(&auth_rate_limiter),
+            limiter: Arc::clone(&login_rate_limiter),
             exemptions: Arc::clone(&exemptions),
             enabled: rate_limit_enabled,
             trusted_proxies: Arc::clone(&trusted_proxies),
@@ -397,6 +407,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let search_cleanup = Arc::clone(&search_rate_limiter);
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
         let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
+        let login_cleanup = Arc::clone(&login_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -407,6 +418,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 search_cleanup.cleanup_expired().await;
                 presign_cleanup.cleanup_expired().await;
                 login_global_cleanup.cleanup_expired().await;
+                login_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
             }
         });
