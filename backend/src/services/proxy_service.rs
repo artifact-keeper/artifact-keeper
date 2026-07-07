@@ -43,10 +43,10 @@ pub const DEFAULT_METADATA_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Larger byte ceiling for formats whose metadata documents are legitimately
 /// large and would be truncated by the 8 MiB default: npm packument/meta,
-/// composer packument, pypi simple-index, maven-metadata, and the protobuf
-/// bundle. Matches the existing npm/goproxy capped reads (npm.rs:308/391,
-/// goproxy.rs:295).
-pub const LARGE_METADATA_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// composer packument, pypi simple-index, maven-metadata, protobuf bundle,
+/// and Debian dists indices (trixie's Packages.xz is 9.6 MB; larger suites
+/// like sid can exceed 20 MB).
+pub const LARGE_METADATA_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
@@ -3128,7 +3128,7 @@ impl ProxyService {
             self.fetch_from_upstream_conditional(&full_url, repo.id, etag)
                 .await
         } else {
-            self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            self.fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
                 .await
                 .map(Some)
         };
@@ -3170,7 +3170,7 @@ impl ProxyService {
                             cache_key = %cache_key,
                             "cached body missing after 304; refetching unconditionally"
                         );
-                        self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+                        self.fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
                             .await?
                     }
                     Err(e) => return Err(e),
@@ -11067,8 +11067,19 @@ mod tests {
         );
     }
 
+    // `LARGE_METADATA_MAX_BYTES` was raised 16 MiB -> 128 MiB (commit c301ee37)
+    // so Debian dists indices (>20 MB) are no longer 502'd. Exceeding the 128 MiB
+    // ceiling in a per-PR `--lib` test is impractical (~128 MiB alloc + loopback
+    // transfer), and the size-agnostic over-cap -> BadGateway(502) rejection is
+    // already covered at the exact boundary (body == max accepted, body == max+1
+    // rejected) by `test_capped_read_accepts_body_at_or_below_max` and
+    // `test_capped_read_rejects_over_cap_with_bad_gateway`. What remains unique
+    // here is the under-cap half against the *real* LARGE constant: a 9 MiB
+    // "packument" — which sits ABOVE the 8 MiB DEFAULT ceiling — must succeed via
+    // the buffered `fetch_from_upstream` primitive shared by every large-metadata
+    // caller (npm/goproxy/pypi/maven/debian).
     #[tokio::test]
-    async fn test_large_metadata_9mib_ok_but_17mib_rejected_under_16mib_cap() {
+    async fn test_large_metadata_under_large_cap_succeeds_via_buffered_fetch() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -11077,18 +11088,16 @@ mod tests {
             return;
         };
         let server = MockServer::start().await;
-        // A 9 MiB "packument" is under the 16 MiB LARGE ceiling; a 17 MiB body
-        // is over it.
+        // 9 MiB: above DEFAULT_METADATA_MAX_BYTES (8 MiB), below
+        // LARGE_METADATA_MAX_BYTES (128 MiB) — so success can only be explained
+        // by the LARGE ceiling being in effect, not the DEFAULT one.
         let ok_body = vec![b'n'; 9 * 1024 * 1024];
-        let over_body = vec![b'n'; 17 * 1024 * 1024];
+        assert!(
+            ok_body.len() > DEFAULT_METADATA_MAX_BYTES && ok_body.len() < LARGE_METADATA_MAX_BYTES
+        );
         Mock::given(method("GET"))
             .and(path("/packument-ok"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(ok_body))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/packument-huge"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(over_body))
             .mount(&server)
             .await;
 
@@ -11096,24 +11105,13 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("tmp");
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
         let ok_url = format!("{}/packument-ok", server.uri());
-        let huge_url = format!("{}/packument-huge", server.uri());
 
         let ok = proxy
             .fetch_from_upstream(&ok_url, Uuid::new_v4(), LARGE_METADATA_MAX_BYTES)
             .await
-            .expect("a 9 MiB packument must succeed under the 16 MiB ceiling");
-        assert_eq!(ok.content.len(), 9 * 1024 * 1024);
-
-        let err = proxy
-            .fetch_from_upstream(&huge_url, Uuid::new_v4(), LARGE_METADATA_MAX_BYTES)
-            .await
-            .err()
-            .expect("a 17 MiB body must be rejected by the 16 MiB ceiling");
+            .expect("a 9 MiB packument must succeed under the LARGE ceiling");
         let _ = std::fs::remove_dir_all(&tmp);
-        assert!(
-            matches!(err, AppError::BadGateway(_)),
-            "a 17 MiB over-cap body must surface as BadGateway (502), got {err:?}",
-        );
+        assert_eq!(ok.content.len(), 9 * 1024 * 1024);
     }
 
     // -- fetch_upstream_direct(+_with_link): drive fetch_buffered + headers --
@@ -11170,7 +11168,7 @@ mod tests {
         };
         let server = MockServer::start().await;
         // 9 MiB: above DEFAULT_METADATA_MAX_BYTES (8 MiB), below
-        // LARGE_METADATA_MAX_BYTES (16 MiB).
+        // LARGE_METADATA_MAX_BYTES (128 MiB).
         let big = vec![0x2eu8; 9 * 1024 * 1024];
         assert!(big.len() > DEFAULT_METADATA_MAX_BYTES && big.len() < LARGE_METADATA_MAX_BYTES);
         Mock::given(method("GET"))
@@ -11191,7 +11189,7 @@ mod tests {
         let outcome = proxy.fetch_upstream_direct(&repo, "simple/foo/").await;
         let _ = std::fs::remove_dir_all(&tmp);
         let (body, _ct, _effective) =
-            outcome.expect("a 9 MiB simple index must succeed under the 16 MiB cap");
+            outcome.expect("a 9 MiB simple index must succeed under the 128 MiB cap");
         assert_eq!(body.len(), big.len());
     }
 
