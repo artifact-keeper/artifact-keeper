@@ -222,6 +222,20 @@ services:
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
+      # Trusted reverse-proxy CIDRs (#2298 / #2023). Caddy terminates all
+      # external traffic and forwards the real client IP in `X-Forwarded-For`
+      # (Caddy overwrites any client-supplied XFF with the real TCP peer, so
+      # the value cannot be spoofed). The backend believes that header ONLY
+      # when the immediate TCP peer falls inside one of these ranges; the
+      # default is empty (secure) and would make the backend key every request
+      # on Caddy's container IP. That collapse is dangerous for the login
+      # limiter: every source of a given account would share ONE bucket, so a
+      # single flooding client could lock a specific victim — including owner
+      # break-glass — out of login. Setting this to the compose network subnet
+      # (pinned to 172.30.0.0/24 under `networks:` below) restores per-client
+      # keying on the real client IP. Override for bare-metal / custom bridge
+      # subnets; keep it in sync with the actual proxy network.
+      RATE_LIMIT_TRUSTED_PROXY_CIDRS: ${RATE_LIMIT_TRUSTED_PROXY_CIDRS:-172.30.0.0/24}
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
@@ -500,6 +514,16 @@ volumes:
 # A single bridge network for all services. All inter-container communication
 # stays on this network; only Caddy (and optionally Postgres/OpenSearch for
 # debugging) expose ports to the host.
+#
+# The subnet is PINNED so it is deterministic: the backend's
+# RATE_LIMIT_TRUSTED_PROXY_CIDRS (see the backend service) must match the
+# network Caddy lives on for per-client login rate-limit keying to work.
+# Without a pinned subnet Docker would pick one from its default pool at
+# random, and the trusted-proxy CIDR could drift out of range. Change both in
+# lockstep if this subnet collides with an existing network on your host.
 networks:
   default:
     name: artifact-keeper-network
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
