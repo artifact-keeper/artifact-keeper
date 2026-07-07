@@ -875,6 +875,18 @@ impl AzureBackend {
         }
     }
 
+    /// URL for the health-check HEAD probe.
+    ///
+    /// Must be a read-authorized URL: in Shared Key mode `authorized_head`
+    /// adds no Authorization header (it expects a SAS URL), so a bare
+    /// `blob_url` yields an anonymous request that Azure answers with
+    /// 409 PublicAccessNotPermitted whenever public blob access is disabled
+    /// on the account — reporting storage as unhealthy regardless of its
+    /// real state.
+    fn health_probe_url(&self) -> Result<String> {
+        self.read_url(".health-probe", Duration::from_secs(60))
+    }
+
     /// Generate a SAS token for a blob (Shared Key mode only).
     ///
     /// Uses Service SAS with blob resource type.
@@ -1587,7 +1599,7 @@ impl StorageBackend for AzureBackend {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
         // authentication errors indicate an unhealthy backend.
-        let url = self.blob_url(".health-probe");
+        let url = self.health_probe_url()?;
         let response = self
             .authorized_head(&url)
             .await
@@ -1868,6 +1880,34 @@ mod tests {
         assert!(url.starts_with(
             "https://testaccount.blob.core.windows.net/testcontainer/path/to/blob.dat?"
         ));
+    }
+
+    // ── Health probe URL ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_probe_url_is_signed_in_shared_key_mode() {
+        let backend = create_test_backend().await;
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            url.contains("sig="),
+            "Shared Key mode must HEAD a SAS-signed URL; an unsigned HEAD is \
+             anonymous and fails with 409 when public blob access is disabled"
+        );
+        assert!(url.contains("sp=r"), "probe needs read permission");
+    }
+
+    #[test]
+    fn test_health_probe_url_is_bare_in_rbac_mode() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            !url.contains("sig="),
+            "RBAC mode authorizes via bearer header, not SAS"
+        );
     }
 
     // ── Redirect support ─────────────────────────────────────────────────
