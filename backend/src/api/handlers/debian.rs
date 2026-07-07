@@ -3114,3 +3114,329 @@ mod upload_db_tests {
         f.teardown().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Virtual `dists/` member-iteration error propagation + large-index cap (#2267,
+// #2278). These exercise `try_virtual_dists`:
+//   * a >8 MiB Packages.xz now succeeds (LARGE_METADATA_MAX_BYTES ceiling) and
+//     is served/cached instead of tripping the old 8 MiB DEFAULT cap (502);
+//   * a genuine non-404 upstream failure is SURFACED to the client rather than
+//     swallowed via `Err(_) => continue` into an `Ok(None)` that fell through
+//     to an empty local-DB 200 (`apt`'s "File has unexpected size");
+//   * a 404 member is still skipped so the caller can fall through to the
+//     local-DB (hosted) path or the next mirror.
+#[cfg(test)]
+mod virtual_dists_cap_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const DIST: &str = "trixie";
+    const PKG_PATH: &str = "dists/trixie/main/binary-amd64/Packages.xz";
+
+    /// Insert a Remote Debian repo pointing at `upstream_url` and enrol it as a
+    /// member of a fresh Virtual repo. Returns `(virtual_id, virtual_key,
+    /// member_id)`; callers clean up via [`cleanup`].
+    async fn virtual_with_remote_member(
+        pool: &sqlx::PgPool,
+        storage_path: &str,
+        upstream_url: &str,
+    ) -> (Uuid, String, Uuid) {
+        let member_id = Uuid::new_v4();
+        let member_key = format!("dbg-mem-{}", member_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $3, $4, 'remote'::repository_type, 'debian'::repository_format, $5)",
+        )
+        .bind(member_id)
+        .bind(&member_key)
+        .bind(&member_key)
+        .bind(storage_path)
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert remote member");
+
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("dbg-virt-{}", virtual_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'debian'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(storage_path)
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("insert virtual member");
+        (virtual_id, virtual_key, member_id)
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, virtual_id: Uuid, member_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![virtual_id, member_id])
+            .execute(pool)
+            .await;
+    }
+
+    // A 9 MiB Packages.xz — above the 8 MiB DEFAULT ceiling that used to 502 —
+    // is fetched, served 200, and cached (second call issues no second upstream
+    // request). Proves the DEFAULT->LARGE (128 MiB) tier switch for dists.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // to_bytes on a bounded in-memory test body
+    async fn large_packages_index_above_default_cap_succeeds_and_caches() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = vec![0x5au8; 9 * 1024 * 1024];
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE so success implies the LARGE tier",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let first = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+        let second = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let hits = server.received_requests().await.unwrap().len();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = first
+            .expect("large index must not error")
+            .expect("large index must resolve via the remote member");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(got.len(), body.len(), "full 9 MiB body must be served");
+        assert!(
+            second.is_ok_and(|o| o.is_some()),
+            "second read must still resolve",
+        );
+        assert_eq!(hits, 1, "second read must be served warm from cache");
+    }
+
+    // A genuine non-404 upstream failure (here a 5xx that folds to 502/503) must
+    // SURFACE as an Err so the client sees the real cause — not be swallowed into
+    // `Ok(None)` and rendered as an empty 200 (the #2278 `apt` size-mismatch bug).
+    #[tokio::test]
+    async fn upstream_failure_surfaces_instead_of_empty_200() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-502-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = out.expect_err(
+            "a genuine upstream failure must surface as Err, not be masked into Ok(None)/empty-200",
+        );
+        assert!(
+            resp.status().is_server_error(),
+            "the real upstream failure status must reach the client, got {}",
+            resp.status(),
+        );
+    }
+
+    // A member that 404s for the path is skipped (the file genuinely is not
+    // there), so the dispatcher returns Ok(None) and the caller falls through to
+    // the local-DB / next-mirror path. This is the arm that must NOT be treated
+    // as a hard failure — the discriminator only surfaces non-404 errors.
+    #[tokio::test]
+    async fn missing_member_file_falls_through_to_none() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            matches!(out, Ok(None)),
+            "a 404 member must fall through to Ok(None), got {:?}",
+            out.map(|o| o.map(|r| r.status())),
+        );
+    }
+
+    // The change-detecting variant (Release/InRelease revalidation path) applies
+    // the same NotFound-vs-real-error discrimination: a 5xx upstream surfaces as
+    // an Err instead of `Ok(None)` (which would have fallen through to an empty
+    // signed Release), while a 404 member is skipped.
+    const INRELEASE_PATH: &str = "dists/trixie/InRelease";
+
+    #[tokio::test]
+    async fn detecting_change_upstream_failure_surfaces() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{INRELEASE_PATH}")))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-dc502-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists_detecting_change(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            INRELEASE_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = out.expect_err("a 5xx upstream must surface as Err, not empty Ok(None)");
+        assert!(
+            resp.status().is_server_error(),
+            "real upstream failure status must reach the client, got {}",
+            resp.status(),
+        );
+    }
+
+    #[tokio::test]
+    async fn detecting_change_missing_member_falls_through_to_none() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{INRELEASE_PATH}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-dc404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists_detecting_change(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            INRELEASE_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            matches!(out, Ok(None)),
+            "a 404 member must fall through to Ok(None), got {:?}",
+            out.map(|o| o.map(|r| r.status())),
+        );
+    }
+}
