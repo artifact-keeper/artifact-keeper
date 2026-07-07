@@ -209,12 +209,21 @@ async fn resolve_virtual_blob_walks_to_third_member_when_first_two_404() {
     let res = resolve_virtual_blob(&state, virt_id, "myimage", &blob_digest).await;
 
     match res {
-        Some(VirtualBlobResolution::Remote { content, .. }) => {
-            assert_eq!(content.as_ref(), blob_body.as_slice());
+        // #2274: the remote member blob is now STREAMED (teed into the proxy
+        // cache) rather than buffered. Collect the streamed body and assert it
+        // round-trips server_c's bytes.
+        Some(VirtualBlobResolution::RemoteStream { result }) => {
+            use futures::StreamExt;
+            let mut body = result.body;
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.next().await {
+                collected.extend_from_slice(&chunk.expect("stream chunk"));
+            }
+            assert_eq!(collected.as_slice(), blob_body.as_slice());
         }
         other => panic!(
-            "expected Remote resolution from server_c, got {:?}",
-            other.map(|_| "Local")
+            "expected RemoteStream resolution from server_c, got {:?}",
+            other.map(|_| "non-stream")
         ),
     }
 

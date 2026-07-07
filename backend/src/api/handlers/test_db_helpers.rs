@@ -460,7 +460,7 @@ pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
 /// True when `dir` holds a committed proxy-cache entry of at least
 /// `min_size` bytes: a `{base}__content__` object of that size whose
 /// matching `{base}__cache_meta__.json` sidecar exists.
-fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
+pub fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };

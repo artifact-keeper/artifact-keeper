@@ -2472,6 +2472,16 @@ pub enum VirtualBlobResolution {
         content: Bytes,
         content_type: Option<String>,
     },
+    /// A remote member served the blob and it is being STREAMED through
+    /// (teed into the proxy cache), rather than buffered in heap (#2274).
+    /// This is the fallback used for image layers that legitimately exceed
+    /// the buffered metadata cap: `resolve_virtual_blob` routes the member
+    /// blob fetch through the digest-gated streaming helper, so a
+    /// multi-GiB layer pulled through a virtual repo returns `200` (streamed)
+    /// instead of `502`, with the cache commit gated on the requested digest.
+    RemoteStream {
+        result: crate::services::proxy_service::StreamingFetchResult,
+    },
 }
 
 /// Pure constructor for the `Local` arm of [`VirtualBlobResolution`].
@@ -2506,30 +2516,6 @@ fn should_attempt_remote_member(
     has_upstream_url: bool,
 ) -> bool {
     member.repo_type == RepositoryType::Remote && has_proxy_service && has_upstream_url
-}
-
-/// Pure post-processing of a successful upstream blob fetch.
-///
-/// Returns `Some(VirtualBlobResolution::Remote { .. })` when the
-/// upstream bytes match the requested content-addressable digest, and
-/// `None` when they do not (the caller must "fall through" to the next
-/// virtual-repo member). For blobs the requested reference is always a
-/// digest, so the verification is unconditional.
-///
-/// Extracted out of [`resolve_virtual_blob`] so the security-critical
-/// verify-then-wrap step can be unit-tested without a wiremock upstream.
-fn finalize_upstream_blob(
-    digest: &str,
-    content: Bytes,
-    content_type: Option<String>,
-) -> Option<VirtualBlobResolution> {
-    if !verify_digest_or_fall_through(&content, digest) {
-        return None;
-    }
-    Some(VirtualBlobResolution::Remote {
-        content,
-        content_type,
-    })
 }
 
 /// Pure post-processing of a successful upstream manifest fetch.
@@ -2748,40 +2734,39 @@ pub async fn resolve_virtual_blob(
             if let (Some(proxy), Some(upstream_url)) =
                 (&state.proxy_service, member.upstream_url.as_deref())
             {
+                // #2274: STREAM the virtual-member blob (parity with the
+                // already-streaming plain-Remote blob download) instead of
+                // buffering it at the 8 MiB metadata cap, which 502'd any
+                // layer larger than the cap. The streaming tee keeps heap
+                // bounded (~4 MiB) regardless of layer size.
+                //
+                // Cache-poisoning protection: for blobs the requested
+                // `digest` is always content-addressable, so the cache
+                // commit is gated on the streamed body's SHA-256 matching
+                // it (the bare-hex form is passed to the streaming helper).
+                // A member that answers `200` with wrong bytes streams to
+                // the client — which independently verifies the digest and
+                // rejects them — but never poisons the proxy cache. This is
+                // the same serve posture the plain-Remote path already ships.
+                let expected_checksum = digest.strip_prefix("sha256:").map(str::to_string);
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_blob_path(&image, digest);
-                    // #2192 / #1608 Phase 4c: this virtual-member blob fallback
-                    // stays BUFFERED (unlike the plain-Remote blob download,
-                    // which now streams). `finalize_upstream_blob` below
-                    // content-address-verifies the whole body against the
-                    // requested digest before serving — a security-critical
-                    // check that requires the complete payload in memory, so it
-                    // cannot be streamed without sacrificing verification.
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
+                    // A member without the blob (404) or any upstream error
+                    // maps to `Err`; skip it and try the next candidate /
+                    // member, preserving the existing member-selection walk.
+                    match proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        &upstream_path,
+                        expected_checksum.clone(),
                     )
                     .await
                     {
-                        // #1348 round 1, concern #3 (digest verification):
-                        // for blobs the requested `digest` is always a
-                        // content-addressable digest. The verify-and-wrap
-                        // step lives in `finalize_upstream_blob` so it
-                        // can be unit-tested without a wiremock upstream.
-                        match finalize_upstream_blob(digest, content, content_type) {
-                            Some(resolution) => return Some(resolution),
-                            None => {
-                                warn!(
-                                    "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
-                                    upstream_url, digest
-                                );
-                                continue;
-                            }
-                        }
+                        Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
+                        Err(_) => continue,
                     }
                 }
             }
@@ -4207,6 +4192,23 @@ async fn handle_head_blob(
                     "application/octet-stream",
                     false,
                 ),
+                VirtualBlobResolution::RemoteStream { result } => {
+                    // HEAD: headers only. Drop the body stream (its upstream
+                    // read is lazy, so no layer bytes are transferred) and
+                    // report the upstream-advertised length when known.
+                    let ct = result
+                        .content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Docker-Content-Digest", digest)
+                        .header(CONTENT_TYPE, ct);
+                    if let Some(len) = result.content_length {
+                        builder = builder.header(CONTENT_LENGTH, len.to_string());
+                    }
+                    builder.body(Body::empty()).unwrap()
+                }
             };
         }
     }
@@ -4356,6 +4358,12 @@ async fn handle_get_blob(
                     "application/octet-stream",
                     true,
                 ),
+                VirtualBlobResolution::RemoteStream { result } => {
+                    // #2274: stream the resolved member layer straight to the
+                    // client (teed into the proxy cache) with the mandatory
+                    // Docker-Content-Digest header, never buffering it in heap.
+                    build_oci_streaming_proxy_response(result, digest, "application/octet-stream")
+                }
             };
         }
     }
@@ -11510,8 +11518,8 @@ mod tests {
                 assert_eq!(content.as_ref(), b"layer-bytes");
                 assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
             }
-            VirtualBlobResolution::Local { .. } => {
-                panic!("Remote variant constructed but Local matched");
+            VirtualBlobResolution::Local { .. } | VirtualBlobResolution::RemoteStream { .. } => {
+                panic!("Remote variant constructed but a different variant matched");
             }
         }
     }
@@ -11536,7 +11544,7 @@ mod tests {
     // -----------------------------------------------------------------------
     //
     // `negative_cache_evict_and_has_room`, `local_blob_resolution`,
-    // `should_attempt_remote_member`, `finalize_upstream_blob`, and
+    // `should_attempt_remote_member`, and
     // `finalize_upstream_manifest` were carved out of the async resolver
     // hot path so the decision logic that previously lived inline could
     // be covered by unit tests without standing up a Postgres + wiremock
@@ -11703,7 +11711,7 @@ mod tests {
                 assert_eq!(storage_key, "oci-blobs/sha256:abc");
                 assert_eq!(member.id, member_id);
             }
-            VirtualBlobResolution::Remote { .. } => {
+            VirtualBlobResolution::Remote { .. } | VirtualBlobResolution::RemoteStream { .. } => {
                 panic!("expected Local variant from local_blob_resolution");
             }
         }
@@ -11756,51 +11764,13 @@ mod tests {
         assert!(!super::should_attempt_remote_member(&m, true, true));
     }
 
-    // finalize_upstream_blob: verify-then-wrap step for the resolver.
-
-    #[test]
-    fn test_finalize_upstream_blob_matching_digest_returns_remote() {
-        let bytes = Bytes::from_static(b"hello world");
-        let digest = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        let result =
-            super::finalize_upstream_blob(digest, bytes.clone(), Some("application/json".into()))
-                .expect("matching digest must produce a Remote resolution");
-        match result {
-            VirtualBlobResolution::Remote {
-                content,
-                content_type,
-            } => {
-                assert_eq!(content, bytes);
-                assert_eq!(content_type.as_deref(), Some("application/json"));
-            }
-            VirtualBlobResolution::Local { .. } => {
-                panic!("finalize_upstream_blob must never construct a Local variant");
-            }
-        }
-    }
-
-    #[test]
-    fn test_finalize_upstream_blob_mismatched_digest_falls_through() {
-        // The exact bytes-substitution attack vector PR #1348 closes:
-        // upstream serves "hello world" under a non-matching digest.
-        // finalize_upstream_blob must refuse the response so the resolver
-        // can `continue` to the next virtual-repo member.
-        let bytes = Bytes::from_static(b"hello world");
-        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(super::finalize_upstream_blob(wrong, bytes, None).is_none());
-    }
-
-    #[test]
-    fn test_finalize_upstream_blob_empty_body_with_canonical_digest_accepts() {
-        let canonical = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let result = super::finalize_upstream_blob(canonical, Bytes::new(), None)
-            .expect("canonical empty-string digest must verify against empty content");
-        if let VirtualBlobResolution::Remote { content, .. } = result {
-            assert!(content.is_empty());
-        } else {
-            panic!("expected Remote variant");
-        }
-    }
+    // Digest verification for the virtual-repo blob fallback moved to the
+    // streaming cache-commit gate (#2274): `resolve_virtual_blob` now streams
+    // the member blob and commits it to the proxy cache ONLY when the streamed
+    // SHA-256 matches the requested digest (see `CacheMetadataTemplate::
+    // expected_checksum` in `proxy_service`). The end-to-end streaming +
+    // poisoning-guard behaviour is covered by the DB-backed wiremock tests in
+    // `virtual_blob_streaming_fallback_tests` below.
 
     // finalize_upstream_manifest: verify-then-compute step for manifest
     // resolution.
@@ -12167,6 +12137,423 @@ mod remote_blob_streaming_fallback_tests {
              proving manifests are NOT streamed"
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2274: the VIRTUAL-repo member blob fallback STREAMS (digest-gated) instead
+// of buffering at the 8 MiB metadata cap. A layer larger than the cap pulled
+// through a virtual docker repo must return 200 (streamed) + the correct
+// Docker-Content-Digest, warm the cache, and — critically — a member serving
+// WRONG bytes for a digest-addressed URL must NOT poison the proxy cache.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test
+// assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod virtual_blob_streaming_fallback_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn insert_remote_repo(pool: &sqlx::PgPool, upstream_url: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("oci-strm-rem-{}", &id.to_string()[..8]);
+        let storage_path = format!("/tmp/oci-strm-{}", id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&storage_path)
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        (id, key)
+    }
+
+    async fn insert_virtual_repo(pool: &sqlx::PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("oci-strm-virt-{}", &id.to_string()[..8]);
+        let storage_path = format!("/tmp/oci-strm-virt-{}", id);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&storage_path)
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        (id, key)
+    }
+
+    async fn link_member(pool: &sqlx::PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        for id in ids {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    /// Render the resolver output through the real handler helper and collect
+    /// the streamed body, returning (status, Docker-Content-Digest, body).
+    async fn render_and_collect(
+        resolution: VirtualBlobResolution,
+        digest: &str,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        let result = match resolution {
+            VirtualBlobResolution::RemoteStream { result } => result,
+            _ => panic!("expected RemoteStream resolution"),
+        };
+        let resp =
+            super::build_oci_streaming_proxy_response(result, digest, "application/octet-stream");
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect streamed body")
+            .to_vec();
+        (status, dcd, body)
+    }
+
+    /// A 9 MiB layer (> 8 MiB DEFAULT_METADATA_MAX_BYTES) served by a Remote
+    /// MEMBER of a Virtual repo must STREAM with 200 + the correct
+    /// Docker-Content-Digest (was 502/500 on the buffered fallback), warm the
+    /// cache, and be served from cache on the second pull (member fetched once).
+    #[tokio::test]
+    async fn virtual_blob_streams_large_layer_from_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x5au8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            // Warm-cache proof: the member is fetched from upstream at most once.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-stream-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        for i in 0..2 {
+            if i == 1 {
+                tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
+            }
+            let resolution = super::resolve_virtual_blob(&state, virt_id, "myimage", &digest)
+                .await
+                .expect("large virtual-member layer must stream (200), not 502");
+            let (status, dcd, body) = render_and_collect(resolution, &digest).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+            assert_eq!(body.len(), layer.len(), "full layer must stream through");
+        }
+
+        drop(server);
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Member selection preserved: a member that 404s for the digest is skipped
+    /// and the next member's blob is streamed.
+    #[tokio::test]
+    async fn virtual_blob_skips_404_member_and_streams_next() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"second-member-layer-bytes".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body.clone()),
+            )
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_a, _) = insert_remote_repo(&pool, &server_a.uri()).await;
+        let (member_b, _) = insert_remote_repo(&pool, &server_b.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_a, 1).await;
+        link_member(&pool, virt_id, member_b, 2).await;
+
+        let resolution = super::resolve_virtual_blob(&state, virt_id, "myimage", &digest)
+            .await
+            .expect("must fall through the 404 member to the one that serves the blob");
+        let (status, dcd, got) = render_and_collect(resolution, &digest).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(got, body);
+
+        drop(server_a);
+        drop(server_b);
+        cleanup(&pool, &[virt_id, member_a, member_b]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Cache-poisoning guard: a member returning 200 with WRONG bytes (sha256
+    /// != requested digest) must NOT be committed to the proxy cache. Proven by
+    /// a second resolve fetching from upstream AGAIN (the mismatched body was
+    /// never cached, so it is never served warm as that digest).
+    #[tokio::test]
+    async fn virtual_blob_wrong_bytes_are_not_cached() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Digest addresses the CORRECT bytes; the member serves different bytes
+        // of the same length so the truncation guard passes and only the digest
+        // gate can reject the cache commit.
+        let correct = b"the-authentic-layer-bytes!".to_vec();
+        let wrong = b"tampered-substitute-bytes!".to_vec();
+        assert_eq!(correct.len(), wrong.len());
+        let digest = format!("sha256:{}", sha256_hex(&correct));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(wrong.clone()),
+            )
+            // Not-poisoned proof: because the mismatched body is never cached,
+            // the second resolve must hit upstream again -> exactly 2 fetches.
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-poison-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        for _ in 0..2 {
+            let resolution = super::resolve_virtual_blob(&state, virt_id, "myimage", &digest)
+                .await
+                .expect("a 200 member still resolves (bytes served, client verifies digest)");
+            // Fully drain so the tee's background writer runs its digest gate
+            // (mismatch -> delete object, no metadata sidecar).
+            let (_status, _dcd, drained) = render_and_collect(resolution, &digest).await;
+            assert_eq!(drained, wrong, "the streamed body is forwarded verbatim");
+            // Give the background writer a moment to finish its reject/delete.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        // The mismatched body must never have been committed as a cache hit.
+        assert!(
+            !tdh::committed_cache_entry_exists(&tmp, wrong.len() as u64),
+            "digest-mismatched bytes must not be committed to the proxy cache"
+        );
+
+        drop(server);
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn anon_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {ANONYMOUS_TOKEN}").parse().unwrap(),
+        );
+        headers
+    }
+
+    /// End-to-end through the real `handle_get_blob` handler: a `docker pull`
+    /// of a >8 MiB layer via a VIRTUAL repo returns 200 with the streamed body
+    /// and the mandatory Docker-Content-Digest (the exact #2274 repro that
+    /// previously 502'd on the buffered fallback).
+    #[tokio::test]
+    async fn handle_get_blob_streams_virtual_member_layer() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x33u8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vget-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, virt_key) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let image_name = format!("{virt_key}/myimage");
+        let resp = super::handle_get_blob(
+            &state,
+            &anon_headers(),
+            "http://localhost",
+            &image_name,
+            &digest,
+        )
+        .await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect streamed body")
+            .to_vec();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual pull-through must stream 200"
+        );
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(body.len(), layer.len());
+
+        drop(server);
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `handle_head_blob` for the same virtual member returns 200 + headers
+    /// only (Content-Length forwarded, empty body) — the streaming HEAD arm.
+    #[tokio::test]
+    async fn handle_head_blob_reports_virtual_member_layer_headers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x44u8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vhead-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, virt_key) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let image_name = format!("{virt_key}/myimage");
+        let resp = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://localhost",
+            &image_name,
+            &digest,
+        )
+        .await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let clen = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body")
+            .to_vec();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(clen.as_deref(), Some(layer.len().to_string().as_str()));
+        assert!(body.is_empty(), "HEAD must not return a body");
+
+        drop(server);
+        cleanup(&pool, &[virt_id, member_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

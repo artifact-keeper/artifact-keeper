@@ -143,6 +143,16 @@ struct CacheMetadataTemplate {
     /// which does not currently surface the header into the tee template.
     last_modified: Option<String>,
     ttl_secs: i64,
+    /// Optional content-addressable checksum the cache commit is gated on
+    /// (#2274). Bare lowercase SHA-256 hex (no `sha256:` prefix). When
+    /// `Some`, [`CachePersister::tee_stream`] persists the cached object
+    /// ONLY if the streamed body's SHA-256 equals this value; a mismatch is
+    /// treated like a rejected write (object deleted, no metadata sidecar)
+    /// so a digest-addressed fetch that returns wrong bytes cannot poison
+    /// the proxy cache. `None` preserves the pre-existing behaviour for every
+    /// other streaming caller (deb/pypi/plain-Remote), which gate only on the
+    /// upstream Content-Length.
+    expected_checksum: Option<String>,
 }
 
 /// Bound on the in-flight chunk queue between the upstream-reader task
@@ -1210,6 +1220,37 @@ impl CachePersister {
             match put_result {
                 Ok(result) => match classify_stream_write(result.bytes_written, expected_len) {
                     StreamWriteOutcome::Commit => {
+                        // #2274 digest-gated commit: when the caller pinned an
+                        // expected content-addressable checksum (the OCI
+                        // virtual-repo blob fallback passes the requested blob
+                        // digest), refuse to persist a body whose streamed
+                        // SHA-256 does not match it. The bytes were already
+                        // forwarded to the client — which independently verifies
+                        // the digest — but the proxy cache must never be poisoned
+                        // with mismatched content addressed by that digest. Treat
+                        // a mismatch exactly like the truncated/empty reject path:
+                        // delete the object and skip the metadata sidecar so the
+                        // next request refetches upstream (self-heal).
+                        if let Some(expected) = template.expected_checksum.as_deref() {
+                            if result.checksum_sha256 != expected {
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    "streamed body checksum does not match the requested digest; \
+                                     not caching (no metadata sidecar) so the cache entry cannot \
+                                     be poisoned"
+                                );
+                                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                                    tracing::debug!(
+                                        cache_key = %cache_key_for_writer,
+                                        error = %e,
+                                        "best-effort delete of digest-mismatched proxy-cache \
+                                         object failed; the missing metadata sidecar still forces \
+                                         a refetch"
+                                    );
+                                }
+                                return;
+                            }
+                        }
                         let now = Utc::now();
                         // #1618 S9 / #1051: pin the storage backend's ETag at
                         // write time so the fast path can re-HEAD on each hit
@@ -2538,6 +2579,26 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
     ) -> Result<StreamingFetchResult> {
+        self.fetch_artifact_streaming_with_cache_path_gated(repo, fetch_path, cache_path, None)
+            .await
+    }
+
+    /// Digest-gated sibling of [`Self::fetch_artifact_streaming_with_cache_path`]
+    /// (#2274). Behaves identically except that, when `expected_checksum` is
+    /// `Some` (bare lowercase SHA-256 hex), the background cache writer commits
+    /// the teed object ONLY if the streamed body's SHA-256 matches — otherwise
+    /// the object is dropped without a metadata sidecar (self-healing refetch).
+    /// Used by the OCI virtual-repo blob fallback so a member answering `200`
+    /// with wrong bytes for a digest-addressed URL cannot poison the cache. The
+    /// client still receives the streamed bytes and independently verifies the
+    /// digest, matching the plain-Remote blob path's serve posture.
+    pub async fn fetch_artifact_streaming_with_cache_path_gated(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        expected_checksum: Option<String>,
+    ) -> Result<StreamingFetchResult> {
         // #1631 layer 2 (#1694): single-flight the cold-cache streaming path so
         // N concurrent requests for the same uncached object open upstream ONCE.
         // The streaming coordinator's followers subscribe to the leader's
@@ -2550,7 +2611,12 @@ impl ProxyService {
         const STREAM_REENTER_BUDGET: usize = 8;
         for _ in 0..STREAM_REENTER_BUDGET {
             if let Some(result) = self
-                .try_fetch_artifact_streaming_once(repo, fetch_path, cache_path)
+                .try_fetch_artifact_streaming_once(
+                    repo,
+                    fetch_path,
+                    cache_path,
+                    expected_checksum.clone(),
+                )
                 .await?
             {
                 return Ok(result);
@@ -2558,7 +2624,7 @@ impl ProxyService {
         }
         // Exhausted re-enters (pathological contention): do one final
         // uncoordinated attempt so the request never spuriously fails.
-        self.fetch_artifact_streaming_uncoordinated(repo, fetch_path, cache_path)
+        self.fetch_artifact_streaming_uncoordinated(repo, fetch_path, cache_path, expected_checksum)
             .await
     }
 
@@ -2597,6 +2663,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
+        expected_checksum: Option<String>,
     ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
@@ -2628,6 +2695,7 @@ impl ProxyService {
                     cache_path,
                     cache_key.clone(),
                     metadata_key.clone(),
+                    expected_checksum.clone(),
                 )
             })
             .await?;
@@ -2774,6 +2842,7 @@ impl ProxyService {
         cache_path: &str,
         cache_key: String,
         metadata_key: String,
+        expected_checksum: Option<String>,
     ) -> Result<StreamHandle> {
         // Package Age Policy (#1770): the streaming path has no buffered
         // upstream `Last-Modified` to base a release-date hold on (#1771), so
@@ -2846,6 +2915,7 @@ impl ProxyService {
                 etag: upstream.etag,
                 last_modified: None,
                 ttl_secs: cache_ttl,
+                expected_checksum,
             },
             upstream.content_length,
         );
@@ -2906,6 +2976,7 @@ impl ProxyService {
         repo: &Repository,
         fetch_path: &str,
         cache_path: &str,
+        expected_checksum: Option<String>,
     ) -> Result<StreamingFetchResult> {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
@@ -2918,7 +2989,14 @@ impl ProxyService {
         }
 
         let handle = self
-            .open_streaming_leader(repo, fetch_path, cache_path, cache_key, metadata_key)
+            .open_streaming_leader(
+                repo,
+                fetch_path,
+                cache_path,
+                cache_key,
+                metadata_key,
+                expected_checksum,
+            )
             .await?;
         Ok(StreamingFetchResult::from(handle))
     }
@@ -7625,6 +7703,7 @@ mod tests {
             etag: None,
             last_modified: None,
             ttl_secs: 60,
+            expected_checksum: None,
         }
     }
 
@@ -7957,6 +8036,7 @@ mod tests {
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
             ttl_secs: 7200,
+            expected_checksum: None,
         };
         let mut client = tee_upstream_to_cache(
             upstream,

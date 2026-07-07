@@ -1183,6 +1183,33 @@ pub async fn proxy_fetch_streaming_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    proxy_fetch_streaming_with_cache_key_verified(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        None,
+    )
+    .await
+}
+
+/// Digest-gated sibling of [`proxy_fetch_streaming_with_cache_key`] (#2274).
+/// Identical, except the proxy-cache commit is gated on `expected_checksum`
+/// (bare lowercase SHA-256 hex): a streamed body whose SHA-256 does not match
+/// is served to the client but NOT persisted, so a digest-addressed upstream
+/// answering with wrong bytes cannot poison the cache. The OCI virtual-repo
+/// blob fallback passes the requested blob digest here.
+pub async fn proxy_fetch_streaming_with_cache_key_verified(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    expected_checksum: Option<String>,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -1190,7 +1217,12 @@ pub async fn proxy_fetch_streaming_with_cache_key(
         fetch_path,
         |repo| async move {
             proxy_service
-                .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+                .fetch_artifact_streaming_with_cache_path_gated(
+                    &repo,
+                    fetch_path,
+                    cache_path,
+                    expected_checksum,
+                )
                 .await
         },
     )
