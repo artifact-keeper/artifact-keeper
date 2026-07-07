@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::{AppState, SharedState};
 use crate::config::Config;
+use crate::models::user::User;
 
 /// Connect to the test database. Returns `None` when `DATABASE_URL` is
 /// unset or unreachable so suites no-op gracefully.
@@ -477,6 +478,114 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .bind(user_id)
         .execute(pool)
         .await;
+}
+
+/// Count `audit_log` rows for a given resource id + action string.
+///
+/// Shared by the auth-event audit trail tests (#386 / #1617 Phase 1) across
+/// the `profile`, `totp`, and `users` handler modules so the identical
+/// count-query is defined once rather than copy-pasted into each DB-backed
+/// test module (keeps the jscpd duplication gate green).
+pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+    )
+    .bind(resource_id)
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .expect("audit_log count query")
+}
+
+/// Delete a test user plus the auth-related rows the audit/2FA test modules
+/// create for it (audit_log, refresh/pending jti, password history). Shared
+/// teardown so the identical cleanup block isn't copy-pasted across the #386
+/// audit test modules (jscpd dedup).
+pub async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
+    for table in ["refresh_token_jti", "totp_pending_jti", "password_history"] {
+        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
+}
+
+/// A TOTP-enrolled test user plus everything the enable/disable/verify handler
+/// tests need: the loaded [`User`] model, the raw secret bytes for generating
+/// live codes, the base32 secret, and the storage-backed [`SharedState`].
+pub struct TotpUserFixture {
+    pub user: User,
+    pub secret_bytes: Vec<u8>,
+    pub secret_b32: String,
+    pub state: SharedState,
+    pub storage_dir: PathBuf,
+}
+
+/// Seed a fresh `totp_enabled` user with the given backup-code hashes and
+/// return a [`TotpUserFixture`]. Centralizes the seed + `User` literal so the
+/// TOTP handler test modules (verify-hardening #1819/#1820/#1822 and the #386
+/// audit-trail tests) share one definition instead of copy-pasting it (jscpd
+/// dedup). `password_hash` is seeded to the sentinel `"unused"`; tests that
+/// exercise the password-verify path (e.g. `disable_totp`) overwrite it with a
+/// real bcrypt hash.
+pub async fn create_totp_user(pool: &PgPool, backup_hashes: &[String]) -> TotpUserFixture {
+    let (user_id, username) = create_user(pool).await;
+    let secret = totp_rs::Secret::generate_secret();
+    let secret_b32 = secret.to_encoded().to_string();
+    let secret_bytes = secret.to_bytes().expect("secret bytes");
+    let backup_json = serde_json::to_string(backup_hashes).expect("serialize backup");
+    sqlx::query(
+        "UPDATE users SET totp_secret = $1, totp_enabled = true, totp_backup_codes = $2 \
+         WHERE id = $3",
+    )
+    .bind(&secret_b32)
+    .bind(&backup_json)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("enable totp");
+    let storage_dir = std::env::temp_dir().join(format!("totp-fixture-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+    let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+    let user = User {
+        id: user_id,
+        username,
+        email: format!("{user_id}@test.local"),
+        password_hash: Some("unused".to_string()),
+        display_name: None,
+        auth_provider: crate::models::user::AuthProvider::Local,
+        external_id: None,
+        is_admin: false,
+        is_active: true,
+        is_service_account: false,
+        must_change_password: false,
+        totp_secret: Some(secret_b32.clone()),
+        totp_enabled: true,
+        totp_backup_codes: Some(backup_json),
+        totp_verified_at: None,
+        failed_login_attempts: 0,
+        locked_until: None,
+        last_failed_login_at: None,
+        password_changed_at: chrono::Utc::now(),
+        last_login_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    TotpUserFixture {
+        user,
+        secret_bytes,
+        secret_b32,
+        state,
+        storage_dir,
+    }
 }
 
 /// Build a `Basic <base64(user:pass)>` header value.

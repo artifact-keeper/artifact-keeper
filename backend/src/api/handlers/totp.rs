@@ -19,6 +19,10 @@ use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{
+    audit_fire_and_forget, sessions_invalidated_audit_entry, totp_audit_entry, AuditAction,
+    AuditEntry, ResourceType,
+};
 use crate::services::auth_service::{invalidate_other_sessions, AuthService};
 
 /// Build a TOTP instance from raw secret bytes and a username label.
@@ -300,6 +304,20 @@ pub async fn enable_totp(
         );
     }
 
+    // Audit the credential-posture change and the mass session invalidation
+    // it triggered (#386). Fire-and-forget and placed AFTER the state change
+    // has committed so an audit-table outage can never fail the enable.
+    audit_fire_and_forget(
+        state.db.clone(),
+        totp_audit_entry(AuditAction::TotpEnabled, auth.user_id),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(auth.user_id, auth.user_id, "totp_enable"),
+    )
+    .await;
+
     Ok(Json(TotpEnableResponse { backup_codes }))
 }
 
@@ -349,6 +367,16 @@ pub async fn verify_totp(
     .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
 
     if !user_row.totp_enabled {
+        // A 2FA login attempt against a user without TOTP enabled is a failed
+        // login; record it (#386). Fire-and-forget, non-gating.
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .user(claims.sub)
+                .resource(claims.sub)
+                .details(serde_json::json!({ "reason": "totp_not_enabled" })),
+        )
+        .await;
         return Err(AppError::Authentication(
             "TOTP not enabled for this user".to_string(),
         ));
@@ -363,6 +391,10 @@ pub async fn verify_totp(
     let code_valid = totp
         .check_current(&payload.code)
         .map_err(|e| AppError::Internal(format!("TOTP check error: {}", e)))?;
+
+    // Track which factor authenticated so the success audit event can label
+    // the login method (#386): a primary TOTP code vs a one-time backup code.
+    let mut used_backup_code = false;
 
     if !code_valid {
         // Try backup codes. Consumption must be atomic: a previous read of
@@ -415,8 +447,23 @@ pub async fn verify_totp(
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         if !backup_used {
+            // Neither the primary TOTP code nor a backup code matched: this is
+            // a failed 2FA login and MUST be audited (#386). Fire-and-forget,
+            // non-gating, emitted before returning the error.
+            audit_fire_and_forget(
+                state.db.clone(),
+                AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                    .user(claims.sub)
+                    .resource(claims.sub)
+                    .details(serde_json::json!({
+                        "reason": "invalid_totp_code",
+                        "method": "totp",
+                    })),
+            )
+            .await;
             return Err(AppError::Authentication("Invalid TOTP code".to_string()));
         }
+        used_backup_code = true;
     }
 
     // TOTP verified -- now fetch full user and generate real tokens
@@ -462,6 +509,26 @@ pub async fn verify_totp(
     auth_service
         .persist_refresh_jti_from_pair(&tokens, user.id)
         .await?;
+
+    // A completed TOTP verify IS a login: record it so 2FA users' logins are
+    // no longer invisible in the audit trail (#386). Fire-and-forget,
+    // non-gating, placed after the refresh jti is durably persisted.
+    let method_label = if used_backup_code {
+        "totp_backup_code"
+    } else {
+        "totp"
+    };
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::Login, ResourceType::User)
+            .user(user.id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "username": user.username,
+                "method": method_label,
+            })),
+    )
+    .await;
 
     let body = super::auth::LoginResponse {
         access_token: tokens.access_token.clone(),
@@ -582,6 +649,19 @@ pub async fn disable_totp(
             "Failed to revoke refresh-token families after TOTP disable",
         );
     }
+
+    // Audit the credential-posture change and the mass session invalidation
+    // it triggered (#386). Fire-and-forget, POST-commit, non-gating.
+    audit_fire_and_forget(
+        state.db.clone(),
+        totp_audit_entry(AuditAction::TotpDisabled, auth.user_id),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(auth.user_id, auth.user_id, "totp_disable"),
+    )
+    .await;
 
     Ok(())
 }
@@ -1291,8 +1371,7 @@ mod totp_verify_hardening_tests {
     //!    authenticate concurrent sessions.
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use crate::models::user::{AuthProvider, User};
-    use chrono::Utc;
+    use crate::models::user::User;
     use uuid::Uuid;
 
     /// Enrol a fresh user in TOTP with the given backup-code hashes and return
@@ -1303,55 +1382,12 @@ mod totp_verify_hardening_tests {
         pool: &sqlx::PgPool,
         backup_hashes: &[String],
     ) -> (User, SharedState, Vec<u8>, String, std::path::PathBuf) {
-        let (user_id, username) = tdh::create_user(pool).await;
-        let secret = totp_rs::Secret::generate_secret();
-        let secret_b32 = secret.to_encoded().to_string();
-        let secret_bytes = secret.to_bytes().expect("secret bytes");
-        let backup_json = serde_json::to_string(backup_hashes).expect("serialize backup");
-        sqlx::query(
-            "UPDATE users SET totp_secret = $1, totp_enabled = true, totp_backup_codes = $2 \
-             WHERE id = $3",
-        )
-        .bind(&secret_b32)
-        .bind(&backup_json)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("enable totp");
-
-        let storage_dir = std::env::temp_dir().join(format!("totp-verify-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
-        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
-
-        let user = User {
-            id: user_id,
-            username,
-            email: format!("{user_id}@test.local"),
-            password_hash: Some("unused".to_string()),
-            display_name: None,
-            auth_provider: AuthProvider::Local,
-            external_id: None,
-            is_admin: false,
-            is_active: true,
-            is_service_account: false,
-            must_change_password: false,
-            totp_secret: Some(secret_b32),
-            totp_enabled: true,
-            totp_backup_codes: Some(backup_json),
-            totp_verified_at: None,
-            failed_login_attempts: 0,
-            locked_until: None,
-            last_failed_login_at: None,
-            password_changed_at: Utc::now(),
-            last_login_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let fx = tdh::create_totp_user(pool, backup_hashes).await;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
         let pending = auth_service
-            .generate_totp_pending_token(&user)
+            .generate_totp_pending_token(&fx.user)
             .expect("pending token");
-        (user, state, secret_bytes, pending, storage_dir)
+        (fx.user, fx.state, fx.secret_bytes, pending, fx.storage_dir)
     }
 
     async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, dir: &std::path::Path) {
@@ -1492,6 +1528,193 @@ mod totp_verify_hardening_tests {
         assert!(
             codes.iter().all(|c| c.is_empty()),
             "the consumed backup-code slot must be cleared"
+        );
+    }
+}
+
+/// DB-backed tests for the auth-event audit trail added in #386 (#1617
+/// Phase 1): TOTP enable, disable and login-verify must each emit the right
+/// audit rows, while a failed 2FA verify emits `LOGIN_FAILED`. Each test
+/// no-ops when `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(test)]
+mod totp_audit_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Pick a 6-digit code guaranteed to differ from the live TOTP code so the
+    /// verify path takes the failure branch deterministically.
+    fn wrong_code(current: &str) -> String {
+        if current == "000000" {
+            "111111".to_string()
+        } else {
+            "000000".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_totp_emits_totp_enabled_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let auth = tdh::make_auth(user_id, &fx.user.username);
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+        let code = totp.generate_current().expect("code");
+
+        let res = enable_totp(
+            State(fx.state.clone()),
+            Extension(auth),
+            Json(TotpCodeRequest { code }),
+        )
+        .await;
+
+        let enabled = tdh::audit_count(&pool, user_id, "TOTP_ENABLED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(res.is_ok(), "enable_totp failed: {:?}", res.err());
+        assert_eq!(enabled, 1, "enable_totp MUST write one TOTP_ENABLED row");
+        assert_eq!(
+            invalidated, 1,
+            "enable_totp MUST write one SESSIONS_INVALIDATED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_totp_emits_totp_disabled_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let password = "Disable!2026pw";
+        let hash = bcrypt::hash(password, 4).expect("hash password");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed password hash");
+        let auth = tdh::make_auth(user_id, &fx.user.username);
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+        let code = totp.generate_current().expect("code");
+
+        let res = disable_totp(
+            State(fx.state.clone()),
+            Extension(auth),
+            Json(TotpDisableRequest {
+                password: password.to_string(),
+                code,
+            }),
+        )
+        .await;
+
+        let disabled = tdh::audit_count(&pool, user_id, "TOTP_DISABLED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(res.is_ok(), "disable_totp failed: {:?}", res.err());
+        assert_eq!(disabled, 1, "disable_totp MUST write one TOTP_DISABLED row");
+        assert_eq!(
+            invalidated, 1,
+            "disable_totp MUST write one SESSIONS_INVALIDATED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_totp_success_emits_login_and_wrong_code_emits_login_failed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+
+        // Wrong-code attempt -> LOGIN_FAILED (fresh single-use pending token).
+        let bad_pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+        let current = totp.generate_current().expect("code");
+        let bad = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: bad_pending,
+                code: wrong_code(&current),
+            }),
+        )
+        .await;
+
+        // Successful verify -> LOGIN (a second fresh pending token + live code).
+        let ok_pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+        let code = totp.generate_current().expect("code");
+        let ok = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: ok_pending,
+                code,
+            }),
+        )
+        .await;
+
+        let logins = tdh::audit_count(&pool, user_id, "LOGIN").await;
+        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(bad.is_err(), "wrong TOTP code must be rejected");
+        assert!(
+            ok.is_ok(),
+            "verify with live code must succeed: {:?}",
+            ok.err()
+        );
+        assert_eq!(logins, 1, "successful TOTP verify MUST write one LOGIN row");
+        assert_eq!(
+            failed, 1,
+            "a wrong-code TOTP verify MUST write one LOGIN_FAILED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_totp_on_non_2fa_user_emits_login_failed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        // Flip the DB row so the handler takes the "TOTP not enabled" branch.
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("clear totp_enabled");
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+
+        let res = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: pending,
+                code: "000000".to_string(),
+            }),
+        )
+        .await;
+
+        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(
+            res.is_err(),
+            "verify against a non-2FA user must be rejected"
+        );
+        assert_eq!(
+            failed, 1,
+            "a TOTP verify against a user without 2FA MUST write one LOGIN_FAILED row"
         );
     }
 }

@@ -15,7 +15,10 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
-use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
+use crate::services::audit_service::{
+    api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
+    sessions_invalidated_audit_entry, AuditAction,
+};
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
@@ -1062,6 +1065,22 @@ pub async fn change_password(
         tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password change");
     }
 
+    // Audit the password change and the session invalidation it triggered
+    // (#386). Fire-and-forget and placed AFTER the transaction has committed
+    // so an audit-table outage can never fail the password change. `by_admin`
+    // is true only when an admin changes a DIFFERENT user's password.
+    let by_admin = auth.is_admin && auth.user_id != id;
+    audit_fire_and_forget(
+        state.db.clone(),
+        password_change_audit_entry(id, auth.user_id, by_admin),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "password_change"),
+    )
+    .await;
+
     // If this user had must_change_password, check if setup mode should be unlocked
     if had_must_change && state.setup_required.load(Ordering::Relaxed) {
         state.setup_required.store(false, Ordering::Relaxed);
@@ -1190,6 +1209,20 @@ pub async fn reset_password(
     if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
         tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password reset");
     }
+
+    // Audit the admin-initiated password reset and the session invalidation it
+    // triggered (#386). Subject = target user, actor = acting admin; an admin
+    // reset is by definition `by_admin = true`. Fire-and-forget, POST-commit.
+    audit_fire_and_forget(
+        state.db.clone(),
+        password_change_audit_entry(id, auth.user_id, true),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "password_reset"),
+    )
+    .await;
 
     Ok(Json(ResetPasswordResponse {
         temporary_password: temp_password,
@@ -1369,6 +1402,15 @@ pub async fn force_password_change(
         id,
         Some(auth.username.clone()),
     );
+
+    // Forcing a password change does NOT itself change the password (it only
+    // flags `must_change_password`), so only the mass session invalidation is
+    // audited here — emitting PASSWORD_CHANGED would be misleading (#386).
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "force_password_change"),
+    )
+    .await;
 
     Ok(Json(ForcePasswordChangeResponse {
         message: "User will be required to change password on next login".to_string(),
@@ -3072,5 +3114,139 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id).await;
+    }
+}
+
+/// DB-backed tests for the auth-event audit trail added in #386 (#1617
+/// Phase 1): a self-service password change and an admin password reset must
+/// emit `PASSWORD_CHANGED` (plus `SESSIONS_INVALIDATED` for the self change),
+/// with `details.by_admin` reflecting who performed it. Each test no-ops when
+/// `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(test)]
+mod password_audit_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Read `details.by_admin` off the single PASSWORD_CHANGED audit row for a
+    /// subject, if present.
+    async fn by_admin_flag(pool: &sqlx::PgPool, subject: Uuid) -> Option<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT (details->>'by_admin')::bool FROM audit_log \
+             WHERE resource_id = $1 AND action = 'PASSWORD_CHANGED' LIMIT 1",
+        )
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .expect("by_admin query")
+    }
+
+    #[tokio::test]
+    async fn self_change_password_emits_password_changed_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let current = "OldPass!2026";
+        let hash = bcrypt::hash(current, 4).expect("hash password");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed password hash");
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::make_auth(user_id, &username);
+
+        let res = change_password(
+            State(state.clone()),
+            Extension(auth),
+            Path(user_id),
+            Json(ChangePasswordRequest {
+                current_password: Some(current.to_string()),
+                new_password: "NewPass!2026".to_string(),
+            }),
+        )
+        .await;
+
+        let changed = tdh::audit_count(&pool, user_id, "PASSWORD_CHANGED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        let by_admin = by_admin_flag(&pool, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(res.is_ok(), "change_password failed: {:?}", res.err());
+        assert_eq!(
+            changed, 1,
+            "self change_password MUST write one PASSWORD_CHANGED row"
+        );
+        assert_eq!(
+            invalidated, 1,
+            "self change_password MUST write one SESSIONS_INVALIDATED row"
+        );
+        assert_eq!(
+            by_admin,
+            Some(false),
+            "a self change must record details.by_admin = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_reset_password_emits_password_changed_by_admin_on_target() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_id, _target_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let res = reset_password(State(state.clone()), Extension(auth), Path(target_id)).await;
+
+        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        let by_admin = by_admin_flag(&pool, target_id).await;
+        tdh::cleanup_user(&pool, target_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(res.is_ok(), "reset_password failed: {:?}", res.err());
+        assert_eq!(
+            changed, 1,
+            "admin reset MUST write one PASSWORD_CHANGED row on the target user"
+        );
+        assert_eq!(
+            by_admin,
+            Some(true),
+            "an admin reset must record details.by_admin = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_force_password_change_emits_sessions_invalidated_only() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_id, _target_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let res =
+            force_password_change(State(state.clone()), Extension(auth), Path(target_id)).await;
+
+        let invalidated = tdh::audit_count(&pool, target_id, "SESSIONS_INVALIDATED").await;
+        // No password actually changed, so PASSWORD_CHANGED must NOT be emitted.
+        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        tdh::cleanup_user(&pool, target_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(res.is_ok(), "force_password_change failed: {:?}", res.err());
+        assert_eq!(
+            invalidated, 1,
+            "force_password_change MUST write one SESSIONS_INVALIDATED row"
+        );
+        assert_eq!(
+            changed, 0,
+            "force_password_change must NOT emit PASSWORD_CHANGED (no password changed)"
+        );
     }
 }
