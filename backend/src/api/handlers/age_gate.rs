@@ -182,8 +182,12 @@ fn require_remote_repo_for_age_gate(repo_type: &RepositoryType) -> Result<()> {
 )]
 pub async fn list_reviews(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ReviewListQuery>,
 ) -> Result<Json<AgeGateReviewListResponse>> {
+    // Belt-and-suspenders with the `/admin` `admin_middleware`: gate in-handler
+    // too, for parity with approve/reject and the codebase's double-guard posture.
+    auth.require_admin()?;
     let svc = age_gate_service(&state)?;
     let (page, per_page, offset) = normalize_review_pagination(query.page, query.per_page);
 
@@ -222,8 +226,11 @@ pub async fn list_reviews(
 )]
 pub async fn get_review(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgeGateReviewResponse>> {
+    // Belt-and-suspenders with the `/admin` `admin_middleware` (see list_reviews).
+    auth.require_admin()?;
     let svc = age_gate_service(&state)?;
     let review = svc.get_review_by_id(id).await?;
     Ok(Json(review_to_response(review)))
@@ -403,7 +410,12 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: if is_admin {
+                crate::models::access_scope::AccessScope::Admin
+            } else {
+                crate::models::access_scope::AccessScope::default()
+            },
+            iat_ms: None,
         }
     }
 

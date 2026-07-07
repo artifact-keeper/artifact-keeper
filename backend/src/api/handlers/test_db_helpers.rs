@@ -835,6 +835,26 @@ pub fn build_state_with_proxy(
     Arc::new(state)
 }
 
+/// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
+/// state so handler tests can exercise the download age gate end-to-end
+/// (`serve_file` / `serve_tarball` only enforce the gate when the service is
+/// present; when it is `None` every check returns `Allow`).
+pub fn build_state_with_proxy_and_age_gate(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> crate::api::SharedState {
+    use crate::services::age_gate_service::AgeGateService;
+    use crate::services::event_bus::EventBus;
+    let mut state = app_state_with(cfg(storage_path), pool.clone(), storage_path);
+    state.set_proxy_service(proxy);
+    state.set_age_gate_service(Arc::new(AgeGateService::new(
+        pool,
+        Arc::new(EventBus::new(4)),
+    )));
+    Arc::new(state)
+}
+
 /// Like [`build_state_with_proxy`] but with `presigned_downloads_enabled = true`
 /// so tests can drive the presigned-redirect gate (#1555). The filesystem
 /// backend still reports `supports_redirect() == false`, so the redirect path

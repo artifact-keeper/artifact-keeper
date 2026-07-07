@@ -1335,6 +1335,67 @@ async fn apply_pypi_download_age_gate(
     }
 }
 
+/// Run the remote-PyPI download age gate and, when the requested version is
+/// withheld, resolve the response the caller should return: the last-known-good
+/// wheel served via the proxy cache (presigned redirect / cache stream /
+/// upstream refetch), or the 451 block propagated as an `Err`.
+///
+/// Returns `Ok(Some(response))` when the gate handled the request and
+/// `Ok(None)` when the version is allowed and the caller should keep serving
+/// normally. Shared by both the cache-miss and the local-`artifacts`-hit
+/// branches of `serve_file` so a young version is never streamed just because a
+/// local row exists (parity with npm's unconditional `serve_tarball` gate).
+async fn enforce_pypi_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Option<Response>, Response> {
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Ok(None),
+    };
+
+    let lkg_filename = match apply_pypi_download_age_gate(state, repo, project, filename).await? {
+        Some(lkg) => lkg,
+        None => return Ok(None),
+    };
+
+    let normalized = PypiHandler::normalize_name(project);
+    let lkg_cache_path = build_pypi_proxy_cache_path(&normalized, &lkg_filename);
+    // #1555 ordering holds on the LKG fallback too: presigned redirect on a
+    // fresh cache hit BEFORE the streaming cache check, so a cached LKG wheel is
+    // not streamed through the backend.
+    if let Some(redirect) = pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
+    {
+        return Ok(Some(redirect));
+    }
+    if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &lkg_cache_path,
+    )
+    .await
+    {
+        return Ok(Some(build_streaming_file_response(&lkg_filename, result)));
+    }
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+    let result = fetch_from_pypi_remote_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        project,
+        &lkg_filename,
+        &index_path,
+    )
+    .await?;
+    Ok(Some(build_streaming_file_response(&lkg_filename, result)))
+}
+
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1370,41 +1431,14 @@ async fn serve_file(
                 {
                     let normalized = PypiHandler::normalize_name(project);
 
-                    if let Some(lkg_filename) =
-                        apply_pypi_download_age_gate(state, repo, project, filename).await?
+                    // Enforce the download age gate before any proxy fetch, and
+                    // serve the last-known-good wheel if the requested version is
+                    // withheld. Shared with the local-`artifacts`-hit branch below.
+                    if let Some(resp) =
+                        enforce_pypi_download_age_gate(state, repo, repo_key, project, filename)
+                            .await?
                     {
-                        let lkg_cache_path =
-                            build_pypi_proxy_cache_path(&normalized, &lkg_filename);
-                        // #1555 ordering holds on the LKG fallback too:
-                        // presigned redirect on a fresh cache hit BEFORE the
-                        // streaming cache check, so a cached LKG wheel is not
-                        // streamed through the backend.
-                        if let Some(redirect) =
-                            pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
-                        {
-                            return Ok(redirect);
-                        }
-                        if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
-                            proxy,
-                            repo.id,
-                            repo_key,
-                            upstream_url,
-                            &lkg_cache_path,
-                        )
-                        .await
-                        {
-                            return Ok(build_streaming_file_response(&lkg_filename, result));
-                        }
-                        let result = fetch_from_pypi_remote_streaming(
-                            proxy,
-                            repo.id,
-                            repo_key,
-                            upstream_url,
-                            project,
-                            &lkg_filename,
-                        )
-                        .await?;
-                        return Ok(build_streaming_file_response(&lkg_filename, result));
+                        return Ok(resp);
                     }
 
                     // Try the proxy cache first using a predictable local
@@ -1614,6 +1648,21 @@ async fn serve_file(
             return Err(AppError::NotFound("File not found".to_string()).into_response());
         }
     };
+
+    // Enforce the download age gate even when a local `artifacts` row exists for
+    // a Remote repo (a locally-published, hydrated/replicated, or pre-#1278
+    // cached wheel). Without this, the cache-hit branch above streams a young
+    // version UNGATED while the cache-miss branch blocks it — a fail-open
+    // asymmetry versus npm's serve_tarball, which gates unconditionally. A
+    // withheld version returns 451 (or the last-known-good wheel) instead of the
+    // young local artifact.
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(resp) =
+            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename).await?
+        {
+            return Ok(resp);
+        }
+    }
 
     // Check quarantine status before serving
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
@@ -4727,6 +4776,130 @@ mod tests {
         );
 
         cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Age-gate fail-open regression: a local `artifacts` row must NOT bypass
+    // the download age gate on a Remote repo.
+    //
+    // `serve_file` looks up the local `artifacts` table first. Before this
+    // fix the gate ran ONLY on the cache-MISS branch, so a version with an
+    // `artifacts` row (locally-published / hydrated / pre-#1278 cached wheel)
+    // streamed UNGATED even when it was too young — an asymmetry versus npm's
+    // `serve_tarball`, which gates unconditionally. This test seeds exactly
+    // such a row for a gate-enabled Remote repo whose upstream reports a
+    // just-now `upload_time` (so the version is younger than the threshold)
+    // and asserts the request is blocked with HTTP 451 rather than streamed.
+    //
+    // Skips cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serve_file_age_gate_blocks_young_version_on_artifacts_hit() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let wheel_bytes: &[u8] = b"PK\x03\x04 young-wheel-should-be-gated";
+        let project = "gated";
+        let version = "1.2.3";
+        let filename = "gated-1.2.3-py3-none-any.whl";
+
+        // Upstream reports the version as published *just now* so it is younger
+        // than the (very large) threshold and must be withheld.
+        let upstream = MockServer::start().await;
+        let now_iso = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": { version: [ { "upload_time_iso_8601": now_iso } ] }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Remote repo with the age gate ENABLED and an absurd threshold so any
+        // recent release is "young".
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        repo_info.age_gate_enabled = true;
+        repo_info.age_gate_min_age_days = 36_500; // 100 years
+
+        // Seed the local `artifacts` row + payload that would otherwise be
+        // served straight from storage on the cache-hit branch.
+        let storage_key = format!(
+            "proxy-cache/{}/simple/{}/{}",
+            fx.repo_key, project, filename
+        );
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &repo_info,
+            &storage_key,
+            Bytes::from_static(wheel_bytes),
+        )
+        .await
+        .expect("seed payload on disk");
+        let _artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind(version)
+        .bind(wheel_bytes.len() as i64)
+        .bind("test-gated")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed cached artifact row");
+
+        let result =
+            super::serve_file(&state, &repo_info, &fx.repo_key, project, filename, None).await;
+
+        // Clean up BEFORE asserting so a panic still leaves the DB clean. The
+        // age_gate_reviews row inserted by `check` cascades on repo delete.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        match result {
+            Ok(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!(
+                    "young version with an artifacts-row hit must be gated, got {status} \
+                     (expected 451 age_gate_blocked)"
+                );
+            }
+            Err(resp) => {
+                let status = resp.status();
+                cleanup().await;
+                assert_eq!(
+                    status,
+                    StatusCode::from_u16(451).unwrap(),
+                    "artifacts-hit young version must return 451, got {status}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
