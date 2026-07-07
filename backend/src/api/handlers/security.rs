@@ -614,6 +614,25 @@ async fn trigger_scan(
     }
 
     if let Some(artifact_id) = body.artifact_id {
+        // Honest not-found up front (#2227): without this, an id with no
+        // `artifacts` row -- e.g. the synthetic, SHA-256-derived id a Remote
+        // repo lists for a proxy-cached object (#1280/#1278) -- returned a
+        // fire-and-forget 200 and then failed only in the worker's logs
+        // ("Scan failed for artifact ...: Artifact not found"). Resolve the
+        // row first and return a clear 404 so the caller learns that scans
+        // are only available for artifacts hosted in this registry.
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE id = $1 AND is_deleted = false")
+                .bind(artifact_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+        if exists.is_none() {
+            return Err(AppError::NotFound(
+                crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.into(),
+            ));
+        }
+
         // Pre-allocate one scan_result row per configured scanner so the IDs
         // can be returned in this response. The actual scan work is still
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs

@@ -2062,6 +2062,17 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
+    /// Whether this artifact can have an SBOM generated or a security scan
+    /// run against it. `false` for proxy-cached (Remote) objects: those are
+    /// listed with a synthetic, SHA-256-derived id (see
+    /// [`cached_artifact_id`]) and have no row in the `artifacts` table
+    /// (#1280/#1278), so SBOM/scan lookups by `artifacts.id` cannot resolve
+    /// them and `sbom_documents`/`scan_results` cannot reference them.
+    /// `true` for hosted artifacts, which carry a real DB id. The web UI
+    /// uses this to hide/disable the "Generate SBOM" / "Scan" actions where
+    /// they cannot work; clients that predate the field should treat an
+    /// absent value as `true` so hosted artifacts are never hidden. (#2227)
+    pub analyzable: bool,
     /// When the proxy cache entry for this artifact was last written.
     /// Only populated for Remote (proxy) repositories whose proxy service is
     /// configured AND that have a cache-metadata blob for this path. None
@@ -2535,6 +2546,9 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        // Proxy-cached objects have no `artifacts` row (#1280/#1278) and a
+        // synthetic id, so SBOM/scan cannot resolve them: not analyzable.
+        analyzable: false,
         // This is a proxy-cache entry, so surface the cache timestamp.
         // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
         cache_cached_at: Some(entry.cached_at),
@@ -2711,6 +2725,8 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
+        // Hosted artifact backed by a real `artifacts` row: SBOM/scan resolve.
+        analyzable: true,
         // Cache metadata is surfaced only by the per-artifact metadata
         // endpoint to avoid fanning out a storage GET per artifact in
         // listings (#1541). Helpers used by listings leave these as None;
@@ -2762,6 +2778,9 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
+            // Secondary Maven files are recorded under a real primary
+            // artifact row (its id), so they are analyzable like the primary.
+            analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
         });
@@ -3601,6 +3620,9 @@ pub async fn get_artifact_metadata(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata.map(|m| m.metadata),
+            // This handler resolves a real `artifacts` row by id, so it is
+            // always a hosted artifact (analyzable), even inside a Remote repo.
+            analyzable: true,
             cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
         })
@@ -3847,6 +3869,8 @@ pub async fn upload_artifact(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata_json,
+            // Freshly-uploaded hosted artifact with a real DB id: analyzable.
+            analyzable: true,
             // Just-uploaded artifacts have no proxy cache state yet -- the
             // cache is populated lazily on the first proxy fetch.
             cache_cached_at: None,
@@ -5967,6 +5991,10 @@ mod tests {
         assert_eq!(resp.checksum_sha256, "deadbeef");
         assert_eq!(resp.download_count, 0);
         assert!(resp.version.is_none());
+        // Proxy-cached objects have no `artifacts` row and a synthetic id,
+        // so they cannot be SBOM'd or scanned: the listing marks them
+        // non-analyzable so the UI hides those actions (#2227).
+        assert!(!resp.analyzable);
         // A cached-listing entry is a live proxy-cache object, so its
         // freshness timestamp is exactly when it was cached; the sidecar
         // projection carries no expiry. (Asserting these guards the
@@ -6020,6 +6048,8 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+        // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
+        assert!(resp.analyzable);
     }
 
     // -----------------------------------------------------------------------
@@ -7386,12 +7416,16 @@ mod tests {
             download_count: 42,
             created_at: chrono::Utc::now(),
             metadata: None,
+            analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
+        // `analyzable` is always serialized (no serde skip) so clients can
+        // gate the SBOM/Scan actions on it (#2227).
+        assert!(json.contains("\"analyzable\":true"));
         // Cache fields are omitted when None so the wire shape stays the
         // same for non-Remote repos and for Remote repos without cache
         // metadata (#1541).
@@ -7425,6 +7459,7 @@ mod tests {
             download_count: 0,
             created_at: cached,
             metadata: None,
+            analyzable: false,
             cache_cached_at: Some(cached),
             cache_expires_at: Some(expires),
         };

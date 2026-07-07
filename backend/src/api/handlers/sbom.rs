@@ -19,6 +19,15 @@ use crate::models::sbom::{
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
 
+/// Not-found message for artifact-scoped analysis endpoints (SBOM generate,
+/// CVE history). A bare "Artifact not found" was confusing for proxy-cached
+/// (Remote) objects: those are listed with a synthetic, SHA-256-derived id and
+/// have no row in the `artifacts` table (#1280/#1278), so SBOM/scan lookups by
+/// `artifacts.id` can never resolve them even though the object is visible in
+/// the listing. This message distinguishes that expected case from a genuine
+/// missing id and tells the caller what actually works. (#2227)
+pub(crate) const ARTIFACT_NOT_ANALYZABLE_MSG: &str = "Artifact not found or not eligible for analysis: SBOM generation and security scanning are available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
+
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
 /// breaking the response over a best-effort audit write would do callers no
@@ -353,7 +362,7 @@ async fn generate_sbom(
             .fetch_optional(&state.db)
             .await
             .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
+            .ok_or_else(|| AppError::NotFound(ARTIFACT_NOT_ANALYZABLE_MSG.into()))?;
 
     // If force_regenerate, delete existing SBOM first
     if body.force_regenerate {
@@ -1601,7 +1610,7 @@ async fn ensure_artifact_repo_access(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_access(auth, repo_id, "Artifact not found")
+    require_repo_access(auth, repo_id, ARTIFACT_NOT_ANALYZABLE_MSG)
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -2344,6 +2353,27 @@ mod tests {
         let auth = make_auth(None, false);
         let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_artifact_analysis_missing_uses_honest_not_analyzable_message() {
+        // #2227: the artifact-scoped analysis endpoints (SBOM generate, CVE
+        // history) no longer return a bare "Artifact not found". When the id
+        // has no `artifacts` row -- e.g. the synthetic id a Remote repo lists
+        // for a proxy-cached object -- the caller must learn that analysis is
+        // only available for hosted artifacts. Pin the exact wording that
+        // `ensure_artifact_repo_access` (and `generate_sbom`) surface.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, ARTIFACT_NOT_ANALYZABLE_MSG).unwrap_err();
+        match err {
+            AppError::NotFound(msg) => {
+                assert_eq!(msg, ARTIFACT_NOT_ANALYZABLE_MSG);
+                assert!(msg.contains("hosted in this registry"));
+                assert!(msg.contains("proxy-cached remote artifacts"));
+                assert_ne!(msg, "Artifact not found");
+            }
+            other => panic!("expected NotFound with the honest message, got {:?}", other),
+        }
     }
 
     #[test]
