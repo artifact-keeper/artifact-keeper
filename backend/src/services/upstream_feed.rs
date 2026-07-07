@@ -17,7 +17,7 @@
 //! * [`FeedConsumer`] — the runner: cluster-wide single consumer via the
 //!   existing advisory-lock primitive (so N replicas do not open N feed
 //!   connections), resume cursor persisted in `upstream_feed_state`
-//!   (migration 146), reconnect with capped exponential backoff.
+//!   (migration 149), reconnect with capped exponential backoff.
 //!
 //! Best-effort by design: the feed is a freshness optimisation, never the
 //! correctness mechanism — the packument cache's TTL/stale-while-revalidate
@@ -361,7 +361,7 @@ impl FeedAction for PackumentInvalidationAction {
 // ---------------------------------------------------------------------------
 
 /// Postgres-backed [`FeedStateStore`] over `upstream_feed_state`
-/// (migration 146).
+/// (migration 149).
 pub struct PgFeedStateStore {
     pool: PgPool,
 }
