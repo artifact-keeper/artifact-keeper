@@ -571,7 +571,7 @@ impl<'a> DebianProxy<'a> {
             self.repo_key,
             upstream_url,
             &upstream_path,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
         )
         .await?;
         Err(build_dists_response(content, upstream_ct, content_type))
@@ -797,6 +797,17 @@ async fn require_active_signing_key(
 /// Iterate the virtual repo's Remote members for `upstream_path` and
 /// return the first successful response. Checks the release epoch for
 /// lazy invalidation before attempting the streaming fetch.
+///
+/// Error propagation:
+///   * `404 / NotFound` — the member genuinely doesn't have this file;
+///     continue to the next member.
+///   * Non-404 (502 cap-exceeded, 503 upstream-down, etc.) — record the
+///     first occurrence but **continue** to the next member so a
+///     transient failure on a higher-priority mirror doesn't block a
+///     healthy lower-priority one. If all members fail, the first
+///     non-404 error is returned so the client sees the real cause. If
+///     every member returned 404, `Ok(None)` lets the caller fall through
+///     to the local-DB path (hosted repos).
 async fn try_virtual_dists(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
@@ -810,6 +821,7 @@ async fn try_virtual_dists(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
@@ -824,7 +836,7 @@ async fn try_virtual_dists(
             &member.key,
             upstream_url,
             upstream_path,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
         )
         .await
         {
@@ -835,13 +847,18 @@ async fn try_virtual_dists(
                     default_content_type,
                 )));
             }
-            Err(_) => {
-                // Try the next member.
-                continue;
+            Err(resp) => {
+                if resp.status() == StatusCode::NOT_FOUND {
+                    continue;
+                }
+                first_err.get_or_insert(resp);
             }
         }
     }
-    Ok(None)
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
 }
 
 /// Check the release epoch and invalidate the cache entry if stale.
@@ -879,6 +896,13 @@ async fn maybe_invalidate_by_epoch(
 /// Change-detection variant of [`try_virtual_dists`]. Uses TTL +
 /// conditional-request + epoch-based lazy invalidation for virtual repo
 /// members' Release/InRelease files.
+///
+/// Error propagation mirrors [`try_virtual_dists`]:
+///   * `NotFound` (404) — continue to the next member.
+///   * Non-404 — record the first occurrence but continue; return it
+///     only if no member succeeds. This preserves multi-mirror failover
+///     while still surfacing real failures (502, 503, etc.) instead of
+///     silently falling through to an empty local DB.
 async fn try_virtual_dists_detecting_change(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
@@ -892,6 +916,7 @@ async fn try_virtual_dists_detecting_change(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
@@ -916,10 +941,18 @@ async fn try_virtual_dists_detecting_change(
                     default_content_type,
                 )));
             }
-            Err(_) => continue,
+            Err(e) => {
+                if matches!(e, crate::error::AppError::NotFound(_)) {
+                    continue;
+                }
+                first_err.get_or_insert(map_proxy_err(e));
+            }
         }
     }
-    Ok(None)
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
 }
 
 fn map_proxy_err(e: crate::error::AppError) -> Response {
@@ -1344,7 +1377,7 @@ async fn dists_proxy_catchall(
         &repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await?;
 
