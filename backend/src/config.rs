@@ -807,7 +807,7 @@ redacted_debug!(Config {
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
     show npm_upstream_feed_enabled,
-    show npm_upstream_feed_url,
+    redact npm_upstream_feed_url,
 });
 
 impl Default for Config {

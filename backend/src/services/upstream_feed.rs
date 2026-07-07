@@ -134,7 +134,10 @@ pub trait UpstreamFeedAdapter: Send + Sync {
 /// per event).
 #[async_trait]
 pub trait FeedAction: Send + Sync {
-    async fn apply(&self, events: &[FeedEvent]);
+    /// Returns whether the batch was applied. On `false` the consumer must
+    /// not advance the cursor past these events, so a later attempt (or
+    /// leader) replays them instead of losing them.
+    async fn apply(&self, events: &[FeedEvent]) -> bool;
 }
 
 /// Resume-cursor persistence seam (table `upstream_feed_state`).
@@ -222,9 +225,14 @@ impl NpmReplicationFeedAdapter {
             .user_agent(concat!("artifact-keeper/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| AppError::Config(format!("building npm feed HTTP client: {e}")))?;
+        // Strip userinfo so credentials in the configured URL never reach
+        // the DB key or log lines that carry `feed = feed_key`.
+        let mut display = parsed.clone();
+        let _ = display.set_username("");
+        let _ = display.set_password(None);
         Ok(Self {
             http,
-            feed_key: format!("npm-changes:{url}"),
+            feed_key: format!("npm-changes:{display}"),
             url: parsed,
         })
     }
@@ -317,7 +325,7 @@ impl PackumentInvalidationAction {
 
 #[async_trait]
 impl FeedAction for PackumentInvalidationAction {
-    async fn apply(&self, events: &[FeedEvent]) {
+    async fn apply(&self, events: &[FeedEvent]) -> bool {
         // Resolve the covered repositories (and their virtuals) once per
         // batch; the per-event work is then pure cache invalidation.
         let repos: Vec<(uuid::Uuid, String, Option<String>)> = match sqlx::query_as(
@@ -330,8 +338,8 @@ impl FeedAction for PackumentInvalidationAction {
         {
             Ok(repos) => repos,
             Err(e) => {
-                tracing::debug!(error = %e, "npm feed invalidation skipped: repo lookup failed");
-                return;
+                tracing::warn!(error = %e, "npm feed invalidation skipped: repo lookup failed");
+                return false;
             }
         };
         for (repo_id, repo_key, upstream_url) in repos {
@@ -353,6 +361,7 @@ impl FeedAction for PackumentInvalidationAction {
                 }
             }
         }
+        true
     }
 }
 
@@ -522,12 +531,20 @@ impl FeedConsumer {
             // at the feed's genesis.
             Ok(None) => self.adapter.initial_cursor(),
             Err(e) => {
+                // Falling back to the head sentinel here would silently skip
+                // everything between the stored cursor and now, and the next
+                // save would overwrite the stored cursor with the head. Sit
+                // the term out; the next leader retries the load.
                 tracing::warn!(
                     feed = feed_key,
                     error = %e,
-                    "upstream feed cursor unreadable; consuming from the feed head"
+                    "upstream feed cursor unreadable; skipping this term"
                 );
-                self.adapter.initial_cursor()
+                // run() re-contends the lock as soon as a term ends, so
+                // without a pause a persistently unreadable cursor becomes a
+                // hot acquire/release loop.
+                cancelled_within(&self.cancel, self.leader_retry).await;
+                return;
             }
         };
         let mut backoff = self.backoff_initial;
@@ -541,8 +558,20 @@ impl FeedConsumer {
             };
             match polled {
                 Ok(batch) => {
-                    if !batch.events.is_empty() {
-                        self.action.apply(&batch.events).await;
+                    if !batch.events.is_empty() && !self.action.apply(&batch.events).await {
+                        // Advancing the cursor past an unapplied batch would
+                        // lose those invalidations for good; hold position
+                        // and replay the batch after a backoff.
+                        tracing::warn!(
+                            feed = feed_key,
+                            backoff_secs = backoff.as_secs_f32(),
+                            "upstream feed actions failed; replaying the batch"
+                        );
+                        if cancelled_within(&self.cancel, backoff).await {
+                            return;
+                        }
+                        backoff = next_backoff(backoff, self.backoff_max);
+                        continue;
                     }
                     let advanced = batch.last_seq.is_some() && batch.last_seq != since;
                     if let Some(last_seq) = batch.last_seq {
@@ -560,14 +589,16 @@ impl FeedConsumer {
                     }
                     if advanced {
                         backoff = self.backoff_initial;
-                    } else if batch.events.is_empty() {
-                        // Idle long-poll round (a well-behaved feed already
-                        // blocked server-side): gentle fixed pacing so an
-                        // instant-empty feed cannot hot-loop.
+                    }
+                    if batch.events.is_empty() {
+                        // Idle round, whether or not the seq moved (a poll can
+                        // advance the cursor with every row filtered out):
+                        // gentle fixed pacing so an instant-empty feed cannot
+                        // hot-loop.
                         if cancelled_within(&self.cancel, self.empty_batch_pacing).await {
                             return;
                         }
-                    } else {
+                    } else if !advanced {
                         // Events but no cursor progress: the next poll would
                         // replay the same batch (e.g. a feed re-shape whose
                         // seqs we cannot normalise). Escalating backoff
@@ -641,7 +672,7 @@ pub fn spawn_npm_feed_consumer(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use std::collections::VecDeque;
@@ -924,6 +955,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingAction {
         applied: Mutex<Vec<String>>,
+        /// Number of upcoming `apply` calls to fail (recording nothing).
+        fail_next: AtomicUsize,
     }
 
     impl RecordingAction {
@@ -934,9 +967,17 @@ mod tests {
 
     #[async_trait]
     impl FeedAction for RecordingAction {
-        async fn apply(&self, events: &[FeedEvent]) {
+        async fn apply(&self, events: &[FeedEvent]) -> bool {
+            if self
+                .fail_next
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return false;
+            }
             let mut applied = self.applied.lock().unwrap();
             applied.extend(events.iter().map(|event| event.package.clone()));
+            true
         }
     }
 
@@ -944,6 +985,7 @@ mod tests {
     struct MemoryStateStore {
         map: Mutex<HashMap<String, String>>,
         fail_saves: AtomicBool,
+        fail_loads: AtomicBool,
     }
 
     impl MemoryStateStore {
@@ -961,6 +1003,9 @@ mod tests {
     #[async_trait]
     impl FeedStateStore for MemoryStateStore {
         async fn load(&self, feed_key: &str) -> Result<Option<String>> {
+            if self.fail_loads.load(Ordering::SeqCst) {
+                return Err(AppError::Database("simulated load failure".to_string()));
+            }
             Ok(self.get(feed_key))
         }
         async fn save(&self, feed_key: &str, last_seq: &str) -> Result<()> {
@@ -1307,6 +1352,131 @@ mod tests {
             polls <= 12,
             "a stalled cursor must back off, not hot-loop; observed {polls} \
              polls in 300ms with a 10ms initial backoff"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_holds_the_cursor_and_replays_the_batch_when_actions_fail() {
+        // The adapter serves the same batch twice: after a failed apply the
+        // consumer must re-poll with an unchanged cursor, so the feed
+        // replays the events instead of losing them.
+        let adapter =
+            ScriptedAdapter::new(vec![batch(&["flaky-pkg"], "5"), batch(&["flaky-pkg"], "5")]);
+        let action = Arc::new(RecordingAction::default());
+        action.fail_next.store(1, Ordering::SeqCst);
+        let state = Arc::new(MemoryStateStore::default());
+        state.put("test-feed", "4");
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| action.applied() == vec!["flaky-pkg"]).await,
+            "the batch must be replayed and applied after the failed attempt; got {:?}",
+            action.applied()
+        );
+        assert_eq!(
+            adapter.sinces()[..2],
+            [Some("4".to_string()), Some("4".to_string())],
+            "a failed apply must not advance the poll cursor"
+        );
+        assert!(
+            wait_until(|| state.get("test-feed") == Some("5".to_string())).await,
+            "the cursor is persisted once the batch finally applies"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_paces_empty_batches_even_when_the_cursor_advances() {
+        // A filtered feed can answer instantly with zero events and a moving
+        // seq on every round; that must be paced like any idle round, not
+        // hot-looped just because the cursor advanced.
+        let polls: Vec<Result<FeedBatch>> = (1..=50)
+            .map(|seq| {
+                Ok(FeedBatch {
+                    events: Vec::new(),
+                    last_seq: Some(seq.to_string()),
+                })
+            })
+            .collect();
+        let adapter = ScriptedAdapter::new(polls);
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| state.get("test-feed").is_some()).await,
+            "the advancing cursor must still be persisted between idle rounds"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let polls = adapter.sinces().len();
+        assert!(
+            polls <= 40,
+            "empty advancing batches must be paced, not hot-looped; observed \
+             {polls} polls in 300ms with 10ms pacing"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_skips_the_term_when_the_cursor_load_fails() {
+        let adapter = ScriptedAdapter::new(vec![batch(&["pkg-after-recovery"], "50")]);
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        state.put("test-feed", "42");
+        state.fail_loads.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            adapter.sinces().is_empty(),
+            "an unreadable cursor must skip the term, not resume from the \
+             head sentinel; got {:?}",
+            adapter.sinces()
+        );
+        assert_eq!(
+            state.get("test-feed"),
+            Some("42".to_string()),
+            "the stored cursor must survive the failed load"
+        );
+
+        // A later term retries the load and resumes from the stored cursor.
+        state.fail_loads.store(false, Ordering::SeqCst);
+        assert!(
+            wait_until(|| adapter.sinces().first() == Some(&Some("42".to_string()))).await,
+            "recovery must resume from the stored cursor; got {:?}",
+            adapter.sinces()
+        );
+        assert!(
+            wait_until(|| action.applied() == vec!["pkg-after-recovery"]).await,
+            "consumption resumes once the cursor is readable again"
         );
         cancel.cancel();
         handle.await.expect("join");
