@@ -2029,6 +2029,57 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
+        // #2066: enforce each gated Remote member's download age gate before
+        // resolving the virtual tarball. Virtual metadata is already filtered
+        // per-member (see the metadata branch), so an ordinary `npm install`
+        // cannot resolve a young version — but a client that already knows the
+        // exact young tarball URL (a pinned lockfile) would otherwise stream it
+        // straight through `resolve_virtual_download`. Only runs when the name
+        // is not locally owned (`proxy_for_virtual` is `Some`); a locally-owned
+        // name is served from the local member and is never age-gated. The
+        // shared `resolve_virtual_download` helper is left untouched so no
+        // other format (maven/hex/...) is affected.
+        if let Some(proxy) = proxy_for_virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref member_upstream) = member.upstream_url else {
+                    continue;
+                };
+                let member_info = proxy_helpers::repo_info_from_member(member);
+                // `apply_npm_download_age_gate` early-returns `Ok(None)` for a
+                // member whose gate is not applicable (disabled / non-npm), so
+                // ungated members are unaffected. An aged version -> `Ok(None)`;
+                // a withheld young version with a last-known-good -> serve the
+                // LKG tarball from this member; without one -> `Err(451)` via `?`.
+                match apply_npm_download_age_gate(state, &member_info, package_name, filename)
+                    .await?
+                {
+                    None => {}
+                    Some((lkg_path, lkg_filename)) => {
+                        let lkg = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            member_upstream,
+                            &lkg_path,
+                            &lkg_path,
+                        )
+                        .await?;
+                        correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
+                        return Ok(build_tarball_response_stream(
+                            lkg.body,
+                            &lkg_filename,
+                            npm_virtual_tarball_content_type(lkg.content_type),
+                            lkg.content_length,
+                        ));
+                    }
+                }
+            }
+        }
+
         let result = proxy_helpers::resolve_virtual_download(
             &state.db,
             proxy_for_virtual,
@@ -6059,6 +6110,109 @@ mod db_cov_tests {
         );
         // Dropping the mock server verifies `expect(1)`: exactly one
         // upstream fetch across both requests.
+    }
+
+    // -----------------------------------------------------------------------
+    // #2066: age-gate enforcement on VIRTUAL npm tarball downloads
+    // -----------------------------------------------------------------------
+
+    /// A gated Remote member of a virtual npm repo must block a YOUNG version's
+    /// tarball (451) even on the pinned-URL download path (metadata is already
+    /// filtered), while an AGED version still streams through the virtual (200).
+    #[tokio::test]
+    async fn test_serve_tarball_virtual_gated_member_blocks_young_allows_old() {
+        use chrono::Utc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "gated-pkg";
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.0.0"},
+            "time": { "1.0.0": old, "9.9.9": now },
+            "versions": {
+                "1.0.0": {"name": package, "version": "1.0.0",
+                          "dist": {"tarball":
+                              format!("{}/{}/-/{}-1.0.0.tgz", upstream.uri(), package, package)}},
+                "9.9.9": {"name": package, "version": "9.9.9",
+                          "dist": {"tarball":
+                              format!("{}/{}/-/{}-9.9.9.tgz", upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&upstream)
+            .await;
+        let tgz: &[u8] = b"\x1f\x8b\x08 aged-npm-tarball";
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{package}-1.0.0.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _mkey, member_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let young = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            package,
+            &format!("{package}-9.9.9.tgz"),
+        )
+        .await;
+        let aged = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            package,
+            &format!("{package}-1.0.0.tgz"),
+        )
+        .await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        let young_status = young.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            young_status,
+            axum::http::StatusCode::from_u16(451).unwrap(),
+            "young version of a gated virtual npm member must be blocked (451)"
+        );
+        let aged_status = aged.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            aged_status,
+            axum::http::StatusCode::OK,
+            "aged version of a gated virtual npm member must still stream (200)"
+        );
     }
 
     /// Attach a freshly created local npm repo as a member of the fixture's

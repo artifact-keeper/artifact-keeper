@@ -2170,6 +2170,36 @@ where
     Ok(results)
 }
 
+/// Adapt a virtual-repo member [`Repository`] (as returned by
+/// [`fetch_virtual_members`]) into the lightweight [`RepoInfo`] the per-member
+/// proxy/age-gate helpers accept.
+///
+/// This exists so the format handlers can reuse the SAME per-member age-gate
+/// helpers on their virtual-resolution loops (#2066) that the direct-Remote
+/// branches already use, without teaching those helpers about the full model
+/// type. `fetch_virtual_members` already SELECTs `age_gate_enabled` /
+/// `age_gate_min_age_days`, so the gate columns survive the conversion.
+///
+/// The `format` string is produced lowercase to match what
+/// [`age_gate_params`] parses (it lower-cases and matches the `npm`/`pypi`
+/// families); the three underscore-renamed enum variants (`wasm_oci`,
+/// `helm_oci`, `conda_native`) are not age-gate formats, so the debug-derived
+/// lowercase is exact for every format the gate acts on.
+pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoInfo {
+    RepoInfo {
+        id: m.id,
+        key: m.key.clone(),
+        storage_path: m.storage_path.clone(),
+        storage_backend: m.storage_backend.clone(),
+        repo_type: m.repo_type.as_str().to_string(),
+        format: format!("{:?}", m.format).to_lowercase(),
+        upstream_url: m.upstream_url.clone(),
+        promotion_only: m.promotion_only,
+        age_gate_enabled: m.age_gate_enabled,
+        age_gate_min_age_days: m.age_gate_min_age_days,
+    }
+}
+
 /// Fetch virtual repository member repos sorted by priority.
 pub async fn fetch_virtual_members(
     db: &PgPool,

@@ -704,33 +704,15 @@ async fn simple_project(
                 // Rewrite absolute download URLs to route through our proxy
                 let body = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
-                    let mut rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
-                    if let Some(svc) = state.age_gate_service.as_ref() {
-                        let params = proxy_helpers::age_gate_params(&repo);
-                        if AgeGateService::is_applicable(&params) {
-                            if let Ok(client) = metadata_http_client() {
-                                if let Ok(times) = svc
-                                    .metadata_cache()
-                                    .fetch_pypi_publish_times(
-                                        &client,
-                                        repo.id,
-                                        &effective_upstream,
-                                        &project,
-                                    )
-                                    .await
-                                {
-                                    if let Ok(filtered) = svc
-                                        .filter_pypi_simple_index(
-                                            &params, &project, &times, &rewritten,
-                                        )
-                                        .await
-                                    {
-                                        rewritten = filtered;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    let rewritten = filter_pypi_simple_html_response(
+                        &state,
+                        &repo,
+                        &effective_upstream,
+                        &project,
+                        rewritten,
+                    )
+                    .await;
                     Body::from(rewritten)
                 } else {
                     Body::from(content)
@@ -874,6 +856,37 @@ async fn simple_project(
 
                 match result {
                     Ok((content, content_type)) => {
+                        // #2066: apply THIS gated remote member's age gate to its
+                        // own contribution before it is merged with local members
+                        // below. Locals stay unfiltered (they are not gated);
+                        // filtering the remote member here mirrors the direct
+                        // simple-index path so a young version of a gated member
+                        // is not leaked through the virtual listing.
+                        let member_info = proxy_helpers::repo_info_from_member(member);
+                        let ct = content_type.clone().unwrap_or_default();
+                        let content = if wants_json && ct.contains("json") {
+                            let filtered = filter_pypi_simple_json_response(
+                                &state,
+                                &member_info,
+                                &effective_upstream,
+                                &project,
+                                String::from_utf8_lossy(&content).into_owned(),
+                            )
+                            .await;
+                            Bytes::from(filtered)
+                        } else if ct.contains("text/html") {
+                            let filtered = filter_pypi_simple_html_response(
+                                &state,
+                                &member_info,
+                                &effective_upstream,
+                                &project,
+                                String::from_utf8_lossy(&content).into_owned(),
+                            )
+                            .await;
+                            Bytes::from(filtered)
+                        } else {
+                            content
+                        };
                         remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
@@ -1274,6 +1287,46 @@ async fn filter_pypi_simple_json_response(
     json
 }
 
+/// Age-gate a PyPI simple-index **HTML** body (PEP 503) for a single repo,
+/// dropping the download links of upstream versions younger than the repo's
+/// threshold. Sibling of [`filter_pypi_simple_json_response`] for the HTML
+/// form; extracted from the direct-Remote branch so the virtual-resolution
+/// loop can apply the SAME per-member filter (#2066). Returns the input
+/// unchanged when the gate is not applicable or the publish times cannot be
+/// resolved (same data-dependent behavior as the original inline block).
+async fn filter_pypi_simple_html_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    effective_upstream: &str,
+    project: &str,
+    html: String,
+) -> String {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return html;
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return html;
+    }
+    let Ok(client) = metadata_http_client() else {
+        return html;
+    };
+    let Ok(times) = svc
+        .metadata_cache()
+        .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+        .await
+    else {
+        return html;
+    };
+    match svc
+        .filter_pypi_simple_index(&params, project, &times, &html)
+        .await
+    {
+        Ok(filtered) => filtered,
+        Err(_) => html,
+    }
+}
+
 async fn apply_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1539,6 +1592,27 @@ async fn serve_file(
                 .await?;
 
                 for member in &members {
+                    // #2066: enforce THIS member's download age gate before any
+                    // of its bytes can be served — including from a local
+                    // `artifacts` cache row below (parity with the direct
+                    // artifacts-hit fix). For local / ungated members the helper
+                    // early-returns `Ok(None)` (no upstream_url / not applicable)
+                    // so normal resolution proceeds; an aged version also returns
+                    // `Ok(None)`. A withheld young version returns the
+                    // last-known-good wheel (`Ok(Some(resp))`) or 451 (`Err`).
+                    let member_info = proxy_helpers::repo_info_from_member(member);
+                    if let Some(resp) = enforce_pypi_download_age_gate(
+                        state,
+                        &member_info,
+                        &member.key,
+                        project,
+                        filename,
+                    )
+                    .await?
+                    {
+                        return Ok(resp);
+                    }
+
                     // Try local storage first (works for hosted repos and
                     // cached remote artifacts). #1555: redirect to S3 presigned
                     // URL instead of streaming when enabled.
@@ -4900,6 +4974,382 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2066: age-gate enforcement on VIRTUAL-repo resolution (download + index)
+    // -----------------------------------------------------------------------
+
+    /// Attach a fresh Remote pypi member (upstream = `upstream_uri`) to the
+    /// virtual fixture, with the age gate enabled/disabled and a 30-day
+    /// threshold. The member is public so an anonymous virtual read authorizes
+    /// it. Returns the member id/key/dir plus a proxy+age-gate SharedState.
+    async fn setup_virtual_pypi_member(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        age_gate_enabled: bool,
+        upstream_uri: &str,
+    ) -> (
+        uuid::Uuid,
+        String,
+        std::path::PathBuf,
+        crate::api::SharedState,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = $2, age_gate_min_age_days = 30 WHERE id = $3",
+        )
+        .bind(upstream_uri)
+        .bind(age_gate_enabled)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+        (member_id, member_key, member_dir, state)
+    }
+
+    /// Seed a cached wheel (`artifacts` row + payload) on a virtual member so
+    /// the virtual `serve_file` loop can serve it locally when the gate allows.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_member_wheel(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        user_id: uuid::Uuid,
+        member_id: uuid::Uuid,
+        member_key: &str,
+        member_dir: &std::path::Path,
+        upstream_uri: &str,
+        project: &str,
+        version: &str,
+        filename: &str,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let wheel: &[u8] = b"PK\x03\x04 virtual-member-wheel";
+        let member_info = tdh::make_repo_info(
+            member_id,
+            member_key,
+            member_dir,
+            "remote",
+            Some(upstream_uri),
+        );
+        let storage_key = format!("proxy-cache/{}/simple/{}/{}", member_key, project, filename);
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            state,
+            &member_info,
+            &storage_key,
+            Bytes::from_static(wheel),
+        )
+        .await
+        .expect("seed member payload");
+        let _id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+        )
+        .bind(member_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind(version)
+        .bind(wheel.len() as i64)
+        .bind("test-member")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed member artifact row");
+    }
+
+    /// Drop everything a virtual member created.
+    async fn cleanup_virtual_member(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        member_dir: &std::path::Path,
+    ) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM age_gate_reviews WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repository_config WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        }
+        let _ = std::fs::remove_dir_all(member_dir);
+    }
+
+    /// Mount the `/pypi/<project>/json` publish-times endpoint used by the
+    /// per-version download gate, reporting `version` published at `iso`.
+    async fn mount_pypi_publish_times(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        version: &str,
+        iso: &str,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": { version: [ { "upload_time_iso_8601": iso } ] }
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_virtual_gated_member_blocks_young() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let version = "9.9.9";
+        let filename = "gated-9.9.9-py3-none-any.whl";
+
+        let upstream = MockServer::start().await;
+        mount_pypi_publish_times(&upstream, project, version, &Utc::now().to_rfc3339()).await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+        // Seed a cached young wheel too, so this also proves the gate fires
+        // BEFORE the local artifacts-hit can serve young bytes.
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        match result {
+            Ok(r) => panic!(
+                "young version of a gated virtual member must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::from_u16(451).unwrap(),
+                "young gated member must return 451 through the virtual"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_virtual_gated_member_allows_old() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let version = "1.0.0";
+        let filename = "gated-1.0.0-py3-none-any.whl";
+
+        let upstream = MockServer::start().await;
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        mount_pypi_publish_times(&upstream, project, version, &old).await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "aged version of a gated virtual member must still resolve 200 (regression guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_ungated_member_unaffected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "ungated";
+        let version = "9.9.9";
+        let filename = "ungated-9.9.9-py3-none-any.whl";
+
+        // Age gate DISABLED on the member: a young version must NOT be blocked.
+        // No upstream is contacted (the gate short-circuits on !is_applicable).
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, "http://127.0.0.1:1").await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            "http://127.0.0.1:1",
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an ungated virtual member must serve its (young) version normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_simple_json_filters_young_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        let index = serde_json::json!({
+            "meta": {"api-version": "1.0"},
+            "name": project,
+            "files": [
+                {"filename": "gated-1.0.0-py3-none-any.whl",
+                 "url": "https://files.example.test/gated-1.0.0-py3-none-any.whl",
+                 "hashes": {}, "upload-time": old},
+                {"filename": "gated-9.9.9-py3-none-any.whl",
+                 "url": "https://files.example.test/gated-9.9.9-py3-none-any.whl",
+                 "hashes": {}, "upload-time": now},
+            ]
+        });
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", PEP691_JSON_CONTENT_TYPE)
+                    .set_body_json(&index),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", PEP691_JSON_CONTENT_TYPE.parse().unwrap());
+        let result = super::simple_project(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((fx.repo_key.clone(), project.to_string())),
+            headers,
+        )
+        .await;
+
+        let names: Vec<String> = match result {
+            Ok(r) => {
+                let bytes = axum::body::to_bytes(r.into_body(), 1024 * 1024)
+                    .await
+                    .expect("read body");
+                let json: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                json.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter_map(|f| {
+                                f.get("filename").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            Err(r) => {
+                let status = r.status();
+                tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+                cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+                let _ = std::fs::remove_dir_all(&fx.storage_dir);
+                panic!("virtual simple JSON index must succeed, got {status}");
+            }
+        };
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(
+            names.iter().any(|n| n.contains("1.0.0")),
+            "aged 1.0.0 must remain in the virtual JSON index: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("9.9.9")),
+            "young 9.9.9 of a gated member must be filtered from the virtual JSON index: {names:?}"
+        );
     }
 
     #[tokio::test]
