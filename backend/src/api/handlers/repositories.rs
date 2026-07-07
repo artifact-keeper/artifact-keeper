@@ -2646,6 +2646,39 @@ async fn lookup_artifact_by_paths(
     Ok(None)
 }
 
+/// Resolve a request path to the artifact's stored path for the generic
+/// download/delete handlers.
+///
+/// npm publish stores tarballs under the version-segmented layout
+/// (`<name>/<version>/<file>.tgz`, see `npm::store_npm_version`), while the Web
+/// UI's Download/Delete buttons emit the canonical npm download-URL shape
+/// (`<name>/-/<file>.tgz`). An exact-match `WHERE path = $2` lookup against the
+/// URL shape therefore never finds the version-segmented row. This mirrors the
+/// resolution `get_artifact_metadata` already performs: try the literal path
+/// first, then the normalised stored shape for npm-family repos.
+///
+/// The extra DB roundtrip is taken only when a normalised candidate actually
+/// exists (npm-family repo + the `/-/` URL shape): for non-npm formats and
+/// already-stored npm paths `lookup_path_candidates` returns a single element,
+/// so the guard short-circuits and behaviour is byte-identical to today. On a
+/// true local miss the original `path` is returned unchanged, so Remote/Virtual
+/// proxy fallback still fires against the original URL shape.
+async fn resolve_stored_path(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: String,
+) -> Result<String> {
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    if candidates.len() > 1 {
+        Ok(lookup_artifact_by_paths(&state.db, repo.id, &candidates)
+            .await?
+            .map(|a| a.path)
+            .unwrap_or(path))
+    } else {
+        Ok(path)
+    }
+}
+
 /// Rewrite an npm-family artifact listing row's `path` from the
 /// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
 /// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
@@ -4237,6 +4270,14 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
 
+    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
+    // version-segmented path the tarball is actually stored under (#2269),
+    // mirroring `get_artifact_metadata`. No-op for non-npm formats and for
+    // paths that are already stored literally; on a local miss `path` is left
+    // unchanged so the Remote/Virtual proxy fallback below still fires against
+    // the original URL shape.
+    let path = resolve_stored_path(&state, &repo, path).await?;
+
     // Check quarantine status before serving the artifact.
     // If the artifact is quarantined or rejected, return 409 Conflict.
     {
@@ -4557,6 +4598,14 @@ pub async fn delete_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+
+    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
+    // version-segmented path the tarball is actually stored under (#2269),
+    // mirroring `get_artifact_metadata`. Done before the promotion-only /
+    // immutability gates below so every gate, the delete query, and the
+    // cache-invalidation all operate on one consistent, real artifact path.
+    // No-op for non-npm formats and already-literal paths.
+    let path = resolve_stored_path(&state, &repo, path).await?;
 
     // Promotion-only release repositories: a direct DELETE is the symmetric
     // mutation to the (already-gated) direct upload and would let a principal
@@ -13015,5 +13064,261 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2269: the generic download/delete handlers must resolve the canonical
+    // npm `/-/` URL shape the Web UI emits to the version-segmented path a
+    // tarball is actually stored under. `lookup_path_candidates` is the guard
+    // predicate: it yields `[url, stored]` (len 2) for an npm `/-/` tarball URL
+    // and `[literal]` (len 1) for everything else, so the resolver only takes
+    // the extra DB roundtrip when a normalized candidate can exist.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lookup_path_candidates_pairs_npm_url_and_stored_shapes() {
+        // Unscoped `/-/` URL -> [url, version-segmented stored].
+        let unscoped =
+            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            unscoped,
+            vec![
+                "npm-test/-/npm-test-1.0.0.tgz".to_string(),
+                "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string(),
+            ],
+            "an npm `/-/` tarball URL must expand to [url, stored] so the guard resolves it"
+        );
+
+        // Scoped `/-/` URL -> [url, version-segmented stored].
+        let scoped = lookup_path_candidates("@scope/pkg/-/pkg-2.1.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            scoped,
+            vec![
+                "@scope/pkg/-/pkg-2.1.0.tgz".to_string(),
+                "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string(),
+            ],
+        );
+
+        // yarn is npm-family too.
+        assert_eq!(
+            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Yarn).len(),
+            2,
+        );
+
+        // An already-stored version-segmented npm path has no distinct
+        // normalized shape -> single candidate, guard short-circuits.
+        assert_eq!(
+            lookup_path_candidates("npm-test/1.0.0/npm-test-1.0.0.tgz", &RepositoryFormat::Npm)
+                .len(),
+            1,
+        );
+
+        // Non-npm formats never expand -> single candidate, byte-identical path.
+        assert_eq!(
+            lookup_path_candidates("com/acme/app/1.0.0/app-1.0.0.jar", &RepositoryFormat::Maven)
+                .len(),
+            1,
+        );
+        assert_eq!(
+            lookup_path_candidates("some/raw/file.bin", &RepositoryFormat::Generic).len(),
+            1,
+        );
+    }
+
+    /// Build a bodyless GET request for `download_artifact`.
+    #[cfg(test)]
+    fn get_request() -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request")
+    }
+
+    /// #2269: an npm tarball stored under the version-segmented layout must be
+    /// downloadable AND deletable from the canonical `/-/` URL shape the Web UI
+    /// emits, while the literal stored path and a bogus path behave as before.
+    #[tokio::test]
+    async fn npm_generic_download_delete_resolve_canonical_url_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        // Publish tarballs under the exact version-segmented layout
+        // `npm::store_npm_version` writes.
+        let unscoped_stored = "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string();
+        let scoped_stored = "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string();
+        for p in [&unscoped_stored, &scoped_stored] {
+            upload_artifact(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((key.clone(), p.clone())),
+                HeaderMap::new(),
+                Bytes::from_static(b"TARBALL-BYTES"),
+            )
+            .await
+            .expect("publish must succeed");
+        }
+
+        // (1) Download via the canonical `/-/` URL shape -> 200 (was 404).
+        let dl = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl.expect("download via /-/ shape must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+            "generic download of a version-segmented npm tarball via /-/ must be 200 (#2269)"
+        );
+
+        // (2) Download via the literal stored path still resolves (literal-first).
+        let dl_literal = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), unscoped_stored.clone())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl_literal
+                .expect("download via literal path must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+        );
+
+        // (3) A bogus `/-/` path (no matching row) must still 404 — the resolver
+        // leaves the path unchanged on a miss so downstream lookup fails cleanly.
+        let dl_bogus = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
+            get_request(),
+        )
+        .await;
+        assert!(
+            matches!(dl_bogus, Err(AppError::NotFound(_))),
+            "an unknown npm tarball must still 404 (resolver leaves a miss path unchanged)"
+        );
+
+        // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
+        // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`
+        // in the resolved stored path) so the immutability gate permits this.
+        let del_scoped = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_scoped.is_ok(),
+            "scoped npm delete via /-/ shape must succeed (#2269), got: {del_scoped:?}"
+        );
+        let scoped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&scoped_stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scoped_live, 0, "the scoped tarball must be soft-deleted");
+
+        // (5) Unscoped delete via the canonical `/-/` URL shape -> Ok, row gone.
+        let del_unscoped = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_unscoped.is_ok(),
+            "unscoped npm delete via /-/ shape must succeed (#2269), got: {del_unscoped:?}"
+        );
+        let unscoped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&unscoped_stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unscoped_live, 0,
+            "the unscoped tarball must be soft-deleted"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2269 short-circuit guard: a non-npm (generic) repo must be completely
+    /// unaffected — an exact-path download still 200 and a bogus path still 404,
+    /// with no path rewriting (the `candidates.len() > 1` guard skips the
+    /// resolver for formats that have no `/-/` normalization).
+    #[tokio::test]
+    async fn generic_non_npm_download_unchanged_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        let path = "tools/build-1.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"GENERIC-BYTES"),
+        )
+        .await
+        .expect("publish must succeed");
+
+        let dl = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl.expect("exact-path download must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+        );
+
+        let dl_bogus = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "tools/does-not-exist.bin".to_string())),
+            get_request(),
+        )
+        .await;
+        assert!(
+            matches!(dl_bogus, Err(AppError::NotFound(_))),
+            "an unknown generic path must still 404 (guard short-circuits for non-npm)"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
