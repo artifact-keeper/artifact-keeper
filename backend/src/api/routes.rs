@@ -538,6 +538,11 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     rate_limit_middleware,
                 ))
                 .merge(handlers::users::self_or_admin_router())
+                // Canonical self-service aliases (#1313): `/users/me/*` for the
+                // caller's own record/tokens. Rides `auth_middleware` (Nest A),
+                // NOT the password-change rate-limit layer above (that layer is
+                // scoped to `self_password_router`, which owns `/me/password`).
+                .merge(handlers::users::self_router())
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
