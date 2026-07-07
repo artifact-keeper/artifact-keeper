@@ -630,6 +630,25 @@ fn parse_latest_revision_json(bytes: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Parse an upstream Conan v2 files-list body `{"files":{"name":{}, ...}}` into
+/// the list of file names. The shape is identical to what these handlers emit
+/// via [`build_files_listing_json`], so parsing an upstream response = reading
+/// the `.files` object keys. An empty/malformed upstream body yields an empty
+/// `Vec` so the caller degrades to local-only rather than erroring.
+fn parse_files_listing_json(bytes: &[u8]) -> Vec<String> {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(v) => v
+            .get("files")
+            .and_then(|f| f.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("conan files_list: failed to parse upstream JSON: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Forward a recipe-revisions list query to a remote upstream and parse the
 /// `revisions` array. Returns `Vec::new()` on any non-2xx response or parse
 /// error (mirrors [`search_recipes_from_remote`]) so a flaky/offline upstream
@@ -664,6 +683,48 @@ async fn recipe_revisions_from_remote(
         Err(_e) => {
             tracing::debug!(
                 "conan recipe_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a recipe files-list query to a remote upstream and parse the `files`
+/// object keys. Same degradation rules as [`recipe_revisions_from_remote`]: a
+/// non-2xx response or parse error yields `Vec::new()` so a flaky/offline
+/// upstream degrades to the local cache instead of erroring. The caller merges
+/// the result with local file names, deduped.
+#[allow(clippy::too_many_arguments)]
+async fn recipe_files_list_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+) -> Vec<String> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/files",
+        name, version, user, channel, revision
+    );
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan recipe_files_list: upstream fetch failed or non-2xx for '{}'",
                 repo_key
             );
             Vec::new()
@@ -783,6 +844,47 @@ async fn package_revisions_from_remote(
         Err(_e) => {
             tracing::debug!(
                 "conan package_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a package files-list query to a remote upstream and parse the `files`
+/// object keys. Same degradation rules as [`recipe_files_list_from_remote`].
+#[allow(clippy::too_many_arguments)]
+async fn package_files_list_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+    pkg_revision: &str,
+) -> Vec<String> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files",
+        name, version, user, channel, revision, package_id, pkg_revision
+    );
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan package_files_list: upstream fetch failed or non-2xx for '{}'",
                 repo_key
             );
             Vec::new()
@@ -1393,6 +1495,36 @@ async fn recipe_files_list(
             .await
             .map_err(map_db_err)?;
             merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward the files-list upstream and merge any
+        // remote file names, deduped by name. Mirrors the recipe_revisions
+        // Remote arm; upstream auth is inherited via proxy_fetch_capped.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        let local = recipe_files_list_for_repo(
+            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |f| f.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = recipe_files_list_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
         }
         merged
     } else {
@@ -2124,6 +2256,47 @@ async fn package_files_list(
             merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
         }
         merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward the package files-list upstream and
+        // merge any remote file names, deduped by name. Mirrors the
+        // package_revisions Remote arm; upstream auth is inherited via
+        // proxy_fetch_capped.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        let local = package_files_list_for_repo(
+            &state.db,
+            repo.id,
+            &name,
+            &version,
+            &user,
+            &channel,
+            &revision,
+            &package_id,
+            &pkg_revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |f| f.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = package_files_list_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+                &package_id,
+                &pkg_revision,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
     } else {
         package_files_list_for_repo(
             &state.db,
@@ -2590,6 +2763,124 @@ mod tests {
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
     }
+
+    #[tokio::test]
+    async fn test_remote_recipe_files_list_forwards_upstream_2247() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Upstream files-list for an uncached recipe revision. Pre-fix, the
+        // Remote arm was missing so AK returned {"files":{}} (empty) and
+        // `conan download` aborted with "no conanfile.py".
+        Mock::given(method("GET"))
+            .and(path("/v2/conans/zlib/1.3/_/_/revisions/rev1/files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"files":{"conanfile.py":{},"conanmanifest.txt":{}}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/files",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from remote recipe files-list, got {status}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("files-list body must be JSON");
+        let files = json
+            .get("files")
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let has_recipe = files.contains_key("conanfile.py");
+        let has_manifest = files.contains_key("conanmanifest.txt");
+        teardown().await;
+        assert!(
+            has_recipe,
+            "remote recipe files-list must forward upstream 'conanfile.py' key (was empty pre-fix)"
+        );
+        assert!(
+            has_manifest,
+            "remote recipe files-list must forward upstream 'conanmanifest.txt' key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_package_files_list_forwards_upstream_2247() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"files":{"conaninfo.txt":{},"conanmanifest.txt":{},"conan_package.tgz":{}}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files", key = fx.repo_key))).await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from remote package files-list, got {status}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("files-list body must be JSON");
+        let files = json
+            .get("files")
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let has_info = files.contains_key("conaninfo.txt");
+        let has_manifest = files.contains_key("conanmanifest.txt");
+        let has_pkg = files.contains_key("conan_package.tgz");
+        teardown().await;
+        assert!(
+            has_info && has_manifest && has_pkg,
+            "remote package files-list must forward all upstream file keys (was empty pre-fix)"
+        );
+    }
+
+    #[test]
+    fn test_parse_files_listing_json_2247() {
+        // Happy path: reads the .files object keys.
+        let body = br#"{"files":{"conanfile.py":{},"conanmanifest.txt":{}}}"#;
+        let mut names = super::parse_files_listing_json(body);
+        names.sort();
+        assert_eq!(names, vec!["conanfile.py", "conanmanifest.txt"]);
+        // Malformed body degrades to an empty Vec (caller falls back to local).
+        assert!(super::parse_files_listing_json(b"not json").is_empty());
+        // Missing `files` key also yields empty.
+        assert!(super::parse_files_listing_json(br#"{"other":1}"#).is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]
