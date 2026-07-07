@@ -244,13 +244,28 @@ fn build_packages_index(
 
     for row in rows {
         let version = row.version.as_deref().unwrap_or("dev-main");
-        let entry = build_version_entry(
+        let mut entry = build_version_entry(
             repo_key,
             &row.name,
             version,
             &row.checksum_sha256,
             row.metadata.as_ref(),
         );
+        // Composer's `ComposerRepository` requires a `uid` on every inline
+        // ("partial") version object embedded in the root packages.json; inject
+        // it here (only the inline root-doc path) so the v2 `p2`/v1 wire shapes
+        // stay untouched. `COMPOSER_METADATA_KEYS` has no `uid`, so the metadata
+        // merge inside `build_version_entry` cannot clobber it (#2250).
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "uid".to_string(),
+                serde_json::json!(composer_inline_uid(
+                    &row.name,
+                    version,
+                    &row.checksum_sha256
+                )),
+            );
+        }
         by_name.entry(row.name.clone()).or_default().push(entry);
     }
 
@@ -438,6 +453,28 @@ fn build_version_entry(
 
     merge_composer_metadata(&mut entry, metadata);
     entry
+}
+
+/// Derive the `uid` Composer requires on every inline ("partial") version object
+/// in the root `packages.json`. Its absence crashes `composer install` with
+/// `Undefined array key "uid"` (#2250). The value must be STABLE across requests
+/// (Composer caches/dedups on it) and unique per version, so it is derived purely
+/// from the package identity plus content digest — independent of DB row order or
+/// virtual fan-out aggregation order. `sha2::Sha256` is used (not
+/// `DefaultHasher`/`RandomState`, which are per-process randomized). Masked into
+/// the non-negative i64 range so PHP treats it as a native integer everywhere.
+fn composer_inline_uid(name: &str, version: &str, checksum_sha256: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(version.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(checksum_sha256.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(bytes) & 0x7FFF_FFFF_FFFF_FFFF) as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,6 +2122,100 @@ mod tests {
         }];
         let map = build_packages_index("r", &rows);
         assert_eq!(map["vendor/pkg"][0]["version"], "dev-main");
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline root-doc `uid` injection (#2250)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_packages_index_inline_entries_have_uid() {
+        // Every inline ("partial") version object in the root packages.json must
+        // carry an integer `uid`; its absence crashes `composer install`.
+        let map = build_packages_index("virt", &index_rows());
+        for (name, versions) in &map {
+            for entry in versions.as_array().unwrap() {
+                let uid = entry["uid"].as_i64();
+                assert!(
+                    uid.is_some(),
+                    "inline entry for {name} is missing an integer uid: {entry}"
+                );
+                assert!(uid.unwrap() >= 0, "uid must be non-negative for PHP");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_packages_index_uid_stable_across_generations() {
+        // The uid is derived purely from (name, version, checksum), so it must be
+        // identical across two independent generations (Composer caches on it).
+        let first = build_packages_index("virt", &index_rows());
+        let second = build_packages_index("virt", &index_rows());
+
+        let uid_of =
+            |map: &serde_json::Map<String, serde_json::Value>, name: &str, version: &str| {
+                map[name]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["version"] == version)
+                    .unwrap()["uid"]
+                    .as_i64()
+                    .unwrap()
+            };
+
+        assert_eq!(
+            uid_of(&first, "testvendor/lib1", "1.0.0"),
+            uid_of(&second, "testvendor/lib1", "1.0.0"),
+        );
+        assert_eq!(
+            uid_of(&first, "testvendor/myplugin", "2.0.0"),
+            uid_of(&second, "testvendor/myplugin", "2.0.0"),
+        );
+    }
+
+    #[test]
+    fn test_build_packages_index_uid_unique_per_version() {
+        // The 3 fixture rows are distinct versions → 3 distinct uids.
+        let map = build_packages_index("virt", &index_rows());
+        let mut uids = std::collections::HashSet::new();
+        for versions in map.values() {
+            for entry in versions.as_array().unwrap() {
+                uids.insert(entry["uid"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(uids.len(), 3, "each version must get a distinct uid");
+    }
+
+    #[test]
+    fn test_composer_inline_uid_is_deterministic() {
+        let a = composer_inline_uid("vendor/pkg", "1.0.0", "abc");
+        let b = composer_inline_uid("vendor/pkg", "1.0.0", "abc");
+        assert_eq!(a, b, "same inputs must produce the same uid");
+        assert!(a >= 0, "uid must be non-negative for PHP");
+
+        let different_version = composer_inline_uid("vendor/pkg", "2.0.0", "abc");
+        assert_ne!(a, different_version, "different version must differ");
+    }
+
+    #[tokio::test]
+    async fn test_metadata_v2_response_has_no_uid() {
+        // Regression: the v2 `p2` (minified composer/2.0) output must stay
+        // byte-identical and must NOT gain a `uid` — the fix is scoped to the
+        // inline root-doc path only.
+        let artifacts = vec![ComposerArtifactRow {
+            version: Some("1.0.0".to_string()),
+            checksum_sha256: "hashX".to_string(),
+            metadata: None,
+        }];
+        let response = build_metadata_v2_response("virt", "vendor/pkg", &artifacts);
+        let json = body_json(response).await;
+        assert_eq!(json["minified"], "composer/2.0");
+        let entry = &json["packages"]["vendor/pkg"][0];
+        assert!(
+            entry.get("uid").is_none(),
+            "v2 p2 output must not contain uid: {entry}"
+        );
     }
 
     // -----------------------------------------------------------------------
