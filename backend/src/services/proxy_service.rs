@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use moka::future::Cache;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
@@ -34,6 +36,33 @@ pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
+
+/// Capacity for the in-process proxy-cache metadata-sidecar LRU (#2301).
+/// 10k × ~500 B ≈ 5 MB; fits a multi-thousand-dependency Maven build.
+const PROXY_METADATA_LRU_CAPACITY: u64 = 10_000;
+
+/// TTL for entries in the metadata-sidecar LRU. Must be shorter than the
+/// upstream metadata TTL (5 min) so disk refreshes become visible promptly,
+/// long enough to amortize a NAS roundtrip across a Maven parse cycle.
+const PROXY_METADATA_LRU_TTL: Duration = Duration::from_secs(30);
+
+static PROXY_METADATA_LRU: tokio::sync::OnceCell<Cache<String, Option<CacheMetadata>>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn proxy_metadata_lru() -> &'static Cache<String, Option<CacheMetadata>> {
+    PROXY_METADATA_LRU
+        .get_or_init(|| async {
+            Cache::builder()
+                .max_capacity(PROXY_METADATA_LRU_CAPACITY)
+                .time_to_live(PROXY_METADATA_LRU_TTL)
+                .build()
+        })
+        .await
+}
+
+async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
+    proxy_metadata_lru().await.invalidate(metadata_key).await;
+}
 
 /// Response from an upstream registry fetch.
 struct UpstreamResponse {
@@ -1030,6 +1059,7 @@ impl CachePersister {
         self.storage
             .put(metadata_key, Bytes::from(metadata_json))
             .await?;
+        invalidate_proxy_metadata_lru(metadata_key).await;
 
         // Proxy-cached content is intentionally NOT recorded in the
         // `artifacts` table (issue #1278). The previous behaviour inserted
@@ -1173,6 +1203,8 @@ impl CachePersister {
                                         error = %e,
                                         "proxy cache metadata sidecar write failed; cache will refetch next request"
                                     );
+                                } else {
+                                    invalidate_proxy_metadata_lru(&metadata_key).await;
                                 }
                             }
                             Err(e) => {
@@ -3553,6 +3585,8 @@ impl ProxyService {
             Ok(json) => {
                 if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
                     tracing::warn!(metadata_key = %metadata_key, error = %e, "failed to extend cache TTL after 304");
+                } else {
+                    invalidate_proxy_metadata_lru(metadata_key).await;
                 }
             }
             Err(e) => {
@@ -3592,6 +3626,7 @@ impl ProxyService {
                 if let Err(e) = self.storage.put(metadata_key, Bytes::from(json)).await {
                     tracing::debug!(metadata_key = %metadata_key, error = %e, "failed to write negative-cache entry");
                 } else {
+                    invalidate_proxy_metadata_lru(metadata_key).await;
                     tracing::debug!(cache_path = %cache_path, "negative-cached upstream 404");
                 }
             }
@@ -3629,11 +3664,28 @@ impl ProxyService {
             .await
     }
 
-    /// Load cache metadata from storage.
-    ///
-    /// Thin delegation to [`CacheStore::load_metadata`] (#1618 S7).
+    /// Load cache metadata from storage via the in-process LRU (#2301).
+    /// Storage errors degrade to a cache miss (B6 — a torn sidecar must not
+    /// surface as a 502).
     async fn load_cache_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
-        self.cache_store.load_metadata(metadata_key).await
+        let lru = proxy_metadata_lru().await;
+        let cache_key = metadata_key.to_string();
+        let result: std::result::Result<Option<CacheMetadata>, Arc<AppError>> = lru
+            .try_get_with(cache_key, async {
+                self.cache_store.load_metadata(metadata_key).await
+            })
+            .await;
+        match result {
+            Ok(opt) => Ok(opt),
+            Err(arc_err) => {
+                tracing::warn!(
+                    metadata_key = %metadata_key,
+                    error = %arc_err,
+                    "proxy metadata-sidecar LRU load failed; treating as miss"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Fetch artifact from upstream URL.
@@ -11269,5 +11321,129 @@ SHA256:
         assert_eq!(repo_key_from_cache_key(""), "unknown");
         assert_eq!(repo_key_from_cache_key("proxy-cache/"), "unknown");
         assert_eq!(repo_key_from_cache_key("proxy-cache//foo"), "unknown");
+    }
+
+    // -- #2301: in-process metadata-sidecar LRU -----------------------------
+
+    #[tokio::test]
+    async fn test_proxy_metadata_lru_caches_positive_entry_across_calls() {
+        let key = format!(
+            "proxy-cache/{}/_test_/pos/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let metadata = sample_cache_metadata("etag-pos");
+        let lru = proxy_metadata_lru().await;
+        lru.insert(key.clone(), Some(metadata.clone())).await;
+        let cached = lru
+            .get(&key)
+            .await
+            .expect("LRU should hold the value")
+            .expect("value should be Some");
+        assert_eq!(cached.upstream_etag.as_deref(), Some("etag-pos"));
+        lru.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_proxy_metadata_lru_caches_definitive_miss() {
+        let key = format!(
+            "proxy-cache/{}/_test_/miss/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(key.clone(), None).await;
+        let cached = lru.get(&key).await;
+        assert!(
+            matches!(cached, Some(None)),
+            "Some(None) signals a known-absent entry"
+        );
+        lru.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_proxy_metadata_lru_invalidate_drops_entry() {
+        let key = format!(
+            "proxy-cache/{}/_test_/inv/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let lru = proxy_metadata_lru().await;
+        lru.insert(key.clone(), Some(sample_cache_metadata("x")))
+            .await;
+        assert!(lru.get(&key).await.is_some());
+        invalidate_proxy_metadata_lru(&key).await;
+        assert!(
+            lru.get(&key).await.is_none(),
+            "invalidate must drop the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_cache_metadata_uses_lru_after_first_load() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("s8-lru-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let cache_key = format!("proxy-cache/lru-test/{}/__content__", Uuid::new_v4());
+        let metadata_key = format!(
+            "{}/__cache_meta__.json",
+            cache_key.trim_end_matches("/__content__")
+        );
+        std::fs::create_dir_all(std::path::Path::new(&cache_key).parent().unwrap()).expect("mkdir");
+
+        proxy
+            .cache_artifact(
+                &cache_key,
+                &metadata_key,
+                &Bytes::from_static(b"body"),
+                Some("text/plain".to_string()),
+                Some("\"etag-1\"".to_string()),
+                None,
+                3600,
+                Uuid::new_v4(),
+                "some/path",
+                None,
+            )
+            .await
+            .expect("cache write");
+
+        let first = proxy
+            .load_cache_metadata(&metadata_key)
+            .await
+            .expect("read 1");
+        assert_eq!(
+            first.as_ref().and_then(|m| m.upstream_etag.clone()),
+            Some("\"etag-1\"".to_string()),
+        );
+
+        std::fs::remove_file(std::path::Path::new(&tmp).join(&metadata_key)).ok();
+        let second = proxy
+            .load_cache_metadata(&metadata_key)
+            .await
+            .expect("read 2");
+        assert_eq!(
+            second.as_ref().and_then(|m| m.upstream_etag.clone()),
+            Some("\"etag-1\"".to_string()),
+            "second read must come from the LRU, not the now-missing sidecar",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn sample_cache_metadata(etag: &str) -> CacheMetadata {
+        let now = Utc::now();
+        CacheMetadata {
+            cached_at: now,
+            upstream_etag: Some(etag.to_string()),
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: None,
+            expires_at: now + chrono::Duration::seconds(3600),
+            content_type: Some("text/xml".to_string()),
+            size_bytes: 12,
+            checksum_sha256: "deadbeef".to_string(),
+        }
     }
 }
