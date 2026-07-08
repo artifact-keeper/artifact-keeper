@@ -128,9 +128,9 @@ fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
 // ---------------------------------------------------------------------------
 
 /// Buffering cap when caching a computed packument body. Packuments are
-/// bounded JSON; this matches the cap `dist_tags_get` already uses when it
-/// buffers the same responses.
-const NPM_PACKUMENT_BUFFER_CAP: usize = 32 * 1024 * 1024;
+/// bounded JSON; keep this aligned with the upstream npm metadata cap so
+/// large public packuments (for example `prisma`) can still be cached.
+const NPM_PACKUMENT_BUFFER_CAP: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
 
 /// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
 /// the metadata compression layer would have gzipped the response. Only gzip
@@ -431,7 +431,7 @@ async fn compute_and_store_packument(
         return Err(response);
     }
 
-    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=32 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
+    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=128 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
     let body_bytes = axum::body::to_bytes(response.into_body(), NPM_PACKUMENT_BUFFER_CAP)
         .await
         .map_err(|e| {
