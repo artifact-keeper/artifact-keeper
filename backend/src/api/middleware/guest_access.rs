@@ -21,11 +21,19 @@
 //! The guard is registered as an outer (global) layer in `routes::create_router`,
 //! which means it runs **before** the inner `auth_middleware` /
 //! `optional_auth_middleware` / `repo_visibility_middleware` layers populate
-//! request extensions. To make the gating decision we therefore call
-//! `try_resolve_auth` directly (the same helper the optional and visibility
-//! middlewares use) and short-circuit with 401 if no principal is found and
-//! the path is not allowlisted. Inner middlewares run again on requests that
-//! pass the guard and populate the extensions used by handlers.
+//! request extensions. To make the gating decision we therefore resolve auth
+//! directly (the same path the optional and visibility middlewares use) and
+//! short-circuit if the path is not allowlisted. Inner middlewares run again on
+//! requests that pass the guard and populate the extensions used by handlers.
+//!
+//! We resolve via [`try_resolve_auth_outcome`] and match on the full
+//! [`AuthOutcome`] rather than a boolean "is there a principal?" check, so a
+//! transient [`AuthOutcome::Overloaded`] shed (the bcrypt-capacity cap
+//! saturating) becomes a retryable **503**, not a 401. Flattening `Overloaded`
+//! into an "unauthenticated" 401 would fail requests carrying valid credentials
+//! under load — the exact regression `AuthOutcome::Overloaded` exists to prevent
+//! (a saturated auth cap is retryable; non-retrying clients such as twine abort
+//! on 401). The guard therefore returns the same 503 the inner middlewares do.
 
 use std::sync::Arc;
 
@@ -38,7 +46,9 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::api::middleware::auth::{extract_token, try_resolve_auth};
+use crate::api::middleware::auth::{
+    extract_token, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+};
 use crate::services::auth_service::AuthService;
 
 /// Shared state for the guest-access guard.
@@ -112,6 +122,25 @@ fn unauthorized_response() -> Response {
     response
 }
 
+/// Map a resolved [`AuthOutcome`] to the guard's short-circuit response, or
+/// `None` when the request should be allowed through to the inner layers.
+///
+/// This is the load-bearing distinction: an `Overloaded` shed must yield a
+/// retryable **503**, NOT a 401. Collapsing it into the "unauthenticated" 401
+/// would make valid credentials fail under transient auth-cap saturation. Kept
+/// as a pure function so the mapping is unit-testable without a live auth backend.
+fn guard_short_circuit(outcome: &AuthOutcome) -> Option<Response> {
+    match outcome {
+        // A principal resolved — let the request through; inner middlewares
+        // re-resolve and populate request extensions for handlers.
+        AuthOutcome::Resolved(_) => None,
+        // Transient bcrypt-capacity shed: retryable 503, never a 401.
+        AuthOutcome::Overloaded => Some(service_unavailable_response()),
+        // No/invalid credential presented: guest access is disabled → 401.
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(unauthorized_response()),
+    }
+}
+
 /// Middleware that blocks unauthenticated requests when guest access is
 /// disabled server-wide. See module docs for behaviour and allowlist.
 pub async fn guest_access_guard(
@@ -128,19 +157,17 @@ pub async fn guest_access_guard(
         return next.run(request).await;
     }
 
-    // Resolve auth from the request headers. We only need to know whether
-    // some valid principal exists; the inner auth middleware will populate
-    // the request extensions for handlers if the guard lets the request
-    // through.
+    // Resolve auth from the request headers via `try_resolve_auth_outcome` and
+    // match the full outcome so a transient `AuthOutcome::Overloaded` shed
+    // becomes a retryable 503 rather than a spurious 401 — see module docs.
+    // Inner middlewares re-resolve and populate request extensions for handlers
+    // on requests that pass the guard.
     let extracted = extract_token(&request);
-    if try_resolve_auth(&state.auth_service, extracted)
-        .await
-        .is_some()
-    {
-        return next.run(request).await;
+    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted).await;
+    match guard_short_circuit(&outcome) {
+        Some(response) => response,
+        None => next.run(request).await,
     }
-
-    unauthorized_response()
 }
 
 #[cfg(test)]
@@ -207,6 +234,37 @@ mod tests {
         assert!(!is_allowlisted("/foo/api/v1/auth"));
         assert!(!is_allowlisted("/proxy/v2/library"));
         assert!(!is_allowlisted("/api/v1/authentication"));
+    }
+
+    // -- guard_short_circuit (Overloaded must be 503, never 401) --
+
+    #[test]
+    fn short_circuit_overloaded_is_503_not_401() {
+        // Regression: a transient bcrypt-capacity shed must surface as a
+        // retryable 503 through the guard. Collapsing it into the
+        // GUEST_ACCESS_DISABLED 401 is what broke preemptive-auth clients
+        // (twine, uv/pip token-in-url, CI X-API-Key) under concurrent load.
+        let resp =
+            guard_short_circuit(&AuthOutcome::Overloaded).expect("Overloaded must short-circuit");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 shed should carry a Retry-After hint"
+        );
+    }
+
+    #[test]
+    fn short_circuit_no_credential_is_401() {
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential)
+            .expect("NoCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn short_circuit_invalid_credential_is_401() {
+        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential)
+            .expect("InvalidCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // -- unauthorized_response --

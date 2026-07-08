@@ -747,30 +747,6 @@ async fn validate_api_token_with_scopes(
     })
 }
 
-/// Try to resolve an optional authentication token into an [`AuthExtension`].
-///
-/// Returns `Some(ext)` when a valid Bearer JWT, Bearer API token, or ApiKey
-/// token is present, and `None` otherwise (missing, invalid, or expired).
-/// This is the shared logic used by [`optional_auth_middleware`] and
-/// [`repo_visibility_middleware`].
-///
-/// Note: this helper conflates "no credential" with "invalid credential" —
-/// callers that need to distinguish those two outcomes (e.g. to honour an
-/// off-boarding deactivation immediately on optional-auth routes, see
-/// [`try_resolve_auth_outcome`] and issue #1371) should use the outcome
-/// variant instead.
-pub(crate) async fn try_resolve_auth(
-    auth_service: &AuthService,
-    extracted: ExtractedToken<'_>,
-) -> Option<AuthExtension> {
-    match try_resolve_auth_outcome(auth_service, extracted).await {
-        AuthOutcome::Resolved(ext) => Some(ext),
-        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential | AuthOutcome::Overloaded => {
-            None
-        }
-    }
-}
-
 /// Outcome of resolving an authentication credential.
 ///
 /// Distinguishes three states an optional-auth path needs to handle
@@ -788,9 +764,7 @@ pub(crate) async fn try_resolve_auth(
 ///     instead of being unambiguously rejected, which masks the
 ///     deactivation and weakens the security posture.
 ///
-/// Use [`try_resolve_auth_outcome`] to obtain this tri-state result; the
-/// boolean [`try_resolve_auth`] helper continues to flatten Invalid into
-/// None for callers that don't need to distinguish.
+/// Use [`try_resolve_auth_outcome`] to obtain this tri-state result.
 #[derive(Debug)]
 pub(crate) enum AuthOutcome {
     Resolved(AuthExtension),
@@ -810,11 +784,10 @@ pub(crate) enum AuthOutcome {
 
 /// Resolve a possibly-missing credential into an [`AuthOutcome`].
 ///
-/// This is the strict variant of [`try_resolve_auth`]: it preserves the
-/// distinction between "no credential presented" and "credential presented
-/// but invalid" so optional-auth middleware can return 401 on the latter
-/// rather than silently dropping to anonymous. The original
-/// [`try_resolve_auth`] delegates to this function and flattens the result.
+/// Preserves the distinction between "no credential presented", "credential
+/// presented but invalid", and "transiently overloaded" so callers can return
+/// 401 on invalid, 503 on overload, and continue as anonymous only on the
+/// no-credential case — rather than silently collapsing all three.
 ///
 /// Decision tree:
 ///   * `ExtractedToken::None` -> `NoCredential` (anonymous request)
@@ -1302,7 +1275,10 @@ fn unauthorized_response() -> Response {
 /// `unauthorized_response` is the load-bearing fix for the twine-upload
 /// gate failure: a saturated auth cap is "retry shortly", not "wrong
 /// password".
-fn service_unavailable_response() -> Response {
+///
+/// `pub(super)` so the sibling `guest_access_guard` can return the same 503 for
+/// an `AuthOutcome::Overloaded` shed instead of collapsing it into a 401.
+pub(super) fn service_unavailable_response() -> Response {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .header(axum::http::header::RETRY_AFTER, "1")
@@ -3497,7 +3473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
+    async fn test_try_resolve_auth_outcome_basic_falls_back_to_jwt_password() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -3518,7 +3494,7 @@ mod tests {
         let jwt = mint_access_jwt(secret, user_id, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
-        let resolved = try_resolve_auth(&auth_service, ExtractedToken::Basic(&basic)).await;
+        let resolved = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic)).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -3526,10 +3502,14 @@ mod tests {
             .await
             .expect("cleanup test user");
 
-        let ext = resolved.expect("expected jwt fallback to authenticate basic password");
-        assert_eq!(ext.username, "ci-user");
-        assert!(!ext.is_admin);
-        assert!(!ext.is_api_token);
+        match resolved {
+            AuthOutcome::Resolved(ext) => {
+                assert_eq!(ext.username, "ci-user");
+                assert!(!ext.is_admin);
+                assert!(!ext.is_api_token);
+            }
+            other => panic!("expected jwt fallback to authenticate basic password, got {other:?}"),
+        }
     }
 
     async fn run_through_auth_middleware(
@@ -3910,8 +3890,8 @@ mod tests {
     // try_resolve_auth_outcome: tri-state behaviour pinned for #1371.
     // The outcome enum is what lets `optional_auth_middleware` distinguish
     // "no credential" (continue anonymously) from "credential presented but
-    // invalid" (401). The legacy `try_resolve_auth` helper delegates to this
-    // function and collapses Invalid into None for back-compat.
+    // invalid" (401), and `guest_access_guard` distinguish an `Overloaded`
+    // shed (503) from an unauthenticated request (401).
     // -----------------------------------------------------------------------
 
     #[tokio::test]
