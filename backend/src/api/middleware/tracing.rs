@@ -1,11 +1,11 @@
 //! Request tracing middleware with correlation ID and W3C Trace Context support.
 //!
-//! Provides correlation ID generation/propagation and wraps each request in a
-//! tracing span so nested operations (including SQLx queries) appear as children
-//! in distributed traces when OpenTelemetry is enabled.
+//! Provides correlation ID generation/propagation. The `http_request` span
+//! itself is created by the outer `TraceLayer` in `main.rs` (which also
+//! redacts sensitive query params, see #544); this middleware records the
+//! correlation ID onto that ambient span rather than opening a second one.
 
 use axum::{extract::Request, http::header::HeaderValue, middleware::Next, response::Response};
-use tracing::Instrument;
 use uuid::Uuid;
 
 /// The header name for correlation IDs.
@@ -45,8 +45,12 @@ impl std::fmt::Display for CorrelationId {
 /// 2. `trace-id` extracted from `traceparent` header (W3C format: version-traceid-parentid-flags)
 /// 3. Generate a new UUID
 ///
-/// Wraps the request in a `tracing::info_span!("http_request")` so all nested
-/// spans (SQLx queries, service calls) become children in the distributed trace.
+/// Records the correlation ID onto the ambient `http_request` span created by
+/// the outer `TraceLayer` (see `main.rs`), rather than opening a second,
+/// unredacted `http_request` span of its own. The outer span already applies
+/// `redact_sensitive_params` to the URI (see #544); a second span built from
+/// the raw `request.uri()` would bypass that redaction and double-emit every
+/// request-scoped log line.
 pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Response {
     let correlation_id = request
         .headers()
@@ -70,35 +74,23 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
         })
         .unwrap_or_else(CorrelationId::generate);
 
-    let method = request.method().clone();
-    let uri = request.uri().path().to_string();
-
     request.extensions_mut().insert(correlation_id.clone());
 
-    let span = tracing::info_span!(
-        "http_request",
+    tracing::Span::current().record("correlation_id", tracing::field::display(&correlation_id));
+
+    let mut response = next.run(request).await;
+
+    if let Ok(value) = HeaderValue::from_str(correlation_id.as_str()) {
+        response.headers_mut().insert(CORRELATION_ID_HEADER, value);
+    }
+
+    tracing::info!(
         correlation_id = %correlation_id,
-        method = %method,
-        uri = %uri,
+        status = %response.status().as_u16(),
+        "Request completed"
     );
 
-    async move {
-        let mut response = next.run(request).await;
-
-        if let Ok(value) = HeaderValue::from_str(correlation_id.as_str()) {
-            response.headers_mut().insert(CORRELATION_ID_HEADER, value);
-        }
-
-        tracing::info!(
-            correlation_id = %correlation_id,
-            status = %response.status().as_u16(),
-            "Request completed"
-        );
-
-        response
-    }
-    .instrument(span)
-    .await
+    response
 }
 
 #[cfg(test)]
