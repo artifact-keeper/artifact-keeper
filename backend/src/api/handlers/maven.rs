@@ -29,6 +29,27 @@ use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
 use crate::models::repository::RepositoryType;
 
+const VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY: u64 = 4_000;
+const VIRTUAL_MAVEN_METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type VirtualMetadataCacheKey = (uuid::Uuid, String, String);
+
+static VIRTUAL_MAVEN_METADATA_CACHE: tokio::sync::OnceCell<
+    moka::future::Cache<VirtualMetadataCacheKey, Option<Bytes>>,
+> = tokio::sync::OnceCell::const_new();
+
+async fn virtual_maven_metadata_cache(
+) -> &'static moka::future::Cache<VirtualMetadataCacheKey, Option<Bytes>> {
+    VIRTUAL_MAVEN_METADATA_CACHE
+        .get_or_init(|| async {
+            moka::future::Cache::builder()
+                .max_capacity(VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY)
+                .time_to_live(VIRTUAL_MAVEN_METADATA_CACHE_TTL)
+                .build()
+        })
+        .await
+}
+
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
 
@@ -968,69 +989,81 @@ async fn fetch_maven_metadata_bytes(
                 .await;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
-            let mut all_versions: Vec<String> = Vec::new();
+            let cache = virtual_maven_metadata_cache().await;
+            let cache_key = (repo.id, group_id.clone(), artifact_id.clone());
 
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: proxy metadata from upstream directly.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
+            let ga_merge: Option<Bytes> = match cache.get(&cache_key).await {
+                Some(cached) => cached,
+                None => {
+                    let mut all_versions: Vec<String> = Vec::new();
+
+                    for member in &members {
+                        if member.repo_type == RepositoryType::Remote {
+                            if let (Some(upstream_url), Some(ref proxy)) =
+                                (member.upstream_url.as_deref(), &state.proxy_service)
+                            {
+                                if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                    proxy,
+                                    member.id,
+                                    &member.key,
+                                    upstream_url,
+                                    path,
+                                )
+                                .await
+                                {
+                                    if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                        if let Some((_, _, versions)) =
+                                            crate::formats::maven::parse_metadata_versions(xml_str)
+                                        {
+                                            all_versions.extend(versions);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Ok(xml) = generate_metadata_for_artifact(
+                            &state.db,
                             member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
+                            &group_id,
+                            &artifact_id,
                         )
                         .await
                         {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                if let Some((_, _, versions)) =
-                                    crate::formats::maven::parse_metadata_versions(xml_str)
-                                {
-                                    all_versions.extend(versions);
-                                }
+                            if let Some((_, _, versions)) =
+                                crate::formats::maven::parse_metadata_versions(&xml)
+                            {
+                                all_versions.extend(versions);
                             }
                         }
                     }
-                } else {
-                    // Local/Staging members: generate from artifact rows.
-                    if let Ok(xml) = generate_metadata_for_artifact(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                    )
-                    .await
-                    {
-                        if let Some((_, _, versions)) =
-                            crate::formats::maven::parse_metadata_versions(&xml)
-                        {
-                            all_versions.extend(versions);
-                        }
-                    }
+
+                    let merged = if all_versions.is_empty() {
+                        None
+                    } else {
+                        all_versions.sort();
+                        all_versions.dedup();
+
+                        use crate::formats::maven_version;
+                        let sorted = maven_version::sort_maven_versions(&all_versions);
+                        let latest = sorted.last().unwrap().clone();
+                        let release = maven_version::latest_release(&sorted).cloned();
+
+                        let xml = generate_metadata_xml(
+                            &group_id,
+                            &artifact_id,
+                            &sorted,
+                            &latest,
+                            release.as_deref(),
+                        );
+                        Some(Bytes::from(xml))
+                    };
+
+                    cache.insert(cache_key, merged.clone()).await;
+                    merged
                 }
-            }
+            };
 
-            if !all_versions.is_empty() {
-                all_versions.sort();
-                all_versions.dedup();
-
-                use crate::formats::maven_version;
-                let sorted = maven_version::sort_maven_versions(&all_versions);
-                let latest = sorted.last().unwrap().clone();
-                let release = maven_version::latest_release(&sorted).cloned();
-
-                let xml = generate_metadata_xml(
-                    &group_id,
-                    &artifact_id,
-                    &sorted,
-                    &latest,
-                    release.as_deref(),
-                );
-
-                return Ok(Bytes::from(xml));
+            if let Some(xml) = ga_merge {
+                return Ok(xml);
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -3272,7 +3305,6 @@ mod tests {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use uuid::Uuid;
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -3311,7 +3343,7 @@ mod tests {
 
         // Insert the artifact row at the timestamped path; this is what
         // `resolve_snapshot_artifact` looks up to map the -SNAPSHOT alias.
-        let artifact_id_db = Uuid::new_v4();
+        let artifact_id_db = uuid::Uuid::new_v4();
         let sha256 = "deadbeef".repeat(8); // 64 hex chars
         sqlx::query(
             r#"
@@ -3355,7 +3387,7 @@ mod tests {
         .expect("insert artifact_metadata");
 
         // -- Build the virtual repo with the hosted as its sole member.
-        let virtual_id = Uuid::new_v4();
+        let virtual_id = uuid::Uuid::new_v4();
         let virtual_key = format!("v-snapj-1444-{}", virtual_id.simple());
         let virtual_dir = std::env::temp_dir().join(format!("snapj-1444-{}", virtual_id));
         std::fs::create_dir_all(&virtual_dir).expect("create virtual storage dir");
@@ -4016,5 +4048,64 @@ mod tests {
             pom_body.as_bytes(),
             "virtual must return the upstream POM bytes (#1562)"
         );
+    }
+
+    // -- #2302: in-process virtual-repo metadata merge cache --------------
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_positive_result() {
+        let repo_id = uuid::Uuid::new_v4();
+        let group = format!("g-{}", uuid::Uuid::new_v4());
+        let artifact = format!("a-{}", uuid::Uuid::new_v4());
+        let key: VirtualMetadataCacheKey = (repo_id, group.clone(), artifact.clone());
+        let cache = virtual_maven_metadata_cache().await;
+        cache
+            .insert(key.clone(), Some(Bytes::from_static(b"<merged/>")))
+            .await;
+        let cached = cache.get(&key).await;
+        assert!(
+            matches!(cached, Some(Some(_))),
+            "Some(Some(_)) on a positive cache entry"
+        );
+        cache.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_definitive_miss() {
+        let repo_id = uuid::Uuid::new_v4();
+        let key: VirtualMetadataCacheKey = (repo_id, "g".to_string(), "a".to_string());
+        let cache = virtual_maven_metadata_cache().await;
+        cache.insert(key.clone(), None).await;
+        let cached = cache.get(&key).await;
+        assert!(
+            matches!(cached, Some(None)),
+            "Some(None) signals a known-empty merge (do not re-iterate members)"
+        );
+        cache.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_isolates_keys() {
+        let repo_id = uuid::Uuid::new_v4();
+        let key_a: VirtualMetadataCacheKey = (repo_id, "g1".to_string(), "a1".to_string());
+        let key_b: VirtualMetadataCacheKey = (repo_id, "g2".to_string(), "a2".to_string());
+        let cache = virtual_maven_metadata_cache().await;
+        cache
+            .insert(key_a.clone(), Some(Bytes::from_static(b"a")))
+            .await;
+        cache
+            .insert(key_b.clone(), Some(Bytes::from_static(b"b")))
+            .await;
+        assert_eq!(
+            cache.get(&key_a).await.unwrap().unwrap(),
+            Bytes::from_static(b"a"),
+        );
+        assert_eq!(
+            cache.get(&key_b).await.unwrap().unwrap(),
+            Bytes::from_static(b"b"),
+        );
+        assert_ne!(key_a, key_b);
+        cache.invalidate(&key_a).await;
+        cache.invalidate(&key_b).await;
     }
 }
