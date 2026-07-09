@@ -383,11 +383,32 @@ impl MigrationService {
         }
     }
 
-    /// Create a repository in Artifact Keeper from Artifactory config
+    /// Compute the persisted `storage_path` for an auto-provisioned repository.
+    ///
+    /// Filesystem-backed repos store an ABSOLUTE path under the staging/storage
+    /// base so writes land on the mounted volume (#2025). Cloud backends (s3,
+    /// gcs, azure) address objects by the bare repo key, matching the HTTP
+    /// create-repo handler in `api::handlers::repositories`.
+    fn build_storage_path(storage_backend: &str, storage_base: &str, target_key: &str) -> String {
+        if storage_backend == "filesystem" {
+            format!("{}/{}", storage_base, target_key)
+        } else {
+            target_key.to_string()
+        }
+    }
+
+    /// Create a repository in Artifact Keeper from Artifactory config.
+    ///
+    /// `storage_backend` is the resolved backend name the migrated repo should
+    /// use (typically the server's default backend). Without it every
+    /// auto-provisioned repo fell back to the column default `filesystem`,
+    /// silently stranding S3/GCS/Azure deployments' migrated artifacts on local
+    /// disk (#2336).
     pub async fn create_repository(
         &self,
         config: &RepositoryMigrationConfig,
         storage_base: &str,
+        storage_backend: &str,
     ) -> Result<Uuid, MigrationError> {
         // Check compatibility
         if config.format_compatibility == FormatCompatibility::Unsupported {
@@ -409,13 +430,14 @@ impl MigrationService {
         // The repositories table schema has no `metadata`, `display_name`, or
         // `repository_type` columns. The corresponding columns are `name` and
         // `repo_type`, and `storage_path` is NOT NULL — so the INSERT must
-        // supply it. storage_path is stored absolute (under STORAGE_PATH),
-        // matching the HTTP create-repo handler.
-        let storage_path = format!("{}/{}", storage_base, config.target_key);
+        // supply it. `storage_backend` must also be supplied explicitly;
+        // otherwise it falls back to the column default `filesystem` (#2336).
+        let storage_path =
+            Self::build_storage_path(storage_backend, storage_base, &config.target_key);
         let repo_id: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO repositories (key, name, description, format, repo_type, storage_path)
-            VALUES ($1, $2, $3, $4::repository_format, $5::repository_type, $6)
+            INSERT INTO repositories (key, name, description, format, repo_type, storage_path, storage_backend)
+            VALUES ($1, $2, $3, $4::repository_format, $5::repository_type, $6, $7)
             RETURNING id
             "#,
         )
@@ -425,6 +447,7 @@ impl MigrationService {
         .bind(&format)
         .bind(repo_type)
         .bind(&storage_path)
+        .bind(storage_backend)
         .fetch_one(&self.db)
         .await?;
 
@@ -1194,6 +1217,34 @@ mod tests {
             MigrationService::get_format_compatibility("unknown"),
             FormatCompatibility::Unsupported
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // storage_path convention for auto-provisioned repos (#2336, #2025)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_storage_path_filesystem_is_absolute() {
+        // Filesystem repos must root under the staging base so writes land on
+        // the mounted volume (regression for #2025).
+        assert_eq!(
+            MigrationService::build_storage_path("filesystem", "/data/storage", "libs-local"),
+            "/data/storage/libs-local"
+        );
+    }
+
+    #[test]
+    fn test_build_storage_path_cloud_uses_bare_key() {
+        // Cloud backends address objects by the bare repo key, matching the
+        // HTTP create-repo handler. Prefixing a local staging path would be
+        // wrong for object storage (#2336).
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                MigrationService::build_storage_path(backend, "/data/storage", "libs-local"),
+                "libs-local",
+                "backend {backend} should use the bare key"
+            );
+        }
     }
 
     #[test]
