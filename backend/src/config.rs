@@ -148,6 +148,9 @@ pub struct Config {
     /// Log level
     pub log_level: String,
 
+    /// Deployment environment name (e.g. "development", "staging", "production")
+    pub environment: String,
+
     /// Storage backend: "filesystem" or "s3"
     pub storage_backend: String,
 
@@ -683,6 +686,7 @@ redacted_debug!(Config {
     redact database_url,
     show bind_address,
     show log_level,
+    show environment,
     show storage_backend,
     show storage_path,
     show s3_bucket,
@@ -790,6 +794,7 @@ impl Default for Config {
             database_url: String::new(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
+            environment: "development".into(),
             storage_backend: "filesystem".into(),
             storage_path: "/tmp/artifact-keeper-test".into(),
             s3_bucket: None,
@@ -914,6 +919,7 @@ impl Config {
                 .map_err(|_| AppError::Config("DATABASE_URL not set".into()))?,
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into()),
             storage_backend: env::var("STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into()),
             storage_path: env::var("STORAGE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {

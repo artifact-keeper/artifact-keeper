@@ -3135,6 +3135,7 @@ mod tests {
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),
             storage_backend: "filesystem".to_string(),
+            environment: "development".to_string(),
             storage_path: "/tmp/test".to_string(),
             s3_bucket: None,
             gcs_bucket: None,

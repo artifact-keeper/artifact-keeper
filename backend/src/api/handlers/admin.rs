@@ -429,6 +429,11 @@ pub async fn delete_backup(
 pub struct SystemSettings {
     pub storage_backend: String,
     pub storage_path: String,
+    /// Read-only deployment environment name, sourced from the `ENVIRONMENT`
+    /// config value. Defaulted on deserialization so it is not required in the
+    /// update-settings request body.
+    #[serde(default)]
+    pub environment: String,
     pub allow_anonymous_download: bool,
     pub max_upload_size_bytes: i64,
     pub retention_days: i32,
@@ -472,6 +477,7 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
     let mut result = SystemSettings {
         storage_backend: state.config.storage_backend.clone(),
         storage_path: state.config.storage_path.clone(),
+        environment: state.config.environment.clone(),
         allow_anonymous_download: false,
         max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
         retention_days: 365,
@@ -1097,6 +1103,7 @@ mod tests {
         let settings = SystemSettings {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/artifacts".to_string(),
+            environment: "development".to_string(),
             allow_anonymous_download: false,
             max_upload_size_bytes: 100 * 1024 * 1024,
             retention_days: 365,
@@ -1111,6 +1118,7 @@ mod tests {
         assert_eq!(settings.backup_retention_count, 10);
         assert_eq!(settings.edge_stale_threshold_minutes, 5);
         assert_eq!(settings.storage_backend, "filesystem");
+        assert_eq!(settings.environment, "development");
     }
 
     #[test]
@@ -1118,6 +1126,7 @@ mod tests {
         let settings = SystemSettings {
             storage_backend: "s3".to_string(),
             storage_path: "/data/artifacts".to_string(),
+            environment: "staging".to_string(),
             allow_anonymous_download: true,
             max_upload_size_bytes: 500_000_000,
             retention_days: 30,
@@ -1133,6 +1142,66 @@ mod tests {
         assert_eq!(parsed.audit_retention_days, 7);
         assert_eq!(parsed.backup_retention_count, 5);
         assert_eq!(parsed.edge_stale_threshold_minutes, 10);
+        assert_eq!(parsed.environment, "staging");
+    }
+
+    /// Regression: the settings DTO must serialize an `environment` field so
+    /// the admin UI can render the true deployment environment instead of a
+    /// hardcoded value. This fails if the field is dropped from the response.
+    #[test]
+    fn test_system_settings_serializes_environment() {
+        let settings = SystemSettings {
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/artifacts".to_string(),
+            environment: "production".to_string(),
+            allow_anonymous_download: false,
+            max_upload_size_bytes: 100 * 1024 * 1024,
+            retention_days: 365,
+            audit_retention_days: 90,
+            backup_retention_count: 10,
+            edge_stale_threshold_minutes: 5,
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"environment\":\"production\""),
+            "settings response must expose environment: {json}"
+        );
+    }
+
+    /// Regression: `serde(default)` on `environment` keeps it optional in the
+    /// update-settings request body, so older clients that omit it still
+    /// deserialize (defaulting to an empty string).
+    #[test]
+    fn test_system_settings_environment_defaults_when_absent() {
+        let json = r#"{
+            "storage_backend": "filesystem",
+            "storage_path": "/data/artifacts",
+            "allow_anonymous_download": false,
+            "max_upload_size_bytes": 104857600,
+            "retention_days": 365,
+            "audit_retention_days": 90,
+            "backup_retention_count": 10,
+            "edge_stale_threshold_minutes": 5
+        }"#;
+        let parsed: SystemSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.environment, "");
+    }
+
+    /// Regression (DB-backed, no-op without `DATABASE_URL`): `get_settings`
+    /// must thread `config.environment` into the response. The test config
+    /// defaults this to "development", matching the runtime default.
+    #[tokio::test]
+    async fn test_get_settings_exposes_config_environment() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/admin-settings-env");
+
+        let Json(settings) = get_settings(State(state)).await.unwrap();
+
+        assert_eq!(settings.environment, "development");
     }
 
     // -----------------------------------------------------------------------

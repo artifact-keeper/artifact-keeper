@@ -743,6 +743,7 @@ mod tests {
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
             storage_backend: "filesystem".into(),
+            environment: "development".into(),
             storage_path: "/tmp/artifacts".into(),
             s3_bucket: None,
             gcs_bucket: None,

@@ -165,6 +165,7 @@ fn cfg(storage_path: &str) -> Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         bind_address: "127.0.0.1:0".into(),
         log_level: "error".into(),
+        environment: "development".into(),
         storage_backend: "filesystem".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,

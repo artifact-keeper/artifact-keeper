@@ -6655,6 +6655,7 @@ mod tests {
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),
                 storage_backend: "filesystem".into(),
+                environment: "development".into(),
                 storage_path: storage_path.into(),
                 s3_bucket: None,
                 gcs_bucket: None,
