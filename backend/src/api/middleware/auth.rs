@@ -1247,12 +1247,32 @@ pub struct RepoVisibilityState {
 
 /// Extract the repository key from a format handler request path.
 ///
-/// Format routes are nested as `/{format}/{repo_key}/...`, so the repo key
-/// is the second path segment (e.g. `/pypi/my-repo/simple/` -> `"my-repo"`).
+/// Format routes are nested as `/{format}/{repo_key}/...`, but middleware can
+/// observe either the nest-stripped form or the full `/api/v1/...` URI. In both
+/// cases the repo key is the segment immediately after the format prefix.
 pub(crate) fn extract_repo_key(path: &str) -> &str {
-    let trimmed = path.trim_start_matches('/');
-    let mut segments = trimmed.split('/');
-    segments.next(); // skip format prefix (pypi, npm, maven, etc.)
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let first = match segments.next() {
+        Some(segment) => segment,
+        None => return "",
+    };
+
+    let format = if first == "api" {
+        let Some(version) = segments.next() else {
+            return "";
+        };
+        if !version.starts_with('v') {
+            return "";
+        }
+        segments.next()
+    } else {
+        Some(first)
+    };
+
+    if format.is_none() {
+        return "";
+    }
+
     segments.next().unwrap_or("")
 }
 
@@ -1623,36 +1643,48 @@ pub async fn repo_visibility_middleware(
                 if !allowed {
                     return forbidden_permission_response();
                 }
-            } else if !is_public {
-                // A private repo with NO fine-grained permission rules must
-                // still not be readable by every authenticated user. Mirror
-                // the REST `require_visible` model: a non-admin needs a role
-                // assignment scoped to this repo (or a global assignment).
+            } else if is_write || !is_public {
+                // A repo with NO fine-grained permission rules falls back to
+                // legacy role assignments. Private repos need that legacy
+                // membership for reads and writes; public repos need it for
+                // writes because public visibility is read-only.
                 //
-                // Without this branch the native-protocol path default-ALLOWED
-                // rule-less private repos to any authenticated principal, while
-                // the REST download path denied the same caller (404) — a
-                // cross-tenant private-artifact leak (red-team round 2).
+                // Without this branch the native-protocol path default-allowed
+                // writes to rule-less public repos for any authenticated
+                // principal, while the REST path now requires an explicit
+                // repository write grant.
                 //
                 // Uses sqlx::query_scalar (not the macro) so no new entry in
                 // the sqlx offline-query cache is required, matching the rest
-                // of this middleware. Same predicate as
-                // RepositoryService::user_can_access_repo.
+                // of this middleware. Same legacy action mapping as
+                // RepositoryService::user_can_perform_repo_action.
+                let action = action_for_method(request.method());
                 let granted = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS ( \
                          SELECT 1 FROM role_assignments ra \
+                         INNER JOIN roles r ON r.id = ra.role_id \
                          WHERE ra.user_id = $1 \
                            AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                           AND ( \
+                               r.name = 'admin' \
+                               OR $3 = ANY(r.permissions) \
+                               OR 'admin' = ANY(r.permissions) \
+                               OR ($3 = 'read') \
+                               OR ($3 = 'write' AND r.name = 'developer') \
+                           ) \
                      )",
                 )
                 .bind(ext.user_id)
                 .bind(repo.id)
+                .bind(action)
                 .fetch_one(&vis_state.db)
                 .await;
 
                 match granted {
                     Ok(true) => {}
-                    // Existence-hiding 404, matching REST `require_visible`.
+                    // Public write denials can be honest 403; private denials
+                    // keep existence-hiding 404, matching REST `require_visible`.
+                    Ok(false) if is_write => return forbidden_permission_response(),
                     Ok(false) => return not_found_response(),
                     Err(_) => {
                         // DB error on access check: fail closed.
@@ -2301,6 +2333,20 @@ mod tests {
     #[test]
     fn test_extract_repo_key_no_leading_slash() {
         assert_eq!(extract_repo_key("pypi/my-repo/simple"), "my-repo");
+    }
+
+    #[test]
+    fn test_extract_repo_key_full_api_path() {
+        assert_eq!(extract_repo_key("/api/v1/pypi/my-repo/simple/"), "my-repo");
+        assert_eq!(
+            extract_repo_key("/api/v1/maven/my-repo/com/example/artifact"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_key_full_api_path_without_repo() {
+        assert_eq!(extract_repo_key("/api/v1/pypi"), "");
     }
 
     // -----------------------------------------------------------------------

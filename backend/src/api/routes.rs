@@ -880,12 +880,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Migration routes with auth middleware
+        // Migration routes are administrative: they store external source
+        // credentials and can drive bulk repository mutations.
         .nest(
             "/migrations",
             handlers::migration::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
-                auth_middleware,
+                admin_middleware,
             )),
         )
         // Chunked/resumable upload routes with auth middleware
@@ -991,6 +992,27 @@ mod tests {
         assert!(
             next_middleware.contains("admin_middleware"),
             "plugin install + lifecycle routes must be gated by admin_middleware"
+        );
+    }
+
+    #[test]
+    fn migrations_require_admin_middleware() {
+        // Migration source connections can contain credentials for external
+        // registries, and migration jobs can bulk-create/update repository
+        // content. Keep the whole nest behind admin_middleware so non-admins
+        // are stopped before request-body validation or connection/job lookup.
+        let migrations_nest = ROUTES_RS_SRC
+            .split("handlers::migration::router()")
+            .nth(1)
+            .expect("migration router must be nested under /migrations");
+        let next_middleware = migrations_nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("migration router nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "migration routes must be gated by admin_middleware before handler \
+             extractors can validate bodies or look up source connections"
         );
     }
 }

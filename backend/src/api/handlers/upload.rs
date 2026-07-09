@@ -219,13 +219,10 @@ async fn create_session(
     // repo_visibility_middleware), and the target repo is named in the JSON body,
     // so the tenant-membership gate that protects the URL-addressed artifact PUT
     // never sees this request. The fine-grained RBAC checks below fall OPEN when
-    // a repo has no permission rules (`has_rules == false`), so derive the tenant
-    // boundary from `is_public` + role_assignments membership
-    // (`require_repo_write_access`): a non-member, non-admin can never open a
-    // session against another tenant's private repo regardless of whether any
-    // permission rule exists. Admins, public-repo writers, same-org members and
-    // write/admin-holding peer-replication identities all pass unchanged. Mirrors
-    // `repositories::upload_artifact`.
+    // a repo has no permission rules (`has_rules == false`), so enforce the
+    // same action-aware gate as the URL-addressed artifact PUT. Public
+    // visibility is read-only: opening an upload session still requires an
+    // explicit repository write grant (or admin).
     let repo_service = RepositoryService::new(state.db.clone());
     let repo_record = repo_service
         .get_by_key(&req.repository_key)
@@ -1145,7 +1142,7 @@ mod tests {
     /// (and `upload_write_decision`) fall OPEN when the target repo has no
     /// fine-grained permission rules (`!has_rules`), so `create_session` must
     /// ALSO enforce the rule-independent tenant gate `require_repo_write_access`
-    /// (is_public + role_assignments membership). String-grep because the handler
+    /// (action-aware write grant). String-grep because the handler
     /// needs a real DB to run.
     #[test]
     fn test_create_session_enforces_tenant_gate() {

@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
+use crate::api::handlers::repositories::{require_repo_admin_access, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -556,8 +556,10 @@ async fn get_all_scores(
 )]
 async fn list_scan_configs(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<ScanConfigResponse>>> {
+    auth.require_admin()?;
+
     let svc = ScanConfigService::new(state.db.clone());
     let configs = svc.list_configs().await?;
     let response: Vec<ScanConfigResponse> =
@@ -588,6 +590,8 @@ async fn trigger_scan(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
+    auth.require_admin()?;
+
     // 503 (not 500) because "scanner not configured" is a normal operational
     // state on minimal stacks (no Trivy / OpenSCAP service), not a server
     // bug. 500 alerts on operator dashboards; 503 does not.
@@ -607,12 +611,6 @@ async fn trigger_scan(
     // result; `bypass_dedup` removes that safety. Gating on admin scope
     // matches the inventory-backfill path in admin.rs which also touches
     // every artifact in a repository (see issue #1469 review feedback).
-    if bypass_dedup && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "bypass_dedup requires admin privileges".to_string(),
-        ));
-    }
-
     if let Some(artifact_id) = body.artifact_id {
         // Honest not-found up front (#2227): without this, an id with no
         // `artifacts` row -- e.g. the synthetic, SHA-256-derived id a Remote
@@ -713,9 +711,11 @@ async fn trigger_scan(
 )]
 async fn list_scans(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -751,9 +751,11 @@ async fn list_scans(
 )]
 async fn get_scan(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ScanResponse>> {
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let s = svc.get_scan(id).await?;
 
@@ -782,10 +784,12 @@ async fn get_scan(
 )]
 async fn list_findings(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(scan_id): Path<Uuid>,
     Query(query): Query<ListFindingsQuery>,
 ) -> Result<Json<FindingListResponse>> {
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
 
     // Verify the scan exists. Without this check, an unknown scan_id falls
@@ -891,8 +895,10 @@ async fn revoke_acknowledgment(
 )]
 async fn list_policies(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<PolicyResponse>>> {
+    auth.require_admin()?;
+
     let svc = PolicyService::new(state.db.clone());
     let policies = svc.list_policies().await?;
     let response: Vec<PolicyResponse> = policies.into_iter().map(PolicyResponse::from).collect();
@@ -950,9 +956,11 @@ async fn create_policy(
 )]
 async fn get_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PolicyResponse>> {
+    auth.require_admin()?;
+
     let svc = PolicyService::new(state.db.clone());
     let p = svc.get_policy(id).await?;
 
@@ -1099,7 +1107,7 @@ async fn update_repo_security(
     // so enforce is_public + per-repo role-assignment membership here.
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    require_repo_admin_access(&auth, &repo, &repo_service).await?;
     let repo = repo.id;
 
     let svc = ScanConfigService::new(state.db.clone());
@@ -1126,10 +1134,12 @@ async fn update_repo_security(
 )]
 async fn list_artifact_scans(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -1241,7 +1251,7 @@ mod tests {
     /// Cross-tenant authz guard (xtenant-write-authz-systemic). The repo-scoped
     /// security endpoints live under the /repositories nest (not gated by
     /// repo_visibility_middleware), so each must enforce the tenant gate itself.
-    /// Assert the write handler calls `require_repo_write_access` and the read
+    /// Assert the write handler calls `require_repo_admin_access` and the read
     /// handlers call `require_visible`. String-grep because the handlers need a
     /// full DB-backed `SharedState` to run.
     #[test]
@@ -1257,8 +1267,8 @@ mod tests {
             &rest[..end]
         };
         assert!(
-            body_of("update_repo_security").contains("require_repo_write_access("),
-            "update_repo_security must call require_repo_write_access (xtenant)"
+            body_of("update_repo_security").contains("require_repo_admin_access("),
+            "update_repo_security must call require_repo_admin_access (xtenant)"
         );
         for reader in ["get_repo_security", "list_repo_scans"] {
             assert!(
@@ -1891,15 +1901,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression: bypass_dedup must be admin-gated in trigger_scan.
+    // Regression: trigger_scan must be admin-gated.
     //
-    // PR #1514 review feedback: `bypass_dedup` skips the hash-based scan
-    // dedup short-circuit and fans out unbounded tokio::spawn workers across
-    // an entire repository's artifacts. The pre-existing `force = true` path
-    // was naturally rate-limited because dedup collapsed repeated calls
-    // against the same checksum into a single cached result; `bypass_dedup`
-    // removes that safety, so a non-admin caller setting it to true would be
-    // a DoS amplifier.
+    // Security hardening made scan trigger an administrative operation for
+    // all callers. `bypass_dedup` remains especially expensive, but even the
+    // normal trigger path can schedule scanner work and expose operational
+    // surfaces that should not be available to non-admin users.
     //
     // This test invokes the `trigger_scan` handler directly (not via the
     // router) so it covers the actual 403 branch under `cargo llvm-cov`.
@@ -1907,17 +1914,17 @@ mod tests {
     // no-ops cleanly otherwise, matching the `tdh::Fixture` pattern used
     // by sibling handler tests.
     //
-    // Coverage strategy: three call shapes prove the gate's behaviour
+    // Coverage strategy: call shapes prove the gate's behaviour
     // without spinning up a real scan run:
     //
-    //   1. non-admin + bypass_dedup=true  -> 403 Authorization (the gate)
+    //   1. non-admin + bypass_dedup=true -> 403 Authorization
     //   2. admin + bypass_dedup=true + no ids -> 400 Validation
     //      (the gate is bypassed for admins; we land on the next check)
-    //   3. non-admin + bypass_dedup omitted + no ids -> 400 Validation
-    //      (the gate does not fire for the normal trigger path)
+    //   3. non-admin + bypass_dedup omitted + no ids -> 403 Authorization
+    //   4. non-admin + bypass_dedup=false + no ids -> 403 Authorization
     // -----------------------------------------------------------------------
     #[tokio::test]
-    async fn test_trigger_scan_handler_admin_gates_bypass_dedup() {
+    async fn test_trigger_scan_handler_requires_admin() {
         use crate::api::handlers::test_db_helpers as tdh;
         use std::sync::Arc;
 
@@ -1995,13 +2002,13 @@ mod tests {
         match result {
             Err(AppError::Authorization(msg)) => {
                 assert!(
-                    msg.contains("bypass_dedup"),
-                    "403 message should mention bypass_dedup, got: {}",
+                    msg.contains("Admin access required"),
+                    "unexpected 403 message: {}",
                     msg
                 );
             }
             other => panic!(
-                "expected AppError::Authorization for non-admin bypass_dedup, got: {:?}",
+                "expected AppError::Authorization for non-admin trigger_scan, got: {:?}",
                 other.as_ref().err()
             ),
         }
@@ -2035,9 +2042,7 @@ mod tests {
             ),
         }
 
-        // ---- Case 3: non-admin + bypass_dedup omitted + no ids -> 400 Validation
-        // The gate must not fire on the normal trigger path; non-admins
-        // should still be able to call trigger_scan without bypass_dedup.
+        // ---- Case 3: non-admin + bypass_dedup omitted + no ids -> 403 Authorization
         let result = trigger_scan(
             State(state.clone()),
             Extension(make_auth(false)),
@@ -2049,17 +2054,14 @@ mod tests {
         )
         .await;
         match result {
-            Err(AppError::Validation(_)) => {} // expected
+            Err(AppError::Authorization(_)) => {} // expected
             other => panic!(
-                "non-admin without bypass_dedup must not be 403'd; expected \
-                 AppError::Validation for the missing-ids case, got: {:?}",
+                "non-admin without bypass_dedup must be stopped by the admin gate; got: {:?}",
                 other.as_ref().err()
             ),
         }
 
-        // ---- Case 4: non-admin + bypass_dedup=false -> 400 Validation
-        // Explicit `false` must behave the same as omitted (gate condition
-        // is `bypass_dedup && !auth.is_admin`, so false short-circuits).
+        // ---- Case 4: non-admin + bypass_dedup=false -> 403 Authorization
         let result = trigger_scan(
             State(state.clone()),
             Extension(make_auth(false)),
@@ -2071,11 +2073,9 @@ mod tests {
         )
         .await;
         match result {
-            Err(AppError::Validation(_)) => {} // expected
+            Err(AppError::Authorization(_)) => {} // expected
             other => panic!(
-                "non-admin with bypass_dedup=false must not be 403'd; \
-                 expected AppError::Validation for the missing-ids case, \
-                 got: {:?}",
+                "non-admin with bypass_dedup=false must be stopped by the admin gate; got: {:?}",
                 other.as_ref().err()
             ),
         }

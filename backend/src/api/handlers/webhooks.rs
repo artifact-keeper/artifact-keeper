@@ -406,6 +406,8 @@ pub async fn create_webhook(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateWebhookRequest>,
 ) -> Result<Json<WebhookSecretCreatedResponse>> {
+    auth.require_admin()?;
+
     // Validate URL (SSRF prevention)
     validate_webhook_url(&payload.url)?;
 
@@ -3760,12 +3762,12 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
-            let creator = create_user(&pool, false).await;
+            let creator = create_user(&pool, true).await;
             let state = tdh::build_state(pool.clone(), "/tmp");
 
             let resp = create_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(creator, false)),
+                axum::Extension(auth_for(creator, true)),
                 axum::Json(CreateWebhookRequest {
                     name: format!("created-by-{}", &creator.to_string()[..8]),
                     url: "http://198.51.100.9/hook".to_string(),

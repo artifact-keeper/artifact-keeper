@@ -242,8 +242,11 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
 )]
 pub async fn list_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<PeerInstanceListResponse>> {
+    auth.require_admin()?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -374,8 +377,11 @@ pub async fn register_peer(
 )]
 pub async fn get_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PeerInstanceResponse>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let instance = service.get_by_id(id).await?;
 
@@ -508,9 +514,12 @@ pub async fn trigger_sync(
 )]
 pub async fn get_sync_tasks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<SyncTaskResponse>>> {
+    auth.require_admin()?;
+
     let limit = query.per_page.unwrap_or(50) as i64;
     let service = PeerInstanceService::new(state.db.clone());
     let tasks = service.get_pending_sync_tasks(id, limit).await?;
@@ -551,8 +560,11 @@ pub async fn get_sync_tasks(
 )]
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Uuid>>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let repos = service.get_assigned_repositories(id).await?;
     Ok(Json(repos))
@@ -635,8 +647,11 @@ pub async fn assign_repo(
 )]
 pub async fn get_subscription(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, repo_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<SubscriptionResponse>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let sub = service.get_subscription(id, repo_id).await?;
     Ok(Json(SubscriptionResponse {

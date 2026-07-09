@@ -1,7 +1,7 @@
 //! Repository-scoped access token management.
 //!
-//! Allows repository administrators (users with write scope or global admins)
-//! to create, list, and revoke API tokens scoped to a specific repository.
+//! Allows repository administrators to create, list, and revoke API tokens
+//! scoped to a specific repository.
 //! Tokens created through these endpoints are automatically restricted to the
 //! repository they were created on via the `api_token_repositories` join table.
 
@@ -116,7 +116,8 @@ fn caller_owns_token(auth: &AuthExtension, created_by_user_id: Option<Uuid>) -> 
 }
 
 /// Require that the caller is authenticated and has write scope on repos
-/// (or is a global admin).
+/// (or is a global admin). The repository-admin permission check happens after
+/// the target repository is resolved.
 fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
@@ -152,23 +153,18 @@ async fn authorize_repo_for_tokens(
         )));
     }
 
-    // Per-repo authorization (mirrors `require_visible` in the repositories
-    // handler). The `can_access_repo` check above only enforces the *token's*
-    // repo scope — a broad `write:repositories` token (`allowed_repo_ids =
-    // None`) passes it for ANY repo. Without this DB-level check, any
-    // authenticated user with the write scope could mint repo-scoped tokens on
-    // a PRIVATE repository they cannot see (#1783). A private repo is visible
-    // only to an admin or a user with a role assignment scoped to it.
-    if !repo.is_public
-        && !auth.is_admin
-        && !repo_service
-            .user_can_access_repo(repo.id, auth.user_id)
-            .await?
-    {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
+    // Repo-scoped tokens are delegation credentials. Visibility/write access is
+    // not enough: a public repository must not let any authenticated principal
+    // mint a token for it, and a writer must not escalate into token issuance.
+    if !auth.is_admin {
+        let allowed = repo_service
+            .user_can_perform_repo_action(repo.id, auth.user_id, "admin")
+            .await?;
+        if !allowed {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage repository tokens".to_string(),
+            ));
+        }
     }
 
     Ok((auth, repo))
@@ -1002,7 +998,8 @@ mod admin_scope_policy_tests {
     /// (token `allowed_repo_ids = None`, so `can_access_repo` passes for ANY
     /// repo) must NOT be able to mint a repo token on a PRIVATE repository it
     /// has no role on. Before the fix the endpoint returned 200/created; it
-    /// must now 404 (existence-hiding), exactly like `require_visible`.
+    /// must now 403 because repo-scoped token issuance requires repository
+    /// admin permission even when the repository is public/readable.
     #[tokio::test]
     async fn non_admin_without_role_cannot_mint_token_on_private_repo() {
         let Some((pool, state, user_id, username, repo_key)) = setup().await else {
@@ -1028,8 +1025,8 @@ mod admin_scope_policy_tests {
 
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "non-admin without a role must not mint tokens on a private repo (existence-hiding); got {} body: {}",
+            StatusCode::FORBIDDEN,
+            "non-admin without repo-admin must not mint tokens on a private repo; got {} body: {}",
             status,
             String::from_utf8_lossy(&body_bytes),
         );
@@ -1179,10 +1176,8 @@ mod ownership_gate_tests {
         row.0
     }
 
-    /// Full public-repo setup with two members (victor=creator, sam=peer) and a
-    /// token seeded on the repo by victor. The repo is public so the #1783
-    /// private-repo gate is satisfied and the gate under test is purely
-    /// per-token, not visibility.
+    /// Full public-repo setup with two users (victor=repo admin/creator,
+    /// sam=peer) and a token seeded on the repo by victor.
     struct Fixture {
         pool: sqlx::PgPool,
         state: SharedState,
@@ -1203,6 +1198,16 @@ mod ownership_gate_tests {
             .expect("make repo public");
         let (victor, victor_name) = tdh::create_user(&pool).await;
         let (sam, _sam_name) = tdh::create_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO permissions \
+               (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+        )
+        .bind(victor)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant victor repo-admin permission");
         let state = tdh::build_state(pool.clone(), "/tmp");
         let token_id = create_token_as(&state, member_auth(victor, &victor_name), &repo_key).await;
         Some(Fixture {
@@ -1225,6 +1230,12 @@ mod ownership_gate_tests {
             .bind(f.victor)
             .execute(&f.pool)
             .await;
+        let _ = sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(f.repo_id)
             .execute(&f.pool)
@@ -1237,23 +1248,23 @@ mod ownership_gate_tests {
         }
     }
 
-    /// (1) A peer GET of another member's token returns 404 (was 200).
+    /// (1) A peer GET of another member's token returns 403 at the repo-admin gate.
     #[tokio::test]
-    async fn peer_get_token_is_404() {
+    async fn peer_get_token_is_403() {
         let Some(f) = fixture().await else { return };
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, _) = tdh::send(app, get_token_req(&f.repo_key, f.token_id)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "peer GET must 404");
+        assert_eq!(status, StatusCode::FORBIDDEN, "peer GET must 403");
         teardown(&f).await;
     }
 
-    /// (2) A peer DELETE returns 404 and the token is NOT revoked.
+    /// (2) A peer DELETE returns 403 and the token is NOT revoked.
     #[tokio::test]
-    async fn peer_delete_token_is_404_and_not_revoked() {
+    async fn peer_delete_token_is_403_and_not_revoked() {
         let Some(f) = fixture().await else { return };
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, _) = tdh::send(app, delete_token_req(&f.repo_key, f.token_id)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "peer DELETE must 404");
+        assert_eq!(status, StatusCode::FORBIDDEN, "peer DELETE must 403");
         assert!(
             revoked_at(&f.pool, f.token_id).await.is_none(),
             "peer DELETE must NOT revoke the token"
@@ -1321,20 +1332,14 @@ mod ownership_gate_tests {
     async fn list_scopes_to_owner_for_non_admin_and_all_for_admin() {
         let Some(f) = fixture().await else { return };
 
-        // Peer sees no items (victor's token is filtered out).
+        // Peer cannot list repository-scoped tokens without repo-admin.
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, bytes) = tdh::send(app, list_tokens_req(&f.repo_key)).await;
-        assert_eq!(status, StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let peer_ids: Vec<&str> = v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["id"].as_str().unwrap())
-            .collect();
         assert!(
-            !peer_ids.contains(&f.token_id.to_string().as_str()),
-            "peer list must not contain victor's token"
+            status == StatusCode::FORBIDDEN,
+            "peer list must 403, got {} body: {}",
+            status,
+            String::from_utf8_lossy(&bytes),
         );
 
         // Creator sees their own token.

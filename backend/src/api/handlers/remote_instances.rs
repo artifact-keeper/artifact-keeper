@@ -56,6 +56,8 @@ async fn list_instances(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<RemoteInstanceResponse>>> {
+    auth.require_admin()?;
+
     let instances = RemoteInstanceService::list(&state.db, auth.user_id).await?;
     Ok(Json(instances))
 }
@@ -84,6 +86,8 @@ async fn create_instance(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> Result<Json<RemoteInstanceResponse>> {
+    auth.require_admin()?;
+
     // Validate URL to prevent SSRF via the proxy endpoints
     validate_outbound_url(&req.url, "Remote instance URL")?;
 
@@ -112,6 +116,8 @@ async fn delete_instance(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    auth.require_admin()?;
+
     RemoteInstanceService::delete(&state.db, id, auth.user_id).await
 }
 
@@ -195,6 +201,8 @@ async fn proxy_get(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
+    auth.require_admin()?;
+
     validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
@@ -231,6 +239,8 @@ async fn proxy_post(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
+    auth.require_admin()?;
+
     validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
@@ -269,6 +279,8 @@ async fn proxy_put(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
+    auth.require_admin()?;
+
     validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
@@ -305,6 +317,8 @@ async fn proxy_delete(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
+    auth.require_admin()?;
+
     validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);

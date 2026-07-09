@@ -428,6 +428,28 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .expect("grant developer role");
 }
 
+/// Grant explicit fine-grained repository actions to the fixture user.
+///
+/// Use this in tests that intentionally exercise action-specific behavior
+/// beyond the legacy developer/write grant, such as successful destructive
+/// operations after repository delete hardening.
+pub async fn grant_repo_actions(pool: &PgPool, repo_id: Uuid, user_id: Uuid, actions: &[&str]) {
+    let actions: Vec<String> = actions.iter().map(|action| (*action).to_string()).collect();
+    sqlx::query(
+        "INSERT INTO permissions \
+         (principal_type, principal_id, target_type, target_id, actions) \
+         VALUES ('user', $1, 'repository', $2, $3) \
+         ON CONFLICT (principal_type, principal_id, target_type, target_id) \
+         DO UPDATE SET actions = EXCLUDED.actions, updated_at = NOW()",
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .bind(&actions)
+    .execute(pool)
+    .await
+    .expect("grant repository actions");
+}
+
 /// Recursively find the largest file (in bytes) under `dir`, or 0 if none.
 fn dir_max_file_size(dir: &std::path::Path) -> u64 {
     let mut max = 0u64;
@@ -522,6 +544,15 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
 }
 
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+    let _ = sqlx::query(
+        "DELETE FROM permissions \
+         WHERE (target_type = 'repository' AND target_id = $1) \
+            OR (principal_type = 'user' AND principal_id = $2)",
+    )
+    .bind(repo_id)
+    .bind(user_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)
         .execute(pool)

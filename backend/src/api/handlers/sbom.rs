@@ -351,6 +351,8 @@ async fn generate_sbom(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<GenerateSbomRequest>,
 ) -> Result<Json<SbomResponse>> {
+    auth.require_admin()?;
+
     let service = SbomService::new(state.db.clone());
     let format = SbomFormat::parse(&body.format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.format)))?;
@@ -619,6 +621,8 @@ async fn delete_sbom(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
+
     ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     service.delete_sbom(id).await?;
@@ -685,10 +689,12 @@ async fn get_sbom_components(
 )]
 async fn convert_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<ConvertSbomRequest>,
 ) -> Result<Json<SbomContentResponse>> {
+    auth.require_admin()?;
+
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
@@ -1009,6 +1015,8 @@ async fn update_cve_status(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateCveStatusRequest>,
 ) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    auth.require_admin()?;
+
     let service = SbomService::new(state.db.clone());
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
@@ -1083,6 +1091,8 @@ async fn update_cve_status_by_artifact_cve(
     Path((artifact_id, cve_id)): Path<(Uuid, String)>,
     Json(body): Json<UpdateCveStatusRequest>,
 ) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    auth.require_admin()?;
+
     if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
@@ -1119,9 +1129,11 @@ async fn update_cve_status_by_artifact_cve(
 )]
 async fn get_cve_trends(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<GetCveTrendsQuery>,
 ) -> Result<Json<CveTrends>> {
+    auth.require_admin()?;
+
     let service = SbomService::new(state.db.clone());
     let trends = service.get_cve_trends(query.repository_id).await?;
     Ok(Json(trends))
@@ -1142,8 +1154,10 @@ async fn get_cve_trends(
 )]
 async fn list_license_policies(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<LicensePolicyResponse>>> {
+    auth.require_admin()?;
+
     let policies: Vec<LicensePolicy> =
         sqlx::query_as("SELECT * FROM license_policies ORDER BY name")
             .fetch_all(&state.db)
@@ -1173,9 +1187,11 @@ async fn list_license_policies(
 )]
 async fn get_license_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LicensePolicyResponse>> {
+    auth.require_admin()?;
+
     let policy: LicensePolicy = sqlx::query_as("SELECT * FROM license_policies WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
@@ -1285,9 +1301,11 @@ async fn delete_license_policy(
 )]
 async fn check_license_compliance(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CheckLicenseComplianceRequest>,
 ) -> Result<Json<LicenseCheckResult>> {
+    auth.require_admin()?;
+
     let service = SbomService::new(state.db.clone());
     let policy = service
         .get_license_policy(body.repository_id)
@@ -2958,6 +2976,12 @@ mod tests {
             .await;
     }
 
+    fn make_admin_auth(user_id: Uuid, username: &str) -> AuthExtension {
+        let mut auth = crate::api::handlers::test_db_helpers::make_auth(user_id, username);
+        auth.is_admin = true;
+        auth
+    }
+
     #[tokio::test]
     async fn test_handler_rejects_malformed_cve_id_before_db_lookup() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -2966,7 +2990,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -2997,7 +3021,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         // `CveStatus::parse` returns None for any string outside the four
         // known variants. Handler must surface that as 400 with the
         // original status text echoed so the client can debug.
@@ -3032,7 +3056,7 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-1010", "high").await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3072,7 +3096,7 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-2020", "low").await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3106,7 +3130,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3142,7 +3166,7 @@ mod tests {
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-4040", "medium")
             .await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         // Send the CVE id lower-cased: handler must still match.
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
@@ -3179,7 +3203,7 @@ mod tests {
         )
         .await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = make_admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3222,7 +3246,7 @@ mod tests {
 
         // Build an auth extension whose allowed_repo_ids does NOT include
         // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
-        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        let mut auth = make_admin_auth(fx.user_id, &fx.username);
         auth.allowed_repo_ids = AccessScope::Restricted(vec![Uuid::new_v4()]);
 
         let result = super::update_cve_status_by_artifact_cve(

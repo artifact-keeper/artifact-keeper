@@ -132,7 +132,12 @@ fn get_dt_service(
     ),
     security(("bearer_auth" = []))
 )]
-async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResponse>> {
+async fn dt_status(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<DtStatusResponse>> {
+    auth.require_admin()?;
+
     match &state.dependency_track {
         Some(dt) => {
             let (healthy, error_status, error_message) = match dt.health_status().await {
@@ -170,8 +175,10 @@ async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResp
 )]
 async fn list_projects(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<DtProject>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let projects = dt.list_projects().await?;
     Ok(Json(projects))
@@ -193,9 +200,11 @@ async fn list_projects(
 )]
 async fn get_project(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
 ) -> Result<Json<Vec<DtFinding>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let findings = dt.get_findings(&project_uuid).await?;
     Ok(Json(findings))
@@ -217,9 +226,11 @@ async fn get_project(
 )]
 async fn get_project_findings(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
 ) -> Result<Json<Vec<DtFinding>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let findings = dt.get_findings(&project_uuid).await?;
     Ok(Json(findings))
@@ -241,9 +252,11 @@ async fn get_project_findings(
 )]
 async fn get_project_components(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
 ) -> Result<Json<Vec<DtComponentFull>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let components = dt.get_components(&project_uuid).await?;
     Ok(Json(components))
@@ -265,9 +278,11 @@ async fn get_project_components(
 )]
 async fn get_project_metrics(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
 ) -> Result<Json<DtProjectMetrics>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let metrics = dt.get_project_metrics(&project_uuid).await?;
     Ok(Json(metrics))
@@ -290,10 +305,12 @@ async fn get_project_metrics(
 )]
 async fn get_project_metrics_history(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
     Query(query): Query<MetricsHistoryQuery>,
 ) -> Result<Json<Vec<DtProjectMetrics>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let history = dt
         .get_project_metrics_history(&project_uuid, query.days)
@@ -314,8 +331,10 @@ async fn get_project_metrics_history(
 )]
 async fn get_portfolio_metrics(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<DtPortfolioMetrics>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let metrics = dt.get_portfolio_metrics().await?;
     Ok(Json(metrics))
@@ -337,9 +356,11 @@ async fn get_portfolio_metrics(
 )]
 async fn get_project_violations(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(project_uuid): Path<String>,
 ) -> Result<Json<Vec<DtPolicyViolation>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let violations = dt.get_policy_violations(&project_uuid).await?;
     Ok(Json(violations))
@@ -359,9 +380,11 @@ async fn get_project_violations(
 )]
 async fn update_analysis(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<UpdateAnalysisBody>,
 ) -> Result<Json<DtAnalysisResponse>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let result = dt
         .update_analysis(
@@ -391,8 +414,10 @@ async fn update_analysis(
 )]
 async fn list_policies(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<DtPolicyFull>>> {
+    auth.require_admin()?;
+
     let dt = get_dt_service(&state)?;
     let policies = dt.get_policies().await?;
     Ok(Json(policies))

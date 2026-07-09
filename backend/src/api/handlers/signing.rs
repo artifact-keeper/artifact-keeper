@@ -96,9 +96,11 @@ pub struct SigningConfigResponse {
 )]
 async fn list_keys(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListKeysQuery>,
 ) -> Result<Json<KeyListResponse>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let keys = svc.list_keys(query.repository_id).await?;
     let total = keys.len();
@@ -170,9 +172,11 @@ async fn create_key(
 )]
 async fn get_key(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let key = svc.get_key(key_id).await?;
     Ok(Json(key))
@@ -253,6 +257,8 @@ async fn rotate_key(
     Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let new_key = svc.rotate_key(key_id, Some(auth.user_id)).await?;
     Ok(Json(new_key))
@@ -300,9 +306,11 @@ async fn get_public_key(
 )]
 async fn get_repo_signing_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_id): Path<Uuid>,
 ) -> Result<Json<SigningConfigResponse>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let config = svc.get_signing_config(repo_id).await?;
 

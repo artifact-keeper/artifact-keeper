@@ -462,14 +462,14 @@ pub struct RepositoryAssessment {
 
 // ============ Ownership Scoping ============
 //
-// The migration router is mounted under `auth_middleware`, so every request
-// here is authenticated, but until now the handlers queried
-// `source_connections` / `migration_jobs` by primary key only — any
-// authenticated user could read or mutate any other user's (or tenant's) rows
-// (BOLA). We scope every access to the calling user via the `created_by`
-// columns that already exist on both tables (migration `020_migration_tables`),
-// mirroring the per-user ownership model used by `repo_tokens.rs` (#1974) and
-// `service_accounts.rs`: admins retain full cross-user visibility/control.
+// The migration router is mounted under `admin_middleware` in production
+// because source connections can contain external registry credentials and jobs
+// can bulk-create/update repository content. The owner scoping below remains as
+// defense in depth and for direct router tests: every access is constrained to
+// the caller via the `created_by` columns that already exist on both tables
+// (migration `020_migration_tables`), mirroring the per-user ownership model
+// used by `repo_tokens.rs` (#1974) and `service_accounts.rs`. Admins retain
+// full cross-user visibility/control.
 //
 // Pre-fix rows have `created_by = NULL` (creation never stamped it); those are
 // owned by nobody and therefore invisible/untouchable to non-admins
