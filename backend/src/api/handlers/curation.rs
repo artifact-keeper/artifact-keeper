@@ -36,7 +36,7 @@ use crate::services::curation_service::CurationService;
         CreateRuleRequest,
         UpdateRuleRequest,
         RuleResponse,
-        PackageResponse,
+        CurationPackageResponse,
         BulkStatusRequest,
         PackageListQuery,
         ReEvaluateRequest,
@@ -135,7 +135,7 @@ pub struct RuleResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PackageResponse {
+pub struct CurationPackageResponse {
     pub id: Uuid,
     pub staging_repo_id: Uuid,
     pub remote_repo_id: Uuid,
@@ -327,13 +327,13 @@ async fn delete_rule(
     path = "/api/v1/curation/packages",
     operation_id = "list_curation_packages",
     params(PackageListQuery),
-    responses((status = 200, body = Vec<PackageResponse>)),
+    responses((status = 200, body = Vec<CurationPackageResponse>)),
     tag = "Curation"
 )]
 async fn list_packages(
     State(state): State<SharedState>,
     Query(query): Query<PackageListQuery>,
-) -> Result<Json<Vec<PackageResponse>>, AppError> {
+) -> Result<Json<Vec<CurationPackageResponse>>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let packages = svc
         .list_packages(
@@ -351,13 +351,13 @@ async fn list_packages(
     path = "/api/v1/curation/packages/{id}",
     operation_id = "get_curation_package",
     params(("id" = Uuid, Path, description = "Package ID")),
-    responses((status = 200, body = PackageResponse)),
+    responses((status = 200, body = CurationPackageResponse)),
     tag = "Curation"
 )]
 async fn get_package(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<PackageResponse>, AppError> {
+) -> Result<Json<CurationPackageResponse>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let pkg = svc.get_package(id).await?;
     Ok(Json(pkg_to_response(pkg)))
@@ -367,14 +367,14 @@ async fn get_package(
     post,
     path = "/api/v1/curation/packages/{id}/approve",
     params(("id" = Uuid, Path, description = "Package ID")),
-    responses((status = 200, body = PackageResponse)),
+    responses((status = 200, body = CurationPackageResponse)),
     tag = "Curation"
 )]
 async fn approve_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-) -> Result<Json<PackageResponse>, AppError> {
+) -> Result<Json<CurationPackageResponse>, AppError> {
     auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let pkg = svc
@@ -393,14 +393,14 @@ async fn approve_package(
     post,
     path = "/api/v1/curation/packages/{id}/block",
     params(("id" = Uuid, Path, description = "Package ID")),
-    responses((status = 200, body = PackageResponse)),
+    responses((status = 200, body = CurationPackageResponse)),
     tag = "Curation"
 )]
 async fn block_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-) -> Result<Json<PackageResponse>, AppError> {
+) -> Result<Json<CurationPackageResponse>, AppError> {
     auth.require_admin()?;
     let svc = CurationService::new(state.db.clone());
     let pkg = svc
@@ -512,8 +512,8 @@ fn rule_to_response(rule: crate::models::curation::CurationRule) -> RuleResponse
     }
 }
 
-fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> PackageResponse {
-    PackageResponse {
+fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> CurationPackageResponse {
+    CurationPackageResponse {
         id: pkg.id,
         staging_repo_id: pkg.staging_repo_id,
         remote_repo_id: pkg.remote_repo_id,

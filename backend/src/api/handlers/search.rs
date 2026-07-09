@@ -795,7 +795,7 @@ pub async fn recent(
 
 /// Response returned when a reindex is triggered.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ReindexResponse {
+pub struct SearchReindexResponse {
     pub status: String,
     pub message: String,
 }
@@ -811,11 +811,13 @@ pub struct ReindexResponse {
     tag = "admin",
     operation_id = "trigger_search_reindex",
     responses(
-        (status = 200, description = "Reindex started in background", body = ReindexResponse),
+        (status = 200, description = "Reindex started in background", body = SearchReindexResponse),
         (status = 500, description = "Search engine is not configured"),
     ),
 )]
-pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<ReindexResponse>> {
+pub async fn trigger_reindex(
+    State(state): State<SharedState>,
+) -> Result<Json<SearchReindexResponse>> {
     let search = state
         .search_service
         .as_ref()
@@ -836,7 +838,7 @@ pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<Re
         }
     });
 
-    Ok(Json(ReindexResponse {
+    Ok(Json(SearchReindexResponse {
         status: "started".to_string(),
         message: "Full reindex of artifacts and repositories triggered in background".to_string(),
     }))
@@ -863,7 +865,7 @@ pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<Re
         ChecksumArtifact,
         ChecksumSearchResponse,
         SuggestResponse,
-        ReindexResponse,
+        SearchReindexResponse,
     ))
 )]
 pub struct SearchApiDoc;
@@ -1296,12 +1298,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ReindexResponse serialization
+    // SearchReindexResponse serialization
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_reindex_response_serialization() {
-        let resp = ReindexResponse {
+        let resp = SearchReindexResponse {
             status: "started".to_string(),
             message: "Full reindex triggered".to_string(),
         };

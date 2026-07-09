@@ -302,11 +302,11 @@ pub struct ReportQuery {
 #[derive(Debug, Serialize)]
 pub struct ListResponse<T> {
     pub items: Vec<T>,
-    pub pagination: Option<PaginationInfo>,
+    pub pagination: Option<MigrationPaginationInfo>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PaginationInfo {
+pub struct MigrationPaginationInfo {
     pub page: i64,
     pub per_page: i64,
     pub total: i64,
@@ -1026,7 +1026,7 @@ async fn list_migrations(
     if !table_exists {
         return Ok(Json(ListResponse {
             items: vec![],
-            pagination: Some(PaginationInfo {
+            pagination: Some(MigrationPaginationInfo {
                 page: 1,
                 per_page: 20,
                 total: 0,
@@ -1079,7 +1079,7 @@ async fn list_migrations(
 
     Ok(Json(ListResponse {
         items: jobs.into_iter().map(Into::into).collect(),
-        pagination: Some(PaginationInfo {
+        pagination: Some(MigrationPaginationInfo {
             page,
             per_page,
             total: total.0,
@@ -1592,7 +1592,7 @@ async fn list_migration_items(
 
     Ok(Json(ListResponse {
         items: items.into_iter().map(Into::into).collect(),
-        pagination: Some(PaginationInfo {
+        pagination: Some(MigrationPaginationInfo {
             page,
             per_page,
             total: total.0,
@@ -2151,12 +2151,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PaginationInfo
+    // MigrationPaginationInfo
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_pagination_info() {
-        let page_info = PaginationInfo {
+        let page_info = MigrationPaginationInfo {
             page: 2,
             per_page: 20,
             total: 100,
@@ -3284,7 +3284,7 @@ mod tests {
         ConnectionTestResult,
         SourceRepository,
         CreateMigrationRequest,
-        PaginationInfo,
+        MigrationPaginationInfo,
         MigrationJobResponse,
         MigrationItemResponse,
         MigrationReportResponse,

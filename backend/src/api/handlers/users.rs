@@ -782,7 +782,7 @@ pub async fn revoke_role(
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateApiTokenRequest {
+pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
@@ -882,7 +882,7 @@ async fn list_user_tokens_inner(
     params(
         ("id" = Uuid, Path, description = "User ID"),
     ),
-    request_body = CreateApiTokenRequest,
+    request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
         (status = 403, description = "Cannot create tokens for other users"),
@@ -893,7 +893,7 @@ pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateApiTokenRequest>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
     auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
@@ -908,7 +908,7 @@ async fn create_api_token_inner(
     state: &SharedState,
     auth: &AuthExtension,
     id: Uuid,
-    payload: CreateApiTokenRequest,
+    payload: CreateUserApiTokenRequest,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Refuse admin-class scopes from non-admin callers. See
     // `token_service::ADMIN_ONLY_SCOPES` for the policy rationale —
@@ -1561,7 +1561,7 @@ pub async fn list_current_user_tokens(
     context_path = "/api/v1/users",
     tag = "users",
     operation_id = "create_current_user_api_token",
-    request_body = CreateApiTokenRequest,
+    request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
         (status = 403, description = "Requested scopes require administrator privileges"),
@@ -1571,7 +1571,7 @@ pub async fn list_current_user_tokens(
 pub async fn create_current_user_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(payload): Json<CreateApiTokenRequest>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     create_api_token_inner(&state, &auth, auth.user_id, payload).await
 }
@@ -1661,7 +1661,7 @@ pub async fn change_current_user_password(
         RoleResponse,
         RoleListResponse,
         AssignRoleRequest,
-        CreateApiTokenRequest,
+        CreateUserApiTokenRequest,
         ApiTokenResponse,
         ApiTokenCreatedResponse,
         ApiTokenListResponse,
@@ -2025,7 +2025,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_deserialize() {
         let json = r#"{"name":"CI token","scopes":["read","deploy"],"expires_in_days":90}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "CI token");
         assert_eq!(req.scopes, vec!["read", "deploy"]);
         assert_eq!(req.expires_in_days, Some(90));
@@ -2034,7 +2034,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_no_expiry() {
         let json = r#"{"name":"permanent","scopes":["*"]}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert!(req.expires_in_days.is_none());
     }
 
