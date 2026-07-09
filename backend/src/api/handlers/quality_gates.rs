@@ -608,9 +608,17 @@ async fn trigger_checks(
     path = "/checks",
     context_path = "/api/v1/quality",
     tag = "quality",
-    params(ListChecksQuery),
+    // Explicit params instead of `params(ListChecksQuery)`: the handler
+    // 400s without `artifact_id`, so the spec must declare it required
+    // (the struct field is `Option` only so the handler can return a clean
+    // validation error instead of an axum 422). `repository_id` is accepted
+    // but ignored, so it is intentionally not published.
+    params(
+        ("artifact_id" = Uuid, Query, description = "Artifact ID to list quality check results for"),
+    ),
     responses(
         (status = 200, description = "List of quality check results", body = Vec<CheckResponse>),
+        (status = 400, description = "Missing or invalid artifact_id", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]

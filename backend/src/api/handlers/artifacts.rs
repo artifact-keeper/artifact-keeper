@@ -12,6 +12,7 @@ use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::ArtifactResponse;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -84,21 +85,22 @@ pub fn router() -> Router<SharedState> {
         .merge(super::artifact_labels::artifact_labels_router())
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ArtifactResponse {
-    pub id: Uuid,
-    pub repository_id: Uuid,
-    pub repository_key: Option<String>,
-    pub path: String,
-    pub name: String,
-    pub version: Option<String>,
-    pub size_bytes: i64,
-    pub checksum_sha256: String,
-    pub checksum_md5: Option<String>,
-    pub checksum_sha1: Option<String>,
-    pub content_type: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+/// Row shape for the by-id artifact lookup.
+///
+/// Runtime `query_as` (not the compile-time macro) so the query needs no
+/// `.sqlx` offline entry; the columns mirror what
+/// [`ArtifactResponse`] needs.
+#[derive(Debug, sqlx::FromRow)]
+struct ArtifactByIdRow {
+    id: Uuid,
+    repository_key: String,
+    path: String,
+    name: String,
+    version: Option<String>,
+    size_bytes: i64,
+    checksum_sha256: String,
+    content_type: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -136,19 +138,14 @@ pub async fn get_artifact(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ArtifactResponse>> {
-    let artifact = sqlx::query!(
-        r#"
-        SELECT
-            a.id, a.repository_id, a.path, a.name, a.version, a.size_bytes,
-            a.checksum_sha256, a.checksum_md5, a.checksum_sha1,
-            a.content_type, a.created_at, a.updated_at,
-            r.key as repository_key
-        FROM artifacts a
-        JOIN repositories r ON r.id = a.repository_id
-        WHERE a.id = $1 AND a.is_deleted = false
-        "#,
-        id
+    let artifact: ArtifactByIdRow = sqlx::query_as(
+        "SELECT a.id, r.key AS repository_key, a.path, a.name, a.version, \
+                a.size_bytes, a.checksum_sha256, a.content_type, a.created_at \
+         FROM artifacts a \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 AND a.is_deleted = false",
     )
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
@@ -156,20 +153,40 @@ pub async fn get_artifact(
 
     check_artifact_visibility(&auth, id, &state.db).await?;
 
+    let download_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let metadata: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
     Ok(Json(ArtifactResponse {
         id: artifact.id,
-        repository_id: artifact.repository_id,
-        repository_key: Some(artifact.repository_key),
+        repository_key: artifact.repository_key,
         path: artifact.path,
         name: artifact.name,
         version: artifact.version,
         size_bytes: artifact.size_bytes,
         checksum_sha256: artifact.checksum_sha256,
-        checksum_md5: artifact.checksum_md5,
-        checksum_sha1: artifact.checksum_sha1,
         content_type: artifact.content_type,
+        download_count,
         created_at: artifact.created_at,
-        updated_at: artifact.updated_at,
+        metadata,
+        // This handler resolves a real `artifacts` row by id, so it is
+        // always a hosted artifact (analyzable), matching the by-path
+        // handler in repositories.rs.
+        analyzable: true,
+        // Proxy cache freshness is a Remote-repo, by-path concern; the
+        // by-id surface does not resolve through the proxy cache.
+        cache_cached_at: None,
+        cache_expires_at: None,
     }))
 }
 
@@ -286,7 +303,13 @@ pub async fn get_artifact_stats(
 #[derive(OpenApi)]
 #[openapi(
     paths(get_artifact, get_artifact_metadata, get_artifact_stats,),
-    components(schemas(ArtifactResponse, ArtifactMetadataResponse, ArtifactStatsResponse,))
+    // `ArtifactResponse` is intentionally NOT registered here: the canonical
+    // schema lives in repositories.rs (RepositoriesApiDoc). Registering a
+    // second struct under the same name used to shadow it (utoipa merge is
+    // first-wins on schema names) and published a stale shape for
+    // GET /api/v1/artifacts/{id}. See the schema-name-uniqueness regression
+    // test in openapi.rs.
+    components(schemas(ArtifactMetadataResponse, ArtifactStatsResponse,))
 )]
 pub struct ArtifactsApiDoc;
 
@@ -296,87 +319,109 @@ mod tests {
     use chrono::Utc;
 
     // ── ArtifactResponse serialization tests ────────────────────────
+    //
+    // The by-id endpoint now serves the canonical repositories.rs
+    // ArtifactResponse (the shape the published OpenAPI spec has always
+    // declared). These tests pin the on-the-wire contract of that shape as
+    // served by GET /api/v1/artifacts/{id}.
 
     #[test]
     fn test_artifact_response_serialization_all_fields() {
         let now = Utc::now();
         let id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
         let resp = ArtifactResponse {
             id,
-            repository_id: repo_id,
-            repository_key: Some("maven-releases".to_string()),
+            repository_key: "maven-releases".to_string(),
             path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
             name: "lib".to_string(),
             version: Some("1.0".to_string()),
             size_bytes: 102400,
             checksum_sha256: "abc123".to_string(),
-            checksum_md5: Some("def456".to_string()),
-            checksum_sha1: Some("ghi789".to_string()),
             content_type: "application/java-archive".to_string(),
+            download_count: 42,
             created_at: now,
-            updated_at: now,
+            metadata: Some(serde_json::json!({"groupId": "com.example"})),
+            analyzable: true,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], id.to_string());
-        assert_eq!(json["repository_id"], repo_id.to_string());
         assert_eq!(json["repository_key"], "maven-releases");
         assert_eq!(json["path"], "com/example/lib/1.0/lib-1.0.jar");
         assert_eq!(json["name"], "lib");
         assert_eq!(json["version"], "1.0");
         assert_eq!(json["size_bytes"], 102400);
         assert_eq!(json["checksum_sha256"], "abc123");
-        assert_eq!(json["checksum_md5"], "def456");
-        assert_eq!(json["checksum_sha1"], "ghi789");
         assert_eq!(json["content_type"], "application/java-archive");
+        // Spec-required fields the by-id endpoint previously omitted (#98).
+        assert_eq!(json["download_count"], 42);
+        assert_eq!(json["analyzable"], true);
+        assert_eq!(json["metadata"]["groupId"], "com.example");
     }
 
     #[test]
-    fn test_artifact_response_optional_fields_null() {
-        let now = Utc::now();
+    fn test_artifact_response_no_undeclared_fields() {
+        // The previous local ArtifactResponse leaked DB columns the spec
+        // never declared. Pin their absence on the serialized output.
         let resp = ArtifactResponse {
             id: Uuid::new_v4(),
-            repository_id: Uuid::new_v4(),
-            repository_key: None,
+            repository_key: "generic-local".to_string(),
             path: "file.tar.gz".to_string(),
             name: "file".to_string(),
             version: None,
             size_bytes: 0,
             checksum_sha256: "sha".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
             content_type: "application/octet-stream".to_string(),
-            created_at: now,
-            updated_at: now,
+            download_count: 0,
+            created_at: Utc::now(),
+            metadata: None,
+            analyzable: true,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json["repository_key"].is_null());
+        let obj = json.as_object().unwrap();
+        for undeclared in [
+            "repository_id",
+            "checksum_md5",
+            "checksum_sha1",
+            "updated_at",
+        ] {
+            assert!(
+                !obj.contains_key(undeclared),
+                "`{undeclared}` is not part of the published ArtifactResponse schema"
+            );
+        }
+        // Cache freshness fields are skip_serializing_if = None.
+        assert!(!obj.contains_key("cache_cached_at"));
+        assert!(!obj.contains_key("cache_expires_at"));
         assert!(json["version"].is_null());
-        assert!(json["checksum_md5"].is_null());
-        assert!(json["checksum_sha1"].is_null());
+        assert!(json["metadata"].is_null());
     }
 
     #[test]
     fn test_artifact_response_zero_size() {
-        let now = Utc::now();
         let resp = ArtifactResponse {
             id: Uuid::new_v4(),
-            repository_id: Uuid::new_v4(),
-            repository_key: None,
+            repository_key: "generic-local".to_string(),
             path: "empty".to_string(),
             name: "empty".to_string(),
             version: None,
             size_bytes: 0,
             checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 .to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
             content_type: "application/octet-stream".to_string(),
-            created_at: now,
-            updated_at: now,
+            download_count: 0,
+            created_at: Utc::now(),
+            metadata: None,
+            analyzable: false,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["size_bytes"], 0);
+        assert_eq!(json["analyzable"], false);
     }
 
     // ── ArtifactMetadataResponse serialization tests ────────────────
@@ -475,18 +520,19 @@ mod tests {
     fn test_artifact_response_debug_impl() {
         let resp = ArtifactResponse {
             id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            repository_key: None,
+            repository_key: "k".to_string(),
             path: "p".to_string(),
             name: "n".to_string(),
             version: None,
             size_bytes: 0,
             checksum_sha256: "s".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
             content_type: "t".to_string(),
+            download_count: 0,
             created_at: Utc::now(),
-            updated_at: Utc::now(),
+            metadata: None,
+            analyzable: true,
+            cache_cached_at: None,
+            cache_expires_at: None,
         };
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ArtifactResponse"));

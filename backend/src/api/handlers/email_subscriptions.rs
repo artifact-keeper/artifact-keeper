@@ -11,6 +11,7 @@
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     routing::{delete, get},
     Extension, Json, Router,
 };
@@ -358,7 +359,7 @@ pub async fn create_subscription(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Json(body): Json<CreateEmailSubscriptionRequest>,
-) -> Result<Json<EmailSubscriptionResponse>> {
+) -> Result<(StatusCode, Json<EmailSubscriptionResponse>)> {
     let (auth, repo_id) = authorize_subscription_repo(&state, auth, &key).await?;
 
     validate_event_types(&body.event_types)?;
@@ -399,7 +400,9 @@ pub async fn create_subscription(
     )
     .await;
 
-    Ok(Json(row.into()))
+    // 201 to match the published spec (`status = 201` above); the handler
+    // used to return a bare 200, which strict generated SDKs reject.
+    Ok((StatusCode::CREATED, Json(row.into())))
 }
 
 /// Delete an email subscription by id.

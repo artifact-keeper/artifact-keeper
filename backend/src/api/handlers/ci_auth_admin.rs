@@ -72,7 +72,10 @@ fn require_admin(auth: &AuthExtension) -> crate::error::Result<()> {
 
 #[utoipa::path(
     get,
-    path = "/",
+    // `""` (not `"/"`): the route is served at the bare collection path
+    // `/api/v1/admin/ci-oidc`; `path = "/"` published a trailing-slash URL
+    // that the router 404s. Mirrors lifecycle.rs.
+    path = "",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
     // Explicit id: the default (`list_providers`) collides with the SSO
@@ -120,7 +123,8 @@ pub async fn get_provider(
 
 #[utoipa::path(
     post,
-    path = "/",
+    // `""` (not `"/"`): see list_providers above.
+    path = "",
     context_path = "/api/v1/admin/ci-oidc",
     tag = "admin",
     security(("bearer_auth" = [])),
