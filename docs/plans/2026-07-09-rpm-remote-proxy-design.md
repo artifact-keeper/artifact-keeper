@@ -104,6 +104,39 @@ metadata-only.
   `release_repository_id`, reusing `ensure_promotion_authorized`/tenant checks **and the existing
   scan gates** (mirrored content must not bypass Grype/Dependency-Track).
 
+### 4a. Confirmed target workflow — Rocky 10, curate + AK-sign
+
+Operator confirmed (2026-07-09): mirror **BaseOS / AppStream / CRB / Extras / EPEL** — all
+**public** EL10 rebuild repos, so **no entitlement certs and P6 is not required for this
+deployment**. Workflow: **mirror → scan/approve (may hold back individual packages) → promote →
+serve internally, DNF-valid.**
+
+Decisions this locks in:
+
+- **Curate + AK-sign metadata.** Because approval can hold back individual packages, a promoted repo
+  may differ from upstream, so AK **regenerates** repomd/primary/filelists/other from the approved
+  set and signs with **AK's** key (served at the existing `/rpm/{repo}/repodata/repomd.xml.key`).
+  `repo_gpgcheck` then trusts AK's key; **package-level `gpgcheck` still validates each RPM against
+  Rocky's key** (unchanged). Clients import AK's repo key once.
+- **This overrides §5's "opaque carry-through" YAGNI for package-enumerating metadata.** Curation
+  *is* package filtering, which is incompatible with carrying `filelists`/`other` opaquely (dnf
+  cross-checks filelists against primary by pkgid). P2/P3 must **regenerate primary + filelists +
+  other** from the package set. `comps` (groups) and `updateinfo` (advisories) may still be carried
+  opaquely — an advisory referencing a held-back package simply won't resolve, which is acceptable.
+- **`immediate` (full) mirror is this track's default mode.** "Serve internally" must not depend on
+  reaching upstream at request time, and a full local mirror lets AK regenerate filelists/other
+  **from the stored RPM headers by reusing the existing hosted-repo metadata generation**
+  (`formats/rpm.rs` + the `filelists_xml_gz`/`primary_xml_gz` handlers) instead of writing a
+  from-scratch filelists parser. This **pulls P4's `immediate` mode forward** in this track and
+  makes P3 publish reuse hosted generation rather than opaque carry-through.
+- **Scale note.** A full EL10 BaseOS+AppStream+CRB+Extras+EPEL mirror is large (many GB, tens of
+  thousands of packages); the scan/approve step is a correspondingly large Grype/Dependency-Track
+  workload. Budget disk + scan time; prefer scanning at sync time so promotion gates read cached
+  results.
+
+Net effect on phases: this workflow completes at **P3 + P5**, with **P4 `immediate` mode brought in
+early**; **P1 remains the substrate**; **P6 is dropped** for this deployment.
+
 ---
 
 ## 5. Reuse-vs-rebuild & deliberate divergences
@@ -113,10 +146,13 @@ SSRF-aware client (no bespoke client permitted), `encryption.rs` for certs, prom
 `release_repository_id`/authz/scan-gates, `cluster_work` leases. **Rebuild:** none of the proxy
 stack. **Rename:** mirror sync table → `rpm_remote_sync_tasks`.
 
-**YAGNI v1 (skip):** `streamed` policy; bit-for-bit republish; parsing filelists/other/updateinfo/
-modules (opaque carry-through only → **no package filtering/sub-repos v1**); sqlite `_db`, drpm,
-zchunk *generation*; mirrorlist/metalink serving; shared Remotes; hosted-repo versioning;
-Distribution as a separate entity (use `active_publication_id`).
+**YAGNI v1 (skip):** `streamed` policy; bit-for-bit republish; sqlite `_db`, drpm, zchunk
+*generation*; mirrorlist/metalink serving; shared Remotes; hosted-repo versioning; Distribution as a
+separate entity (use `active_publication_id`). `comps`/`updateinfo`/`modules` carried opaquely.
+
+**Overridden by §4a (curate track):** primary/filelists/other are **regenerated** (not opaque),
+because curation requires package filtering; reuse the existing hosted-repo generation from local
+RPM headers under `immediate` mode.
 
 ---
 
