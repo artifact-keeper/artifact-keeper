@@ -10669,12 +10669,12 @@ mod tests {
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, None).is_ok(),
                 "{:?} with no members must be Ok",
-                &rt
+                rt
             );
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, Some(&[])).is_ok(),
                 "{:?} with empty members must be Ok",
-                &rt
+                rt
             );
         }
     }
@@ -11597,7 +11597,7 @@ mod tests {
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(repo_id)
-                .bind(format!("app/{}", &key))
+                .bind(format!("app/{}", key))
                 .bind("manifest")
                 .bind(16_i64)
                 .bind("f".repeat(64))
