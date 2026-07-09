@@ -1,295 +1,236 @@
-# Design: RPM/YUM Remote Mirroring & Promotion
+# Design: RPM/YUM Remote Mirroring & Promotion (re-baselined)
 
 **Date:** 2026-07-09
-**Status:** Approved (design) — Phase 1 ready for implementation planning
+**Status:** Approved (design, re-baselined against verified code) — Phase 1 ready for planning
 **Author:** Brandon Geraci (with Claude Code)
-**Scope:** Add Pulp-grade RPM/YUM mirroring and promotion to Artifact Keeper, delivered as a
-sequenced set of independently-shippable phases. This document specifies the **target
-architecture**, the **6-phase roadmap**, and **Phase 1** in implementation-ready detail.
-Phases 2–6 are specified at roadmap altitude and will each get their own design doc.
+
+> **Re-baseline note.** An earlier revision of this doc described a codebase that did not
+> match reality (it claimed `ProxyService` had zero callers, that `rpm.rs` bypassed the storage
+> abstraction via `FilesystemStorage`, that the migration tip was 048, and that a `sync_tasks`
+> table did not exist). A parallel accuracy + security + compliance review caught this. Every
+> "current state" claim below has now been **verified by direct file reads** (citations inline).
+> The headline correction: **Remote RPM pull-through already works** — the substrate this feature
+> was going to "build" is shipped. The real work is (a) a handful of RPM-specific proxy gaps and
+> (b) the genuinely net-new Pulp-grade sync/versioning/promotion layer, built on existing infra.
 
 ---
 
 ## 1. Motivation
 
-Artifact Keeper today serves RPMs only as a **hosted** (`Local`) repository: upload, download,
-on-demand `repodata` generation (repomd.xml / primary.xml / filelists.xml), and detached GPG
-signing. It cannot mirror an upstream OS/vendor repository (Rocky, Alma, EPEL, Fedora, RHEL),
-which is the capability Pulp and Artifactory/Nexus provide.
+Artifact Keeper can already **serve** hosted RPMs and **proxy** Remote RPM repos (pull-through).
+It cannot **mirror at Pulp grade**: sync upstream metadata into the DB for search, version the
+mirror, take point-in-time snapshots, schedule syncs, or promote mirrored content through
+staging→release with the existing scan gates. This effort adds those, reusing what exists.
 
-The goal is to let a `Remote` RPM repository **pull-through and/or fully sync** an upstream, make
-the mirrored content **searchable and versioned**, support **point-in-time snapshots**, run
-**scheduled syncs**, and **promote** mirrored content through staging→release stages.
-
-### Non-goals (this effort)
-- Mirroring non-RPM formats via this machinery (RPM-only tables in v1; generalize later if a
-  second synced format demands it).
-- Being a drop-in Pulp replacement. We deliberately diverge from Pulp where the cost is not
-  justified (see §5).
+Non-goals: mirroring non-RPM formats via this machinery (RPM-only tables in v1); being a Pulp
+drop-in. Deliberate divergences in §5.
 
 ---
 
-## 2. Existing building blocks (reuse inventory)
+## 2. Verified current state (what already works)
 
-Verified against the codebase; these are the assets Phase 1+ build on.
+All citations verified by direct read on branch `feat/rpm-remote-proxy` (migration tip **148**).
 
-| Asset | Location | Role in this design |
+| Capability | Status | Evidence |
 |---|---|---|
-| `ProxyService` | `backend/src/services/proxy_service.rs` | Generic pull-through: TTL, ETag revalidation, SHA-256 verification, storage-backed cache (`proxy-cache/{repo_key}/{path}` + `.__metadata__.json`), conditional HEAD. **Currently has zero callers.** Reuse + extend. |
-| `RepositoryType` enum | `backend/src/models/repository.rs` | `Local`, `Remote` (scaffolded/unwired), `Virtual`, `Staging`. `Remote` + `upstream_url` are the entry point. |
-| `Repository` fields | same | Already has `upstream_url`, `promotion_target_id`, `promotion_policy_id`, `quota_bytes`, `storage_backend`, `storage_path`. |
-| RPM handlers | `backend/src/api/handlers/rpm.rs` | Routes at `/rpm/{repo_key}/...`. **`download_package` reads the local `artifacts` table + `FilesystemStorage::new(...)` directly (lines ~536, ~678) — a storage-abstraction bypass that Phase 1 must fix.** |
-| RPM metadata structs | `backend/src/formats/rpm.rs` | repomd.xml / primary.xml generation structs. Reused by publish (P3). |
-| `SigningService` | `backend/src/services/signing_service.rs` | Detached `.asc` signing already shipped for hosted repos. Reused for publish (P3). |
-| `StorageService` | `backend/src/services/storage_service.rs` | fs/S3/GCS/Azure abstraction; `ProxyService` writes here. Content-addressed keys give free dedup. |
-| Promotion | `backend/src/api/handlers/promotion.rs`, `PromotionPolicyService` | `Staging`→`Local` copy-based promotion with policy gates + history. Extended (not rebuilt) in P5. |
-| Scheduler / job worker | `scheduler_service`, `migration_worker.rs` | In-process tick + job-table+worker pattern reused for sync (P2/P4). |
+| Remote RPM **repodata** pull-through | **Shipped** | `rpm.rs:118` `try_proxy_repodata` → `proxy_helpers::proxy_fetch_capped` (buffered, capped) for Remote repos. |
+| Remote RPM **package** pull-through | **Shipped** | `rpm.rs:747` `download_package` falls back to `proxy_helpers::try_remote_or_virtual_download` on local miss. |
+| **Streaming** (no full-body buffering) | **Shipped** | `proxy_helpers::proxy_fetch_streaming*` (`:538`) → `ProxyService::fetch_artifact_streaming`; `rpm.rs` `build_rpm_package_response` streams via `Body::from_stream(get_stream(...))` (#1608 "Core Invariant ①"). Storage via `state.storage_for_repo(...).get_stream(...)` — **no `FilesystemStorage` bypass exists.** |
+| Central **cache freshness** classifier | **Shipped** | `cache_classifier.rs` (Core Invariant ④, #1611): `classify(format, path) -> Mutability{Immutable\|Mutable{ttl}}`, pure `evaluate()`, `Freshness{Fresh,Stale,NegativeHit}`. Constants: `MUTABLE_DEFAULT_TTL_SECS=300`, `NEGATIVE_CACHE_TTL_SECS=45`, `STALE_IF_ERROR_GRACE_SECS=3600` (RFC 5861 stale-if-error already implemented). |
+| Cache **integrity on read** | **Shipped** | `ProxyService` stores + compares `checksum_sha256` on cache reads (`proxy_service.rs:835-852`) — detects on-disk corruption. |
+| **SSRF** URL validation | **Shipped (partial)** | `validation.rs:147` `validate_outbound_url` / `:319` `is_blocked_url` block loopback/link-local/private/metadata (169.254.169.254); wired into repo create/update (`repository_service.rs:92-109`). `http_client.rs:59` `base_client_builder` + `:129` `ssrf_redirect_policy` re-validate every redirect hop. **Gap: no connect-time resolved-IP check (DNS rebinding) — see §6.** |
+| Secrets **encryption at rest** | **Shipped** | `encryption.rs` (AES-256-GCM `CredentialEncryption`); precedent in `signing_service.rs`, `webhook_secret_crypto.rs`. Reuse for entitlement certs (P6). |
+| **Promotion** (Staging→release) + scan gates | **Shipped** | Release target = `repository_config` key `release_repository_id` (`promotion.rs:337-358`). Authz: `ensure_promotion_authorized` + admin-mintable `promote:artifacts` scope + `require_promotion_tenant_access` (`promotion.rs:432-564`). Scan gates: Grype/Dependency-Track (`grype_scanner.rs`, `dependency_track_service.rs`; migs 054–056 promotion_approvals/gates/rules, 121 block-unscanned, 143 repo_scan_failed). |
+| Cross-replica **singleton job lease** | **Shipped** | `cluster_work.rs:249` `try_acquire_scheduler_lease` + `scheduler_leases` table (mig 147). Reuse for scheduled sync (P4) and cross-replica single-flight. |
+| Background **sync worker** pattern | **Shipped (different domain)** | `sync_worker.rs` + `sync_tasks` table (mig 008) — **peer-mesh/edge replication** (`edge_node_id`/`artifact_id`), 10 callers. Pattern is reusable; **the table name is taken (§6).** |
+| Audit + telemetry infra | **Shipped** | `audit_log` (mig 005: user_id/action/resource_type/ip); `download_statistics` (mig 004: user_id/ip/user_agent). |
+
+**Bottom line:** Remote RPM pull-through, streaming, cache classification, stale-if-error,
+SSRF URL-string validation, secrets encryption, promotion, and cross-replica leasing all exist.
 
 ---
 
-## 3. Target architecture (end state)
+## 3. The real gaps
 
-### 3.1 Modes
+### RPM-proxy gaps (small, mostly Phase 1)
+1. **No `Rpm` arm in `cache_classifier::classify`** — RPM paths hit the conservative 300s mutable
+   default, so content-addressed `repodata/<sha256>-*.xml.gz`, `.rpm`, `.drpm`, `.zck` are
+   revalidated every 5 min instead of cached immutably. Add an arm: content-addressed/package
+   paths → `Immutable`; `repodata/repomd.xml`(+`.asc`) → `Mutable` (300s default is safe).
+2. **No HTTP `Range`/`206` passthrough** — verified absent in `proxy_service.rs` (only a
+   `validate_upstream_status` test references 206). Needed for zchunk chunk-deltas + `.rpm` resume.
+3. **No mirrorlist/metalink rejection** at repo creation — a mirrorlist/metalink `upstream_url`
+   must be rejected (proxy one concrete baseurl only).
+4. **No cache quota enforcement** — `Repository.quota_bytes` exists but is not enforced against
+   proxy-cache writes (unbounded growth risk — §6, security High).
+5. **DNS-rebinding connect-time gap** — see §6 (security High); affects the already-shipped proxy.
 
-A `Remote` RPM repository operates in one of three escalating modes (stored in `remote_configs`,
-introduced P2):
+### Pulp-grade gaps (net-new; build on existing infra)
+6. **Metadata sync into DB** for search/versioning (`RpmSyncService`, parse primary.xml).
+7. **Versions / snapshots / publications** (locally generated + AK-signed metadata).
+8. **Promotion of mirrored content** through the existing `release_repository_id` + scan-gate path.
+9. **GPG-verify-before-ingest/re-sign** — precondition for P2/P3 (§6, security High).
 
-| Mode | Metadata | Packages | Introduced |
-|---|---|---|---|
-| **passthrough** | not stored in DB; byte-exact cache | cached on GET | P1 |
-| **on_demand** | synced into DB (searchable) | fetched lazily on first GET, then persisted | P2 |
-| **immediate** | synced into DB | all downloaded at sync time | P4 |
+---
 
-Versioning, snapshots, and promotion sit **above** the on_demand/immediate tier. All mirrored
-blobs are **content-addressed** in storage (`content/rpm/{sha256[0..2]}/{sha256}.rpm`), so
-snapshots and promotion are metadata-only operations (no blob copies).
+## 4. Target architecture
 
-### 3.2 New data model (target)
+A `Remote` RPM repository gains three escalating modes (config in a new `remote_configs` row):
+**passthrough** (today's behavior, hardened), **on_demand** (metadata in DB, packages lazy),
+**immediate** (full mirror). Versioning/snapshots/promotion sit above on_demand/immediate.
+Mirrored blobs stay content-addressed in `StorageService`, so snapshots/promotion are
+metadata-only.
 
-Introduced across phases; listed here for the whole picture. Migrations start at `049`.
+### New data model (migrations start at **149**; verify with `ls backend/migrations | sort -V | tail`)
 
 | Table | Purpose | Phase |
 |---|---|---|
-| `remote_configs` | 1:1 typed remote config: `mode`, `metadata_ttl_secs`, `negative_ttl_secs`, `sync_schedule`, encrypted `client_cert`/`client_key`/`ca_cert`, `proxy_url`, `last_synced_at`. Not the k/v `repository_config` — certs need encryption. | P2 (cert cols P6) |
-| `rpm_packages` | Global, deduped content units: NEVRA, `checksum_sha256` (UNIQUE), `size_bytes`, `location_href`, `summary`, raw `<package>` primary.xml snippet, `storage_key` (NULL = not yet fetched). | P2 |
-| `repository_versions` | Monotonic point-in-time membership set per repo. | P3 |
-| `repository_version_packages` | `(version_id, package_id)` membership rows. | P3 |
-| `repo_metadata_files` | Opaque carry-through of non-primary repomd `<data>` entries (filelists/other/updateinfo/modules/comps): `data_type`, `checksum`, `open_checksum`, `storage_key`, `repomd_attrs` jsonb. | P3 |
-| `publications` | Self-consistent locally generated + signed metadata for one version: `repomd_xml`, `repomd_asc`. | P3 |
-| `sync_tasks` | Sync job rows (follows `migration_worker` pattern): `state`, timings, `error`, `stats` jsonb. | P2 |
-| `repositories.active_publication_id` (ALTER) | The "distribution pointer". Repointing it = atomic promote/rollback. | P3 |
+| `remote_configs` | 1:1 typed remote config: `mode`, TTL overrides, `sync_schedule`, **encrypted** `client_cert`/`client_key`/`ca_cert` (via `encryption.rs`), `proxy_url`, `trusted_gpg_key`, `last_synced_at`. | P2 (cert cols P6) |
+| `rpm_packages` | Global deduped content units: NEVRA, `checksum_sha256` UNIQUE, `location_href`, raw `<package>` snippet, `storage_key` (NULL=not fetched). | P2 |
+| `repository_versions` (+ `_packages`) | Monotonic point-in-time membership. | P3 |
+| `repo_metadata_files` | Opaque carry-through of non-primary repomd `<data>` (filelists/other/updateinfo/modules/comps). | P3 |
+| `publications` | Locally generated + AK-signed repomd/metadata for one version. | P3 |
+| **`rpm_remote_sync_tasks`** | Mirror sync jobs. **Renamed** to avoid colliding with the existing peer-mesh `sync_tasks` (mig 008). | P2 |
+| `repositories.active_publication_id` (ALTER) | Distribution pointer; repoint = atomic promote/rollback. | P3 |
 
-### 3.3 New/changed services (target)
-
-| Service | Status | Role |
-|---|---|---|
-| `ProxyService` | Extend | Streaming tee (upstream→client + cache), HTTP Range passthrough, negative cache, per-path TTL classes, single-flight dedup. |
-| `RpmSyncService` | New (P2) | Fetch repomd → stream-parse primary.xml → upsert `rpm_packages` → create `repository_version`; retry if repomd checksum changes mid-sync. |
-| `RpmPublishService` | New (P3) | Generate primary.xml from stored snippets, carry opaque metadata refs, build + sign repomd.xml. |
-| `PromotionService` / `PromotionPolicyService` | Extend (P5) | Promote a `repository_version` by reference into a target repo; reuse policy gates + history. |
-| `scheduler_service` | Extend (P4) | Sync tick: scan `sync_schedule`, enqueue `sync_tasks` under per-repo advisory lock. |
-| RPM handlers | Fix + extend (P1+) | Route through `StorageService`; dispatch on `repo_type`. |
-
-### 3.4 Request-path decision tree (Remote RPM repo, end state)
-1. `active_publication_id` set → serve locally generated repomd/primary + our `.asc`; `.rpm` from
-   `storage_key`, lazy-fetch via ProxyService if NULL.
-2. No publication (passthrough) → ProxyService byte-exact passthrough, incl. upstream
-   `repomd.xml.asc` and gpgkey (never rewrite bodies).
-3. Snapshot URL `/rpm/{repo_key}/@{version}/repodata/...` → serve the pinned publication forever.
+### Services (all extend existing, except two new)
+- `cache_classifier::classify` — **add `Rpm` arm** (P1).
+- `ProxyService` / `proxy_helpers` — **add Range/206 passthrough** and quota-aware cache writes (P1); reuse existing streaming + classifier + stale-if-error unchanged.
+- `http_client` — **add connect-time resolved-IP validation** (DNS-rebinding fix) to `base_client_builder` (P1).
+- `RpmSyncService` (**new**, P2) — fetch repomd, **verify `.asc` against `trusted_gpg_key`**, stream-parse primary.xml (with decompression cap), upsert `rpm_packages`, create a version.
+- `RpmPublishService` (**new**, P3) — generate + sign metadata via `SigningService`.
+- Scheduled sync (P4) — reuse `cluster_work::try_acquire_scheduler_lease` (not a new lock).
+- Promotion (P5) — extend `promotion.rs` to promote a **version by reference** into
+  `release_repository_id`, reusing `ensure_promotion_authorized`/tenant checks **and the existing
+  scan gates** (mirrored content must not bypass Grype/Dependency-Track).
 
 ---
 
-## 4. Reuse-vs-rebuild decisions
+## 5. Reuse-vs-rebuild & deliberate divergences
 
-| Decision | Call | Rationale |
-|---|---|---|
-| Lazy-fetch path | Reuse + extend `ProxyService` | TTL/ETag/SHA-256/cache logic already correct; only lacks streaming/Range/negative-cache. |
-| Remote config storage | New `remote_configs` (1:1) | Certs/schedules/TTLs are remote-specific and need encryption; keep `Repository` lean. Pulp's shared many-to-many Remote is YAGNI. |
-| Content units | New `rpm_packages` | `artifacts` is per-repo, path-centric, soft-delete — wrong shape for global deduped version-member units. |
-| Blob storage | Reuse `StorageService`, content-addressed keys | Already abstracts fs/S3/GCS/Azure; content addressing = free dedup + immutability. |
-| Metadata generation | Reuse `formats/rpm.rs` structs + raw-snippet republish | Storing raw `<package>` XML avoids lossless re-serialization bugs. |
-| Signing | Reuse `SigningService` | Detached repomd `.asc` already shipped. |
-| Promotion | Extend existing | Policy gates, history, endpoints, `promotion_target_id` exist; add a version-by-reference path. |
-| Scheduling/jobs | Reuse `scheduler_service` + `migration_worker` pattern | Proven in-process pattern; a Pulp-style task+resource-lock system is overkill. |
-| Distribution entity | Rebuild simpler: `active_publication_id` on Repository | Repo key already IS the serving URL in AK; a separate Distribution row adds indirection with no user value. |
+**Reuse:** `cache_classifier` (add arm, don't parallel it), `proxy_helpers` streaming, `http_client`
+SSRF-aware client (no bespoke client permitted), `encryption.rs` for certs, promotion's
+`release_repository_id`/authz/scan-gates, `cluster_work` leases. **Rebuild:** none of the proxy
+stack. **Rename:** mirror sync table → `rpm_remote_sync_tasks`.
+
+**YAGNI v1 (skip):** `streamed` policy; bit-for-bit republish; parsing filelists/other/updateinfo/
+modules (opaque carry-through only → **no package filtering/sub-repos v1**); sqlite `_db`, drpm,
+zchunk *generation*; mirrorlist/metalink serving; shared Remotes; hosted-repo versioning;
+Distribution as a separate entity (use `active_publication_id`).
 
 ---
 
-## 5. Deliberate divergences from Pulp (YAGNI v1)
+## 6. Security & compliance requirements (from parallel review — binding)
 
-| Pulp feature | Decision | Why |
-|---|---|---|
-| `streamed` policy | Skip | `on_demand` covers the use case. |
-| `mirror_complete` bit-for-bit | Skip (passthrough approximates) | Byte-exact republish needs upstream signatures we can't re-sign; passthrough already gives byte-exact. |
-| Parse filelists/other/updateinfo/modules/comps | Opaque carry-through only | Parsing primary.xml suffices for search/versioning; opaque blobs keep modularity/comps/errata working with zero parsing. **Consequence: no package filtering / sub-repos in v1** (filtered repos desync opaque filelists). |
-| sqlite `_db`, drpm/delta, zchunk generation | Skip | createrepo_c 1.0 dropped sqlite by default; dnf works without deltas; upstream `.zck` passes through (Range-aware). |
-| Mirrorlist/metalink serving or transparent resolution | Skip | Admin configures one concrete baseurl; validate at config time. |
-| Shared Remotes across repos; generic content-plugin framework | Skip | 1:1 config; RPM-only tables. Generalize when a 2nd synced format demands it. |
-| Versioning for hosted (`Local`) repos | Skip | Mirror versions solve the stated problem; hosted versioning is a separate feature. |
+These are design requirements, not optional hardening. Phase assignment noted.
 
----
+| # | Requirement | Severity | Phase |
+|---|---|---|---|
+| S1 | **DNS-rebinding:** validate the *resolved IP* at connect time (custom `reqwest` resolver/connector re-applying `is_blocked_url` logic), for initial request + every redirect. The Range/streaming change must route **only** through `base_client_builder()` — no new client. Add a test asserting connect-time IP checks. | High | **P1** |
+| S2 | **Cache quota:** enforce `Repository.quota_bytes` on proxy-cache writes (at minimum: stop caching + alert past quota, keep serving). Don't defer disk-exhaustion control to P4 GC. | High | **P1** |
+| S3 | **Content-addressed integrity:** when a fetched path embeds a hex checksum (createrepo unique-filename convention), verify SHA-256 of the body before caching it "immutable". | Medium | **P1** |
+| S4 | **GPG-verify-before-ingest:** `RpmSyncService` must verify `repomd.xml.asc` against a configured `trusted_gpg_key` before ingesting/parsing; without it, refuse publishable/re-signed mode or label the publication "unverified upstream". Prevents P3 AK-re-signing from laundering unverified content. | High | P2/P3 |
+| S5 | **Authz:** new `POST /sync`, `remote_configs` writes, and P6 cert upload need a global capability gate (admin or admin-mintable scope, e.g. `manage:remote-config`/`trigger:sync`) **plus** a non-admin-bypassing per-repo tenant check — mirroring `ensure_promotion_authorized` + `require_promotion_tenant_access`. | Medium | P2/P6 |
+| S6 | **Scan gates for mirrored promotion:** mirrored content promoted to a release repo must pass the same Grype/Dependency-Track gates as uploaded artifacts (decide sync-time vs promotion-time scanning; do not silently bypass). | High | P5 |
+| S7 | **Audit logging:** remote create/edit, sync trigger, cert upload, and mirrored-content promotion write `audit_log` entries (actor/action/resource). | Medium | P2/P5/P6 |
+| S8 | **Cert handling:** reuse `encryption.rs` AES-256-GCM (no new scheme); redacting newtype so `{:?}` can't leak key material; test that logs never contain raw cert bytes. | Medium | P6 |
+| S9 | **Negative-cache tuning:** reuse the existing 45s `NEGATIVE_CACHE_TTL_SECS` convention (the earlier draft's 1800s was wrong); exempt `repomd.xml`(+`.asc`) from negative caching (already revalidated). | Medium | P1 |
+| S10 | **Decompression cap:** P2 primary.xml.gz parsing must cap decompressed size / use a bounded decompressor. | Medium | P2 |
+| S11 | **Single-flight across replicas:** in-process coalescing only dedupes per process; for multi-replica, consider the `scheduler_leases`/advisory-lock pattern, or document the bounded N-fetch tradeoff. | Medium | P1 (doc) / P4 |
+| S12 | **Secrets hygiene:** forbid credentials embedded in `upstream_url`/`proxy_url`; size-cap + redact any upstream response data persisted to `rpm_remote_sync_tasks.error`/`stats`. | Medium | P2/P6 |
+| C1 | **RHEL redistribution (P6):** explicit operator-vs-software responsibility statement + on-screen notice at entitlement-cert config; gate P6 on legal-counsel review, not engineering. | Medium | P6 |
+| C2 | **Trust-model doc (P3):** document that once a publication exists, `repo_gpgcheck` validates AK's key (operators must distribute it); package-level signatures remain the vendor's; package integrity enforced via checksum vs upstream primary.xml. | Medium | P3 |
 
-## 6. Phased roadmap
-
-Each phase is independently shippable and demoable.
-
-### P1 — Pull-through (thin vertical slice) — *specified in §7*
-Wire `ProxyService` into the Remote RPM path; fix the `StorageService` seam; add streaming tee,
-Range passthrough, negative cache, TTL classes.
-**Done =** `dnf install` works against AK proxying Rocky 9; 2nd install from cache; upstream
-`.asc` byte-exact so `repo_gpgcheck=1` works; hosted RPM repos provably unaffected.
-
-### P2 — Remote config + metadata sync + search (on_demand)
-`remote_configs` (cert cols present, unused), `rpm_packages`, `sync_tasks`, `RpmSyncService`
-(manual `POST /sync`), package search API; lazy downloads record `storage_key`.
-**Done =** sync EPEL → ~20k packages searchable via API in minutes; dnf unaffected.
-Risks: stream-parse ~200MB primary.xml; bulk-upsert throughput; repomd changing mid-sync.
-
-### P3 — Versions, publications, snapshots
-`repository_versions` + membership, `repo_metadata_files` (opaque carry-through), `publications`,
-`RpmPublishService` + GPG signing, `active_publication_id`, snapshot serving at `/@{version}/`.
-**Done =** create version N, publish, point dnf at `/rpm/epel/@N/`, identical resolvable content
-a month later.
-Risks: repomd generation fidelity (dnf is unforgiving about checksum/open-checksum mismatch);
-snapshot URL routing vs hosted routes.
-
-### P4 — Scheduled sync, immediate policy, GC
-Scheduler tick reading `sync_schedule` under per-repo advisory lock; `immediate` bulk-download
-with concurrency + resume; version retention; orphan-blob GC; quota accounting; **offline mode
-toggle** (Nexus-style cache-only serving).
-**Done =** nightly EPEL full mirror; old versions pruned; GC reclaims orphans without racing
-in-flight lazy fetches.
-Risks: GC-vs-lazy-fetch race; disk growth; long syncs vs deploy restarts (resumable tasks).
-
-### P5 — Promotion of mirrored versions
-Extend promote endpoint/policy: source Staging-or-Remote repo version → target gets new version
-with membership copied by reference + auto-publish + re-sign; history records version ids;
-rollback = repoint `active_publication_id`.
-**Done =** `promote {version: 12}` from `rocky-staging` to `rocky-prod`; clients on the prod URL
-atomically see new signed metadata; one-call rollback.
-Risks: current policy gates assume source=Staging/target=Local — needs a mirrored-content variant;
-per-stage GPG key expectations.
-
-### P6 — RHEL CDN & authenticated upstreams
-Wire encrypted `client_cert`/`client_key`/`ca_cert` into ProxyService + sync HTTP client (reqwest
-identity); entitlement-cert upload UX; validation ping.
-**Done =** sync RHEL 9 BaseOS via entitlement certs; certs stored encrypted, never logged.
-Risks: cert/entitlement lifecycle (expiry alerting); Red Hat T&C compliance is the maintainer's
-call, not a technical one.
-
-### The three hardest problems in the whole effort
-1. **Streaming tee through ProxyService** — feed client + cache simultaneously, honor Range,
-   dedupe concurrent misses, without buffering multi-GB rpms. Changes the current `Bytes` return
-   type, touching every caller. (Starts in P1.)
-2. **Sync consistency at scale** — a `repository_version` must be coherent even when upstream
-   republishes `repomd.xml` mid-sync (recheck/retry loop) with transactional bulk membership
-   writes that don't lock the serving path. (P2/P3.)
-3. **GC of shared content-addressed blobs** — refcounts span repos, versions, snapshots, and
-   in-flight lazy fetches; a wrong delete breaks a "permanent" snapshot. (P4.)
+**P1 verdict from review:** safe to proceed **provided S1, S2, S3, S9 (and S11 as a documented
+note) are in the Phase-1 spec.** S4/S6/C1/C2 are the load-bearing items for later phases.
 
 ---
 
-## 7. Phase 1 — implementation-ready specification
+## 7. Revised phased roadmap
 
-### 7.1 Objective
-A `Remote` RPM repository transparently pull-through caches a **public** upstream over HTTPS.
-Byte-exact passthrough (including GPG artifacts). No DB metadata, no versioning, no auth.
+- **P1 — RPM proxy hardening (thin slice).** `Rpm` arm in `cache_classifier`; Range/206 passthrough
+  through `base_client_builder`; mirrorlist/metalink rejection at repo create; **S1 DNS-rebind
+  connect-time check, S2 quota enforcement, S3 content-addressed checksum verify, S9 negative-cache
+  reuse**. No new tables.
+  **Done =** `dnf install` against a Remote repo mirroring Rocky 9 works with `repo_gpgcheck=1`;
+  content-addressed files served immutably from cache (no needless revalidation); a rebinding test
+  and a quota test pass; existing hosted + other-format proxy behavior unchanged.
+- **P2 — Sync + search (on_demand).** `remote_configs`, `rpm_packages`, `rpm_remote_sync_tasks`,
+  `RpmSyncService` (manual `POST /sync`), package search; **S4 GPG-verify, S5 authz, S7 audit, S10
+  decompression cap, S12 hygiene.** Done = sync EPEL → ~20k searchable packages; dnf unaffected.
+- **P3 — Versions, publications, snapshots.** `repository_versions`(+members), `repo_metadata_files`,
+  `publications`, `RpmPublishService` + signing, `active_publication_id`, `/@{version}/` serving;
+  **C2 trust-model doc.** Done = pin `/rpm/epel/@N/`, identical resolvable content later.
+- **P4 — Scheduled sync, immediate policy, GC.** Reuse `try_acquire_scheduler_lease`; `immediate`
+  bulk download; version retention; orphan-blob GC; offline mode. Done = nightly mirror; GC safe.
+- **P5 — Promote mirrored versions.** Extend promotion to promote a version by reference into
+  `release_repository_id`; **S6 scan gates apply**; rollback = repoint `active_publication_id`.
+- **P6 — RHEL / authed upstreams.** Encrypted certs via `encryption.rs`; **S8 handling, C1 legal
+  gate.** Done = sync RHEL 9 via entitlement certs, encrypted, never logged.
 
-### 7.2 Components & changes
-
-**A. Request-path dispatch — `backend/src/api/handlers/rpm.rs`**
-- In `download_package` (and the `repodata/*` GET handlers), branch on `repo.repo_type`:
-  - `Local` → existing DB + storage path, **unchanged** (must be behaviorally invisible).
-  - `Remote` → `ProxyService`, proxying the same relative path to
-    `{upstream_url}/{path}`.
-- For a `Remote` repo, a single catch-all proxy covers **both** packages and `repodata/*`
-  uniformly (dnf just issues GETs), including `repomd.xml`, `repomd.xml.asc`, and the
-  checksum-named metadata files.
-
-**B. Storage-seam fix**
-- The `Remote` path uses `StorageService` (where `ProxyService` writes its cache), not the direct
-  `FilesystemStorage::new(&repo.storage_path)` bypass at `rpm.rs:~536/~678`. The `Local` path may
-  remain as-is in P1 (scoped change), but the Remote path must not use the bypass.
-
-**C. `ProxyService` extensions — `backend/src/services/proxy_service.rs`**
-1. **Streaming tee** — replace the buffer-whole-body `fetch_artifact -> (Bytes, ...)` with a
-   streaming response that writes to the cache and streams to the client concurrently. Multi-GB
-   rpms must not be fully buffered in memory. (Keep a buffered path only for small metadata if
-   simpler, but packages must stream.)
-2. **HTTP Range passthrough** — forward `Range` and relay `206 Partial Content` (+ `Content-Range`,
-   `Accept-Ranges`). Required for zchunk and interrupted-download resume. Ranged responses are
-   **not** cached in P1 (only full 200s populate the cache).
-3. **Negative cache** — persist upstream `404`s with `negative_ttl_secs` (default 1800s) to avoid
-   hammering upstream on repeated misses.
-4. **Single-flight** — coalesce concurrent cache-miss fetches for the same path (in-process lock
-   keyed by cache key) to prevent thundering-herd on cold cache.
-
-**D. TTL classes** (classify by request path; P1 stores config in `repository_config` k/v):
-
-| Path pattern | Behavior |
-|---|---|
-| `repodata/repomd.xml`, `repodata/repomd.xml.asc` | TTL `metadata_ttl_secs` (default **600s**); always revalidate via existing ETag conditional GET. |
-| `repodata/<anything-else>` (checksum-named `*.xml.gz`/`.zck`) | Immutable — cache indefinitely. |
-| `*.rpm`, `*.drpm` | Immutable — cache indefinitely. |
-| upstream 404 | Negative cache, `negative_ttl_secs` (default **1800s**). |
-
-**E. Repo-creation validation — `repository_service`**
-- `Remote` + RPM already requires `upstream_url`. Add: reject a `upstream_url` that looks like a
-  mirrorlist/metalink endpoint (heuristic: path contains `mirrorlist`/`metalink`, or query has
-  `release=`/`repo=` typical of metalink) with a clear error directing the admin to a concrete
-  baseurl. Resolving mirrorlist/metalink is explicitly out of scope.
-
-### 7.3 Behavior decisions (Phase 1 defaults)
-- **Byte-exact:** never rewrite response bodies. `repomd.xml.asc` and `gpgkey` pass through
-  untouched so `repo_gpgcheck=1` / `gpgcheck=1` work against the **upstream's** key.
-- **Offline mode:** no dedicated toggle in P1. Cached content is served whenever present; on a
-  cache miss with upstream unreachable, return the upstream error. (Toggle arrives P4.)
-- **E2E target:** Rocky Linux 9 BaseOS (public, plain HTTPS, no certs).
-- **Config location:** TTLs in the existing `repository_config` k/v table; typed `remote_configs`
-  arrives in P2.
-
-### 7.4 Error handling
-- Upstream `404` → `404` to client (+ negative cache).
-- Upstream `5xx`/timeout on cache miss → `502 Bad Gateway` with upstream status in the message; do
-  **not** poison the cache.
-- Cache write failure → still stream to client (serving the client takes priority over caching);
-  log a warning.
-- Checksum mismatch on a cached content-addressed file → treat as cache miss, re-fetch.
-
-### 7.5 Testing
-- **Unit:** path→TTL-class classification; mirrorlist/metalink rejection heuristic; negative-cache
-  expiry; single-flight coalescing.
-- **Integration:** `Remote` RPM repo → mock upstream; assert byte-exact passthrough of
-  `repomd.xml.asc`; assert immutable files cached and served from cache on 2nd request; assert
-  Range request relays `206`; assert `Local` RPM repos are unchanged (regression).
-- **E2E** (`scripts/native-tests/`): create a `Remote` repo pointing at Rocky 9 BaseOS; run
-  `dnf --disablerepo=* --enablerepo=<ak> install <small pkg>` with `repo_gpgcheck=1`; assert
-  success; second install served from cache (assert no upstream hit via proxy logs/metrics).
-- Must pass Tier-1 CI: `cargo fmt --check`, `cargo clippy --workspace`, `cargo test --workspace --lib`.
-
-### 7.6 Out of scope for Phase 1 (explicit)
-DB metadata sync, `rpm_packages`, search, versioning, publications, snapshots, scheduled sync,
-`immediate`/`on_demand` modes, promotion, upstream auth / entitlement certs, offline-mode toggle,
-mirrorlist/metalink resolution, non-RPM formats.
-
-### 7.7 Phase 1 risks
-- Streaming refactor changes the `ProxyService` return type — audit for future callers and keep the
-  change self-contained.
-- Memory blowups if streaming is fudged for large rpms (explicit test with a large artifact).
-- Route-precedence between the Remote catch-all and existing hosted RPM routes — verify hosted
-  repos are untouched.
+**Three hardest problems (revised):** (1) DNS-rebind-safe streaming client without regressing the
+shipped SSRF controls; (2) sync consistency when upstream republishes repomd mid-sync + GPG-verify;
+(3) GC of shared content-addressed blobs vs in-flight lazy fetches and pinned snapshots.
 
 ---
 
-## 8. Rollout & workflow notes
-- All work via feature branches + PRs (never push to main); squash-merge after CI.
-- No Docker builds on cloud instances; E2E runs locally or in GitHub Actions.
-- Each phase ships behind its own PR with the "Done =" criterion demonstrably met.
-- **CI merge gates (mandatory, per CLAUDE.md):** `cargo clippy --workspace --all-targets -- -D warnings`,
-  unit tests, **≥70% coverage on new/changed lines**, **≤3% duplication (jscpd) on changed files**,
-  security audit, CodeQL — all green; no `--admin` bypass. Implication for design: extract testable
-  logic (TTL classification, mirrorlist/metalink rejection, negative-cache expiry, single-flight)
-  into **pure helper functions** so handler code is coverable, and factor the cache read/write
-  patterns into shared helpers to stay under the duplication gate.
-- Check migration numbering before adding migrations (`ls backend/migrations/ | tail -5`); target is
-  `049+` (current tip is `048`).
+## 8. Phase 1 — implementation-ready specification
+
+### 8.1 Objective
+Harden the **existing** Remote RPM passthrough: correct cache classification, add Range support,
+reject non-baseurl upstreams, and close the S1/S2/S3/S9 review findings. Public HTTPS upstreams
+only; no auth, no DB metadata, no versioning.
+
+### 8.2 Work items
+1. **`cache_classifier::classify` — add `Rpm` arm** (pure fn; table-tested for jscpd/coverage):
+   - `repodata/repomd.xml`, `repodata/repomd.xml.asc` → `Mutable{300}` (safe default; revalidated).
+   - `repodata/<hex>-*` (content-addressed) and `*.rpm`/`*.drpm`/`*.zck` → `Immutable`.
+   - Everything else under the repo → conservative `Mutable` default.
+2. **Range/206 passthrough** in the proxy fetch path: forward `Range`, relay `206`/`Content-Range`/
+   `Accept-Ranges`; do **not** cache partial responses (only full 200s populate cache). Must use
+   `base_client_builder()` (S1).
+3. **DNS-rebinding connect-time check (S1):** add a custom resolver/connector to
+   `base_client_builder` that re-applies `is_blocked_url`-equivalent logic to the **resolved IP**,
+   for initial + redirect hops. Test: hostname resolving to 169.254.169.254 is refused at connect.
+4. **Quota enforcement (S2):** before a proxy-cache write, check `Repository.quota_bytes`; past
+   quota, skip the cache write (still stream to client) and emit a warning/metric.
+5. **Content-addressed integrity (S3):** when the path embeds a hex checksum, verify body SHA-256
+   before caching immutable; mismatch → serve but refuse to cache (treat as miss).
+6. **Mirrorlist/metalink rejection:** in `repository_service` repo create/update validation for
+   Remote+RPM, reject an `upstream_url` whose path/query indicates mirrorlist/metalink, with a
+   clear error pointing to a concrete baseurl.
+7. **Negative-cache (S9):** confirm RPM uses the shared 45s `NEGATIVE_CACHE_TTL_SECS`; exempt
+   `repomd.xml`(+`.asc`) from negative caching.
+
+### 8.3 Error handling
+Upstream 404 → 404 (+ short negative cache, except repomd). Upstream 5xx/timeout on miss → 502;
+existing `STALE_IF_ERROR_GRACE_SECS` stale-if-error path continues to serve a still-held mutable
+body. Cache-write failure → still stream to client (existing self-healing). Checksum mismatch → S3.
+
+### 8.4 Testing
+- **Unit (pure fns):** `Rpm` classify arm (table test: repomd vs content-addressed vs pkg);
+  mirrorlist/metalink rejection; S3 checksum-in-path verification; S2 quota decision.
+- **Integration:** Remote RPM repo vs mock upstream — immutable file served from cache without
+  revalidation; repomd revalidated; Range → 206 relayed; **S1 rebinding refused at connect**;
+  hosted + other-format proxy paths unchanged (regression).
+- **E2E** (`scripts/native-tests/`): Remote repo → Rocky 9 BaseOS; `dnf install` with
+  `repo_gpgcheck=1`; 2nd install from cache (assert no upstream hit).
+- **CI gates (must pass):** `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D
+  warnings`; `cargo test --workspace --lib`; ≥70% coverage on changed lines; ≤3% jscpd duplication.
+
+### 8.5 Out of scope for P1
+DB metadata sync, `rpm_packages`, search, versions, publications, snapshots, scheduled sync,
+on_demand/immediate modes, promotion, upstream auth/certs, offline-mode toggle, mirrorlist
+resolution, non-RPM formats.
+
+### 8.6 Phase 1 risks
+Touching `base_client_builder`/the shared fetch path affects **all** formats — regression tests for
+maven/pypi/etc. proxy paths are mandatory. The DNS-rebind resolver must not break normal resolution
+or add latency. Keep the classifier arm a pure function to satisfy coverage/duplication gates.
+
+---
+
+## 9. Rollout & workflow
+- Feature branches + PRs (never push to main); squash-merge after CI; each phase = its own PR with
+  its "Done =" met. No Docker builds on cloud. Verify migration numbering before adding (tip 148).
+- Before P2/P5/P6 sub-design-docs are written, resolve their binding review items (S4/S6/C1/C2).
