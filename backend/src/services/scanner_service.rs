@@ -1038,7 +1038,7 @@ pub(crate) async fn fail_scan(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
-    AppError::Internal(msg)
+    preserve_engine_unavailable(error, msg)
 }
 
 /// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
@@ -1053,7 +1053,23 @@ pub(crate) async fn fail_scan_path(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup_path(workspace).await;
-    AppError::Internal(msg)
+    preserve_engine_unavailable(error, msg)
+}
+
+/// Map a wrapped scanner error to the [`AppError`] the orchestrator should act
+/// on. A `ScannerEngineUnavailable` (the trivy CLI is intentionally absent,
+/// #2059, so both server + standalone modes spawn-fail with NotFound) is kept
+/// as `ScannerEngineUnavailable` — with its clean inner reason — so the
+/// orchestrator records `not_applicable` instead of failing the scan closed to
+/// grade F. Every other error stays `Internal` -> `failed` (fail-closed). The
+/// verbose `msg` was already logged by the caller for operators.
+fn preserve_engine_unavailable(error: &AppError, msg: String) -> AppError {
+    match error {
+        AppError::ScannerEngineUnavailable(reason) => {
+            AppError::ScannerEngineUnavailable(reason.clone())
+        }
+        _ => AppError::Internal(msg),
+    }
 }
 
 /// Convert a Trivy report into `RawFinding` values. Shared by all scanners
@@ -1861,6 +1877,45 @@ pub(crate) async fn cached_trivy_cli_version(cell: &VersionCache) -> Option<Stri
         format_trivy_version(&raw)
     })
     .await
+}
+
+/// Classify a spawn failure from the `trivy` CLI into an [`AppError`].
+///
+/// Twin of `classify_grype_spawn_error` (grype_scanner.rs), but the
+/// binary-missing case is routed differently. The hardened runtime image
+/// deliberately ships **no** `trivy` CLI: container-image scans go through the
+/// Harbor scanner-adapter over HTTP (`TRIVY_ADAPTER_URL`), and dropping the
+/// binary removed its CVE surface and ~180 MB. The filesystem and incus
+/// scanners, however, invoke `trivy filesystem` locally — even in `--server`
+/// mode the trivy *client* walks the on-disk workspace and only forwards the
+/// discovered package set to `TRIVY_URL`; a remote server cannot scan a
+/// workspace that lives on the backend, so there is no HTTP fallback for them.
+///
+/// A missing `trivy` binary is therefore an availability state, not a scan
+/// error: the kernel returns `io::ErrorKind::NotFound` from the spawn when
+/// `execve()` cannot resolve `trivy` on `PATH`. We surface that as
+/// [`AppError::ScannerEngineUnavailable`] so the orchestrator records a
+/// terminal `not_applicable` row (the bundled grype still scans the same
+/// artifacts via `dir:` mode) instead of `failed`, which would floor the
+/// repository to grade F under fail-closed scoring. Any OTHER spawn failure
+/// (permission denied, fork failure) is a real problem and stays a hard
+/// `Internal` error, keeping the fail-closed contract for genuine breakage.
+///
+/// Pure helper so the classification is unit-testable without depending on
+/// whether `trivy` happens to be installed on the test host.
+pub(crate) fn classify_trivy_spawn_error(err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::ScannerEngineUnavailable(
+            "Trivy CLI not available (the `trivy` executable was not found on \
+             PATH). The runtime image scans container images through the \
+             scanner-adapter over HTTP and does not bundle the trivy CLI, so \
+             the filesystem/incus scanners cannot run here; grype covers these \
+             artifacts instead."
+                .to_string(),
+        )
+    } else {
+        AppError::Internal(format!("Failed to execute Trivy CLI: {}", err))
+    }
 }
 
 /// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
@@ -2789,7 +2844,12 @@ impl ScannerService {
             )));
         }
 
-        // Grype scanner (CLI-based, degrades gracefully if binary not available)
+        // Grype scanner (CLI-based). Unlike the trivy filesystem/incus scanners
+        // — whose engine is optional and, when absent, yields `not_applicable`
+        // via `classify_trivy_spawn_error` — grype is bundled in the runtime
+        // image and intentionally stays fail-closed: a missing grype binary is
+        // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
+        // for an image that somehow ships no scanner engine at all.
         info!("Grype scanner enabled");
         let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
         // Wire the per-repo token minter so grype's registry pull is
@@ -3439,6 +3499,39 @@ impl ScannerService {
 
                     // Update quarantine status
                     self.update_quarantine_status(artifact_id, total).await?;
+                }
+                Err(AppError::ScannerEngineUnavailable(reason)) => {
+                    // #2059 dropped the trivy CLI from the runtime image (image
+                    // scans moved to the Harbor scanner-adapter over HTTP), but
+                    // the filesystem/incus scanners spawn `trivy` directly and
+                    // there is no HTTP equivalent for a workspace that lives on
+                    // the backend, so on this image they cannot run at all.
+                    // `classify_trivy_spawn_error` surfaced the missing binary as
+                    // `ScannerEngineUnavailable`: an intentionally-absent optional
+                    // engine is an availability state, not a scan error. Record
+                    // the same terminal `not_applicable` row the format gate uses
+                    // (the bundled grype still scans these artifacts via `dir:`
+                    // mode) so the artifact stays scanned-OK (#1648) and the repo
+                    // is not floored to grade F by fail-closed scoring
+                    // (#2167/#2240). Genuine scan failures (unreachable server,
+                    // malformed output) are NOT `NotFound` and fall through to the
+                    // fail-closed arm below.
+                    info!(
+                        "Scanner {} engine unavailable for artifact {}: {}; recording not_applicable",
+                        scanner.name(),
+                        artifact_id,
+                        reason,
+                    );
+                    if let Err(mark_err) = self
+                        .scan_result_service
+                        .mark_not_applicable(scan_result.id, &reason, started_at)
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark scan {} not_applicable (engine unavailable): {}",
+                            scan_result.id, mark_err
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -5251,6 +5344,62 @@ mod tests {
         }
         let s = DummyScanner;
         assert_eq!(s.version().await, None);
+    }
+
+    /// A missing `trivy` binary (the hardened image ships none) surfaces
+    /// from the spawn as `io::ErrorKind::NotFound`, which must classify as
+    /// `ScannerEngineUnavailable` so the orchestrator records `not_applicable`
+    /// (grype covers the artifact) rather than failing the scan closed. Pure —
+    /// no dependency on whether `trivy` is installed on the test host.
+    #[test]
+    fn test_classify_trivy_spawn_error_notfound_is_engine_unavailable() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        match classify_trivy_spawn_error(&io_err) {
+            AppError::ScannerEngineUnavailable(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("trivy"),
+                    "message should name the trivy CLI: {msg}"
+                );
+            }
+            other => panic!("NotFound must map to ScannerEngineUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Any OTHER spawn failure (e.g. permission denied) is a genuine
+    /// problem and must stay a hard `Internal` error -> `failed`, preserving
+    /// the fail-closed contract for real breakage.
+    #[test]
+    fn test_classify_trivy_spawn_error_other_stays_hard_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        match classify_trivy_spawn_error(&io_err) {
+            AppError::Internal(_) => {}
+            other => panic!("non-NotFound spawn failure must stay Internal, got {other:?}"),
+        }
+    }
+
+    /// The `fail_scan` / `fail_scan_path` wrappers must NOT flatten a
+    /// `ScannerEngineUnavailable` to `Internal` — otherwise the trivy CLI
+    /// absence surfaces as `failed` (grade F) instead of `not_applicable`.
+    /// (The live path wraps the error through these helpers after both server
+    /// and standalone modes spawn-fail with NotFound.)
+    #[test]
+    fn test_preserve_engine_unavailable_keeps_variant() {
+        let eu = AppError::ScannerEngineUnavailable("trivy CLI not available".into());
+        match preserve_engine_unavailable(&eu, "Trivy filesystem scan failed for app: x".into()) {
+            AppError::ScannerEngineUnavailable(reason) => {
+                assert_eq!(
+                    reason, "trivy CLI not available",
+                    "keeps the clean inner reason"
+                );
+            }
+            other => panic!("engine-unavailable must be preserved, got {other:?}"),
+        }
+        // A genuine error still flattens to Internal -> failed (fail-closed).
+        let boom = AppError::Internal("connection refused".into());
+        assert!(matches!(
+            preserve_engine_unavailable(&boom, "wrapped".into()),
+            AppError::Internal(_)
+        ));
     }
 
     /// Exercise the success path of `capture_cli_version_with_timeout`:
@@ -11924,6 +12073,136 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("does not apply"),
+            "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// A scanner that IS applicable but whose backing engine is absent: its
+    /// `scan` returns `ScannerEngineUnavailable`, exactly as
+    /// `classify_trivy_spawn_error` does when the `trivy` CLI is missing from
+    /// the hardened runtime image. Drives the dispatch branch that records
+    /// a terminal `not_applicable` row (grype still covers the artifact) rather
+    /// than `failed`.
+    struct EngineUnavailableScanner;
+
+    #[async_trait]
+    impl Scanner for EngineUnavailableScanner {
+        fn name(&self) -> &str {
+            "engine-unavailable"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Allowed by scan_results_scan_type_check; the orchestrator persists
+            // a row with this scan_type.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            Err(AppError::ScannerEngineUnavailable(
+                "Trivy CLI not available (the `trivy` executable was not found on PATH)"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Regression: when an *applicable* scanner's engine is missing (the
+    /// hardened image ships no trivy CLI, so the filesystem/incus scanners
+    /// spawn `trivy` -> `NotFound`), the orchestration must record a terminal
+    /// `not_applicable` row -- NOT `failed`. A `failed` row would set
+    /// has_failed_scan=true and floor the whole repository to grade F under
+    /// fail-closed scoring (#2167/#2240), even though grype scanned the same
+    /// artifact successfully.
+    #[tokio::test]
+    async fn test_scan_artifact_inner_engine_unavailable_records_not_applicable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("engine-unavailable/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, 'pkg.jar', 'pkg.jar', 4, $3,
+                    'application/java-archive', $4, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+
+        // prepared=None -> InsertFresh path; the row is created, scan() returns
+        // ScannerEngineUnavailable, and the orchestrator marks it not_applicable.
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(EngineUnavailableScanner)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed when the engine is unavailable");
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error_message FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read scan rows");
+
+        assert_eq!(rows.len(), 1, "exactly one scan row expected");
+        assert_eq!(
+            rows[0].0, "not_applicable",
+            "engine-unavailable must persist not_applicable, never failed"
+        );
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not available"),
             "reason text must be preserved for display"
         );
 

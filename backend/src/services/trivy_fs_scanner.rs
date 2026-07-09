@@ -107,7 +107,7 @@ impl TrivyFsScanner {
             .args(&args)
             .output()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
+            .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
 
         let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -282,7 +282,7 @@ mod tests {
     use super::*;
     use crate::models::security::Severity;
     use crate::services::scanner_service::convert_trivy_findings;
-    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
+    use crate::services::scanner_service::test_helpers::make_test_artifact;
 
     #[test]
     fn test_is_applicable() {
@@ -409,9 +409,18 @@ mod tests {
             "http://localhost:0".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
-        assert_scan_failed(
-            &no_trivy.scan(&artifact, None, &content).await,
-            "Trivy filesystem scan",
+        // A missing trivy CLI must surface as `ScannerEngineUnavailable`
+        // (which the orchestrator maps to a terminal `not_applicable` row), NOT
+        // a hard scan failure — otherwise fail-closed scoring floors the repo to
+        // grade F. Both server and standalone modes spawn-fail with NotFound and
+        // `fail_scan` preserves the variant.
+        let err = no_trivy
+            .scan(&artifact, None, &content)
+            .await
+            .expect_err("scan() must return Err when the trivy CLI is absent");
+        assert!(
+            matches!(err, crate::error::AppError::ScannerEngineUnavailable(_)),
+            "missing trivy CLI must surface as ScannerEngineUnavailable, got: {err:?}"
         );
     }
 

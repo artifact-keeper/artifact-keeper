@@ -115,6 +115,19 @@ pub enum AppError {
     /// by status code alone.
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// A scanner's backing engine/CLI is not present in this deployment, so the
+    /// scan cannot run at all — distinct from the scan running and failing. The
+    /// hardened runtime image routes container-image scans through the Harbor
+    /// scanner-adapter over HTTP and does not bundle the `trivy` CLI; the
+    /// filesystem/incus scanners spawn it directly and hit
+    /// `io::ErrorKind::NotFound`. The scan orchestrator maps this to a terminal
+    /// `not_applicable` scan row (grype still covers the same artifacts) rather
+    /// than `failed`, so an intentionally-absent optional scanner engine does
+    /// not fail closed. Genuine scan errors (unreachable server, malformed
+    /// output) are NOT `NotFound` and stay on the `Internal` -> `failed` path.
+    #[error("Scanner engine unavailable: {0}")]
+    ScannerEngineUnavailable(String),
 }
 
 impl AppError {
@@ -184,6 +197,10 @@ impl AppError {
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            Self::ScannerEngineUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SCANNER_ENGINE_UNAVAILABLE",
+            ),
         }
     }
 
@@ -221,7 +238,8 @@ impl AppError {
             | Self::Validation(msg)
             | Self::QuotaExceeded(msg)
             | Self::BadGateway(msg)
-            | Self::ServiceUnavailable(msg) => msg.clone(),
+            | Self::ServiceUnavailable(msg)
+            | Self::ScannerEngineUnavailable(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -429,6 +447,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Service unavailable: Scanner service not configured"
+        );
+    }
+
+    #[test]
+    fn test_scanner_engine_unavailable_passes_through() {
+        let err = AppError::ScannerEngineUnavailable("Trivy CLI not available".into());
+        assert_eq!(err.user_message(), "Trivy CLI not available");
+        assert_eq!(
+            err.to_string(),
+            "Scanner engine unavailable: Trivy CLI not available"
+        );
+        assert_eq!(
+            err.status_and_code(),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SCANNER_ENGINE_UNAVAILABLE"
+            )
         );
     }
 

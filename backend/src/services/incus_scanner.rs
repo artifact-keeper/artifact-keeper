@@ -181,7 +181,7 @@ async fn run_trivy_scan(
         .args(&args)
         .output()
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
+        .map_err(|e| crate::services::scanner_service::classify_trivy_spawn_error(&e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
