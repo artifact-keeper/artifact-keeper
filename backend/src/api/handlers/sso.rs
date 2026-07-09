@@ -2629,7 +2629,9 @@ mod tests {
     // =======================================================================
 
     mod sync_db {
-        use super::super::{sync_federated_groups_to_local_groups, sync_oidc_groups_to_local_groups};
+        use super::super::{
+            sync_federated_groups_to_local_groups, sync_oidc_groups_to_local_groups,
+        };
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
         use uuid::Uuid;
@@ -2795,9 +2797,15 @@ mod tests {
             let provider_id = Uuid::new_v4();
             let sg = rand_group_name("saml-team");
 
-            sync_federated_groups_to_local_groups(&pool, user_id, provider_id, "saml", &[sg.clone()])
-                .await
-                .expect("saml sync");
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[sg.clone()],
+            )
+            .await
+            .expect("saml sync");
 
             let sg_id = group_id_by_name(&pool, &sg).await.expect("saml group");
             assert!(user_is_in_group(&pool, user_id, sg_id).await);
