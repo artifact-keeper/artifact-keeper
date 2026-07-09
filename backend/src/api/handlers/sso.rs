@@ -897,6 +897,10 @@ pub async fn saml_acs(
         }
     };
 
+    // Captured before the move into FederatedCredentials for group-to-group
+    // mapping below.
+    let saml_groups = saml_user.groups.clone();
+
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -924,6 +928,24 @@ pub async fn saml_acs(
         serde_json::json!({ "username": user.username }),
     )
     .await;
+
+    // When map_groups_to_groups is enabled, reflect the SAML assertion group
+    // values as Artifact Keeper group memberships (parity with OIDC #1094).
+    // Auto-create groups tagged external_source = 'saml' and reconcile so
+    // removed groups drop their members. Failure never blocks login.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "saml", &saml_groups)
+                .await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %id,
+                "Failed to sync SAML groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -1119,32 +1141,46 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
 }
 
 /// Reconcile an OIDC user's group memberships against the `groups` table.
-///
-/// For each group name in `oidc_groups`:
-/// - Find the group by name; if missing, auto-create it tagged with
-///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
-/// - Ensure a `user_group_members` row exists.
-///
-/// Then remove the user from any group that:
-/// - is tagged with this same `external_source` + `external_provider_id`, AND
-/// - is not present in `oidc_groups`.
-///
-/// Operator-managed groups (NULL `external_source`) are never modified by
-/// this sync. (Issue #1094.)
+/// Thin wrapper over [`sync_federated_groups_to_local_groups`] with the
+/// `oidc` source tag. (Issue #1094.)
 pub(crate) async fn sync_oidc_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
     provider_id: Uuid,
     oidc_groups: &[String],
 ) -> Result<()> {
+    sync_federated_groups_to_local_groups(pool, user_id, provider_id, "oidc", oidc_groups).await
+}
+
+/// Reconcile a federated user's group memberships against the `groups` table.
+///
+/// For each group name in `idp_groups`:
+/// - Find the group by name; if missing, auto-create it tagged with
+///   `external_source = source` and `external_provider_id = provider_id`.
+/// - Ensure a `user_group_members` row exists.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `idp_groups`.
+///
+/// Operator-managed groups (NULL `external_source`) and groups owned by other
+/// providers/sources are never modified by this sync. `source` scopes the
+/// reconcile to one IdP kind (e.g. "oidc", "saml"). (Issues #1094, SAML parity.)
+pub(crate) async fn sync_federated_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    idp_groups: &[String],
+) -> Result<()> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Upsert each OIDC group: find-or-create, then ensure membership.
-    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
-    for name in oidc_groups {
+    // Upsert each group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(idp_groups.len());
+    for name in idp_groups {
         if name.trim().is_empty() {
             continue;
         }
@@ -1164,13 +1200,14 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
         let (group_id,): (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
-            VALUES ($1, $2, 'oidc', $3)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
             RETURNING id
             "#,
         )
         .bind(name)
-        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(format!("Auto-created from {source} group claim: {name}"))
+        .bind(source)
         .bind(provider_id)
         .fetch_one(&mut *tx)
         .await
@@ -1192,24 +1229,25 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
         current_group_ids.push(group_id);
     }
 
-    // Remove the user from any OIDC-managed group (same provider) that they
-    // are no longer a member of according to the latest claims. We deliberately
-    // limit the scope to groups marked external_source = 'oidc' AND
-    // external_provider_id = provider_id so we never strip membership in
-    // operator-managed groups or groups owned by other IdPs.
+    // Remove the user from any group managed by this same source+provider that
+    // they are no longer a member of according to the latest assertion/claims.
+    // We deliberately limit the scope to groups marked external_source = source
+    // AND external_provider_id = provider_id so we never strip membership in
+    // operator-managed groups or groups owned by other IdPs/sources.
     sqlx::query(
         r#"
         DELETE FROM user_group_members
         WHERE user_id = $1
           AND group_id IN (
               SELECT id FROM groups
-              WHERE external_source = 'oidc'
-                AND external_provider_id = $2
-                AND NOT (id = ANY($3))
+              WHERE external_source = $2
+                AND external_provider_id = $3
+                AND NOT (id = ANY($4))
           )
         "#,
     )
     .bind(user_id)
+    .bind(source)
     .bind(provider_id)
     .bind(&current_group_ids)
     .execute(&mut *tx)
@@ -2591,7 +2629,7 @@ mod tests {
     // =======================================================================
 
     mod sync_db {
-        use super::super::sync_oidc_groups_to_local_groups;
+        use super::super::{sync_federated_groups_to_local_groups, sync_oidc_groups_to_local_groups};
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
         use uuid::Uuid;
@@ -2743,6 +2781,45 @@ mod tests {
             assert!(group_id_by_name(&pool, "   ").await.is_none());
 
             cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_saml_tags_source_and_isolates_from_oidc() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            // Same provider_id on purpose: isolation must come from `source`,
+            // not just a differing provider id.
+            let provider_id = Uuid::new_v4();
+            let sg = rand_group_name("saml-team");
+
+            sync_federated_groups_to_local_groups(&pool, user_id, provider_id, "saml", &[sg.clone()])
+                .await
+                .expect("saml sync");
+
+            let sg_id = group_id_by_name(&pool, &sg).await.expect("saml group");
+            assert!(user_is_in_group(&pool, user_id, sg_id).await);
+            assert_eq!(
+                group_external_source(&pool, sg_id).await.as_deref(),
+                Some("saml")
+            );
+
+            // An OIDC reconcile for the same provider with no groups must NOT
+            // strip the SAML-sourced membership — the DELETE is scoped by source.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &[])
+                .await
+                .expect("oidc empty sync");
+            assert!(user_is_in_group(&pool, user_id, sg_id).await);
+
+            // A SAML reconcile with no groups, however, does drop the membership.
+            sync_federated_groups_to_local_groups(&pool, user_id, provider_id, "saml", &[])
+                .await
+                .expect("saml empty sync");
+            assert!(!user_is_in_group(&pool, user_id, sg_id).await);
+
+            cleanup_groups(&pool, &[sg_id]).await;
             cleanup_user(&pool, user_id).await;
         }
 

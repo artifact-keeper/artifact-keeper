@@ -1126,6 +1126,7 @@ mod tests {
             admin_group: Some("admin-group".to_string()),
             is_enabled: false,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
