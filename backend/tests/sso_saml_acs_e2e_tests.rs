@@ -120,6 +120,7 @@ async fn create_saml_provider(pool: &PgPool, opts: SamlProviderOpts) -> Uuid {
             admin_group: opts.admin_group,
             is_enabled: Some(true),
             use_absolute_acs_url: Some(opts.use_absolute_acs_url),
+            map_groups_to_groups: None,
         },
     )
     .await

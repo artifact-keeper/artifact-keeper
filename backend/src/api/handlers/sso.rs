@@ -2802,7 +2802,7 @@ mod tests {
                 user_id,
                 provider_id,
                 "saml",
-                &[sg.clone()],
+                std::slice::from_ref(&sg),
             )
             .await
             .expect("saml sync");
