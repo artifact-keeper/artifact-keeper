@@ -59,7 +59,9 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let mut builder = reqwest::Client::builder().redirect(ssrf_redirect_policy());
+    let mut builder = reqwest::Client::builder()
+        .redirect(ssrf_redirect_policy())
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver());
 
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
         match std::fs::read(&ca_path) {
@@ -269,6 +271,26 @@ mod tests {
         assert!(
             err.to_string().contains("SSRF") || err.is_redirect(),
             "expected redirect-rejection error, got: {err}"
+        );
+    }
+
+    /// A hostname resolving to a blocked IP must be refused at DNS time, not
+    /// connected to. `localhost` resolves to 127.0.0.1/::1 (blocked).
+    #[tokio::test]
+    async fn test_client_refuses_host_resolving_to_blocked_ip() {
+        let client = base_client_builder().build().unwrap();
+        let err = client
+            .get("http://localhost/")
+            .send()
+            .await
+            .expect_err("host resolving to a blocked IP must be refused");
+        // A DNS/connect-layer rejection (not a live HTTP response).
+        assert!(
+            err.is_connect()
+                || err.is_request()
+                || err.to_string().to_lowercase().contains("ssrf")
+                || err.to_string().to_lowercase().contains("block"),
+            "expected resolver rejection, got: {err}"
         );
     }
 
