@@ -6676,6 +6676,44 @@ async fn handle_get_manifest(
     )
 }
 
+/// True when a manifest reference is a tag rather than a digest
+/// (`sha256:...`). Same filter as the tags/list handler and the
+/// `docker_tag` grouping query (`POSITION(':' IN tag) = 0`): OCI tag
+/// grammar (`[a-zA-Z0-9_][a-zA-Z0-9._-]*`) can never contain `:`.
+pub(crate) fn oci_reference_is_tag(reference: &str) -> bool {
+    !reference.contains(':')
+}
+
+/// Sum of the artifact sizes recorded for an index manifest's child
+/// manifests, used to size the packages-catalog row for a multi-arch tag.
+///
+/// An image index carries no `config`/`layers` of its own, so the size
+/// computed from its body is ~0; the meaningful number is the sum over the
+/// child image manifests it references (`docker push` uploads those first,
+/// so their `artifacts` rows exist by the time the index is tagged). Same
+/// join the `docker_tag` grouping endpoint uses (`fetch_index_child_sizes`
+/// in repositories.rs). Best-effort: sizing must not fail the push.
+async fn index_child_artifact_size_sum(db: &PgPool, repo_id: Uuid, parent_digest: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        r#"SELECT COALESCE(SUM(a.size_bytes), 0)::BIGINT
+           FROM oci_manifest_refs r
+           JOIN artifacts a
+             ON a.repository_id = r.repository_id
+            AND a.checksum_sha256 = REPLACE(r.child_digest, 'sha256:', '')
+            AND a.is_deleted = false
+           WHERE r.repository_id = $1
+             AND r.parent_digest = $2"#,
+    )
+    .bind(repo_id)
+    .bind(parent_digest)
+    .fetch_one(db)
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Failed to sum child manifest sizes for {parent_digest}: {e}");
+        0
+    })
+}
+
 async fn handle_put_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -6883,6 +6921,36 @@ async fn handle_put_manifest(
         Err(e) => {
             tracing::error!("Failed to upsert artifact record for {}: {}", artifact_path, e);
         }
+    }
+
+    // Surface the pushed image in the packages catalog. The web UI's
+    // Packages tab reads `packages`/`package_versions` (via
+    // /api/v1/packages), NOT `artifacts` — every other format handler
+    // (composer, debian, incus, maven, npm, nuget, pypi, generic upload)
+    // populates the catalog on upload, but the OCI path never did, so a
+    // pushed image was pullable yet invisible in the Packages tab.
+    // Digest-only pushes are skipped: the child manifests of a multi-arch
+    // index are not user-facing versions (mirrors the tags/list filter).
+    // Best-effort — a catalog failure must not fail the push docker just
+    // committed (the fire-and-forget wrapper logs it).
+    if oci_reference_is_tag(reference) {
+        let child_size = match class {
+            ManifestClass::Index => {
+                index_child_artifact_size_sum(&state.db, repo_id, &digest).await
+            }
+            _ => 0,
+        };
+        crate::services::package_service::PackageService::new(state.db.clone())
+            .try_create_or_update_from_artifact(
+                repo_id,
+                &image,
+                reference,
+                total_size.saturating_add(child_size),
+                checksum,
+                None,
+                Some(serde_json::json!({ "format": "docker" })),
+            )
+            .await;
     }
 
     info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);
@@ -12894,6 +12962,25 @@ mod oci_manifest_refs_tests {
             classify_manifest(br#"{"manifests":[],"config":{"digest":"sha256:x"}}"#),
             ManifestClass::Index
         ));
+    }
+
+    /// Packages-catalog gate: only tag references may create catalog rows.
+    /// A digest push (multi-arch index children, `docker push <name>@sha256:...`)
+    /// is not a user-facing version. Matches the OCI tag grammar
+    /// (`[a-zA-Z0-9_][a-zA-Z0-9._-]*` — no `:` possible) and the
+    /// `POSITION(':' IN tag) = 0` filter in tags/list and docker_tag grouping.
+    #[test]
+    fn oci_reference_is_tag_accepts_tags_rejects_digests() {
+        assert!(oci_reference_is_tag("latest"));
+        assert!(oci_reference_is_tag("1.2.3"));
+        assert!(oci_reference_is_tag("v1.0.0-rc.1_hotfix"));
+        assert!(!oci_reference_is_tag(
+            "sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
+        ));
+        assert!(!oci_reference_is_tag("sha512:00aa"));
+        // Defensive: a bare colon-containing string is still not a tag.
+        assert!(!oci_reference_is_tag("a:b"));
+        assert!(!oci_reference_is_tag(":"));
     }
 
     /// #1409 C1: the STORED media type is derived from content, so the gate
