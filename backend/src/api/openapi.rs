@@ -123,62 +123,133 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// Per-module OpenAPI documents, in merge order.
+///
+/// Kept as a named list (rather than inline `doc.merge(...)` calls) so tests
+/// can inspect each module's contribution BEFORE the first-wins merge
+/// collapses schema-name collisions -- see
+/// `test_openapi_schema_names_are_unique_across_modules`.
+pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
+    use super::handlers;
+    vec![
+        ("auth", handlers::auth::AuthApiDoc::openapi()),
+        (
+            "repositories",
+            handlers::repositories::RepositoriesApiDoc::openapi(),
+        ),
+        ("artifacts", handlers::artifacts::ArtifactsApiDoc::openapi()),
+        ("users", handlers::users::UsersApiDoc::openapi()),
+        ("groups", handlers::groups::GroupsApiDoc::openapi()),
+        ("packages", handlers::packages::PackagesApiDoc::openapi()),
+        ("search", handlers::search::SearchApiDoc::openapi()),
+        ("builds", handlers::builds::BuildsApiDoc::openapi()),
+        ("promotion", handlers::promotion::PromotionApiDoc::openapi()),
+        ("health", handlers::health::HealthApiDoc::openapi()),
+        ("plugins", handlers::plugins::PluginsApiDoc::openapi()),
+        ("webhooks", handlers::webhooks::WebhooksApiDoc::openapi()),
+        (
+            "email_subscriptions",
+            handlers::email_subscriptions::EmailSubscriptionsApiDoc::openapi(),
+        ),
+        ("signing", handlers::signing::SigningApiDoc::openapi()),
+        ("security", handlers::security::SecurityApiDoc::openapi()),
+        ("sbom", handlers::sbom::SbomApiDoc::openapi()),
+        ("admin", handlers::admin::AdminApiDoc::openapi()),
+        ("analytics", handlers::analytics::AnalyticsApiDoc::openapi()),
+        ("lifecycle", handlers::lifecycle::LifecycleApiDoc::openapi()),
+        (
+            "storage_gc",
+            handlers::storage_gc::StorageGcApiDoc::openapi(),
+        ),
+        (
+            "monitoring",
+            handlers::monitoring::MonitoringApiDoc::openapi(),
+        ),
+        ("telemetry", handlers::telemetry::TelemetryApiDoc::openapi()),
+        ("peers", handlers::peers::PeersApiDoc::openapi()),
+        (
+            "permissions",
+            handlers::permissions::PermissionsApiDoc::openapi(),
+        ),
+        ("migration", handlers::migration::MigrationApiDoc::openapi()),
+        ("sso", handlers::sso::SsoApiDoc::openapi()),
+        ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),
+        ("totp", handlers::totp::TotpApiDoc::openapi()),
+        (
+            "remote_instances",
+            handlers::remote_instances::RemoteInstancesApiDoc::openapi(),
+        ),
+        (
+            "dependency_track",
+            handlers::dependency_track::DependencyTrackApiDoc::openapi(),
+        ),
+        ("peer", handlers::peer::PeerApiDoc::openapi()),
+        ("transfer", handlers::transfer::TransferApiDoc::openapi()),
+        ("tree", handlers::tree::TreeApiDoc::openapi()),
+        (
+            "repository_labels",
+            handlers::repository_labels::RepositoryLabelsApiDoc::openapi(),
+        ),
+        (
+            "sync_policies",
+            handlers::sync_policies::SyncPoliciesApiDoc::openapi(),
+        ),
+        (
+            "peer_instance_labels",
+            handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi(),
+        ),
+        (
+            "quality_gates",
+            handlers::quality_gates::QualityGatesApiDoc::openapi(),
+        ),
+        ("approval", handlers::approval::ApprovalApiDoc::openapi()),
+        ("age_gate", handlers::age_gate::AgeGateApi::openapi()),
+        (
+            "promotion_rules",
+            handlers::promotion_rules::PromotionRulesApiDoc::openapi(),
+        ),
+        (
+            "service_accounts",
+            handlers::service_accounts::ServiceAccountsApiDoc::openapi(),
+        ),
+        (
+            "artifact_labels",
+            handlers::artifact_labels::ArtifactLabelsApiDoc::openapi(),
+        ),
+        ("curation", handlers::curation::CurationApiDoc::openapi()),
+        (
+            "quarantine",
+            handlers::quarantine::QuarantineApiDoc::openapi(),
+        ),
+        ("upload", handlers::upload::UploadApiDoc::openapi()),
+        (
+            "system_config",
+            handlers::system_config::SystemConfigApiDoc::openapi(),
+        ),
+        (
+            "repo_tokens",
+            handlers::repo_tokens::RepoTokensApiDoc::openapi(),
+        ),
+        ("smtp", handlers::smtp::SmtpApiDoc::openapi()),
+        ("ci_auth", handlers::ci_auth::CiAuthApiDoc::openapi()),
+        (
+            "ci_auth_admin",
+            handlers::ci_auth_admin::CiAuthAdminApiDoc::openapi(),
+        ),
+    ]
+}
+
 /// Build the merged OpenAPI document from all handler modules.
 pub fn build_openapi() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
 
-    // Merge per-module OpenAPI structs as they are annotated.
-    // Each module defines its own XxxApiDoc that lists its paths and schemas.
-    doc.merge(super::handlers::auth::AuthApiDoc::openapi());
-    doc.merge(super::handlers::repositories::RepositoriesApiDoc::openapi());
-    doc.merge(super::handlers::artifacts::ArtifactsApiDoc::openapi());
-    doc.merge(super::handlers::users::UsersApiDoc::openapi());
-    doc.merge(super::handlers::groups::GroupsApiDoc::openapi());
-    doc.merge(super::handlers::packages::PackagesApiDoc::openapi());
-    doc.merge(super::handlers::search::SearchApiDoc::openapi());
-    doc.merge(super::handlers::builds::BuildsApiDoc::openapi());
-    doc.merge(super::handlers::promotion::PromotionApiDoc::openapi());
-    doc.merge(super::handlers::health::HealthApiDoc::openapi());
-    doc.merge(super::handlers::plugins::PluginsApiDoc::openapi());
-    doc.merge(super::handlers::webhooks::WebhooksApiDoc::openapi());
-    doc.merge(super::handlers::email_subscriptions::EmailSubscriptionsApiDoc::openapi());
-    doc.merge(super::handlers::signing::SigningApiDoc::openapi());
-    doc.merge(super::handlers::security::SecurityApiDoc::openapi());
-    doc.merge(super::handlers::sbom::SbomApiDoc::openapi());
-    doc.merge(super::handlers::admin::AdminApiDoc::openapi());
-    doc.merge(super::handlers::analytics::AnalyticsApiDoc::openapi());
-    doc.merge(super::handlers::lifecycle::LifecycleApiDoc::openapi());
-    doc.merge(super::handlers::storage_gc::StorageGcApiDoc::openapi());
-    doc.merge(super::handlers::monitoring::MonitoringApiDoc::openapi());
-    doc.merge(super::handlers::telemetry::TelemetryApiDoc::openapi());
-    doc.merge(super::handlers::peers::PeersApiDoc::openapi());
-    doc.merge(super::handlers::permissions::PermissionsApiDoc::openapi());
-    doc.merge(super::handlers::migration::MigrationApiDoc::openapi());
-    doc.merge(super::handlers::sso::SsoApiDoc::openapi());
-    doc.merge(super::handlers::sso_admin::SsoAdminApiDoc::openapi());
-    doc.merge(super::handlers::totp::TotpApiDoc::openapi());
-    doc.merge(super::handlers::remote_instances::RemoteInstancesApiDoc::openapi());
-    doc.merge(super::handlers::dependency_track::DependencyTrackApiDoc::openapi());
-    doc.merge(super::handlers::peer::PeerApiDoc::openapi());
-    doc.merge(super::handlers::transfer::TransferApiDoc::openapi());
-    doc.merge(super::handlers::tree::TreeApiDoc::openapi());
-    doc.merge(super::handlers::repository_labels::RepositoryLabelsApiDoc::openapi());
-    doc.merge(super::handlers::sync_policies::SyncPoliciesApiDoc::openapi());
-    doc.merge(super::handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi());
-    doc.merge(super::handlers::quality_gates::QualityGatesApiDoc::openapi());
-    doc.merge(super::handlers::approval::ApprovalApiDoc::openapi());
-    doc.merge(super::handlers::age_gate::AgeGateApi::openapi());
-    doc.merge(super::handlers::promotion_rules::PromotionRulesApiDoc::openapi());
-    doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
-    doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
-    doc.merge(super::handlers::curation::CurationApiDoc::openapi());
-    doc.merge(super::handlers::quarantine::QuarantineApiDoc::openapi());
-    doc.merge(super::handlers::upload::UploadApiDoc::openapi());
-    doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
-    doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
-    doc.merge(super::handlers::smtp::SmtpApiDoc::openapi());
-    doc.merge(super::handlers::ci_auth::CiAuthApiDoc::openapi());
-    doc.merge(super::handlers::ci_auth_admin::CiAuthAdminApiDoc::openapi());
+    // Merge per-module OpenAPI structs as they are annotated. NOTE: the merge
+    // is FIRST-WINS on schema names -- a name collision between two modules
+    // silently publishes only the earlier module's shape. The schema-name
+    // uniqueness test below guards against that.
+    for (_module, module_doc) in module_docs() {
+        doc.merge(module_doc);
+    }
 
     doc
 }
@@ -341,6 +412,97 @@ mod tests {
              and block SDK generation/publishing. Give one handler an explicit \
              `operation_id = \"...\"` in its #[utoipa::path]:\n{}",
             dups.join("\n")
+        );
+    }
+
+    /// Regression: utoipa's `merge` is FIRST-WINS on schema NAMES. Two
+    /// different structs that share a name across handler modules mean the
+    /// later module's operations silently publish the earlier module's
+    /// shape — a spec-fidelity drift no per-operation check can see. This
+    /// is exactly how GET /api/v1/artifacts/{id} published the wrong
+    /// `ArtifactResponse` and PATCH /admin/lifecycle/{id} published the
+    /// quality-gate `UpdatePolicyRequest` (CLI repo #98). Registering the
+    /// SAME struct from several modules is fine (identical definition);
+    /// two different definitions under one name is not.
+    #[test]
+    fn test_openapi_schema_names_are_unique_across_modules() {
+        use std::collections::{HashMap, HashSet};
+
+        // Ratchet: pre-existing collisions grandfathered until each is
+        // renamed (same fix as `ArtifactResponse`/`UpdatePolicyRequest`).
+        // For every name below, the FIRST-listed module's definition is the
+        // one the published spec currently carries; the other module's
+        // operations publish the wrong shape. This list may only SHRINK —
+        // the assertions below fail both on a NEW collision and on a stale
+        // entry (so a fixed collision must be removed here).
+        const KNOWN_COLLISIONS: &[&str] = &[
+            "CreateApiTokenRequest", // auth vs users
+            "CreatePolicyRequest",   // security (quality-gate) vs lifecycle
+            "PackageResponse",       // packages vs curation
+            "PaginationInfo",        // search vs migration
+            "ReindexResponse",       // search vs admin
+        ];
+
+        // name -> (first module that registered it, serialized schema)
+        let mut seen: HashMap<String, (String, String)> = HashMap::new();
+        let mut conflicts: HashSet<String> = HashSet::new();
+        let mut conflict_details: Vec<String> = Vec::new();
+
+        let mut docs = module_docs();
+        // Include the base doc's own components too.
+        docs.insert(0, ("(base ApiDoc)", ApiDoc::openapi()));
+
+        for (module, doc) in docs {
+            let Some(components) = doc.components else {
+                continue;
+            };
+            for (name, schema) in components.schemas {
+                let json = serde_json::to_string(&schema).expect("schema must serialize");
+                match seen.get(&name) {
+                    Some((first_module, first_json)) => {
+                        if *first_json != json && conflicts.insert(name.clone()) {
+                            conflict_details.push(format!(
+                                "  {name}: `{first_module}` and `{module}` register \
+                                 different definitions under the same schema name"
+                            ));
+                        }
+                    }
+                    None => {
+                        seen.insert(name, (module.to_string(), json));
+                    }
+                }
+            }
+        }
+
+        let mut new_conflicts: Vec<String> = conflict_details
+            .iter()
+            .filter(|d| {
+                !KNOWN_COLLISIONS
+                    .iter()
+                    .any(|k| d.contains(&format!("  {k}:")))
+            })
+            .cloned()
+            .collect();
+        new_conflicts.sort();
+        assert!(
+            new_conflicts.is_empty(),
+            "Duplicate OpenAPI schema name(s) with divergent definitions — \
+             utoipa keeps only the FIRST definition, so every other module's \
+             operations publish the wrong shape in the spec. Rename the \
+             colliding struct(s) or share one canonical type:\n{}",
+            new_conflicts.join("\n")
+        );
+
+        // Ratchet enforcement: a grandfathered entry that no longer collides
+        // must be deleted from KNOWN_COLLISIONS so the list only shrinks.
+        let stale: Vec<&&str> = KNOWN_COLLISIONS
+            .iter()
+            .filter(|k| !conflicts.contains(**k))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_COLLISIONS entries no longer collide — remove them so the \
+             grandfather list only shrinks: {stale:?}"
         );
     }
 

@@ -347,7 +347,7 @@ pub struct CreatePolicyRequest {
 
 /// Request to update a lifecycle policy.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdatePolicyRequest {
+pub struct UpdateLifecyclePolicyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -505,7 +505,7 @@ impl LifecycleService {
     pub async fn update_policy(
         &self,
         id: Uuid,
-        req: UpdatePolicyRequest,
+        req: UpdateLifecyclePolicyRequest,
     ) -> Result<LifecyclePolicy> {
         let existing = self.get_policy(id).await?;
 
@@ -1767,7 +1767,7 @@ mod tests {
     #[test]
     fn test_update_policy_request_empty() {
         let json_str = "{}";
-        let req: UpdatePolicyRequest = serde_json::from_str(json_str).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_str(json_str).unwrap();
         assert!(req.name.is_none());
         assert!(req.description.is_none());
         assert!(req.enabled.is_none());
@@ -2389,7 +2389,7 @@ mod tests {
             "enabled": false,
             "priority": 99
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert!(req.name.is_none());
         assert!(req.description.is_none());
         assert_eq!(req.enabled, Some(false));
@@ -2407,7 +2407,7 @@ mod tests {
             "priority": 5,
             "cron_schedule": "0 0 3 * * *"
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.description, Some("Updated Description".to_string()));
         assert_eq!(req.enabled, Some(true));
@@ -2449,7 +2449,7 @@ mod tests {
         let json_val = json!({
             "enabled": true
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert!(req.cron_schedule.is_none());
     }
 

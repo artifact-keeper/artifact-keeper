@@ -14,7 +14,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::lifecycle_service::{
     CreatePolicyRequest, LifecyclePolicy, LifecycleService, PolicyExecutionResult,
-    UpdatePolicyRequest,
+    UpdateLifecyclePolicyRequest,
 };
 
 #[derive(OpenApi)]
@@ -32,7 +32,7 @@ use crate::services::lifecycle_service::{
     components(schemas(
         LifecyclePolicy,
         CreatePolicyRequest,
-        UpdatePolicyRequest,
+        UpdateLifecyclePolicyRequest,
         PolicyExecutionResult,
     ))
 )]
@@ -134,7 +134,7 @@ pub async fn get_policy(
     params(
         ("id" = Uuid, Path, description = "Policy ID"),
     ),
-    request_body = UpdatePolicyRequest,
+    request_body = UpdateLifecyclePolicyRequest,
     responses(
         (status = 200, description = "Policy updated successfully", body = LifecyclePolicy),
     ),
@@ -144,7 +144,7 @@ pub async fn update_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdatePolicyRequest>,
+    Json(payload): Json<UpdateLifecyclePolicyRequest>,
 ) -> Result<Json<LifecyclePolicy>> {
     let service = LifecycleService::new(state.db.clone());
     let policy = service.update_policy(id, payload).await?;
@@ -338,7 +338,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── UpdatePolicyRequest deserialization tests ────────────────────
+    // ── UpdateLifecyclePolicyRequest deserialization tests ────────────────────
 
     #[test]
     fn test_update_policy_request_all_fields() {
@@ -349,7 +349,7 @@ mod tests {
             "config": {"max_versions": 10},
             "priority": 5
         }"#;
-        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, Some("renamed".to_string()));
         assert_eq!(req.description, Some("updated desc".to_string()));
         assert_eq!(req.enabled, Some(false));
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_update_policy_request_empty_body() {
         let json = r#"{}"#;
-        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_str(json).unwrap();
         assert!(req.name.is_none());
         assert!(req.description.is_none());
         assert!(req.enabled.is_none());
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn test_update_policy_request_partial() {
         let json = r#"{"enabled": true}"#;
-        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.enabled, Some(true));
         assert!(req.name.is_none());
     }

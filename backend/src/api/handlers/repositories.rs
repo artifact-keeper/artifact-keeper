@@ -3713,7 +3713,10 @@ pub async fn get_artifact_metadata(
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Artifact uploaded", body = ArtifactResponse),
+        // 201, not 200: the handler has always returned StatusCode::CREATED
+        // (package-manager clients depend on it); the spec must say so or
+        // strict generated SDKs treat every successful upload as an error.
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
     )
