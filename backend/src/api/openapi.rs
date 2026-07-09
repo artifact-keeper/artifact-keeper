@@ -435,13 +435,11 @@ mod tests {
         // operations publish the wrong shape. This list may only SHRINK —
         // the assertions below fail both on a NEW collision and on a stale
         // entry (so a fixed collision must be removed here).
-        const KNOWN_COLLISIONS: &[&str] = &[
-            "CreateApiTokenRequest", // auth vs users
-            "CreatePolicyRequest",   // security (quality-gate) vs lifecycle
-            "PackageResponse",       // packages vs curation
-            "PaginationInfo",        // search vs migration
-            "ReindexResponse",       // search vs admin
-        ];
+        // All previously grandfathered collisions have been resolved by
+        // renaming the less-canonical struct in each pair (see #2334 for the
+        // ArtifactResponse/UpdatePolicyRequest precedent). The ratchet is now
+        // empty: any new divergent same-name schema fails this test outright.
+        const KNOWN_COLLISIONS: &[&str] = &[];
 
         // name -> (first module that registered it, serialized schema)
         let mut seen: HashMap<String, (String, String)> = HashMap::new();

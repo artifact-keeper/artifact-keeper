@@ -13,7 +13,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::lifecycle_service::{
-    CreatePolicyRequest, LifecyclePolicy, LifecycleService, PolicyExecutionResult,
+    CreateLifecyclePolicyRequest, LifecyclePolicy, LifecycleService, PolicyExecutionResult,
     UpdateLifecyclePolicyRequest,
 };
 
@@ -31,7 +31,7 @@ use crate::services::lifecycle_service::{
     ),
     components(schemas(
         LifecyclePolicy,
-        CreatePolicyRequest,
+        CreateLifecyclePolicyRequest,
         UpdateLifecyclePolicyRequest,
         PolicyExecutionResult,
     ))
@@ -84,7 +84,7 @@ pub async fn list_policies(
     context_path = "/api/v1/admin/lifecycle",
     tag = "lifecycle",
     operation_id = "create_lifecycle_policy",
-    request_body = CreatePolicyRequest,
+    request_body = CreateLifecyclePolicyRequest,
     responses(
         (status = 200, description = "Policy created successfully", body = LifecyclePolicy),
     ),
@@ -93,7 +93,7 @@ pub async fn list_policies(
 pub async fn create_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
-    Json(payload): Json<CreatePolicyRequest>,
+    Json(payload): Json<CreateLifecyclePolicyRequest>,
 ) -> Result<Json<LifecyclePolicy>> {
     let service = LifecycleService::new(state.db.clone());
     let policy = service.create_policy(payload).await?;
@@ -283,7 +283,7 @@ mod tests {
         assert!(q.repository_id.is_none());
     }
 
-    // ── CreatePolicyRequest deserialization tests ────────────────────
+    // ── CreateLifecyclePolicyRequest deserialization tests ────────────────────
 
     #[test]
     fn test_create_policy_request_full() {
@@ -295,7 +295,7 @@ mod tests {
             "config": {"max_age_days": 90},
             "priority": 10
         }"#;
-        let req: CreatePolicyRequest = serde_json::from_str(json).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "cleanup-old");
         assert_eq!(req.policy_type, "max_age_days");
         assert_eq!(req.priority, Some(10));
@@ -310,7 +310,7 @@ mod tests {
             "policy_type": "max_versions",
             "config": {"max_versions": 5}
         }"#;
-        let req: CreatePolicyRequest = serde_json::from_str(json).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "global-policy");
         assert!(req.repository_id.is_none());
         assert!(req.description.is_none());
@@ -320,21 +320,24 @@ mod tests {
     #[test]
     fn test_create_policy_request_missing_name_fails() {
         let json = r#"{"policy_type": "max_age_days", "config": {}}"#;
-        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json);
+        let result: std::result::Result<CreateLifecyclePolicyRequest, _> =
+            serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_create_policy_request_missing_policy_type_fails() {
         let json = r#"{"name": "test", "config": {}}"#;
-        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json);
+        let result: std::result::Result<CreateLifecyclePolicyRequest, _> =
+            serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_create_policy_request_missing_config_fails() {
         let json = r#"{"name": "test", "policy_type": "max_age_days"}"#;
-        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json);
+        let result: std::result::Result<CreateLifecyclePolicyRequest, _> =
+            serde_json::from_str(json);
         assert!(result.is_err());
     }
 

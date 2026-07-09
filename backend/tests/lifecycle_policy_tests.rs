@@ -11,7 +11,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use artifact_keeper_backend::services::lifecycle_service::{CreatePolicyRequest, LifecycleService};
+use artifact_keeper_backend::services::lifecycle_service::{
+    CreateLifecyclePolicyRequest, LifecycleService,
+};
 
 /// Create a test repository and return its ID.
 async fn create_test_repo(pool: &PgPool, name: &str) -> Uuid {
@@ -106,7 +108,7 @@ async fn test_tag_pattern_keep_deletes_non_matching_artifacts() {
 
     // Create a tag_pattern_keep policy: keep release-* and v*
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Keep releases".to_string(),
             description: Some("Keep release and version tags".to_string()),
@@ -187,7 +189,7 @@ async fn test_tag_pattern_keep_all_match_deletes_nothing() {
     let a2 = insert_artifact(&pool, repo_id, "release-2.0", 200).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Keep all releases".to_string(),
             description: None,
@@ -226,7 +228,7 @@ async fn test_tag_pattern_keep_none_match_deletes_all() {
     let a2 = insert_artifact(&pool, repo_id, "dev-build-2", 200).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Keep only releases".to_string(),
             description: None,
@@ -266,7 +268,7 @@ async fn test_tag_pattern_delete_still_works() {
     let a_snapshot = insert_artifact(&pool, repo_id, "snapshot-nightly", 200).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Delete snapshots".to_string(),
             description: None,
@@ -368,7 +370,7 @@ async fn test_size_quota_lru_evicts_never_downloaded_first() {
 
     // Set quota to 200 bytes — need to evict 200 bytes (2 artifacts)
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "LRU quota".to_string(),
             description: None,
@@ -436,7 +438,7 @@ async fn test_size_quota_lru_frequently_downloaded_survives() {
 
     // Set quota to 100 bytes — need to evict 200 bytes (2 artifacts)
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "LRU frequent test".to_string(),
             description: None,
@@ -649,7 +651,7 @@ async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
     insert_oci_tag(&pool, repo_id, "myimg", "release-alias", ephemeral_digest).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Delete snapshot-images".to_string(),
             description: None,
@@ -742,7 +744,7 @@ async fn test_max_age_days_cascades_oci_tags() {
         .expect("backdate failed");
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop > 7 days".to_string(),
             description: None,
@@ -807,7 +809,7 @@ async fn test_cascade_respects_repo_scope() {
         .unwrap();
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_a),
             name: "Drop snapshots in A".to_string(),
             description: None,
@@ -866,7 +868,7 @@ async fn test_cascade_handles_port_in_image_name() {
     insert_oci_tag(&pool, repo_id, image, "alias", digest).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop snapshot-keep-me".to_string(),
             description: None,
@@ -943,7 +945,7 @@ async fn test_cascade_handles_digest_reference() {
         .expect("backdate failed");
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop > 7 days".to_string(),
             description: None,
@@ -1033,7 +1035,7 @@ async fn test_execute_policy_reclaims_orphan_oci_tags() {
     .await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop ^stale$ (no match)".to_string(),
             description: None,
@@ -1152,7 +1154,7 @@ async fn test_cascade_picks_up_orphans_from_prior_run() {
     insert_oci_tag(&pool, repo_id, "imgC", "live", live_digest).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Recovery sweep".to_string(),
             description: None,
@@ -1220,7 +1222,7 @@ async fn test_size_quota_under_limit_evicts_nothing() {
     let a2 = insert_artifact(&pool, repo_id, "small-2", 100).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Generous quota".to_string(),
             description: None,
@@ -1327,7 +1329,7 @@ async fn test_max_versions_cascades_oci_tags() {
     .unwrap();
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Keep latest".to_string(),
             description: None,
@@ -1423,7 +1425,7 @@ async fn test_no_downloads_days_cascades_oci_tags() {
     record_download_days_ago(&pool, cold_alias_id, 1).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop cold".to_string(),
             description: None,
@@ -1489,7 +1491,7 @@ async fn test_tag_pattern_keep_cascades_oci_tags() {
     insert_oci_tag(&pool, repo_id, "img", "v0.0.0-snap", snapshot_digest).await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Keep semver".to_string(),
             description: None,
@@ -1564,7 +1566,7 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
     record_download(&pool, evict_alias_id, "2026-05-29T00:00:00Z").await;
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Tight quota".to_string(),
             description: None,
@@ -1657,7 +1659,7 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
     );
 
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Drop > 7 days".to_string(),
             description: None,
@@ -1722,7 +1724,7 @@ async fn cascade_retains_sole_protecting_oci_tag() {
     // A retention rule whose regex matches the manifest artifact's name
     // ("app:prod"): tx1 soft-deletes the manifest row, tx2 runs the cascade.
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Prune prod".to_string(),
             description: None,
@@ -1780,7 +1782,7 @@ async fn cascade_prunes_redundant_tag_when_sibling_survives() {
     // A prune rule matching only "stale": tx1 soft-deletes the `stale`
     // manifest row (the `keep` row stays live), tx2 runs the cascade.
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Prune stale".to_string(),
             description: None,
@@ -1843,7 +1845,7 @@ async fn cascade_retains_all_when_every_protecting_tag_pruned() {
     // ("app:prod", "app:prod-old"): tx1 soft-deletes both manifest rows,
     // tx2 runs the cascade.
     let policy = svc
-        .create_policy(CreatePolicyRequest {
+        .create_policy(CreateLifecyclePolicyRequest {
             repository_id: Some(repo_id),
             name: "Prune all prod".to_string(),
             description: None,
