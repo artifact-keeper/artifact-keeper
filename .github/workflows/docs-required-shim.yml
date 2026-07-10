@@ -1,0 +1,49 @@
+# Docs-only required-check shim.
+#
+# The main CI workflow (ci.yml) uses `paths-ignore` to skip docs-only
+# changes. Branch protection on `main` requires the contexts
+# "🦀 Check Rust", "🧪 Backend Unit Tests", and "✅ CI Complete", so a
+# PR that only touches ignored paths never gets those checks posted and
+# is permanently blocked.
+#
+# This workflow is the standard GitHub-documented counterpart
+# ("Handling skipped but required checks"): it triggers on exactly the
+# paths ci.yml ignores and posts trivially-successful jobs whose names
+# match the required contexts character-for-character.
+#
+# IMPORTANT: keep the `paths` list below in sync with the
+# `paths-ignore` list in ci.yml, and keep the job names in sync with
+# the branch-protection required status checks.
+name: CI (docs-only shim)
+
+on:
+  pull_request:
+    branches: [main, master, develop, 'release/**']
+    paths:
+      - 'site/**'
+      - '**/*.md'
+      - '.beads/**'
+      - 'LICENSE'
+      - 'CLAUDE.md'
+
+permissions:
+  contents: read
+
+jobs:
+  check-rust:
+    name: 🦀 Check Rust
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs-only change — real CI skipped by path filter; shim satisfies required check"
+
+  test-backend-unit:
+    name: 🧪 Backend Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs-only change — real CI skipped by path filter; shim satisfies required check"
+
+  ci-complete:
+    name: ✅ CI Complete
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs-only change — real CI skipped by path filter; shim satisfies required check"
