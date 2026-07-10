@@ -7,6 +7,209 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-07-10
+
+### Fixed
+
+- **OpenAPI spec aligned with runtime behavior on six endpoints** (#2335), and 5 OpenAPI schema-name collisions resolved with the collision ratchet emptied (#2340).
+- **Auth returns 503, not 401, from the guest-access guard when the auth path is overloaded** (#2315), and the credential watermark check now tolerates app-vs-DB clock skew (#2350).
+- **Authenticated users are granted the anonymous read baseline on public repositories** (#2346), so logging in can no longer see less than an anonymous client.
+- **Azure storage**: the health-check HEAD probe is signed in Shared Key mode (#2295), SAS signed start is backdated 15 minutes to tolerate clock skew (#2294).
+- **npm**: raised the packument cache buffer cap (#2313).
+- **Swift**: release versions are aggregated across all virtual repo members (#2342).
+- **Signing**: `key_type` is normalized so RSA algorithm variants no longer 500 at key creation (#2344).
+- **Scanner**: records `not_applicable` when the trivy CLI is absent instead of failing the scan (#2324).
+- **Uploads**: concurrent duplicate chunk uploads are serialized (#2316, #2348).
+- **OCI**: the packages catalog is populated on manifest push (#2337).
+- **Downloads**: presigned-redirect downloads are recorded in `download_statistics` (#2349).
+- **Migration**: `storage_backend` is persisted for auto-provisioned repos (#2336, #2338).
+- **PyPI**: virtual-repo dependency-confusion isolation is now priority-aware (#2351).
+
+### Security
+
+- **Scan-policy `max_severity` and `repository_id` are validated before insert** (#2345).
+
+## [1.4.0] - 2026-07-09
+
+### Added
+
+- **Keyless CI/CD token exchange via OIDC** (#1142) -- CI pipelines can exchange a workload OIDC token for an Artifact Keeper token without long-lived secrets.
+- **OCI: OAuth2 refresh-token grant and `access_type=offline` support** (#1166), and `/v2/token` accepts repeated `scope` query params (kaniko cross-repo push) (#2276).
+- **OIDC providers can opt into accepting ID tokens signed with RSA keys shorter than 2048 bits** via the new per-provider `allow_legacy_rsa_keys` flag (migration 144, defaults to `false`). The strict signature path goes through `jsonwebtoken` + `aws_lc_rs`, which enforces RFC 7518's effective baseline by rejecting every RSA modulus below 2048 bits. That keeps Artifact Keeper aligned with NIST SP 800-131A Rev.2 (RSA < 2048 disallowed since 2014) and OWASP ASVS 4.0 V6.2.5 by default, but leaves legitimate operators stranded when the IdP still publishes a 1024-bit RSA key on its JWKS (e.g. Lark AnyCross's OIDC offering at time of writing). When the flag is enabled on a specific provider, the ID token signature is verified through a restricted manual `rsa` + `sha2` PKCS#1 v1.5 path that accepts RS256, RS384, or RS512 only; PS* (RSA-PSS), ES* (ECDSA), and HS* (HMAC) tokens never engage the legacy branch regardless of the flag. The audience, issuer, expiry and nonce checks remain in force on the fallback path. Operators who do not turn the flag on see the strict path's exact pre-144 behaviour with no change.
+- **PyPI: non-PEP-503 upstream indexes** supported via the `upstream_index_path` repo config field (#1995).
+- **Dart: Pub upload protocol compliance and Remote/Virtual metadata resolution** (#2008).
+- **Audit: TOTP, password-change and session-invalidation auth events are recorded** (#2263).
+- **npm: cross-replica single-flight for stale-while-revalidate background refreshes** (#2256).
+- **Storage: tracing spans around storage backend operations** (#1947).
+- **Proxy quality gate adopts the package age gate, with coverage** (#2066).
+- **Canonical `/users/me` self-service aliases** for own record, tokens and password (#2265).
+
+### Changed
+
+- **Repo-scope authorization internals**: `AuthExtension.allowed_repo_ids` and `ApiTokenValidation.allowed_repo_ids` became an explicit `AccessScope`, and token issued-at folded into `AuthExtension` (#2206, #2257, #2259, #2261).
+
+### Fixed
+
+- **Sync**: `sync_tasks` are claimed before peer side effects, stopping multi-replica double execution (#2221).
+- **apt**: simplified InRelease cache invalidation (#2232); virtual `dists` no longer swallows a 502 cap-exceeded into an empty 200 (#2255).
+- **npm**: canonical `/-/` tarball paths resolve in the generic download/delete handlers (#2280).
+- **OCI**: virtual-repo blob cache-fill streams instead of buffering at the 8 MiB metadata cap (#2281).
+- **Composer**: `uid` added to inline root `packages.json` version objects (#2250, #2279).
+- **Conan**: recipe/package files-list proxied to upstream for remote repositories (#2288).
+- **SBOM**: SBOM/scan is no longer offered for proxy-cached remote artifacts (#2291).
+- **Azure storage**: Content-Length left empty in the Shared Key string-to-sign for zero-length bodies (#2293).
+- **Dependencies**: cleared cargo-audit advisories (crossbeam-epoch RUSTSEC-2026-0204, crypto-bigint yank) (#2157).
+
+### Security
+
+- **Sync-policy read/preview routes require admin** (#2252), and **build read endpoints require authentication** (#2254).
+- **`/health` detail and gRPC reflection are gated behind config, off by default** (#2253), closing version/topology information leaks.
+- **Dedicated strict rate limit for the login endpoint** (#2297), separating login throttling from the general limiter.
+
+## [1.3.0] - 2026-07-06
+
+Streaming-focused minor release: uploads and pull-through downloads stream end-to-end through the storage backend, blob GC becomes two-phase and idempotent, and the auth/audit epic (#1617) lands its first phases.
+
+### Added
+
+- **Streaming uploads to storage** for chef/ansible/pub multipart (#2176), helm chart metadata-parsing uploads (#2180), and pypi/nuget via a shared content-addressed primitive (#2199), part of the #1608 streaming-invariant effort.
+- **CI streaming-invariant enforcement gate** (Phase 1 of #1608) (#2171), and `StorageBackend::put_stream` is now a required trait method so backends can't silently inherit in-memory buffering (#2207).
+- **Storage GC: `pending_delete` marker with idempotent blob GC delete and two-phase mark-and-sweep** (#1660; #2209, #2213).
+- **Audit: federated logins and API-token lifecycle events are audited** (#1617 Phase 1) (#2187); `require_admin` consolidated onto the `AuthExtension` gate (#1617 Phase 3) (#2185); new `AccessScope` enum for repo-scope authorization (#2195) threaded through SBOM and search read paths (#2194, #2205).
+- **Composer: upstream dist artifacts are cached for remote/proxy repositories** (#2204).
+- **npm: computed packuments cached with stale-while-revalidate** (#2166).
+- **SSO end-to-end regression harnesses**: OIDC login/callback against a mock IdP (#2210) and SAML ACS signed-assertion (#2214).
+
+### Fixed
+
+- **Proxy**: cross-replica single-flight for the pull-through cache via Postgres advisory lock (#2172); pull-through artifact-blob downloads stream (#2178); buffered upstream metadata reads are capped (#2181, #2191); remaining buffered blob fallback paths stream (#2203); quality-gate content reads stream (#2174).
+- **OCI**: referenced `oci_blobs` are locked FOR UPDATE before ref-insert (#1660, #2190); upload cleanup-journal hygiene plus a Range integration test (#1533, #1410, #2202).
+- **Repositories**: OCI upload temp objects are purged after repo-delete and the listing query is batched (#2198).
+- **Storage**: GCS rewrite-loop token refresh; S3 copy digest-check and abort-on-drop (#2200).
+- **Cache**: authorization-cache invalidation fans out across replicas (#2169).
+- **Metrics**: unmatched HTTP paths collapse to a single label, preventing scanner-driven cardinality explosion (#2217).
+- **Auth cookies**: `Secure` flag gated on explicit `AK_ENFORCE_HTTPS` (#2233, #2234) with HTTPS auto-detection via `X-Forwarded-Proto` (#2236).
+- **Scanner adapter**: registry pull credential scoped to the target image so the trivy DB pull is not rejected (#2238; scanner-adapter 1.1.0, #2242).
+- **Dependencies**: bcrypt bumped to 0.19.2 (RUSTSEC-2026-0199) (#2216).
+
+### Security
+
+- **Global security-policy create/update/delete requires admin** (#2223).
+- **Direct artifact delete is gated on promotion-only release repos** (#2239).
+- **A vulnerability scan that errors now fails closed instead of reporting the artifact clean** (#2240).
+
+## [1.2.5] - 2026-07-03
+
+### Added
+
+- **SAML providers can opt into emitting an absolute `AssertionConsumerServiceURL`** via the new per-provider `use_absolute_acs_url` flag (migration 139, defaults to `false`). The `saml_login` and `saml_acs` handlers historically emitted the relative path `/api/v1/auth/sso/saml/<id>/acs` in the AuthnRequest's `AssertionConsumerServiceURL` attribute and used the same string when validating the IdP-asserted Destination/Recipient on the ACS callback. Stricter SAML 2.0 IdPs (and certain enterprise deployments) reject a relative ACS URL outright, so those IdPs were unreachable without rebasing the URL onto the SP origin. When the new flag is enabled on a SAML provider, the ACS URL is prefixed with the operator-configured `AK_EXTERNAL_URL` (a trusted process-env source, never derived from `Host` / `X-Forwarded-Host` request headers — those would let an attacker steer the signed AuthnRequest's `AssertionConsumerServiceURL` toward a hostile origin). If the flag is on but `AK_EXTERNAL_URL` is unset, the handler fails closed to the historical relative form and logs a warning so the misconfiguration is visible. Existing providers keep their pre-139 wire format unchanged because the flag defaults to `false`.
+- **Dependency-Track now finds CVEs for purl/language dependencies via an opt-in OSV mirror** (closes #1972). On first bootstrap, `docker/init-dtrack.sh` enabled only the NVD mirror (`nvd.api.enabled`). NVD matches by **CPE**, so purl-based application dependencies (Maven, PyPI, npm, Go, NuGet, RubyGems, crates.io, Packagist, ...) produced few or no findings and Dependency-Track looked empty for application code even though Artifact Keeper submits well-formed purls in the CycloneDX BOM (`build_dependency_info_from_packages` -> `pkg:{type}/{name}@{version}`, `format_to_purl_type` covers every OSV ecosystem). OSV matches by **purl** and aggregates GitHub Security Advisories, PyPA, RustSec, Go and npm advisories. A new `DTRACK_INIT_OSV_ENABLED` toggle (default off, mirroring the opt-in resource posture of the bundled DT itself, #1432) enables `google.osv.enabled` for the ecosystems Artifact Keeper hosts; the ecosystem list is overridable via `DTRACK_INIT_OSV_ECOSYSTEMS`. Wired through `docker-compose.yml` and documented in `.env.example`. Covered by new phases in the `docker/test-init-dtrack.sh` regression harness (NVD-still-on + OSV-off by default, OSV-on with the full ecosystem list under the toggle, and a custom ecosystem override).
+
+### Changed
+
+- **Performance pass on hot paths**: Maven HTTP cache headers, moka in-memory cache and a GAV index (#2079, #2100), plus skipping the always-missing artifacts lookup for remote repos (#2104); negative-caching of repos with no upstream credentials (#2106); quarantine per-repo config resolution cached off the hot path (#2109); `last_login_at` DB writes throttled to reduce WAL pressure (#2133); catalog upsert collapsed to two statements on the cached-remote write path (#2134); cold-negative virtual fan-out parallelized using the member's format (#2069, #2074).
+- **The scanner-adapter image now carries its own independent semver** (starting at 1.0.0) (#2123).
+
+### Fixed
+
+- **SAML SP now binds the IdP-asserted response delivery target and enforces single-use InResponseTo** (#2096). The ACS callback previously validated status, issuer, audience, time window and XML signature, but ignored the response `Destination`, the assertion `SubjectConfirmationData` `Recipient`, and the `InResponseTo` correlation to the AuthnRequest it issued. The SP now (a) rejects a response whose `Destination` or assertion `Recipient` does not match this SP's own ACS URL — enforced only when a trusted ACS URL is available (`AK_EXTERNAL_URL` set) and the IdP actually asserted the attribute, so permissive IdPs and deployments without a trusted external URL are unaffected; and (b) requires every response to carry an `InResponseTo` that matches a pending, unexpired, not-yet-consumed AuthnRequest the SP itself minted, persisted as a single-use SSO session. This closes SAML response/assertion redirection and replay, and rejects unsolicited (IdP-initiated) assertions — AK is SP-initiated only. No new migration (reuses `sso_sessions`); no wire-format change for the flag-off default path.
+- **Overload shedding**: sqlx pool-acquire timeouts map to 503 instead of 500 across the error type (#2101) and format handlers (#2102), and to 503 instead of 401 in the auth pre-check (#2139).
+- **Quarantine**: upload-time hold applied across all hosted formats via a shared helper (#2138), and the presigned-redirect fast path is gated on quarantine hold (#2075, #2137).
+- **SSO**: opt-in strict SSO enforcement flag (#2018) so operators can disable the local-login break-glass; flaky scan-dedup DB test stabilized (#2000) (#2131).
+- **Admin**: promote scope is grantable, webhook-secret errors return 4xx, signing-key repository validation (#2127).
+- **Auth/Conan**: OIDC auto-create toggle honored; Conan package-search route added (#2128).
+- **Dart/Maven**: `dart pub publish` handshake fixed; Maven proxy reserved-prefix probe (#2130).
+- **Proxy**: multipart ETags tolerated in pull-through cache revalidation (#2132).
+- **Terraform**: hardened mirror URL handling (#2094).
+- **Scanner**: image-vuln scanners gated on OCI config mediaType (#2113).
+- **Migration**: report served for completed jobs; typed 4xx on source-client build failure (#2136).
+- **Peers**: Maven package metadata replicates to peers (#2153).
+- **Compose**: hardened backend starts without a `/bin/sh` entrypoint (#2126).
+
+### Security
+
+- **quick-xml bumped to 0.41 for XML-parser DoS hardening** (#2160).
+
+## [1.2.4] - 2026-07-01
+
+### Added
+
+- **In-house multi-arch Trivy Harbor scanner adapter** (#2091, #2092) -- container-image scanning moves to a dedicated adapter sidecar, with the release gate verifying the scanner-adapter image before releasing (#2115).
+- **Private-repo image scans via short-lived repo-scoped tokens** (#2098).
+
+### Fixed
+
+- **Migration**: Artifactory FEDERATED repos map to the Local repository type (#2030); leading `/` stripped from Nexus asset paths (#2026, #2037); absolute `storage_path` stored for auto-provisioned repos (#2029).
+- **PyPI**: PEP 691 JSON served with upload-time for proxied simple indexes (#1944).
+
+### Security
+
+- **Container images are scanned via the Harbor adapter and fail closed** (#2088, #2090) -- fixes the trivy false-clean regression introduced by the runtime-image hardening in #2059, where image scans silently reported clean.
+- **Per-member authorization enforced on PyPI virtual repo downloads** (#2073, #2087).
+- **API token writes are blocked in demo mode** (#2071).
+- **Startup requires absolute `STORAGE_PATH`/`SCAN_WORKSPACE_PATH` for the filesystem backend** (#2089).
+
+## [1.2.3] - 2026-06-29
+
+### Fixed
+
+- **Storage health probe is concurrency-safe with reduced probe churn** (#2050).
+- **Curation rules OpenAPI schema reconciled with the handler, plus a by-id read** (#2052).
+- **Proxy-cached Maven artifacts are indexed into the package catalog** (#1999, #2051), and the proxy cache is purged on repository delete (#2055).
+- **Scanner: local OCI images scan with Grype without internal registry auth** (#2054).
+
+### Security
+
+- **Repository visibility honors fine-grained permission grants** (#2049).
+- **Promotion-only gate enforced on all format-native publish paths** (#2045), closing direct-publish bypasses of the release-promotion workflow.
+- **Rate limiting: `X-Forwarded-For` is only trusted from configured trusted-proxy CIDRs, with a `ConnectInfo` assertion at startup** (#2046), so clients can't spoof their source IP to evade limits.
+- **Hardened backend runtime image** (#2059) and wasmtime bumped 36.0.11 -> 36.0.12 (RUSTSEC-2026-0188) (#2065).
+
+## [1.2.2] - 2026-06-25
+
+Security-focused patch release hardening authorization, the promotion workflow, and scanner correctness.
+
+### Security
+
+- **Admin authorization derives from the server-side role, not the JWT claim** (#1939).
+- **Object-level authorization enforced on webhook endpoints** (#1942).
+- **Promotion workflow hardening**: `promotion_rules` enforced on manual single and bulk promote (#1940); an approved approval request is required and consumed before promote (#2006); promotion-only repos reject all direct artifact uploads (#2005); rule authoring restricted to admins with `auto_promote` defaulting to false (#2013); tenant-ownership check on the promote target plus separation-of-duties on approval (#1961).
+- **Release-immutability can no longer be swapped via delete + re-upload of different content** (#1941).
+- **`/system/config` disclosure restricted and fail-open auth gates closed** (#1960).
+- **Per-token ownership enforced on repository token read/revoke** (#1974).
+- **Per-user/tenant ownership enforced across the migration subsystem** (#2007).
+- **Peers: PUT labels authorized (BOLA/cross-tenant) and self-referential probes return 4xx** (#1963).
+- **Outbound SSRF validator blocks the RFC 6598 CGNAT range (100.64.0.0/10)** (#1968).
+- **Rate limiting**: search rate limit keyed per authenticated user, not per IP (#1962); the login rate limiter is per-identifier so junk floods cannot lock out all accounts (#1979).
+- **`repository:admin` required to change the proxy cache TTL** (#1985).
+- **PyPI HTML escaping covers apostrophes** (#1981); quinn-proto bumped for RUSTSEC-2026-0185 (#1969).
+
+### Fixed
+
+- **Auth**: baseline `user` role seeded for federated role mapping (#1919); mandatory first-login password-change flow allowed through the 428 gate (#1993), with the self-lookup exemption anchored to the exact `/auth/me` route (#2014); LDAP env bootstrap no longer duplicates an existing provider (#1984).
+- **SSO**: OIDC discovery may reach configured private-IP IdPs (#1891, #1953).
+- **Scanning**: Grype accepts bare-string licenses (#1929); Trivy image scan targets qualified with the owning repository key (#1965); Grype OCI scans on docker repos use a repo-scoped image ref (#1903, #1952); OCI image indexes resolve to a concrete child platform before scanning (#1971, #1992); scan-dedup short-circuit made atomic under concurrency (#1989).
+- **Maven**: `WWW-Authenticate` headers included in guest-access 401s (#1920); metadata resolution centralized for remote and virtual repos (#1922); hosted Maven repositories made production-ready (#1907); virtual fall-through to remote-only POMs pinned by test (#1562, #1986).
+- **npm**: abbreviated metadata served with response compression (#1931, #1932).
+- **Proxy**: proxy-cache downloads presign via the no-prefix backend instead of streaming (#1555, #1917).
+- **Peers/migration**: repository-to-peer assignment repaired (DATABASE_ERROR) (#1954); migration-connection/job create repaired (DATABASE_ERROR) (#1959).
+- **Lifecycle**: `repository_id` required at policy create for repo-scoped policy types (#1850, #1951); the sole `oci_tags` row protecting a live image is retained (#1987).
+- **Quota**: `quota_bytes` 0/null treated as unlimited with corrected usage accounting (#1970).
+- **Robustness**: 400 on over-length artifact paths and migration-connection input (#1967); free-text search sanitized into a valid tsquery so search endpoints cannot 500 on metacharacters (#1991).
+- **Uploads**: `artifact_version` derived on chunked uploads to format repos (#1983).
+- **Conan**: recipe/package revisions resolved from upstream for remote repos (#1990).
+- **Base URL**: external base URL derived from the HTTP/2 authority (#1921).
+- **OpenAPI**: quarantine reject given a unique operationId, unblocking SDK publishing (#1937).
+
+### Changed
+
+- **Docker images hardened**: bundled trivy bumped to 0.71.2, base OS errata refreshed, residual scanner CVEs documented (#2004).
+- **Docs**: `QUARANTINE_ENABLED` mode documented (#1976); `tag_pattern_keep` clarified as a deletion policy, not protection (#1980); Bearer vs Basic auth asymmetry documented for `/api/v1` and format endpoints (#1978); `PORTFOLIO_MANAGEMENT` added to the Dependency-Track permission hint (#1977).
+
+## [1.2.1] - 2026-06-21
+
+Large patch release: credential-invalidation hardening (sub-second token-invalidation precision), a broad authorization/security wave, streaming downloads across formats, proxy-cache correctness, and multi-format fixes.
+
 ### Security
 
 - **PyPI virtual repositories now isolate locally-owned project names by default (PEP 708 dependency-confusion mitigation)** (#1600). Previously, when a local member owned a project name, a virtual repo could union an unrelated upstream package of the same name into its `/simple/` index and serve it on download, so an unpinned `pip install <name>` could resolve to the higher public version (a supply-chain hole). A PyPI virtual now serves only the owning member's distributions for a locally-owned name, in both the simple index and the download, unless an operator declares a PEP 708 `tracks` relationship for that project. The Simple API now advertises v1.2 and emits `meta.tracks` / `pypi:tracks` where declared.
@@ -19,6 +222,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
   Names a local member does not own are unaffected and continue to proxy normally.
+- **Authorization hardening across the API surface**: authentication required for group read endpoints (#1756); admin required for plugin install/lifecycle (#1759), curation policy writes (#1760), direct artifact promotion (#1761), repository signing-key management (#1762), mutating `/quality/*` routes (#1805, #1814), and HTTP license-policy create/delete to match the gRPC gate (#1869); per-repo authorization on artifact access -- private repos are members-only (#1764) -- and on `/tree` and `/search` (#1803, #1813); per-member authorization on virtual repo downloads (#1804, #1816); private-repo authorization when minting repo-scoped tokens (#1783, #1786); repository write authorization on chunked upload sessions (#1833, #1834); repository visibility on artifact label endpoints (#1835) and the packages listing/detail (#1836); write authorization on OCI v2 blob/manifest writes (#1837); repository-admin permission for virtual-repo member mutations (#1830); repository tenant ownership enforced on all write paths independent of fine-grained RBAC (#1867); admin required for federation writes with the SSRF allowlist applied to peer `endpoint_url` (#1868); rule-less private repositories no longer default-allow in the native middleware (#1802, #1817); the anonymous repo-existence oracle on native paths is closed (#1808, #1812).
+- **SSRF hardening**: hostnames in the URL allowlist resolve to block internal targets (#1763); the allowlist applies to LDAP provider config and connectivity tests (#1831), OIDC issuer URLs on config write and discovery fetch (#1832), and Artifactory `downloadUri` (#1423, #1750).
+- **Session/credential hardening**: sub-second precision for credential-change token invalidation with a millisecond issued-at claim (#1933, #1934); tokens invalidated on admin/role privilege change (#1821, #1827); the refresh-token family is revoked on logout (#1807, #1811); `must_change_password` enforced in the auth middleware (#1818, #1824); the TOTP 2FA verify path hardened (#1819, #1820, #1822, #1825) and TOTP bcrypt offloaded to the capped auth path with a global concurrency/timeout backstop (#1897); correct credentials are allowed past the failed-login lockout (#1871); admin break-glass local login preserved when SSO is enabled (#1873); JWT secret strength validated at startup in all environments (#1766, #1829, #1840).
+- **Supply chain**: plugin install enforces signature verification and rejects unsigned WASM (#1892); deletion of immutable released artifacts is blocked (#1765) and the replication delete exemption requires a trusted identity (#1895); the quarantine package-age policy applies to remote/proxy downloads and is based on release date (#1841); Helm gzip/tar decompression capped to prevent DoS (#1806, #1815); group read endpoints scoped to caller membership/grants for non-admins (#1896).
+- **PyPI dependency confusion**: local-precedence for the virtual simple index (#1600, #1738) with PEP 708 mitigation (#1613) -- see the headline entry above.
+
+### Added
+
+- **Per-artifact cache metadata on `GET /:key/artifacts/:path`** (#1541, #1542) and an HTTP endpoint for proxy cache invalidation (#1539, #1540).
+- **Storage GC for OCI blobs**: read-only blob footprint report and orphan blob-layer reclaim via the new `manifest_blob_refs` table with push-write and startup backfill (#1408, #1409, #1621, #1635, #1641, #1655).
+- **Proxy cache correctness**: immutable/mutable classifier with conditional revalidation (#1611, #1708, #1732) and single-flight coordination with streaming broadcast fan-out (#1631).
+- **Proxy cache lookup observability** (#1263 follow-up) -- adds `ak_proxy_cache_lookups_total{repository, result}` Prometheus counter and explicit structured logs on every branch of the fresh proxy-cache read (`CacheStore::get` with `allow_stale = false`, behind `get_cached_artifact`). The `result` label is one of `hit`, `miss_no_metadata`, `miss_expired`, `miss_no_content`, `miss_checksum_mismatch`, or `error`, covering every previously-silent cache-miss reason. Only the fresh per-request lookup is counted; the stale-fallback body read is excluded so revalidated entries are never double-counted. Operators investigating "why are repeat fetches not getting cache hits" can chart `rate(ak_proxy_cache_lookups_total[5m])` by `result` and isolate the responsible branch without redeploying with debug logs. Repository label cardinality is bounded by the operator's repo count, matching the shape of existing `ak_artifact_downloads_total`. The previously-existing `Cache hit`/`Cache expired`/`Cache checksum mismatch` log lines are preserved as structured-field events so log scrapers that already grep for them keep working.
+- **`promotion_only` write policy on repositories** blocks direct release writes (#1769).
+- **OIDC**: custom `OIDC_NAME` (#1397), `OIDC_DEFAULT_ROLE`, and `OIDC_GROUP_ROLE_MAP` wired into the admin check (#1745).
+- **`RATE_LIMIT_ENABLED` master off switch** (#1602, #1739).
+- **`not_applicable` terminal scan status** (#1470, #1693).
+- **Terraform provider network mirror protocol for remote repos** (#1730).
+- **npm dist-tags are persisted and served, with `latest` derived by semver, not recency** (#1557).
+- **Incus: `.tar.zst` accepted as a unified-tarball image extension** (#1296).
+- **Debian hosted repositories made production-ready** (#1741).
+
+### Changed
+
+- **Streaming end-to-end**: artifact downloads stream across all package formats (#1393), OCI blob pulls and uploads stream through the storage backend (#1534, #1448), the generic local-serve path streams (#1713), remaining full-body buffers stream (#1736), and PyPI remote package downloads stream instead of buffering in memory (#1866).
+- **Proxy subsystem refactor** into `CacheKeys`/`CacheStore`/`CachePersister`/`UpstreamClient` seams (#1618 series).
+- **S3 adaptive multipart part sizing lifts the ~50 GiB upload ceiling** (#1701).
+
+### Fixed
+
+- **Promotion gates**: `block_unscanned` honored and fail-closed on unscanned artifacts for manual and auto promotion (#1643, #1648, #1728), fires on failed/pending scans (#1649, #1750); the open-CVE gate repointed from the never-populated `cve_history` to `scan_findings` (#1640); the scan-on-proxy gap is surfaced instead of silently skipped (#1274, #1650); legacy CVE-status acks fall back to `scan_findings` (#1561, #1692).
+- **OCI**: manifests served and deleted by digest independent of tags (#1684); final blob key journaled so a failed `oci_blobs` commit can't orphan it (#1711); `manifest_blob_refs` backfill runs in the background at startup (#1642, #1749).
+- **Repository delete**: storage objects deleted and FKs cascaded (#1598), with OCI keys excluded from the purge (data-loss regression fix, #1724).
+- **Migration**: Nexus enum-type mapping (#1575); Maven/sbt group prefixes preserved (#1586); JFrog forward-port consolidated (#1420); artifact downloads spill under `STORAGE_PATH`, not `/tmp` (#1699, #1702); Nexus migrations unblocked for empty `include_repos` and repo-type aliases (#1902).
+- **Format fixes**: npm cache metadata looked up under the upstream URL path (#1580, #1581), `/-/<meta>` requests routed to the npm meta handler (#1885); PyPI version-aware shadowing guard for virtual downloads (#1584); Swift virtual package lookups across members (#1554, #1734); Composer p2/p metadata for virtual repositories (#1715, #1740); Maven remote checksum lookups (#1549), empty artifact paths forwarded upstream (#1884), group-level plugin-prefix `maven-metadata.xml` via virtual repos (#1842), artifact-level metadata checksums proxied upstream (#1775, #1791); sbt short-filename parsing with storage-fallback security gates (#1900).
+- **Format QA waves** resolving reported bugs across npm (#1774), cargo (#1777), rpm (#1780), pypi (#1773), helm (#1779), nuget (#1778), oci (#1776), composer (#1781), generic/go/conda (#1782), scanning-lifecycle (#1784), repos-rbac-auth (#1783), and health/metrics (#1785).
+- **OIDC/SSO**: the +1 watermark offset that self-invalidated tokens after OIDC login removed (#1915); env-managed OIDC/LDAP providers reconciled on every boot (#1661); IdP error redirects handled on callback per RFC 6749 (#1662); roles.name cast to text in the role-mapping privilege probe (#1888).
+- **Incus**: large uploads staged under `STORAGE_PATH` with orphan reaping wired into the hourly scheduler (#1573, #1622, #1654, #1751); uploads finalize on a background task returning 202 with observable status (#1494); HTTP Range honored on image download (#1848).
+- **Uploads**: `total_size` bounded and repository quota enforced at upload-session creation (#1870); truncated streamed cache writes rejected (#1912, #1913).
+- **Peers**: peer replication sync worker and ranged reads hardened (#1665); hosted Debian and PyPI packages replicate to peers (#1810, #1865).
+- **DB/infrastructure**: pooled Postgres connections failing a liveness probe are evicted (#1878); object-level GCS health probe (least-privilege) (#1737); 503 preserved on the API-token auth branch under bcrypt saturation (#1843); cached-artifact listing paginates without O(N) sidecar loads and guards `per_page=0` (#1571, #1747).
+- **Scanning**: repository passed to the Grype scanner for OCI artifacts (#1664); writable shared scan-workspace volume for the non-root backend (#1563, #1697); openscap rootfs pulls el9_8 z-stream errata (#1544, #1733); Dependency-Track API-key team permissions ensured (#1530, #1531).
+
+## [1.2.0] - 2026-06-02
 
 ### Pre-upgrade check
 
@@ -44,16 +290,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Proxy cache lookup observability** (#1263 follow-up) -- adds `ak_proxy_cache_lookups_total{repository, result}` Prometheus counter and explicit structured logs on every branch of the fresh proxy-cache read (`CacheStore::get` with `allow_stale = false`, behind `get_cached_artifact`). The `result` label is one of `hit`, `miss_no_metadata`, `miss_expired`, `miss_no_content`, `miss_checksum_mismatch`, or `error`, covering every previously-silent cache-miss reason. Only the fresh per-request lookup is counted; the stale-fallback body read is excluded so revalidated entries are never double-counted. Operators investigating "why are repeat fetches not getting cache hits" can chart `rate(ak_proxy_cache_lookups_total[5m])` by `result` and isolate the responsible branch without redeploying with debug logs. Repository label cardinality is bounded by the operator's repo count, matching the shape of existing `ak_artifact_downloads_total`. The previously-existing `Cache hit`/`Cache expired`/`Cache checksum mismatch` log lines are preserved as structured-field events so log scrapers that already grep for them keep working.
 - **Stuck-scan janitor** (#1015) -- new `ScanResultService::cleanup_stuck_scans` background job registered in `scheduler_service::spawn_all` (90s startup delay, 600s default cadence) transitions `scan_results` rows wedged in `status='running'` past `STUCK_SCAN_THRESHOLD_SECS` (default 1800) to `status='failed'`. Configurable via `STUCK_SCAN_THRESHOLD_SECS` and `STUCK_SCAN_CHECK_INTERVAL_SECS` env vars. Emits the existing `ak_cleanup_items_removed_total{type="stuck_scans"}` counter. Forward-ported from `release/1.1.x` PR #1064.
 - **Stuck-scan janitor partial index** (#1061) -- migration `105_partial_index_running_scans.sql` adds `idx_scan_results_running_started ON scan_results (started_at) WHERE status = 'running'`. The janitor sweep added in #1015 filters on `status='running'` without a `repository_id` predicate, which would degrade on installs with very large `scan_results` tables. The partial index only contains in-flight rows so the planner goes straight to the candidates. `CREATE INDEX CONCURRENTLY` is intentionally not used because `sqlx::migrate` runs each migration in a transaction; in-flight rows are bounded by the janitor itself so the synchronous build is short.
 - **Audit-event emission on stuck-scan reap** (#1063) -- `ScanResultService::cleanup_stuck_scans` now writes one `SCAN_REAPED` entry to `audit_log` per reaped row, capturing `scan_id`, `artifact_id`, `repository_id`, `started_at`, `reaped_at`, `threshold_secs`, and `reason='stuck_running_janitor'` in the `details` JSON column. Previously the janitor emitted only the `ak_cleanup_items_removed_total{type="stuck_scans"}` counter, so operators investigating an incident could not tell which vulnerability scans never completed. Audit writes are best-effort: a failure to record the event is logged at warn level but does not roll back the reap, since leaving the row wedged in `running` is the worse outcome. Adds `AuditAction::ScanReaped` and `ResourceType::ScanResult`.
 - **Auth: download-ticket consumer middleware** (#930) -- the `?ticket=<v>` query parameter minted by `POST /api/v1/auth/ticket` is now accepted as a fallback authenticator on read routes (`auth_middleware`, `optional_auth_middleware`, and `repo_visibility_middleware`). Tickets are single-use, expire after 30 seconds, are restricted to GET/HEAD methods, and only authenticate the request whose URL path matches the ticket's bound `resource_path`. Useful for browser anchor-tag downloads and `EventSource` SSE streams where `Authorization` headers cannot be set.
-- **OIDC providers can opt into accepting ID tokens signed with RSA keys shorter than 2048 bits** via the new per-provider `allow_legacy_rsa_keys` flag (migration 144, defaults to `false`). The strict signature path goes through `jsonwebtoken` + `aws_lc_rs`, which enforces RFC 7518's effective baseline by rejecting every RSA modulus below 2048 bits. That keeps Artifact Keeper aligned with NIST SP 800-131A Rev.2 (RSA < 2048 disallowed since 2014) and OWASP ASVS 4.0 V6.2.5 by default, but leaves legitimate operators stranded when the IdP still publishes a 1024-bit RSA key on its JWKS (e.g. Lark AnyCross's OIDC offering at time of writing). When the flag is enabled on a specific provider, the ID token signature is verified through a restricted manual `rsa` + `sha2` PKCS#1 v1.5 path that accepts RS256, RS384, or RS512 only; PS* (RSA-PSS), ES* (ECDSA), and HS* (HMAC) tokens never engage the legacy branch regardless of the flag. The audience, issuer, expiry and nonce checks remain in force on the fallback path. Operators who do not turn the flag on see the strict path's exact pre-144 behaviour with no change.
 
 ### Fixed
 
-- **Dependency-Track now finds CVEs for purl/language dependencies via an opt-in OSV mirror** (closes #1972). On first bootstrap, `docker/init-dtrack.sh` enabled only the NVD mirror (`nvd.api.enabled`). NVD matches by **CPE**, so purl-based application dependencies (Maven, PyPI, npm, Go, NuGet, RubyGems, crates.io, Packagist, ...) produced few or no findings and Dependency-Track looked empty for application code even though Artifact Keeper submits well-formed purls in the CycloneDX BOM (`build_dependency_info_from_packages` -> `pkg:{type}/{name}@{version}`, `format_to_purl_type` covers every OSV ecosystem). OSV matches by **purl** and aggregates GitHub Security Advisories, PyPA, RustSec, Go and npm advisories. A new `DTRACK_INIT_OSV_ENABLED` toggle (default off, mirroring the opt-in resource posture of the bundled DT itself, #1432) enables `google.osv.enabled` for the ecosystems Artifact Keeper hosts; the ecosystem list is overridable via `DTRACK_INIT_OSV_ECOSYSTEMS`. Wired through `docker-compose.yml` and documented in `.env.example`. Covered by new phases in the `docker/test-init-dtrack.sh` regression harness (NVD-still-on + OSV-off by default, OSV-on with the full ecosystem list under the toggle, and a custom ecosystem override).
 - **SBOM generation now includes the artifact's declared dependencies and stops emitting authoritative empty inventories** (closes #870). The SBOM read path sourced components only from scanner output (`scan_packages`, then `scan_findings`). An artifact a scanner could not enumerate, a bare Maven `.jar` with no lockfile, or any upload that was never scanned, produced an SBOM with `"components": []` that was indistinguishable from a genuinely dependency-free artifact, which the reporter correctly flagged as a security problem. SBOM generation now adds a second source: the artifact's own declared dependencies, parsed from its manifest. Maven direct dependencies come from the stored POM metadata (with a fallback that reads the sibling `.pom` from object storage and resolves `${property}` versions against the POM's own `<properties>`); npm dependencies come from `package.json` (`dependencies` + `optionalDependencies`, excluding `devDependencies`); Helm dependencies come from `Chart.yaml`. Declared dependencies are merged with scanner output (deduplicated by purl, scanner data winning), and the document carries an honest completeness signal: `complete` (full scanner inventory), `declared` (direct deps only, no scanner inventory), `partial` (CVE-only findings, or unresolved declared versions), or `none` (no source at all). Both the on-demand `POST /api/v1/sbom/generate` endpoint and the on-scan Dependency-Track submission path use the merged source. Scope: declared dependencies are direct only (transitive resolution remains the scanner's job), and versions managed by a parent or `dependencyManagement` BOM that is not in the registry are emitted with a null version and mark the SBOM `partial`. This change also fixes a latent bug where any POM declaring `<properties>` failed to parse entirely (`invalid type: map, expected a string`), which previously rejected such uploads at validation and left their metadata without dependencies. The declared-dependency lookups also cast the `repository_format` enum column to text in SQL (`format::text`); without the cast the query failed to decode into a Rust `String` and the error was silently swallowed, so the declared-dependency source produced nothing and the SBOM still came back empty. These query paths now log on failure instead of degrading silently. Reported by @Firjens and @flopma.
 - **OpenSCAP scanner accepts the default scan workspace path out of the box** (closes #1466). The wrapper sidecar (`scripts/openscap-wrapper.py`) validates incoming scan paths against `OPENSCAP_ALLOWED_SCAN_DIRS`, which defaulted to `/tmp/:/var/tmp/`. The backend, however, writes per-artifact scan workspaces under `SCAN_WORKSPACE_PATH` (defaults to `/scan-workspace`) and sends that path to the wrapper, so every fresh docker-compose and Helm install hit `HTTP 400 {"error": "scan path not found or not allowed"}` on first Docker/OCI scan unless the operator knew to set the env var. The wrapper's default allowlist now includes `/scan-workspace/` alongside the previous `/tmp/` and `/var/tmp/` entries, so the default deployment topology works without per-deployment tweaks. Operators who customise `SCAN_WORKSPACE_PATH` or want a stricter allowlist can still override via `OPENSCAP_ALLOWED_SCAN_DIRS`. The backend's HTTP-400 surface in `services::openscap_scanner::call_openscap` also now includes the rejected path in the error chain so future allowlist mismatches are debuggable from backend logs alone, without enabling wrapper-side debug logging. Three new unit tests in `openscap_scanner::tests` cover the prepare-and-scan happy path (asserting the request body carries the configured workspace path), the workspace-under-base invariant, and the error-message-includes-rejected-path invariant.
 - **Incus image scanner can scan real multi-GiB OS images again** (closes #1492, follow-up to #1428). The extraction hardening added in #1428 made the `incus-image` scanner reject every legitimate `incus export` OS rootfs: the compressed-size cap was 2 GiB (a real image is several GiB compressed), the post-extraction guard walked the tree as the non-root scanner UID and hit `EACCES` on a real rootfs's restrictive modes (combined with `--no-same-owner` extraction and tar's implicitly-created parent dirs that miss the archive `--mode`), and the symlink-traversal guard resolved absolute targets against the host root, so the ubiquitous `/var/run -> /run` present in essentially every OS rootfs was flagged as escaping the workspace. Three changes, with the decompression-bomb guards kept in force: (1) the compressed and extracted byte caps are now env-tunable (`MAX_INCUS_SCAN_COMPRESSED_BYTES` / `MAX_INCUS_SCAN_EXTRACTED_BYTES`) with OS-image-sized defaults (16 GiB compressed / 64 GiB extracted); (2) the extracted tree is made owner-traversable (`u+rwX`) before the guard walk and the trivy scan, done in-process via `symlink_metadata` so the chmod never follows a symlink target out of the workspace (which a `chmod -R` would); (3) absolute symlink targets are re-rooted under the workspace (chroot semantics) so `/run` resolves in-tree and is accepted, while `../`-style targets that normalise outside the workspace are still rejected. Adds unit tests for the env-cap resolver, the owner-traversable walk over a `0o000` tree, the guard passing a restrictively-permissioned tree, acceptance of absolute intra-rootfs links, and rejection of both relative and absolute climbing-out escapes. The silent-completion gap the reporter also noted (a failed format-native scanner still rolling up to an overall `completed` status) is tracked separately as #1497.
@@ -70,12 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`upload_chunks.status` check constraint now accepts `'uploading'` (closes #1168, part 2)**. Migration 072 created the table with `CHECK (status IN ('pending','completed','failed'))`, but the chunked-upload service in `services/upload_service.rs` atomically claims chunks via `UPDATE ... SET status = 'uploading' WHERE status = 'pending'` before writing data, then sets `'completed'` or `'failed'` after the write. The first PATCH against any chunk therefore aborted with `new row for relation "upload_chunks" violates check constraint`, surfacing in the browser as "upload big file failed because of database table error". Migration 089 drops and re-adds the constraint with the full status set (`'pending','uploading','completed','failed'`); the constraint is looked up via `pg_constraint` rather than by hard-coded name so prior fix migrations under non-default names are still handled.
 - **Chunked upload finalize writes to the repo-scoped, content-addressable storage key (closes #1168, parts 1 and 3)**. Two bugs interacted: the create-session handler queried `SELECT id FROM repositories WHERE key = $1 AND is_deleted = false`, but `repositories` has no `is_deleted` column (the soft-delete pattern lives on `artifacts`, not `repositories`), so the lookup failed with a SQL error before any chunks could be uploaded. The `AND is_deleted = false` clause is removed. Second, the `complete` handler called `state.storage.put_file("uploads/<repo_id>/<path>", ...)` against the global default backend (no repo path prefix), while `download_artifact` resolves via `state.storage_for_repo(&repo.storage_location())` which prepends the repo's `storage_path`. The two paths never agreed, so a 201-CREATED chunked upload could not be downloaded. Finalize now resolves the repo-scoped backend and writes using `ArtifactService::storage_key_from_checksum` (`<sha[:2]>/<sha[2:4]>/<sha>`), matching how non-chunked uploads land on disk.
 - **Migration runner recovers from the legacy duplicate-073 state without operator intervention (closes #1129)**. Between PRs #975 and #1138 the migrations directory contained two files numbered 073 (`073_account_lockout.sql` and `073_download_tickets_cascade.sql`). `sqlx migrate run` only inserts one row per version, and which checksum landed in `_sqlx_migrations` depended on filesystem-walk order, so installs that bootstrapped in that window now refuse to start with `Migration(VersionMismatch(73))` even though the `account_lockout` columns are physically present on `users`. The backend now runs a pre-migration repair step at startup: if `_sqlx_migrations` already has a version-73 row whose checksum doesn't match the current `073_account_lockout.sql`, and the `users.failed_login_attempts` column is present (proof account_lockout was applied at least once), the checksum is rewritten to the current value and the migrator continues. The check is conservative; unrelated checksum drift still aborts startup so accidental tampering surfaces loudly.
-
 - **`POST /v2/token` now accepts OAuth2 password-grant credentials in the form body** (#894). Docker's distribution token endpoint flow uses `Content-Type: application/x-www-form-urlencoded` with `grant_type=password&username=...&password=...&service=...&scope=...` in the request body, but the handler previously read credentials only from the HTTP Basic Auth header and returned the anonymous token when the body carried the credentials. Result: `docker push` to a private repository failed with `unauthorized` because the OCI client received an anonymous token despite valid credentials. The handler now extracts username and password from the form body when no Basic Auth header is present, accepts `application/x-www-form-urlencoded` (with optional charset suffix), validates `grant_type=password` when supplied, and falls through to the existing Bearer / anonymous flow on any malformed input. No protocol regression: existing Basic Auth and Bearer-refresh paths are unchanged.
-
-- **SAML SP now binds the IdP-asserted response delivery target and enforces single-use InResponseTo** (#2096). The ACS callback previously validated status, issuer, audience, time window and XML signature, but ignored the response `Destination`, the assertion `SubjectConfirmationData` `Recipient`, and the `InResponseTo` correlation to the AuthnRequest it issued. The SP now (a) rejects a response whose `Destination` or assertion `Recipient` does not match this SP's own ACS URL — enforced only when a trusted ACS URL is available (`AK_EXTERNAL_URL` set) and the IdP actually asserted the attribute, so permissive IdPs and deployments without a trusted external URL are unaffected; and (b) requires every response to carry an `InResponseTo` that matches a pending, unexpired, not-yet-consumed AuthnRequest the SP itself minted, persisted as a single-use SSO session. This closes SAML response/assertion redirection and replay, and rejects unsolicited (IdP-initiated) assertions — AK is SP-initiated only. No new migration (reuses `sso_sessions`); no wire-format change for the flag-off default path.
-
-- **SAML providers can opt into emitting an absolute `AssertionConsumerServiceURL`** via the new per-provider `use_absolute_acs_url` flag (migration 139, defaults to `false`). The `saml_login` and `saml_acs` handlers historically emitted the relative path `/api/v1/auth/sso/saml/<id>/acs` in the AuthnRequest's `AssertionConsumerServiceURL` attribute and used the same string when validating the IdP-asserted Destination/Recipient on the ACS callback. Stricter SAML 2.0 IdPs (and certain enterprise deployments) reject a relative ACS URL outright, so those IdPs were unreachable without rebasing the URL onto the SP origin. When the new flag is enabled on a SAML provider, the ACS URL is prefixed with the operator-configured `AK_EXTERNAL_URL` (a trusted process-env source, never derived from `Host` / `X-Forwarded-Host` request headers — those would let an attacker steer the signed AuthnRequest's `AssertionConsumerServiceURL` toward a hostile origin). If the flag is on but `AK_EXTERNAL_URL` is unset, the handler fails closed to the historical relative form and logs a warning so the misconfiguration is visible. Existing providers keep their pre-139 wire format unchanged because the flag defaults to `false`.
 
 ### Changed
 
@@ -293,9 +531,6 @@ Community contributors who shipped fixes in this release candidate:
 - **`dtrack-init`: post-upgrade orphaned-key hygiene check** (#1039) -- during Kubernetes rollouts two init containers can race against the same `Automation` team and create two keys, leaving one orphaned (still a valid bearer credential against the DT API until the next cold-start rotation deletes it). The orphan window can be days or weeks in a stable cluster, and an orphan that leaks via a backup, screenshot, or log scrape remains a fully-valid key for that entire period. After every `helm upgrade`, review `Administration` -> `Teams` -> `Automation` -> `API Keys` in the DT UI and delete any entry whose `publicId` does not match the value recorded in the running pod's `/shared/.dtrack-publicid` (`kubectl exec <pod> -c <init-container> -- cat /shared/.dtrack-publicid`). A leader-election fix that closes the race in code is tracked as a follow-up and will land in a future release.
 
 - **Mock fidelity and assertion coverage in `docker/test-init-dtrack.sh`** (#1041) -- the regression-test mock now returns HTTP 200 on `POST /api/v1/team/{uuid}/key` to match the DT 4.11 swagger contract, and the assertion suite was expanded to cover (a) warm-start short-circuit log content (not just `POST` count), (b) foreign-key refusal and `DTRACK_INIT_FORCE_ROTATE` override paths, (c) an injected 5xx from `POST /key` to exercise the script's negative branch, and (d) absence of half-written `dtrack-api-key` / `.tmp` files after a failed run. The mock-fidelity change alone is **not** drift detection — the init script uses `curl -sf` which accepts any 2xx — but the new explicit response-code assertions in the negative-path test do detect drift in the failure direction.
-
-## [1.2.0] - 2026-04-24
-
 ## [1.1.6] - 2026-04-20
 
 ### Sponsors
@@ -740,7 +975,6 @@ This release includes fixes reported by the community. A special thanks to every
 
 ### Changed
 - Moved `site/` to separate `artifact-keeper-site` repository (#101)
-
 ## [1.0.0-rc.3] - 2026-02-08
 
 Bug fix release resolving 9 issues found by automated stress testing, plus build hygiene improvements.
@@ -762,6 +996,34 @@ Bug fix release resolving 9 issues found by automated stress testing, plus build
 
 ### Changed
 - Documentation gaps filled for v1.0.0-a2 features (#61)
+
+## [1.0.0-rc.1] - 2026-02-03
+
+### Added
+- First-boot admin provisioning and Caddy reverse proxy
+- OpenSCAP compliance scanner service
+- Package auto-population and build tracking API
+- httpOnly cookies, download tickets, and remote instance proxy
+- SSO single-use exchange codes for secure token passing
+- Complete SSO auth flows with real LDAP bind, SAML endpoints, and encryption key handling
+- Admin-configurable SSO providers (OIDC, LDAP, SAML)
+- Web frontend service in all docker-compose files
+- Native apps section on landing page with macOS, iOS, Android demos
+
+### Changed
+- Use pre-built images from ghcr.io instead of local builds
+- Rename frontend to web in Docker deployment docs
+- Use standard port 3000 and correct BACKEND_URL env var for web service
+- Clean up operations services and handlers
+- Simplify SSO backend code for clarity and consistency
+
+### Fixed
+- NPM tarball URL and integrity hash in package metadata
+- Hardcoded localhost:9080 fallback URLs removed from frontend
+- Logo transparency using flood-fill to preserve silver highlights
+- Duplicate heading on docs welcome page
+- GitHub links updated to point to org instead of repo
+- CORS credentials support for dev mode
 
 ## [1.0.0-a2] - 2026-02-08
 
@@ -840,31 +1102,3 @@ First public alpha release, announced on Hacker News.
 ### Security
 - Secure first-boot admin password with API lock
 - GitGuardian integration for secret scanning
-
-## [1.0.0-rc.1] - 2026-02-03
-
-### Added
-- First-boot admin provisioning and Caddy reverse proxy
-- OpenSCAP compliance scanner service
-- Package auto-population and build tracking API
-- httpOnly cookies, download tickets, and remote instance proxy
-- SSO single-use exchange codes for secure token passing
-- Complete SSO auth flows with real LDAP bind, SAML endpoints, and encryption key handling
-- Admin-configurable SSO providers (OIDC, LDAP, SAML)
-- Web frontend service in all docker-compose files
-- Native apps section on landing page with macOS, iOS, Android demos
-
-### Changed
-- Use pre-built images from ghcr.io instead of local builds
-- Rename frontend to web in Docker deployment docs
-- Use standard port 3000 and correct BACKEND_URL env var for web service
-- Clean up operations services and handlers
-- Simplify SSO backend code for clarity and consistency
-
-### Fixed
-- NPM tarball URL and integrity hash in package metadata
-- Hardcoded localhost:9080 fallback URLs removed from frontend
-- Logo transparency using flood-fill to preserve silver highlights
-- Duplicate heading on docs welcome page
-- GitHub links updated to point to org instead of repo
-- CORS credentials support for dev mode
