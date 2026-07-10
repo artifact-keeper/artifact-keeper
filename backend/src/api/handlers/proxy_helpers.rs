@@ -3146,6 +3146,53 @@ pub async fn virtual_non_remote_owns_path(
     Ok(exists.is_some())
 }
 
+/// Resolve the local `artifacts` row a virtual-repo content serve delivered,
+/// so the caller can attribute the download to it (#2394 / #2365).
+///
+/// Only meaningful after [`virtual_non_remote_owns_path`] returned `true`:
+/// the caller then suppresses the proxy, Remote members classify as `Skip`,
+/// and [`resolve_virtual_download`] finalizes in strict member-priority
+/// order — so the winning bytes belong to the FIRST non-Remote member (by
+/// `virtual_repo_members.priority`) holding a non-deleted artifact at the
+/// exact path. This query re-derives that row. Remote pass-through has no
+/// local row and stays unrecorded (#1278).
+///
+/// Best-effort: a database error logs at `warn` and yields `None` —
+/// telemetry must never block or fail the download itself.
+pub async fn virtual_local_winner_artifact_id(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    path: &str,
+) -> Option<Uuid> {
+    match sqlx::query_scalar::<_, Uuid>(
+        "SELECT a.id FROM artifacts a \
+         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE vrm.virtual_repo_id = $1 \
+           AND r.repo_type != 'remote' \
+           AND a.path = $2 \
+           AND a.is_deleted = false \
+         ORDER BY vrm.priority \
+         LIMIT 1",
+    )
+    .bind(virtual_repo_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                %virtual_repo_id,
+                path,
+                error = %e,
+                "failed to resolve virtual download attribution; skipping statistics"
+            );
+            None
+        }
+    }
+}
+
 /// Build the SQL `LIKE` pattern that matches every artifact path under
 /// a given Maven `groupId/artifactId/` directory.
 ///
