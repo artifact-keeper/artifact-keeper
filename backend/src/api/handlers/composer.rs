@@ -3268,10 +3268,14 @@ mod metadata_db_tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0]["version"], "1.2.0");
         // dist.url is rewritten to the virtual repo key so downloads route back.
+        // #2361: the URL is ABSOLUTE (RequestBaseUrl-prefixed; the test
+        // request carries no Host header, so the base falls back to
+        // http://localhost) and must still route through the virtual key.
         let url = versions[0]["dist"]["url"].as_str().unwrap();
         assert!(
-            url.starts_with(&format!("/composer/{}/dist/", vf.repo_key)),
-            "dist url must point at virtual repo, got {}",
+            url.starts_with("http://localhost/")
+                && url.contains(&format!("/composer/{}/dist/", vf.repo_key)),
+            "dist url must be absolute and point at virtual repo, got {}",
             url
         );
 
@@ -3398,12 +3402,14 @@ mod metadata_db_tests {
         assert!(packages.contains_key("testvendor/mypackage"));
         assert!(packages.contains_key("testvendor/myplugin"));
         // dist URLs route back through the virtual repo, not the member.
+        // #2361: absolute (RequestBaseUrl-prefixed) but still on the virtual key.
         let url = packages["testvendor/mypackage"][0]["dist"]["url"]
             .as_str()
             .unwrap();
         assert!(
-            url.starts_with(&format!("/composer/{}/dist/", vf.repo_key)),
-            "dist url must point at virtual repo, got {}",
+            url.starts_with("http://localhost/")
+                && url.contains(&format!("/composer/{}/dist/", vf.repo_key)),
+            "dist url must be absolute and point at virtual repo, got {}",
             url
         );
 
