@@ -860,12 +860,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Dependency-Track proxy routes with auth middleware
+        // Dependency-Track proxy routes require admin (#2321 G1).
+        //
+        // Every `dependency_track` handler binds `_auth` and performs no
+        // per-handler authorization, so under `auth_middleware` ANY authenticated
+        // user could list projects/findings and PUT vulnerability analyses on the
+        // external Dependency-Track instance. This is an administrative
+        // integration surface (same tier as the other proxy/integration routers),
+        // so gate the whole nest with `admin_middleware` — which also emits the
+        // `PermissionDenied` audit event on rejection for free.
         .nest(
             "/dependency-track",
             handlers::dependency_track::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
-                auth_middleware,
+                admin_middleware,
             )),
         )
         // Remote instance management & proxy routes with auth middleware
@@ -995,6 +1003,36 @@ mod tests {
         assert!(
             next_middleware.contains("admin_middleware"),
             "plugin install + lifecycle routes must be gated by admin_middleware"
+        );
+    }
+
+    #[test]
+    fn dependency_track_nest_requires_admin() {
+        // #2321 G1: every `dependency_track` handler binds `_auth` and performs
+        // NO per-handler authorization, so under `auth_middleware` any
+        // authenticated user could list projects/findings and PUT vulnerability
+        // analyses on the external Dependency-Track instance. The nest must be
+        // gated by `admin_middleware`. A runtime test would need full app state
+        // + a DB fixture, so pin the routing decision in source (mirrors
+        // `plugin_install_and_lifecycle_require_admin`).
+        let dt_nest = ROUTES_RS_SRC
+            .split("handlers::dependency_track::router()")
+            .nth(1)
+            .expect("dependency_track::router() must be nested under /dependency-track");
+        let next_middleware = dt_nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("dependency_track nest must attach a middleware layer");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "dependency-track proxy routes must be gated by admin_middleware, \
+             not auth_middleware (regression of #2321 G1)"
+        );
+        // Guard against the assertion going vacuously true if the nest is
+        // dropped: the prefix must still be registered.
+        assert!(
+            ROUTES_RS_SRC.contains("\"/dependency-track\","),
+            "/dependency-track nest registration missing"
         );
     }
 }

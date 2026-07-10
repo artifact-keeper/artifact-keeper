@@ -406,6 +406,21 @@ pub async fn create_webhook(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateWebhookRequest>,
 ) -> Result<Json<WebhookSecretCreatedResponse>> {
+    // #2321 G4: creating an outbound webhook provisions an egress target and a
+    // signing secret — a global integration/security action, not something any
+    // authenticated user should do. Require admin BEFORE URL validation, secret
+    // generation, or any DB write, and record the RBAC-deny. Read/list webhook
+    // handlers are unchanged (non-admin owners keep their existing read access).
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::Setting,
+        "/api/v1/webhooks",
+        "POST",
+    )
+    .await?;
+
     // Validate URL (SSRF prevention)
     validate_webhook_url(&payload.url)?;
 
@@ -3760,12 +3775,15 @@ mod tests {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
-            let creator = create_user(&pool, false).await;
+            // #2321 G4: webhook creation is admin-only. Create as an admin
+            // identity; `created_by` is still stamped with that caller, and the
+            // NON-admin owner read path below must keep working for the same id.
+            let creator = create_user(&pool, true).await;
             let state = tdh::build_state(pool.clone(), "/tmp");
 
             let resp = create_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(creator, false)),
+                axum::Extension(auth_for(creator, true)),
                 axum::Json(CreateWebhookRequest {
                     name: format!("created-by-{}", &creator.to_string()[..8]),
                     url: "http://198.51.100.9/hook".to_string(),
@@ -3804,6 +3822,50 @@ mod tests {
             .is_ok());
 
             cleanup(&pool, &[], &[creator]).await;
+        }
+
+        /// #2321 G4 (denial): a non-admin caller cannot create a webhook. The
+        /// gate fires BEFORE URL validation / secret generation / any DB write,
+        /// so a valid request body still returns 403.
+        #[tokio::test]
+        async fn create_webhook_requires_admin() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let creator = create_user(&pool, false).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            let result = create_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(creator, false)),
+                axum::Json(CreateWebhookRequest {
+                    name: "nonadmin-denied".to_string(),
+                    url: "http://198.51.100.9/hook".to_string(),
+                    events: vec!["artifact.created".to_string()],
+                    repository_id: None,
+                    headers: None,
+                    secret: None,
+                    payload_template: Default::default(),
+                    event_schema_version: None,
+                }),
+            )
+            .await;
+
+            // Nothing must have been written.
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM webhooks WHERE created_by = $1")
+                    .bind(creator)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            cleanup(&pool, &[], &[creator]).await;
+
+            assert!(
+                matches!(result, Err(AppError::Authorization(_))),
+                "non-admin create_webhook must be 403, got: {result:?}"
+            );
+            assert_eq!(count, 0, "a denied create must not persist a webhook");
         }
     }
 }

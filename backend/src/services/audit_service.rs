@@ -506,6 +506,58 @@ pub async fn audit_fire_and_forget(db: PgPool, entry: AuditEntry) {
     }
 }
 
+/// Fire-and-forget `PermissionDenied` audit for a HANDLER-level admin gate
+/// (#2321 G-AUDIT).
+///
+/// Handlers that enforce `require_admin()` themselves (rather than riding
+/// `admin_middleware`) must still record the RBAC-deny the same way the
+/// middleware does (`admin_middleware`, #2366): an authenticated non-admin
+/// reaching an admin-only surface is exactly the decision an auditor wants
+/// logged. Records only the attempted `path`/`method` + a fixed reason, never
+/// any credential material, and is fire-and-forget so an audit-table outage can
+/// never turn a clean 403 into a 500.
+pub async fn audit_admin_permission_denied(
+    db: PgPool,
+    user_id: uuid::Uuid,
+    resource_type: ResourceType,
+    path: &str,
+    method: &str,
+) {
+    let entry = AuditEntry::new(AuditAction::PermissionDenied, resource_type)
+        .user(user_id)
+        .resource(user_id)
+        .details(serde_json::json!({
+            "path": path,
+            "method": method,
+            "reason": "admin_privileges_required",
+        }));
+    audit_fire_and_forget(db, entry).await;
+}
+
+/// Handler-level admin gate that ALSO records the RBAC-deny (#2321 G3/G4/G5 +
+/// G-AUDIT). Returns `Ok(())` for admins; for a non-admin, emits the
+/// fire-and-forget `PermissionDenied` audit (via
+/// [`audit_admin_permission_denied`]) and returns `AppError::Authorization`
+/// (403) with the same message `AuthExtension::require_admin` uses. Factored so
+/// each admin-only handler is a single call, keeping the deny-and-audit logic in
+/// one place instead of copy-pasting the block per handler (jscpd dedup).
+pub async fn enforce_admin_audited(
+    is_admin: bool,
+    db: PgPool,
+    user_id: uuid::Uuid,
+    resource_type: ResourceType,
+    path: &str,
+    method: &str,
+) -> crate::error::Result<()> {
+    if is_admin {
+        return Ok(());
+    }
+    audit_admin_permission_denied(db, user_id, resource_type, path, method).await;
+    Err(crate::error::AppError::Authorization(
+        "Admin access required".to_string(),
+    ))
+}
+
 /// Build the `details` JSON for a federated (SSO) login audit event.
 ///
 /// `provider` is a stable label (`"oidc"` | `"saml"` | `"ldap"`) recorded so

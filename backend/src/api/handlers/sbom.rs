@@ -1083,6 +1083,18 @@ async fn update_cve_status_by_artifact_cve(
     Path((artifact_id, cve_id)): Path<(Uuid, String)>,
     Json(body): Json<UpdateCveStatusRequest>,
 ) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    // #2321 G3: mutating vulnerability triage state (accept/dismiss a CVE) is an
+    // administrative security decision, not a per-repo-member action. Gate on
+    // global admin BEFORE any validation or lookup, and record the RBAC-deny.
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/sbom/cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}",
+        "POST",
+    )
+    .await?;
     if !is_valid_vuln_id(&cve_id) {
         return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
     }
@@ -2966,7 +2978,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -2997,7 +3009,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         // `CveStatus::parse` returns None for any string outside the four
         // known variants. Handler must surface that as 400 with the
         // original status text echoed so the client can debug.
@@ -3032,7 +3044,7 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-1010", "high").await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3072,7 +3084,7 @@ mod tests {
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-2020", "low").await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3106,7 +3118,7 @@ mod tests {
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3142,7 +3154,7 @@ mod tests {
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-4040", "medium")
             .await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         // Send the CVE id lower-cased: handler must still match.
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
@@ -3179,7 +3191,7 @@ mod tests {
         )
         .await;
 
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
             axum::Extension(auth),
@@ -3207,23 +3219,25 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #2321 G3 (denial): mutating CVE triage state is now admin-only. A
+    /// non-admin caller — even a legitimate repo member (developer role) who
+    /// would pass every downstream check — is rejected 403 at the admin gate,
+    /// BEFORE any lookup or mutation. The admin-authorized happy-path tests
+    /// above are the matching legit-success coverage. (Formerly asserted a
+    /// repo-scope 404; the handler is now gated one tier higher, on global
+    /// admin, so repo-scope no longer decides this route.)
     #[tokio::test]
-    async fn test_handler_rejects_caller_without_repo_access() {
-        // `ensure_artifact_repo_access` must enforce the auth extension's
-        // `allowed_repo_ids` whitelist: a caller scoped to some other repo
-        // must see the same 404 they'd see if the artifact didn't exist,
-        // never the contents of a repo they can't access.
+    async fn test_handler_update_cve_status_requires_admin() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
         let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
         seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-5050", "high").await;
-
-        // Build an auth extension whose allowed_repo_ids does NOT include
-        // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
-        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
-        auth.allowed_repo_ids = AccessScope::Restricted(vec![Uuid::new_v4()]);
+        // Legitimate repo member — proves the gate is on GLOBAL admin, not repo
+        // access.
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, fx.user_id).await;
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
 
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),
@@ -3239,12 +3253,12 @@ mod tests {
         teardown_scans(&fx.pool, fx.repo_id).await;
         fx.teardown().await;
 
-        // Repo-scope mismatch is surfaced as the same NotFound used for a
-        // missing artifact (deliberate: don't leak existence of inaccessible
-        // repos through error shape).
         match result {
-            Err(AppError::NotFound(_)) => {}
-            other => panic!("expected NotFound for scoped-out caller, got {:?}", other),
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "expected Authorization (admin-only) denial, got {:?}",
+                other
+            ),
         }
     }
 }

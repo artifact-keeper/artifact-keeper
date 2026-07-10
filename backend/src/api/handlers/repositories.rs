@@ -913,6 +913,23 @@ pub async fn invalidate_cache(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
 
+    // #2321 G6: evicting proxy-cache entries is a pull-through supply-chain
+    // control on the same administrative tier as `set_cache_ttl` (an attacker
+    // with plain repo-write could force re-fetches / open a cache-poisoning
+    // window). Require `repository:admin` for non-admins, mirroring
+    // `set_cache_ttl`; the global-admin bypass is preserved.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to invalidate the cache of this repository".to_string(),
+            ));
+        }
+    }
+
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
     // storage so the failure mode is a clear 400, not a silent no-op.
@@ -10246,6 +10263,10 @@ mod tests {
             return;
         };
 
+        // #2321 G6: invalidate_cache is now repo-admin gated. Grant the fixture
+        // user repository:admin so this success-path test still reaches the
+        // proxy-eviction behavior it covers.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let proxy =
             tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
         let state =
@@ -10302,6 +10323,9 @@ mod tests {
             return;
         };
 
+        // #2321 G6: grant repository:admin so the test reaches the repo_type
+        // (non-remote -> 400) guard rather than being denied 403 at the new gate.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let proxy =
             tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
         let state =
@@ -10343,6 +10367,9 @@ mod tests {
             return;
         };
 
+        // #2321 G6: grant repository:admin so the test reaches the
+        // proxy-service-missing (-> 503) guard rather than the new 403 gate.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         // Plain `build_state` does NOT install a proxy_service, so the
         // handler hits the `state.proxy_service.as_ref().ok_or_else(...)`
         // arm.
@@ -10364,6 +10391,50 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "missing proxy_service MUST surface as 503 ServiceUnavailable, \
              not 500 / not unwrap-panic (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// #2321 G6 (denial): cache invalidation is a proxy supply-chain control on
+    /// the same tier as `set_cache_ttl`, so a plain repo-WRITE member (developer
+    /// role, no `repository:admin` grant) must be rejected 403 — even on a Remote
+    /// repo with the proxy service configured, and BEFORE the repo_type / proxy
+    /// checks. The `invalidate_cache_handler_returns_200_for_remote_repo` test
+    /// (which grants repository:admin) is the matching legit-success case.
+    #[tokio::test]
+    async fn invalidate_cache_handler_requires_repo_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        // Fixture::setup grants the developer (write) role but NOT
+        // repository:admin, so the caller passes the tenant gate and is denied
+        // by the new repo-admin gate.
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "repo-write-only caller must be 403 on invalidate_cache (#2321 G6); \
+             got status {} with body: {}",
             status,
             String::from_utf8_lossy(&body),
         );

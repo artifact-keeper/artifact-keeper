@@ -588,6 +588,24 @@ async fn trigger_scan(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
+    // #2321 G5: triggering scans fans out scanner work per artifact (and, at the
+    // repo level, one worker per artifact). Previously only the `bypass_dedup`
+    // shape was admin-gated, leaving the default and `bypass_dedup=false` shapes
+    // open to any authenticated user as an amplification/DoS lever. Require admin
+    // for ALL request shapes, up front, and record the RBAC-deny.
+    //
+    // Chosen default: global admin. If a future policy decides repo-write should
+    // suffice for a single-artifact scan, narrow this deliberately with a test.
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/security/scan",
+        "POST",
+    )
+    .await?;
+
     // 503 (not 500) because "scanner not configured" is a normal operational
     // state on minimal stacks (no Trivy / OpenSCAP service), not a server
     // bug. 500 alerts on operator dashboards; 503 does not.
@@ -597,21 +615,12 @@ async fn trigger_scan(
         .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
-    let bypass_dedup = body.bypass_dedup.unwrap_or(false);
-
     // `bypass_dedup = true` skips the hash-based scan dedup short-circuit and
     // fans out a fresh scanner run per artifact (and, at the repo level, one
-    // tokio::spawn worker per artifact in the repo). The pre-existing
-    // `force = true` path was naturally rate-limited because dedup would
-    // collapse repeated calls against the same checksum into a single cached
-    // result; `bypass_dedup` removes that safety. Gating on admin scope
-    // matches the inventory-backfill path in admin.rs which also touches
-    // every artifact in a repository (see issue #1469 review feedback).
-    if bypass_dedup && !auth.is_admin {
-        return Err(AppError::Authorization(
-            "bypass_dedup requires admin privileges".to_string(),
-        ));
-    }
+    // tokio::spawn worker per artifact in the repo). The whole handler is now
+    // admin-only (see the gate above), so no separate non-admin check is needed
+    // here; the flag still selects the dedup behavior for the admin caller.
+    let bypass_dedup = body.bypass_dedup.unwrap_or(false);
 
     if let Some(artifact_id) = body.artifact_id {
         // Honest not-found up front (#2227): without this, an id with no
@@ -1909,17 +1918,21 @@ mod tests {
     // no-ops cleanly otherwise, matching the `tdh::Fixture` pattern used
     // by sibling handler tests.
     //
-    // Coverage strategy: three call shapes prove the gate's behaviour
-    // without spinning up a real scan run:
+    // #2321 G5 update: the handler is now admin-only for EVERY request shape
+    // (not just bypass_dedup=true), so a non-admin can no longer trigger scans
+    // at all — closing the amplification lever on the default/false shapes too.
     //
-    //   1. non-admin + bypass_dedup=true  -> 403 Authorization (the gate)
-    //   2. admin + bypass_dedup=true + no ids -> 400 Validation
-    //      (the gate is bypassed for admins; we land on the next check)
-    //   3. non-admin + bypass_dedup omitted + no ids -> 400 Validation
-    //      (the gate does not fire for the normal trigger path)
+    // Coverage strategy: four call shapes prove the gate's behaviour without
+    // spinning up a real scan run:
+    //
+    //   1. non-admin + bypass_dedup=true    -> 403 Authorization (the gate)
+    //   2. non-admin + bypass_dedup omitted -> 403 Authorization (all shapes)
+    //   3. non-admin + bypass_dedup=false   -> 403 Authorization
+    //   4. admin     + no ids               -> 400 Validation
+    //      (admins pass the gate and land on the next check; not over-blocked)
     // -----------------------------------------------------------------------
     #[tokio::test]
-    async fn test_trigger_scan_handler_admin_gates_bypass_dedup() {
+    async fn test_trigger_scan_handler_requires_admin_all_shapes() {
         use crate::api::handlers::test_db_helpers as tdh;
         use std::sync::Arc;
 
@@ -1983,6 +1996,10 @@ mod tests {
             iat_ms: None,
         };
 
+        // #2321 G5: trigger_scan is now admin-only for ALL request shapes, not
+        // just `bypass_dedup=true`. Non-admins are rejected 403 regardless of
+        // the flag; admins pass the gate and reach the post-auth validation.
+
         // ---- Case 1: non-admin + bypass_dedup=true -> 403 Authorization
         let result = trigger_scan(
             State(state.clone()),
@@ -1994,23 +2011,49 @@ mod tests {
             }),
         )
         .await;
-        match result {
-            Err(AppError::Authorization(msg)) => {
-                assert!(
-                    msg.contains("bypass_dedup"),
-                    "403 message should mention bypass_dedup, got: {}",
-                    msg
-                );
-            }
-            other => panic!(
-                "expected AppError::Authorization for non-admin bypass_dedup, got: {:?}",
-                other.as_ref().err()
-            ),
-        }
+        assert!(
+            matches!(result, Err(AppError::Authorization(_))),
+            "non-admin + bypass_dedup=true must be 403, got: {:?}",
+            result.as_ref().err()
+        );
 
-        // ---- Case 2: admin + bypass_dedup=true + no ids -> 400 Validation
-        // The gate is bypassed for admins; the handler falls through to the
-        // "either artifact_id or repository_id is required" validation.
+        // ---- Case 2: non-admin + bypass_dedup omitted -> 403 Authorization
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Authorization(_))),
+            "non-admin + bypass_dedup omitted must be 403 (all shapes admin-only), got: {:?}",
+            result.as_ref().err()
+        );
+
+        // ---- Case 3: non-admin + bypass_dedup=false -> 403 Authorization
+        let result = trigger_scan(
+            State(state.clone()),
+            Extension(make_auth(false)),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: None,
+                bypass_dedup: Some(false),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Authorization(_))),
+            "non-admin + bypass_dedup=false must be 403, got: {:?}",
+            result.as_ref().err()
+        );
+
+        // ---- Case 4 (legit): admin + no ids -> 400 Validation. Proves the
+        // admin PASSES the gate and lands on the next check (post-auth), i.e.
+        // the gate does not over-block the admin path.
         let result = trigger_scan(
             State(state.clone()),
             Extension(make_auth(true)),
@@ -2025,59 +2068,13 @@ mod tests {
             Err(AppError::Validation(msg)) => {
                 assert!(
                     msg.contains("artifact_id") || msg.contains("repository_id"),
-                    "admin bypass_dedup with no ids should hit the post-gate \
-                     validation check, got: {}",
+                    "admin must reach the post-gate validation check, got: {}",
                     msg
                 );
             }
             other => panic!(
-                "expected AppError::Validation for admin bypass_dedup with no \
-                 ids (proves gate is bypassed for admins), got: {:?}",
-                other.as_ref().err()
-            ),
-        }
-
-        // ---- Case 3: non-admin + bypass_dedup omitted + no ids -> 400 Validation
-        // The gate must not fire on the normal trigger path; non-admins
-        // should still be able to call trigger_scan without bypass_dedup.
-        let result = trigger_scan(
-            State(state.clone()),
-            Extension(make_auth(false)),
-            Json(TriggerScanRequest {
-                artifact_id: None,
-                repository_id: None,
-                bypass_dedup: None,
-            }),
-        )
-        .await;
-        match result {
-            Err(AppError::Validation(_)) => {} // expected
-            other => panic!(
-                "non-admin without bypass_dedup must not be 403'd; expected \
-                 AppError::Validation for the missing-ids case, got: {:?}",
-                other.as_ref().err()
-            ),
-        }
-
-        // ---- Case 4: non-admin + bypass_dedup=false -> 400 Validation
-        // Explicit `false` must behave the same as omitted (gate condition
-        // is `bypass_dedup && !auth.is_admin`, so false short-circuits).
-        let result = trigger_scan(
-            State(state.clone()),
-            Extension(make_auth(false)),
-            Json(TriggerScanRequest {
-                artifact_id: None,
-                repository_id: None,
-                bypass_dedup: Some(false),
-            }),
-        )
-        .await;
-        match result {
-            Err(AppError::Validation(_)) => {} // expected
-            other => panic!(
-                "non-admin with bypass_dedup=false must not be 403'd; \
-                 expected AppError::Validation for the missing-ids case, \
-                 got: {:?}",
+                "expected AppError::Validation for admin with no ids (proves the \
+                 gate lets admins through), got: {:?}",
                 other.as_ref().err()
             ),
         }
