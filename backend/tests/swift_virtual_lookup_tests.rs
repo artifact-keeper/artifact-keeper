@@ -5,8 +5,10 @@
 //! `get_release_metadata`, and `fetch_manifest` previously queried the
 //! `artifacts` table using the *virtual* repo's own id. Virtual repos own no
 //! artifacts, so every lookup returned 404 even when a member served the
-//! package. The fix fans out across Local/Staging members in priority order
-//! and returns the first hit.
+//! package. The fix fans out across Local/Staging members in priority order:
+//! single-version lookups return the first hit, while `list_releases`
+//! aggregates versions across all members, deduplicated with the
+//! highest-priority member winning on conflict (#2307).
 //!
 //! Requires a PostgreSQL database with migrations applied. Run with:
 //!
@@ -177,30 +179,83 @@ async fn swift_virtual_resolves_release_from_local_member() {
     cleanup(&pool, virtual_id, &[local_id]).await;
 }
 
-/// Priority ordering: the first member (by priority) that owns the package wins.
+/// Aggregation (#2307): `list_releases` must union versions across ALL
+/// Local/Staging members, not just the first member that owns the package.
 #[tokio::test]
 #[ignore]
-async fn swift_virtual_returns_first_member_hit_by_priority() {
+async fn swift_virtual_aggregates_versions_across_members() {
     let pool = pool().await;
     let suffix = Uuid::new_v4();
-    let virtual_id = insert_repo(&pool, &format!("sw-virt-prio-{}", suffix), "virtual").await;
+    let virtual_id = insert_repo(&pool, &format!("sw-virt-agg-{}", suffix), "virtual").await;
     let local_a = insert_repo(&pool, &format!("sw-a-{}", suffix), "local").await;
     let local_b = insert_repo(&pool, &format!("sw-b-{}", suffix), "local").await;
-    // local_b has higher priority value but later position; local_a is first.
     add_virtual_member(&pool, virtual_id, local_a, 1).await;
     add_virtual_member(&pool, virtual_id, local_b, 2).await;
 
     let package_id = "apple.swift-log";
     insert_swift_artifact(&pool, local_a, package_id, "1.0.0", None).await;
-    insert_swift_artifact(&pool, local_b, package_id, "9.9.9", None).await;
+    insert_swift_artifact(&pool, local_b, package_id, "2.0.0", None).await;
+
+    let versions = query_release_versions_virtual(&pool, virtual_id, package_id)
+        .await
+        .expect("lookup must succeed");
+    assert!(
+        versions.contains(&"1.0.0".to_string()),
+        "member A's version must appear in the aggregated list, got {:?}",
+        versions
+    );
+    assert!(
+        versions.contains(&"2.0.0".to_string()),
+        "member B's version must appear in the aggregated list, got {:?}",
+        versions
+    );
+    assert_eq!(
+        versions.len(),
+        2,
+        "no duplicates or extras, got {:?}",
+        versions
+    );
+
+    cleanup(&pool, virtual_id, &[local_a, local_b]).await;
+}
+
+/// Deduplication (#2307): when the same version exists in multiple members it
+/// must appear exactly once (the highest-priority member's entry wins).
+#[tokio::test]
+#[ignore]
+async fn swift_virtual_dedupes_versions_across_members() {
+    let pool = pool().await;
+    let suffix = Uuid::new_v4();
+    let virtual_id = insert_repo(&pool, &format!("sw-virt-dedup-{}", suffix), "virtual").await;
+    let local_a = insert_repo(&pool, &format!("sw-da-{}", suffix), "local").await;
+    let local_b = insert_repo(&pool, &format!("sw-db-{}", suffix), "local").await;
+    add_virtual_member(&pool, virtual_id, local_a, 1).await;
+    add_virtual_member(&pool, virtual_id, local_b, 2).await;
+
+    let package_id = "apple.swift-nio";
+    insert_swift_artifact(&pool, local_a, package_id, "3.1.0", None).await;
+    insert_swift_artifact(&pool, local_b, package_id, "3.1.0", None).await;
+    insert_swift_artifact(&pool, local_b, package_id, "3.2.0", None).await;
 
     let versions = query_release_versions_virtual(&pool, virtual_id, package_id)
         .await
         .expect("lookup must succeed");
     assert_eq!(
-        versions,
-        vec!["1.0.0".to_string()],
-        "the highest-priority member that owns the package must win"
+        versions.iter().filter(|v| v.as_str() == "3.1.0").count(),
+        1,
+        "a version present in both members must appear exactly once, got {:?}",
+        versions
+    );
+    assert!(
+        versions.contains(&"3.2.0".to_string()),
+        "the second member's unique version must still appear, got {:?}",
+        versions
+    );
+    assert_eq!(
+        versions.len(),
+        2,
+        "expected exactly two versions, got {:?}",
+        versions
     );
 
     cleanup(&pool, virtual_id, &[local_a, local_b]).await;

@@ -276,27 +276,32 @@ async fn query_release_versions(
 }
 
 /// Fan out a `list_releases` lookup across the members of a virtual repo,
-/// returning the versions from the first member that owns the package
-/// (members are returned in priority order). Remote members are not consulted
-/// for listing because their upstream listing shape is format-specific; the
-/// `.zip`/metadata endpoints proxy them on demand.
+/// aggregating the versions from ALL Local/Staging members that own the
+/// package. Members are visited in priority order and the result is
+/// deduplicated by version string, so when the same version exists in more
+/// than one member the highest-priority member's entry wins. Remote members
+/// are not consulted for listing because their upstream listing shape is
+/// format-specific; the `.zip`/metadata endpoints proxy them on demand.
 pub async fn query_release_versions_virtual(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
     package_id: &str,
 ) -> Result<Vec<String>, Response> {
     let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
     for member in &members {
         if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
         {
             continue;
         }
-        let versions = query_release_versions(db, member.id, package_id).await?;
-        if !versions.is_empty() {
-            return Ok(versions);
+        for version in query_release_versions(db, member.id, package_id).await? {
+            if seen_versions.insert(version.clone()) {
+                aggregated.push(version);
+            }
         }
     }
-    Ok(Vec::new())
+    Ok(aggregated)
 }
 
 // ---------------------------------------------------------------------------
