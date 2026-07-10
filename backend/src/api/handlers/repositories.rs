@@ -10672,12 +10672,12 @@ mod tests {
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, None).is_ok(),
                 "{:?} with no members must be Ok",
-                &rt
+                rt
             );
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, Some(&[])).is_ok(),
                 "{:?} with empty members must be Ok",
-                &rt
+                rt
             );
         }
     }
@@ -11600,7 +11600,7 @@ mod tests {
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(repo_id)
-                .bind(format!("app/{}", &key))
+                .bind(format!("app/{}", key))
                 .bind("manifest")
                 .bind(16_i64)
                 .bind("f".repeat(64))
@@ -13011,10 +13011,12 @@ mod tests {
         );
     }
 
-    /// PEP 708 (#1600): a PyPI virtual isolates a locally-owned project name by
-    /// default (so an unrelated public package of the same name is never served
-    /// through the virtual), and only unblocks the cross-member union when an
-    /// operator `tracks` declaration exists on the owning member.
+    /// PEP 708 (#1600, priority-aware per #2311): a PyPI virtual isolates a
+    /// locally-owned project name by default (so an unrelated public package
+    /// of the same name is never served through the virtual), reporting the
+    /// owning local member's priority so callers suppress only the remote
+    /// members the owner outranks, and only unblocks the cross-member union
+    /// when an operator `tracks` declaration exists on the owning member.
     #[tokio::test]
     async fn pypi_virtual_isolates_locally_owned_name_until_tracks_declared() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13056,20 +13058,24 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream).
+        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream),
+        // reporting the owning local member's priority (1) so the caller can
+        // suppress exactly the remote members the owner outranks — here the
+        // priority-2 remote (the genuine dependency-confusion case).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(true)
+                Ok(Some(1))
             ),
-            "a locally-owned name with no tracks declaration must be isolated"
+            "a locally-owned name with no tracks declaration must be isolated \
+             at the owning member's priority"
         );
 
         // A name the local member does not own -> proxy normally (no isolation).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "six").await,
-                Ok(false)
+                Ok(None)
             ),
             "a name no local member owns must not be isolated"
         );
@@ -13089,7 +13095,7 @@ mod tests {
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(false)
+                Ok(None)
             ),
             "a tracks declaration must re-enable the cross-member union"
         );
@@ -13101,6 +13107,101 @@ mod tests {
             .ok();
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// #2311: the PEP 708 isolation decision must respect member priority. A
+    /// local member that owns a name but sits at LOWER priority (higher
+    /// `priority` value) than a remote member must not hide that remote: the
+    /// guard reports the owning member's priority and the priority map lets
+    /// callers serve every remote at equal or higher priority, while a remote
+    /// the local owner outranks stays suppressed (the genuine
+    /// dependency-confusion case).
+    #[tokio::test]
+    async fn pypi_virtual_isolation_respects_member_priority() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, _lk, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (remote_hi_id, _rhk, remote_hi_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (remote_lo_id, _rlk, remote_lo_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (virtual_id, _vk, virtual_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+
+        // Priority inversion: the remote at priority 1 outranks the owning
+        // local at priority 2; a second remote at priority 3 is outranked.
+        for (member, priority) in [
+            (remote_hi_id, 1_i32),
+            (local_id, 2_i32),
+            (remote_lo_id, 3_i32),
+        ] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(local_id)
+        .bind("mypackage/1.0.0/mypackage-1.0.0-py3-none-any.whl")
+        .bind("mypackage")
+        .bind(1_i64)
+        .bind("0".repeat(64))
+        .bind("application/octet-stream")
+        .bind("pypi/mypackage/1")
+        .execute(&pool)
+        .await
+        .expect("seed local artifact");
+
+        // The guard reports the owning local member's priority (2), NOT a
+        // blanket "suppress all remotes".
+        let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
+            .await
+            .expect("isolation query");
+        assert_eq!(
+            owning,
+            Some(2),
+            "the guard must report the owning local member's priority"
+        );
+
+        // The per-member decision the handlers apply: a remote is suppressed
+        // only when the owning local strictly outranks it.
+        let priorities = proxy_helpers::fetch_virtual_member_priorities(&pool, virtual_id)
+            .await
+            .expect("fetch member priorities");
+        let local_min = owning.expect("owned");
+        let hi_suppressed = local_min < priorities[&remote_hi_id];
+        let lo_suppressed = local_min < priorities[&remote_lo_id];
+        assert!(
+            !hi_suppressed,
+            "a remote member at HIGHER priority (1) than the owning local (2) \
+             must survive isolation so its versions stay visible to pip (#2311)"
+        );
+        assert!(
+            lo_suppressed,
+            "a remote member at LOWER priority (3) than the owning local (2) \
+             must stay suppressed (dependency-confusion protection)"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_hi_id, remote_lo_id, virtual_id])
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_hi_dir);
+        let _ = std::fs::remove_dir_all(&remote_lo_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
     }
 

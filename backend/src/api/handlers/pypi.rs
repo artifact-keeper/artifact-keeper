@@ -739,13 +739,22 @@ async fn simple_project(
                 );
             }
 
-            // PEP 708 (#1600): when a local member owns this name and no
-            // operator `tracks` declaration permits merging, isolate the name to
-            // its local owner. We then skip every Remote member below, so the
-            // index lists only the local distributions (and the download path
-            // makes the same decision, keeping index and download consistent).
-            let isolate =
+            // PEP 708 (#1600, priority-aware per #2311): when a local member
+            // owns this name and no operator `tracks` declaration permits
+            // merging, isolate the name to its local owner — but only against
+            // Remote members the owning local outranks. A Remote member the
+            // operator configured at equal or higher priority than the owning
+            // local still surfaces below, so a lower-priority local owner
+            // cannot hide a higher-priority upstream's versions from pip.
+            // The download path makes the same per-member decision, keeping
+            // index and download consistent.
+            let owning_local_min_priority =
                 proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, &normalized).await?;
+            let member_priorities = if owning_local_min_priority.is_some() {
+                proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
+            } else {
+                Default::default()
+            };
 
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
@@ -792,23 +801,38 @@ async fn simple_project(
             // Ownership / dependency-confusion guard (#1600), superseding the
             // name-only suppression from #1738. When a local member owns this
             // PEP 503 name and no operator `tracks` declaration permits merging,
-            // `isolate` is true and the virtual serves ONLY that member's
-            // distributions for the name — in both the simple index and the
-            // download — rather than unioning the remote's versions for it.
-            // Unioning an unrelated public package that merely shares the name
-            // is a supply-chain hole (`pip` prefers the higher public version)
-            // AND makes the index inconsistent with the download path, which is
-            // also tracks-aware and 404s for any version only the remote has.
-            // Local precedence is the PEP 708-aligned default for a locally-
-            // owned name; a `tracks` declaration re-enables the union (#1582).
-            // Second pass: fetch a remote index only when the name is not
-            // isolated.
+            // the virtual serves ONLY that member's distributions for the name
+            // — in both the simple index and the download — rather than
+            // unioning the remote's versions for it. Unioning an unrelated
+            // public package that merely shares the name is a supply-chain hole
+            // (`pip` prefers the higher public version) AND makes the index
+            // inconsistent with the download path, which is also tracks-aware
+            // and 404s for any version only the remote has. Local precedence is
+            // the PEP 708-aligned default for a locally-owned name; a `tracks`
+            // declaration re-enables the union (#1582).
+            //
+            // #2311: the guard is applied PER REMOTE MEMBER relative to member
+            // priority. It only suppresses a Remote member the owning local
+            // outranks (owning priority value strictly lower). A Remote member
+            // at equal or higher priority than the owning local was explicitly
+            // ranked above the internal package by the operator, so its
+            // versions still surface.
+            // Second pass: fetch a remote index only from non-suppressed
+            // remote members.
             for member in &members {
-                if isolate {
-                    break;
-                }
                 if member.repo_type != RepositoryType::Remote {
                     continue;
+                }
+                if let Some(local_min) = owning_local_min_priority {
+                    // A member missing from the priority map cannot outrank the
+                    // owning local: treat it as lowest priority (fail closed).
+                    let member_priority = member_priorities
+                        .get(&member.id)
+                        .copied()
+                        .unwrap_or(i32::MAX);
+                    if local_min < member_priority {
+                        continue;
+                    }
                 }
                 // Only take the first remote response; multiple remote
                 // members in one virtual is rare, and merging two upstream
@@ -1575,21 +1599,33 @@ async fn serve_file(
                 // version-aware shadowing guard (#1217, #1582) and the
                 // name-only local-precedence suppression (#1738). Isolate to the
                 // local owner when a local member owns the name and no operator
-                // `tracks` declaration permits merging with upstream. When
-                // isolated, every Remote member is skipped so an unrelated
-                // public package of the same name is never served through the
-                // virtual; the download then 404s for a version the local owner
-                // lacks, which matches what the simple index lists (consistent).
-                // When a `tracks` declaration exists (same project, split version
-                // ranges, #1582) this returns false and the proxy fallthrough
+                // `tracks` declaration permits merging with upstream. A
+                // suppressed Remote member is skipped so an unrelated public
+                // package of the same name is never served through the virtual;
+                // the download then 404s for a version the local owner lacks,
+                // which matches what the simple index lists (consistent). When
+                // a `tracks` declaration exists (same project, split version
+                // ranges, #1582) this returns None and the proxy fallthrough
                 // below applies.
+                //
+                // #2311: the guard is priority-aware and applied PER REMOTE
+                // MEMBER — it only suppresses a Remote member the owning local
+                // outranks (owning priority value strictly lower). A Remote
+                // member at equal or higher priority than the owning local
+                // still serves, mirroring the simple-index decision above so
+                // every version the index lists is downloadable.
                 let normalized_project = normalize_pep503(project);
-                let suppress_remote_members = proxy_helpers::pypi_virtual_isolates_name(
+                let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
                     &state.db,
                     repo.id,
                     &normalized_project,
                 )
                 .await?;
+                let member_priorities = if owning_local_min_priority.is_some() {
+                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
+                } else {
+                    Default::default()
+                };
 
                 for member in &members {
                     // #2066: enforce THIS member's download age gate before any
@@ -1642,14 +1678,24 @@ async fn serve_file(
                     // a stable key, then fall back to the format-specific fetch
                     // that resolves the real download URL via the simple index.
                     //
-                    // Shadowing guard (#1217 follow-up, ak-hv3s): when
-                    // `suppress_remote_members` is set, skip every Remote
-                    // member so an upstream cannot serve a project whose
-                    // normalized PEP 503 name a local member already
-                    // owns. Pair with `order_members_local_first`-style
-                    // ordering at the top of this loop: locals run
-                    // first so they win even when the guard doesn't fire.
-                    if member.repo_type == RepositoryType::Remote && !suppress_remote_members {
+                    // Shadowing guard (#1217 follow-up, ak-hv3s; priority-aware
+                    // per #2311): skip this Remote member when a local member
+                    // that owns the normalized PEP 503 name outranks it, so an
+                    // upstream cannot serve a project a higher-priority local
+                    // member already owns. A member missing from the priority
+                    // map cannot outrank the owning local: it is treated as
+                    // lowest priority (fail closed, suppressed).
+                    let remote_suppressed = match owning_local_min_priority {
+                        Some(local_min) => {
+                            local_min
+                                < member_priorities
+                                    .get(&member.id)
+                                    .copied()
+                                    .unwrap_or(i32::MAX)
+                        }
+                        None => false,
+                    };
+                    if member.repo_type == RepositoryType::Remote && !remote_suppressed {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {

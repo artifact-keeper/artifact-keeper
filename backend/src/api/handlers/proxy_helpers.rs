@@ -2982,17 +2982,27 @@ fn shadowing_guard_db_err(virtual_repo_id: Uuid, format: &str, e: sqlx::Error) -
     (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
 }
 
-/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600).
+/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600,
+/// made priority-aware by #2311).
 ///
-/// Returns `true` when the virtual must ISOLATE this project name to its local
-/// owner: a local/staging member owns the PEP 503 normalized `normalized_name`
-/// AND no `pypi_project_tracks` declaration exists on an owning member for it.
-/// When `true`, the caller MUST serve only the owning member's distributions in
-/// both the simple index and the file download (no cross-member union, no
-/// proxy fallthrough), which is PEP 708's "refuse to implicitly assume merging
-/// is safe" default and keeps the index and download consistent.
+/// Returns `Some(min_priority)` when a local/staging member owns the PEP 503
+/// normalized `normalized_name` AND no `pypi_project_tracks` declaration
+/// exists on an owning member for it. `min_priority` is the smallest
+/// `virtual_repo_members.priority` value among the owning local members
+/// (lower value = higher priority, matching the `ORDER BY vrm.priority`
+/// member ordering).
 ///
-/// Returns `false` when the name is not locally owned (proxy normally) or when
+/// The caller must then decide isolation PER REMOTE MEMBER: a Remote member
+/// `R` is suppressed only when the owning local member outranks it
+/// (`min_priority < R.priority`). A Remote member configured at equal or
+/// higher priority than every owning local (`R.priority <= min_priority`)
+/// still surfaces — the operator explicitly ranked the upstream above the
+/// local owner, so hiding it would invert their priority intent (#2311).
+/// Suppression when the local owner outranks the remote is PEP 708's "refuse
+/// to implicitly assume merging is safe" default and must be applied
+/// consistently in both the simple index and the file download.
+///
+/// Returns `None` when the name is not locally owned (proxy normally) or when
 /// an operator `tracks` declaration permits merging the same project across
 /// members (the #1267 union / #1584 version fallthrough then apply).
 ///
@@ -3004,7 +3014,7 @@ pub async fn pypi_virtual_isolates_name(
     db: &PgPool,
     virtual_repo_id: Uuid,
     normalized_name: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<i32>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let local_ids: Vec<Uuid> = members
         .iter()
@@ -3012,28 +3022,34 @@ pub async fn pypi_virtual_isolates_name(
         .map(|m| m.id)
         .collect();
     if local_ids.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    // Which local/staging members actually own (hold artifacts for) this name?
-    // Uses the same PEP 503 normalization as simple_project so isolation agrees
-    // with what the index lists.
-    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT repository_id FROM artifacts \
-         WHERE repository_id = ANY($1) \
-           AND is_deleted = false \
-           AND LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-')) = $2",
+    // Which local/staging members actually own (hold artifacts for) this name,
+    // and at what member priority? Uses the same PEP 503 normalization as
+    // simple_project so isolation agrees with what the index lists.
+    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT DISTINCT a.repository_id, vrm.priority \
+         FROM artifacts a \
+         INNER JOIN virtual_repo_members vrm \
+                 ON vrm.member_repo_id = a.repository_id \
+                AND vrm.virtual_repo_id = $3 \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2",
     )
     .bind(&local_ids)
     .bind(normalized_name)
+    .bind(virtual_repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    if owning_ids.is_empty() {
+    if owning.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
-        return Ok(false);
+        return Ok(None);
     }
+    let owning_ids: Vec<Uuid> = owning.iter().map(|(id, _)| *id).collect();
 
     // A `tracks` declaration on any owning member means the operator has
     // asserted the local project is the same project as upstream, so merging is
@@ -3048,7 +3064,31 @@ pub async fn pypi_virtual_isolates_name(
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    Ok(tracked == 0)
+    if tracked > 0 {
+        return Ok(None);
+    }
+    Ok(owning.iter().map(|(_, priority)| *priority).min())
+}
+
+/// Fetches the `virtual_repo_members.priority` value for every member of
+/// `virtual_repo_id`, keyed by member repository id (lower value = higher
+/// priority). Used by the PyPI virtual paths to make the PEP 708 isolation
+/// decision per remote member relative to the owning local member's priority
+/// (#2311). Fails closed (Err) on DB error, matching
+/// [`pypi_virtual_isolates_name`].
+#[allow(clippy::result_large_err)]
+pub async fn fetch_virtual_member_priorities(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, i32>, Response> {
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT member_repo_id, priority FROM virtual_repo_members WHERE virtual_repo_id = $1",
+    )
+    .bind(virtual_repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
