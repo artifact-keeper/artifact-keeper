@@ -4075,6 +4075,44 @@ fn download_filename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Best-effort download-statistics recording for the presigned/redirect
+/// download path (S3/CloudFront).
+///
+/// Writes to `download_statistics` — the same table (and column set) the
+/// streaming path's `ArtifactService::finish_download` uses, so redirect
+/// downloads show up in the same analytics as proxied ones. `downloaded_at`
+/// takes the column's `NOW()` default.
+///
+/// Stats recording must never block or fail the download itself, so errors
+/// are logged at `warn` and swallowed rather than propagated.
+async fn record_redirect_download(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    user_id: Option<Uuid>,
+    ip_address: &str,
+    user_agent: Option<&str>,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            %artifact_id,
+            error = %e,
+            "failed to record download statistics for redirect download"
+        );
+    }
+}
+
 /// Outcome of parsing an HTTP `Range` request header against a known total
 /// size. We only support a single `bytes=start-end` range (the common case for
 /// resumable downloads and media seeking); anything more exotic falls back to a
@@ -4380,18 +4418,18 @@ pub async fn download_artifact(
                 .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
-                // Record download analytics
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO download_events (artifact_id, user_id, ip_address, user_agent, downloaded_at)
-                    VALUES ($1, $2, $3, $4, NOW())
-                    "#,
+                // Record download analytics (best-effort; must not block the
+                // redirect). This previously inserted into an events table
+                // that does not exist in the schema — and discarded the
+                // error — so every presigned/redirect download was silently
+                // missing from download statistics (#2260, bug 1).
+                record_redirect_download(
+                    &state.db,
+                    artifact.id,
+                    auth.as_ref().map(|a| a.user_id),
+                    &ip_addr.to_string(),
+                    user_agent.as_deref(),
                 )
-                .bind(artifact.id)
-                .bind(auth.as_ref().map(|a| a.user_id))
-                .bind(ip_addr.to_string())
-                .bind(user_agent.as_deref())
-                .execute(&state.db)
                 .await;
 
                 tracing::info!(
@@ -5648,6 +5686,144 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Presigned/redirect download statistics (#2260, bug 1)
+    //
+    // The redirect path used to INSERT into an events table that does not
+    // exist in the schema and discard the error, so every presigned
+    // (S3/CloudFront) download was silently missing from analytics. It must
+    // record into `download_statistics`, the table the streaming path's
+    // `ArtifactService::finish_download` uses.
+    //
+    // The DB-backed tests run only when DATABASE_URL points at a migrated
+    // Postgres (as in CI); they skip cleanly otherwise.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn presigned_download_path_does_not_reference_legacy_events_table() {
+        // Source-level regression guard: the non-existent table name must not
+        // reappear in this handler module. Built with concat! so this test's
+        // own literal does not match itself.
+        let legacy_table = concat!("download_", "events");
+        let src = include_str!("repositories.rs");
+        assert_eq!(
+            src.matches(legacy_table).count(),
+            0,
+            "repositories.rs must not reference the non-existent `{legacy_table}` table; \
+             download recording goes to `download_statistics` (#2260, bug 1)"
+        );
+    }
+
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    async fn seed_artifact(pool: &sqlx::PgPool) -> Uuid {
+        let key = format!("redirect-stats-test-{}", Uuid::new_v4().as_simple());
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository");
+
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0.0', 100, $4, 'application/octet-stream', $5) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{key}/artifact.bin"))
+        .bind(&key)
+        .bind(format!("{:0>64}", "ab"))
+        .bind(format!("{key}/storage.bin"))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_writes_download_statistics() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // The table the old code wrote to must not exist — writing there was
+        // pure data loss, never a fallback.
+        let legacy: Option<String> =
+            sqlx::query_scalar(concat!("SELECT to_regclass('download_", "events')::text"))
+                .fetch_one(&pool)
+                .await
+                .expect("to_regclass query failed");
+        assert!(
+            legacy.is_none(),
+            "the legacy table unexpectedly exists; this regression test assumes it does not"
+        );
+
+        let artifact_id = seed_artifact(&pool).await;
+
+        record_redirect_download(
+            &pool,
+            artifact_id,
+            None,
+            "203.0.113.7",
+            Some("redirect-stats-test-agent/1.0"),
+        )
+        .await;
+
+        let row: Option<(Option<String>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT ip_address, user_agent, user_id FROM download_statistics \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("failed to query download_statistics");
+
+        let (ip, ua, user_id) =
+            row.expect("redirect download was not recorded in download_statistics");
+        assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(ua.as_deref(), Some("redirect-stats-test-agent/1.0"));
+        assert_eq!(user_id, None);
+
+        // Cleanup (FK cascade removes the download_statistics row).
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_swallows_stats_errors() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // A non-existent artifact violates the FK; recording must stay
+        // best-effort (log + swallow) so a stats failure never fails the
+        // download. Reaching the assertion at all proves no panic/propagation.
+        let bogus_artifact = Uuid::new_v4();
+        record_redirect_download(&pool, bogus_artifact, None, "203.0.113.8", None).await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+                .bind(bogus_artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query download_statistics");
+        assert_eq!(count, 0);
     }
 
     // -----------------------------------------------------------------------
