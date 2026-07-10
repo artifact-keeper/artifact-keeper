@@ -207,6 +207,7 @@ pub mod error_helpers;
 pub(crate) mod test_db_helpers;
 
 pub mod admin;
+pub mod admin_security;
 pub mod age_gate;
 pub mod alpine;
 pub mod analytics;

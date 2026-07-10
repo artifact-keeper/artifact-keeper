@@ -155,6 +155,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("security", handlers::security::SecurityApiDoc::openapi()),
         ("sbom", handlers::sbom::SbomApiDoc::openapi()),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
+        (
+            "admin_security",
+            handlers::admin_security::AdminSecurityApiDoc::openapi(),
+        ),
         ("analytics", handlers::analytics::AnalyticsApiDoc::openapi()),
         ("lifecycle", handlers::lifecycle::LifecycleApiDoc::openapi()),
         (

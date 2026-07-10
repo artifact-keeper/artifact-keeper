@@ -713,6 +713,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             .nest("/lifecycle", handlers::lifecycle::router())
             .nest("/storage-gc", handlers::storage_gc::router())
             .nest("/search", handlers::search::admin_router())
+            // Blast-radius reports expose download attribution (who pulled a
+            // vulnerable artifact) — this nest MUST stay inside the /admin
+            // block so admin_middleware gates it (#2364).
+            .nest("/security", handlers::admin_security::router())
             .nest("/telemetry", handlers::telemetry::router())
             .nest("/monitoring", handlers::monitoring::router())
             .nest("/sso", handlers::sso_admin::router())

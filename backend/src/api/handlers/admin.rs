@@ -848,7 +848,8 @@ pub struct DownloadListResponse {
 }
 
 /// Parse an optional RFC 3339 query timestamp, rejecting malformed input.
-fn parse_rfc3339_bound(
+/// Shared with the blast-radius endpoints (`admin_security`, #2364).
+pub(crate) fn parse_rfc3339_bound(
     value: Option<&str>,
     name: &str,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
