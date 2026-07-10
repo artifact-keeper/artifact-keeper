@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-07-10
+
+### Fixed
+
+- **Composer Local/hosted repositories now emit an absolute `dist.url`** (#2361). The Composer metadata (`packages.json`, `p2/`, and legacy `p/`) previously returned a root-relative `dist.url` (`/composer/{repo}/dist/...`) with no scheme/host, so `composer install`/`update` failed to download the archive. The Composer handler now threads the external base URL (via the `RequestBaseUrl` extractor, honoring `AK_EXTERNAL_URL` / `X-Forwarded-Host` / Host) — matching npm/cargo/nuget/oci/gitlfs. Also fixed `dist.shasum` (Composer verifies it with `sha1_file()`; it's now emitted empty since AK stores SHA-256, with integrity carried on `dist.reference`). Remote/proxied Composer repos are unaffected (separate rewrite path, tracked in #2370).
+
 ## [1.4.1] - 2026-07-10
 
 ### Fixed
