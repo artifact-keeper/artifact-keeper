@@ -187,6 +187,44 @@ jobs:
       needs.build-binaries.result == 'success'
     timeout-minutes: 35
     steps:
+      - name: Checkout tag (for CHANGELOG verification)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # ── CHANGELOG documents the release ─────────────────────────────
+      # Release policy: every final release vX.Y.Z must carry a
+      # non-empty `## [X.Y.Z]` section in CHANGELOG.md (promote the
+      # [Unreleased] section before tagging; see RELEASING.md). This
+      # runs before the image polling so a missing entry fails in
+      # seconds instead of after the 30-minute image wait. Prerelease
+      # tags (contain '-') are exempt. The same rule is enforced by the
+      # version-set-integrity job in the artifact-keeper-test release
+      # gate when it is dispatched with a release version tag.
+      - name: Verify CHANGELOG.md documents this release
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag ${VERSION} is not a final release version (X.Y.Z); CHANGELOG check skipped."
+            exit 0
+          fi
+          ver_esc="${VERSION//./\\.}"
+          if ! grep -qE "^## \[${ver_esc}\]" CHANGELOG.md; then
+            echo "::error title=CHANGELOG entry missing::CHANGELOG.md has no entry for ${VERSION} -- promote [Unreleased] to a '## [${VERSION}] - <date>' section before tagging. The release stays a DRAFT until the entry exists and the tag is re-cut."
+            exit 1
+          fi
+          content_lines=$(awk -v ver="${VERSION}" '
+            BEGIN { esc = ver; gsub(/\./, "\\.", esc); pat = "^## \\[" esc "\\]" }
+            $0 ~ pat { insec = 1; next }
+            insec && /^## /  { exit }
+            insec && NF > 0  { n++ }
+            END { print n + 0 }
+          ' CHANGELOG.md)
+          if [ "${content_lines}" -eq 0 ]; then
+            echo "::error title=CHANGELOG entry empty::CHANGELOG.md has a '## [${VERSION}]' heading but no content under it -- fill in the release notes before tagging."
+            exit 1
+          fi
+          echo "CHANGELOG.md documents ${VERSION} (${content_lines} content lines). OK."
+
       - name: Wait for and verify required images on ghcr.io and docker.io
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
