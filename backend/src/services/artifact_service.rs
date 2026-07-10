@@ -2410,4 +2410,77 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
+
+    /// #2366: the artifact lifecycle emits audit events. Upload -> download ->
+    /// delete each writes exactly one `audit_log` row for the artifact, keyed
+    /// by the shared service-layer choke points (`finalize_upload`,
+    /// `finish_download`, `delete_with_sync_options`). The download event also
+    /// carries the client IP and acting user. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_artifact_lifecycle_emits_audit_events_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+
+        // Upload -> ARTIFACT_UPLOADED (audit write is awaited inside
+        // finalize_upload, so it has landed by the time upload() returns).
+        let artifact = svc
+            .upload(
+                repo_id,
+                "audit/pkg.txt",
+                "pkg.txt",
+                Some("1.0"),
+                "text/plain",
+                Bytes::from_static(b"audit-bytes"),
+                Some(user_id),
+            )
+            .await
+            .expect("upload succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED").await,
+            1,
+            "upload emits exactly one ARTIFACT_UPLOADED event"
+        );
+
+        // Download -> ARTIFACT_DOWNLOADED with a resolved client IP + user.
+        let _ = svc
+            .download(
+                repo_id,
+                "audit/pkg.txt",
+                Some(user_id),
+                Some("203.0.113.5".to_string()),
+                Some("test-ua"),
+            )
+            .await
+            .expect("download succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED").await,
+            1,
+            "download emits exactly one ARTIFACT_DOWNLOADED event"
+        );
+
+        // Delete -> ARTIFACT_DELETED.
+        svc.delete(artifact.id).await.expect("delete succeeds");
+        assert_eq!(
+            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DELETED").await,
+            1,
+            "delete emits exactly one ARTIFACT_DELETED event"
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(artifact.id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
 }

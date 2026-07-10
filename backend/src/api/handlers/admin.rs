@@ -1491,4 +1491,80 @@ mod tests {
         let val = serde_json::json!("not a number");
         assert_eq!(val.as_i64().unwrap_or(100), 100);
     }
+
+    // -----------------------------------------------------------------------
+    // #2366: GET /admin/audit — admin can read recorded events; a non-admin is
+    // refused by the handler's defense-in-depth check. Skips without
+    // `DATABASE_URL`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_audit_logs_admin_reads_and_non_admin_forbidden_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Extension as AxumExtension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Seed one audit event keyed by a unique resource id.
+        let resource_id = Uuid::new_v4();
+        AuditService::new(pool.clone())
+            .log(
+                AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+                    .user(user_id)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("seed audit event");
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Admin caller -> 200, and our event is returned when filtered.
+        let mut admin_auth = tdh::make_auth(user_id, &username);
+        admin_auth.is_admin = true;
+        let app = router()
+            .with_state(state.clone())
+            .layer(AxumExtension::<AuthExtension>(admin_auth));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/audit?resource_id={}", resource_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin can read audit; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["action"], "USER_CREATED");
+        assert_eq!(v["items"][0]["resource_id"], resource_id.to_string());
+
+        // Non-admin caller -> 403 (handler defense-in-depth, independent of the
+        // `/admin` admin_middleware which is not mounted in this unit router).
+        let non_admin = tdh::make_auth(user_id, &username);
+        let app2 = router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(non_admin));
+        let req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/audit")
+            .body(Body::empty())
+            .unwrap();
+        let (status2, _) = tdh::send(app2, req2).await;
+        assert_eq!(status2, StatusCode::FORBIDDEN);
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
 }
