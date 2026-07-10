@@ -428,6 +428,61 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .expect("grant developer role");
 }
 
+/// Insert a fine-grained `permissions` rule granting `user_id` exactly the
+/// listed `actions` on `repo_id` (e.g. `["read", "write", "delete"]`).
+///
+/// This drives the #817/#2321 fine-grained gate (`has_any_rules_for_target` +
+/// `check_permission`), which is DISTINCT from `grant_repo_access` (a
+/// `role_assignments` membership row). Once any `permissions` rule exists for a
+/// repository, the per-action check on the write/delete handlers stops falling
+/// through, so a destructive test that expects success must grant the exact
+/// action it exercises. Rows are cleaned up by `cleanup` (which deletes all
+/// `permissions WHERE target_id = repo_id`).
+pub async fn grant_repo_actions(pool: &PgPool, repo_id: Uuid, user_id: Uuid, actions: &[&str]) {
+    let actions: Vec<String> = actions.iter().map(|s| s.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO permissions \
+         (principal_type, principal_id, target_type, target_id, actions) \
+         VALUES ('user', $1, 'repository', $2, $3)",
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .bind(&actions)
+    .execute(pool)
+    .await
+    .expect("insert repository permission rule");
+}
+
+/// Mint a `Bearer <jwt>` authorization header for `user_id` using the same
+/// `AuthService` the handlers validate against (the state's DB + config). Shared
+/// so authz tests that need a SECOND authenticated identity don't copy-paste the
+/// user-row SELECT + token mint (keeps the jscpd dedup gate green).
+pub async fn bearer_for(state: &SharedState, user_id: Uuid) -> String {
+    let auth_service = crate::services::auth_service::AuthService::new(
+        state.db.clone(),
+        Arc::new(state.config.clone()),
+    );
+    let user = sqlx::query_as::<_, User>(
+        r#"SELECT id, username, email, password_hash, display_name, auth_provider,
+                  external_id, is_admin, is_active, is_service_account, must_change_password,
+                  totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                  failed_login_attempts, locked_until, last_failed_login_at,
+                  password_changed_at, last_login_at, created_at, updated_at
+           FROM users WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("fetch user for bearer");
+    format!(
+        "Bearer {}",
+        auth_service
+            .generate_tokens(&user)
+            .expect("mint bearer token")
+            .access_token
+    )
+}
+
 /// Recursively find the largest file (in bytes) under `dir`, or 0 if none.
 fn dir_max_file_size(dir: &std::path::Path) -> u64 {
     let mut max = 0u64;
@@ -526,6 +581,14 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .bind(repo_id)
         .execute(pool)
         .await;
+    // Fine-grained rules (`grant_repo_actions`) are polymorphic on
+    // (target_type, target_id) with no FK cascade from `repositories`, so
+    // remove them explicitly to keep the row self-cleaning.
+    let _ =
+        sqlx::query("DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
     let _ = sqlx::query(
         "DELETE FROM artifact_metadata WHERE artifact_id IN \
          (SELECT id FROM artifacts WHERE repository_id = $1)",
