@@ -418,7 +418,7 @@ fn classify_rpm(lower: &str) -> Mutability {
     // Content-addressed metadata under repodata/: a checksum-prefixed name such
     // as `<hex>-primary.xml.gz` / `.zck`. Require a hex prefix before the first
     // '-' so a bare `primary.xml.gz` (no unique-filename) stays conservative.
-    if lower.starts_with("repodata/") {
+    if lower.contains("repodata/") {
         if let Some((prefix, _rest)) = leaf.split_once('-') {
             let looks_hashed = prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_hexdigit());
             if looks_hashed {
@@ -766,6 +766,21 @@ mod tests {
         );
         // Unknown / directory-ish paths stay conservative.
         assert_eq!(classify(&Rpm, "repodata/"), Mutability::mutable_default());
+        // A bare, non-checksum-prefixed metadata file stays conservative (mutable).
+        assert_eq!(
+            classify(&Rpm, "repodata/primary.xml.gz"),
+            Mutability::mutable_default()
+        );
+        // A prefix shorter than 8 hex chars is NOT treated as content-addressed.
+        assert_eq!(
+            classify(&Rpm, "repodata/1234567-primary.xml.gz"),
+            Mutability::mutable_default()
+        );
+        // Content-addressed metadata nested under a subpath is still immutable.
+        assert_eq!(
+            classify(&Rpm, "centos/9/repodata/deadbeef12-primary.xml.gz"),
+            Mutability::Immutable
+        );
     }
 
     #[test]
