@@ -54,11 +54,12 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # binary's HIGH-severity Go-dependency CVEs and image size with no functional
 # loss. See issue #1544.
 #
-# Grype is pinned to v0.114.0, the latest upstream release. No newer Grype build
-# picks up fixed versions of its bundled Go deps (docker, containerd, stdlib),
-# so its residual CVEs are upstream-unfixable for now and are documented/
-# suppressed in /.trivyignore rather than "bumped away".
-FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+# Grype is pinned to v0.115.0, the latest upstream release. It is rebuilt
+# against fixed containerd/go-git/x-crypto versions (clearing those CVEs from
+# v0.114.0), but still bundles Go 1.26.3 stdlib and docker v28.5.2; those
+# residual CVEs have no fixed grype release yet and are documented/suppressed
+# in /.trivyignore rather than "bumped away". Re-evaluate on every bump (#2391).
+FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
@@ -71,7 +72,11 @@ ENV GRYPE_DB_CACHE_DIR=/grype-db
 RUN mkdir -p /grype-db && grype db update && grype db status
 
 # ---------- Stage 5: Alpine runtime ----------
-FROM alpine:3.24
+# Named so CI can cache-bust the package-refresh stages (`no-cache-filters`)
+# if/when the suspended alpine publish job is re-enabled; see
+# docker-publish.yml. Without that, the registry build cache can serve the
+# `apk upgrade` layer stale and ship months-old errata (#2391).
+FROM alpine:3.24 AS runtime
 
 # Refresh the whole base first so the alpine:3.24 layer picks up the latest
 # APK security errata, then install the runtime deps (no libssl needed -

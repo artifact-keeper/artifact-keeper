@@ -107,6 +107,13 @@ jobs:
           # to accept mode=max cache manifests.
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Always re-run the package-refresh and runtime stages: their RUN
+          # lines (`dnf upgrade`, `grype db update`) are only correct when
+          # executed against the CURRENT repos, but the registry cache would
+          # otherwise happily serve months-old layers, shipping stale security
+          # errata and a stale grype DB (#2391). The expensive Rust stages
+          # (planner/deps/builder) stay fully cached.
+          no-cache-filters: rootfs-builder,grype-db-seed,runtime
           sbom: true
           provenance: mode=max
           build-args: |
@@ -186,6 +193,9 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:buildcache-${{ matrix.cache-tag }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Re-run the dnf package-refresh stage against current errata on
+          # every publish instead of serving it from stale cache (#2391).
+          no-cache-filters: rootfs-builder
           sbom: true
           provenance: mode=max
 
@@ -262,6 +272,10 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:buildcache-${{ matrix.cache-tag }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:buildcache-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Re-run the runtime stage (`apk add --no-cache`) against current
+          # Alpine errata on every publish instead of serving it from stale
+          # cache (#2391). The Go build stage stays cached.
+          no-cache-filters: runtime
           sbom: true
           provenance: mode=max
 
@@ -334,6 +348,9 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-alpine-${{ matrix.cache-tag }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache-alpine-${{ matrix.cache-tag }},mode=max,image-manifest=true,oci-mediatypes=true
+          # Re-run the package-refresh and runtime stages against current
+          # errata on every publish; see the backend job note (#2391).
+          no-cache-filters: grype-db-seed,runtime
           sbom: true
           provenance: mode=max
           build-args: |

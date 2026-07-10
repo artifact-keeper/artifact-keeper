@@ -16,7 +16,12 @@
 # ---------- Stage 1: cross-compile the Go adapter ----------
 # Pinned to the BUILDPLATFORM so the toolchain runs natively and cross-compiles
 # to the requested TARGET arch (fast, no emulation for the compile step).
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+# Go 1.26 toolchain: the adapter is stdlib-only, so every Go CVE reported
+# against the compiled binary is a stdlib CVE baked in by the builder
+# toolchain. Track the current patched Go minor here (>= 1.26.5 clears the
+# 2026-07 stdlib batch, issue #2391); the go.mod `go` directive stays at the
+# minimum language version.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -36,12 +41,21 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ---------- Stage 2: pull the matching trivy binary ----------
 # buildx selects this image's TARGETPLATFORM variant automatically, so the
 # arm64 build gets the arm64 trivy and the amd64 build gets amd64. Pinned to
-# 0.71.2 (rig-standard; #2090's backend tests assert trivy-0.71.2). Aqua
-# publishes both linux/amd64 and linux/arm64 for this tag.
-FROM ghcr.io/aquasecurity/trivy:0.71.2 AS trivy
+# 0.72.0, the latest release, which is rebuilt against a patched Go toolchain
+# and clears most of the bundled binary's Go-dependency CVEs (#2391; residuals
+# with no fixed trivy release yet are justified per-CVE in /.trivyignore).
+# Nothing couples the backend to a specific trivy version: the 0.71.2 strings
+# in backend/scanner-adapter tests are mock/stub fixtures, and the adapter
+# probes the real version at startup (ProbeVersion). Aqua publishes both
+# linux/amd64 and linux/arm64 for this tag.
+FROM ghcr.io/aquasecurity/trivy:0.72.0 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
-FROM alpine:3.20
+# alpine 3.20 reached EOL; 3.24 is the current stable with active security
+# errata. The stage is named so CI can cache-bust it (`no-cache-filters`),
+# forcing `apk add --no-cache` to re-resolve current package errata on every
+# publish instead of reusing a stale cached layer.
+FROM alpine:3.24 AS runtime
 
 # ca-certificates: TLS to the trivy vuln-DB registry / HTTPS registries.
 # git + rpm: trivy uses them for certain package/source scanners.

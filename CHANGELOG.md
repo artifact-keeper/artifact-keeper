@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Trivy code-scanning backlog burned down** (#2391): bundled scanner tools bumped to the latest releases built on a patched Go toolchain — trivy 0.71.2 → 0.72.0 (scanner-adapter image) and grype v0.114.0 → v0.115.0 (backend images); the scanner-adapter is now compiled with Go 1.26.5 (clears the 35 Go-stdlib CVEs in the adapter binary) and its runtime base moved from EOL alpine 3.20 to 3.24. `docker-publish` now cache-busts the package-refresh stages (`no-cache-filters`) so `dnf upgrade`/`apk` errata and the pre-seeded Grype DB are re-resolved on every publish instead of being served from a stale layer cache. The weekly scheduled scan of `:latest-alpine` was removed — that image's publish job is suspended (`if: false`), so the frozen artifact could only re-report unfixable-by-rebuild CVEs (143 of the 188 open alerts). `.trivyignore` refreshed to the current residual set (no fixed tool release yet), justified per-CVE.
 - The RPM Phase-1 connect-time private-IP check runs in the Upstream resolver context and, as a fail-safe, also blocks private-IP targets for **SSO-metadata** and **webhook** flows that carry their own private-IP allow-toggles. It **fails safe** (over-blocks, never leaks). Deployments that legitimately target a private-IP host for SSO metadata or webhook delivery should track **#2380** (union private-IP allow-toggles across contexts).
 
 ## [1.4.2] - 2026-07-10

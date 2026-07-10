@@ -174,11 +174,12 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # binary's HIGH-severity Go-dependency CVEs and ~150 MB of image size with no
 # functional loss. See issues #1544 and #2088.
 #
-# Grype is pinned to v0.114.0, which is the latest upstream release. There is no
-# newer Grype build that picks up fixed versions of its bundled Go deps
-# (docker, containerd, stdlib), so its residual CVEs are upstream-unfixable for
-# now and are documented/suppressed in /.trivyignore rather than "bumped away".
-FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+# Grype is pinned to v0.115.0, the latest upstream release. It is rebuilt
+# against fixed containerd/go-git/x-crypto versions (clearing those CVEs from
+# v0.114.0), but still bundles Go 1.26.3 stdlib and docker v28.5.2; those
+# residual CVEs have no fixed grype release yet and are documented/suppressed
+# in /.trivyignore rather than "bumped away". Re-evaluate on every bump (#2391).
+FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
@@ -194,7 +195,10 @@ ENV GRYPE_DB_CACHE_DIR=/grype-db
 RUN mkdir -p /grype-db && grype db update && grype db status
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
+# Named so CI can cache-bust the package-refresh stages (`no-cache-filters`);
+# see docker-publish.yml. Without that, the registry build cache can serve the
+# rootfs-builder `dnf upgrade` layer stale and ship months-old errata (#2391).
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.8 AS runtime
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /

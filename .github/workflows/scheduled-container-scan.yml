@@ -68,18 +68,15 @@ jobs:
           exit-code: '0'
           skip-setup-trivy: true
 
-      - name: Trivy scan - Backend Alpine
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
-        if: always()
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest-alpine
-          format: 'sarif'
-          output: 'backend-alpine-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
-          ignore-unfixed: true
-          trivyignores: '.trivyignore'
-          exit-code: '0'
-          skip-setup-trivy: true
+      # NOTE: the Backend Alpine (`:latest-alpine`) scan was removed (#2391).
+      # The alpine publish job has been suspended (`if: false` in
+      # docker-publish.yml), so `:latest-alpine` is a frozen artifact that is
+      # never rebuilt; scanning it weekly can only re-report CVEs that no code
+      # change can clear (the stale image predates the trivy-CLI removal and
+      # current base/grype pins) and it accumulated the bulk of the stale
+      # code-scanning backlog. Dockerfile.backend.alpine is kept patched;
+      # re-add the scan together with the publish job if the alpine variant
+      # comes back online.
 
       - name: Upload Backend Trivy SARIF
         uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
@@ -95,13 +92,6 @@ jobs:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap-scheduled'
 
-      - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
-        if: always()
-        with:
-          sarif_file: 'backend-alpine-trivy.sarif'
-          category: 'trivy-backend-alpine-scheduled'
-
       - name: Upload Trivy reports
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -110,7 +100,6 @@ jobs:
           path: |
             backend-trivy.sarif
             openscap-trivy.sarif
-            backend-alpine-trivy.sarif
           retention-days: 90
 
       - name: Check for new findings and create issue
@@ -123,7 +112,7 @@ jobs:
             let totalFindings = 0;
             const summaries = [];
 
-            for (const [name, file] of [['Backend', 'backend-trivy.sarif'], ['OpenSCAP', 'openscap-trivy.sarif'], ['Backend Alpine', 'backend-alpine-trivy.sarif']]) {
+            for (const [name, file] of [['Backend', 'backend-trivy.sarif'], ['OpenSCAP', 'openscap-trivy.sarif']]) {
               if (!fs.existsSync(file)) {
                 summaries.push(`- **${name}**: Scan skipped or failed`);
                 continue;
@@ -180,6 +169,5 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
-          echo "- **Backend Alpine**: $([ -f backend-alpine-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "SARIF reports uploaded to Security tab and as workflow artifacts." >> $GITHUB_STEP_SUMMARY
