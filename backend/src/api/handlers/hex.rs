@@ -202,6 +202,7 @@ async fn package_info(
 async fn download_tarball(
     State(state): State<SharedState>,
     Path((repo_key, tarball_file)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
 
@@ -266,6 +267,7 @@ async fn download_tarball(
         &artifact.storage_key,
         "application/octet-stream",
         Some(filename),
+        &ctx,
     )
     .await
 }

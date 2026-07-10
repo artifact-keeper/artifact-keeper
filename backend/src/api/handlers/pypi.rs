@@ -1240,6 +1240,7 @@ async fn download_or_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, project, filename)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
@@ -1257,7 +1258,16 @@ async fn download_or_metadata(
     }
 
     // Regular file download
-    serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref()).await
+    serve_file(
+        &state,
+        &repo,
+        &repo_key,
+        &project,
+        &filename,
+        auth.as_ref(),
+        &ctx,
+    )
+    .await
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -1480,6 +1490,7 @@ async fn serve_file(
     project: &str,
     filename: &str,
     auth: Option<&AuthExtension>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
@@ -1839,12 +1850,7 @@ async fn serve_file(
     // Proxied and virtual-repo fetches go through
     // build_streaming_file_response() which intentionally skips stats since
     // the artifact is not ours.
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -4846,8 +4852,16 @@ mod tests {
         // must construct a `get_remote_cached_or_refetch` call against
         // the storage backend; the helper hits the cache and returns the
         // wheel bytes; the handler wraps them in a PyPI download response.
-        let result =
-            super::serve_file(&state, &repo_info, &fx.repo_key, project, filename, None).await;
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
 
         // Clean up BEFORE asserting so a panic still leaves the DB clean.
         let cleanup_pool = fx.pool.clone();
@@ -4987,8 +5001,16 @@ mod tests {
         .await
         .expect("seed cached artifact row");
 
-        let result =
-            super::serve_file(&state, &repo_info, &fx.repo_key, project, filename, None).await;
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
 
         // Clean up BEFORE asserting so a panic still leaves the DB clean. The
         // age_gate_reviews row inserted by `check` cascades on repo delete.
@@ -5196,8 +5218,16 @@ mod tests {
         .await;
 
         let virtual_info = fx.repo_info("virtual", None);
-        let result =
-            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
 
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
@@ -5249,8 +5279,16 @@ mod tests {
         .await;
 
         let virtual_info = fx.repo_info("virtual", None);
-        let result =
-            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
 
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
@@ -5294,8 +5332,16 @@ mod tests {
         .await;
 
         let virtual_info = fx.repo_info("virtual", None);
-        let result =
-            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
 
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;

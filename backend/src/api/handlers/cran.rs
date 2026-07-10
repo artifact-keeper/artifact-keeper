@@ -196,6 +196,7 @@ async fn package_index_gz(
 async fn download_package(
     State(state): State<SharedState>,
     Path((repo_key, filename)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
@@ -230,6 +231,7 @@ async fn download_package(
         &artifact.storage_key,
         "application/x-gzip",
         Some(&filename),
+        &ctx,
     )
     .await
 }

@@ -311,13 +311,14 @@ pub async fn query_release_versions_virtual(
 async fn version_path_handler(
     State(state): State<SharedState>,
     Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let version_path = version_path.trim_start_matches('/');
 
     if version_path.ends_with(".zip") {
         // Download source archive: /:scope/:name/:version.zip
         let version = version_path.trim_end_matches(".zip");
-        return download_archive(state, &repo_key, &scope, &name, version).await;
+        return download_archive(state, &repo_key, &scope, &name, version, &ctx).await;
     }
 
     if version_path.ends_with("/Package.swift") || version_path.contains("/Package.swift") {
@@ -483,6 +484,7 @@ async fn download_archive(
     scope: &str,
     name: &str,
     version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, repo_key).await?;
     let package_id = format!("{}.{}", scope, name);
@@ -591,12 +593,7 @@ async fn download_archive(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     let checksum = artifact.checksum_sha256.clone();
     let filename = format!("{}-{}-{}.zip", scope, name, version);
@@ -1545,6 +1542,7 @@ mod db_cov_tests {
                 "apple",
                 "swift-nio",
                 "2.40.0",
+                &Default::default(),
             )
             .await;
             let response = match result {

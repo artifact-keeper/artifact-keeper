@@ -204,6 +204,7 @@ async fn resolve_go_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respon
 async fn handle_get(
     State(state): State<SharedState>,
     Path((repo_key, path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     let request = parse_path(&path)?;
@@ -214,10 +215,10 @@ async fn handle_get(
             version_info(&state, &repo, &module, &version).await
         }
         GoProxyRequest::Mod { module, version } => {
-            get_mod_file(&state, &repo, &module, &version).await
+            get_mod_file(&state, &repo, &module, &version, &ctx).await
         }
         GoProxyRequest::Zip { module, version } => {
-            download_zip(&state, &repo, &module, &version).await
+            download_zip(&state, &repo, &module, &version, &ctx).await
         }
         GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
@@ -620,6 +621,7 @@ async fn get_mod_file(
     repo: &RepoInfo,
     module: &str,
     version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -734,12 +736,7 @@ async fn get_mod_file(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -758,6 +755,7 @@ async fn download_zip(
     repo: &RepoInfo,
     module: &str,
     version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -864,12 +862,7 @@ async fn download_zip(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

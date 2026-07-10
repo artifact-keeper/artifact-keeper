@@ -1254,6 +1254,7 @@ async fn upload(
 async fn download(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
     axum::Json(body): axum::Json<DownloadRequest>,
 ) -> Result<Response, Response> {
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1431,12 +1432,7 @@ async fn download(
 
         // Record download
         let artifact_id: uuid::Uuid = artifact_row.get("id");
-        let _ = sqlx::query(
-            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        )
-        .bind(artifact_id)
-        .execute(&state.db)
-        .await;
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
 
         contents.push(DownloadContent { commit, files });
     }

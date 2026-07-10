@@ -4028,6 +4028,7 @@ pub async fn serve_local_artifact(
     storage_key: &str,
     content_type: &str,
     content_disposition_filename: Option<&str>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -4042,12 +4043,7 @@ pub async fn serve_local_artifact(
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    let _ = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-    )
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
 
     Ok(build_download_response(
         content,
@@ -7280,6 +7276,11 @@ mod tests {
         .await
         .expect("insert");
 
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.77".parse().unwrap()),
+            user_id: Some(user_id),
+            user_agent: Some("serve-local-test/1.0".to_string()),
+        };
         let resp = serve_local_artifact(
             &state,
             &repo,
@@ -7287,6 +7288,7 @@ mod tests {
             "cran/foo/1.0/foo.tar.gz",
             "application/gzip",
             Some("foo.tar.gz"),
+            &ctx,
         )
         .await
         .expect("serve");
@@ -7297,6 +7299,20 @@ mod tests {
         );
         let cd = resp.headers().get("Content-Disposition").unwrap();
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
+
+        // #2365: the download must be attributed to the real client, not the
+        // historical '0.0.0.0' sentinel with no user.
+        let (ip, ua, uid): (Option<String>, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT ip_address, user_agent, user_id FROM download_statistics \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("download_statistics row");
+        assert_eq!(ip.as_deref(), Some("203.0.113.77"));
+        assert_eq!(ua.as_deref(), Some("serve-local-test/1.0"));
+        assert_eq!(uid, Some(user_id));
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
