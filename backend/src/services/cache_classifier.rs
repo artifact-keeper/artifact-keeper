@@ -215,6 +215,12 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // rewritten in place by upstream.
         RepositoryFormat::Debian => classify_debian(&lower),
 
+        // -- RPM / YUM ------------------------------------------------------
+        // repomd.xml(+.asc) is the single mutable entry point; every other
+        // repodata file is content-addressed (checksum-prefixed filename) and
+        // packages are version-pinned — both immutable.
+        RepositoryFormat::Rpm => classify_rpm(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -261,7 +267,8 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         | RepositoryFormat::WasmOci
         | RepositoryFormat::HelmOci
         | RepositoryFormat::Cargo
-        | RepositoryFormat::Debian => !classify(format, &lower).is_immutable(),
+        | RepositoryFormat::Debian
+        | RepositoryFormat::Rpm => !classify(format, &lower).is_immutable(),
 
         // Conan revision-file coordinates
         // (`.../revisions/{rev}/files/{file}`) are legitimately rewritten in
@@ -273,7 +280,7 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
-        // Default-format families (Generic, Nuget, Composer, Go, Rpm,
+        // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate.
         _ => false,
@@ -395,6 +402,34 @@ fn classify_debian(lower: &str) -> Mutability {
     Mutability::mutable_default()
 }
 
+/// RPM: `repodata/repomd.xml`(+`.asc`) is the mutable index; all other
+/// `repodata/<checksum>-*` files are content-addressed and packages
+/// (`.rpm`/`.drpm`) are version-pinned — both immutable.
+fn classify_rpm(lower: &str) -> Mutability {
+    let leaf = leaf(lower);
+    // The mutable pointer and its detached signature.
+    if leaf == "repomd.xml" || leaf == "repomd.xml.asc" {
+        return Mutability::mutable_default();
+    }
+    // Packages are immutable.
+    if leaf.ends_with(".rpm") || leaf.ends_with(".drpm") {
+        return Mutability::Immutable;
+    }
+    // Content-addressed metadata under repodata/: a checksum-prefixed name such
+    // as `<hex>-primary.xml.gz` / `.zck`. Require a hex prefix before the first
+    // '-' so a bare `primary.xml.gz` (no unique-filename) stays conservative.
+    if lower.starts_with("repodata/") {
+        if let Some((prefix, _rest)) = leaf.split_once('-') {
+            let looks_hashed = prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_hexdigit());
+            if looks_hashed {
+                return Mutability::Immutable;
+            }
+        }
+    }
+    // Unknown path: revalidate.
+    Mutability::mutable_default()
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -475,7 +510,7 @@ mod tests {
         ));
         // Default-format families have NO in-place index at a coordinate; every
         // stored path is a release coordinate -> always false (protected).
-        for f in [Generic, Nuget, Composer, Go, Rpm, Helm] {
+        for f in [Generic, Nuget, Composer, Go, Helm] {
             assert!(
                 !is_explicitly_mutable_index(&f, "anything/1.0.0/file.bin"),
                 "{f:?} coordinates must be treated as release coordinates"
@@ -697,5 +732,53 @@ mod tests {
     #[test]
     fn negative_ttl_constant_is_short() {
         assert!((30..=60).contains(&NEGATIVE_CACHE_TTL_SECS));
+    }
+
+    #[test]
+    fn test_classify_rpm() {
+        use RepositoryFormat::Rpm;
+        // repomd.xml and its signature are the mutable entry point.
+        assert_eq!(
+            classify(&Rpm, "repodata/repomd.xml"),
+            Mutability::mutable_default()
+        );
+        assert_eq!(
+            classify(&Rpm, "repodata/repomd.xml.asc"),
+            Mutability::mutable_default()
+        );
+        // Content-addressed metadata (checksum-prefixed) is immutable.
+        assert_eq!(
+            classify(&Rpm, "repodata/1a2b3c4d-primary.xml.gz"),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            classify(&Rpm, "repodata/deadbeef-primary.xml.zck"),
+            Mutability::Immutable
+        );
+        // Packages are immutable.
+        assert_eq!(
+            classify(&Rpm, "Packages/foo-1.2-3.x86_64.rpm"),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            classify(&Rpm, "getPackage/bar-2.0-1.noarch.drpm"),
+            Mutability::Immutable
+        );
+        // Unknown / directory-ish paths stay conservative.
+        assert_eq!(classify(&Rpm, "repodata/"), Mutability::mutable_default());
+    }
+
+    #[test]
+    fn test_rpm_explicit_mutable_index() {
+        use RepositoryFormat::Rpm;
+        assert!(is_explicitly_mutable_index(&Rpm, "repodata/repomd.xml"));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "Packages/foo-1.2-3.x86_64.rpm"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "repodata/deadbeef-primary.xml.gz"
+        ));
     }
 }
