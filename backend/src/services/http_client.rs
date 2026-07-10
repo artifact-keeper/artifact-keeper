@@ -59,10 +59,41 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .redirect(ssrf_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver());
 
+    apply_custom_ca_cert(builder)
+}
+
+/// Return a [`ClientBuilder`] for **operator-configured, trusted
+/// internal-service** endpoints (the scanner-adapter `TRIVY_ADAPTER_URL`,
+/// Dependency-Track, OpenSCAP). It mirrors [`base_client_builder`] — same
+/// custom-CA handling — but wires the SSRF DNS resolver and redirect policy
+/// in the trusted-internal trust class, so a scanner-adapter on a private
+/// network (the normal in-cluster topology) is reachable WITHOUT any
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` operator knob. Cloud-metadata, loopback and
+/// link-local addresses stay hard-blocked at connect time and across
+/// redirects (issue #2389).
+///
+/// This must ONLY be used for URLs that come from server configuration, never
+/// for attacker/user-influenceable targets (remote-repo upstreams, proxy
+/// URLs, webhooks, plugins) — those keep using [`base_client_builder`], which
+/// stays fail-closed.
+pub fn internal_service_client_builder() -> ClientBuilder {
+    log_proxy_env();
+
+    let builder = reqwest::Client::builder()
+        .redirect(ssrf_internal_redirect_policy())
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_internal());
+
+    apply_custom_ca_cert(builder)
+}
+
+/// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
+/// into the builder when configured. Shared by every client builder so the
+/// private-CA handling is identical and lives in one place.
+fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
         match std::fs::read(&ca_path) {
             Ok(pem_bytes) => match Certificate::from_pem_bundle(&pem_bytes) {
@@ -129,8 +160,33 @@ pub fn default_client() -> reqwest::Client {
 /// otherwise defeat the entry-point validator. Caps at
 /// [`MAX_REDIRECTS`] hops so a redirect loop cannot tie up a worker.
 fn ssrf_redirect_policy() -> Policy {
-    Policy::custom(|attempt| {
-        if let Some(reason) = crate::api::validation::is_blocked_url(attempt.url()) {
+    ssrf_redirect_policy_with(
+        crate::api::validation::is_blocked_url,
+        "http-client redirect",
+    )
+}
+
+/// Redirect policy for the trusted internal-service clients (#2389). Same
+/// per-hop SSRF re-check as [`ssrf_redirect_policy`], but uses the
+/// trusted-internal block-list so a redirect to a private address is allowed
+/// while a redirect that pivots to a cloud-metadata / loopback / link-local
+/// target is still refused.
+fn ssrf_internal_redirect_policy() -> Policy {
+    ssrf_redirect_policy_with(
+        crate::api::validation::is_blocked_url_internal,
+        "internal-service redirect",
+    )
+}
+
+/// Shared redirect-policy body: re-run `is_blocked` on every hop and refuse
+/// the request if it returns a block reason, capping at [`MAX_REDIRECTS`].
+/// The `is_blocked` fn selects the trust class (upstream vs trusted-internal).
+fn ssrf_redirect_policy_with(
+    is_blocked: fn(&reqwest::Url) -> Option<crate::api::validation::BlockReason>,
+    context_label: &'static str,
+) -> Policy {
+    Policy::custom(move |attempt| {
+        if let Some(reason) = is_blocked(attempt.url()) {
             tracing::warn!(
                 target: "security",
                 redirect_url = %attempt.url(),
@@ -139,7 +195,7 @@ fn ssrf_redirect_policy() -> Policy {
             );
             crate::services::metrics_service::record_outbound_url_blocked(
                 reason.metric_label(),
-                "http-client redirect",
+                context_label,
             );
             return attempt.error("redirect target rejected by SSRF policy");
         }
@@ -154,7 +210,10 @@ fn ssrf_redirect_policy() -> Policy {
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
-    use super::{base_client_builder, default_client, large_object_client_builder};
+    use super::{
+        base_client_builder, default_client, internal_service_client_builder,
+        large_object_client_builder,
+    };
     use std::io::Write;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -335,6 +394,46 @@ mod tests {
             "listener must never accept a connection; the SSRF resolver should have \
              blocked the request before any TCP connection was attempted, but a \
              connection was accepted: {accept_result:?}"
+        );
+    }
+
+    /// The trusted internal-service client (#2389) relaxes the private-IP
+    /// gate for operator-configured endpoints, but the loopback / metadata
+    /// hard-blocks must NOT be relaxed: a host resolving to 127.0.0.1 must
+    /// still be refused before any TCP connection is made. Mirrors the
+    /// discriminating listener assertion used for `base_client_builder`.
+    #[tokio::test]
+    async fn test_internal_client_still_refuses_loopback_host() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let client = internal_service_client_builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("http://localhost:{port}/");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("internal client must still refuse a loopback host");
+        assert!(
+            err.is_connect()
+                || err.is_request()
+                || err.to_string().to_lowercase().contains("ssrf")
+                || err.to_string().to_lowercase().contains("block"),
+            "expected resolver rejection, got: {err}"
+        );
+
+        let accept_result =
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accept_result.is_err(),
+            "internal client must never connect to a loopback listener: {accept_result:?}"
         );
     }
 

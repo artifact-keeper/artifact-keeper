@@ -662,7 +662,7 @@ impl DependencyTrackService {
             );
         }
 
-        let client = crate::services::http_client::base_client_builder()
+        let client = crate::services::http_client::internal_service_client_builder()
             .timeout(Duration::from_secs(30))
             .https_only(!allow_http)
             .build()

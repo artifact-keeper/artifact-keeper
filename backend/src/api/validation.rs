@@ -119,6 +119,21 @@ pub enum OutboundUrlContext {
     /// OIDC/SSO discovery, token, JWKS and userinfo fetch path against a
     /// configured identity provider.
     SsoDiscovery,
+    /// Operator-configured, trusted internal-service endpoints (e.g. the
+    /// scanner-adapter `TRIVY_ADAPTER_URL`, Dependency-Track, OpenSCAP).
+    ///
+    /// These URLs come from server configuration, not from any
+    /// attacker/user-influenceable input, so RFC1918 / CGNAT / IPv6
+    /// unique-local addresses are permitted unconditionally (the normal
+    /// in-cluster / private-network topology) WITHOUT requiring the
+    /// `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist or a per-surface blanket
+    /// toggle. The cloud-metadata / loopback / link-local hard-blocks still
+    /// apply (see [`is_hard_blocked_ipv4`] and [`is_blocked_ipv6`]), so a
+    /// misconfigured or redirect-pivoted internal client still cannot reach
+    /// a metadata endpoint or the loopback interface. This context has no
+    /// env var — the [`private_ip_allowed`] short-circuit permits private
+    /// addresses before any env var is consulted (issue #2389).
+    TrustedInternal,
 }
 
 impl OutboundUrlContext {
@@ -129,6 +144,12 @@ impl OutboundUrlContext {
             OutboundUrlContext::Upstream => "UPSTREAM_ALLOW_PRIVATE_IPS",
             OutboundUrlContext::Webhook => "WEBHOOK_ALLOW_PRIVATE_IPS",
             OutboundUrlContext::SsoDiscovery => "SSO_ALLOW_PRIVATE_IPS",
+            // TrustedInternal permits private addresses via the
+            // `private_ip_allowed` short-circuit, so this env var is never
+            // consulted. Name an undefined var so that even a hypothetical
+            // future caller reaching this arm falls through to "blocked"
+            // (fail-closed) rather than panicking.
+            OutboundUrlContext::TrustedInternal => "AK_TRUSTED_INTERNAL_ALLOW_PRIVATE_IPS",
         }
     }
 }
@@ -266,6 +287,16 @@ pub fn is_blocked_resolved_ip(ip: std::net::IpAddr) -> bool {
     is_blocked_ip_in(ip, OutboundUrlContext::Upstream)
 }
 
+/// Connect-time resolved-IP check for the [`OutboundUrlContext::TrustedInternal`]
+/// context: RFC1918 / CGNAT / IPv6 unique-local are permitted (operator config,
+/// not attacker input) while cloud-metadata, loopback, link-local and
+/// unspecified addresses stay hard-blocked. Used by the internal-service HTTP
+/// client's SSRF DNS resolver so a private-network scanner-adapter is reachable
+/// without relaxing the upstream/proxy guard (issue #2389).
+pub fn is_blocked_resolved_ip_internal(ip: std::net::IpAddr) -> bool {
+    is_blocked_ip_in(ip, OutboundUrlContext::TrustedInternal)
+}
+
 /// Common implementation shared by the per-context validators. The
 /// `ctx` selects which env var the private-IP relaxation toggle reads.
 fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContext) -> Result<()> {
@@ -318,6 +349,15 @@ fn block_reason_to_error(label: &str, reason: BlockReason) -> AppError {
 /// redirect policy to also relax under the webhook env var.
 pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
     is_blocked_url_in(url, OutboundUrlContext::Upstream)
+}
+
+/// [`is_blocked_url`] variant for the trusted internal-service redirect
+/// policy. Permits private/CGNAT/ULA redirect targets (operator-configured
+/// endpoints legitimately live on private networks) but keeps the
+/// metadata / loopback / link-local hard-blocks so a redirect cannot pivot
+/// an internal-service client onto a metadata endpoint (issue #2389).
+pub(crate) fn is_blocked_url_internal(url: &reqwest::Url) -> Option<BlockReason> {
+    is_blocked_url_in(url, OutboundUrlContext::TrustedInternal)
 }
 
 /// Context-aware variant of [`is_blocked_url`]. Returning `Some(_)`
@@ -530,6 +570,16 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
 /// Metadata IPs and loopback are checked separately and are never
 /// reachable through this path (see `is_hard_blocked_ipv4`).
 fn private_ip_allowed(ip: std::net::IpAddr, ctx: OutboundUrlContext) -> bool {
+    // Operator-configured, trusted internal-service endpoints permit
+    // RFC1918 / CGNAT / IPv6 unique-local addresses unconditionally — the URL
+    // is server config, not attacker/user input (issue #2389). This
+    // short-circuits BEFORE any env var is read, so TrustedInternal (which has
+    // no env var) never reaches `allow_private_ips_enabled`. The metadata /
+    // loopback / link-local hard-blocks are enforced earlier in
+    // `is_hard_blocked_ipv4` / `is_blocked_ipv6` and are NOT reachable here.
+    if matches!(ctx, OutboundUrlContext::TrustedInternal) {
+        return true;
+    }
     if let Some(list) = private_cidr_allowlist_value() {
         return cidr_list_contains(&list, ip);
     }
@@ -1006,6 +1056,58 @@ mod tests {
             validate_outbound_url("http://100.64.0.1/x", "Upstream URL").is_ok(),
             "CGNAT must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustedInternal context (issue #2389): operator-configured internal
+    // services may sit on private networks WITHOUT any allowlist env var, but
+    // metadata / loopback / link-local must stay hard-blocked.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trusted_internal_permits_private_without_env() {
+        // No env var set: TrustedInternal must accept RFC1918 while the
+        // Upstream context still rejects the very same address.
+        let _g = AllowlistGuard::new();
+        let rfc1918 = "10.0.0.5".parse::<std::net::IpAddr>().unwrap();
+        assert!(
+            !is_blocked_ip_in(rfc1918, OutboundUrlContext::TrustedInternal),
+            "10.0.0.5 must be allowed for TrustedInternal with no env set"
+        );
+        assert!(
+            is_blocked_ip_in(rfc1918, OutboundUrlContext::Upstream),
+            "10.0.0.5 must stay blocked for Upstream with no env set"
+        );
+        // A CGNAT and a ULA representative are also operator-reachable.
+        assert!(!is_blocked_ip_in(
+            "100.64.0.1".parse().unwrap(),
+            OutboundUrlContext::TrustedInternal
+        ));
+        assert!(!is_blocked_ip_in(
+            "fc00::1".parse().unwrap(),
+            OutboundUrlContext::TrustedInternal
+        ));
+    }
+
+    #[test]
+    fn test_trusted_internal_retains_hard_blocks() {
+        // The metadata / loopback / link-local hard-blocks are NOT relaxed by
+        // the trusted-internal exemption: is_blocked_resolved_ip_internal must
+        // still reject each of them.
+        let _g = AllowlistGuard::new();
+        for ip in [
+            "169.254.169.254", // cloud metadata (IPv4 link-local)
+            "127.0.0.1",       // IPv4 loopback
+            "::1",             // IPv6 loopback
+            "fe80::1",         // IPv6 link-local
+            "0.0.0.0",         // unspecified
+        ] {
+            let parsed = ip.parse::<std::net::IpAddr>().unwrap();
+            assert!(
+                is_blocked_resolved_ip_internal(parsed),
+                "{ip} must stay hard-blocked even for the internal-service context"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

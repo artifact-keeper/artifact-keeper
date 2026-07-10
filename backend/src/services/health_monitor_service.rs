@@ -105,7 +105,7 @@ pub(crate) fn dependency_track_probe_url(config: &Config) -> Option<&str> {
 
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
-        let http_client = crate::services::http_client::base_client_builder()
+        let http_client = crate::services::http_client::internal_service_client_builder()
             .timeout(Duration::from_secs(config.check_timeout_secs))
             .build()
             .unwrap_or_default();

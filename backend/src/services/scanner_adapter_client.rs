@@ -182,13 +182,13 @@ impl ScannerAdapterFsClient {
     pub fn new(adapter_url: String) -> Self {
         Self {
             adapter_url,
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::internal_service_client_builder()
                 // Generous: the body is the tarred workspace, potentially GBs
                 // for an incus rootfs.
                 .timeout(std::time::Duration::from_secs(900))
                 .build()
                 .unwrap_or_default(),
-            poll_http: crate::services::http_client::base_client_builder()
+            poll_http: crate::services::http_client::internal_service_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
