@@ -367,13 +367,23 @@ At the immutable-write site found in Step 1, before persisting, when `expected_s
 
 Model it on the existing proxy_service cache tests (search `#[tokio::test]` in that file). Assert: fetch a `repodata/<64hex>-primary.xml.gz` whose body hashes differently → body returned to caller, no cache sidecar written.
 
-- [ ] **Step 8: Run tests + fmt/clippy, then commit**
+- [ ] **Step 8: Interim one-object-over-quota guard (S2 interim; full quota → P4)**
+
+At the SAME buffered cache-write decision point, add a cheap guard: if `repo.quota_bytes` is
+`Some(q)` and the object being cached is larger than `q`, skip the cache write (still stream/return
+to the client) and log a `target: "security"` warning + metric. This is the Phase-1 interim for
+bug `artifact-keeper-x70`; true per-repo usage accounting + eviction is deferred to P4 (proxy cache
+is NOT recorded in the `artifacts` table, so there is no per-repo proxy-cache usage figure to check
+a running total against yet). Add a pure helper + unit test for the decision, e.g.
+`fn exceeds_single_object_quota(quota_bytes: Option<i64>, object_len: i64) -> bool`.
+
+- [ ] **Step 9: Run tests + fmt/clippy, then commit**
 
 ```bash
 cargo test -p artifact-keeper-backend --lib cache_classifier:: proxy_service::
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 git add backend/src/services/cache_classifier.rs backend/src/services/proxy_service.rs
-git commit -m "fix(security): verify content-addressed body hash before immutable caching"
+git commit -m "fix(security): verify content-addressed hash + reject over-quota single objects before caching"
 ```
 
 ---
@@ -478,13 +488,12 @@ without that read would mean guessing — against this skill's "no placeholders"
 ~15-minute read of the named functions first, after which its task is written to the same standard
 as Tasks 1–4.
 
-- **Task 5 — Cache quota enforcement (`artifact-keeper-x70`, S2).** Read the cache-write sites
-  (`proxy_service.rs` ~1085 buffered `storage.put`, ~1268–1290 streaming writer) and how a Remote
-  repo's cached bytes are accounted (are proxied blobs recorded in `artifacts`, i.e. counted by the
-  `SUM(size_bytes)` usage query at `repository_service.rs:1307`, or only under `proxy-cache/` keys?).
-  Then: before an immutable cache write, if `repo.quota_bytes` is `Some(q)` and
-  `current_usage + object_size > q`, skip the cache write (still stream to client) + warn/metric.
-  Reuse `exceeds_quota_warning_threshold` / the `artifact_service.rs:662` quota pattern.
+- **Task 5 — Full cache quota enforcement — MOVED TO P4 (bug `artifact-keeper-x70`).** Confirmed:
+  proxy-cache blobs are NOT recorded in the `artifacts` table (test
+  `proxy_service.rs:10266 test_cache_artifact_does_not_insert_into_artifacts_table`), so there is no
+  per-repo proxy-cache usage figure to enforce a running total against. True enforcement needs a
+  usage-accounting mechanism (per-repo counter + eviction) that belongs with P4's GC. **Phase-1
+  interim** (reject caching a single object larger than `quota_bytes`) is folded into Task 3 Step 8.
 - **Task 6 — Range/`206` passthrough (§8.2.2).** Read `fetch_artifact_streaming_uncoordinated`
   (`proxy_service.rs:2974`) and the upstream request builder it calls, to see where request headers
   are set. Then: forward the client `Range` header, relay `206`/`Content-Range`/`Accept-Ranges`, and
