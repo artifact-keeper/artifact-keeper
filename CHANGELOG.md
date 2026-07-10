@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Functional audit log** (#2366): security-relevant events — artifact upload/download/delete, user/role/repository CRUD, and permission-denied — are now recorded, with a new admin-only query endpoint `GET /api/v1/admin/audit` (filters + pagination).
+- **RPM proxy hardening — Phase 1** (#2354): connect-time SSRF IP validation, RPM cache classification, content-integrity verification, and mirrorlist rejection for RPM upstream/proxy repositories.
+
+### Security
+
+- The RPM Phase-1 connect-time private-IP check runs in the Upstream resolver context and, as a fail-safe, also blocks private-IP targets for **SSO-metadata** and **webhook** flows that carry their own private-IP allow-toggles. It **fails safe** (over-blocks, never leaks). Deployments that legitimately target a private-IP host for SSO metadata or webhook delivery should track **#2380** (union private-IP allow-toggles across contexts).
+
 ## [1.4.2] - 2026-07-10
 
 ### Fixed
