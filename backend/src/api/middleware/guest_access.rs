@@ -613,7 +613,35 @@ mod tests {
 
     #[tokio::test]
     async fn guard_rejects_request_with_invalid_bearer_when_disabled() {
-        let app = make_app(make_state(false));
+        // An unknown bearer falls through JWT validation to the API-token
+        // lookup, which hits Postgres. With the guard now surfacing
+        // `AuthOutcome::Overloaded` as 503, an *unreachable* pool is
+        // (correctly) classified as a transient pool-timeout shed rather
+        // than an invalid credential — so this test needs a real DB to
+        // deterministically observe the 401. Skip when `DATABASE_URL` is
+        // unset, mirroring `guard_allows_request_with_valid_jwt_when_disabled`;
+        // CI runs it against the real postgres service. The DB-free mapping
+        // (`InvalidCredential` -> 401, `Overloaded` -> 503) is pinned by the
+        // `guard_short_circuit` unit tests above.
+        //
+        // Reuse the shared `test_db_helpers::try_pool()` scaffold (same skip
+        // semantics) instead of open-coding the DATABASE_URL/connect dance —
+        // that copy keeps the guard/DB setup a single source of truth and
+        // avoids a jscpd clone of the sibling test's connect block.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mut config = Config::test_config();
+        config.guest_access_enabled = false;
+        let auth_service = Arc::new(AuthService::new(pool, Arc::new(config)));
+        let state = GuestAccessState {
+            guest_access_enabled: false,
+            auth_service,
+        };
+
+        let app = make_app(state);
         let resp = app
             .oneshot(
                 Request::builder()
