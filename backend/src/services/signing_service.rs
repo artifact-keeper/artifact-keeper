@@ -41,6 +41,25 @@ pub(crate) fn algorithm_to_bits(algorithm: &str) -> std::result::Result<usize, S
     }
 }
 
+/// Normalize a key-type string to one of the families accepted by the
+/// `signing_keys_key_type_check` DB constraint (`gpg`, `rsa`, `ed25519`).
+///
+/// Clients commonly send the RSA algorithm variant ("rsa2048"/"rsa4096") in
+/// the `key_type` field; those are coerced to the `rsa` family. Anything else
+/// is rejected with a message suitable for a 400 response, instead of letting
+/// the value trip the CHECK constraint at INSERT time (opaque 500).
+pub(crate) fn normalize_key_type(key_type: &str) -> std::result::Result<&'static str, String> {
+    match key_type {
+        "rsa" | "rsa2048" | "rsa4096" => Ok("rsa"),
+        "gpg" => Ok("gpg"),
+        "ed25519" => Ok("ed25519"),
+        other => Err(format!(
+            "Unsupported key_type: {}. Use gpg, rsa, or ed25519.",
+            other
+        )),
+    }
+}
+
 fn algorithm_to_bits_u32(algorithm: &str) -> std::result::Result<u32, String> {
     algorithm_to_bits(algorithm).and_then(|bits| {
         u32::try_from(bits).map_err(|_| format!("Unsupported RSA key size: {}", bits))
@@ -219,7 +238,14 @@ impl SigningService {
 
     /// Generate a new signing key pair and store it.
     pub async fn create_key(&self, req: CreateKeyRequest) -> Result<SigningKeyPublic> {
-        let (public_key_out, private_key_material, fingerprint, key_id) = if req.key_type == "gpg" {
+        // Normalize the key family before generation so an unsupported value
+        // surfaces as a clean 400 Validation error instead of tripping the
+        // signing_keys_key_type_check DB constraint (opaque 500). (#2319)
+        let key_type = normalize_key_type(&req.key_type)
+            .map_err(AppError::Validation)?
+            .to_string();
+
+        let (public_key_out, private_key_material, fingerprint, key_id) = if key_type == "gpg" {
             self.generate_openpgp_key(&req).await?
         } else {
             self.generate_rsa_key(&req.algorithm).await?
@@ -244,7 +270,7 @@ impl SigningService {
             id,
             req.repository_id,
             req.name,
-            req.key_type,
+            key_type,
             fingerprint,
             key_id,
             public_key_out,
@@ -266,7 +292,7 @@ impl SigningService {
             id,
             repository_id: req.repository_id,
             name: req.name,
-            key_type: req.key_type,
+            key_type,
             fingerprint: Some(fingerprint),
             key_id: Some(key_id),
             public_key_pem: public_key_out,
@@ -984,6 +1010,54 @@ mod tests {
     #[test]
     fn test_algorithm_to_bits_empty() {
         assert!(algorithm_to_bits("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_key_type (#2319 regression: algorithm variant sent as
+    // key_type must coerce to the DB-accepted family, not 500 at INSERT)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_key_type_rsa2048_coerced_to_rsa_family() {
+        assert_eq!(normalize_key_type("rsa2048").unwrap(), "rsa");
+    }
+
+    #[test]
+    fn test_normalize_key_type_rsa4096_coerced_to_rsa_family() {
+        assert_eq!(normalize_key_type("rsa4096").unwrap(), "rsa");
+    }
+
+    #[test]
+    fn test_normalize_key_type_rsa_passthrough() {
+        assert_eq!(normalize_key_type("rsa").unwrap(), "rsa");
+    }
+
+    #[test]
+    fn test_normalize_key_type_gpg_passthrough() {
+        assert_eq!(normalize_key_type("gpg").unwrap(), "gpg");
+    }
+
+    #[test]
+    fn test_normalize_key_type_ed25519_passthrough() {
+        assert_eq!(normalize_key_type("ed25519").unwrap(), "ed25519");
+    }
+
+    #[test]
+    fn test_normalize_key_type_unsupported_rejected() {
+        let result = normalize_key_type("dsa");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported key_type"));
+    }
+
+    #[test]
+    fn test_normalize_key_type_empty_rejected() {
+        assert!(normalize_key_type("").is_err());
+    }
+
+    #[test]
+    fn test_normalize_key_type_case_sensitive() {
+        // The DB CHECK constraint is case-sensitive; so is normalization.
+        assert!(normalize_key_type("RSA2048").is_err());
     }
 
     // -----------------------------------------------------------------------

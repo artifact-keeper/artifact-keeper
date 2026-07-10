@@ -14,7 +14,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
-use crate::services::signing_service::{CreateKeyRequest, SigningService};
+use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
 
 /// Create signing key management routes.
 pub fn router() -> Router<SharedState> {
@@ -137,19 +137,54 @@ async fn create_key(
             .await?;
     }
 
+    // Normalize the key family / algorithm pair before handing off to the
+    // signing service. Clients commonly send the algorithm variant
+    // ("rsa2048"/"rsa4096") as the key_type; without normalization that value
+    // hits the signing_keys_key_type_check CHECK constraint at INSERT and
+    // surfaces as an opaque 500 DATABASE_ERROR. An unsupported key_type now
+    // returns a clean Validation (400) instead.
+    let (key_type, algorithm) =
+        resolve_key_type_and_algorithm(payload.key_type, payload.algorithm)?;
+
     let svc = signing_service(&state);
     let key = svc
         .create_key(CreateKeyRequest {
             repository_id: payload.repository_id,
             name: payload.name,
-            key_type: payload.key_type.unwrap_or_else(|| "rsa".to_string()),
-            algorithm: payload.algorithm.unwrap_or_else(|| "rsa4096".to_string()),
+            key_type,
+            algorithm,
             uid_name: payload.uid_name,
             uid_email: payload.uid_email,
             created_by: Some(auth.user_id),
         })
         .await?;
     Ok(Json(key))
+}
+
+/// Resolve the `(key_type, algorithm)` pair from the optional payload fields.
+///
+/// - `key_type` is normalized to the DB-accepted family (`gpg`/`rsa`/`ed25519`);
+///   RSA algorithm variants sent as key_type are coerced to `rsa`.
+/// - When the client sent an RSA variant as `key_type` without an explicit
+///   `algorithm`, the variant is used as the algorithm so the requested key
+///   size is honored.
+/// - Defaults (`rsa` / `rsa4096`) are preserved when fields are omitted.
+fn resolve_key_type_and_algorithm(
+    key_type: Option<String>,
+    algorithm: Option<String>,
+) -> Result<(String, String)> {
+    let raw_key_type = key_type.unwrap_or_else(|| "rsa".to_string());
+    let family = normalize_key_type(&raw_key_type)
+        .map_err(AppError::Validation)?
+        .to_string();
+    let algorithm = algorithm.unwrap_or_else(|| {
+        if matches!(raw_key_type.as_str(), "rsa2048" | "rsa4096") {
+            raw_key_type.clone()
+        } else {
+            "rsa4096".to_string()
+        }
+    });
+    Ok((family, algorithm))
 }
 
 /// Get a signing key by ID.
@@ -641,6 +676,75 @@ mod tests {
         let payload: CreateKeyPayload = serde_json::from_str(r#"{"name": "k"}"#).unwrap();
         let algorithm = payload.algorithm.unwrap_or_else(|| "rsa4096".to_string());
         assert_eq!(algorithm, "rsa4096");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_key_type_and_algorithm (#2319 regression)
+    //
+    // POST /signing/keys with key_type "rsa2048"/"rsa4096" used to pass the
+    // algorithm variant straight into the key_type column and blow up on the
+    // signing_keys_key_type_check constraint (500 DATABASE_ERROR). The
+    // resolver must coerce variants to the "rsa" family, honor the variant as
+    // the algorithm when none is given, and reject unknown values with a
+    // Validation error (400).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_rsa2048_as_key_type_creates_valid_pair() {
+        let (key_type, algorithm) =
+            resolve_key_type_and_algorithm(Some("rsa2048".to_string()), None).unwrap();
+        // "rsa" satisfies the signing_keys_key_type_check DB constraint.
+        assert_eq!(key_type, "rsa");
+        // The requested key size is preserved via the algorithm.
+        assert_eq!(algorithm, "rsa2048");
+    }
+
+    #[test]
+    fn test_resolve_rsa4096_as_key_type_creates_valid_pair() {
+        let (key_type, algorithm) =
+            resolve_key_type_and_algorithm(Some("rsa4096".to_string()), None).unwrap();
+        assert_eq!(key_type, "rsa");
+        assert_eq!(algorithm, "rsa4096");
+    }
+
+    #[test]
+    fn test_resolve_explicit_algorithm_takes_precedence() {
+        let (key_type, algorithm) = resolve_key_type_and_algorithm(
+            Some("rsa4096".to_string()),
+            Some("rsa2048".to_string()),
+        )
+        .unwrap();
+        assert_eq!(key_type, "rsa");
+        assert_eq!(algorithm, "rsa2048");
+    }
+
+    #[test]
+    fn test_resolve_defaults_when_both_omitted() {
+        let (key_type, algorithm) = resolve_key_type_and_algorithm(None, None).unwrap();
+        assert_eq!(key_type, "rsa");
+        assert_eq!(algorithm, "rsa4096");
+    }
+
+    #[test]
+    fn test_resolve_gpg_key_type_preserved() {
+        let (key_type, algorithm) =
+            resolve_key_type_and_algorithm(Some("gpg".to_string()), Some("rsa2048".to_string()))
+                .unwrap();
+        assert_eq!(key_type, "gpg");
+        assert_eq!(algorithm, "rsa2048");
+    }
+
+    #[test]
+    fn test_resolve_ed25519_key_type_preserved() {
+        let (key_type, _) =
+            resolve_key_type_and_algorithm(Some("ed25519".to_string()), None).unwrap();
+        assert_eq!(key_type, "ed25519");
+    }
+
+    #[test]
+    fn test_resolve_unknown_key_type_is_validation_error() {
+        let err = resolve_key_type_and_algorithm(Some("dsa".to_string()), None).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     // -----------------------------------------------------------------------
