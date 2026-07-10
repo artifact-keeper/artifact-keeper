@@ -273,6 +273,36 @@ pub fn record_email_dispatch_attempted(event_type: &str) {
     .increment(1);
 }
 
+/// Record a proxy-cache write refused because the fetched body's SHA-256
+/// did not match the checksum embedded in a content-addressed path (e.g. an
+/// RPM createrepo unique-filename `repodata/<sha256>-primary.xml.gz`).
+///
+/// This is a `target: "security"`-adjacent signal: a mismatch here means
+/// either transport corruption or a dishonest/compromised upstream handed us
+/// bytes that do not match the identity the path itself promises. The body
+/// is still served to the client; only the cache write is skipped so a bad
+/// body is never pinned as "immutable forever".
+pub fn record_proxy_cache_checksum_mismatch(repo_key: &str) {
+    counter!(
+        "ak_proxy_cache_checksum_mismatch_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a proxy-cache write skipped because the fetched object exceeded
+/// the repository's `quota_bytes` (Phase-1 interim single-object guard for
+/// bug artifact-keeper-x70; full per-repo usage accounting is deferred to
+/// P4). The body is still served to the client; only the cache write is
+/// skipped.
+pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
+    counter!(
+        "ak_proxy_cache_quota_exceeded_total",
+        "repository" => repo_key.to_string()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +419,16 @@ mod tests {
     #[test]
     fn test_record_email_dispatch_attempted_does_not_panic() {
         record_email_dispatch_attempted("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_proxy_cache_checksum_mismatch_does_not_panic() {
+        record_proxy_cache_checksum_mismatch("my-rpm-repo");
+    }
+
+    #[test]
+    fn test_record_proxy_cache_quota_exceeded_does_not_panic() {
+        record_proxy_cache_quota_exceeded("my-rpm-repo");
     }
 
     #[test]

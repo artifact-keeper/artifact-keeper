@@ -435,6 +435,53 @@ fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// If `path` is a createrepo unique-filename (`repodata/<sha256>-<name>`),
+/// return the 64-hex-char checksum prefix. Used to verify a content-addressed
+/// body's integrity before caching it as immutable (design S3): the RPM
+/// `createrepo --unique-md-filenames` convention embeds the SHA-256 of the
+/// file's own content in its name (e.g.
+/// `repodata/1a2b...-primary.xml.gz`), so the path itself is an assertion
+/// about the body that a proxy can verify before trusting it forever.
+///
+/// Returns `None` for any path whose leaf does not have a 64-hex-char prefix
+/// before the first `-` (e.g. `repomd.xml`, a package file, or a
+/// non-checksum-prefixed metadata file) — those paths are not
+/// content-addressed and this check does not apply to them.
+pub fn expected_sha256_from_path(path: &str) -> Option<&str> {
+    let lower = path.to_ascii_lowercase();
+    let leaf = leaf(&lower);
+    let (prefix, _) = leaf.split_once('-')?;
+    if prefix.len() == 64 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Return the slice from the ORIGINAL path (case-insensitive hex).
+        let start = path.len() - leaf.len();
+        Some(&path[start..start + 64])
+    } else {
+        None
+    }
+}
+
+/// Phase-1 interim over-quota guard for a single object about to be cached
+/// (bug artifact-keeper-x70). Returns `true` when `quota_bytes` is set and
+/// `object_len` exceeds it, in which case the caller must skip the cache
+/// write for this object (still serving the body to the client).
+///
+/// This is deliberately NOT full per-repo usage accounting: the proxy cache
+/// is not recorded in the `artifacts` table (#1278), so there is no running
+/// per-repo proxy-cache total to check a request against yet. Full quota
+/// enforcement (usage tracking + eviction) is deferred to P4; this is only a
+/// cheap guard against a single object that is, by itself, already larger
+/// than the whole configured quota.
+///
+/// `quota_bytes = None` (no quota configured) never exceeds. An object
+/// exactly equal to the quota does NOT exceed (the quota is an inclusive
+/// ceiling, not an exclusive bound).
+pub fn exceeds_single_object_quota(quota_bytes: Option<i64>, object_len: i64) -> bool {
+    match quota_bytes {
+        Some(quota) => object_len > quota,
+        None => false,
+    }
+}
+
 /// Concrete versioned Maven artifact extensions (immutable). Checksums and
 /// signatures of these are immutable too.
 fn has_artifact_extension(leaf: &str) -> bool {
@@ -795,5 +842,90 @@ mod tests {
             &Rpm,
             "repodata/deadbeef-primary.xml.gz"
         ));
+    }
+
+    // ----- expected_sha256_from_path(): content-addressed integrity (S3) ----
+
+    #[test]
+    fn test_expected_sha256_from_path() {
+        // Full SHA-256 (64 hex) prefix is returned.
+        let p = "repodata/9f".to_string() + &"a".repeat(62) + "-primary.xml.gz";
+        assert!(expected_sha256_from_path(&p).is_some());
+        // repomd.xml and packages have no embedded checksum.
+        assert_eq!(expected_sha256_from_path("repodata/repomd.xml"), None);
+        assert_eq!(
+            expected_sha256_from_path("Packages/foo-1.2-3.x86_64.rpm"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_returns_exact_slice_of_original_path() {
+        let hex = "9f".to_string() + &"a".repeat(62);
+        let p = format!("repodata/{hex}-primary.xml.gz");
+        assert_eq!(expected_sha256_from_path(&p), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_case_insensitive_hex() {
+        // Uppercase hex in the path is still recognized as a checksum
+        // prefix, and the returned slice is the ORIGINAL (uppercase) bytes so
+        // the caller can compare byte-for-byte with a lowercase hex digest
+        // using an ascii-case-insensitive comparison.
+        let hex_upper = "9F".to_string() + &"A".repeat(62);
+        let p = format!("repodata/{hex_upper}-primary.xml.gz");
+        assert_eq!(expected_sha256_from_path(&p), Some(hex_upper.as_str()));
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_rejects_short_prefix() {
+        // A prefix shorter than 64 hex chars is not a full SHA-256 and must
+        // not be treated as content-addressed.
+        let p = "repodata/deadbeef-primary.xml.gz";
+        assert_eq!(expected_sha256_from_path(p), None);
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_rejects_non_hex_prefix() {
+        // 64 characters but not all hex digits.
+        let p = "repodata/".to_string() + &"z".repeat(64) + "-primary.xml.gz";
+        assert_eq!(expected_sha256_from_path(&p), None);
+    }
+
+    #[test]
+    fn test_expected_sha256_from_path_no_dash_in_leaf() {
+        // No '-' separator at all -> no checksum prefix to extract.
+        assert_eq!(
+            expected_sha256_from_path("repodata/primarynodash.xml"),
+            None
+        );
+    }
+
+    // ----- exceeds_single_object_quota(): Phase-1 interim guard (x70) -------
+
+    #[test]
+    fn test_exceeds_single_object_quota_table() {
+        // (quota_bytes, object_len, expected)
+        let cases: Vec<(Option<i64>, i64, bool)> = vec![
+            // No quota configured -> never exceeds.
+            (None, 0, false),
+            (None, i64::MAX, false),
+            // Object strictly larger than quota -> exceeds.
+            (Some(100), 101, true),
+            // Object exactly at quota -> does NOT exceed (quota is a ceiling,
+            // not an exclusive bound).
+            (Some(100), 100, false),
+            // Object smaller than quota -> does not exceed.
+            (Some(100), 99, false),
+            // Zero-byte object never exceeds any positive quota.
+            (Some(100), 0, false),
+        ];
+        for (quota_bytes, object_len, expected) in cases {
+            assert_eq!(
+                exceeds_single_object_quota(quota_bytes, object_len),
+                expected,
+                "exceeds_single_object_quota({quota_bytes:?}, {object_len}) expected {expected}"
+            );
+        }
     }
 }

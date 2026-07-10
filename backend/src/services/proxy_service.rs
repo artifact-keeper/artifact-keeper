@@ -2427,6 +2427,79 @@ impl ProxyService {
                         let quarantine_until = self
                             .quarantine_until_for_new_entry(repo.id, resp.last_modified.as_deref())
                             .await;
+
+                        // S3: content-addressed integrity. When `cache_path`
+                        // embeds a hex checksum (createrepo unique-filename,
+                        // e.g. `repodata/<sha256>-primary.xml.gz`), the path
+                        // itself asserts the body's identity. Verify it BEFORE
+                        // caching as immutable -- an immutable entry is cached
+                        // forever and never revalidated, so a dishonest or
+                        // compromised upstream handing us a mismatched body
+                        // here would be pinned permanently. On mismatch: serve
+                        // the body to the client (it already asked for this
+                        // path and upstream returned 200) but refuse to cache
+                        // it, so the next request re-fetches from upstream
+                        // instead of hitting a poisoned cache entry. This check
+                        // is a no-op (`None`) for every non-content-addressed
+                        // path and every other format.
+                        let checksum_ok = match cache_classifier::expected_sha256_from_path(
+                            cache_path,
+                        ) {
+                            Some(expected) => {
+                                let actual = StorageService::calculate_hash(&resp.content);
+                                if actual.eq_ignore_ascii_case(expected) {
+                                    true
+                                } else {
+                                    tracing::warn!(
+                                        target: "security",
+                                        repository = %repo.key,
+                                        cache_key = %cache_key,
+                                        path = %cache_path,
+                                        expected_sha256 = %expected,
+                                        actual_sha256 = %actual,
+                                        "content-addressed proxy body does not match the checksum \
+                                         embedded in its path; refusing to cache (serving body to \
+                                         client, treating as a cache miss)"
+                                    );
+                                    crate::services::metrics_service::record_proxy_cache_checksum_mismatch(
+                                        &repo.key,
+                                    );
+                                    false
+                                }
+                            }
+                            None => true,
+                        };
+
+                        // Phase-1 interim over-quota guard (bug
+                        // artifact-keeper-x70): full per-repo proxy-cache usage
+                        // accounting is deferred to P4 (proxy-cached content is
+                        // deliberately absent from the `artifacts` table, #1278,
+                        // so there is no running per-repo total to check yet).
+                        // This is only a cheap single-object guard: an object
+                        // larger than the repository's configured quota on its
+                        // own is never cached, even though nothing tracks
+                        // cumulative usage below that ceiling yet.
+                        let quota_ok = !cache_classifier::exceeds_single_object_quota(
+                            repo.quota_bytes,
+                            resp.content.len() as i64,
+                        );
+                        if !quota_ok {
+                            tracing::warn!(
+                                target: "security",
+                                repository = %repo.key,
+                                cache_key = %cache_key,
+                                path = %cache_path,
+                                object_len = resp.content.len(),
+                                quota_bytes = ?repo.quota_bytes,
+                                "proxy-fetched object exceeds repository quota_bytes; skipping \
+                                 cache write (Phase-1 interim single-object guard, serving body \
+                                 to client)"
+                            );
+                            crate::services::metrics_service::record_proxy_cache_quota_exceeded(
+                                &repo.key,
+                            );
+                        }
+
                         // B6 (coalescing 502 leak, remaining path): the upstream fetch
                         // already SUCCEEDED -- `resp.content` is in hand. A failure to
                         // persist the cache entry must NOT fail the client request.
@@ -2441,7 +2514,11 @@ impl ProxyService {
                         // write as best-effort: log at warn and still serve the bytes
                         // we fetched. The cache self-heals on the next request (the
                         // streaming path already documents this self-healing).
-                        if let Err(cache_err) = self
+                        if !checksum_ok || !quota_ok {
+                            // Guard tripped above: skip the cache write entirely
+                            // (do not index into the package catalog either --
+                            // nothing was actually cached).
+                        } else if let Err(cache_err) = self
                             .cache_artifact(
                                 &cache_key,
                                 &metadata_key,
@@ -10017,6 +10094,188 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// S3: a content-addressed RPM repodata body (createrepo unique
+    /// filename `repodata/<sha256>-primary.xml.gz`) whose SHA-256 does NOT
+    /// match the checksum embedded in the path must still be served to the
+    /// client (upstream returned 200; the client asked for this path) but
+    /// must NOT be cached -- caching it would pin a mismatched body as
+    /// "immutable forever" under the RPM classifier. This drives the real
+    /// buffered fetch path (`fetch_artifact_capped`, the same one RPM
+    /// repodata handlers use) against a wiremock upstream so both the S3
+    /// guard and its call site are exercised end-to-end.
+    #[tokio::test]
+    async fn test_content_addressed_checksum_mismatch_is_served_but_not_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        // The path promises this SHA-256; the body served below hashes to
+        // something else entirely, so this is a deliberate mismatch.
+        let claimed_sha256 = "0".repeat(64);
+        let cache_path = format!("repodata/{claimed_sha256}-primary.xml.gz");
+        let body = b"this body does not hash to the claimed checksum";
+        assert_ne!(
+            StorageService::calculate_hash(body.as_ref()),
+            claimed_sha256,
+            "test fixture sanity: body must NOT hash to the claimed checksum"
+        );
+
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{cache_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-x70-s3-mismatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let mut repo = remote_repo_for("rpm-remote", &server.uri(), tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Rpm;
+
+        let result = proxy
+            .fetch_artifact_capped(&repo, &cache_path, DEFAULT_METADATA_MAX_BYTES)
+            .await;
+
+        let (content, _ct) = result.expect(
+            "a checksum mismatch must still serve the fetched body to the \
+             client, not fail the request",
+        );
+        assert_eq!(&content[..], body.as_ref());
+
+        // The whole point of the guard: this must NOT have been cached.
+        let cached = proxy
+            .get_cached_artifact_by_path(&repo.key, &cache_path)
+            .await
+            .expect("cache lookup must not error");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            cached.is_none(),
+            "a content-addressed body whose SHA-256 does not match its path \
+             must be refused from the cache (treated as a miss), not pinned \
+             as an immutable entry"
+        );
+    }
+
+    /// Companion to the mismatch test above: a content-addressed RPM
+    /// repodata body whose SHA-256 DOES match the path's embedded checksum
+    /// must be cached normally. Pins that the S3 guard is gated on
+    /// `expected_sha256_from_path` returning `Some` AND a genuine mismatch --
+    /// it must not accidentally block every content-addressed write.
+    #[tokio::test]
+    async fn test_content_addressed_checksum_match_is_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        let body = b"primary.xml.gz body that DOES match its own checksum";
+        let real_sha256 = StorageService::calculate_hash(body.as_ref());
+        let cache_path = format!("repodata/{real_sha256}-primary.xml.gz");
+
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{cache_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-x70-s3-match-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let mut repo = remote_repo_for("rpm-remote", &server.uri(), tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Rpm;
+
+        let result = proxy
+            .fetch_artifact_capped(&repo, &cache_path, DEFAULT_METADATA_MAX_BYTES)
+            .await;
+        let (content, _ct) = result.expect("matching checksum must fetch successfully");
+        assert_eq!(&content[..], body.as_ref());
+
+        let cached = proxy
+            .get_cached_artifact_by_path(&repo.key, &cache_path)
+            .await
+            .expect("cache lookup must not error");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (cached_content, _) = cached.expect("a matching content-addressed body MUST be cached");
+        assert_eq!(&cached_content[..], body.as_ref());
+    }
+
+    /// Phase-1 interim over-quota guard (bug artifact-keeper-x70): an
+    /// object larger than the repository's configured `quota_bytes` must be
+    /// served to the client but never written to the cache.
+    #[tokio::test]
+    async fn test_object_exceeding_quota_is_served_but_not_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+
+        let cache_path = "repodata/repomd.xml";
+        let body = b"this object is bigger than the tiny configured quota";
+        assert!(
+            body.len() > 10,
+            "test fixture sanity: body must exceed the quota configured below"
+        );
+
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{cache_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_ref()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("ak-x70-quota-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let mut repo = remote_repo_for("rpm-remote-quota", &server.uri(), tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Rpm;
+        // Quota smaller than the served body -- must trip the guard.
+        repo.quota_bytes = Some(10);
+
+        let result = proxy
+            .fetch_artifact_capped(&repo, cache_path, DEFAULT_METADATA_MAX_BYTES)
+            .await;
+
+        let (content, _ct) =
+            result.expect("an over-quota object must still be served to the client");
+        assert_eq!(&content[..], body.as_ref());
+
+        let cached = proxy
+            .get_cached_artifact_by_path(&repo.key, cache_path)
+            .await
+            .expect("cache lookup must not error");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            cached.is_none(),
+            "an object larger than the repository's quota_bytes must be \
+             refused from the cache (Phase-1 interim single-object guard, \
+             bug artifact-keeper-x70), not silently cached over quota"
+        );
     }
 
     #[test]
