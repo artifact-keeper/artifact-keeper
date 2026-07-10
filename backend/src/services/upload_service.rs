@@ -81,6 +81,9 @@ pub enum UploadError {
     #[error("invalid chunk: {0}")]
     InvalidChunk(String),
 
+    #[error("chunk {0} is currently being uploaded by another request; retry shortly")]
+    ChunkInProgress(i32),
+
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
@@ -381,76 +384,105 @@ impl UploadService {
             return Err(UploadError::InvalidStatus(session.status));
         }
 
-        // C6: Use an atomic claim to prevent race conditions on concurrent
-        // uploads of the same chunk. Only the first request to transition
-        // from 'pending' to 'uploading' wins; others get an idempotent
-        // response or a conflict error.
-        let claimed = sqlx::query_as::<_, (i64,)>(
+        // C6/#2316: Serialize concurrent uploads of the SAME chunk with a
+        // row-level lock that is held for the whole write. The browser's
+        // parallel chunk uploader can issue two PATCHes for one chunk_index;
+        // previously the loser hit a terminal 400 (`InvalidChunk`) which made
+        // the UI abort the entire upload. Now the claim, the file write, and
+        // the completion bookkeeping all run inside one transaction that holds
+        // `SELECT ... FOR UPDATE` on the chunk row:
+        //
+        //   * A second concurrent request BLOCKS on the lock, then re-reads the
+        //     committed state and returns an idempotent success once the winner
+        //     commits 'completed'.
+        //   * If the winner fails mid-write, its transaction rolls back and the
+        //     claim reverts to its prior state automatically — no chunk is ever
+        //     left permanently stuck 'uploading' (self-healing; the old code
+        //     had no such release, so a failed write 400'd every retry forever).
+        //   * A committed 'uploading' row observed *while holding the lock* can
+        //     only be an abandoned claim (a live writer would hold this lock),
+        //     e.g. from a crashed request or a pre-#2316 backend. It is
+        //     reclaimed once its lease has expired; otherwise a retriable 409
+        //     (`ChunkInProgress`) is returned.
+        const CHUNK_CLAIM_LEASE_SECS: i64 = 300; // 5 minutes
+
+        let mut tx = db.begin().await?;
+
+        let existing = sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>)>(
             r#"
-            UPDATE upload_chunks
-            SET status = 'uploading'
-            WHERE session_id = $1 AND chunk_index = $2 AND status = 'pending'
-            RETURNING byte_length::bigint
+            SELECT status, claimed_at
+            FROM upload_chunks
+            WHERE session_id = $1 AND chunk_index = $2
+            FOR UPDATE
             "#,
         )
         .bind(session_id)
         .bind(chunk_index)
-        .fetch_optional(db)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        match claimed {
-            Some(_) => {
-                // We successfully claimed this chunk, continue with upload
-            }
+        match existing {
             None => {
-                // Either chunk doesn't exist, is already uploading, or is completed
-                let existing = sqlx::query_as::<_, (String,)>(
-                    "SELECT status FROM upload_chunks WHERE session_id = $1 AND chunk_index = $2",
-                )
-                .bind(session_id)
-                .bind(chunk_index)
-                .fetch_optional(db)
-                .await?;
-
-                match existing {
-                    Some((ref status,)) if status == "completed" => {
-                        // Idempotent: chunk already uploaded
-                        let completed = session.completed_chunks;
-                        return Ok(ChunkResult {
-                            chunk_index,
-                            bytes_received: session.bytes_received,
-                            chunks_completed: completed,
-                            chunks_remaining: session.total_chunks - completed,
-                        });
-                    }
-                    Some((ref status,)) if status == "uploading" => {
-                        return Err(UploadError::InvalidChunk(format!(
-                            "chunk {} is already being uploaded by another request",
-                            chunk_index
-                        )));
-                    }
-                    Some(_) => {
-                        return Err(UploadError::InvalidChunk(format!(
-                            "chunk {} is in an unexpected state",
-                            chunk_index
-                        )));
-                    }
-                    None => {
-                        return Err(UploadError::InvalidChunk(format!(
-                            "chunk_index {} out of range (0..{})",
-                            chunk_index, session.total_chunks
-                        )));
-                    }
+                let _ = tx.rollback().await;
+                return Err(UploadError::InvalidChunk(format!(
+                    "chunk_index {} out of range (0..{})",
+                    chunk_index, session.total_chunks
+                )));
+            }
+            Some((ref status, _)) if status == "completed" => {
+                // Idempotent: the winning request already uploaded this chunk.
+                let _ = tx.rollback().await;
+                let completed = session.completed_chunks;
+                return Ok(ChunkResult {
+                    chunk_index,
+                    bytes_received: session.bytes_received,
+                    chunks_completed: completed,
+                    chunks_remaining: session.total_chunks - completed,
+                });
+            }
+            Some((ref status, claimed_at)) if status == "uploading" => {
+                let stale = claimed_at
+                    .map(|t| (chrono::Utc::now() - t).num_seconds() > CHUNK_CLAIM_LEASE_SECS)
+                    .unwrap_or(true);
+                if !stale {
+                    let _ = tx.rollback().await;
+                    return Err(UploadError::ChunkInProgress(chunk_index));
                 }
+                // Lease expired: fall through and re-claim the abandoned chunk.
+            }
+            Some((ref status, _)) if status == "pending" || status == "failed" => {
+                // Fall through and claim.
+            }
+            Some((status, _)) => {
+                let _ = tx.rollback().await;
+                return Err(UploadError::InvalidChunk(format!(
+                    "chunk {} is in an unexpected state ({})",
+                    chunk_index, status
+                )));
             }
         }
+
+        // Claim the chunk under the held row lock.
+        sqlx::query(
+            r#"
+            UPDATE upload_chunks
+            SET status = 'uploading', claimed_at = NOW()
+            WHERE session_id = $1 AND chunk_index = $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(chunk_index)
+        .execute(&mut *tx)
+        .await?;
 
         // Compute SHA256 of the chunk data
         let mut hasher = Sha256::new();
         hasher.update(&data);
         let chunk_checksum = format!("{:x}", hasher.finalize());
 
-        // Write to temp file at the correct offset
+        // Write to temp file at the correct offset. Any `?` failure below
+        // returns before `tx.commit()`, so the transaction is dropped and the
+        // 'uploading' claim rolls back to its prior state.
         let temp_path = PathBuf::from(&session.temp_file_path);
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -463,7 +495,7 @@ impl UploadService {
 
         let data_len = data.len() as i64;
 
-        // Mark chunk as completed and update session counters atomically
+        // Mark chunk as completed within the same transaction.
         sqlx::query(
             r#"
             UPDATE upload_chunks
@@ -474,12 +506,13 @@ impl UploadService {
         .bind(session_id)
         .bind(chunk_index)
         .bind(&chunk_checksum)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
 
-        // The session counter UPDATE is atomic in PostgreSQL (completed_chunks + 1
-        // uses the row's current value under the hood), so concurrent chunk
-        // completions produce correct totals.
+        // Increment the session counters atomically with the chunk completion.
+        // Because the chunk-row lock is held for the whole claim→complete
+        // window, exactly one request completes each chunk, so `+ 1` counts
+        // every completed chunk once.
         let updated = sqlx::query_as::<_, (i32, i64)>(
             r#"
             UPDATE upload_sessions
@@ -493,8 +526,10 @@ impl UploadService {
         )
         .bind(session_id)
         .bind(data_len)
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         let (completed_chunks, bytes_received) = updated;
 
@@ -1946,5 +1981,109 @@ mod tests {
     fn test_validate_path_very_long_ok() {
         let long_path = "a/".repeat(100) + "file.bin";
         assert!(validate_artifact_path(&long_path).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent chunk upload (#2316)
+    // -----------------------------------------------------------------------
+    //
+    // Regression for #2316: the web UI's parallel chunk uploader can issue two
+    // PATCHes for the SAME chunk_index. The old code claimed the chunk with a
+    // bare `UPDATE ... WHERE status='pending'` and returned a terminal
+    // `InvalidChunk` (HTTP 400) to the loser, which aborted the whole upload.
+    // The fix serializes duplicate requests on a row lock held for the whole
+    // write, so the loser resolves to an idempotent success (or a retriable
+    // 409) instead — and the completed-chunk counter is still incremented
+    // exactly once.
+    //
+    // DB-backed: no-ops when `DATABASE_URL` is unset (mirrors the handler
+    // suites). Requires migration 149 (`upload_chunks.claimed_at`).
+    #[tokio::test]
+    async fn test_concurrent_duplicate_chunk_does_not_terminal_400() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage_path = storage_dir.to_string_lossy().into_owned();
+
+        // Small single-chunk session (default 8 MB chunk >= 4 KiB total).
+        let total_size: i64 = 4096;
+        let session = UploadService::create_session(CreateSessionParams {
+            db: &pool,
+            storage_path: &storage_path,
+            user_id,
+            repo_id,
+            repo_key: &repo_key,
+            artifact_path: "concurrent/chunk-2316.bin",
+            artifact_name: None,
+            artifact_version: None,
+            artifact_metadata_format: None,
+            artifact_metadata: None,
+            artifact_metadata_properties: None,
+            package_description: None,
+            package_metadata: None,
+            is_replication: false,
+            total_size,
+            max_upload_size: 0,
+            chunk_size: None,
+            checksum_sha256: "",
+            content_type: None,
+        })
+        .await
+        .expect("create session");
+
+        let data = bytes::Bytes::from(vec![0xABu8; total_size as usize]);
+
+        // Fire the SAME chunk (index 0) as two concurrent uploads.
+        let (a, b) = tokio::join!(
+            UploadService::upload_chunk(&pool, session.id, 0, 0, data.clone(), user_id),
+            UploadService::upload_chunk(&pool, session.id, 0, 0, data.clone(), user_id),
+        );
+
+        // Neither request may abort with a terminal InvalidChunk (HTTP 400).
+        for (label, r) in [("A", &a), ("B", &b)] {
+            if let Err(UploadError::InvalidChunk(m)) = r {
+                panic!("request {label} returned terminal InvalidChunk (400): {m}");
+            }
+        }
+        // At least one must have succeeded; the other is either an idempotent
+        // success or a retriable ChunkInProgress (409) — never a hard failure.
+        let ok_count = [&a, &b].iter().filter(|r| r.is_ok()).count();
+        assert!(ok_count >= 1, "expected >=1 success, got A={a:?} B={b:?}");
+        for (label, r) in [("A", &a), ("B", &b)] {
+            match r {
+                Ok(_) => {}
+                Err(UploadError::ChunkInProgress(_)) => {}
+                other => panic!("request {label} unexpected error: {other:?}"),
+            }
+        }
+
+        // The chunk is completed exactly once: the session counter is 1, not 2.
+        let (completed_chunks, chunk_status): (i32, String) = sqlx::query_as(
+            "SELECT s.completed_chunks, c.status \
+             FROM upload_sessions s \
+             JOIN upload_chunks c ON c.session_id = s.id AND c.chunk_index = 0 \
+             WHERE s.id = $1",
+        )
+        .bind(session.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read session + chunk state");
+        assert_eq!(chunk_status, "completed", "chunk 0 must end completed");
+        assert_eq!(
+            completed_chunks, 1,
+            "duplicate upload must not double-count the chunk"
+        );
+
+        // A subsequent request for the already-completed chunk is idempotent.
+        let again = UploadService::upload_chunk(&pool, session.id, 0, 0, data, user_id)
+            .await
+            .expect("idempotent replay of a completed chunk");
+        assert_eq!(again.chunk_index, 0);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 }

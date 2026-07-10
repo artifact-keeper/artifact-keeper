@@ -800,6 +800,9 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
         UploadError::Expired => (StatusCode::GONE, e.to_string()),
         UploadError::InvalidChunk(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        // A duplicate PATCH for a chunk another request is actively uploading:
+        // a transient, retriable condition, not a client error (#2316).
+        UploadError::ChunkInProgress(_) => (StatusCode::CONFLICT, e.to_string()),
         UploadError::InvalidChunkSize => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         UploadError::PathTooLong { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
