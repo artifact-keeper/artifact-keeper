@@ -1182,6 +1182,7 @@ pub async fn proxy_fetch_streaming_with_cache_key(
     upstream_url: &str,
     fetch_path: &str,
     cache_path: &str,
+    format: RepositoryFormat,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     proxy_fetch_streaming_with_cache_key_verified(
         proxy_service,
@@ -1191,6 +1192,7 @@ pub async fn proxy_fetch_streaming_with_cache_key(
         fetch_path,
         cache_path,
         None,
+        format,
     )
     .await
 }
@@ -1201,6 +1203,7 @@ pub async fn proxy_fetch_streaming_with_cache_key(
 /// is served to the client but NOT persisted, so a digest-addressed upstream
 /// answering with wrong bytes cannot poison the cache. The OCI virtual-repo
 /// blob fallback passes the requested blob digest here.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_cache_key_verified(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1209,24 +1212,18 @@ pub async fn proxy_fetch_streaming_with_cache_key_verified(
     fetch_path: &str,
     cache_path: &str,
     expected_checksum: Option<String>,
+    format: RepositoryFormat,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
-    with_proxy_repo(
-        repo_id,
-        repo_key,
-        upstream_url,
-        fetch_path,
-        |repo| async move {
-            proxy_service
-                .fetch_artifact_streaming_with_cache_path_gated(
-                    &repo,
-                    fetch_path,
-                    cache_path,
-                    expected_checksum,
-                )
-                .await
-        },
-    )
-    .await
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_streaming_with_cache_path_gated(
+            &repo,
+            fetch_path,
+            cache_path,
+            expected_checksum,
+        )
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
 }
 
 /// Response-producing sibling of [`proxy_fetch_streaming_with_cache_key`]:
@@ -1237,6 +1234,7 @@ pub async fn proxy_fetch_streaming_with_cache_key_verified(
 /// OpenTofu network-mirror archive downloads, where the registry-provided
 /// `download_url` is an absolute URL and `https://` trips the cache path's
 /// empty-segment guard — use this instead of `proxy_fetch_streaming` (#1998).
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_response_with_cache_key(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1245,6 +1243,7 @@ pub async fn proxy_fetch_streaming_response_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
     default_content_type: &str,
+    format: RepositoryFormat,
 ) -> Result<Response, Response> {
     let result = proxy_fetch_streaming_with_cache_key(
         proxy_service,
@@ -1253,6 +1252,7 @@ pub async fn proxy_fetch_streaming_response_with_cache_key(
         upstream_url,
         fetch_path,
         cache_path,
+        format,
     )
     .await?;
 
@@ -1271,8 +1271,9 @@ pub async fn proxy_check_cache_streaming(
     repo_key: &str,
     upstream_url: &str,
     cache_path: &str,
+    format: RepositoryFormat,
 ) -> Option<crate::services::proxy_service::StreamingFetchResult> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     match proxy_service
         .streaming_cached_artifact_by_path(&repo, cache_path)
         .await
@@ -4117,13 +4118,34 @@ pub fn age_gate_blocked_response(
 /// `Repository` value for `ProxyService` calls that need more than just
 /// the fields carried on the thin `RepoInfo` struct, e.g.
 /// `ProxyService::fetch_dists_with_revalidation` in the Debian handler.
+///
+/// Defaults to [`RepositoryFormat::Generic`]. Format-aware callers (e.g.
+/// Debian dists proxying) should use [`build_remote_repo_with_format`] so
+/// the proxy cache TTL classifier sees the real format and applies the
+/// correct immutable-vs-mutable rules (#1611).
 pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
+    build_remote_repo_with_format(id, key, upstream_url, RepositoryFormat::Generic)
+}
+
+/// Same as [`build_remote_repo`] but lets the caller specify the format.
+///
+/// The proxy cache TTL classifier (`cache_classifier::classify`) keys off
+/// `repo.format` to decide immutable (10-year TTL) vs mutable (5-min TTL).
+/// A handler that proxies a format with immutable paths (e.g. Debian
+/// `by-hash` indices) MUST pass its real format here; otherwise the
+/// classifier sees `Generic` and treats every path as mutable.
+pub(crate) fn build_remote_repo_with_format(
+    id: Uuid,
+    key: &str,
+    upstream_url: &str,
+    format: RepositoryFormat,
+) -> Repository {
     Repository {
         id,
         key: key.to_string(),
         name: key.to_string(),
         description: None,
-        format: RepositoryFormat::Generic,
+        format,
         repo_type: RepositoryType::Remote,
         storage_backend: "filesystem".to_string(),
         storage_path: String::new(),
@@ -5187,6 +5209,72 @@ mod tests {
         let after = Utc::now();
         assert!(repo.created_at >= before && repo.created_at <= after);
         assert!(repo.updated_at >= before && repo.updated_at <= after);
+    }
+
+    // ── build_remote_repo_with_format tests ─────────────────────────
+
+    #[test]
+    fn test_build_remote_repo_with_format_sets_format() {
+        let repo = build_remote_repo_with_format(
+            Uuid::new_v4(),
+            "debian-proxy",
+            "https://deb.debian.org/debian",
+            RepositoryFormat::Debian,
+        );
+        assert_eq!(repo.format, RepositoryFormat::Debian);
+    }
+
+    #[test]
+    fn test_build_remote_repo_with_format_generic_matches_default() {
+        // Passing Generic must produce the same result as build_remote_repo.
+        let id = Uuid::new_v4();
+        let a = build_remote_repo_with_format(id, "k", "https://u.com", RepositoryFormat::Generic);
+        let b = build_remote_repo(id, "k", "https://u.com");
+        assert_eq!(a.format, b.format);
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.upstream_url, b.upstream_url);
+    }
+
+    /// Regression: a Debian by-hash path proxied through a repo built with
+    /// `build_remote_repo_with_format(_, _, _, Debian)` MUST classify as
+    /// Immutable so `cache_ttl_for_path` stamps a 10-year TTL — not the
+    /// 5-minute mutable default that a Generic-format repo would produce.
+    #[test]
+    fn test_build_remote_repo_with_format_debian_by_hash_classifies_immutable() {
+        use crate::services::cache_classifier;
+
+        let repo = build_remote_repo_with_format(
+            Uuid::new_v4(),
+            "debian-huaweicloud",
+            "https://mirrors.huaweicloud.com/debian",
+            RepositoryFormat::Debian,
+        );
+        let by_hash_path =
+            "dists/trixie/main/binary-amd64/by-hash/SHA256/0f343b0931126a20f133d67c2b018a3b";
+        assert!(
+            cache_classifier::classify(&repo.format, by_hash_path).is_immutable(),
+            "Debian by-hash path must classify as Immutable when repo format is Debian"
+        );
+    }
+
+    /// Negative regression: an ordinary mutable dists/ index file proxied
+    /// through a Debian-format repo must still classify as Mutable so the
+    /// 5-minute TTL (revalidation window) is preserved.
+    #[test]
+    fn test_build_remote_repo_with_format_debian_dists_index_classifies_mutable() {
+        use crate::services::cache_classifier;
+
+        let repo = build_remote_repo_with_format(
+            Uuid::new_v4(),
+            "debian-huaweicloud",
+            "https://mirrors.huaweicloud.com/debian",
+            RepositoryFormat::Debian,
+        );
+        let mutable_path = "dists/trixie/main/binary-amd64/Packages.xz";
+        assert!(
+            !cache_classifier::classify(&repo.format, mutable_path).is_immutable(),
+            "Debian dists/ index must classify as Mutable when repo format is Debian"
+        );
     }
 
     // ── with_proxy_repo tests ────────────────────────────────────────
@@ -7948,6 +8036,7 @@ mod tests {
             &fetch_path,
             cache_path,
             "application/zip",
+            RepositoryFormat::Terraform,
         )
         .await
         .expect("streaming response must succeed for a split fetch/cache path");

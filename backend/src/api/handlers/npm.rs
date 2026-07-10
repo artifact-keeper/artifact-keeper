@@ -36,7 +36,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
@@ -1972,6 +1972,7 @@ async fn serve_tarball(
                 upstream_url,
                 &fetch_path,
                 &fetch_path,
+                RepositoryFormat::Npm,
             )
             .await?;
 
@@ -2067,6 +2068,7 @@ async fn serve_tarball(
                             member_upstream,
                             &lkg_path,
                             &lkg_path,
+                            member.format.clone(),
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;

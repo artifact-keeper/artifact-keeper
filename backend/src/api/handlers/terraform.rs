@@ -37,7 +37,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1465,6 +1465,7 @@ async fn mirror_download(
         archive_url,
         &cache_path,
         "application/zip",
+        RepositoryFormat::Terraform,
     )
     .await
 }

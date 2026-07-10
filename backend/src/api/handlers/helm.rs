@@ -24,7 +24,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler, HelmIndex};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::proxy_service::ProxyService;
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,7 @@ async fn fetch_chart_via_index(
         upstream_url,
         &fetch_url,
         &cache_path,
+        RepositoryFormat::Helm,
     )
     .await?;
     proxy_helpers::stream_fetch_result(result, "application/gzip", Some(filename))

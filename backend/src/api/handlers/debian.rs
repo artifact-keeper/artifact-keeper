@@ -565,15 +565,25 @@ impl<'a> DebianProxy<'a> {
         // treats it as a cache miss and re-fetches from upstream.
         maybe_invalidate_by_epoch(proxy, self.repo_key, self.distribution, &upstream_path).await;
 
-        let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
-            proxy,
+        // Use a Debian-format repo so the cache TTL classifier sees the
+        // real format: by-hash paths classify as Immutable (10-year TTL),
+        // while ordinary dists/ index files stay Mutable (5-min TTL).
+        // The generic proxy_fetch_capped helper defaults to Generic,
+        // which treats every path as mutable.
+        let proxy_repo = proxy_helpers::build_remote_repo_with_format(
             repo.id,
             self.repo_key,
             upstream_url,
-            &upstream_path,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        )
-        .await?;
+            RepositoryFormat::Debian,
+        );
+        let (content, upstream_ct) = proxy
+            .fetch_artifact_capped(
+                &proxy_repo,
+                &upstream_path,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await
+            .map_err(map_proxy_err)?;
         Err(build_dists_response(content, upstream_ct, content_type))
     }
 
@@ -830,15 +840,22 @@ async fn try_virtual_dists(
         // Epoch-based lazy invalidation for this member's cache entry
         maybe_invalidate_by_epoch(proxy, &member.key, distribution, upstream_path).await;
 
-        match proxy_helpers::proxy_fetch_capped(
-            proxy,
+        // Use a Debian-format repo so the cache TTL classifier sees the
+        // real format: by-hash paths classify as Immutable (10-year TTL),
+        // while ordinary dists/ index files stay Mutable (5-min TTL).
+        let proxy_repo = proxy_helpers::build_remote_repo_with_format(
             member.id,
             &member.key,
             upstream_url,
-            upstream_path,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        )
-        .await
+            RepositoryFormat::Debian,
+        );
+        match proxy
+            .fetch_artifact_capped(
+                &proxy_repo,
+                upstream_path,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await
         {
             Ok((content, upstream_ct)) => {
                 return Ok(Some(build_dists_response(
@@ -847,11 +864,11 @@ async fn try_virtual_dists(
                     default_content_type,
                 )));
             }
-            Err(resp) => {
-                if resp.status() == StatusCode::NOT_FOUND {
+            Err(e) => {
+                if matches!(e, crate::error::AppError::NotFound(_)) {
                     continue;
                 }
-                first_err.get_or_insert(resp);
+                first_err.get_or_insert(map_proxy_err(e));
             }
         }
     }
@@ -1371,15 +1388,24 @@ async fn dists_proxy_catchall(
     // Immutable paths (by-hash) are skipped by maybe_invalidate_by_epoch.
     maybe_invalidate_by_epoch(proxy, &repo_key, &distribution, &upstream_path).await;
 
-    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
-        proxy,
+    // Use a Debian-format repo so the cache TTL classifier sees the real
+    // format: by-hash paths under dists/ classify as Immutable (10-year
+    // TTL), while ordinary dists/ index files (Packages, Sources,
+    // Translation, etc.) stay Mutable (5-min TTL).
+    let proxy_repo = proxy_helpers::build_remote_repo_with_format(
         repo.id,
         &repo_key,
         upstream_url,
-        &upstream_path,
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-    )
-    .await?;
+        RepositoryFormat::Debian,
+    );
+    let (content, upstream_ct) = proxy
+        .fetch_artifact_capped(
+            &proxy_repo,
+            &upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        .map_err(map_proxy_err)?;
 
     let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
 
