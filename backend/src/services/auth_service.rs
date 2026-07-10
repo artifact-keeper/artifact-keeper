@@ -245,6 +245,47 @@ const INVALIDATION_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// round-trip on every single request that comes in within a burst.
 const CREDENTIAL_DB_CACHE_TTL_SECS: u64 = 5;
 
+/// Bounded cross-host clock-skew tolerance, in **milliseconds**, applied to
+/// the **DB-derived** credential-change watermark (#2245).
+///
+/// The token's issued-at ([`Claims::effective_iat_ms`]) is stamped from the
+/// API host's clock, while the DB watermark
+/// (`GREATEST(password_changed_at, totp_verified_at, privileges_changed_at)`)
+/// is stamped by Postgres `NOW()` — two different clocks whenever the API
+/// server and the database run on different hosts. When the API host lags the
+/// database by ordinary NTP-level offset, a token minted strictly AFTER a
+/// credential change can still carry `iat_ms < watermark` and be spuriously
+/// rejected (fails closed — a 401 on a legitimate fresh login, reproduced in
+/// CI with the database pinned to a different node than the runner).
+///
+/// [`fetch_credential_change_watermark`] subtracts this tolerance from the
+/// DB-clock watermark at ingestion (see [`apply_db_clock_skew_tolerance`]),
+/// so a token is only rejected when its `iat_ms` is more than this many
+/// milliseconds behind the DB timestamp. 2 s covers NTP-grade cross-host
+/// offset (typically well under 1 s) plus the up-to-999 ms floor error of
+/// legacy whole-second `iat` tokens, while staying strictly inside the
+/// existing cross-replica revocation-latency posture
+/// ([`CREDENTIAL_DB_CACHE_TTL_SECS`] = 5 s) and a tiny fraction of the token
+/// lifetime — a credential change still invalidates every token minted more
+/// than 2 s before it, so the watermark's purpose (killing stale pre-change
+/// tokens) is preserved.
+///
+/// Deliberately NOT applied to watermarks written by the local
+/// `invalidate_user_tokens*` family: those are stamped from THIS host's
+/// clock, the same clock domain as `iat_ms`, so no skew exists and the
+/// millisecond-precision same-second ordering (#931/#1911/#1933) is kept
+/// exact on the same-replica path.
+pub(crate) const CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS: i64 = 2_000;
+
+/// Shift a DB-clock watermark into the app-clock domain conservatively:
+/// subtract [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] so the strict-`<`
+/// comparison in [`is_token_invalidated_replica_safe`] cannot spuriously
+/// reject a token minted (per the app clock) at-or-after the credential
+/// change just because the app clock lags Postgres (#2245).
+pub(crate) fn apply_db_clock_skew_tolerance(db_watermark_ms: i64) -> i64 {
+    db_watermark_ms.saturating_sub(CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS)
+}
+
 fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
     CREDENTIAL_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -396,6 +437,12 @@ pub(crate) struct CredentialWatermark {
     /// component of `password_changed_at` (microsecond TIMESTAMPTZ) so a token
     /// minted in the same wall-clock second as a credential change is ordered
     /// correctly against the watermark.
+    ///
+    /// When freshly read from the database, the DB-clock timestamp is
+    /// pre-shifted down by [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] (#2245)
+    /// so the strict-`<` comparison against the app-clock `iat_ms` tolerates
+    /// cross-host clock skew. A cache-served value may instead be a local
+    /// app-clock watermark (same clock domain as `iat_ms`, no shift needed).
     pub(crate) watermark: i64,
     /// `users.is_active`. When `false`, [`is_token_invalidated_replica_safe`]
     /// rejects every token regardless of `iat` so a deactivation processed
@@ -408,7 +455,9 @@ pub(crate) struct CredentialWatermark {
 ///
 /// Returns the highest of `users.password_changed_at` and
 /// `users.totp_verified_at` as a Unix timestamp (in **milliseconds**),
-/// alongside `users.is_active`, or `None` if the user no longer exists.
+/// shifted down by [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] to absorb
+/// app-vs-DB clock skew (#2245), alongside `users.is_active`, or `None` if
+/// the user no longer exists.
 ///
 /// Note: `users.updated_at` is deliberately NOT included. Profile edits
 /// (display name, email, last_login_at touches) bump `updated_at` without
@@ -478,7 +527,17 @@ async fn fetch_credential_change_watermark(
     // needed. Full precision is also strictly more correct cross-replica: a
     // password change observed via the DB on a peer replica now rejects
     // same-second pre-change tokens there too, which the floored value weakened.
-    let watermark = watermark_ts.timestamp_millis();
+    //
+    // The DB timestamp is then shifted down by
+    // `CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS` (#2245): the watermark is
+    // Postgres-clock while the token's `iat_ms` is app-host-clock, and when
+    // the app host lags the database a token minted strictly AFTER the change
+    // would otherwise carry `iat_ms < watermark` and be spuriously 401'd.
+    // Local `invalidate_user_tokens*` watermarks (same clock domain as
+    // `iat_ms`) are NOT adjusted, and the monotonic-max cache write below
+    // keeps the higher, full-precision local value dominant on the replica
+    // that processed the change.
+    let watermark = apply_db_clock_skew_tolerance(watermark_ts.timestamp_millis());
 
     // Only cache when the user is active. Caching `is_active=false` would
     // require expanding the cache value to a tuple; instead we skip the
@@ -529,6 +588,14 @@ async fn fetch_credential_change_watermark(
 /// `iat_ms < watermark` and is rejected to the millisecond. There is no
 /// exploitable window. Legacy tokens with no `iat_ms` fall back to the floored
 /// `iat * 1000`, the conservative side (rejected against a same-second change).
+///
+/// Cross-clock skew (#2245): `iat_ms` comes from the API host's clock while
+/// the DB watermark comes from Postgres `NOW()`. A watermark freshly read
+/// from the database is therefore pre-shifted down by
+/// [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] at ingestion
+/// ([`fetch_credential_change_watermark`]) so a token minted after the change
+/// on a lagging app clock is not spuriously rejected. Locally-written
+/// watermarks (same clock domain) keep exact millisecond ordering.
 ///
 /// Resolution order:
 ///   1. DB watermark, served from the in-memory cache when fresh
@@ -4966,6 +5033,81 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #2245: app-clock `iat_ms` vs DB-clock watermark skew tolerance.
+    //
+    // `fetch_credential_change_watermark` shifts the DB-clock timestamp down
+    // by `CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS` at ingestion; the replica-
+    // safe check then rejects with strict `<`. These tests pin the combined
+    // decision — `iat_ms < apply_db_clock_skew_tolerance(db_watermark_ms)` —
+    // which is exactly the comparison a token faces against a freshly-read
+    // DB watermark.
+    // -----------------------------------------------------------------------
+
+    /// A token whose `iat_ms` equals the raw DB watermark must be accepted
+    /// (strict `<` already allowed the equal case pre-#2245; the tolerance
+    /// must not regress it).
+    #[test]
+    fn test_db_skew_iat_exactly_at_db_watermark_accepted() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        let iat_ms = db_watermark_ms;
+        assert!(
+            iat_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat exactly at the DB watermark must pass"
+        );
+    }
+
+    /// The #2245 defect case: the app host clock lags Postgres by ~1 s, so a
+    /// token minted strictly AFTER the credential change carries an `iat_ms`
+    /// 1 s BEFORE the DB-clock watermark. Within the tolerance it must now be
+    /// accepted (pre-fix: spurious 401).
+    #[test]
+    fn test_db_skew_iat_within_tolerance_accepted() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        let iat_ms = db_watermark_ms - 1_000; // 1 s behind: NTP-level skew
+        assert!(
+            iat_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat within the skew tolerance must pass (the #2245 fix)"
+        );
+        // Exact edge: iat at watermark - tolerance still passes (strict `<`).
+        let iat_edge_ms = db_watermark_ms - CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS;
+        assert!(
+            iat_edge_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat exactly at the tolerance edge must pass"
+        );
+    }
+
+    /// A token minted well before the credential change (beyond any plausible
+    /// clock skew) must still be rejected — the tolerance must not defeat the
+    /// watermark's purpose of killing stale pre-change tokens.
+    #[test]
+    fn test_db_skew_iat_beyond_tolerance_rejected() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        // One millisecond past the tolerance edge: rejected.
+        let iat_just_past_ms = db_watermark_ms - CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS - 1;
+        assert!(
+            iat_just_past_ms < apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat one ms beyond the tolerance must be rejected"
+        );
+        // A genuinely stale token (minted a minute before the change).
+        let iat_stale_ms = db_watermark_ms - 60_000;
+        assert!(
+            iat_stale_ms < apply_db_clock_skew_tolerance(db_watermark_ms),
+            "a genuinely pre-change token must still be rejected"
+        );
+    }
+
+    /// The tolerance is a bounded, security-reviewed window; a change to the
+    /// constant should be deliberate, not incidental.
+    #[test]
+    fn test_db_skew_tolerance_is_narrow() {
+        assert!(
+            (1_000..=2_000).contains(&CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS),
+            "the skew tolerance must stay a narrow 1-2s window; widening it \
+             weakens credential-change invalidation and needs security review"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // API-token cache invalidation on user deactivation (issue #931)
     // -----------------------------------------------------------------------
 
@@ -5653,6 +5795,85 @@ mod tests {
 
         // Cleanup.
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2245 end-to-end: the DB clock running AHEAD of the app clock (the
+    /// same inequality a lagging API host produces) must not 401 a token
+    /// minted after the credential change. We simulate the skew by
+    /// future-dating `password_changed_at` relative to this process's clock —
+    /// no split-clock environment needed — and assert the replica-safe check
+    /// accepts an app-clock "now" token within the tolerance but still
+    /// rejects one beyond it.
+    #[tokio::test]
+    async fn test_replica_safe_tolerates_db_clock_ahead_of_app_clock() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("skew_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        // Watermark 1 s in the future of the app clock: models NTP-level
+        // app-behind-DB skew around a credential change (well within
+        // CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS).
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             privileges_changed_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
+             NOW() + INTERVAL '1 second', NOW() + INTERVAL '1 second')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert skewed user");
+
+        // A token minted "now" on the app clock (post-change in real time,
+        // but 1 s behind the DB-stamped watermark). Pre-#2245 this was
+        // spuriously rejected; with the ingestion-side tolerance it passes.
+        let app_now_iat = Utc::now().timestamp_millis();
+        let rejected = is_token_invalidated_replica_safe(&pool, user_id, app_now_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            !rejected,
+            "a token minted after the change on a 1s-lagging app clock must \
+             be accepted (#2245)"
+        );
+
+        // Beyond the tolerance the watermark still bites: push the change
+        // 60 s ahead of the token's iat and re-check (cache cleared so the
+        // DB is re-read).
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+        sqlx::query(
+            "UPDATE users SET password_changed_at = NOW() + INTERVAL '60 seconds' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("bump watermark beyond tolerance");
+        let rejected_beyond = is_token_invalidated_replica_safe(&pool, user_id, app_now_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            rejected_beyond,
+            "a token more than the tolerance behind the watermark must still \
+             be rejected"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
