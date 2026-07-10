@@ -348,13 +348,13 @@ impl MigrationWorker {
                     }
                 }
             } else {
+                // Auto-provisioned repos inherit the server's default storage
+                // backend; without this they fall back to the column default
+                // `filesystem`, stranding cloud deployments' artifacts (#2336).
+                let backend = self.storage_registry.default_backend();
                 match self
                     .migration_service
-                    .create_repository(
-                        &migration_config,
-                        &self.config.staging_path,
-                        self.storage_registry.default_backend(),
-                    )
+                    .create_repository(&migration_config, &self.config.staging_path, backend)
                     .await
                 {
                     Ok(_) => {

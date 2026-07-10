@@ -1248,6 +1248,40 @@ mod tests {
     }
 
     #[test]
+    fn test_build_storage_path_contract() {
+        // Only "filesystem" gets the absolute staging prefix; every other
+        // backend name — including unknown ones — is treated as object storage
+        // and addressed by the bare repo key. This mirrors the create-repo
+        // handler and guards against a newly added cloud backend silently
+        // inheriting the filesystem path convention (#2336).
+        let base = "/srv/ak/storage";
+
+        // Filesystem: absolute prefix, and nested keys are preserved verbatim.
+        assert_eq!(
+            MigrationService::build_storage_path("filesystem", base, "libs-release"),
+            "/srv/ak/storage/libs-release"
+        );
+        assert_eq!(
+            MigrationService::build_storage_path("filesystem", base, "team/libs"),
+            "/srv/ak/storage/team/libs"
+        );
+
+        // Object stores ignore the base entirely and use the bare key, even a
+        // backend name the helper has never seen before.
+        assert_eq!(
+            MigrationService::build_storage_path("minio", base, "libs-release"),
+            "libs-release"
+        );
+
+        // Backend matching is exact and case-sensitive: "Filesystem" is NOT the
+        // filesystem backend, so it must not receive the staging prefix.
+        assert_eq!(
+            MigrationService::build_storage_path("Filesystem", base, "libs-release"),
+            "libs-release"
+        );
+    }
+
+    #[test]
     fn test_permission_mapping() {
         assert_eq!(MigrationService::map_permission("read"), Some("read"));
         assert_eq!(MigrationService::map_permission("deploy"), Some("write"));
