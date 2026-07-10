@@ -907,6 +907,8 @@ async fn list_policies(
     request_body = CreatePolicyRequest,
     responses(
         (status = 200, description = "Policy created", body = PolicyResponse),
+        (status = 400, description = "Invalid max_severity (must be one of critical, high, medium, low; case-insensitive)", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "repository_id does not reference an existing repository", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
