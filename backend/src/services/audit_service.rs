@@ -86,6 +86,14 @@ pub enum AuditAction {
     AgeGateQueued,
     AgeGateApproved,
     AgeGateRejected,
+
+    // Authorization decisions (#2366 functional audit log). Recorded when an
+    // authenticated principal is refused a privileged operation (e.g. a
+    // non-admin reaching an admin-only route) so the audit trail captures
+    // denials, not just successful state changes. Appended at the END of the
+    // enum to keep the additive change conflict-free with in-flight taxonomy
+    // work.
+    PermissionDenied,
 }
 
 impl AuditAction {
@@ -137,6 +145,7 @@ impl AuditAction {
             AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
+            AuditAction::PermissionDenied => "PERMISSION_DENIED",
         }
     }
 }
@@ -732,6 +741,12 @@ mod tests {
         assert_eq!(AuditAction::ScanReaped.as_str(), "SCAN_REAPED");
     }
 
+    #[test]
+    fn test_audit_action_as_str_permission_denied() {
+        // #2366: authorization-denial event.
+        assert_eq!(AuditAction::PermissionDenied.as_str(), "PERMISSION_DENIED");
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -1212,5 +1227,76 @@ mod tests {
         assert_eq!(details["trigger"], "password_change");
         // Reserved key must not survive into the stored payload.
         assert!(!details.as_object().expect("object").contains_key("actor"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2366: emit -> query round-trip against a real database. Skips cleanly
+    // when `DATABASE_URL` is unset (the CI coverage job seeds Postgres, so it
+    // is exercised there). Uses `user_id = None` to avoid the users FK.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_log_then_query_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuditService::new(pool);
+
+        // A unique resource id keys this test's rows so parallel test processes
+        // never see each other's events.
+        let resource_id = Uuid::new_v4();
+        let entry = AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+            .resource(resource_id)
+            .details(serde_json::json!({ "key": "audit-roundtrip-test" }));
+        let id = service.log(entry).await.expect("log succeeds");
+        assert!(!id.is_nil());
+
+        // Query by the unique resource id: exactly our row comes back, with the
+        // action, resource type/id, and a populated timestamp.
+        let (rows, total) = service
+            .query(
+                None,
+                None,
+                Some("repository"),
+                Some(resource_id),
+                None,
+                None,
+                0,
+                50,
+            )
+            .await
+            .expect("query succeeds");
+        assert_eq!(total, 1, "exactly one event for the unique resource id");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.action, "REPOSITORY_CREATED");
+        assert_eq!(row.resource_type, "repository");
+        assert_eq!(row.resource_id, Some(resource_id));
+        assert_eq!(row.details.as_ref().unwrap()["key"], "audit-roundtrip-test");
+
+        // A non-matching action filter excludes the row (filter is applied).
+        let (rows2, total2) = service
+            .query(
+                None,
+                Some("LOGIN"),
+                None,
+                Some(resource_id),
+                None,
+                None,
+                0,
+                50,
+            )
+            .await
+            .expect("query succeeds");
+        assert_eq!(total2, 0);
+        assert!(rows2.is_empty());
+
+        // Cleanup our row so the table does not accrete across test runs.
+        // Runtime (non-macro) query so no offline `.sqlx` prepare is needed.
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&service.db)
+            .await;
     }
 }

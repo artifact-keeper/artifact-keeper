@@ -881,6 +881,28 @@ impl ArtifactService {
             });
         }
 
+        // Best-effort audit trail (#2366): record who uploaded which artifact.
+        // Fire-and-forget so an audit-table outage can never fail an upload,
+        // mirroring the download/stats contract.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let mut entry = AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
+                .resource(artifact.id)
+                .details(serde_json::json!({
+                    "repository_id": artifact.repository_id.to_string(),
+                    "path": artifact.path,
+                    "name": artifact.name,
+                    "version": artifact.version,
+                    "size_bytes": artifact.size_bytes,
+                }));
+            if let Some(uid) = uploaded_by {
+                entry = entry.user(uid);
+            }
+            audit_fire_and_forget(self.db.clone(), entry).await;
+        }
+
         Ok(artifact)
     }
 
@@ -958,6 +980,33 @@ impl ArtifactService {
         .execute(&self.db)
         .await
         .ok(); // Ignore stats errors
+
+        // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
+        // per-access record auditors need to answer "who fetched this artifact,
+        // and when?". Fire-and-forget: a download must never fail because the
+        // audit table is unavailable, mirroring the download-statistics write
+        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let mut entry =
+                AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
+                    .resource(artifact_id)
+                    .details(serde_json::json!({
+                        "repository_id": artifact_info.repository_id.to_string(),
+                        "path": artifact_info.path,
+                        "name": artifact_info.name,
+                        "version": artifact_info.version,
+                    }));
+            if let Some(uid) = user_id {
+                entry = entry.user(uid);
+            }
+            if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
+                entry = entry.ip(ip);
+            }
+            audit_fire_and_forget(self.db.clone(), entry).await;
+        }
 
         // Trigger AfterDownload hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
@@ -1265,6 +1314,27 @@ impl ArtifactService {
                     );
                     e
                 });
+        }
+
+        // Best-effort audit trail (#2366): record artifact deletion (soft
+        // delete). Fire-and-forget; never fails the delete.
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            // The service-layer delete does not carry the acting principal, so
+            // `user_id` (the actor) is intentionally left unset here; the
+            // original uploader is recorded in `details` for context.
+            let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
+                .resource(artifact.id)
+                .details(serde_json::json!({
+                    "repository_id": artifact.repository_id.to_string(),
+                    "path": artifact.path,
+                    "name": artifact.name,
+                    "version": artifact.version,
+                    "uploaded_by": artifact.uploaded_by.map(|u| u.to_string()),
+                }));
+            audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
         // Trigger AfterDelete hooks (non-blocking)

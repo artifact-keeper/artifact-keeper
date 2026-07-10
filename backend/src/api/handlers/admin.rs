@@ -34,6 +34,148 @@ pub fn router() -> Router<SharedState> {
         .route("/reindex", post(trigger_reindex))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
+        .route("/audit", get(list_audit_logs))
+}
+
+// ---------------------------------------------------------------------------
+// Audit log query endpoint (#2366 functional audit log)
+// ---------------------------------------------------------------------------
+
+/// Default page size for the audit-log query when the caller does not specify.
+const AUDIT_DEFAULT_PER_PAGE: u32 = 50;
+/// Hard cap on page size so a single query cannot pull an unbounded slice.
+const AUDIT_MAX_PER_PAGE: u32 = 200;
+
+/// Normalize/clamp audit-query pagination into a `(offset, limit, page,
+/// per_page)` tuple.
+///
+/// Pure (no I/O) so the coverage gate exercises the pagination arithmetic even
+/// where Postgres is unavailable. `page` is 1-based and floored at 1;
+/// `per_page` defaults to [`AUDIT_DEFAULT_PER_PAGE`] and is clamped to
+/// `1..=AUDIT_MAX_PER_PAGE`.
+pub(crate) fn audit_page_bounds(page: Option<u32>, per_page: Option<u32>) -> (i64, i64, u32, u32) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page
+        .unwrap_or(AUDIT_DEFAULT_PER_PAGE)
+        .clamp(1, AUDIT_MAX_PER_PAGE);
+    let offset = i64::from(page - 1) * i64::from(per_page);
+    (offset, i64::from(per_page), page, per_page)
+}
+
+/// Filters for `GET /api/v1/admin/audit`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AuditLogQuery {
+    /// Filter by acting/subject user id.
+    pub user_id: Option<Uuid>,
+    /// Filter by action string (e.g. `LOGIN`, `USER_CREATED`, `ARTIFACT_DOWNLOADED`).
+    pub action: Option<String>,
+    /// Filter by resource type (e.g. `user`, `repository`, `artifact`).
+    pub resource_type: Option<String>,
+    /// Filter by the affected resource id.
+    pub resource_id: Option<Uuid>,
+    /// Inclusive lower time bound (RFC 3339).
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Inclusive upper time bound (RFC 3339).
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+    /// 1-based page index (default 1).
+    pub page: Option<u32>,
+    /// Page size (default 50, max 200).
+    pub per_page: Option<u32>,
+}
+
+/// A single audit-log row in a query response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuditLogItem {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub details: Option<serde_json::Value>,
+    pub ip_address: Option<String>,
+    pub correlation_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::audit_service::AuditLogEntry> for AuditLogItem {
+    fn from(e: crate::services::audit_service::AuditLogEntry) -> Self {
+        Self {
+            id: e.id,
+            user_id: e.user_id,
+            action: e.action,
+            resource_type: e.resource_type,
+            resource_id: e.resource_id,
+            details: e.details,
+            ip_address: e.ip_address,
+            correlation_id: e.correlation_id,
+            created_at: e.created_at,
+        }
+    }
+}
+
+/// Paginated audit-log query response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuditLogListResponse {
+    pub items: Vec<AuditLogItem>,
+    pub total: i64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Query the audit log (admin only).
+///
+/// Returns recorded audit events ordered newest-first, filtered by any
+/// combination of actor/user, action, resource type/id, and time range, with
+/// page/per_page pagination. Backed by the `audit_log` table and
+/// [`AuditService::query`]; admin-only both via the `/admin` `admin_middleware`
+/// and a defense-in-depth check here (#2366).
+#[utoipa::path(
+    get,
+    path = "/audit",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(AuditLogQuery),
+    responses(
+        (status = 200, description = "Audit events", body = AuditLogListResponse),
+        (status = 403, description = "Admin privileges required"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_audit_logs(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<AuditLogListResponse>> {
+    // Defense-in-depth: the `/admin` nest already enforces `admin_middleware`,
+    // but never rely on a single gate for a security-sensitive read.
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let (offset, limit, page, per_page) = audit_page_bounds(query.page, query.per_page);
+
+    let audit_service = crate::services::audit_service::AuditService::new(state.db.clone());
+    let (entries, total) = audit_service
+        .query(
+            query.user_id,
+            query.action.as_deref(),
+            query.resource_type.as_deref(),
+            query.resource_id,
+            query.from,
+            query.to,
+            offset,
+            limit,
+        )
+        .await?;
+
+    Ok(Json(AuditLogListResponse {
+        items: entries.into_iter().map(AuditLogItem::from).collect(),
+        total,
+        page,
+        per_page,
+    }))
 }
 
 /// List available storage backends.
@@ -967,6 +1109,7 @@ pub async fn rescan_for_inventory(
         trigger_reindex,
         rescan_for_inventory,
         list_storage_backends,
+        list_audit_logs,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -982,6 +1125,8 @@ pub async fn rescan_for_inventory(
         ReindexResponse,
         RescanForInventoryRequest,
         RescanForInventoryResponse,
+        AuditLogItem,
+        AuditLogListResponse,
     ))
 )]
 pub struct AdminApiDoc;
@@ -989,6 +1134,55 @@ pub struct AdminApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
+    // the coverage gate exercises it even without Postgres.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_page_bounds_defaults() {
+        // No page/per_page -> page 1, default page size, offset 0.
+        let (offset, limit, page, per_page) = audit_page_bounds(None, None);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, AUDIT_DEFAULT_PER_PAGE as i64);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, AUDIT_DEFAULT_PER_PAGE);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_computes_offset() {
+        // Page 3 at 25/page -> offset 50.
+        let (offset, limit, page, per_page) = audit_page_bounds(Some(3), Some(25));
+        assert_eq!(offset, 50);
+        assert_eq!(limit, 25);
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 25);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_floors_page_at_one() {
+        // Page 0 must not underflow (page-1) or produce a negative offset.
+        let (offset, _limit, page, _pp) = audit_page_bounds(Some(0), Some(10));
+        assert_eq!(offset, 0);
+        assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_clamps_per_page_to_max() {
+        // An over-large per_page is clamped to the hard cap.
+        let (_offset, limit, _page, per_page) = audit_page_bounds(Some(1), Some(10_000));
+        assert_eq!(limit, AUDIT_MAX_PER_PAGE as i64);
+        assert_eq!(per_page, AUDIT_MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_clamps_zero_per_page_to_one() {
+        // per_page = 0 would return an empty page forever; clamp up to 1.
+        let (_offset, limit, _page, per_page) = audit_page_bounds(Some(1), Some(0));
+        assert_eq!(limit, 1);
+        assert_eq!(per_page, 1);
+    }
 
     // -----------------------------------------------------------------------
     // parse_backup_type

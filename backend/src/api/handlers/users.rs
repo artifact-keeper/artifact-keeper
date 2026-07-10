@@ -17,7 +17,7 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::audit_service::{
     api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
-    sessions_invalidated_audit_entry, AuditAction,
+    sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
@@ -386,6 +386,21 @@ pub async fn create_user(
         .event_bus
         .emit("user.created", user.id, Some(auth.username.clone()));
 
+    // Audit trail (#2366): admin created a user. Actor = acting admin
+    // (`user_id`), target = the new user (`resource`). Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "username": user.username,
+                "is_admin": user.is_admin,
+            })),
+    )
+    .await;
+
     Ok(Json(CreateUserResponse {
         user: user_to_response(user),
         generated_password: if auto_generated { Some(password) } else { None },
@@ -571,6 +586,20 @@ pub async fn update_user(
         .event_bus
         .emit("user.updated", user.id, Some(auth.username.clone()));
 
+    // Audit trail (#2366): admin updated a user record. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserUpdated, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "is_admin": user.is_admin,
+                "is_active": user.is_active,
+            })),
+    )
+    .await;
+
     Ok(Json(user_to_response(user)))
 }
 
@@ -633,6 +662,16 @@ pub async fn delete_user(
     state
         .event_bus
         .emit("user.deleted", id, Some(auth.username.clone()));
+
+    // Audit trail (#2366): admin deleted a user. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserDeleted, ResourceType::User)
+            .user(auth.user_id)
+            .resource(id)
+            .details(serde_json::json!({ "actor_id": auth.user_id.to_string() })),
+    )
+    .await;
 
     Ok(())
 }
@@ -739,6 +778,20 @@ pub async fn assign_role(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Audit trail (#2366): role granted to a user — a permission change.
+    // Actor = acting admin, target = the user receiving the role. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RoleAssigned, ResourceType::User)
+            .user(auth.user_id)
+            .resource(id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "role_id": payload.role_id.to_string(),
+            })),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -777,6 +830,20 @@ pub async fn revoke_role(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Role assignment not found".to_string()));
     }
+
+    // Audit trail (#2366): role revoked from a user — a permission change.
+    // Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RoleRevoked, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user_id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "role_id": role_id.to_string(),
+            })),
+    )
+    .await;
 
     Ok(())
 }

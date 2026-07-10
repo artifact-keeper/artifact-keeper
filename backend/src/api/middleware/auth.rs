@@ -1199,6 +1199,25 @@ pub async fn admin_middleware(
     };
 
     if !auth_ext.is_admin {
+        // Best-effort RBAC-deny audit event (#2366): an authenticated non-admin
+        // reaching an admin-only route is exactly the kind of authorization
+        // decision an auditor wants recorded. Fire-and-forget so an audit-table
+        // outage can never turn a clean 403 into a 500. The attempted path is
+        // recorded (never any credential material).
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let entry = AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
+                .user(auth_ext.user_id)
+                .resource(auth_ext.user_id)
+                .details(serde_json::json!({
+                    "path": request.uri().path(),
+                    "method": request.method().as_str(),
+                    "reason": "admin_privileges_required",
+                }));
+            audit_fire_and_forget(auth_service.db().clone(), entry).await;
+        }
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
 

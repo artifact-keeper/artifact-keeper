@@ -31,6 +31,9 @@ use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::cache_classifier;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
@@ -1485,6 +1488,20 @@ pub async fn create_repository(
         Some(auth.username.clone()),
     );
 
+    // Audit trail (#2366): repository created. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+                "is_public": repo.is_public,
+            })),
+    )
+    .await;
+
     let mut response = repo_to_response(repo, 0);
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
@@ -1710,6 +1727,19 @@ pub async fn update_repository(
         repo.id,
         Some(auth.username.clone()),
     );
+
+    // Audit trail (#2366): repository updated. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+            })),
+    )
+    .await;
 
     let repo_id = repo.id;
     let response = repo_to_response(repo, storage_used);
@@ -2024,6 +2054,20 @@ pub async fn delete_repository(
         repo.id,
         Some(auth.username.clone()),
     );
+
+    // Audit trail (#2366): repository deleted. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+            })),
+    )
+    .await;
+
     Ok(())
 }
 
