@@ -48,6 +48,21 @@ fn normalize_max_severity(raw: &str) -> Result<String> {
     }
 }
 
+/// Decision half of [`PolicyService::ensure_repository_exists`] (#2320): map
+/// the `EXISTS` query result onto Ok / 404-NotFound. Split out from the DB
+/// query so the contract — a missing FK target must surface as `NotFound`
+/// naming the repository id, never a raw FK-violation 500 — is pure and
+/// unit-testable.
+fn repository_exists_or_not_found(exists: bool, repository_id: Uuid) -> Result<()> {
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(format!(
+            "Repository {repository_id} not found"
+        )))
+    }
+}
+
 pub struct PolicyService {
     db: PgPool,
 }
@@ -216,13 +231,7 @@ impl PolicyService {
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
 
-        if exists {
-            Ok(())
-        } else {
-            Err(AppError::NotFound(format!(
-                "Repository {repository_id} not found"
-            )))
-        }
+        repository_exists_or_not_found(exists, repository_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -489,6 +498,120 @@ mod tests {
             normalize_max_severity("info"),
             Err(AppError::Validation(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // repository existence pre-check (#2320)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repository_exists_or_not_found_accepts_existing_repository() {
+        let repo_id = Uuid::new_v4();
+        assert!(
+            repository_exists_or_not_found(true, repo_id).is_ok(),
+            "an existing repository must pass the pre-check"
+        );
+    }
+
+    #[test]
+    fn test_repository_exists_or_not_found_maps_missing_repo_to_not_found() {
+        // #2320 regression: a stale/mistyped repository_id used to fall
+        // through to the scan_policies_repository_id_fkey violation on
+        // INSERT and surface as an opaque 500. The pre-check must turn it
+        // into a NotFound (404) that names the offending id.
+        let repo_id = Uuid::new_v4();
+        match repository_exists_or_not_found(false, repo_id) {
+            Err(AppError::NotFound(msg)) => {
+                assert!(
+                    msg.contains(&repo_id.to_string()),
+                    "NotFound message should name the repository id, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::NotFound for a missing repository, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // create/update entry-point validation ordering (#2320)
+    // -----------------------------------------------------------------------
+
+    /// A pool that never opens a connection (and gives up acquiring almost
+    /// immediately). Calling a service method with it proves where the DB
+    /// boundary sits: anything that returns `Validation` did so BEFORE any
+    /// DB round-trip, and anything that returns `Database` got past
+    /// validation and genuinely tried to reach the pool.
+    fn disconnected_service() -> PolicyService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy should not fail");
+        PolicyService::new(pool)
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_rejects_invalid_max_severity_before_touching_db() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy("p", None, "bogus", false, false, None, None, false)
+            .await
+            .unwrap_err();
+        // Validation (not Database/PoolTimedOut) proves the reject happened
+        // before any DB round-trip — the pool cannot serve a connection.
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_with_valid_severity_proceeds_to_repository_check() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy(
+                "p",
+                Some(Uuid::new_v4()),
+                "Critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        // The mis-cased-but-known severity normalizes fine, so create must
+        // move on to the repository existence pre-check, whose EXISTS query
+        // is the first DB touch — surfacing here as a Database error.
+        assert!(matches!(err, AppError::Database(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_unscoped_valid_input_reaches_insert() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy("p", None, "high", true, true, Some(1), Some(30), true)
+            .await
+            .unwrap_err();
+        // No repository scope: nothing to pre-check, so the INSERT itself is
+        // the first DB touch.
+        assert!(matches!(err, AppError::Database(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_update_policy_rejects_invalid_max_severity_before_touching_db() {
+        let svc = disconnected_service();
+        let err = svc
+            .update_policy(
+                Uuid::new_v4(),
+                None,
+                Some("bogus"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
     }
 
     // -----------------------------------------------------------------------
