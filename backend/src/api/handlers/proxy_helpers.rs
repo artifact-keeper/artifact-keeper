@@ -4039,6 +4039,7 @@ pub async fn record_artifact_metadata(
 /// response with the supplied content type and optional `Content-Disposition`.
 /// `artifact_id` is the row id for quarantine + statistics; `storage_key` is
 /// the raw key handed to the storage backend.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_local_artifact(
     state: &crate::api::SharedState,
     repo: &RepoInfo,

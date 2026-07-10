@@ -1487,6 +1487,7 @@ async fn enforce_pypi_download_age_gate(
     Ok(Some(build_streaming_file_response(&lkg_filename, result)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,

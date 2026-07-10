@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource, DownloadTracker};
-use crate::services::event_bus::EventBus;
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
@@ -1535,6 +1534,7 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::event_bus::EventBus;
 
     #[test]
     fn test_calculate_sha256() {
@@ -2239,7 +2239,7 @@ mod tests {
         let svc = ArtifactService::new(
             pool.clone(),
             storage,
-            Arc::new(DownloadTracker::new(pool.clone(), EventBus::new(100))),
+            DownloadTracker::new(pool.clone(), Arc::new(EventBus::new(100))),
         );
 
         // -- (a) dists/… index coordinate: overwrite after tombstone ALLOWED --
