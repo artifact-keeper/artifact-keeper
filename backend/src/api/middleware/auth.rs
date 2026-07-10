@@ -1337,6 +1337,23 @@ pub(crate) fn action_for_method(method: &Method) -> &'static str {
     }
 }
 
+/// Whether a fine-grained ACL check may be skipped because the repository is
+/// public and the requested action is a read.
+///
+/// On a public repository, anonymous callers are granted read access by the
+/// visibility check (see [`should_allow_repo_access`]) without ever consulting
+/// permission rules. Authenticated callers must therefore receive *at least*
+/// that same read allowance: enforcing the ACL against them when rules exist
+/// would make an authenticated principal strictly less privileged than an
+/// anonymous one on the same public repository (#2329).
+///
+/// This applies only to the `read` action. Write and delete actions are still
+/// fully governed by the ACL when rules exist, and private repositories
+/// (`is_public == false`) never take this shortcut.
+pub(crate) fn public_read_satisfies_acl(is_public: bool, action: &str) -> bool {
+    is_public && action == "read"
+}
+
 /// Middleware that enforces repository visibility on format handler routes.
 ///
 /// For routes whose first path segment is a repository key, this middleware
@@ -1581,23 +1598,34 @@ pub async fn repo_visibility_middleware(
 
             if has_rules {
                 let action = action_for_method(request.method());
-                // Check for the specific action first, then fall back to
-                // "admin" which implies all actions (#827 policy compat).
-                // Both calls resolve from the same cached action set, so the
-                // second call is essentially free.
-                let allowed = vis_state
-                    .permission_service
-                    .check_permission(ext.user_id, "repository", repo.id, action, false)
-                    .await
-                    .unwrap_or(false)
-                    || vis_state
+                // #2329: On a *public* repository, reads are always allowed
+                // for anonymous callers (visibility check above), so an
+                // authenticated caller must not end up with *less* read
+                // access just because ACL rules exist. Grant the anonymous
+                // read baseline and skip the ACL for reads only; writes and
+                // deletes remain fully ACL-gated, and private repos never
+                // take this shortcut. Anonymous callers never reach this
+                // block at all (no `auth_ext`), so the existing
+                // anonymous-public contract is untouched.
+                if !public_read_satisfies_acl(is_public, action) {
+                    // Check for the specific action first, then fall back to
+                    // "admin" which implies all actions (#827 policy compat).
+                    // Both calls resolve from the same cached action set, so
+                    // the second call is essentially free.
+                    let allowed = vis_state
                         .permission_service
-                        .check_permission(ext.user_id, "repository", repo.id, "admin", false)
+                        .check_permission(ext.user_id, "repository", repo.id, action, false)
                         .await
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || vis_state
+                            .permission_service
+                            .check_permission(ext.user_id, "repository", repo.id, "admin", false)
+                            .await
+                            .unwrap_or(false);
 
-                if !allowed {
-                    return forbidden_permission_response();
+                    if !allowed {
+                        return forbidden_permission_response();
+                    }
                 }
             } else if !is_public {
                 // A private repo with NO fine-grained permission rules must
@@ -2852,6 +2880,88 @@ mod tests {
     fn test_action_for_method_unknown_defaults_to_read() {
         // TRACE and other uncommon methods should default to read.
         assert_eq!(action_for_method(&Method::TRACE), "read");
+    }
+
+    // -----------------------------------------------------------------------
+    // public_read_satisfies_acl: public-repo read parity (#2329)
+    //
+    // Regression: with ACL rules present on a *public* repo, an authenticated
+    // non-admin user with no matching grant was denied (403) while anonymous
+    // read of the same path succeeded (200). Authenticated callers must get
+    // at least the anonymous read baseline on public repos.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_public_read_parity_public_repo_read_skips_acl() {
+        // Public repo + read action: ACL check is skipped, so an
+        // authenticated user with no grant is at least as allowed as
+        // anonymous (#2329 core regression).
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::GET)
+        ));
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::HEAD)
+        ));
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::OPTIONS)
+        ));
+    }
+
+    #[test]
+    fn test_public_read_parity_private_repo_still_acl_gated() {
+        // Private repo: no shortcut for any action — the ungranted user must
+        // still hit the ACL (and be denied). No over-allow.
+        assert!(!public_read_satisfies_acl(
+            false,
+            action_for_method(&Method::GET)
+        ));
+        assert!(!public_read_satisfies_acl(false, "read"));
+        assert!(!public_read_satisfies_acl(false, "write"));
+        assert!(!public_read_satisfies_acl(false, "delete"));
+        assert!(!public_read_satisfies_acl(false, "admin"));
+    }
+
+    #[test]
+    fn test_public_read_parity_writes_still_acl_gated_on_public_repo() {
+        // Public repo but non-read actions: writes and deletes remain fully
+        // ACL-gated even on public repos.
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::PUT)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::POST)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::PATCH)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::DELETE)
+        ));
+        assert!(!public_read_satisfies_acl(true, "admin"));
+    }
+
+    #[test]
+    fn test_public_read_parity_matches_anonymous_baseline() {
+        // The shortcut must be granted exactly when an anonymous caller
+        // would already pass the visibility check for a read: public repo,
+        // read action. This asserts authenticated read access on public
+        // repos is never narrower than the anonymous baseline.
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            let anonymous_read_allowed =
+                should_allow_repo_access(true, false) && !is_write_method(&method);
+            assert_eq!(
+                public_read_satisfies_acl(true, action_for_method(&method)),
+                anonymous_read_allowed,
+                "authenticated read parity broken for {method}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
