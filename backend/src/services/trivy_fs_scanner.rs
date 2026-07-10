@@ -1,7 +1,10 @@
 //! Trivy filesystem scanner for non-container artifacts.
 //!
 //! Writes artifact content to a scan workspace directory, optionally extracts
-//! archives, and invokes `trivy filesystem` via CLI to discover vulnerabilities.
+//! archives, and runs `trivy filesystem` over the prepared workspace — either
+//! by spawning the local CLI (legacy `TRIVY_URL` deployments that bundle the
+//! binary) or, on the hardened CLI-free image, by tarring the workspace and
+//! uploading it to the scanner-adapter's filesystem endpoint (#2363).
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,27 +14,41 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::image_scanner::TrivyReport;
+use crate::services::scanner_adapter_client::{fs_upload_cap_bytes, TrivyEngine, TrivyFsBackend};
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 // `ScanCompleteness` is used via `output.scan_completeness.as_str()` in the
 // info!() log line below.
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
-    trivy_url: String,
+    engine: TrivyEngine,
     scan_workspace: String,
     /// Lazily-probed version string from `trivy --version`, e.g.
     /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
     /// does not pay an extra subprocess; failed probes expire after 60s so
-    /// the field starts populating once the binary becomes available.
+    /// the field starts populating once the binary becomes available. Only
+    /// meaningful in CLI mode.
     cached_version: VersionCache,
 }
 
 impl TrivyFsScanner {
+    /// Legacy CLI mode: spawn the bundled `trivy` binary, trying
+    /// `--server <trivy_url>` then standalone.
     pub fn new(trivy_url: String, scan_workspace: String) -> Self {
         Self {
-            trivy_url,
+            engine: TrivyEngine::cli(trivy_url),
+            scan_workspace,
+            cached_version: VersionCache::new(),
+        }
+    }
+
+    /// Adapter mode (#2363): tar the prepared workspace and upload it to the
+    /// scanner-adapter at `adapter_url`. No local `trivy` binary needed.
+    pub fn new_with_adapter(adapter_url: String, scan_workspace: String) -> Self {
+        Self {
+            engine: TrivyEngine::adapter(adapter_url),
             scan_workspace,
             cached_version: VersionCache::new(),
         }
@@ -127,6 +144,25 @@ impl TrivyFsScanner {
             .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))?;
         Ok((report, stderr_text))
     }
+
+    /// CLI path: try server mode against `trivy_url`, then standalone.
+    async fn run_cli(
+        &self,
+        workspace: &Path,
+        trivy_url: &str,
+        artifact_name: &str,
+    ) -> Result<(TrivyReport, String)> {
+        match self.run_trivy(workspace, Some(trivy_url)).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                warn!(
+                    "Trivy server-mode CLI failed for {}: {}. Trying standalone mode.",
+                    artifact_name, e
+                );
+                self.run_trivy(workspace, None).await
+            }
+        }
+    }
 }
 
 /// Lockfile / manifest basenames that Trivy parses when invoked with
@@ -196,11 +232,12 @@ impl Scanner for TrivyFsScanner {
         Self::is_applicable(artifact)
     }
 
-    /// Probe `trivy --version` once and cache the parsed version string.
-    /// Returns `None` if the binary is missing or its output cannot be
-    /// parsed; `scan_results.scanner_version` is nullable for that case.
+    /// CLI mode: probe `trivy --version` once and cache the parsed version
+    /// string (`None` if the binary is missing). Adapter mode: return the
+    /// version the adapter reported on the last successful scan (`None`
+    /// until one has run) — there is no local binary to probe.
     async fn version(&self) -> Option<String> {
-        cached_trivy_cli_version(&self.cached_version).await
+        self.engine.version(&self.cached_version).await
     }
 
     async fn scan(
@@ -226,27 +263,32 @@ impl Scanner for TrivyFsScanner {
         let workspace =
             ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
-        // Try CLI with server mode first, then standalone
-        let (report, stderr) = match self.run_trivy(&workspace, Some(&self.trivy_url)).await {
+        // Run the scan engine: legacy CLI (server-then-standalone) or the
+        // scanner-adapter upload path (#2363). Both yield (report, stderr);
+        // errors flow through `fail_scan`, which preserves the
+        // `ScannerEngineUnavailable` variant so an absent engine degrades to
+        // `not_applicable` (#2324) instead of flooring the grade to F.
+        let scan_result = match self.engine.backend() {
+            TrivyFsBackend::Cli { trivy_url } => {
+                self.run_cli(&workspace, trivy_url, &artifact.name).await
+            }
+            TrivyFsBackend::Adapter(client) => {
+                self.engine
+                    .scan_dir_via_adapter(client, &workspace, fs_upload_cap_bytes())
+                    .await
+            }
+        };
+        let (report, stderr) = match scan_result {
             Ok(out) => out,
             Err(e) => {
-                warn!(
-                    "Trivy server-mode CLI failed for {}: {}. Trying standalone mode.",
-                    artifact.name, e
-                );
-                match self.run_trivy(&workspace, None).await {
-                    Ok(out) => out,
-                    Err(e) => {
-                        return Err(fail_scan(
-                            "Trivy filesystem scan",
-                            artifact,
-                            &e,
-                            &self.scan_workspace,
-                            None,
-                        )
-                        .await);
-                    }
-                }
+                return Err(fail_scan(
+                    "Trivy filesystem scan",
+                    artifact,
+                    &e,
+                    &self.scan_workspace,
+                    None,
+                )
+                .await);
             }
         };
 
@@ -421,6 +463,104 @@ mod tests {
         assert!(
             matches!(err, crate::error::AppError::ScannerEngineUnavailable(_)),
             "missing trivy CLI must surface as ScannerEngineUnavailable, got: {err:?}"
+        );
+    }
+
+    /// Adapter mode end-to-end against a mocked scanner-adapter (#2363): the
+    /// scan must surface trivy findings AND a non-empty package inventory
+    /// (#903) from the native-JSON round trip, with completeness classified
+    /// (#1153) — proving the adapter path does not regress the SBOM data the
+    /// Harbor image report would have dropped.
+    #[tokio::test]
+    async fn test_adapter_scan_yields_findings_and_package_inventory() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "fs-42",
+            serde_json::json!({
+                "report": {"Results": [{
+                    "Target": "requirements.txt",
+                    "Class": "lang-pkgs",
+                    "Type": "pip",
+                    "Vulnerabilities": [{
+                        "VulnerabilityID": "CVE-2023-12345",
+                        "PkgName": "requests",
+                        "InstalledVersion": "2.28.0",
+                        "FixedVersion": "2.31.0",
+                        "Severity": "HIGH"
+                    }],
+                    "Packages": [
+                        {"Name": "requests", "Version": "2.28.0"},
+                        {"Name": "urllib3", "Version": "1.26.0"}
+                    ]
+                }]},
+                "stderr": "",
+                "scanner_version": "0.71.2"
+            }),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            server.uri(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "requirements.txt",
+            "text/plain",
+            "pypi/proj/1.0.0/requirements.txt",
+        );
+        let content = bytes::Bytes::from_static(b"requests==2.28.0\n");
+
+        let output = scanner
+            .scan(&artifact, None, &content)
+            .await
+            .expect("adapter-backed scan should complete");
+
+        assert_eq!(output.findings.len(), 1, "trivy findings must surface");
+        assert_eq!(
+            output.findings[0].cve_id,
+            Some("CVE-2023-12345".to_string())
+        );
+        assert_eq!(
+            output.findings[0].source,
+            Some("trivy-filesystem".to_string())
+        );
+        // #903: the Packages block must land in the package inventory.
+        assert_eq!(output.packages.len(), 2, "SBOM package inventory lost");
+        // #1153: the completeness classifier ran over report + stderr.
+        assert_eq!(
+            output.scan_completeness,
+            crate::services::scanner_service::ScanCompleteness::Complete
+        );
+        // Provenance: version comes from the adapter, not a CLI probe.
+        assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+    }
+
+    /// Adapter mode with the sidecar down must degrade gracefully: the
+    /// orchestrator maps `ScannerEngineUnavailable` to a terminal
+    /// `not_applicable` row (#2324), never a grade-F-flooring failure.
+    #[tokio::test]
+    async fn test_adapter_unavailable_degrades_to_engine_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new_with_adapter(
+            "http://127.0.0.1:1".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "requirements.txt",
+            "text/plain",
+            "pypi/proj/1.0.0/requirements.txt",
+        );
+        let content = bytes::Bytes::from_static(b"requests==2.28.0\n");
+
+        let err = scanner
+            .scan(&artifact, None, &content)
+            .await
+            .expect_err("a down adapter must not complete the scan");
+        assert!(
+            matches!(err, crate::error::AppError::ScannerEngineUnavailable(_)),
+            "a down adapter must be ScannerEngineUnavailable, got {err:?}"
         );
     }
 

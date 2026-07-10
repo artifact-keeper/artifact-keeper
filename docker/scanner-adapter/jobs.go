@@ -21,11 +21,14 @@ const (
 	StatusFailed JobStatus = "Failed"
 )
 
-// Job is a single scan request's state.
+// Job is a single scan request's state. Exactly one of Report (image scan,
+// Harbor shape) or Fs (filesystem scan, native trivy JSON + stderr, #2363) is
+// populated on success, depending on which endpoint created the job.
 type Job struct {
 	ID      string
 	Status  JobStatus
 	Report  *HarborScanReport
+	Fs      *FsScanResult
 	Err     string
 	Created time.Time
 }
@@ -93,6 +96,16 @@ func (s *JobStore) Succeed(id string, report *HarborScanReport) {
 	defer s.mu.Unlock()
 	if job, ok := s.jobs[id]; ok {
 		job.Report = report
+		job.Status = StatusSucceeded
+	}
+}
+
+// SucceedFs attaches a filesystem-scan result and marks the job Succeeded.
+func (s *JobStore) SucceedFs(id string, res *FsScanResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if job, ok := s.jobs[id]; ok {
+		job.Fs = res
 		job.Status = StatusSucceeded
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Scanner runs trivy against an image reference and maps the result into the
@@ -256,6 +257,61 @@ func (s *Scanner) Scan(ctx context.Context, req *ScanRequest) (*HarborScanReport
 
 	scanner := HarborScanner{Name: "Trivy", Version: s.cfg.ScannerVersion}
 	return mapTrivyToHarbor(&trivyReport, scanner), nil
+}
+
+// fsSeverity is the severity filter for filesystem scans. It mirrors the
+// backend's legacy `trivy filesystem` CLI invocation (trivy_fs_scanner.rs /
+// incus_scanner.rs) so routing through the adapter (#2363) does not change
+// which findings are reported.
+const fsSeverity = "CRITICAL,HIGH,MEDIUM,LOW"
+
+// buildFsArgs returns the trivy CLI arguments for a filesystem scan over dir.
+// `--list-all-pkgs` is load-bearing: the backend's SBOM package inventory
+// (#903) reads the Packages blocks it adds to the native JSON report.
+func (s *Scanner) buildFsArgs(dir string) []string {
+	return []string{
+		"filesystem",
+		"--format", "json",
+		"--list-all-pkgs",
+		"--severity", fsSeverity,
+		"--timeout", s.cfg.FsScanTimeout.String(),
+		"--cache-dir", s.cfg.CacheDir,
+		"--quiet",
+		dir,
+	}
+}
+
+// ScanFilesystem runs `trivy filesystem` over an untarred workspace dir and
+// returns trivy's NATIVE JSON report plus its stderr text. The stderr is
+// returned even on success so the backend can classify partial scans (#1153).
+// Fail-closed like Scan: a non-zero exit, an exit-0 DB failure, or unparseable
+// output is an error (the job fails and the report endpoint 500s).
+func (s *Scanner) ScanFilesystem(ctx context.Context, dir string) (json.RawMessage, string, error) {
+	// Leave headroom over trivy's own --timeout so trivy's descriptive timeout
+	// error wins over a blunt context kill.
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.FsScanTimeout+30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, s.cfg.TrivyPath, s.buildFsArgs(dir)...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, stderr.String(), fmt.Errorf("trivy filesystem scan failed: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	// Exit-0 DB-failure detection: same fail-closed marker check the image
+	// path uses, so a missing/rejected vuln DB never yields a false clean.
+	if trivyOutputIndicatesDBFailure(stderr.String()) {
+		return nil, stderr.String(), fmt.Errorf("trivy filesystem scan reported a vulnerability-DB failure: %s", strings.TrimSpace(stderr.String()))
+	}
+
+	raw := []byte(stdout.String())
+	if !json.Valid(raw) {
+		return nil, stderr.String(), fmt.Errorf("trivy filesystem output is not valid JSON")
+	}
+	return json.RawMessage(raw), stderr.String(), nil
 }
 
 // ProbeVersion runs `trivy --version` and extracts the semantic version string

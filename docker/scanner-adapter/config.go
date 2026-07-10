@@ -25,8 +25,16 @@ type Config struct {
 	SkipDBUpdate bool
 	// Severity is the trivy --severity filter (comma-separated UPPERCASE).
 	Severity string
-	// ScanTimeout bounds a single trivy invocation.
+	// ScanTimeout bounds a single trivy image invocation.
 	ScanTimeout time.Duration
+	// FsScanTimeout bounds a single trivy filesystem invocation (#2363). Kept
+	// separate from ScanTimeout: an extracted incus rootfs is a much larger
+	// walk than a registry image pull.
+	FsScanTimeout time.Duration
+	// FsMaxUploadBytes caps the tar workspace body accepted by
+	// POST /api/v1/filesystem/scan. The body is an UNCOMPRESSED tar, so this
+	// also bounds the extracted tree (no decompression amplification).
+	FsMaxUploadBytes int64
 	// JobTTL is how long a finished job (report or error) is retained before the
 	// sweeper evicts it.
 	JobTTL time.Duration
@@ -41,16 +49,22 @@ type Config struct {
 // LoadConfig reads the SCANNER_* environment variables, applying defaults.
 func LoadConfig() *Config {
 	return &Config{
-		Addr:           getenv("SCANNER_ADAPTER_ADDR", ":8080"),
-		TrivyPath:      getenv("SCANNER_TRIVY_PATH", "trivy"),
-		CacheDir:       getenv("SCANNER_TRIVY_CACHE_DIR", "/home/scanner/.cache/trivy"),
-		Insecure:       getenvBool("SCANNER_TRIVY_INSECURE", true),
-		SkipDBUpdate:   getenvBool("SCANNER_TRIVY_SKIP_DB_UPDATE", false),
-		Severity:       getenv("SCANNER_TRIVY_SEVERITY", "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"),
-		ScanTimeout:    getenvDuration("SCANNER_TRIVY_TIMEOUT", 5*time.Minute),
-		JobTTL:         getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
-		LogLevel:       getenv("SCANNER_LOG_LEVEL", "info"),
-		ScannerVersion: os.Getenv("SCANNER_SCANNER_VERSION"),
+		Addr:         getenv("SCANNER_ADAPTER_ADDR", ":8080"),
+		TrivyPath:    getenv("SCANNER_TRIVY_PATH", "trivy"),
+		CacheDir:     getenv("SCANNER_TRIVY_CACHE_DIR", "/home/scanner/.cache/trivy"),
+		Insecure:     getenvBool("SCANNER_TRIVY_INSECURE", true),
+		SkipDBUpdate: getenvBool("SCANNER_TRIVY_SKIP_DB_UPDATE", false),
+		Severity:     getenv("SCANNER_TRIVY_SEVERITY", "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"),
+		ScanTimeout:  getenvDuration("SCANNER_TRIVY_TIMEOUT", 5*time.Minute),
+		// Defaults mirror the backend's legacy CLI path: incus rootfs scans ran
+		// with --timeout 10m; the 64 GiB body cap matches the backend's
+		// MAX_INCUS_SCAN_EXTRACTED_BYTES default (the backend enforces its own
+		// budget before uploading).
+		FsScanTimeout:    getenvDuration("SCANNER_FS_SCAN_TIMEOUT", 10*time.Minute),
+		FsMaxUploadBytes: getenvInt64("SCANNER_FS_MAX_UPLOAD_BYTES", 64*1024*1024*1024),
+		JobTTL:           getenvDuration("SCANNER_JOB_TTL", 30*time.Minute),
+		LogLevel:         getenv("SCANNER_LOG_LEVEL", "info"),
+		ScannerVersion:   os.Getenv("SCANNER_SCANNER_VERSION"),
 	}
 }
 
@@ -71,6 +85,18 @@ func getenvBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func getenvInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func getenvDuration(key string, def time.Duration) time.Duration {

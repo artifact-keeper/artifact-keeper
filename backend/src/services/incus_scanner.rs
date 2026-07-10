@@ -19,8 +19,11 @@ use crate::error::{AppError, Result};
 use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::image_scanner::TrivyReport;
+use crate::services::scanner_adapter_client::{
+    ScannerAdapterFsClient, TrivyEngine, TrivyFsBackend,
+};
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -200,19 +203,33 @@ async fn run_trivy_scan(
 /// Extracts the filesystem contents from container images and runs
 /// `trivy filesystem` to find OS package vulnerabilities.
 pub struct IncusScanner {
-    trivy_url: String,
+    engine: TrivyEngine,
     scan_workspace: String,
     /// Lazily-probed version string from `trivy --version`, e.g.
     /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
     /// does not pay an extra subprocess; failed probes expire after 60s so
-    /// the field starts populating once the binary becomes available.
+    /// the field starts populating once the binary becomes available. Only
+    /// meaningful in CLI mode.
     cached_version: VersionCache,
 }
 
 impl IncusScanner {
+    /// Legacy CLI mode: spawn the bundled `trivy` binary against the
+    /// extracted rootfs, trying `--server <trivy_url>` then standalone.
     pub fn new(trivy_url: String, scan_workspace: String) -> Self {
         Self {
-            trivy_url,
+            engine: TrivyEngine::cli(trivy_url),
+            scan_workspace,
+            cached_version: VersionCache::new(),
+        }
+    }
+
+    /// Adapter mode (#2363): tar the extracted (and hardened) rootfs and
+    /// upload it to the scanner-adapter at `adapter_url`. Extraction and all
+    /// its hardening stay local; only the trivy engine moves off-image.
+    pub fn new_with_adapter(adapter_url: String, scan_workspace: String) -> Self {
+        Self {
+            engine: TrivyEngine::adapter(adapter_url),
             scan_workspace,
             cached_version: VersionCache::new(),
         }
@@ -772,14 +789,37 @@ impl IncusScanner {
         ScanWorkspace::cleanup_path(workspace).await;
     }
 
-    /// Run Trivy filesystem scan on the extracted rootfs.
-    async fn scan_with_cli(&self, rootfs: &Path) -> Result<TrivyReport> {
-        run_trivy_scan(rootfs, Some(&self.trivy_url), "Trivy Incus scan").await
+    /// CLI path: run the local trivy binary over the extracted rootfs,
+    /// trying `--server <trivy_url>` then standalone.
+    async fn run_cli_scan(&self, rootfs: &Path, trivy_url: &str) -> Result<TrivyReport> {
+        match run_trivy_scan(rootfs, Some(trivy_url), "Trivy Incus scan").await {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                warn!(
+                    "Trivy server-mode Incus scan failed: {}. Trying standalone.",
+                    e
+                );
+                run_trivy_scan(rootfs, None, "Trivy standalone Incus scan").await
+            }
+        }
     }
 
-    /// Fallback: scan using Trivy standalone CLI (no server).
-    async fn scan_standalone(&self, rootfs: &Path) -> Result<TrivyReport> {
-        run_trivy_scan(rootfs, None, "Trivy standalone Incus scan").await
+    /// Adapter path (#2363): tar the extracted rootfs — capped at the same
+    /// extracted-tree budget the decompression-bomb guard enforces, so a
+    /// runaway rootfs can never be buffered/uploaded (availability guard) —
+    /// and ship it to the scanner-adapter. Over-cap surfaces as
+    /// `ScannerEngineUnavailable` -> `not_applicable`.
+    async fn run_adapter_scan(
+        &self,
+        client: &ScannerAdapterFsClient,
+        rootfs: &Path,
+    ) -> Result<TrivyReport> {
+        // Incus reports feed `from_trivy_report` (no stderr context), so the
+        // stderr half of the adapter result is dropped here.
+        self.engine
+            .scan_dir_via_adapter(client, rootfs, max_extracted_bytes())
+            .await
+            .map(|(report, _stderr)| report)
     }
 
     /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
@@ -812,12 +852,12 @@ impl Scanner for IncusScanner {
         Self::is_applicable(artifact)
     }
 
-    /// Probe `trivy --version` once and cache the parsed version string.
-    /// Returns `None` if the binary is missing or its output cannot be
-    /// parsed. The Incus scanner shells out to the same `trivy` binary as
-    /// `TrivyFsScanner`, so the format is also `trivy-<version>`.
+    /// CLI mode: probe `trivy --version` once and cache the parsed version
+    /// string (`None` if the binary is missing). Adapter mode: return the
+    /// version the adapter reported on the last successful scan (`None`
+    /// until one has run). Both normalize to `trivy-<version>`.
     async fn version(&self) -> Option<String> {
-        cached_trivy_cli_version(&self.cached_version).await
+        self.engine.version(&self.cached_version).await
     }
 
     async fn scan(
@@ -853,22 +893,18 @@ impl Scanner for IncusScanner {
             }
         };
 
-        // Run Trivy filesystem scan on the extracted rootfs
-        let report = match self.scan_with_cli(&rootfs).await {
+        // Run the Trivy filesystem scan on the extracted rootfs: local CLI
+        // (legacy TRIVY_URL) or the scanner-adapter upload path (#2363).
+        // `fail_scan_path` preserves `ScannerEngineUnavailable` so an absent
+        // engine degrades to `not_applicable` (#2324) instead of `failed`.
+        let scan_result = match self.engine.backend() {
+            TrivyFsBackend::Cli { trivy_url } => self.run_cli_scan(&rootfs, trivy_url).await,
+            TrivyFsBackend::Adapter(client) => self.run_adapter_scan(client, &rootfs).await,
+        };
+        let report = match scan_result {
             Ok(report) => report,
             Err(e) => {
-                warn!(
-                    "Trivy server-mode scan failed for Incus image {}: {}. Trying standalone.",
-                    artifact.name, e
-                );
-                match self.scan_standalone(&rootfs).await {
-                    Ok(report) => report,
-                    Err(e) => {
-                        return Err(
-                            fail_scan_path("Trivy Incus scan", artifact, &e, &workspace).await
-                        );
-                    }
-                }
+                return Err(fail_scan_path("Trivy Incus scan", artifact, &e, &workspace).await);
             }
         };
 
@@ -1001,6 +1037,90 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Adapter mode (#2363)
+    // -----------------------------------------------------------------------
+
+    /// The adapter path tars the extracted rootfs, uploads it, and yields the
+    /// NATIVE trivy report (Packages included, #903) — proving the incus
+    /// scanner's off-image engine produces the same data as the local CLI.
+    #[tokio::test]
+    async fn test_run_adapter_scan_returns_native_report() {
+        let server = wiremock::MockServer::start().await;
+        crate::services::scanner_adapter_client::test_support::mount_fs_scan_success(
+            &server,
+            "incus-1",
+            serde_json::json!({
+                "report": {"Results": [{
+                    "Target": "var/lib/dpkg/status",
+                    "Class": "os-pkgs",
+                    "Type": "ubuntu",
+                    "Vulnerabilities": [{
+                        "VulnerabilityID": "CVE-2024-12345",
+                        "PkgName": "libssl3",
+                        "InstalledVersion": "3.0.13-0ubuntu3",
+                        "Severity": "HIGH"
+                    }],
+                    "Packages": [{"Name": "libssl3", "Version": "3.0.13-0ubuntu3"}]
+                }]},
+                "stderr": "",
+                "scanner_version": "0.71.2"
+            }),
+        )
+        .await;
+
+        let ws = tempfile::tempdir().unwrap();
+        let rootfs = ws.path().join("rootfs");
+        tokio::fs::create_dir_all(rootfs.join("var/lib/dpkg"))
+            .await
+            .unwrap();
+        tokio::fs::write(rootfs.join("var/lib/dpkg/status"), b"Package: libssl3\n")
+            .await
+            .unwrap();
+
+        let scanner =
+            IncusScanner::new_with_adapter(server.uri(), ws.path().to_string_lossy().to_string());
+        let client = ScannerAdapterFsClient::new(server.uri());
+        let report = scanner
+            .run_adapter_scan(&client, &rootfs)
+            .await
+            .expect("adapter incus scan should complete");
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].vulnerabilities.as_ref().unwrap().len(), 1);
+        // #903: package inventory survives the native-JSON round trip.
+        assert_eq!(report.results[0].packages.as_ref().unwrap().len(), 1);
+        // Provenance flows from the adapter.
+        use crate::services::scanner_service::Scanner as _;
+        assert_eq!(scanner.version().await, Some("trivy-0.71.2".to_string()));
+    }
+
+    /// A down adapter degrades the incus scan gracefully — the same #2324
+    /// `not_applicable` semantics the missing CLI produced.
+    #[tokio::test]
+    async fn test_run_adapter_scan_unavailable_degrades() {
+        let ws = tempfile::tempdir().unwrap();
+        let rootfs = ws.path().join("rootfs");
+        tokio::fs::create_dir_all(&rootfs).await.unwrap();
+        tokio::fs::write(rootfs.join("etc-os-release"), b"ID=ubuntu\n")
+            .await
+            .unwrap();
+
+        let scanner = IncusScanner::new_with_adapter(
+            "http://127.0.0.1:1".to_string(),
+            ws.path().to_string_lossy().to_string(),
+        );
+        let client = ScannerAdapterFsClient::new("http://127.0.0.1:1".to_string());
+        let err = scanner
+            .run_adapter_scan(&client, &rootfs)
+            .await
+            .expect_err("a down adapter must not complete the scan");
+        assert!(
+            matches!(err, AppError::ScannerEngineUnavailable(_)),
+            "a down adapter must be ScannerEngineUnavailable, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // find_rootfs tests
 
     #[tokio::test]
@@ -1127,8 +1247,23 @@ mod tests {
             "http://trivy:8090".to_string(),
             "/tmp/scan-workspace".to_string(),
         );
-        assert_eq!(scanner.trivy_url, "http://trivy:8090");
+        assert!(
+            matches!(scanner.engine.backend(), TrivyFsBackend::Cli { trivy_url } if trivy_url == "http://trivy:8090"),
+            "IncusScanner::new must select the legacy CLI backend"
+        );
         assert_eq!(scanner.scan_workspace, "/tmp/scan-workspace");
+    }
+
+    #[test]
+    fn test_scanner_new_with_adapter() {
+        let scanner = IncusScanner::new_with_adapter(
+            "http://trivy:8090".to_string(),
+            "/tmp/scan-workspace".to_string(),
+        );
+        assert!(
+            matches!(scanner.engine.backend(), TrivyFsBackend::Adapter(_)),
+            "IncusScanner::new_with_adapter must select the adapter backend"
+        );
     }
 
     #[test]

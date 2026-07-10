@@ -193,20 +193,27 @@ pub struct Config {
     /// LDAP base DN (optional)
     pub ldap_base_dn: Option<String>,
 
-    /// Trivy server URL for filesystem / incus (rootfs) scanning (optional).
-    /// Consumed by `TrivyFsScanner` and `IncusScanner`, which drive the trivy
-    /// server directly (`--server` / dir-mode). NOT used for container image
-    /// scanning — see `trivy_adapter_url`.
+    /// Legacy trivy server URL for filesystem / incus (rootfs) scanning
+    /// (optional). Only consulted when `trivy_adapter_url` is UNSET: it makes
+    /// `TrivyFsScanner` / `IncusScanner` spawn a bundled local `trivy` CLI
+    /// (`--server <url>` then standalone), which requires the binary in the
+    /// image. Deployments on the hardened CLI-free image should set
+    /// `trivy_adapter_url` instead (#2363). NOT used for container image
+    /// scanning.
     pub trivy_url: Option<String>,
 
-    /// Harbor Pluggable Scanner adapter URL for container *image* scanning
-    /// (optional), e.g. `http://trivy:8090` for `harbor-scanner-trivy`. When
-    /// set, `ImageScanner` is registered and scans images via the Harbor
-    /// scanner-adapter API (fail-closed on any adapter error). When unset, no
-    /// container-image (trivy/image) scanner runs — grype still scans. This is
-    /// deliberately separate from `trivy_url`: the adapter's HTTP API is
-    /// incompatible with the trivy-server Twirp/`--server` protocol the
-    /// fs/incus scanners use. See #2088.
+    /// Scanner-adapter URL (optional), e.g. `http://trivy:8090` for the
+    /// in-repo `docker/scanner-adapter`. When set it drives BOTH scan
+    /// families over HTTP with no in-image trivy binary (#2059):
+    /// * container *image* scans via the Harbor Pluggable Scanner API —
+    ///   `ImageScanner`, fail-closed on any adapter error (#2088);
+    /// * filesystem / incus scans via the adapter's filesystem endpoint
+    ///   (#2363, adapter >= 1.2.0) — workspace prep stays local, the tarred
+    ///   workspace is uploaded, and an unavailable adapter degrades those
+    ///   scans to `not_applicable` (#2324) while grype still covers the
+    ///   artifacts. Takes precedence over `trivy_url` for the fs/incus
+    ///   scanners. The tarred-workspace upload budget is tunable via
+    ///   `MAX_FS_SCAN_UPLOAD_BYTES` (default 64 GiB).
     pub trivy_adapter_url: Option<String>,
 
     /// Lifetime, in seconds, of the short-lived per-repository pull token the

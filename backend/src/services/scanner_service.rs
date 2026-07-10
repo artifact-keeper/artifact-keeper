@@ -2811,7 +2811,7 @@ impl ScannerService {
         // ONLY when an adapter URL is configured. When unset, no trivy/image
         // scan row is produced at all (grype still runs) — we do not claim to
         // have run trivy on images.
-        if let Some(adapter_url) = trivy_adapter_url {
+        if let Some(adapter_url) = trivy_adapter_url.clone() {
             info!(
                 "Container image scanner (Harbor adapter) enabled at {}",
                 adapter_url
@@ -2827,21 +2827,43 @@ impl ScannerService {
             scanners.push(Arc::new(image_scanner));
         }
 
-        // Trivy filesystem + incus (rootfs) scanners drive the trivy server
-        // directly and keep consuming TRIVY_URL unchanged: their
-        // `--server` / dir-mode protocol is incompatible with the Harbor
-        // adapter, so they are NOT repointed at it.
-        if let Some(url) = trivy_url {
-            info!("Trivy filesystem scanner enabled");
-            scanners.push(Arc::new(TrivyFsScanner::new(
-                url.clone(),
-                scan_workspace_path.clone(),
-            )));
-            info!("Incus container image scanner enabled");
-            scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
-                url,
-                scan_workspace_path.clone(),
-            )));
+        // Trivy filesystem + incus (rootfs) scanners. Preferred wiring (#2363):
+        // when TRIVY_ADAPTER_URL is set, they route through the scanner-adapter's
+        // filesystem endpoint over HTTP — the backend still prepares/hardens the
+        // workspace locally, tars it, and uploads it, so the hardened image stays
+        // CLI-free (#2059). Legacy TRIVY_URL deployments that bundle the trivy
+        // binary keep the local-CLI path (`--server` then standalone) unchanged.
+        match (trivy_adapter_url, trivy_url) {
+            (Some(adapter_url), _) => {
+                info!(
+                    "Trivy filesystem scanner enabled (scanner-adapter at {})",
+                    adapter_url
+                );
+                scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
+                    adapter_url.clone(),
+                    scan_workspace_path.clone(),
+                )));
+                info!("Incus container image scanner enabled (scanner-adapter)");
+                scanners.push(Arc::new(
+                    crate::services::incus_scanner::IncusScanner::new_with_adapter(
+                        adapter_url,
+                        scan_workspace_path.clone(),
+                    ),
+                ));
+            }
+            (None, Some(url)) => {
+                info!("Trivy filesystem scanner enabled (local CLI)");
+                scanners.push(Arc::new(TrivyFsScanner::new(
+                    url.clone(),
+                    scan_workspace_path.clone(),
+                )));
+                info!("Incus container image scanner enabled (local CLI)");
+                scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
+                    url,
+                    scan_workspace_path.clone(),
+                )));
+            }
+            (None, None) => {}
         }
 
         // Grype scanner (CLI-based). Unlike the trivy filesystem/incus scanners

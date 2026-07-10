@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
 )
 
@@ -52,6 +53,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/metadata", s.handleMetadata)
 	mux.HandleFunc("POST /api/v1/scan", s.handleScan)
 	mux.HandleFunc("GET /api/v1/scan/{id}/report", s.handleReport)
+	// Filesystem scans (#2363): the backend uploads a tarred, pre-hardened
+	// workspace; the adapter untars it and runs `trivy filesystem` over it.
+	mux.HandleFunc("POST /api/v1/filesystem/scan", s.handleFsScan)
+	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", s.handleFsReport)
 	return mux
 }
 
@@ -137,26 +142,93 @@ func (s *Server) runJob(id string, req ScanRequest) {
 	s.jobs.Succeed(id, report)
 }
 
-// handleReport serves the scan report per the Harbor polling contract.
+// handleReport serves the image-scan report per the Harbor polling contract.
 func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	s.serveJobReport(w, r.PathValue("id"), reportMimeType, func(job *Job) any { return job.Report })
+}
+
+// handleFsScan accepts a tarred scan workspace, untars it into a private temp
+// dir, and starts the filesystem scan asynchronously (#2363). The body is
+// capped at cfg.FsMaxUploadBytes; since the tar is uncompressed, the cap also
+// bounds the extracted tree.
+func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
+	body := http.MaxBytesReader(w, r.Body, s.cfg.FsMaxUploadBytes)
+
+	dir, err := os.MkdirTemp("", "fs-scan-")
+	if err != nil {
+		http.Error(w, "failed to create scan workspace", http.StatusInternalServerError)
+		return
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		http.Error(w, "failed to secure scan workspace", http.StatusInternalServerError)
+		return
+	}
+	if err := untarWorkspace(body, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		// An over-cap body surfaces here as a read error from MaxBytesReader.
+		http.Error(w, "invalid workspace tar: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	job, err := s.jobs.Create()
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		http.Error(w, "failed to create scan job", http.StatusInternalServerError)
+		return
+	}
+
+	go s.runFsJob(job.ID, dir)
+
+	writeJSON(w, http.StatusAccepted, ScanResponse{ID: job.ID})
+}
+
+// runFsJob executes the filesystem scan and records the outcome, then removes
+// the untarred workspace. Detached from the request context so a client
+// disconnect does not cancel the scan.
+func (s *Server) runFsJob(id, dir string) {
+	defer func() { _ = os.RemoveAll(dir) }()
+	s.jobs.Running(id)
+	report, stderr, err := s.scanner.ScanFilesystem(context.Background(), dir)
+	if err != nil {
+		log.Printf("filesystem scan %s failed: %v", id, err)
+		s.jobs.Fail(id, err.Error())
+		return
+	}
+	s.debugf("filesystem scan %s succeeded (%d report bytes)", id, len(report))
+	s.jobs.SucceedFs(id, &FsScanResult{
+		Report:         report,
+		Stderr:         stderr,
+		ScannerVersion: s.cfg.ScannerVersion,
+	})
+}
+
+// handleFsReport serves the filesystem-scan result with the same polling
+// contract as the image report (200 / 302+Refresh-After / 500).
+func (s *Server) handleFsReport(w http.ResponseWriter, r *http.Request) {
+	s.serveJobReport(w, r.PathValue("id"), "", func(job *Job) any { return job.Fs })
+}
+
+// serveJobReport implements the shared report-polling contract for both scan
+// families: 200 + body when Succeeded, 500 when Failed (fail-closed — a trivy
+// error is NEVER a 200 with empty findings), 302 + integer Refresh-After while
+// Pending/Running, 404 for an unknown/expired id.
+func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, body func(*Job) any) {
 	job, ok := s.jobs.Get(id)
 	if !ok {
-		// Unknown id: treated as pending by the backend (times out -> fail
-		// closed). Never 404 a known-failed job.
 		http.Error(w, "unknown scan id", http.StatusNotFound)
 		return
 	}
 
 	switch job.Status {
 	case StatusSucceeded:
-		w.Header().Set("Content-Type", reportMimeType)
-		writeJSON(w, http.StatusOK, job.Report)
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		writeJSON(w, http.StatusOK, body(job))
 	case StatusFailed:
-		// Fail-closed: a trivy error is a 500, NEVER a 200 with empty findings.
 		http.Error(w, "scan failed: "+job.Err, http.StatusInternalServerError)
 	default:
-		// Pending / Running: signal "not ready" with an integer Refresh-After.
 		w.Header().Set("Refresh-After", "5")
 		w.WriteHeader(http.StatusFound)
 	}

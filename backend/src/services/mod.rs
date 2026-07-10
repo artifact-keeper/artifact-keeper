@@ -63,6 +63,7 @@ pub mod sbom_service;
 pub mod scan_config_service;
 pub mod scan_result_service;
 pub mod scan_state;
+pub mod scanner_adapter_client;
 pub mod scanner_service;
 pub mod search_service;
 pub mod service_account_service;
