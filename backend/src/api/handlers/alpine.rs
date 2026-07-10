@@ -508,6 +508,7 @@ async fn download_package(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
@@ -599,12 +600,7 @@ async fn download_package(
     match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => {
             // Record download
-            let _ = sqlx::query!(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-                artifact.id
-            )
-            .execute(&state.db)
-            .await;
+            crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -630,12 +626,7 @@ async fn download_package(
             )
             .await?;
 
-            let _ = sqlx::query!(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-                artifact.id
-            )
-            .execute(&state.db)
-            .await;
+            crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
             Ok(Response::builder()
                 .status(StatusCode::OK)

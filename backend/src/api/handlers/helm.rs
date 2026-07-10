@@ -393,6 +393,7 @@ async fn download_chart_via_index(
 async fn download_chart(
     State(state): State<SharedState>,
     Path((repo_key, filename)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
@@ -429,6 +430,7 @@ async fn download_chart(
         &artifact.storage_key,
         "application/gzip",
         Some(&filename),
+        &ctx,
     )
     .await
 }

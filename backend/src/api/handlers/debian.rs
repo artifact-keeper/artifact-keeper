@@ -1428,6 +1428,7 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
 async fn pool_download(
     State(state): State<SharedState>,
     Path((repo_key, component, path)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
@@ -1531,12 +1532,7 @@ async fn pool_download(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let filename = path.rsplit('/').next().unwrap_or(&path);
 

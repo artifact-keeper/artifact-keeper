@@ -4133,7 +4133,7 @@ async fn record_redirect_download(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
     user_id: Option<Uuid>,
-    ip_address: &str,
+    ip_address: Option<&str>,
     user_agent: Option<&str>,
 ) {
     if let Err(e) = sqlx::query(
@@ -4415,15 +4415,19 @@ pub async fn download_artifact(
         }
     }
 
-    // Get client IP for analytics
-    let ip_addr = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("127.0.0.1")
-        .parse()
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    // Get client IP for analytics. Trusted-proxy-aware (#2365): the socket
+    // peer is authoritative and X-Forwarded-For is believed only when the
+    // peer is inside RATE_LIMIT_TRUSTED_PROXY_CIDRS (#2023) — the previous
+    // parse here trusted any XFF. `None` (unresolvable) records as NULL.
+    let client_ip = crate::api::middleware::rate_limit::resolve_client_ip_addr(
+        request.headers(),
+        request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip()),
+        &state.config.rate_limit_trusted_proxy_cidrs,
+    );
+    let client_ip_str = client_ip.map(|ip| ip.to_string());
 
     let user_agent = request
         .headers()
@@ -4471,7 +4475,7 @@ pub async fn download_artifact(
                     &state.db,
                     artifact.id,
                     auth.as_ref().map(|a| a.user_id),
-                    &ip_addr.to_string(),
+                    client_ip_str.as_deref(),
                     user_agent.as_deref(),
                 )
                 .await;
@@ -4495,7 +4499,7 @@ pub async fn download_artifact(
             repo.id,
             &path,
             auth.map(|a| a.user_id),
-            Some(ip_addr.to_string()),
+            client_ip_str.clone(),
             user_agent.as_deref(),
         )
         .await;
@@ -5820,7 +5824,7 @@ mod tests {
             &pool,
             artifact_id,
             None,
-            "203.0.113.7",
+            Some("203.0.113.7"),
             Some("redirect-stats-test-agent/1.0"),
         )
         .await;
@@ -5859,7 +5863,7 @@ mod tests {
         // best-effort (log + swallow) so a stats failure never fails the
         // download. Reaching the assertion at all proves no panic/propagation.
         let bogus_artifact = Uuid::new_v4();
-        record_redirect_download(&pool, bogus_artifact, None, "203.0.113.8", None).await;
+        record_redirect_download(&pool, bogus_artifact, None, Some("203.0.113.8"), None).await;
 
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")

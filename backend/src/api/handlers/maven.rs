@@ -823,6 +823,7 @@ async fn download(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
     let storage = state
@@ -997,7 +998,7 @@ async fn download(
     }
 
     // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
+    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await
 }
 
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
@@ -1380,6 +1381,7 @@ async fn serve_artifact(
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // Remote (proxy) repos never persist rows in the `artifacts` table: the
     // proxy cache writes to the package catalog + filesystem only (guarded by
@@ -1648,12 +1650,7 @@ async fn serve_artifact(
         .map_err(map_storage_err)?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     let ct = content_type_for_path(path);
     let mut builder = Response::builder()
@@ -4019,6 +4016,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), meta_path.to_string())),
             axum::http::HeaderMap::new(),
+            Default::default(),
         )
         .await
         .expect("metadata download must succeed");
@@ -4036,6 +4034,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), format!("{}.{}", meta_path, ext))),
             axum::http::HeaderMap::new(),
+            Default::default(),
         )
         .await
         .expect("checksum download must succeed");
@@ -4580,6 +4579,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((virtual_key.clone(), meta_path.clone())),
             HeaderMap::new(),
+            Default::default(),
         )
         .await
         .expect("virtual metadata download must succeed");
@@ -4690,6 +4690,7 @@ mod tests {
             Extension(Some(auth)),
             Path((virtual_key.clone(), pom_path.to_string())),
             HeaderMap::new(),
+            Default::default(),
         )
         .await;
 

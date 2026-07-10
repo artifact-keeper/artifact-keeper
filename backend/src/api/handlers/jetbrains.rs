@@ -147,6 +147,7 @@ async fn list_plugins(
 async fn download_plugin(
     State(state): State<SharedState>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
 
@@ -248,12 +249,7 @@ async fn download_plugin(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let filename = format!("{}-{}.zip", name, version);
 

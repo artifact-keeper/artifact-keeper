@@ -62,6 +62,7 @@ async fn resolve_sbt_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 async fn download_by_path(
     State(state): State<SharedState>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
@@ -159,12 +160,7 @@ async fn download_by_path(
                 .into_response()
         })?;
 
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let content_type = if artifact.content_type.is_empty() {
         "application/octet-stream"

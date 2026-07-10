@@ -1012,6 +1012,7 @@ async fn download_archive(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
     let full_name = format!("{}/{}", vendor, package);
@@ -1139,12 +1140,7 @@ async fn download_archive(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let filename = format!("{}-{}.zip", package, version);
 

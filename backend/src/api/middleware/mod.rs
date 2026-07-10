@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod demo;
+pub mod download_telemetry;
 pub mod guest_access;
 pub mod metrics;
 pub mod rate_limit;

@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
@@ -966,20 +967,14 @@ impl ArtifactService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) {
-        // Record download statistics
-        sqlx::query!(
-            r#"
-            INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
-            VALUES ($1, $2, $3, $4)
-            "#,
-            artifact_id,
+        // Record download statistics (best-effort; #2365). An unparseable
+        // ip string is recorded as NULL rather than a sentinel value.
+        let ctx = DownloadContext {
+            client_ip: ip_address.and_then(|s| s.parse().ok()),
             user_id,
-            ip_address,
-            user_agent
-        )
-        .execute(&self.db)
-        .await
-        .ok(); // Ignore stats errors
+            user_agent: user_agent.map(str::to_string),
+        };
+        record_download(&self.db, artifact_id, &ctx).await;
 
         // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
         // per-access record auditors need to answer "who fetched this artifact,
@@ -1525,6 +1520,31 @@ impl ArtifactService {
             map.insert(artifact_id, count);
         }
         Ok(map)
+    }
+}
+
+/// Best-effort recorder for a completed local-artifact download (#2365).
+///
+/// Writes real attribution (validated client IP or NULL, authenticated user
+/// or NULL, user agent) into `download_statistics` — replacing the historical
+/// per-format `'0.0.0.0'` sentinel inserts. Errors are logged at `warn` and
+/// swallowed: statistics must never block or fail the download itself.
+///
+/// Call this only after a **local** artifact row has been resolved; remote
+/// pass-through proxy fetches are not our artifacts and stay unrecorded.
+pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(artifact_id)
+    .bind(ctx.user_id)
+    .bind(ctx.client_ip.map(|ip| ip.to_string()))
+    .bind(ctx.user_agent.as_deref())
+    .execute(db)
+    .await
+    {
+        warn!(%artifact_id, error = %e, "failed to record download statistics");
     }
 }
 

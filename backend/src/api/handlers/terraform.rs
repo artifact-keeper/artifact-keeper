@@ -207,6 +207,7 @@ async fn download_module(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let module_name = format!("{}/{}/{}", namespace, name, provider);
@@ -305,12 +306,7 @@ async fn download_module(
     };
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     // Return 204 with X-Terraform-Get header pointing to the archive download URL
     let download_url = format!(
@@ -725,6 +721,7 @@ async fn download_provider(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
@@ -826,12 +823,7 @@ async fn download_provider(
     };
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let filename = format!(
         "terraform-provider-{}_{}_{}.zip",

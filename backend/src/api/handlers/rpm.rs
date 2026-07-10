@@ -747,6 +747,7 @@ async fn upstream_proxy(
 async fn download_package(
     State(state): State<SharedState>,
     Path((repo_key, pkg_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
@@ -811,12 +812,7 @@ async fn download_package(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     Ok(build_rpm_package_response(
         Body::from_stream(stream),

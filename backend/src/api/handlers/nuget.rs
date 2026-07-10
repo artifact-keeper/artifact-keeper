@@ -646,6 +646,7 @@ async fn flatcontainer_versions(
 async fn flatcontainer_download(
     State(state): State<SharedState>,
     Path((repo_key, package_id, version, filename)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
@@ -818,12 +819,7 @@ async fn flatcontainer_download(
         };
 
     // Record download.
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     use futures::StreamExt as _;
     Ok(Response::builder()
@@ -2019,6 +2015,7 @@ mod tests {
                 version.to_string(),
                 filename.clone(),
             )),
+            Default::default(),
         )
         .await;
 

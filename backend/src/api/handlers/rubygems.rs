@@ -197,6 +197,7 @@ async fn gem_versions(
 async fn download_gem(
     State(state): State<SharedState>,
     Path((repo_key, gem_file)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
@@ -262,6 +263,7 @@ async fn download_gem(
         &artifact.storage_key,
         "application/octet-stream",
         Some(filename),
+        &ctx,
     )
     .await
 }

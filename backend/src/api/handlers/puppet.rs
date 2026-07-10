@@ -268,6 +268,7 @@ async fn release_info(
 async fn download_module(
     State(state): State<SharedState>,
     Path((repo_key, file_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_puppet_repo(&state.db, &repo_key).await?;
 
@@ -310,6 +311,7 @@ async fn download_module(
         &artifact.storage_key,
         "application/gzip",
         Some(filename),
+        &ctx,
     )
     .await
 }

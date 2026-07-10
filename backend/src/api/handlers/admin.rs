@@ -30,6 +30,9 @@ pub fn router() -> Router<SharedState> {
         .route("/backups/:id/cancel", post(cancel_backup))
         .route("/settings", get(get_settings).post(update_settings))
         .route("/stats", get(get_system_stats))
+        .route("/downloads", get(list_downloads))
+        .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
+        .route("/downloads/by-user/:user_id", get(list_downloads_by_user))
         .route("/cleanup", post(run_cleanup))
         .route("/reindex", post(trigger_reindex))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
@@ -805,6 +808,212 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
     }))
 }
 
+/// Query parameters for the download-telemetry listing (#2365).
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+pub struct ListDownloadsQuery {
+    /// Filter to downloads of one artifact.
+    pub artifact_id: Option<Uuid>,
+    /// Filter to downloads by one user.
+    pub user_id: Option<Uuid>,
+    /// Filter to downloads from one client IP (exact match).
+    pub ip: Option<String>,
+    /// Inclusive lower bound on `downloaded_at` (RFC 3339).
+    pub from: Option<String>,
+    /// Inclusive upper bound on `downloaded_at` (RFC 3339).
+    pub to: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// One attributed download event.
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct DownloadRecord {
+    pub artifact_id: Uuid,
+    pub user_id: Option<Uuid>,
+    /// Username of the downloader, when the download was authenticated and
+    /// the user still exists.
+    pub username: Option<String>,
+    /// Resolved client IP; NULL for legacy rows and unresolvable clients.
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub downloaded_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadListResponse {
+    pub downloads: Vec<DownloadRecord>,
+    pub total: i64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Parse an optional RFC 3339 query timestamp, rejecting malformed input.
+fn parse_rfc3339_bound(
+    value: Option<&str>,
+    name: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    value
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| AppError::Validation(format!("invalid `{name}` timestamp: {e}")))
+        })
+        .transpose()
+}
+
+/// Append the shared WHERE clauses for the download-telemetry queries.
+fn push_download_filters<'a>(
+    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+    query: &'a ListDownloadsQuery,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    builder.push(" WHERE TRUE");
+    if let Some(artifact_id) = query.artifact_id {
+        builder.push(" AND d.artifact_id = ").push_bind(artifact_id);
+    }
+    if let Some(user_id) = query.user_id {
+        builder.push(" AND d.user_id = ").push_bind(user_id);
+    }
+    if let Some(ip) = &query.ip {
+        builder.push(" AND d.ip_address = ").push_bind(ip);
+    }
+    if let Some(from) = from {
+        builder.push(" AND d.downloaded_at >= ").push_bind(from);
+    }
+    if let Some(to) = to {
+        builder.push(" AND d.downloaded_at <= ").push_bind(to);
+    }
+}
+
+/// Shared listing core for the three download-telemetry endpoints.
+async fn query_downloads(
+    db: &sqlx::PgPool,
+    query: &ListDownloadsQuery,
+) -> Result<DownloadListResponse> {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    let offset = ((page - 1) * per_page) as i64;
+    let from = parse_rfc3339_bound(query.from.as_deref(), "from")?;
+    let to = parse_rfc3339_bound(query.to.as_deref(), "to")?;
+
+    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM download_statistics d");
+    push_download_filters(&mut count_builder, query, from, to);
+    let total: i64 = count_builder
+        .build_query_scalar()
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT d.artifact_id, d.user_id, u.username, d.ip_address, d.user_agent, \
+         d.downloaded_at \
+         FROM download_statistics d LEFT JOIN users u ON u.id = d.user_id",
+    );
+    push_download_filters(&mut builder, query, from, to);
+    builder
+        .push(" ORDER BY d.downloaded_at DESC LIMIT ")
+        .push_bind(per_page as i64)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let downloads: Vec<DownloadRecord> = builder
+        .build_query_as()
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(DownloadListResponse {
+        downloads,
+        total,
+        page,
+        per_page,
+    })
+}
+
+/// List attributed downloads (client IP + user), filterable by artifact,
+/// user, IP, and time range (#2365). Admin-only: download attribution is
+/// sensitive.
+#[utoipa::path(
+    get,
+    path = "/downloads",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(ListDownloadsQuery),
+    responses(
+        (status = 200, description = "Attributed download events", body = DownloadListResponse),
+        (status = 400, description = "Invalid filter parameter"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads(
+    State(state): State<SharedState>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    Ok(Json(query_downloads(&state.db, &query).await?))
+}
+
+/// Downloads originating from one client IP: "what did this network
+/// location pull?" (#2365).
+#[utoipa::path(
+    get,
+    path = "/downloads/by-ip/{ip}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("ip" = String, Path, description = "Client IP address"),
+        ListDownloadsQuery
+    ),
+    responses(
+        (status = 200, description = "Downloads from the IP", body = DownloadListResponse),
+        (status = 400, description = "Invalid IP address"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads_by_ip(
+    State(state): State<SharedState>,
+    Path(ip): Path<String>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| AppError::Validation("invalid IP address".to_string()))?;
+    let query = ListDownloadsQuery {
+        ip: Some(ip.to_string()),
+        ..query
+    };
+    Ok(Json(query_downloads(&state.db, &query).await?))
+}
+
+/// Downloads performed by one user: "what did this user pull?" (#2365).
+#[utoipa::path(
+    get,
+    path = "/downloads/by-user/{user_id}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("user_id" = Uuid, Path, description = "User id"),
+        ListDownloadsQuery
+    ),
+    responses(
+        (status = 200, description = "Downloads by the user", body = DownloadListResponse),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads_by_user(
+    State(state): State<SharedState>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    let query = ListDownloadsQuery {
+        user_id: Some(user_id),
+        ..query
+    };
+    Ok(Json(query_downloads(&state.db, &query).await?))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CleanupRequest {
     pub cleanup_audit_logs: Option<bool>,
@@ -1105,6 +1314,9 @@ pub async fn rescan_for_inventory(
         get_settings,
         update_settings,
         get_system_stats,
+        list_downloads,
+        list_downloads_by_ip,
+        list_downloads_by_user,
         run_cleanup,
         trigger_reindex,
         rescan_for_inventory,
@@ -1120,6 +1332,9 @@ pub async fn rescan_for_inventory(
         RestoreResponse,
         SystemSettings,
         SystemStats,
+        ListDownloadsQuery,
+        DownloadRecord,
+        DownloadListResponse,
         CleanupRequest,
         CleanupResponse,
         ReindexResponse,
@@ -1566,5 +1781,179 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // download telemetry (#2365)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_rfc3339_bound_accepts_valid_and_none() {
+        assert_eq!(parse_rfc3339_bound(None, "from").unwrap(), None);
+        let parsed = parse_rfc3339_bound(Some("2026-07-01T00:00:00Z"), "from")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-07-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_parse_rfc3339_bound_rejects_malformed() {
+        let err = parse_rfc3339_bound(Some("yesterday"), "to").unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_query_downloads_filters_by_ip_user_and_artifact() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-telemetry', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-telemetry/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "1"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+
+        // One authenticated download from 203.0.113.10, one anonymous from
+        // 203.0.113.11.
+        let ctx_authed = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.10".parse().unwrap()),
+            user_id: Some(user_id),
+            user_agent: Some("admin-dl-test/1.0".to_string()),
+        };
+        let ctx_anon = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.11".parse().unwrap()),
+            user_id: None,
+            user_agent: None,
+        };
+        crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
+        crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
+
+        // Filter by artifact: both rows.
+        let by_artifact = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by artifact");
+        assert_eq!(by_artifact.total, 2);
+        assert_eq!(by_artifact.downloads.len(), 2);
+
+        // Filter by IP: only the authenticated row, with the username joined.
+        let by_ip = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ip: Some("203.0.113.10".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by ip");
+        assert_eq!(by_ip.total, 1);
+        let row = &by_ip.downloads[0];
+        assert_eq!(row.user_id, Some(user_id));
+        assert_eq!(row.username.as_deref(), Some(username.as_str()));
+        assert_eq!(row.ip_address.as_deref(), Some("203.0.113.10"));
+        assert_eq!(row.user_agent.as_deref(), Some("admin-dl-test/1.0"));
+
+        // Filter by user: only the authenticated row.
+        let by_user = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by user");
+        assert_eq!(by_user.total, 1);
+
+        // The anonymous row keeps a NULL user but a real IP.
+        let anon = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ip: Some("203.0.113.11".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query anon row");
+        assert_eq!(anon.total, 1);
+        assert_eq!(anon.downloads[0].user_id, None);
+
+        // Pagination clamps per_page and honors page.
+        let paged = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                page: Some(2),
+                per_page: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("paged query");
+        assert_eq!(paged.total, 2);
+        assert_eq!(paged.downloads.len(), 1);
+        assert_eq!(paged.page, 2);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_record_download_unresolvable_ip_is_null_not_sentinel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-null-ip', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-null-ip/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "2"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+
+        crate::services::artifact_service::record_download(&pool, artifact_id, &Default::default())
+            .await;
+
+        let (ip, uid): (Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT ip_address, user_id FROM download_statistics WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stats row");
+        assert_eq!(
+            ip, None,
+            "unresolvable client must record NULL, not 0.0.0.0"
+        );
+        assert_eq!(uid, None);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 }

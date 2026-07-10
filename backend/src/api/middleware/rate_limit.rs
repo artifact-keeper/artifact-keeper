@@ -583,8 +583,13 @@ fn too_many_requests(retry_after: u64, max_requests: u32) -> Response {
 /// First `X-Forwarded-For` token, trimmed, as a string (may be a hostname or
 /// otherwise non-parseable). `None` when the header is absent or empty.
 fn first_xff_token(request: &Request) -> Option<&str> {
-    request
-        .headers()
+    first_xff_token_in(request.headers())
+}
+
+/// [`first_xff_token`] over a bare header map, for callers that only hold
+/// request parts (e.g. the download-telemetry extractor, #2365).
+fn first_xff_token_in(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
         .get("x-forwarded-for")?
         .to_str()
         .ok()?
@@ -653,14 +658,30 @@ fn extract_client_ip(request: &Request, trusted_proxies: &[CidrRange]) -> String
 /// back to a parseable `XFF` (direct-test / pre-ConnectInfo topology).
 /// Returns `None` if the address cannot be resolved or does not parse.
 fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> Option<IpAddr> {
-    if let Some(connect_info) = request
+    let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        let peer = connect_info.0.ip();
+        .map(|connect_info| connect_info.0.ip());
+    resolve_client_ip_addr(request.headers(), peer, trusted_proxies)
+}
+
+/// Core client-IP resolution over bare request parts (#2365).
+///
+/// Same trusted-proxy contract as [`extract_client_ip_addr`], which delegates
+/// here: the socket `peer` is authoritative; `X-Forwarded-For` overrides it
+/// **only** when the peer falls inside a configured trusted-proxy CIDR
+/// (#2023). With no peer at all (test harness / pre-`ConnectInfo` topology),
+/// a parseable `XFF` first token is a last-resort fallback. Returns `None`
+/// when nothing resolves — callers must record "unknown", never a sentinel.
+pub(crate) fn resolve_client_ip_addr(
+    headers: &axum::http::HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[CidrRange],
+) -> Option<IpAddr> {
+    if let Some(peer) = peer {
         // Believe XFF only when the immediate peer is a trusted proxy.
         if trusted_proxies.iter().any(|cidr| cidr.contains(peer)) {
-            if let Some(first) = first_xff_token(request) {
+            if let Some(first) = first_xff_token_in(headers) {
                 if let Ok(ip) = first.parse::<IpAddr>() {
                     return Some(ip);
                 }
@@ -673,7 +694,7 @@ fn extract_client_ip_addr(request: &Request, trusted_proxies: &[CidrRange]) -> O
 
     // No ConnectInfo (test harness / pre-ConnectInfo topology): fall back to a
     // parseable XFF first token so keying still distinguishes callers.
-    if let Some(first) = first_xff_token(request) {
+    if let Some(first) = first_xff_token_in(headers) {
         if let Ok(ip) = first.parse::<IpAddr>() {
             return Some(ip);
         }
@@ -1009,6 +1030,68 @@ mod tests {
         assert_eq!(
             extract_client_ip(&request, &no_trusted_proxies()),
             "ip:10.0.0.5"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_client_ip_addr (parts-level core; #2365)
+    // -----------------------------------------------------------------------
+
+    fn xff_headers(xff: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", xff.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn test_resolve_client_ip_addr_trusted_peer_uses_xff() {
+        let ip = resolve_client_ip_addr(
+            &xff_headers("203.0.113.7"),
+            Some("127.0.0.1".parse().unwrap()),
+            &loopback_trusted_proxies(),
+        );
+        assert_eq!(ip, Some("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_addr_untrusted_peer_ignores_xff() {
+        // Spoofed XFF from an untrusted peer must not steer attribution
+        // (#2023): the socket peer wins.
+        let ip = resolve_client_ip_addr(
+            &xff_headers("203.0.113.7"),
+            Some("198.51.100.9".parse().unwrap()),
+            &no_trusted_proxies(),
+        );
+        assert_eq!(ip, Some("198.51.100.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_addr_trusted_peer_unparseable_xff_falls_back_to_peer() {
+        let ip = resolve_client_ip_addr(
+            &xff_headers("not-an-ip"),
+            Some("127.0.0.1".parse().unwrap()),
+            &loopback_trusted_proxies(),
+        );
+        assert_eq!(ip, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_addr_no_peer_falls_back_to_parseable_xff() {
+        let ip = resolve_client_ip_addr(&xff_headers("192.0.2.4"), None, &no_trusted_proxies());
+        assert_eq!(ip, Some("192.0.2.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_addr_nothing_resolvable_is_none() {
+        // No peer + no (parseable) XFF: None, never a `0.0.0.0` sentinel.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(
+            resolve_client_ip_addr(&empty, None, &no_trusted_proxies()),
+            None
+        );
+        assert_eq!(
+            resolve_client_ip_addr(&xff_headers("bogus"), None, &no_trusted_proxies()),
+            None
         );
     }
 
