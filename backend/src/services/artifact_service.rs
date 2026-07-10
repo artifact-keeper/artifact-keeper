@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
-use crate::models::artifact::{Artifact, ArtifactMetadata};
+use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
+use crate::models::repository::RepositoryFormat;
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
@@ -111,6 +112,104 @@ impl MultiHasher {
             md5: format!("{:x}", md5::Digest::finalize(self.md5)),
         }
     }
+}
+
+/// Whether uploads to a repository append immutable revisions to
+/// `artifact_versions` instead of overwriting/rejecting the prior content at
+/// the same path (#2367).
+///
+/// The versioning branch is deliberately narrow: it requires BOTH the
+/// per-repo `versioning_enabled` opt-in (DEFAULT false) AND a Generic or
+/// Mlmodel format. Every other format — and every repo that has not opted in
+/// — keeps the exact pre-existing `ON CONFLICT` overwrite semantics and the
+/// release-immutability backstop.
+pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: bool) -> bool {
+    versioning_enabled
+        && matches!(
+            format,
+            RepositoryFormat::Generic | RepositoryFormat::Mlmodel
+        )
+}
+
+/// Next auto-increment revision for a (repository_id, path) coordinate given
+/// the current maximum stored revision (`None` when no revisions exist yet).
+pub(crate) fn next_revision(current_max: Option<i32>) -> i32 {
+    current_max.unwrap_or(0) + 1
+}
+
+/// How a `?version=` selector on the versioned-artifact API is interpreted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VersionSelector {
+    /// Absent, empty, or the literal `latest`: resolve to the HEAD revision.
+    Latest,
+    /// All-digits selector: resolve by exact revision number.
+    Revision(i32),
+    /// Anything else: resolve by `version_label` (highest matching revision).
+    Label(String),
+}
+
+/// Parse a raw `?version=` value into a [`VersionSelector`].
+///
+/// A numeric string (all ASCII digits) selects by revision; `latest`, empty,
+/// or absent selects HEAD; any other string is treated as a human label.
+pub(crate) fn parse_version_selector(raw: Option<&str>) -> VersionSelector {
+    match raw.map(str::trim) {
+        None | Some("") | Some("latest") => VersionSelector::Latest,
+        Some(s) => {
+            if s.chars().all(|c| c.is_ascii_digit()) {
+                match s.parse::<i32>() {
+                    Ok(n) => VersionSelector::Revision(n),
+                    // Overflows i32: cannot match any stored revision, but it
+                    // is still a well-formed label lookup.
+                    Err(_) => VersionSelector::Label(s.to_string()),
+                }
+            } else {
+                VersionSelector::Label(s.to_string())
+            }
+        }
+    }
+}
+
+/// Resolve a [`VersionSelector`] against the `(revision, version_label)`
+/// pairs stored for a coordinate. Returns the matching revision number, or
+/// `None` when nothing matches (or no revisions exist).
+///
+/// `Latest` picks the maximum revision; `Label` picks the highest revision
+/// carrying that label (labels are not forced unique, so re-tagging picks
+/// the newest).
+pub(crate) fn resolve_version_selector(
+    selector: &VersionSelector,
+    versions: &[(i32, Option<String>)],
+) -> Option<i32> {
+    match selector {
+        VersionSelector::Latest => versions.iter().map(|(rev, _)| *rev).max(),
+        VersionSelector::Revision(n) => versions
+            .iter()
+            .find(|(rev, _)| rev == n)
+            .map(|(rev, _)| *rev),
+        VersionSelector::Label(label) => versions
+            .iter()
+            .filter(|(_, l)| l.as_deref() == Some(label.as_str()))
+            .map(|(rev, _)| *rev)
+            .max(),
+    }
+}
+
+/// Pre-upsert HEAD snapshot used by the versioned-history append (#2367):
+/// the `ON CONFLICT DO UPDATE` upsert overwrites the HEAD row in place, so
+/// the prior state must be captured first for idempotency and
+/// backfill-on-write.
+#[derive(Debug, sqlx::FromRow)]
+struct PriorHeadRow {
+    name: String,
+    version: Option<String>,
+    size_bytes: i64,
+    checksum_sha256: String,
+    checksum_sha1: Option<String>,
+    checksum_md5: Option<String>,
+    content_type: String,
+    storage_key: String,
+    uploaded_by: Option<Uuid>,
 }
 
 /// Artifact service
@@ -515,9 +614,22 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #2367: for repositories that opted into first-class versioning
+        // (Generic/Mlmodel only), a re-upload to an existing path APPENDS an
+        // immutable revision to `artifact_versions` instead of conflicting, so
+        // both the live-overwrite check and the release-immutability backstop
+        // below are relaxed for the HEAD row. Old revisions stay immutable and
+        // addressable; every other format and every non-opted-in repo keeps
+        // the exact pre-existing 409 behavior.
+        let repo = self.repo_service.get_by_id(repository_id).await;
+        let versioning_active = repo
+            .as_ref()
+            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
+            .unwrap_or(false);
+
         if let Some(existing) = existing {
             // For immutable artifacts, reject if version matches
-            if existing.version == version.map(String::from) {
+            if !versioning_active && existing.version == version.map(String::from) {
                 return Err(AppError::Conflict(
                     "Artifact version already exists and is immutable".to_string(),
                 ));
@@ -542,8 +654,13 @@ impl ArtifactService {
         // is a release coordinate and which `classify` would otherwise treat as
         // mutable-by-default. Identical-bytes republish (idempotent undelete)
         // and genuine mutable index files proceed unchanged.
-        if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
-            if !crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path) {
+        if let Ok(repo) = repo {
+            if !versioning_active
+                && !crate::services::cache_classifier::is_explicitly_mutable_index(
+                    &repo.format,
+                    path,
+                )
+            {
                 let prior = sqlx::query!(
                     "SELECT checksum_sha256, version FROM artifacts \
                      WHERE repository_id = $1 AND path = $2",
@@ -597,6 +714,33 @@ impl ArtifactService {
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
     ) -> Result<Artifact> {
+        // #2367: for versioning-enabled Generic/Mlmodel repos, capture the
+        // pre-upsert HEAD state so the history append below can (a) stay
+        // idempotent on identical-bytes re-uploads and (b) backfill the
+        // pre-existing HEAD as revision 1 on the first versioned write to a
+        // coordinate that predates the feature.
+        let versioning_active = self
+            .repo_service
+            .get_by_id(repository_id)
+            .await
+            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
+            .unwrap_or(false);
+        let prior_head = if versioning_active {
+            sqlx::query_as::<_, PriorHeadRow>(
+                "SELECT name, version, size_bytes, checksum_sha256, checksum_sha1, \
+                        checksum_md5, content_type, storage_key, uploaded_by \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repository_id)
+            .bind(path)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+        } else {
+            None
+        };
+
         // Create artifact record.
         //
         // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
@@ -647,6 +791,14 @@ impl ArtifactService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // #2367: append an immutable revision to `artifact_versions` for
+        // versioning-enabled Generic/Mlmodel repos. Identical-bytes
+        // re-uploads create no new revision (idempotent republish); the
+        // `version` coordinate doubles as the human `version_label`.
+        if versioning_active {
+            self.record_version(&artifact, prior_head, version).await?;
+        }
 
         // Apply quarantine hold if enabled for this repository. This is the
         // shared upload path (pypi/debian/incus/generic), which only ever
@@ -905,6 +1057,242 @@ impl ArtifactService {
         }
 
         Ok(artifact)
+    }
+
+    /// Append an immutable revision for a freshly-upserted HEAD artifact
+    /// (#2367). Only called for versioning-enabled Generic/Mlmodel repos.
+    ///
+    /// * Idempotency: when the incoming bytes hash identically to the prior
+    ///   HEAD, no new revision is created (retract/republish stays a no-op).
+    /// * Backfill-on-write: the first versioned upload over a HEAD that
+    ///   predates the feature (zero `artifact_versions` rows) records that
+    ///   prior HEAD as revision 1 before appending the new upload.
+    ///
+    /// Returns the revision number the upload landed at (`None` when the
+    /// upload was an identical-bytes no-op onto an unversioned HEAD).
+    async fn record_version(
+        &self,
+        artifact: &Artifact,
+        prior_head: Option<PriorHeadRow>,
+        version_label: Option<&str>,
+    ) -> Result<Option<i32>> {
+        // Identical-bytes re-upload: keep the existing history untouched.
+        if let Some(ref prior) = prior_head {
+            if prior
+                .checksum_sha256
+                .trim()
+                .eq_ignore_ascii_case(artifact.checksum_sha256.trim())
+            {
+                return Ok(self
+                    .latest_version_info(artifact.repository_id, &artifact.path)
+                    .await?
+                    .map(|(rev, _)| rev));
+            }
+        }
+
+        let current_max: Option<i32> = sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT MAX(revision) FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(artifact.repository_id)
+        .bind(&artifact.path)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Backfill-on-write: preserve the pre-feature HEAD as revision 1.
+        if current_max.is_none() {
+            if let Some(prior) = prior_head {
+                self.insert_revision_row(
+                    artifact.repository_id,
+                    &artifact.path,
+                    &prior.name,
+                    prior.version.as_deref(),
+                    prior.size_bytes,
+                    &prior.checksum_sha256,
+                    prior.checksum_sha1.as_deref(),
+                    prior.checksum_md5.as_deref(),
+                    &prior.content_type,
+                    &prior.storage_key,
+                    prior.uploaded_by,
+                )
+                .await?;
+            }
+        }
+
+        let revision = self
+            .insert_revision_row(
+                artifact.repository_id,
+                &artifact.path,
+                &artifact.name,
+                version_label,
+                artifact.size_bytes,
+                &artifact.checksum_sha256,
+                artifact.checksum_sha1.as_deref(),
+                artifact.checksum_md5.as_deref(),
+                &artifact.content_type,
+                &artifact.storage_key,
+                artifact.uploaded_by,
+            )
+            .await?;
+        Ok(Some(revision))
+    }
+
+    /// Insert one `artifact_versions` row at `MAX(revision)+1`, retrying once
+    /// on the UNIQUE(repository_id, path, revision) constraint so two
+    /// concurrent uploads to the same coordinate both land (on consecutive
+    /// revisions) instead of one failing spuriously.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_revision_row(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        name: &str,
+        version_label: Option<&str>,
+        size_bytes: i64,
+        checksum_sha256: &str,
+        checksum_sha1: Option<&str>,
+        checksum_md5: Option<&str>,
+        content_type: &str,
+        storage_key: &str,
+        uploaded_by: Option<Uuid>,
+    ) -> Result<i32> {
+        for attempt in 0..2 {
+            let current_max: Option<i32> = sqlx::query_scalar::<_, Option<i32>>(
+                "SELECT MAX(revision) FROM artifact_versions \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repository_id)
+            .bind(path)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let revision = next_revision(current_max);
+
+            let inserted = sqlx::query(
+                "INSERT INTO artifact_versions ( \
+                     repository_id, path, revision, version_label, name, size_bytes, \
+                     checksum_sha256, checksum_sha1, checksum_md5, content_type, \
+                     storage_key, uploaded_by \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(repository_id)
+            .bind(path)
+            .bind(revision)
+            .bind(version_label)
+            .bind(name)
+            .bind(size_bytes)
+            .bind(checksum_sha256)
+            .bind(checksum_sha1)
+            .bind(checksum_md5)
+            .bind(content_type)
+            .bind(storage_key)
+            .bind(uploaded_by)
+            .execute(&self.db)
+            .await;
+
+            match inserted {
+                Ok(_) => return Ok(revision),
+                Err(e) if attempt == 0 && e.to_string().contains("duplicate key") => {
+                    // A concurrent upload claimed this revision number;
+                    // recompute MAX and retry once.
+                    continue;
+                }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
+        }
+        Err(AppError::Conflict(
+            "Concurrent uploads exhausted the revision-number retry".to_string(),
+        ))
+    }
+
+    /// Latest `(revision, version_label)` recorded for a coordinate, or
+    /// `None` when the coordinate has no version history.
+    pub async fn latest_version_info(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+    ) -> Result<Option<(i32, Option<String>)>> {
+        sqlx::query_as::<_, (i32, Option<String>)>(
+            "SELECT revision, version_label FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2 \
+             ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// List every stored revision for a coordinate, newest first (#2367).
+    pub async fn list_versions(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+    ) -> Result<Vec<ArtifactVersion>> {
+        sqlx::query_as::<_, ArtifactVersion>(
+            "SELECT id, repository_id, path, revision, version_label, name, \
+                    size_bytes, checksum_sha256, checksum_sha1, checksum_md5, \
+                    content_type, storage_key, uploaded_by, created_at \
+             FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2 \
+             ORDER BY revision DESC",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Resolve a `?version=` selector (revision number, human label, or
+    /// `latest`) to the stored revision row for a coordinate (#2367).
+    /// Returns `None` when nothing matches.
+    pub async fn get_version(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        selector_raw: Option<&str>,
+    ) -> Result<Option<ArtifactVersion>> {
+        let pairs = sqlx::query_as::<_, (i32, Option<String>)>(
+            "SELECT revision, version_label FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let selector = parse_version_selector(selector_raw);
+        let Some(revision) = resolve_version_selector(&selector, &pairs) else {
+            return Ok(None);
+        };
+
+        sqlx::query_as::<_, ArtifactVersion>(
+            "SELECT id, repository_id, path, revision, version_label, name, \
+                    size_bytes, checksum_sha256, checksum_sha1, checksum_md5, \
+                    content_type, storage_key, uploaded_by, created_at \
+             FROM artifact_versions \
+             WHERE repository_id = $1 AND path = $2 AND revision = $3",
+        )
+        .bind(repository_id)
+        .bind(path)
+        .bind(revision)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Stream a specific stored revision's bytes from content-addressed
+    /// storage (#2367). Old revisions stay addressable even after the HEAD
+    /// row is soft-deleted or overwritten.
+    pub async fn download_version_stream(
+        &self,
+        version: &ArtifactVersion,
+    ) -> Result<BoxStream<'static, Result<Bytes>>> {
+        self.storage.get_stream(&version.storage_key).await
     }
 
     /// Shared download preamble: look up the artifact row, enforce quarantine,
@@ -2500,6 +2888,385 @@ mod tests {
             .bind(artifact.id)
             .execute(&pool)
             .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- #2367 first-class versioning: pure helpers ------------------------
+
+    #[test]
+    fn test_next_revision_starts_at_one_and_increments() {
+        assert_eq!(next_revision(None), 1);
+        assert_eq!(next_revision(Some(1)), 2);
+        assert_eq!(next_revision(Some(7)), 8);
+    }
+
+    #[test]
+    fn test_versioning_applies_gated_on_flag_and_format() {
+        // Opt-in + supported formats.
+        assert!(versioning_applies(&RepositoryFormat::Generic, true));
+        assert!(versioning_applies(&RepositoryFormat::Mlmodel, true));
+        // Flag off: never applies, even for supported formats.
+        assert!(!versioning_applies(&RepositoryFormat::Generic, false));
+        assert!(!versioning_applies(&RepositoryFormat::Mlmodel, false));
+        // Other formats: never applies, even with the flag on.
+        assert!(!versioning_applies(&RepositoryFormat::Maven, true));
+        assert!(!versioning_applies(&RepositoryFormat::Npm, true));
+        assert!(!versioning_applies(&RepositoryFormat::Debian, true));
+        assert!(!versioning_applies(&RepositoryFormat::Docker, true));
+    }
+
+    #[test]
+    fn test_parse_version_selector() {
+        // Absent / empty / literal `latest` -> HEAD.
+        assert_eq!(parse_version_selector(None), VersionSelector::Latest);
+        assert_eq!(parse_version_selector(Some("")), VersionSelector::Latest);
+        assert_eq!(parse_version_selector(Some("  ")), VersionSelector::Latest);
+        assert_eq!(
+            parse_version_selector(Some("latest")),
+            VersionSelector::Latest
+        );
+        // All-digits -> revision number.
+        assert_eq!(
+            parse_version_selector(Some("3")),
+            VersionSelector::Revision(3)
+        );
+        assert_eq!(
+            parse_version_selector(Some(" 12 ")),
+            VersionSelector::Revision(12)
+        );
+        // Anything else -> label (including mixed and signed strings; revisions
+        // are server-assigned positive integers so `-1` can only be a label).
+        assert_eq!(
+            parse_version_selector(Some("gold")),
+            VersionSelector::Label("gold".to_string())
+        );
+        assert_eq!(
+            parse_version_selector(Some("v2")),
+            VersionSelector::Label("v2".to_string())
+        );
+        assert_eq!(
+            parse_version_selector(Some("-1")),
+            VersionSelector::Label("-1".to_string())
+        );
+        assert_eq!(
+            parse_version_selector(Some("1.0.0")),
+            VersionSelector::Label("1.0.0".to_string())
+        );
+        // Digits that overflow i32 degrade to a (non-matching) label.
+        assert_eq!(
+            parse_version_selector(Some("99999999999")),
+            VersionSelector::Label("99999999999".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_version_selector() {
+        let versions: Vec<(i32, Option<String>)> = vec![
+            (1, None),
+            (2, Some("gold".to_string())),
+            (3, Some("rc".to_string())),
+        ];
+        // Numeric selector -> exact revision.
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Revision(3), &versions),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Revision(9), &versions),
+            None
+        );
+        // Label selector -> labelled revision.
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Label("gold".to_string()), &versions),
+            Some(2)
+        );
+        // Unknown label -> None.
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Label("nope".to_string()), &versions),
+            None
+        );
+        // Latest -> max revision.
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Latest, &versions),
+            Some(3)
+        );
+        // Empty history -> None for every selector.
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Latest, &[]),
+            None
+        );
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Revision(1), &[]),
+            None
+        );
+        // Duplicate label -> highest matching revision wins (re-tagging).
+        let retagged: Vec<(i32, Option<String>)> =
+            vec![(1, Some("gold".to_string())), (2, Some("gold".to_string()))];
+        assert_eq!(
+            resolve_version_selector(&VersionSelector::Label("gold".to_string()), &retagged),
+            Some(2)
+        );
+    }
+
+    // ---- #2367 first-class versioning: DB-backed flow ----------------------
+
+    /// Set the per-repo `versioning_enabled` opt-in flag.
+    async fn set_versioning(pool: &sqlx::PgPool, repo_id: Uuid, value: bool) {
+        sqlx::query("UPDATE repositories SET versioning_enabled = $1 WHERE id = $2")
+            .bind(value)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set versioning_enabled");
+    }
+
+    /// Versioning-enabled generic repo: different-bytes re-upload APPENDS a
+    /// revision instead of 409ing, identical-bytes re-upload is idempotent,
+    /// and selectors (revision / label / latest) resolve correctly.
+    #[tokio::test]
+    async fn versioned_generic_reupload_appends_revisions_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        set_versioning(&pool, repo_id, true).await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+        let path = "configs/app/config.yaml";
+
+        // Revision 1.
+        svc.upload_with_sync_options(
+            repo_id,
+            path,
+            "config.yaml",
+            None,
+            "application/yaml",
+            Bytes::from_static(b"content: A"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("first upload must succeed");
+
+        // Different bytes to the same path: previously a 409/overwrite; with
+        // versioning enabled this must APPEND revision 2 (with a label).
+        let head = svc
+            .upload_with_sync_options(
+                repo_id,
+                path,
+                "config.yaml",
+                Some("gold"),
+                "application/yaml",
+                Bytes::from_static(b"content: B"),
+                Some(user_id),
+                false,
+            )
+            .await
+            .expect("versioned re-upload with different bytes must succeed");
+        assert_eq!(
+            head.checksum_sha256,
+            ArtifactService::calculate_sha256(b"content: B"),
+            "HEAD must point at the newest content"
+        );
+
+        let versions = svc.list_versions(repo_id, path).await.expect("list");
+        assert_eq!(
+            versions.iter().map(|v| v.revision).collect::<Vec<_>>(),
+            vec![2, 1],
+            "history must hold revisions [2, 1], newest first"
+        );
+        assert_eq!(
+            versions[1].checksum_sha256.trim(),
+            ArtifactService::calculate_sha256(b"content: A"),
+            "revision 1 must preserve the original bytes' checksum"
+        );
+
+        // Identical-bytes re-upload: idempotent, no new revision.
+        svc.upload_with_sync_options(
+            repo_id,
+            path,
+            "config.yaml",
+            Some("gold"),
+            "application/yaml",
+            Bytes::from_static(b"content: B"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("identical-bytes re-upload must stay idempotent");
+        let after = svc.list_versions(repo_id, path).await.expect("list");
+        assert_eq!(
+            after.len(),
+            2,
+            "identical-bytes re-upload must not append a new revision"
+        );
+
+        // Selector resolution: revision number, label, latest, unknown.
+        let rev1 = svc.get_version(repo_id, path, Some("1")).await.expect("q");
+        assert_eq!(rev1.map(|v| v.revision), Some(1));
+        let gold = svc
+            .get_version(repo_id, path, Some("gold"))
+            .await
+            .expect("q");
+        assert_eq!(gold.map(|v| v.revision), Some(2));
+        let latest = svc.get_version(repo_id, path, None).await.expect("q");
+        assert_eq!(latest.map(|v| v.revision), Some(2));
+        let missing = svc
+            .get_version(repo_id, path, Some("nope"))
+            .await
+            .expect("q");
+        assert!(missing.is_none(), "unknown selector must resolve to None");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Backfill-on-write: the first versioned upload over a HEAD that predates
+    /// the feature records that HEAD as revision 1, then the new bytes as
+    /// revision 2 — and deleting the HEAD afterwards leaves both revisions
+    /// addressable.
+    #[tokio::test]
+    async fn versioned_backfill_preserves_preexisting_head_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+        let path = "docs/manual.pdf";
+
+        // Upload BEFORE opting in: no history is recorded (flag defaults off).
+        svc.upload_with_sync_options(
+            repo_id,
+            path,
+            "manual.pdf",
+            None,
+            "application/pdf",
+            Bytes::from_static(b"pdf-v1"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("pre-feature upload must succeed");
+        assert!(
+            svc.list_versions(repo_id, path)
+                .await
+                .expect("list")
+                .is_empty(),
+            "flag-off upload must record no history"
+        );
+
+        // Opt in, then upload different bytes: prior HEAD is backfilled as
+        // revision 1 and the new bytes land as revision 2.
+        set_versioning(&pool, repo_id, true).await;
+        svc.upload_with_sync_options(
+            repo_id,
+            path,
+            "manual.pdf",
+            None,
+            "application/pdf",
+            Bytes::from_static(b"pdf-v2"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("versioned upload over pre-feature HEAD must succeed");
+
+        let versions = svc.list_versions(repo_id, path).await.expect("list");
+        assert_eq!(
+            versions.iter().map(|v| v.revision).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            versions[1].checksum_sha256.trim(),
+            ArtifactService::calculate_sha256(b"pdf-v1"),
+            "backfilled revision 1 must carry the pre-feature HEAD checksum"
+        );
+
+        // Soft-delete the HEAD: prior revisions stay addressable.
+        tombstone(&pool, repo_id, path).await;
+        let still_there = svc
+            .get_version(repo_id, path, Some("1"))
+            .await
+            .expect("q")
+            .expect("revision 1 must remain addressable after HEAD delete");
+        assert_eq!(still_there.revision, 1);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Regression guard: with `versioning_enabled` left at its default
+    /// (false), a generic repo's released coordinate still rejects a
+    /// different-bytes re-upload with 409 — the versioning branch must not
+    /// weaken any non-opted-in repository.
+    #[tokio::test]
+    async fn versioning_flag_off_keeps_release_immutability_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+        let path = "app/1.0.0/app-1.0.0.bin";
+
+        svc.upload_with_sync_options(
+            repo_id,
+            path,
+            "app",
+            Some("1.0.0"),
+            "application/octet-stream",
+            Bytes::from_static(b"release-bytes"),
+            Some(user_id),
+            false,
+        )
+        .await
+        .expect("initial release upload must succeed");
+
+        let swap = svc
+            .upload_with_sync_options(
+                repo_id,
+                path,
+                "app",
+                Some("1.0.0"),
+                "application/octet-stream",
+                Bytes::from_static(b"DIFFERENT-bytes"),
+                Some(user_id),
+                false,
+            )
+            .await;
+        assert!(
+            matches!(swap, Err(AppError::Conflict(_))),
+            "flag-off different-bytes re-upload to a released coordinate must still 409, got {:?}",
+            swap.map(|a| a.path)
+        );
+        assert!(
+            svc.list_versions(repo_id, path)
+                .await
+                .expect("list")
+                .is_empty(),
+            "flag-off repos must record no version history"
+        );
+
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }

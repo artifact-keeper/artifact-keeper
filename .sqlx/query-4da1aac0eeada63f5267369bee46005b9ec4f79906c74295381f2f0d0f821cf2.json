@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days,\n                created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -194,18 +194,23 @@
       },
       {
         "ordinal": 21,
+        "name": "versioning_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -231,8 +236,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "f09e19f04559df32ec3f8239f0a89c59ba524f2ae6ab806b72a2b0fa11d3659f"
+  "hash": "4da1aac0eeada63f5267369bee46005b9ec4f79906c74295381f2f0d0f821cf2"
 }

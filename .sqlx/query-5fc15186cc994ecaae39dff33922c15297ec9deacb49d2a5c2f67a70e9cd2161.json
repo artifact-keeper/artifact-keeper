@@ -39,7 +39,8 @@
                 "local",
                 "ldap",
                 "saml",
-                "oidc"
+                "oidc",
+                "ci"
               ]
             }
           }
@@ -139,7 +140,8 @@
                 "local",
                 "ldap",
                 "saml",
-                "oidc"
+                "oidc",
+                "ci"
               ]
             }
           }

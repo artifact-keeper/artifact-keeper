@@ -2249,7 +2249,7 @@ pub async fn fetch_virtual_members(
             r.replication_priority as "replication_priority: ReplicationPriority",
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-            r.age_gate_enabled, r.age_gate_min_age_days,
+            r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
             r.created_at, r.updated_at
         FROM repositories r
         INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -4176,6 +4176,7 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         curation_auto_fetch: false,
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        versioning_enabled: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -8775,6 +8776,7 @@ mod tests {
     /// struct literal across each member variant (jscpd).
     fn member_repo(id: Uuid, is_public: bool) -> Repository {
         Repository {
+            versioning_enabled: false,
             id,
             key: format!("member-{}", id.simple()),
             name: "member".to_string(),

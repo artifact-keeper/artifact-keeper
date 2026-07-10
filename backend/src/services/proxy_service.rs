@@ -9598,6 +9598,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
 
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-accept-fwd".to_string(),
             name: "test-accept-fwd".to_string(),
@@ -9675,6 +9676,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
 
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-cached-meta-servable".to_string(),
             name: "test-cached-meta-servable".to_string(),
@@ -9758,6 +9760,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
 
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-accept-none".to_string(),
             name: "test-accept-none".to_string(),
@@ -9840,6 +9843,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
 
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "remote-container-ghcr".to_string(),
             name: "remote-container-ghcr".to_string(),
@@ -9926,6 +9930,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
 
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "remote-container-ghcr".to_string(),
             name: "remote-container-ghcr".to_string(),
@@ -10070,6 +10075,7 @@ mod tests {
     /// is required by the struct.
     fn remote_repo_for(key: &str, upstream_url: &str, storage_path: &str) -> Repository {
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),
@@ -10944,6 +10950,7 @@ mod tests {
     /// (`Ok(None)`) for an unknown id and then proceeds to the HTTP request.
     fn wiremock_remote_repo(key: &str, upstream: &str, storage_path: &str) -> Repository {
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),

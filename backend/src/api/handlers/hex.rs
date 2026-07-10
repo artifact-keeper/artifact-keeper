@@ -1026,6 +1026,7 @@ mod tests {
     fn make_member(repo_type: RepositoryType, key: &str) -> Repository {
         use crate::models::repository::{ReplicationPriority, RepositoryFormat};
         Repository {
+            versioning_enabled: false,
             id: uuid::Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),

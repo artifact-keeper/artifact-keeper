@@ -1573,6 +1573,7 @@ mod tests {
     fn test_validate_promotion_repos_staging_to_local() {
         use crate::models::repository::*;
         let source = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "staging-maven".to_string(),
             name: "Staging Maven".to_string(),
@@ -1598,6 +1599,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let target = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "release-maven".to_string(),
             name: "Release Maven".to_string(),
@@ -1633,6 +1635,7 @@ mod tests {
         // promotion.rs `test_validate_promotion_repos_source_local_is_allowed`.)
         use crate::models::repository::*;
         let source = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "remote-maven".to_string(),
             name: "Remote Maven".to_string(),
@@ -1658,6 +1661,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let target = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "release-maven".to_string(),
             name: "Release Maven".to_string(),
@@ -1692,6 +1696,7 @@ mod tests {
     fn test_validate_promotion_repos_format_mismatch() {
         use crate::models::repository::*;
         let source = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "staging-maven".to_string(),
             name: "Staging Maven".to_string(),
@@ -1717,6 +1722,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let target = Repository {
+            versioning_enabled: false,
             id: Uuid::nil(),
             key: "release-npm".to_string(),
             name: "Release NPM".to_string(),

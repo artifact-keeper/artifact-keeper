@@ -358,6 +358,8 @@ pub fn router() -> Router<SharedState> {
                 .post(upload_artifact_multipart_with_path)
                 .delete(delete_artifact),
         )
+        // Immutable revision history for versioned artifacts (#2367).
+        .route("/:key/versions/*path", get(list_artifact_versions))
         // Note: `/:key/download/*path` lives in `download_router()` so it
         // can carry a stricter per-IP presign-mint rate limit (#1053).
         // Security routes nested under repository
@@ -401,6 +403,10 @@ pub struct CreateRepositoryRequest {
     /// artifacts must arrive via the promotion path. Admin-only to set.
     /// Defaults to false (no behavior change for existing repositories).
     pub promotion_only: Option<bool>,
+    /// Opt this repository into first-class artifact versioning (#2367):
+    /// uploads to Generic/Mlmodel repos append immutable revisions instead
+    /// of overwriting. Defaults to false (current behavior preserved).
+    pub versioning_enabled: Option<bool>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -472,6 +478,9 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
     pub promotion_only: Option<bool>,
+    /// When provided, enables/disables first-class artifact versioning for
+    /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
+    pub versioning_enabled: Option<bool>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -518,6 +527,9 @@ pub struct RepositoryResponse {
     pub allow_anonymous_access: bool,
     /// When true, direct user uploads are rejected; artifacts must be promoted.
     pub promotion_only: bool,
+    /// When true, uploads to this Generic/Mlmodel repository append immutable
+    /// revisions instead of overwriting the prior content (#2367).
+    pub versioning_enabled: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     pub upstream_url: Option<String>,
@@ -557,6 +569,7 @@ fn repo_to_response(
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
+        versioning_enabled: repo.versioning_enabled,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         upstream_url: repo.upstream_url,
@@ -1415,6 +1428,7 @@ pub async fn create_repository(
             is_public,
             quota_bytes: payload.quota_bytes,
             promotion_only: payload.promotion_only.unwrap_or(false),
+            versioning_enabled: payload.versioning_enabled.unwrap_or(false),
             // Plugin format key takes precedence over any explicit format_key
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
@@ -1630,6 +1644,7 @@ pub async fn update_repository(
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
                 promotion_only: payload.promotion_only,
+                versioning_enabled: payload.versioning_enabled,
             },
         )
         .await?;
@@ -2092,6 +2107,38 @@ pub struct ListArtifactsQuery {
     pub group_by: Option<String>,
 }
 
+/// `?version=` selector accepted by the artifact metadata/download routes on
+/// versioning-enabled repositories (#2367). A numeric value selects by
+/// server-assigned revision, `latest` (or omitting the parameter) selects the
+/// HEAD, and any other string selects by human `version_label`. Ignored on
+/// repositories without versioning enabled.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct ArtifactVersionQuery {
+    pub version: Option<String>,
+}
+
+/// One immutable stored revision of a versioned artifact (#2367).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArtifactVersionResponse {
+    /// Server-assigned auto-increment revision (1-based).
+    pub revision: i32,
+    /// Optional human tag supplied via `X-Artifact-Version` at upload time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_label: Option<String>,
+    pub size_bytes: i64,
+    pub checksum_sha256: String,
+    pub content_type: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Version history for one artifact coordinate, newest first (#2367).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArtifactVersionListResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub items: Vec<ArtifactVersionResponse>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactResponse {
     pub id: Uuid,
@@ -2130,6 +2177,16 @@ pub struct ArtifactResponse {
     /// re-validated against upstream. Same gating as `cache_cached_at`. (#1541)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Server-assigned revision number for repositories with first-class
+    /// versioning enabled (#2367). `None` for non-versioned repositories and
+    /// for coordinates with no recorded history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i32>,
+    /// Optional human tag recorded for this revision (from the
+    /// `X-Artifact-Version` upload header). Only populated alongside
+    /// `revision`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_label: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2597,6 +2654,9 @@ fn build_cached_artifact_response(
         // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
         cache_cached_at: Some(entry.cached_at),
         cache_expires_at: None,
+        // Proxy-cache entries carry no versioned history (#2367).
+        revision: None,
+        version_label: None,
     }
 }
 
@@ -2777,6 +2837,10 @@ fn build_artifact_response(
         // get_artifact_metadata populates them after the fact.
         cache_cached_at: None,
         cache_expires_at: None,
+        // Like cache metadata, revision history is populated only by the
+        // per-artifact metadata endpoint, not fanned out in listings (#2367).
+        revision: None,
+        version_label: None,
     }
 }
 
@@ -2827,6 +2891,8 @@ fn expand_maven_secondary_files(
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            revision: None,
+            version_label: None,
         });
     }
     out
@@ -3581,6 +3647,7 @@ fn is_docker_index_content_type(content_type: &str) -> bool {
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ArtifactVersionQuery,
     ),
     responses(
         (status = 200, description = "Artifact metadata", body = ArtifactResponse),
@@ -3591,6 +3658,7 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    Query(version_query): Query<ArtifactVersionQuery>,
 ) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
@@ -3598,6 +3666,33 @@ pub async fn get_artifact_metadata(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
+
+    // #2367: on versioning-enabled Generic/Mlmodel repos, an explicit
+    // `?version=` selector (revision number or human label) resolves against
+    // the immutable revision history instead of the HEAD row. `latest` (or
+    // omitting the parameter) keeps the HEAD path below. The parameter is
+    // ignored on non-versioned repositories so existing clients are
+    // unaffected.
+    let versioning_active = crate::services::artifact_service::versioning_applies(
+        &repo.format,
+        repo.versioning_enabled,
+    );
+    let version_selector = version_query
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "latest");
+    if versioning_active {
+        if let Some(selector) = version_selector {
+            let stored = artifact_service
+                .get_version(repo.id, &path, Some(selector))
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("Artifact version '{selector}' not found"))
+                })?;
+            return Ok(Json(artifact_version_to_response(&key, stored)).into_response());
+        }
+    }
 
     // #1443: npm publish stores tarballs under
     // `<name>/<version>/<name>-<version>.tgz` (see
@@ -3616,6 +3711,17 @@ pub async fn get_artifact_metadata(
     if let Some(artifact) = direct {
         let downloads = artifact_service.get_download_stats(artifact.id).await?;
         let metadata = artifact_service.get_metadata(artifact.id).await?;
+
+        // #2367: surface the HEAD's revision number for versioned repos.
+        let (revision, version_label) = if versioning_active {
+            artifact_service
+                .latest_version_info(repo.id, &artifact.path)
+                .await?
+                .map(|(rev, label)| (Some(rev), label))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
         // #1541: surface proxy cache freshness on Remote repos so the UI
         // can render "expires in 4 hours" / "expired" without a separate
@@ -3669,6 +3775,8 @@ pub async fn get_artifact_metadata(
             analyzable: true,
             cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
+            revision,
+            version_label,
         })
         .into_response());
     }
@@ -3742,6 +3850,86 @@ pub async fn get_artifact_metadata(
     }
 
     Err(AppError::NotFound("Artifact not found".to_string()))
+}
+
+/// Build the `ArtifactResponse` describing one stored revision (#2367).
+///
+/// The `id` is the `artifact_versions` row id (not an `artifacts` id), so the
+/// response is marked `analyzable: false` — SBOM/scan lookups key on
+/// `artifacts.id` and cannot resolve a historical revision.
+fn artifact_version_to_response(
+    key: &str,
+    stored: crate::models::artifact::ArtifactVersion,
+) -> ArtifactResponse {
+    ArtifactResponse {
+        id: stored.id,
+        repository_key: key.to_string(),
+        path: stored.path,
+        name: stored.name,
+        version: stored.version_label.clone(),
+        size_bytes: stored.size_bytes,
+        checksum_sha256: stored.checksum_sha256.trim().to_string(),
+        content_type: stored.content_type,
+        download_count: 0,
+        created_at: stored.created_at,
+        metadata: None,
+        analyzable: false,
+        cache_cached_at: None,
+        cache_expires_at: None,
+        revision: Some(stored.revision),
+        version_label: stored.version_label,
+    }
+}
+
+/// List the immutable revision history for a versioned artifact (#2367).
+#[utoipa::path(
+    get,
+    path = "/{key}/versions/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Version history, newest first", body = ArtifactVersionListResponse),
+        (status = 404, description = "Repository or artifact not found"),
+    )
+)]
+pub async fn list_artifact_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, path)): Path<(String, String)>,
+) -> Result<Json<ArtifactVersionListResponse>> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &repo_service).await?;
+
+    let storage = state.storage_for_repo(&repo.storage_location())?;
+    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let versions = artifact_service.list_versions(repo.id, &path).await?;
+    if versions.is_empty() {
+        return Err(AppError::NotFound(
+            "No version history for this artifact".to_string(),
+        ));
+    }
+
+    Ok(Json(ArtifactVersionListResponse {
+        repository_key: key,
+        path,
+        items: versions
+            .into_iter()
+            .map(|v| ArtifactVersionResponse {
+                revision: v.revision,
+                version_label: v.version_label,
+                size_bytes: v.size_bytes,
+                checksum_sha256: v.checksum_sha256.trim().to_string(),
+                content_type: v.content_type,
+                created_at: v.created_at,
+            })
+            .collect(),
+    }))
 }
 
 /// Upload artifact
@@ -3863,6 +4051,25 @@ pub async fn upload_artifact(
         }
     };
 
+    // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
+    // `X-Artifact-Version` header supplies the human version label for the
+    // appended revision, taking precedence over the path-derived guess.
+    // Gated on the opt-in so non-versioned repos keep their exact semantics.
+    let versioning_active = crate::services::artifact_service::versioning_applies(
+        &repo.format,
+        repo.versioning_enabled,
+    );
+    let version = if versioning_active {
+        headers
+            .get("x-artifact-version")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or(version)
+    } else {
+        version
+    };
+
     // Content-Type resolution priority:
     //   1. WASM plugin metadata (format-aware)
     //   2. the request's declared Content-Type header (honour the client)
@@ -3902,6 +4109,17 @@ pub async fn upload_artifact(
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
+    // #2367: echo the revision this upload landed at for versioned repos.
+    let (revision, version_label) = if versioning_active {
+        artifact_service
+            .latest_version_info(repo.id, &artifact.path)
+            .await?
+            .map(|(rev, label)| (Some(rev), label))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(ArtifactResponse {
@@ -3922,6 +4140,8 @@ pub async fn upload_artifact(
             // cache is populated lazily on the first proxy fetch.
             cache_cached_at: None,
             cache_expires_at: None,
+            revision,
+            version_label,
         }),
     ))
 }
@@ -4346,6 +4566,63 @@ pub(crate) fn ranged_stream_response(
     Ok(response)
 }
 
+/// Serve one immutable stored revision of a versioned artifact (#2367).
+///
+/// Streams the revision's bytes from content-addressed storage. No download
+/// statistics are recorded (stats key on `artifacts.id`, which a historical
+/// revision does not have). Range requests are honored like the HEAD path.
+async fn download_artifact_version(
+    artifact_service: &ArtifactService,
+    repo_id: Uuid,
+    path: &str,
+    selector: &str,
+    range_header: Option<&str>,
+    is_head: bool,
+) -> Result<Response> {
+    let stored = artifact_service
+        .get_version(repo_id, path, Some(selector))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Artifact version '{selector}' not found")))?;
+
+    let total = stored.size_bytes.max(0) as u64;
+    let checksum = stored.checksum_sha256.trim().to_string();
+    let base_headers = vec![
+        (header::CONTENT_TYPE, stored.content_type.clone()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", download_filename(path)),
+        ),
+        (
+            header::HeaderName::from_static("x-checksum-sha256"),
+            checksum,
+        ),
+        (
+            header::HeaderName::from_static("x-artifact-revision"),
+            stored.revision.to_string(),
+        ),
+        (
+            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+            "proxy".to_string(),
+        ),
+    ];
+
+    if is_head {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::ACCEPT_RANGES, "bytes");
+        for (name, value) in base_headers {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(Body::empty())
+            .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")));
+    }
+
+    let body = artifact_service.download_version_stream(&stored).await?;
+    ranged_stream_response(range_header, total, body, base_headers)
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -4355,6 +4632,7 @@ pub(crate) fn ranged_stream_response(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ArtifactVersionQuery,
     ),
     responses(
         (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
@@ -4366,6 +4644,7 @@ pub async fn download_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    Query(version_query): Query<ArtifactVersionQuery>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse> {
     // A HEAD request must return identical headers to GET but no body, and it
@@ -4412,6 +4691,41 @@ pub async fn download_artifact(
                 qrow.quarantine_until,
                 chrono::Utc::now(),
             )?;
+        }
+    }
+
+    // #2367: an explicit `?version=` selector on a versioning-enabled
+    // Generic/Mlmodel repo serves the requested immutable revision straight
+    // from content-addressed storage (old revisions stay addressable even
+    // after the HEAD was overwritten or deleted). `latest` / absent falls
+    // through to the normal HEAD path; the parameter is ignored on
+    // non-versioned repositories so existing clients are unaffected. The
+    // quarantine check above still ran against the coordinate's HEAD row, so
+    // a quarantine hold cannot be bypassed via a historical revision.
+    if crate::services::artifact_service::versioning_applies(&repo.format, repo.versioning_enabled)
+    {
+        let selector = version_query
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "latest");
+        if let Some(selector) = selector {
+            let storage = state.storage_for_repo(&repo.storage_location())?;
+            let artifact_service = ArtifactService::new(state.db.clone(), storage);
+            let range_header = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            return download_artifact_version(
+                &artifact_service,
+                repo.id,
+                &path,
+                selector,
+                range_header.as_deref(),
+                is_head,
+            )
+            .await;
         }
     }
 
@@ -5591,6 +5905,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         upload_artifact,
         download_artifact,
         delete_artifact,
+        list_artifact_versions,
         list_virtual_members,
         add_virtual_member,
         remove_virtual_member,
@@ -5617,6 +5932,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
+        ArtifactVersionQuery,
+        ArtifactVersionResponse,
+        ArtifactVersionListResponse,
         MavenComponentResponse,
         DockerTagResponse,
         AddVirtualMemberRequest,
@@ -7015,6 +7333,7 @@ mod tests {
     #[test]
     fn test_repository_response_serialization() {
         let resp = RepositoryResponse {
+            versioning_enabled: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
             name: "My Repo".to_string(),
@@ -7632,6 +7951,8 @@ mod tests {
     #[test]
     fn test_artifact_response_serialization() {
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "my-repo".to_string(),
             path: "org/example/1.0/example-1.0.jar".to_string(),
@@ -7675,6 +7996,8 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "pypi-remote".to_string(),
             path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
@@ -8247,6 +8570,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "maven-central".to_string(),
             name: "Maven Central".to_string(),
@@ -8296,6 +8620,7 @@ mod tests {
         // #1770 B: when the handler populates the quarantine settings from
         // `repository_config`, they appear in the serialized detail response.
         let resp = RepositoryResponse {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
             name: "npm-age".to_string(),
@@ -8326,6 +8651,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "npm-hosted".to_string(),
             name: "NPM Local".to_string(),
@@ -8370,6 +8696,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "docker-all".to_string(),
             name: "Docker Virtual".to_string(),
@@ -8407,6 +8734,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
             name: "Cargo Staging".to_string(),
@@ -8522,6 +8850,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, Repository};
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id,
             key: key.to_string(),
             name: key.to_string(),
@@ -9429,6 +9758,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),
@@ -13534,6 +13864,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
             get_request(),
         )
         .await;
@@ -13550,6 +13881,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), unscoped_stored.clone())),
+            Query(ArtifactVersionQuery { version: None }),
             get_request(),
         )
         .await;
@@ -13567,6 +13899,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
             get_request(),
         )
         .await;
@@ -13659,6 +13992,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(ArtifactVersionQuery { version: None }),
             get_request(),
         )
         .await;
@@ -13673,6 +14007,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "tools/does-not-exist.bin".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
             get_request(),
         )
         .await;

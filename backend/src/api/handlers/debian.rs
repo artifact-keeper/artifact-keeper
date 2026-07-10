@@ -2060,6 +2060,7 @@ mod tests {
     ) -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
+            versioning_enabled: false,
             id: uuid::Uuid::new_v4(),
             key: "m".to_string(),
             name: "m".to_string(),

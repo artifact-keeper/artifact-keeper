@@ -31,6 +31,9 @@ pub struct CreateRepositoryRequest {
     /// When true, direct user uploads are rejected (artifacts must arrive via
     /// the promotion path). Defaults to false.
     pub promotion_only: bool,
+    /// When true, uploads to Generic/Mlmodel repos append immutable revisions
+    /// to `artifact_versions` instead of overwriting (#2367). Defaults to false.
+    pub versioning_enabled: bool,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
     /// User who is creating this repository. When set, the repository records
@@ -51,6 +54,9 @@ pub struct UpdateRepositoryRequest {
     pub upstream_url: Option<String>,
     /// When `Some`, sets the `promotion_only` flag; `None` leaves it unchanged.
     pub promotion_only: Option<bool>,
+    /// When `Some`, sets the `versioning_enabled` flag (#2367); `None` leaves
+    /// it unchanged.
+    pub versioning_enabled: Option<bool>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -612,9 +618,9 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, promotion_only
+                is_public, quota_bytes, promotion_only, versioning_enabled
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
@@ -624,7 +630,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             "#,
             req.key,
@@ -638,6 +644,7 @@ impl RepositoryService {
             req.is_public,
             req.quota_bytes,
             req.promotion_only,
+            req.versioning_enabled,
         )
         .fetch_one(&mut *tx)
         .await;
@@ -769,7 +776,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE id = $1
@@ -798,7 +805,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE key = $1
@@ -850,7 +857,7 @@ impl RepositoryService {
                 replication_priority,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
@@ -930,6 +937,7 @@ impl RepositoryService {
                 quota_bytes = COALESCE($6, quota_bytes),
                 upstream_url = COALESCE($7, upstream_url),
                 promotion_only = COALESCE($8, promotion_only),
+                versioning_enabled = COALESCE($9, versioning_enabled),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -941,7 +949,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             "#,
             id,
@@ -952,6 +960,7 @@ impl RepositoryService {
             req.quota_bytes.flatten(),
             req.upstream_url,
             req.promotion_only,
+            req.versioning_enabled,
         )
         .fetch_optional(&self.db)
         .await
@@ -1304,7 +1313,7 @@ impl RepositoryService {
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-                r.age_gate_enabled, r.age_gate_min_age_days,
+                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
                 r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -1450,6 +1459,7 @@ mod tests {
     fn make_test_repo(format: RepositoryFormat, repo_type: RepositoryType) -> Repository {
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repository".to_string(),
@@ -1519,6 +1529,7 @@ mod tests {
     fn test_repo_to_search_doc_no_description() {
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "no-desc".to_string(),
             name: "No Description".to_string(),
@@ -1587,6 +1598,7 @@ mod tests {
     #[test]
     fn test_create_repository_request_construction() {
         let req = CreateRepositoryRequest {
+            versioning_enabled: false,
             key: "my-repo".to_string(),
             name: "My Repository".to_string(),
             description: Some("Test repo".to_string()),
@@ -1611,6 +1623,7 @@ mod tests {
     #[test]
     fn test_create_repository_request_remote_with_upstream() {
         let req = CreateRepositoryRequest {
+            versioning_enabled: false,
             key: "npm-remote".to_string(),
             name: "NPM Remote".to_string(),
             description: None,
@@ -1639,6 +1652,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_all_none() {
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: None,
             description: None,
@@ -1658,6 +1672,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_partial() {
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
             description: Some("Updated Description".to_string()),
@@ -1675,6 +1690,7 @@ mod tests {
     fn test_update_repository_request_clear_quota() {
         // quota_bytes: Some(None) should clear the quota
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: None,
             description: None,
@@ -2751,6 +2767,7 @@ mod tests {
 
         fn make_create_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
             CreateRepositoryRequest {
+                versioning_enabled: false,
                 key: format!("acs-repo-{suffix}"),
                 name: format!("acs repo {suffix}"),
                 description: None,

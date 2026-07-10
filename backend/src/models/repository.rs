@@ -173,6 +173,11 @@ pub struct Repository {
     pub age_gate_enabled: bool,
     /// Age gate: minimum package age in days before automatic pass-through
     pub age_gate_min_age_days: i32,
+    /// When true, uploads to Generic/Mlmodel repositories append an immutable
+    /// revision to `artifact_versions` instead of overwriting (or rejecting)
+    /// the prior content at the same path (#2367). Defaults to false: no
+    /// behavior change for existing repositories.
+    pub versioning_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

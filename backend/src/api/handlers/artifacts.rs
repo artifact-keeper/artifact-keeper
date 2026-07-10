@@ -187,6 +187,10 @@ pub async fn get_artifact(
         // by-id surface does not resolve through the proxy cache.
         cache_cached_at: None,
         cache_expires_at: None,
+        // Revision history is a by-path, versioned-repo concern (#2367);
+        // the by-id surface leaves it unset.
+        revision: None,
+        version_label: None,
     }))
 }
 
@@ -330,6 +334,8 @@ mod tests {
         let now = Utc::now();
         let id = Uuid::new_v4();
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id,
             repository_key: "maven-releases".to_string(),
             path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
@@ -365,6 +371,8 @@ mod tests {
         // The previous local ArtifactResponse leaked DB columns the spec
         // never declared. Pin their absence on the serialized output.
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "generic-local".to_string(),
             path: "file.tar.gz".to_string(),
@@ -403,6 +411,8 @@ mod tests {
     #[test]
     fn test_artifact_response_zero_size() {
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "generic-local".to_string(),
             path: "empty".to_string(),
@@ -519,6 +529,8 @@ mod tests {
     #[test]
     fn test_artifact_response_debug_impl() {
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::nil(),
             repository_key: "k".to_string(),
             path: "p".to_string(),

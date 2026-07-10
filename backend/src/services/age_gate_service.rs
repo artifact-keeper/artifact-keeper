@@ -1294,6 +1294,7 @@ mod tests {
     ) -> crate::models::repository::Repository {
         let now = Utc::now();
         crate::models::repository::Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "age-gate-test".to_string(),
             name: "Age Gate Test".to_string(),

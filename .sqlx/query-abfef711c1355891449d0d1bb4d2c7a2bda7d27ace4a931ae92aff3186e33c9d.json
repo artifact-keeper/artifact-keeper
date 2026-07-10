@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes, r.promotion_only,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.age_gate_enabled, r.age_gate_min_age_days,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes, r.promotion_only,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
   "describe": {
     "columns": [
       {
@@ -194,11 +194,16 @@
       },
       {
         "ordinal": 21,
+        "name": "versioning_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -231,8 +236,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "09050053ec7723ff930509cb7ed4f940571d193c74611f3ff59303f2bc9ba8ea"
+  "hash": "abfef711c1355891449d0d1bb4d2c7a2bda7d27ace4a931ae92aff3186e33c9d"
 }
