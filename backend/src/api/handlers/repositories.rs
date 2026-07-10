@@ -125,6 +125,80 @@ pub(crate) async fn require_repo_write_access(
     }
 }
 
+/// Pure fine-grained per-action decision, mirroring `upload_write_decision`
+/// (#817) in the chunked-upload path. Admins always pass; a repository with no
+/// permission rules falls through to the default access model; otherwise the
+/// caller must hold the requested action or `admin` (which implies all actions).
+///
+/// Factored out so both branches are unit-testable without a database.
+fn repo_fine_grained_action_allowed(
+    is_admin: bool,
+    has_rules: bool,
+    has_action: bool,
+    has_admin: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if !has_rules {
+        return true;
+    }
+    has_action || has_admin
+}
+
+/// Fine-grained per-action authorization, applied AFTER `require_repo_write_access`
+/// (the outer tenant gate) on the generic REST artifact write/delete handlers.
+///
+/// `require_repo_write_access` is only a tenant-membership gate: it treats a
+/// public repository or ANY role-assignment grantee (including a read-only one)
+/// as authorized, collapsing read/write/delete into a single "has access"
+/// predicate. That is the gap #2321 (G2) reports: on a rules-bearing repo a
+/// read-only grantee could still PUT/DELETE, and on a public repo any authed
+/// caller could write. This adds the SAME `has_rules -> check_permission(action)`
+/// block the chunked upload-session path (`upload.rs::create_session`, #817)
+/// already enforces, so the action actually maps to the granted permission.
+///
+/// `action` is `"write"` for uploads and `"delete"` for deletes. Admins bypass;
+/// a repository with no permission rules falls through unchanged (the rules-less
+/// public-repo case is a separate global default-access decision, out of scope
+/// here). A permission-rule lookup error fails closed (503), mirroring
+/// `repo_visibility_middleware` and `create_session`.
+async fn require_repo_fine_grained_action(
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    action: &str,
+    permission_service: &crate::services::permission_service::PermissionService,
+) -> Result<()> {
+    if auth.is_admin {
+        return Ok(());
+    }
+    let has_rules = permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+        .map_err(|_| {
+            tracing::error!("permission check failed: database unreachable");
+            AppError::ServiceUnavailable("permission service temporarily unavailable".to_string())
+        })?;
+    if !has_rules {
+        return Ok(());
+    }
+    let has_action = permission_service
+        .check_permission(auth.user_id, "repository", repo_id, action, false)
+        .await
+        .unwrap_or(false);
+    let has_admin = permission_service
+        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
+        .await
+        .unwrap_or(false);
+    if repo_fine_grained_action_allowed(auth.is_admin, has_rules, has_action, has_admin) {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "You do not have permission to perform this action on this repository".to_string(),
+        ))
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -4009,6 +4083,11 @@ pub async fn upload_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Fine-grained write gate (#2321 G2): the tenant gate above admits any
+    // grantee (incl. a read-only one) and any authed caller on a public repo,
+    // collapsing read/write. Require the `write` action when rules exist, the
+    // same block `upload.rs::create_session` applies to the chunked path.
+    require_repo_fine_grained_action(&auth, repo.id, "write", &state.permission_service).await?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
@@ -5059,6 +5138,11 @@ pub async fn delete_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
+    // grantee (incl. a write-only or read-only one), collapsing write/delete.
+    // Require the `delete` action when rules exist so a write-scoped grantee
+    // cannot destroy artifacts. Mirrors the upload path's `write` gate.
+    require_repo_fine_grained_action(&auth, repo.id, "delete", &state.permission_service).await?;
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
@@ -9017,6 +9101,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #2321 G2: pure fine-grained per-action decision (write/delete) applied
+    // after the tenant gate on the generic REST + OCI artifact paths. Mirrors
+    // `upload.rs::upload_write_decision`.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_repo_fine_grained_action_admin_always_allowed() {
+        // Admins bypass regardless of rules/actions state.
+        assert!(repo_fine_grained_action_allowed(true, false, false, false));
+        assert!(repo_fine_grained_action_allowed(true, true, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_no_rules_falls_through() {
+        // A repo with no permission rules keeps the default access model.
+        assert!(repo_fine_grained_action_allowed(false, false, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_require_matching_action() {
+        // Rules exist but the caller holds neither the action nor admin -> deny.
+        // This is the read-only-grantee-cannot-write / write-only-cannot-delete
+        // collapse that #2321 G2 closes.
+        assert!(!repo_fine_grained_action_allowed(false, true, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_with_action_allowed() {
+        // Holding the requested action (write or delete) passes.
+        assert!(repo_fine_grained_action_allowed(false, true, true, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_with_admin_action_allowed() {
+        // `admin` implies all actions, so it passes any per-action gate.
+        assert!(repo_fine_grained_action_allowed(false, true, false, true));
+    }
+
+    // -----------------------------------------------------------------------
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
@@ -9616,6 +9738,215 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
+    /// fine-grained `write` action AFTER the tenant gate. A read-only grantee on
+    /// a rules-bearing private repo is DENIED; adding `write` lets them through;
+    /// an admin bypasses; and a non-member is denied on a PUBLIC repo that
+    /// carries a write rule for someone else (public visibility is read-only).
+    #[tokio::test]
+    async fn upload_artifact_fine_grained_write_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await; // tenant membership
+        let auth = tdh::make_auth(user_id, &username);
+        let dirs = dir.to_string_lossy().to_string();
+        // Replace the repo's fine-grained rule set with exactly `actions`, then
+        // return a fresh state so the per-process rules cache never masks the
+        // change (mirrors `set_cache_ttl_requires_repo_admin_grant_db`).
+        let reset_rule = |actions: &'static [&'static str]| {
+            let pool = pool.clone();
+            let dirs = dirs.clone();
+            async move {
+                let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await;
+                tdh::grant_repo_actions(&pool, repo_id, user_id, actions).await;
+                tdh::build_state(pool.clone(), &dirs)
+            }
+        };
+
+        // (a) read-only grant on a rules-bearing repo -> write DENIED.
+        let denied = upload_artifact(
+            State(reset_rule(&["read"]).await),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "read-only grantee must be denied write, got: {denied:?}"
+        );
+
+        // (d) add the write action -> write ALLOWED.
+        let allowed = upload_artifact(
+            State(reset_rule(&["read", "write"]).await),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(allowed.is_ok(), "write grant must upload, got: {allowed:?}");
+
+        // (f) admin bypasses the fine-grained gate even under a restrictive rule.
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let admin_ok = upload_artifact(
+            State(reset_rule(&["read"]).await),
+            Extension(Some(admin)),
+            Path((key.clone(), "pkg/2.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(admin_ok.is_ok(), "admin must bypass, got: {admin_ok:?}");
+
+        // (c) PUBLIC repo carrying a write rule for ANOTHER user: a non-member
+        // (no grant of their own) passes the tenant gate on visibility but is
+        // still denied write, because public = read-only visibility, not write.
+        let (pub_repo_id, pub_key, pub_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(pub_repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        let (other_id, _other_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, pub_repo_id, other_id, &["read", "write"]).await;
+        let nonmember_pub = upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                pub_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path((pub_key.clone(), "pub/1.0.0/pub.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(nonmember_pub, Err(AppError::Authorization(_))),
+            "non-member must be denied write on a public repo with a write rule, got: {nonmember_pub:?}"
+        );
+
+        tdh::cleanup(&pool, pub_repo_id, other_id).await;
+        let _ = std::fs::remove_dir_all(&pub_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2321 G2 (delete): the generic REST `delete_artifact` handler enforces the
+    /// fine-grained `delete` action AFTER the tenant gate, so a WRITE-only
+    /// grantee cannot destroy artifacts. Granting `delete` lets them through.
+    #[tokio::test]
+    async fn delete_artifact_fine_grained_delete_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let path = "pkg/1.0.0/pkg-1.0.0.bin".to_string();
+
+        // Publish an artifact as a write+delete grantee so the row exists.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await
+        .expect("publish must succeed with write+delete grant");
+
+        // (b) downgrade to write-only (no delete) -> DELETE DENIED.
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write"]).await;
+        let denied = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only grantee must be denied delete, got: {denied:?}"
+        );
+
+        // (e) restore the delete action -> DELETE ALLOWED.
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let allowed = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "delete grant must delete, got: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2321 G2 binding test: the generic artifact write/delete handlers must
+    /// keep routing through `require_repo_fine_grained_action` after the tenant
+    /// gate. A handler that dropped the call would silently re-collapse
+    /// read/write/delete, so pin it structurally (the DB tests above cannot run
+    /// without a Postgres).
+    #[test]
+    fn test_generic_artifact_handlers_call_fine_grained_gate() {
+        let source = include_str!("repositories.rs");
+        for (handler, action) in [
+            ("upload_artifact", "\"write\""),
+            ("delete_artifact", "\"delete\""),
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("require_repo_fine_grained_action(") && body.contains(action),
+                "handler `{}` must call require_repo_fine_grained_action with {} (#2321 G2)",
+                handler,
+                action
+            );
+        }
     }
 
     /// Issue #913 binding test:
