@@ -92,20 +92,36 @@ pub(crate) enum VisibilityBind {
 pub(crate) fn validate_remote_upstream(
     repo_type: &RepositoryType,
     upstream_url: &Option<String>,
+    format: &RepositoryFormat,
 ) -> Result<()> {
     if *repo_type == RepositoryType::Remote {
         match upstream_url {
             None => {
                 return Err(AppError::Validation(
                     "Remote repository must have an upstream URL".to_string(),
-                ))
+                ));
             }
-            Some(url) => validate_outbound_url(url, "Upstream URL")?,
+            Some(url) => {
+                validate_outbound_url(url, "Upstream URL")?;
+                if *format == RepositoryFormat::Rpm && is_mirrorlist_or_metalink(url) {
+                    return Err(AppError::Validation(
+                        "RPM remote upstream must be a concrete baseurl, not a mirrorlist/metalink \
+                         URL. Point it at a resolved repo root (e.g. .../BaseOS/x86_64/os/)."
+                            .to_string(),
+                    ));
+                }
+            }
         }
     } else if let Some(url) = upstream_url {
         validate_outbound_url(url, "Upstream URL")?;
     }
     Ok(())
+}
+
+/// Heuristic: a URL whose path or query names a mirrorlist/metalink endpoint.
+fn is_mirrorlist_or_metalink(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("mirrorlist") || lower.contains("metalink")
 }
 
 /// Derive a format key string from a RepositoryFormat enum.
@@ -539,7 +555,7 @@ impl RepositoryService {
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
         // Validate remote repository has upstream URL and it is safe to contact
-        validate_remote_upstream(&req.repo_type, &req.upstream_url)?;
+        validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
         // Check if format handler is enabled (T044).
         //
@@ -893,9 +909,13 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
-        // Validate upstream_url is safe to contact if it is being updated
-        if let Some(ref url) = req.upstream_url {
-            validate_outbound_url(url, "Upstream URL")?;
+        // Validate upstream_url is safe to contact if it is being updated.
+        // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
+        // (both are immutable after creation), so load the existing row to
+        // source them for the mirrorlist/metalink check on RPM remotes.
+        if req.upstream_url.is_some() {
+            let existing = self.get_by_id(id).await?;
+            validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
         }
 
         let repo = sqlx::query_as!(
@@ -1672,7 +1692,8 @@ mod tests {
 
     #[test]
     fn test_validate_remote_upstream_remote_without_url_fails() {
-        let result = validate_remote_upstream(&RepositoryType::Remote, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Remote, &None, &RepositoryFormat::Generic);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("upstream URL"));
     }
@@ -1682,25 +1703,29 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("https://upstream.example.com".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_local_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Local, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Local, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_virtual_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Virtual, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Virtual, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_staging_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Staging, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Staging, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
@@ -1709,6 +1734,7 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("http://127.0.0.1:8080/".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
     }
@@ -1718,6 +1744,7 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("http://169.254.169.254/latest/meta-data/".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
     }
@@ -1728,8 +1755,26 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Local,
             &Some("http://10.0.0.1/internal".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rpm_remote_rejects_mirrorlist_and_metalink() {
+        let ml = Some("https://mirrors.example.org/mirrorlist?repo=epel-9&arch=x86_64".to_string());
+        let mt = Some("https://mirrors.example.org/metalink?repo=epel-9".to_string());
+        let base = Some("https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/".to_string());
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &ml, &RepositoryFormat::Rpm).is_err()
+        );
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &mt, &RepositoryFormat::Rpm).is_err()
+        );
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &base, &RepositoryFormat::Rpm)
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
