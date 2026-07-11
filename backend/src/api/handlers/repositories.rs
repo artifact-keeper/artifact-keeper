@@ -2219,6 +2219,10 @@ pub struct ArtifactVersionResponse {
     pub size_bytes: i64,
     pub checksum_sha256: String,
     pub content_type: String,
+    /// Id of the user that uploaded this revision (#2397). Always serialized
+    /// (`null` when unknown, e.g. anonymous uploads) so the versions UI can
+    /// rely on the key being present.
+    pub uploaded_by: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -4034,6 +4038,7 @@ pub async fn list_artifact_versions(
                 size_bytes: v.size_bytes,
                 checksum_sha256: v.checksum_sha256.trim().to_string(),
                 content_type: v.content_type,
+                uploaded_by: v.uploaded_by,
                 created_at: v.created_at,
             })
             .collect(),
@@ -8097,6 +8102,44 @@ mod tests {
         // metadata (#1541).
         assert!(!json.contains("cache_cached_at"));
         assert!(!json.contains("cache_expires_at"));
+    }
+
+    #[test]
+    fn test_artifact_version_response_serializes_uploaded_by() {
+        // (#2397) The versions API must expose who uploaded each revision so
+        // the version-history UI can show the uploader column.
+        let uploader = Uuid::new_v4();
+        let resp = ArtifactVersionResponse {
+            revision: 2,
+            version_label: Some("v1.0.1".to_string()),
+            size_bytes: 2048,
+            checksum_sha256: "abc123".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            uploaded_by: Some(uploader),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(&format!("\"uploaded_by\":\"{uploader}\"")));
+        assert!(json.contains("\"version_label\":\"v1.0.1\""));
+        assert!(json.contains("\"revision\":2"));
+    }
+
+    #[test]
+    fn test_artifact_version_response_uploaded_by_null_when_unknown() {
+        // (#2397) Unlike `version_label`, `uploaded_by` is always serialized
+        // -- as `null` when unknown -- so clients can rely on the key.
+        let resp = ArtifactVersionResponse {
+            revision: 1,
+            version_label: None,
+            size_bytes: 1024,
+            checksum_sha256: "def456".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"uploaded_by\":null"));
+        assert!(!json.contains("version_label"));
     }
 
     #[test]
