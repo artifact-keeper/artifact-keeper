@@ -965,9 +965,21 @@ pub async fn list_downloads(
     path = "/downloads/by-ip/{ip}",
     context_path = "/api/v1/admin",
     tag = "admin",
+    // NOTE: enumerate the query filters instead of `params(ListDownloadsQuery)`
+    // so the `ip` filter is not emitted a second time alongside the `{ip}` path
+    // parameter. A duplicate parameter name (path + query) is valid OpenAPI but
+    // makes the openapi-generator Rust client generate the path parameter as
+    // `Option<&str>`, which fails to compile. The path IP overrides the filter
+    // anyway (see handler body), so dropping the redundant `ip` query is a no-op
+    // for callers.
     params(
         ("ip" = String, Path, description = "Client IP address"),
-        ListDownloadsQuery
+        ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("user_id" = Option<Uuid>, Query, description = "Filter to downloads by one user"),
+        ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
     ),
     responses(
         (status = 200, description = "Downloads from the IP", body = DownloadListResponse),
@@ -997,9 +1009,18 @@ pub async fn list_downloads_by_ip(
     path = "/downloads/by-user/{user_id}",
     context_path = "/api/v1/admin",
     tag = "admin",
+    // See list_downloads_by_ip: enumerate the query filters so the `user_id`
+    // filter is not emitted alongside the `{user_id}` path parameter (a
+    // duplicate name breaks the openapi-generator Rust client). The path
+    // user_id overrides the filter anyway.
     params(
         ("user_id" = Uuid, Path, description = "User id"),
-        ListDownloadsQuery
+        ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("ip" = Option<String>, Query, description = "Filter to downloads from one client IP (exact match)"),
+        ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
     ),
     responses(
         (status = 200, description = "Downloads by the user", body = DownloadListResponse),
