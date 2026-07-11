@@ -1588,11 +1588,17 @@ mod tests {
         let served: serde_json::Value =
             serde_json::from_slice(&body).expect("served metadata must be JSON");
         let entry = &served["packages"]["monolog/monolog"][0];
-        let expected_url = format!(
+        // #2370: the rewritten dist.url is now ABSOLUTE (RequestBaseUrl-prefixed;
+        // the test request carries no Host header, so the base falls back to
+        // http://localhost) so Composer clients that resolve a repo via a
+        // remote/proxied `metadata-url` template still get a fetchable dist.
+        let dist_url = entry["dist"]["url"].as_str().unwrap_or_default();
+        let expected_suffix = format!(
             "/composer/{key}/dist/monolog/monolog/2.0.0/abc123.zip",
             key = fx.repo_key
         );
-        let ok = entry["dist"]["url"] == serde_json::json!(expected_url)
+        let ok = dist_url.starts_with("http://localhost/")
+            && dist_url.ends_with(&expected_suffix)
             && entry["dist"]["reference"] == serde_json::json!("abc123")
             && entry["dist"]["shasum"] == serde_json::json!("deadbeef")
             && served["minified"] == serde_json::json!("composer/2.0");
@@ -2659,8 +2665,9 @@ mod tests {
 
     /// #2361: the p2 (metadata_v2) wire shape must emit an ABSOLUTE dist.url
     /// for locally-hosted artifacts, prefixed with the request-derived base
-    /// URL — while the proxied/remote rewrite path (#1652, covered by
-    /// `test_remote_metadata_v2_rewrites_dist_url_1652`) is left unchanged.
+    /// URL. #2370 brings the proxied/remote rewrite path (#1652, covered by
+    /// `test_remote_metadata_v2_rewrites_dist_url_1652`) to the same absolute
+    /// shape so remote/proxied `metadata-url` clients get a fetchable dist.
     #[tokio::test]
     async fn test_build_metadata_v2_response_dist_url_absolute_2361() {
         let resp = build_metadata_v2_response(
