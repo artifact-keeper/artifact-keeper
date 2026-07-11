@@ -526,13 +526,18 @@ fn composer_inline_uid(name: &str, version: &str, checksum_sha256: &str) -> i64 
 // owned by an in-flight PR, so a local copy avoids parallel-merge drift.
 // ---------------------------------------------------------------------------
 
-/// Rewrite the `dist.url` of a single composer version entry to the relative
-/// in-registry download path, preserving every other field (notably
-/// `dist.reference` and `dist.shasum`). Entries without a `dist.url` (e.g. the
-/// delta rows of the "minified" format) are left untouched. `version_hint` is
-/// used when the entry itself omits a `version` field (the v1 wire shape keys
-/// versions by the map key rather than an inline field).
+/// Rewrite the `dist.url` of a single composer version entry to the ABSOLUTE
+/// in-registry download URL (`base_url` prefixed, same derivation as
+/// [`build_version_entry`]), preserving every other field (notably
+/// `dist.reference` and `dist.shasum`). Composer does not resolve a
+/// root-relative `dist.url` against the repository URL, so a relative form
+/// makes it fall back to a source clone and bypass the proxy cache (#2370).
+/// Entries without a `dist.url` (e.g. the delta rows of the "minified"
+/// format) are left untouched. `version_hint` is used when the entry itself
+/// omits a `version` field (the v1 wire shape keys versions by the map key
+/// rather than an inline field).
 fn rewrite_dist_url_in_entry(
+    base_url: &str,
     repo_key: &str,
     name: &str,
     version_hint: &str,
@@ -570,8 +575,8 @@ fn rewrite_dist_url_in_entry(
     dist.insert(
         "url".to_string(),
         serde_json::Value::String(format!(
-            "/composer/{}/dist/{}/{}/{}.zip",
-            repo_key, name, version, reference
+            "{}/composer/{}/dist/{}/{}/{}.zip",
+            base_url, repo_key, name, version, reference
         )),
     );
 }
@@ -581,7 +586,7 @@ fn rewrite_dist_url_in_entry(
 /// upstream host directly. Handles both wire shapes: the v2 `packages` map of
 /// version *arrays* and the v1 map of version *objects*. Pure + DB-free so it is
 /// unit-testable (#1652).
-fn rewrite_remote_dist_urls(repo_key: &str, doc: &mut serde_json::Value) {
+fn rewrite_remote_dist_urls(base_url: &str, repo_key: &str, doc: &mut serde_json::Value) {
     let Some(packages) = doc.get_mut("packages").and_then(|p| p.as_object_mut()) else {
         return;
     };
@@ -589,13 +594,13 @@ fn rewrite_remote_dist_urls(repo_key: &str, doc: &mut serde_json::Value) {
         match versions {
             serde_json::Value::Array(arr) => {
                 for entry in arr.iter_mut() {
-                    rewrite_dist_url_in_entry(repo_key, name, "dev-main", entry);
+                    rewrite_dist_url_in_entry(base_url, repo_key, name, "dev-main", entry);
                 }
             }
             serde_json::Value::Object(map) => {
                 for (ver, entry) in map.iter_mut() {
                     let hint = ver.clone();
-                    rewrite_dist_url_in_entry(repo_key, name, &hint, entry);
+                    rewrite_dist_url_in_entry(base_url, repo_key, name, &hint, entry);
                 }
             }
             _ => {}
@@ -607,10 +612,10 @@ fn rewrite_remote_dist_urls(repo_key: &str, doc: &mut serde_json::Value) {
 /// re-serialize. On any JSON parse failure the original bytes are returned
 /// unchanged so a non-JSON (or unexpected) upstream body is still served
 /// verbatim rather than dropped. Pure so the transform is unit-testable (#1652).
-fn rewrite_remote_metadata_body(repo_key: &str, content: &Bytes) -> Bytes {
+fn rewrite_remote_metadata_body(base_url: &str, repo_key: &str, content: &Bytes) -> Bytes {
     match serde_json::from_slice::<serde_json::Value>(content) {
         Ok(mut doc) => {
-            rewrite_remote_dist_urls(repo_key, &mut doc);
+            rewrite_remote_dist_urls(base_url, repo_key, &mut doc);
             match serde_json::to_vec(&doc) {
                 Ok(bytes) => Bytes::from(bytes),
                 Err(_) => content.clone(),
@@ -913,8 +918,10 @@ async fn metadata_v2(
                 // the archive back through us (and we can proxy-cache it),
                 // instead of pulling it straight from the off-registry host. The
                 // proxy cache still stores the original upstream bytes; only the
-                // served copy is transformed.
-                let content = rewrite_remote_metadata_body(&repo_key, &content);
+                // served copy is transformed. The rewritten URL is ABSOLUTE
+                // (base-URL prefixed) — Composer does not resolve a relative
+                // dist.url and would bypass the proxy cache (#2370).
+                let content = rewrite_remote_metadata_body(base_url.as_str(), &repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
         }
@@ -982,8 +989,9 @@ async fn metadata_v1(
                 )
                 .await?;
                 // #1652: rewrite upstream `dist.url`s to route dist downloads
-                // back through us (see metadata_v2 for the rationale).
-                let content = rewrite_remote_metadata_body(&repo_key, &content);
+                // back through us (see metadata_v2 for the rationale); absolute
+                // per #2370.
+                let content = rewrite_remote_metadata_body(base_url.as_str(), &repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
         }
@@ -3559,11 +3567,11 @@ mod metadata_db_tests {
     #[test]
     fn test_rewrite_remote_dist_urls_v2_array() {
         let mut doc = packagist_v2_doc();
-        rewrite_remote_dist_urls("php-remote", &mut doc);
+        rewrite_remote_dist_urls("https://ak.example.com", "php-remote", &mut doc);
         let entry = &doc["packages"]["monolog/monolog"][0];
         assert_eq!(
             entry["dist"]["url"],
-            "/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
+            "https://ak.example.com/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
         );
         // reference, shasum, minified, and unrelated fields preserved.
         assert_eq!(entry["dist"]["reference"], "aaa111");
@@ -3591,11 +3599,11 @@ mod metadata_db_tests {
                 }
             }
         });
-        rewrite_remote_dist_urls("legacy", &mut doc);
+        rewrite_remote_dist_urls("https://ak.example.com", "legacy", &mut doc);
         let entry = &doc["packages"]["monolog/monolog"]["1.0.0"];
         assert_eq!(
             entry["dist"]["url"],
-            "/composer/legacy/dist/monolog/monolog/1.0.0/bbb222.zip"
+            "https://ak.example.com/composer/legacy/dist/monolog/monolog/1.0.0/bbb222.zip"
         );
         assert_eq!(entry["dist"]["reference"], "bbb222");
     }
@@ -3607,25 +3615,50 @@ mod metadata_db_tests {
                 "vendor/pkg": [{"name": "vendor/pkg", "version": "9.9.9"}]
             }
         });
-        rewrite_remote_dist_urls("k", &mut doc);
+        rewrite_remote_dist_urls("https://ak.example.com", "k", &mut doc);
         assert!(doc["packages"]["vendor/pkg"][0].get("dist").is_none());
     }
 
     #[test]
     fn test_rewrite_remote_metadata_body_non_json_passthrough() {
         let raw = bytes::Bytes::from_static(b"<html>not json</html>");
-        let out = rewrite_remote_metadata_body("k", &raw);
+        let out = rewrite_remote_metadata_body("https://ak.example.com", "k", &raw);
         assert_eq!(out, raw, "non-JSON upstream body is served verbatim");
     }
 
     #[test]
     fn test_rewrite_remote_metadata_body_rewrites() {
         let raw = bytes::Bytes::from(packagist_v2_doc().to_string());
-        let out = rewrite_remote_metadata_body("php-remote", &raw);
+        let out = rewrite_remote_metadata_body("https://ak.example.com", "php-remote", &raw);
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed["packages"]["monolog/monolog"][0]["dist"]["url"],
-            "/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
+            "https://ak.example.com/composer/php-remote/dist/monolog/monolog/2.0.0/aaa111.zip"
+        );
+    }
+
+    /// #2370 regression gate: the rewritten remote `dist.url` must be an
+    /// ABSOLUTE http(s) URL rooted at the request base URL. Composer does not
+    /// resolve a root-relative dist.url against the repository URL, so a
+    /// relative form makes it fall back to a source clone and bypass the
+    /// proxy cache.
+    #[test]
+    fn test_rewrite_remote_dist_url_is_absolute() {
+        let base = "https://ak.example.com";
+        let mut doc = packagist_v2_doc();
+        rewrite_remote_dist_urls(base, "php-remote", &mut doc);
+        let url = doc["packages"]["monolog/monolog"][0]["dist"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(
+            url.starts_with(&format!("{}/composer/php-remote/dist/", base)),
+            "dist.url must be prefixed with the request base URL, got {url}"
+        );
+        let parsed = url::Url::parse(url).expect("dist.url must be a valid absolute URL");
+        assert!(
+            parsed.scheme() == "http" || parsed.scheme() == "https",
+            "dist.url must be http(s), got {}",
+            parsed.scheme()
         );
     }
 
