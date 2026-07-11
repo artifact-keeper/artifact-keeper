@@ -60,11 +60,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 
 # OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
-opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
-opentelemetry-http = { version = "0.28", features = ["reqwest"] }
-opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
-tracing-opentelemetry = "0.29"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-http = { version = "0.32", features = ["reqwest"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
+tracing-opentelemetry = "0.33"
 
 # Metrics
 metrics = "0.24"
