@@ -4758,6 +4758,7 @@ pub async fn download_artifact(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
     Query(version_query): Query<ArtifactVersionQuery>,
+    dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse> {
     // A HEAD request must return identical headers to GET but no body, and it
@@ -4842,25 +4843,13 @@ pub async fn download_artifact(
         }
     }
 
-    // Get client IP for analytics. Trusted-proxy-aware (#2365): the socket
+    // Client attribution for analytics comes from the shared
+    // `DownloadContext` extractor. Trusted-proxy-aware (#2365): the socket
     // peer is authoritative and X-Forwarded-For is believed only when the
     // peer is inside RATE_LIMIT_TRUSTED_PROXY_CIDRS (#2023) — the previous
     // parse here trusted any XFF. `None` (unresolvable) records as NULL.
-    let client_ip = crate::api::middleware::rate_limit::resolve_client_ip_addr(
-        request.headers(),
-        request
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.ip()),
-        &state.config.rate_limit_trusted_proxy_cidrs,
-    );
-    let client_ip_str = client_ip.map(|ip| ip.to_string());
-
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let client_ip_str = dl_ctx.client_ip.map(|ip| ip.to_string());
+    let user_agent = dl_ctx.user_agent.clone();
 
     // Check if the storage backend supports redirect downloads (S3 with presigned URLs).
     // This path is gated on PRESIGNED_DOWNLOADS_ENABLED (or the per-backend
@@ -5037,6 +5026,29 @@ pub async fn download_artifact(
             .map_err(|_| {
                 AppError::NotFound("Artifact not found in any member repository".to_string())
             })?;
+
+            // #2398 (sibling of #2394): this arm is only reached when
+            // `download_stream` returned NotFound for the virtual repo
+            // itself, so the #2365 recorder inside it never fired — yet the
+            // response streams a member's BYTES, a real download. When the
+            // shadowing guard proved a non-Remote member owns the exact path
+            // (Remote members were suppressed), attribute the download to
+            // that local member's artifact row. Remote pass-through resolves
+            // no local `artifacts` row and stays unrecorded (#1278). No
+            // double-count: the direct-row path records in `download_stream`
+            // and cannot reach this arm.
+            if owns_locally {
+                if let Some(artifact_id) =
+                    proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
+                {
+                    crate::services::artifact_service::record_download(
+                        &state.db,
+                        artifact_id,
+                        &dl_ctx,
+                    )
+                    .await;
+                }
+            }
 
             let ct = result
                 .content_type
@@ -12352,6 +12364,189 @@ mod tests {
         fx.teardown().await;
     }
 
+    // ---------------------------------------------------------------------
+    // download_artifact: download telemetry on the virtual-member-local
+    // branch (#2398, sibling of #2394).
+    //
+    // GET /:key/download/*path on a Virtual repository falls through to
+    // `resolve_virtual_download` when the virtual repo has no direct row.
+    // When the shadowing guard proves a non-Remote member owns the exact
+    // path, the served bytes are that local member's artifact — a real
+    // download that used to bypass the #2365 recorder (only the direct-row
+    // `download_stream` path recorded). Pinned here:
+    //   1. a virtual-local serve via /download/ records exactly ONE
+    //      `download_statistics` row against the member's artifact, with
+    //      the resolved client IP and the user (NULL when anonymous) — one
+    //      row also proves no double-count vs. the direct-row recorder
+    //   2. a virtual remote pass-through records nothing and still inserts
+    //      no `artifacts` row (#1278)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_virtual_local_serve_records_download() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add virtual member");
+
+        let body_bytes: &[u8] = b"virtual-member-download-bytes";
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            &storage_key,
+            "vdl/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Authenticated download through the virtual repo. No ConnectInfo
+        // peer exists in a unit router, so DownloadContext falls back to the
+        // parseable X-Forwarded-For value for the client IP.
+        let mut req = tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.90".parse().unwrap());
+        req.headers_mut()
+            .insert("user-agent", "dl-telemetry-test/2.0".parse().unwrap());
+        let (status, body) = tdh::send(fx.router_with_auth(download_router()), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            body_bytes,
+            "virtual /download/ GET must serve the member's content bytes"
+        );
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a virtual-local serve must record exactly one download_statistics row \
+             (zero = #2398 regression, more = double-count)"
+        );
+        assert_eq!(rows[0].0, Some(fx.user_id), "user must be attributed");
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("203.0.113.90"),
+            "resolved client IP must be recorded, not a sentinel"
+        );
+        assert_eq!(rows[0].2.as_deref(), Some("dl-telemetry-test/2.0"));
+
+        // Anonymous download: user_id records as NULL, not dropped.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make virtual repo public");
+        let mut anon_req = tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key));
+        anon_req
+            .headers_mut()
+            .insert("x-forwarded-for", "203.0.113.91".parse().unwrap());
+        let (anon_status, _) = tdh::send(fx.router_anon(download_router()), anon_req).await;
+        assert_eq!(anon_status, axum::http::StatusCode::OK);
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(rows.len(), 2, "anonymous serve must also record");
+        assert_eq!(rows[1].0, None, "anonymous must record a NULL user");
+        assert_eq!(rows[1].1.as_deref(), Some("203.0.113.91"));
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_virtual_remote_passthrough_does_not_record() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add remote virtual member");
+
+        let server = wiremock::MockServer::start().await;
+        let upstream_body: &[u8] = b"remote-download-passthrough-bytes";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pass/dl.bin"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(upstream_body))
+            .mount(&server)
+            .await;
+        point_repo_at_upstream(&fx.pool, member_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let mut req = tdh::get(format!("/{}/download/pass/dl.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.92".parse().unwrap());
+        let (status, body) =
+            tdh::send(tdh::router_with_auth(download_router(), state, auth), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], upstream_body);
+
+        // #1278: a proxy pass-through must not materialize an artifacts row,
+        // and therefore records no download_statistics either.
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = ANY($1)")
+                .bind(vec![fx.repo_id, member_id])
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts");
+        assert_eq!(
+            artifact_count, 0,
+            "remote pass-through must not insert into artifacts (#1278)"
+        );
+        let stat_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = ANY($1))",
+        )
+        .bind(vec![fx.repo_id, member_id])
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count stats");
+        assert_eq!(
+            stat_count, 0,
+            "remote pass-through must record no download_statistics"
+        );
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
     // Source-level pin (#1608, epic #1607): the local-serve happy path in
     // `download_artifact` MUST stream via `ArtifactService::download_stream`
     // and `Body::from_stream`, never the buffered `.download(` -> `Bytes`
@@ -14518,6 +14713,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
             Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -14535,6 +14731,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), unscoped_stored.clone())),
             Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -14553,6 +14750,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
             Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -14646,6 +14844,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -14661,6 +14860,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), "tools/does-not-exist.bin".to_string())),
             Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
