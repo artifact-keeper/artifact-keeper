@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **CI-OIDC identity-provider fetches are now context-aware** (#2405): the CI-OIDC discovery/JWKS fetches use the SSO trust-class client, so a CI-OIDC identity provider on a private address is reachable when the operator opts in via the existing `SSO_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS` knobs — completing the #2380/#2389 context-aware SSRF work for the last identity-provider surface still pinned to the fail-closed upstream default. With no toggle set, behavior is unchanged (fail-closed), and cloud-metadata, loopback and link-local addresses remain hard-blocked regardless of any toggle.
+
 ## [1.5.0] - 2026-07-11
 
 Value-proposition parity release: the enterprise pitch claims are now true in code — a functional audit trail, per-download attribution, CVE blast-radius, first-class artifact versioning, tightened RBAC, and a coherent connect-time SSRF story — each surfaced in the web UI.

@@ -199,7 +199,13 @@ impl CiOidcService {
     pub fn new(db: PgPool) -> Self {
         Self {
             db,
-            http: crate::services::http_client::default_client(),
+            // SSO trust class: CI-OIDC discovery/JWKS fetches target an
+            // operator-configured identity provider (the same class as the
+            // SSO/OIDC login path), so the connect-time SSRF check honors
+            // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS instead of
+            // the fail-closed upstream default (issue #2405). Cloud-metadata,
+            // loopback and link-local addresses stay hard-blocked regardless.
+            http: crate::services::http_client::sso_client(),
         }
     }
 
@@ -690,15 +696,19 @@ impl CiOidcService {
     // -----------------------------------------------------------------------
 
     async fn fetch_discovery(&self, issuer_url: &str) -> Result<serde_json::Value> {
-        // SSRF protection: reject private/internal addresses and non-HTTPS schemes.
+        // SSRF protection: reject blocked addresses and non-HTTPS schemes.
         // The issuer_url is admin-controlled DB data; validating here (not just at
         // write time) provides defence-in-depth for values already in the database.
+        // Validated in the SSO trust class (issue #2405) to match the connect-time
+        // check of the SSO client: a private-IP identity provider is reachable when
+        // the operator opts in via SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS,
+        // while metadata / loopback / link-local targets stay hard-blocked.
         if !issuer_url.starts_with("https://") {
             return Err(AppError::Validation(
                 "CI OIDC issuer URL must use HTTPS".into(),
             ));
         }
-        crate::api::validation::validate_outbound_url(issuer_url, "CI OIDC issuer URL")?;
+        crate::api::validation::validate_outbound_sso_url(issuer_url, "CI OIDC issuer URL")?;
 
         let url = format!(
             "{}/.well-known/openid-configuration",
@@ -1021,6 +1031,114 @@ mod tests {
             .await
             .expect_err("non-https issuer must be rejected");
         assert!(err.to_string().contains("must use HTTPS"));
+    }
+
+    /// Serializes the SSRF-toggle tests below: they mutate process-wide env
+    /// vars that must stay in place across an `.await`, so this is a tokio
+    /// mutex (held across the awaited fetch) rather than a std one. Without
+    /// it, `cargo test`'s parallel threads could flip a toggle under another
+    /// test's nose. (Under `cargo nextest`, per-test process isolation makes
+    /// this a no-op safety net.) Mirrors the `ssrf_dns` test pattern.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Await `fut()` with ONLY the given env toggles set (all other
+    /// private-IP allow knobs cleared), restoring the prior values
+    /// afterwards. The env must be manipulated around the *await* (not just
+    /// future construction): an async fn body runs on poll.
+    async fn with_ssrf_toggles<F, Fut, R>(set: &[(&str, &str)], fut: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        const VARS: [&str; 5] = [
+            "WEBHOOK_ALLOW_PRIVATE_IPS",
+            "SSO_ALLOW_PRIVATE_IPS",
+            "UPSTREAM_ALLOW_PRIVATE_IPS",
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+            "UPSTREAM_PRIVATE_IP_ALLOWLIST",
+        ];
+        let _lock = ENV_LOCK.lock().await;
+        let prev: Vec<(&str, Option<String>)> =
+            VARS.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        for v in VARS {
+            std::env::remove_var(v);
+        }
+        for (k, val) in set {
+            std::env::set_var(k, val);
+        }
+        let out = fut().await;
+        for (k, val) in prev {
+            match val {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    /// With no toggle set, a private-IP issuer stays blocked (fail-closed
+    /// default), and the error names the SSO-surface knobs — discriminating
+    /// for the #2405 fix: the old `Upstream`-context validation produced a
+    /// block message with no `SSO_ALLOW_PRIVATE_IPS` guidance.
+    #[tokio::test]
+    async fn fetch_discovery_blocks_private_issuer_by_default_with_sso_guidance() {
+        let svc = test_service();
+        let err = with_ssrf_toggles(&[], || svc.fetch_discovery("https://10.10.0.8"))
+            .await
+            .expect_err("private-IP issuer must be blocked with no toggle set");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SSO_ALLOW_PRIVATE_IPS") && msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "block error must name the SSO-surface opt-in knobs (#2405), got: {msg}"
+        );
+    }
+
+    /// Cloud-metadata and loopback issuers stay hard-blocked even in the
+    /// MOST permissive configuration (`SSO_ALLOW_PRIVATE_IPS=true`) — the
+    /// toggle relaxes only the RFC1918/CGNAT/ULA class, never the SSRF
+    /// hard-block class.
+    #[tokio::test]
+    async fn fetch_discovery_hard_blocks_metadata_and_loopback_even_with_toggle_on() {
+        let svc = test_service();
+        for issuer in [
+            "https://169.254.169.254",
+            "https://127.0.0.1",
+            "https://[::1]",
+        ] {
+            let err = with_ssrf_toggles(&[("SSO_ALLOW_PRIVATE_IPS", "true")], || {
+                svc.fetch_discovery(issuer)
+            })
+            .await
+            .expect_err(
+                "metadata/loopback issuer must stay blocked even with SSO_ALLOW_PRIVATE_IPS=true",
+            );
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("discovery fetch failed"),
+                "{issuer} must be rejected by validation, not attempted, got: {msg}"
+            );
+        }
+    }
+
+    /// With `SSO_ALLOW_PRIVATE_IPS=true`, a private-IP issuer passes the
+    /// SSRF validation (the #2405 fix) — the fetch proceeds to the network
+    /// layer and fails there (nothing listens at the unroutable target),
+    /// NOT with a validation block. Asserts on the error class only, so no
+    /// live endpoint is required.
+    #[tokio::test]
+    async fn fetch_discovery_private_issuer_passes_validation_when_toggle_on() {
+        let svc = test_service();
+        let err = with_ssrf_toggles(&[("SSO_ALLOW_PRIVATE_IPS", "true")], || {
+            svc.fetch_discovery("https://10.255.255.1")
+        })
+        .await
+        .expect_err("no IdP is listening at 10.255.255.1, so the fetch itself must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("discovery fetch failed"),
+            "with the toggle on, a private-IP issuer must get past SSRF validation \
+             and fail at the connection layer, got: {msg}"
+        );
     }
 
     #[tokio::test]
