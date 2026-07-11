@@ -250,7 +250,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pgp",
  "prost 0.13.5",
- "prost-types 0.13.5",
+ "prost-types 0.14.4",
  "quick-xml 0.41.0",
  "rand 0.8.6",
  "rand 0.9.3",
