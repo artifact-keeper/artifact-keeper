@@ -1225,6 +1225,175 @@ async fn fetch_npm_artifacts(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// npm scope policy (#2327)
+// ---------------------------------------------------------------------------
+
+/// `repository_config` key holding the JSON array of allowed npm scopes.
+pub(crate) const NPM_ALLOWED_SCOPES_KEY: &str = "npm_allowed_scopes";
+/// `repository_config` key holding the unscoped-package toggle ("true"/"false").
+pub(crate) const NPM_ALLOW_UNSCOPED_KEY: &str = "npm_allow_unscoped";
+
+/// Parsed shape of an npm package name for scope-policy evaluation.
+#[derive(Debug, PartialEq, Eq)]
+enum NpmNameShape<'a> {
+    /// `@scope/name` — carries the `@scope` part (including the `@`).
+    Scoped(&'a str),
+    /// Plain `name` with no scope.
+    Unscoped,
+    /// Not a well-formed npm package name (e.g. `@scope` without a name,
+    /// `@/x`, or an empty string).
+    Invalid,
+}
+
+/// Split an npm package name into its scope-policy-relevant shape.
+fn npm_name_shape(package_name: &str) -> NpmNameShape<'_> {
+    if package_name.is_empty() {
+        return NpmNameShape::Invalid;
+    }
+    let Some(rest) = package_name.strip_prefix('@') else {
+        return NpmNameShape::Unscoped;
+    };
+    match rest.split_once('/') {
+        Some((scope, name)) if !scope.is_empty() && !name.is_empty() && !name.contains('/') => {
+            NpmNameShape::Scoped(&package_name[..scope.len() + 1])
+        }
+        _ => NpmNameShape::Invalid,
+    }
+}
+
+/// Validate an npm scope literal (`@scope`) for the policy allow-list.
+///
+/// npm scope names follow the same character rules as package names: ASCII
+/// lowercase letters, digits, `-`, `_` and `.`, not starting with `.` or `_`,
+/// and at most 214 characters. Callers normalise to lowercase before
+/// validating, so uppercase input is accepted but stored case-folded.
+pub(crate) fn is_valid_npm_scope(scope: &str) -> bool {
+    let Some(rest) = scope.strip_prefix('@') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 214
+        && !rest.starts_with('.')
+        && !rest.starts_with('_')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Per-repository npm name-namespace policy (#2327).
+///
+/// Stored in `repository_config` (`npm_allowed_scopes` = JSON array,
+/// `npm_allow_unscoped` = bool) for Remote repositories. Virtual candidate
+/// selection consults the policy before proxying a package name to a Remote
+/// member. A repository with no stored policy is unrestricted (default
+/// behaviour unchanged).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NpmScopePolicy {
+    /// Allowed `@scope` values, case-folded to lowercase. Empty = no scope
+    /// restriction.
+    pub(crate) allowed_scopes: Vec<String>,
+    /// Whether unscoped package names may be resolved through this
+    /// repository. `None` = not configured; treated as "deny" once the
+    /// policy is otherwise active (fail-closed) and "allow" otherwise.
+    pub(crate) allow_unscoped: Option<bool>,
+}
+
+impl NpmScopePolicy {
+    /// A policy participates in filtering iff an allow-list is present or
+    /// unscoped resolution was explicitly switched off.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.allowed_scopes.is_empty() || self.allow_unscoped == Some(false)
+    }
+
+    /// Whether `package_name` may be resolved through the repository this
+    /// policy belongs to. Inactive policies allow everything; active
+    /// policies fail closed on malformed names.
+    pub(crate) fn allows(&self, package_name: &str) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        match npm_name_shape(package_name) {
+            NpmNameShape::Scoped(scope) => {
+                self.allowed_scopes.is_empty()
+                    || self
+                        .allowed_scopes
+                        .iter()
+                        .any(|allowed| allowed == &scope.to_ascii_lowercase())
+            }
+            NpmNameShape::Unscoped => self.allow_unscoped == Some(true),
+            NpmNameShape::Invalid => false,
+        }
+    }
+}
+
+/// Batch-load the npm scope policies for a set of member repositories in a
+/// single query. Repositories with no stored policy are absent from the map
+/// (treated as unrestricted). Mirrors the runtime-query style of
+/// `fetch_pypi_upstream_index_path` (no compile-time sqlx macro) so offline
+/// `cargo check` needs no prepared query data.
+async fn fetch_npm_scope_policies(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+) -> std::collections::HashMap<uuid::Uuid, NpmScopePolicy> {
+    let mut policies: std::collections::HashMap<uuid::Uuid, NpmScopePolicy> =
+        std::collections::HashMap::new();
+    if repo_ids.is_empty() {
+        return policies;
+    }
+    let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+        "SELECT repository_id, key, value FROM repository_config \
+         WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+    )
+    .bind(repo_ids)
+    .bind(NPM_ALLOWED_SCOPES_KEY)
+    .bind(NPM_ALLOW_UNSCOPED_KEY)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for (repo_id, key, value) in rows {
+        let policy = policies.entry(repo_id).or_default();
+        if key == NPM_ALLOWED_SCOPES_KEY {
+            policy.allowed_scopes = serde_json::from_str::<Vec<String>>(&value)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+        } else if key == NPM_ALLOW_UNSCOPED_KEY {
+            policy.allow_unscoped = value.parse::<bool>().ok();
+        }
+    }
+    policies
+}
+
+/// Fetch the npm scope policy for a single repository. Returns the default
+/// (inactive, unrestricted) policy when nothing is configured.
+pub(crate) async fn fetch_npm_scope_policy(db: &PgPool, repo_id: uuid::Uuid) -> NpmScopePolicy {
+    fetch_npm_scope_policies(db, &[repo_id])
+        .await
+        .remove(&repo_id)
+        .unwrap_or_default()
+}
+
+/// Whether a virtual-repo member may serve as a candidate for
+/// `package_name`. Only Remote members are subject to the scope policy;
+/// Local/Staging members (and members with no stored policy) are always
+/// eligible. Pure so the loop wiring is unit-testable without network/DB.
+fn npm_member_eligible(
+    member_repo_type: &RepositoryType,
+    policy: Option<&NpmScopePolicy>,
+    package_name: &str,
+) -> bool {
+    if member_repo_type != &RepositoryType::Remote {
+        return true;
+    }
+    match policy {
+        Some(p) => p.allows(package_name),
+        None => true,
+    }
+}
+
 /// Return the package metadata: the full packument, or the abbreviated document
 /// when the client requests it.
 async fn get_package_metadata(
@@ -1281,6 +1450,10 @@ async fn get_package_metadata(
             );
         }
 
+        // Batch-load per-member npm scope policies once per request (#2327).
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+
         for member in &members {
             // For Local/Staging members, query artifacts from the DB.
             if member.repo_type == RepositoryType::Local
@@ -1303,6 +1476,19 @@ async fn get_package_metadata(
 
             // For Remote members, proxy metadata from upstream.
             if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            // Honour the member's npm scope policy before proxying (#2327).
+            if !npm_member_eligible(
+                &member.repo_type,
+                scope_policies.get(&member.id),
+                package_name,
+            ) {
+                debug!(
+                    member_key = %member.key,
+                    package = %package_name,
+                    "npm virtual member skipped by scope policy"
+                );
                 continue;
             }
             let Some(ref upstream_url) = member.upstream_url else {
@@ -1488,6 +1674,10 @@ async fn fetch_virtual_packument(
         );
     }
 
+    // Batch-load per-member npm scope policies once per request (#2327).
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+
     for member in &members {
         if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
         {
@@ -1519,6 +1709,19 @@ async fn fetch_virtual_packument(
         }
 
         if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        // Honour the member's npm scope policy before proxying (#2327).
+        if !npm_member_eligible(
+            &member.repo_type,
+            scope_policies.get(&member.id),
+            package_name,
+        ) {
+            debug!(
+                member_key = %member.key,
+                package = %package_name,
+                "npm virtual member skipped by scope policy"
+            );
             continue;
         }
         let Some(ref upstream_url) = member.upstream_url else {
@@ -2878,6 +3081,148 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // npm scope policy (#2327)
+    // -----------------------------------------------------------------------
+
+    fn policy(scopes: &[&str], allow_unscoped: Option<bool>) -> NpmScopePolicy {
+        NpmScopePolicy {
+            allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allow_unscoped,
+        }
+    }
+
+    #[test]
+    fn npm_name_shape_classifies_names() {
+        assert_eq!(
+            npm_name_shape("@types/node"),
+            NpmNameShape::Scoped("@types")
+        );
+        assert_eq!(npm_name_shape("lodash"), NpmNameShape::Unscoped);
+        assert_eq!(npm_name_shape(""), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@types"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@/node"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@types/"), NpmNameShape::Invalid);
+        assert_eq!(npm_name_shape("@a/b/c"), NpmNameShape::Invalid);
+    }
+
+    #[test]
+    fn scope_policy_allow_list_without_unscoped() {
+        let p = policy(&["@types"], Some(false));
+        assert!(p.is_active());
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@partner/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_allow_list_with_unscoped() {
+        let p = policy(&["@types"], Some(true));
+        assert!(p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@partner/x"));
+    }
+
+    #[test]
+    fn scope_policy_default_allows_everything() {
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@anything/x"));
+        // Even a malformed name passes through an inactive policy: legacy
+        // behaviour is preserved bit-for-bit when nothing is configured.
+        assert!(p.allows("@broken"));
+    }
+
+    #[test]
+    fn scope_policy_explicit_allow_unscoped_true_only_is_inactive() {
+        // {allowed_scopes: [], allow_unscoped: true} places no restriction.
+        let p = policy(&[], Some(true));
+        assert!(!p.is_active());
+        assert!(p.allows("lodash"));
+        assert!(p.allows("@anything/x"));
+    }
+
+    #[test]
+    fn scope_policy_unscoped_only_restriction() {
+        // Empty allow-list + explicit unscoped=false: any scope is fine,
+        // unscoped names are not.
+        let p = policy(&[], Some(false));
+        assert!(p.is_active());
+        assert!(p.allows("@anything/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_unscoped_unset_fails_closed_when_active() {
+        // Allow-list present but allow_unscoped never configured: unscoped
+        // resolution is denied (fail-closed).
+        let p = policy(&["@types"], None);
+        assert!(p.is_active());
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("lodash"));
+    }
+
+    #[test]
+    fn scope_policy_match_is_case_insensitive() {
+        // Loader case-folds stored scopes; the requested name may still
+        // arrive in mixed case.
+        let p = policy(&["@types"], Some(false));
+        assert!(p.allows("@Types/Node"));
+        assert!(p.allows("@TYPES/node"));
+    }
+
+    #[test]
+    fn scope_policy_malformed_name_denied_when_active() {
+        let p = policy(&["@types"], Some(true));
+        assert!(!p.allows("@types"));
+        assert!(!p.allows("@/x"));
+        assert!(!p.allows(""));
+    }
+
+    #[test]
+    fn npm_scope_literal_validation() {
+        assert!(is_valid_npm_scope("@types"));
+        assert!(is_valid_npm_scope("@my-org.sub_team"));
+        assert!(!is_valid_npm_scope("types"));
+        assert!(!is_valid_npm_scope("@"));
+        assert!(!is_valid_npm_scope("@Types")); // callers lowercase first
+        assert!(!is_valid_npm_scope("@.hidden"));
+        assert!(!is_valid_npm_scope("@_private"));
+        assert!(!is_valid_npm_scope("@sc/ope"));
+        assert!(!is_valid_npm_scope(&format!("@{}", "a".repeat(215))));
+    }
+
+    #[test]
+    fn member_eligibility_only_gates_remote_members() {
+        let restrictive = policy(&["@types"], Some(false));
+        // Remote member with an active policy: filtered by name.
+        assert!(npm_member_eligible(
+            &RepositoryType::Remote,
+            Some(&restrictive),
+            "@types/node"
+        ));
+        assert!(!npm_member_eligible(
+            &RepositoryType::Remote,
+            Some(&restrictive),
+            "lodash"
+        ));
+        // Remote member with no stored policy: always eligible.
+        assert!(npm_member_eligible(&RepositoryType::Remote, None, "lodash"));
+        // Local/Staging members are never subject to the scope policy.
+        assert!(npm_member_eligible(
+            &RepositoryType::Local,
+            Some(&restrictive),
+            "lodash"
+        ));
+        assert!(npm_member_eligible(
+            &RepositoryType::Staging,
+            Some(&restrictive),
+            "lodash"
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)

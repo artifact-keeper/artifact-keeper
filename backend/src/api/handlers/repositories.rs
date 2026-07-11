@@ -391,6 +391,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // npm scope policy for Remote members of npm virtual repositories (#2327)
+        .route(
+            "/:key/npm-scope-policy",
+            put(set_npm_scope_policy).get(get_npm_scope_policy),
+        )
         // Cache invalidation for a specific path on a Remote (proxy) repository
         // (#1539). POST keeps the action explicit; the underlying
         // `ProxyService::invalidate_cache` is idempotent so a second call for
@@ -929,6 +934,205 @@ pub async fn get_cache_ttl(
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetNpmScopePolicyRequest {
+    /// npm scopes (each starting with `@`) that may be resolved through this
+    /// repository. An empty list places no scope restriction.
+    pub allowed_scopes: Vec<String>,
+    /// Whether unscoped package names may be resolved through this
+    /// repository. Defaults to `false` when an allow-list is submitted.
+    #[serde(default)]
+    pub allow_unscoped: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NpmScopePolicyResponse {
+    pub repository_key: String,
+    pub allowed_scopes: Vec<String>,
+    pub allow_unscoped: bool,
+    /// Whether the stored policy actually restricts anything. `false` means
+    /// virtual resolution treats this repository as unrestricted.
+    pub active: bool,
+}
+
+/// Reject npm scope-policy writes against repositories whose resolution code
+/// path will never read the value back. Only Remote members of npm virtual
+/// repositories consume the policy (#2327); writing it for Local, Virtual or
+/// Staging repos — or non-npm formats — produces dead state with no consumer.
+fn is_npm_scope_policy_configurable(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+) -> Result<()> {
+    if repo_type != &RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "npm scope policy is only configurable on remote (proxy) repositories".to_string(),
+        ));
+    }
+    if format != &RepositoryFormat::Npm {
+        return Err(AppError::Validation(
+            "npm scope policy is only configurable on npm-format repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Set the npm scope policy for a Remote repository (#2327).
+///
+/// Mirrors the auth + repo-access pattern of `set_cache_ttl`: candidate
+/// selection for virtual npm resolution is a supply-chain control on the same
+/// administrative tier, so non-admins need `repository:admin` on the target.
+#[utoipa::path(
+    put,
+    path = "/{key}/npm-scope-policy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetNpmScopePolicyRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "npm scope policy updated", body = NpmScopePolicyResponse),
+        (status = 400, description = "Validation error (e.g. non-remote repo or invalid scope)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_npm_scope_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetNpmScopePolicyRequest>,
+) -> Result<Json<NpmScopePolicyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &service).await?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository (mirrors `set_cache_ttl`; the global-admin bypass is
+    // preserved).
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to change the npm scope policy of this repository"
+                    .to_string(),
+            ));
+        }
+    }
+
+    is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
+
+    // Normalise and validate the allow-list: lowercase (matching is
+    // case-insensitive), dedupe, and require each entry to be a well-formed
+    // `@scope` literal.
+    let mut allowed_scopes: Vec<String> = payload
+        .allowed_scopes
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    allowed_scopes.sort();
+    allowed_scopes.dedup();
+    for scope in &allowed_scopes {
+        if !crate::api::handlers::npm::is_valid_npm_scope(scope) {
+            return Err(AppError::Validation(format!(
+                "Invalid npm scope '{}': scopes must start with '@' followed by \
+                 lowercase letters, digits, '-', '_' or '.' (not leading '.'/'_')",
+                scope
+            )));
+        }
+    }
+
+    let scopes_json = serde_json::to_string(&allowed_scopes)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize scope list: {}", e)))?;
+    upsert_repo_config(
+        &state.db,
+        repo.id,
+        crate::api::handlers::npm::NPM_ALLOWED_SCOPES_KEY,
+        &scopes_json,
+    )
+    .await?;
+    upsert_repo_config(
+        &state.db,
+        repo.id,
+        crate::api::handlers::npm::NPM_ALLOW_UNSCOPED_KEY,
+        if payload.allow_unscoped {
+            "true"
+        } else {
+            "false"
+        },
+    )
+    .await?;
+
+    let active = !allowed_scopes.is_empty() || !payload.allow_unscoped;
+    Ok(Json(NpmScopePolicyResponse {
+        repository_key: key,
+        allowed_scopes,
+        allow_unscoped: payload.allow_unscoped,
+        active,
+    }))
+}
+
+/// Get the npm scope policy for a repository (#2327).
+///
+/// Same administrative tier as the write path: the policy is an
+/// administrative supply-chain control, so reads require `repository:admin`
+/// (or global admin) as well.
+#[utoipa::path(
+    get,
+    path = "/{key}/npm-scope-policy",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current npm scope policy", body = NpmScopePolicyResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_npm_scope_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<NpmScopePolicyResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to read the npm scope policy of this repository"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await;
+    let active = policy.is_active();
+    Ok(Json(NpmScopePolicyResponse {
+        repository_key: key,
+        allow_unscoped: policy.allow_unscoped.unwrap_or(!active),
+        allowed_scopes: policy.allowed_scopes,
+        active,
     }))
 }
 
@@ -6030,6 +6234,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         update_repository,
         delete_repository,
         set_cache_ttl,
+        set_npm_scope_policy,
+        get_npm_scope_policy,
         list_pypi_tracks,
         put_pypi_track,
         delete_pypi_track,
@@ -6059,6 +6265,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryListResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
+        SetNpmScopePolicyRequest,
+        NpmScopePolicyResponse,
         InvalidateCacheQuery,
         InvalidateCacheResponse,
         PypiTrackRequest,
