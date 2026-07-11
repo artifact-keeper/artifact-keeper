@@ -360,7 +360,12 @@ impl AuditService {
         Ok(id)
     }
 
-    /// Query audit logs
+    /// Query audit logs, with each row joined to its actor's username (#2392).
+    ///
+    /// A `LEFT JOIN` on `users` embeds `actor_username` without ever dropping
+    /// an audit row: system events (`user_id` NULL) and events whose acting
+    /// user has since been deleted come back with `actor_username = None`.
+    /// Runtime (non-macro) query so no offline `.sqlx` prepare is needed.
     #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &self,
@@ -372,33 +377,34 @@ impl AuditService {
         to: Option<chrono::DateTime<chrono::Utc>>,
         offset: i64,
         limit: i64,
-    ) -> Result<(Vec<AuditLogEntry>, i64)> {
-        let entries = sqlx::query_as!(
-            AuditLogEntry,
+    ) -> Result<(Vec<AuditLogEntryWithActor>, i64)> {
+        let entries = sqlx::query_as::<_, AuditLogEntryWithActor>(
             r#"
             SELECT
-                id, user_id, action, resource_type, resource_id,
-                details, ip_address, correlation_id, created_at
-            FROM audit_log
-            WHERE ($1::uuid IS NULL OR user_id = $1)
-              AND ($2::text IS NULL OR action = $2)
-              AND ($3::text IS NULL OR resource_type = $3)
-              AND ($4::uuid IS NULL OR resource_id = $4)
-              AND ($5::timestamptz IS NULL OR created_at >= $5)
-              AND ($6::timestamptz IS NULL OR created_at <= $6)
-            ORDER BY created_at DESC
+                a.id, a.user_id, a.action, a.resource_type, a.resource_id,
+                a.details, a.ip_address, a.correlation_id, a.created_at,
+                u.username AS actor_username
+            FROM audit_log a
+            LEFT JOIN users u ON u.id = a.user_id
+            WHERE ($1::uuid IS NULL OR a.user_id = $1)
+              AND ($2::text IS NULL OR a.action = $2)
+              AND ($3::text IS NULL OR a.resource_type = $3)
+              AND ($4::uuid IS NULL OR a.resource_id = $4)
+              AND ($5::timestamptz IS NULL OR a.created_at >= $5)
+              AND ($6::timestamptz IS NULL OR a.created_at <= $6)
+            ORDER BY a.created_at DESC
             OFFSET $7
             LIMIT $8
             "#,
-            user_id,
-            action,
-            resource_type,
-            resource_id,
-            from,
-            to,
-            offset,
-            limit
         )
+        .bind(user_id)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(from)
+        .bind(to)
+        .bind(offset)
+        .bind(limit)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -662,6 +668,27 @@ pub struct AuditLogEntry {
     pub ip_address: Option<String>,
     pub correlation_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Audit log entry joined with the actor's username (#2392).
+///
+/// Returned by [`AuditService::query`] so the admin audit endpoint can render
+/// actors without a client-side join against `/admin/users`. `actor_username`
+/// is `None` for system events (no `user_id`) and for events whose acting
+/// user has since been deleted (`audit_log.user_id` is `ON DELETE SET NULL`);
+/// the row itself is always preserved.
+#[derive(Debug, sqlx::FromRow)]
+pub struct AuditLogEntryWithActor {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub details: Option<serde_json::Value>,
+    pub ip_address: Option<String>,
+    pub correlation_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub actor_username: Option<String>,
 }
 
 /// Helper macro for logging audit events
@@ -1326,6 +1353,8 @@ mod tests {
         assert_eq!(row.resource_type, "repository");
         assert_eq!(row.resource_id, Some(resource_id));
         assert_eq!(row.details.as_ref().unwrap()["key"], "audit-roundtrip-test");
+        // No acting user on this event -> no embedded actor username (#2392).
+        assert_eq!(row.actor_username, None);
 
         // A non-matching action filter excludes the row (filter is applied).
         let (rows2, total2) = service
@@ -1346,6 +1375,79 @@ mod tests {
 
         // Cleanup our row so the table does not accrete across test runs.
         // Runtime (non-macro) query so no offline `.sqlx` prepare is needed.
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&service.db)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2392: the query embeds the actor's username via LEFT JOIN users —
+    // present for a known user, NULL for system events, and NULL (row kept)
+    // once the acting user is deleted.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_query_embeds_actor_username_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let service = AuditService::new(pool.clone());
+
+        // Two events under one unique resource id: one by the known user, one
+        // with no actor (system-style event).
+        let resource_id = Uuid::new_v4();
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+                    .user(user_id)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("log user-actor event");
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("log system event");
+
+        let (rows, total) = service
+            .query(None, None, None, Some(resource_id), None, None, 0, 50)
+            .await
+            .expect("query succeeds");
+        assert_eq!(total, 2);
+        let user_row = rows
+            .iter()
+            .find(|r| r.user_id == Some(user_id))
+            .expect("user-actor row present");
+        assert_eq!(
+            user_row.actor_username.as_deref(),
+            Some(username.as_str()),
+            "known actor's username is embedded"
+        );
+        let system_row = rows
+            .iter()
+            .find(|r| r.user_id.is_none())
+            .expect("system row present");
+        assert_eq!(system_row.actor_username, None, "system actor has no name");
+
+        // Delete the acting user: the audit rows must survive (FK is
+        // ON DELETE SET NULL) with the username now unresolvable -> NULL.
+        tdh::cleanup_user(&pool, user_id).await;
+        let (rows_after, total_after) = service
+            .query(None, None, None, Some(resource_id), None, None, 0, 50)
+            .await
+            .expect("query after actor deletion succeeds");
+        assert_eq!(total_after, 2, "rows survive actor deletion");
+        assert!(
+            rows_after.iter().all(|r| r.actor_username.is_none()),
+            "deleted actor resolves to NULL username"
+        );
+
         let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
             .bind(resource_id)
             .execute(&service.db)

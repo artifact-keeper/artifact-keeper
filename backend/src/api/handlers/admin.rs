@@ -91,6 +91,9 @@ pub struct AuditLogQuery {
 pub struct AuditLogItem {
     pub id: Uuid,
     pub user_id: Option<Uuid>,
+    /// Username of the acting user, embedded server-side (#2392). `null` for
+    /// system/non-user actors and for actors that have since been deleted.
+    pub actor_username: Option<String>,
     pub action: String,
     pub resource_type: String,
     pub resource_id: Option<Uuid>,
@@ -100,11 +103,12 @@ pub struct AuditLogItem {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<crate::services::audit_service::AuditLogEntry> for AuditLogItem {
-    fn from(e: crate::services::audit_service::AuditLogEntry) -> Self {
+impl From<crate::services::audit_service::AuditLogEntryWithActor> for AuditLogItem {
+    fn from(e: crate::services::audit_service::AuditLogEntryWithActor) -> Self {
         Self {
             id: e.id,
             user_id: e.user_id,
+            actor_username: e.actor_username,
             action: e.action,
             resource_type: e.resource_type,
             resource_id: e.resource_id,
@@ -1762,6 +1766,9 @@ mod tests {
         assert_eq!(v["total"], 1);
         assert_eq!(v["items"][0]["action"], "USER_CREATED");
         assert_eq!(v["items"][0]["resource_id"], resource_id.to_string());
+        // #2392: the actor's username is embedded server-side so the UI does
+        // not have to client-side-join against /admin/users.
+        assert_eq!(v["items"][0]["actor_username"], username);
 
         // Non-admin caller -> 403 (handler defense-in-depth, independent of the
         // `/admin` admin_middleware which is not mounted in this unit router).
