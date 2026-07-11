@@ -76,6 +76,9 @@ pub struct AuditLogQuery {
     pub resource_type: Option<String>,
     /// Filter by the affected resource id.
     pub resource_id: Option<Uuid>,
+    /// Filter by exact correlation ID (#2414) — the request's
+    /// `X-Correlation-ID` / trace ID as stored on each audit event.
+    pub correlation_id: Option<String>,
     /// Inclusive lower time bound (RFC 3339).
     pub from: Option<chrono::DateTime<chrono::Utc>>,
     /// Inclusive upper time bound (RFC 3339).
@@ -99,7 +102,9 @@ pub struct AuditLogItem {
     pub resource_id: Option<Uuid>,
     pub details: Option<serde_json::Value>,
     pub ip_address: Option<String>,
-    pub correlation_id: Uuid,
+    /// Request correlation ID (#2414): a string — caller-supplied values and
+    /// W3C trace IDs are not UUIDs.
+    pub correlation_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -170,6 +175,7 @@ pub async fn list_audit_logs(
             query.action.as_deref(),
             query.resource_type.as_deref(),
             query.resource_id,
+            query.correlation_id.as_deref(),
             query.from,
             query.to,
             offset,

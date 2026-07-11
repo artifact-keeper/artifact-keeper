@@ -472,12 +472,19 @@ impl ScanResultService {
 
         // Build the UNNEST arrays for a single batched audit INSERT
         // (PR #1212 audit, M1). One statement instead of N.
+        //
+        // One sweep is one logical operation, so every audit row it emits
+        // shares one generated correlation ID (#2414): an operator can pull
+        // the whole sweep out of the audit log with a single
+        // `get_by_correlation` query. The janitor runs outside any request
+        // scope, so the ID is generated here rather than inherited.
+        let sweep_correlation = crate::api::middleware::tracing::CorrelationId::generate();
         let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut actions: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_types: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut details_blobs: Vec<serde_json::Value> = Vec::with_capacity(reaped.len());
-        let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(reaped.len());
+        let mut correlation_ids: Vec<String> = Vec::with_capacity(reaped.len());
         for row in &reaped {
             let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .resource(row.id)
@@ -489,7 +496,8 @@ impl ScanResultService {
                     row.completed_at,
                     secs,
                 ))
-                .system_actor(STUCK_SCAN_AUDIT_ACTOR);
+                .system_actor(STUCK_SCAN_AUDIT_ACTOR)
+                .correlation(sweep_correlation.as_str());
             user_ids.push(entry.user_id());
             actions.push(entry.action().as_str().to_string());
             resource_types.push(entry.resource_type().as_str().to_string());
@@ -500,7 +508,7 @@ impl ScanResultService {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             );
-            correlation_ids.push(entry.correlation_id());
+            correlation_ids.push(entry.correlation_id().to_string());
         }
 
         // Per-row audit emission (#1063). A scan transitioning running -> failed
@@ -527,7 +535,7 @@ impl ScanResultService {
                  ip_address, correlation_id)
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::text[], $3::text[], $4::uuid[],
-                $5::jsonb[], $6::text[], $7::uuid[]
+                $5::jsonb[], $6::text[], $7::text[]
             )
             "#,
         )

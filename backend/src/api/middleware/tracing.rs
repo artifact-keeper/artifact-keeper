@@ -14,13 +14,54 @@ pub const CORRELATION_ID_HEADER: &str = "X-Correlation-ID";
 /// W3C Trace Context header.
 const TRACEPARENT_HEADER: &str = "traceparent";
 
+/// Hard cap on a correlation ID, in bytes (#2414).
+///
+/// The header is caller-controlled and unauthenticated, and audited public
+/// paths (e.g. login failures) persist the value per event — an unbounded
+/// value would let an attacker write hundreds of KB into the audit table,
+/// tracing spans, and response headers on every request. 256 bytes is far
+/// beyond any real correlation scheme (UUIDs are 36, W3C trace IDs 32).
+/// Values over the cap are truncated, and the TRUNCATED value is the
+/// canonical ID everywhere: request extension, task-local, trace span,
+/// response-header echo, and audit row. Prefix truncation permits deliberate
+/// collisions, but callers can already reuse arbitrary IDs — correlation
+/// grouping is never authenticated evidence.
+pub const CORRELATION_ID_MAX_BYTES: usize = 256;
+
+/// Clamp a correlation value to [`CORRELATION_ID_MAX_BYTES`], cutting at a
+/// UTF-8 character boundary. Header-derived values are ASCII (hyper rejects
+/// non-visible-ASCII in `to_str`), but programmatic callers of
+/// `AuditEntry::correlation` may pass arbitrary UTF-8. Borrows rather than
+/// owns so callers copy only the bounded prefix — truncating an owned
+/// String would keep the oversized allocation's full capacity alive for as
+/// long as the value lives (a whole request scope, per request).
+pub(crate) fn clamp_correlation_value(value: &str) -> &str {
+    if value.len() > CORRELATION_ID_MAX_BYTES {
+        let mut cut = CORRELATION_ID_MAX_BYTES;
+        while !value.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        &value[..cut]
+    } else {
+        value
+    }
+}
+
 /// Extension that holds the correlation ID for the current request.
+///
+/// The inner value is private (#2414): every construction path goes through
+/// [`CorrelationId::new`]'s clamp, so no caller can smuggle an over-cap
+/// value past it with a tuple literal.
 #[derive(Debug, Clone)]
-pub struct CorrelationId(pub String);
+pub struct CorrelationId(String);
 
 impl CorrelationId {
-    pub fn new(id: String) -> Self {
-        Self(id)
+    /// Build a correlation ID from a caller-supplied value, clamping it to
+    /// [`CORRELATION_ID_MAX_BYTES`] so one canonical (possibly truncated)
+    /// value flows to the span, response header, task-local, and audit rows.
+    /// Copies only the bounded prefix, never the caller's full buffer.
+    pub fn new(id: impl AsRef<str>) -> Self {
+        Self(clamp_correlation_value(id.as_ref()).to_owned())
     }
 
     pub fn generate() -> Self {
@@ -30,12 +71,48 @@ impl CorrelationId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
 }
 
 impl std::fmt::Display for CorrelationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+tokio::task_local! {
+    /// The correlation ID of the request currently being handled (#2414).
+    ///
+    /// `correlation_id_middleware` scopes this around the downstream request
+    /// future, so anything `.await`ed while handling the request — handlers,
+    /// service calls, audit emitters — observes the request's correlation ID
+    /// without threading it through every signature. The scope wraps the
+    /// future, not the OS task, so it is correct under HTTP/2 multiplexing.
+    /// A future detached with `tokio::spawn` does NOT inherit the value;
+    /// code that emits audit entries from a detached task must capture the
+    /// ID first (no current emitter does).
+    static CURRENT_CORRELATION: CorrelationId;
+}
+
+/// The correlation ID of the in-flight request, when called from within a
+/// request future wrapped by [`correlation_id_middleware`]; `None` from
+/// background jobs, startup code, and detached tasks (#2414).
+pub fn current_correlation_id() -> Option<CorrelationId> {
+    CURRENT_CORRELATION.try_with(Clone::clone).ok()
+}
+
+/// Runs `fut` with [`current_correlation_id`] resolving to `id` — the same
+/// scoping the middleware applies to each request. Public so tests (and any
+/// future non-HTTP entry point that has its own correlation handle, e.g. a
+/// job runner) can establish a scope without standing up a router.
+pub async fn with_correlation_scope<F: std::future::Future>(
+    id: CorrelationId,
+    fut: F,
+) -> F::Output {
+    CURRENT_CORRELATION.scope(id, fut).await
 }
 
 /// Correlation ID middleware with W3C Trace Context interop.
@@ -52,7 +129,7 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
         .headers()
         .get(CORRELATION_ID_HEADER)
         .and_then(|h| h.to_str().ok())
-        .map(|s| CorrelationId::new(s.to_string()))
+        .map(CorrelationId::new)
         .or_else(|| {
             // Extract trace-id from traceparent header
             request
@@ -62,7 +139,7 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
                 .and_then(|tp| {
                     let parts: Vec<&str> = tp.split('-').collect();
                     if parts.len() >= 2 {
-                        Some(CorrelationId::new(parts[1].to_string()))
+                        Some(CorrelationId::new(parts[1]))
                     } else {
                         None
                     }
@@ -82,7 +159,10 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
         uri = %uri,
     );
 
-    async move {
+    // Scope the task-local around the whole downstream future so audit
+    // emitters anywhere under this request observe the same correlation ID
+    // the span carries and the response header echoes (#2414).
+    with_correlation_scope(correlation_id.clone(), async move {
         let mut response = next.run(request).await;
 
         if let Ok(value) = HeaderValue::from_str(correlation_id.as_str()) {
@@ -96,7 +176,7 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
         );
 
         response
-    }
+    })
     .instrument(span)
     .await
 }
@@ -120,19 +200,19 @@ mod tests {
 
     #[test]
     fn test_correlation_id_new() {
-        let id = CorrelationId::new("my-custom-id".to_string());
+        let id = CorrelationId::new("my-custom-id");
         assert_eq!(id.as_str(), "my-custom-id");
     }
 
     #[test]
     fn test_correlation_id_display() {
-        let id = CorrelationId::new("test-id".to_string());
+        let id = CorrelationId::new("test-id");
         assert_eq!(format!("{}", id), "test-id");
     }
 
     #[test]
     fn test_correlation_id_clone() {
-        let id = CorrelationId::new("clone-test".to_string());
+        let id = CorrelationId::new("clone-test");
         let cloned = id.clone();
         assert_eq!(id.as_str(), cloned.as_str());
     }
@@ -213,6 +293,67 @@ mod tests {
     fn test_header_constants() {
         assert_eq!(CORRELATION_ID_HEADER, "X-Correlation-ID");
         assert_eq!(TRACEPARENT_HEADER, "traceparent");
+    }
+
+    // #2414: the 256-byte correlation cap.
+
+    #[test]
+    fn test_clamp_preserves_values_at_the_cap() {
+        let exact = "x".repeat(CORRELATION_ID_MAX_BYTES);
+        assert_eq!(clamp_correlation_value(&exact), exact);
+        assert_eq!(
+            clamp_correlation_value("audit-correlation-test"),
+            "audit-correlation-test"
+        );
+    }
+
+    #[test]
+    fn test_clamp_truncates_values_over_the_cap() {
+        let over = "y".repeat(CORRELATION_ID_MAX_BYTES + 100);
+        let clamped = clamp_correlation_value(&over);
+        assert_eq!(clamped.len(), CORRELATION_ID_MAX_BYTES);
+        assert_eq!(clamped, &over[..CORRELATION_ID_MAX_BYTES]);
+    }
+
+    #[test]
+    fn test_clamp_cuts_at_a_char_boundary() {
+        // 'é' is 2 bytes. A leading ASCII byte shifts every 'é' boundary to
+        // an odd offset, so the 256-byte cut lands mid-character and the
+        // clamp must walk back to 255 instead of panicking on a non-boundary
+        // slice.
+        let s = format!("a{}", "é".repeat(129));
+        let clamped = clamp_correlation_value(&s);
+        assert_eq!(clamped.len(), CORRELATION_ID_MAX_BYTES - 1);
+        assert_eq!(clamped, format!("a{}", "é".repeat(127)));
+    }
+
+    #[test]
+    fn test_correlation_id_new_applies_the_cap_without_retaining_capacity() {
+        let oversized = "z".repeat(CORRELATION_ID_MAX_BYTES * 100);
+        let id = CorrelationId::new(&oversized);
+        assert_eq!(id.as_str().len(), CORRELATION_ID_MAX_BYTES);
+        // The point of the borrow-based clamp: only the bounded prefix is
+        // copied. Truncating an owned String instead would retain the full
+        // oversized capacity for the life of the request scope.
+        assert!(id.0.capacity() <= CORRELATION_ID_MAX_BYTES);
+    }
+
+    // #2414: the request-scoped correlation task-local.
+
+    #[tokio::test]
+    async fn test_current_correlation_id_is_none_outside_a_scope() {
+        assert!(current_correlation_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_correlation_scope_bounds_the_value() {
+        let seen = with_correlation_scope(CorrelationId::new("scoped-id"), async {
+            current_correlation_id().map(|c| c.0)
+        })
+        .await;
+        assert_eq!(seen.as_deref(), Some("scoped-id"));
+        // The value must not leak past the scope.
+        assert!(current_correlation_id().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -308,6 +449,29 @@ mod tests {
                 entries,
                 vec![trace_id.to_string(), trace_id.to_string()],
                 "audit entries must preserve the W3C trace-id as their correlation ID (#2414)"
+            );
+        }
+
+        /// #2414 hardening: an oversized caller-supplied header is truncated
+        /// to [`CORRELATION_ID_MAX_BYTES`] and the TRUNCATED value is the one
+        /// canonical ID — echoed to the caller and carried by every audit
+        /// entry — so an unauthenticated caller cannot pump hundreds of KB
+        /// per request into the audit table, spans, and response headers.
+        #[tokio::test]
+        async fn oversized_header_truncates_to_one_canonical_id() {
+            let oversized = "h".repeat(CORRELATION_ID_MAX_BYTES + 44);
+            let request = AxumRequest::builder()
+                .uri("/probe")
+                .header(CORRELATION_ID_HEADER, &oversized)
+                .body(Body::empty())
+                .unwrap();
+            let (echoed, entries) = run_probe(request).await;
+            let expected = &oversized[..CORRELATION_ID_MAX_BYTES];
+            assert_eq!(echoed, expected, "echo must carry the truncated value");
+            assert_eq!(
+                entries,
+                vec![expected.to_string(), expected.to_string()],
+                "audit entries must carry the same truncated canonical value"
             );
         }
 

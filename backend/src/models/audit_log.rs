@@ -15,6 +15,8 @@ pub struct AuditLog {
     pub resource_id: Option<Uuid>,
     pub details: Option<serde_json::Value>,
     pub ip_address: Option<String>,
-    pub correlation_id: Uuid,
+    /// Request correlation ID (#2414): a caller-supplied `X-Correlation-ID`
+    /// value, a W3C trace ID, or a generated UUID — a string, not a UUID.
+    pub correlation_id: String,
     pub created_at: DateTime<Utc>,
 }
