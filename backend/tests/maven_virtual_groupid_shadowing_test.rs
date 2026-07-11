@@ -7,9 +7,11 @@
 //! artifactId. That made a local `com.example.mylib:common:1.0` shadow
 //! every remote `com/android/tools/common/...` lookup, returning 404
 //! instead of falling through to the remote member. The Maven-aware
-//! variant `virtual_non_remote_owns_maven_ga` matches on the full
-//! `groupId/artifactId/` path prefix, so only true GA collisions
-//! activate the suppression.
+//! variant `virtual_non_remote_owns_maven_gav` matches on the full
+//! `groupId/artifactId/version/` path prefix, so only true GAV
+//! collisions activate the suppression: a local artifact at one
+//! version no longer shadows remote members for other versions of the
+//! same coordinate (#2328).
 //!
 //! Requires a PostgreSQL database with migrations applied. Run with:
 //!
@@ -21,7 +23,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use artifact_keeper_backend::api::handlers::proxy_helpers::virtual_non_remote_owns_maven_ga;
+use artifact_keeper_backend::api::handlers::proxy_helpers::virtual_non_remote_owns_maven_gav;
 
 async fn insert_repo(pool: &PgPool, key: &str, repo_type: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -156,24 +158,52 @@ async fn maven_shadowing_guard_does_not_fire_across_different_groupids() {
     // Querying for the REMOTE groupId+artifactId must return false:
     // the local member does not own this GA, so the guard must not
     // suppress remote resolution.
-    let owns_remote_ga =
-        virtual_non_remote_owns_maven_ga(&pool, virtual_id, "com.android.tools", "common")
-            .await
-            .expect("guard query should succeed");
+    let owns_remote_ga = virtual_non_remote_owns_maven_gav(
+        &pool,
+        virtual_id,
+        "com.android.tools",
+        "common",
+        "31.4.0",
+    )
+    .await
+    .expect("guard query should succeed");
     assert!(
         !owns_remote_ga,
         "local member's `com.example.mylib:common` must NOT shadow remote `com.android.tools:common` (#1287)"
     );
 
-    // Sanity: querying for the LOCAL groupId+artifactId still returns
-    // true (the guard still does its job for genuine collisions).
-    let owns_local_ga =
-        virtual_non_remote_owns_maven_ga(&pool, virtual_id, "com.example.mylib", "common")
-            .await
-            .expect("guard query should succeed");
+    // #2328: a DIFFERENT version of the SAME locally owned coordinate
+    // must not activate the guard either — only the exact G:A:V the
+    // local member owns is protected.
+    let owns_other_version = virtual_non_remote_owns_maven_gav(
+        &pool,
+        virtual_id,
+        "com.example.mylib",
+        "common",
+        "2.0.0",
+    )
+    .await
+    .expect("guard query should succeed");
     assert!(
-        owns_local_ga,
-        "guard must still fire when groupId+artifactId match the local artifact"
+        !owns_other_version,
+        "local `com.example.mylib:common:1.0.0` must NOT shadow version 2.0.0 of the same coordinate (#2328)"
+    );
+
+    // Sanity: querying for the LOCAL groupId+artifactId+version still
+    // returns true (the guard still does its job for genuine
+    // collisions).
+    let owns_local_gav = virtual_non_remote_owns_maven_gav(
+        &pool,
+        virtual_id,
+        "com.example.mylib",
+        "common",
+        "1.0.0",
+    )
+    .await
+    .expect("guard query should succeed");
+    assert!(
+        owns_local_gav,
+        "guard must still fire when groupId+artifactId+version match the local artifact"
     );
 
     cleanup(&pool, virtual_id, &[local_id, remote_id]).await;
@@ -196,7 +226,7 @@ async fn maven_shadowing_guard_no_non_remote_members_returns_false() {
     let remote_id = insert_repo(&pool, &format!("mv-remote-rmonly-{}", suffix), "remote").await;
     add_virtual_member(&pool, virtual_id, remote_id, 1).await;
 
-    let owns = virtual_non_remote_owns_maven_ga(&pool, virtual_id, "com.foo", "bar")
+    let owns = virtual_non_remote_owns_maven_gav(&pool, virtual_id, "com.foo", "bar", "1.0")
         .await
         .expect("guard query should succeed");
     assert!(
@@ -236,12 +266,24 @@ async fn maven_shadowing_guard_escapes_like_metachars() {
 
     // A LIKE-style query like `a%a` must not slip past escaping and
     // match the `aaa` artifact: the guard treats `%` as a literal.
-    let widened = virtual_non_remote_owns_maven_ga(&pool, virtual_id, "com.example", "a%a")
-        .await
-        .expect("guard query should succeed");
+    let widened =
+        virtual_non_remote_owns_maven_gav(&pool, virtual_id, "com.example", "a%a", "1.0.0")
+            .await
+            .expect("guard query should succeed");
     assert!(
         !widened,
         "% inside artifactId must be escaped, not act as a wildcard"
+    );
+
+    // Same for a `%` smuggled into the version segment: it must not
+    // widen the match to the locally owned `1.0.0` directory.
+    let widened_version =
+        virtual_non_remote_owns_maven_gav(&pool, virtual_id, "com.example", "aaa", "%")
+            .await
+            .expect("guard query should succeed");
+    assert!(
+        !widened_version,
+        "% inside version must be escaped, not act as a wildcard"
     );
 
     cleanup(&pool, virtual_id, &[local_id]).await;
