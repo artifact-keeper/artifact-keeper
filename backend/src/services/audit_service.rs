@@ -1453,4 +1453,96 @@ mod tests {
             .execute(&service.db)
             .await;
     }
+
+    // -----------------------------------------------------------------------
+    // #2414: end-to-end request → audit-row correlation contract. A request
+    // carrying `X-Correlation-ID` is driven through the real
+    // `correlation_id_middleware` into a handler that logs audit entries the
+    // way production emitters do; the STORED rows must carry the caller's
+    // exact value (which is a string, not a UUID) and all rows from one
+    // request must share it.
+    // -----------------------------------------------------------------------
+
+    /// Logs two audit entries tagged with the test's unique resource id,
+    /// mirroring a production handler that audits twice in one request.
+    async fn double_audit_handler(
+        axum::extract::State((pool, resource_id)): axum::extract::State<(PgPool, Uuid)>,
+    ) -> &'static str {
+        let service = AuditService::new(pool);
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("first audit write succeeds");
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("second audit write succeeds");
+        "ok"
+    }
+
+    /// Fetches the stored correlation values for the test's rows as text.
+    /// The `::text` cast reads identically whether the column is the legacy
+    /// UUID type or the #2414 TEXT type, so this test compiles and runs
+    /// against both schemas — red before the fix, green after.
+    async fn stored_correlations(pool: &PgPool, resource_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT correlation_id::text FROM audit_log \
+             WHERE resource_id = $1 ORDER BY created_at, id",
+        )
+        .bind(resource_id)
+        .fetch_all(pool)
+        .await
+        .expect("read stored correlation ids")
+    }
+
+    #[tokio::test]
+    async fn request_correlation_id_round_trips_into_stored_audit_rows_db() {
+        use crate::api::middleware::tracing::{correlation_id_middleware, CORRELATION_ID_HEADER};
+        use axum::{body::Body, http::Request, middleware, routing::post, Router};
+        use tower::ServiceExt;
+
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let resource_id = Uuid::new_v4();
+        let app = Router::new()
+            .route("/audited-op", post(double_audit_handler))
+            .with_state((pool.clone(), resource_id))
+            .layer(middleware::from_fn(correlation_id_middleware));
+
+        let supplied = format!("audit-correlation-test-{}", resource_id.as_simple());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/audited-op")
+                    .header(CORRELATION_ID_HEADER, &supplied)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("audited request");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let stored = stored_correlations(&pool, resource_id).await;
+        assert_eq!(stored.len(), 2, "both audit writes must land");
+        assert!(
+            stored.iter().all(|c| *c == supplied),
+            "stored audit rows must preserve the caller-supplied correlation ID \
+             (#2414); got {stored:?}, want {supplied:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
+            .await;
+    }
 }
