@@ -3194,51 +3194,67 @@ pub async fn virtual_local_winner_artifact_id(
 }
 
 /// Build the SQL `LIKE` pattern that matches every artifact path under
-/// a given Maven `groupId/artifactId/` directory.
+/// a given Maven `groupId/artifactId/version/` directory.
 ///
 /// Pure helper extracted so the prefix construction has unit-test
-/// coverage without a database. Returns `<group-path>/<artifactId>/%`,
-/// where the dot-to-slash conversion runs before LIKE-escaping so
-/// directory separators in the groupId are preserved, and `%`/`_`/`\`
-/// inside either input become literal characters. Use with
+/// coverage without a database. Returns
+/// `<group-path>/<artifactId>/<version>/%`, where the dot-to-slash
+/// conversion runs before LIKE-escaping so directory separators in the
+/// groupId are preserved, and `%`/`_`/`\` inside any input become
+/// literal characters (versions arrive from the request path, so the
+/// version segment is escaped like the others). Use with
 /// `LIKE ... ESCAPE '\'`.
-pub(crate) fn maven_ga_like_pattern(group_id: &str, artifact_id: &str) -> String {
+///
+/// Matching at GAV rather than GA granularity means a local artifact at
+/// one version no longer shadows remote members for *other* versions of
+/// the same coordinate (#2328), while a true G:A:V collision still
+/// activates the guard.
+pub(crate) fn maven_gav_like_pattern(group_id: &str, artifact_id: &str, version: &str) -> String {
     let group_path = group_id.replace('.', "/");
-    let mut prefix = String::with_capacity(group_path.len() + artifact_id.len() + 3);
+    let mut prefix =
+        String::with_capacity(group_path.len() + artifact_id.len() + version.len() + 4);
     prefix.push_str(&super::escape_like_literal(&group_path));
     prefix.push('/');
     prefix.push_str(&super::escape_like_literal(artifact_id));
+    prefix.push('/');
+    prefix.push_str(&super::escape_like_literal(version));
     prefix.push('/');
     prefix.push('%');
     prefix
 }
 
 /// Maven-aware shadowing guard: returns true if any non-Remote member of
-/// `virtual_repo_id` owns an artifact under the same groupId + artifactId
-/// directory prefix.
+/// `virtual_repo_id` owns an artifact under the same groupId +
+/// artifactId + version directory prefix.
 ///
 /// The generic [`virtual_non_remote_owns_name`] matches by `artifacts.name`
 /// alone, which for Maven is the artifactId component of the GAV. Two
 /// distinct Maven coordinates that happen to share an artifactId (eg.
 /// `com.foo:bar:1.0` vs. `com.baz:bar:1.0`) collide under the generic
 /// guard, suppressing legitimate remote resolution for any sibling
-/// groupId (#1287). Matching on the full groupId/artifactId path prefix
-/// instead means a local `com/example/mylib/common/...` artifact no
-/// longer shadows a remote `com/android/tools/common/...` lookup.
+/// groupId (#1287). A GA-granular prefix was still too wide: a local
+/// member owning ANY version of a coordinate suppressed remote
+/// resolution for EVERY version, so a request for a remote-only version
+/// 404'd instead of falling through to the remote member (#2328).
+/// Matching on the full groupId/artifactId/version path prefix means
+/// the guard only fires for the exact G:A:V the local member owns —
+/// which is also the only case where a remote response could substitute
+/// for a locally published artifact (dependency confusion).
 ///
-/// `group_path` must be the dot-replaced groupId (`com.foo` ->
-/// `com/foo`); the function appends `/<artifact_id>/` and runs a
-/// `path LIKE` against `artifacts.path`. The prefix is escaped to
-/// neutralise `%` / `_` / `\` so a crafted artifactId cannot widen the
-/// match. Uses the `(repository_id, path)` btree (`idx_artifacts_repo_path`).
+/// The pattern is `<group-path>/<artifact_id>/<version>/%` run as a
+/// `path LIKE` against `artifacts.path`. Every segment is escaped to
+/// neutralise `%` / `_` / `\` so a crafted artifactId or version cannot
+/// widen the match. Uses the `(repository_id, path)` btree
+/// (`idx_artifacts_repo_path`).
 ///
 /// Fails closed on DB error (matches `virtual_non_remote_owns_name`).
 #[allow(clippy::result_large_err)]
-pub async fn virtual_non_remote_owns_maven_ga(
+pub async fn virtual_non_remote_owns_maven_gav(
     db: &PgPool,
     virtual_repo_id: Uuid,
     group_id: &str,
     artifact_id: &str,
+    version: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
@@ -3251,7 +3267,7 @@ pub async fn virtual_non_remote_owns_maven_ga(
         return Ok(false);
     }
 
-    let prefix = maven_ga_like_pattern(group_id, artifact_id);
+    let prefix = maven_gav_like_pattern(group_id, artifact_id, version);
 
     let exists = sqlx::query(
         "SELECT 1 FROM artifacts \
@@ -5132,78 +5148,128 @@ mod tests {
         assert_eq!(reverse_suffix_for_like(""), "/");
     }
 
-    // ── maven_ga_like_pattern tests (#1287) ─────────────────────────
+    // ── maven_gav_like_pattern tests (#1287, #2328) ──────────────────
 
     #[test]
-    fn test_maven_ga_like_pattern_simple_groupid() {
-        // Regular groupId/artifactId pair: dots in groupId become
-        // path separators, then a `/<artifactId>/%` suffix is appended.
+    fn test_maven_gav_like_pattern_simple_groupid() {
+        // Regular groupId/artifactId/version triple: dots in groupId
+        // become path separators, then a `/<artifactId>/<version>/%`
+        // suffix is appended.
         assert_eq!(
-            maven_ga_like_pattern("com.android.tools", "common"),
-            "com/android/tools/common/%"
+            maven_gav_like_pattern("com.android.tools", "common", "31.4.0"),
+            "com/android/tools/common/31.4.0/%"
+        );
+        assert_eq!(
+            maven_gav_like_pattern("org.apache.commons", "commons-lang3", "3.14.0"),
+            "org/apache/commons/commons-lang3/3.14.0/%"
         );
     }
 
     #[test]
-    fn test_maven_ga_like_pattern_distinguishes_groupids() {
+    fn test_maven_gav_like_pattern_distinguishes_groupids() {
         // Two artifactIds that collide on `name` alone but live under
         // different groupIds must produce distinct LIKE prefixes.
         // This is the core property #1287 needs.
-        let foo = maven_ga_like_pattern("com.foo", "bar");
-        let baz = maven_ga_like_pattern("com.baz", "bar");
+        let foo = maven_gav_like_pattern("com.foo", "bar", "1.0");
+        let baz = maven_gav_like_pattern("com.baz", "bar", "1.0");
         assert_ne!(foo, baz);
-        assert_eq!(foo, "com/foo/bar/%");
-        assert_eq!(baz, "com/baz/bar/%");
+        assert_eq!(foo, "com/foo/bar/1.0/%");
+        assert_eq!(baz, "com/baz/bar/1.0/%");
     }
 
     #[test]
-    fn test_maven_ga_like_pattern_does_not_match_sibling_groupids() {
+    fn test_maven_gav_like_pattern_distinguishes_versions() {
+        // The core property #2328 needs: a local artifact at one
+        // version must NOT match the directory of a different version
+        // of the same coordinate, so the shadowing guard cannot
+        // suppress remote resolution of remote-only versions.
+        let old = maven_gav_like_pattern("org.apache.commons", "commons-lang3", "3.0.0");
+        let new = maven_gav_like_pattern("org.apache.commons", "commons-lang3", "3.14.0");
+        assert_ne!(old, new);
+        assert_eq!(old, "org/apache/commons/commons-lang3/3.0.0/%");
+        assert_eq!(new, "org/apache/commons/commons-lang3/3.14.0/%");
+        // The 3.14.0 request path lives outside the 3.0.0 pattern's
+        // literal prefix (and vice versa).
+        let requested = "org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.pom";
+        assert!(!requested.starts_with("org/apache/commons/commons-lang3/3.0.0/"));
+        assert!(requested.starts_with("org/apache/commons/commons-lang3/3.14.0/"));
+    }
+
+    #[test]
+    fn test_maven_gav_like_pattern_does_not_match_sibling_groupids() {
         // `com.android.tools/common/...` must NOT be matched by a
         // pattern derived from `com.example.mylib:common`. We assert
-        // the produced prefix is anchored at the full GA directory
+        // the produced prefix is anchored at the full GAV directory
         // boundary.
-        let prefix = maven_ga_like_pattern("com.example.mylib", "common");
-        assert_eq!(prefix, "com/example/mylib/common/%");
+        let prefix = maven_gav_like_pattern("com.example.mylib", "common", "1.0.0");
+        assert_eq!(prefix, "com/example/mylib/common/1.0.0/%");
         // A path under a different groupId does not start with this
         // prefix even though both share the `common` artifactId.
         let unrelated_path = "com/android/tools/common/31.4.0/common-31.4.0.pom";
-        assert!(!unrelated_path.starts_with("com/example/mylib/common/"));
+        assert!(!unrelated_path.starts_with("com/example/mylib/common/1.0.0/"));
         // Sanity: the matching local artifact path DOES start with it.
         let local_path = "com/example/mylib/common/1.0.0/common-1.0.0.pom";
-        assert!(local_path.starts_with("com/example/mylib/common/"));
+        assert!(local_path.starts_with("com/example/mylib/common/1.0.0/"));
         // And the LIKE suffix is open-ended.
         assert!(prefix.ends_with('%'));
     }
 
     #[test]
-    fn test_maven_ga_like_pattern_escapes_metachars() {
-        // A crafted artifactId containing `%` or `_` must not widen
-        // the LIKE match. Both inputs get escaped before being woven
-        // into the pattern.
+    fn test_maven_gav_like_pattern_snapshot_version() {
+        // SNAPSHOT versions keep their literal directory name; the
+        // open-ended `%` then covers the timestamped filenames Maven
+        // resolves inside that directory.
         assert_eq!(
-            maven_ga_like_pattern("a.b", "ev%il"),
-            "a/b/ev\\%il/%",
+            maven_gav_like_pattern("com.example", "app", "1.0-SNAPSHOT"),
+            "com/example/app/1.0-SNAPSHOT/%"
+        );
+    }
+
+    #[test]
+    fn test_maven_gav_like_pattern_escapes_metachars() {
+        // A crafted artifactId or version containing `%` or `_` must
+        // not widen the LIKE match. All inputs get escaped before
+        // being woven into the pattern.
+        assert_eq!(
+            maven_gav_like_pattern("a.b", "ev%il", "1.0"),
+            "a/b/ev\\%il/1.0/%",
             "% inside artifactId must be escaped"
         );
         assert_eq!(
-            maven_ga_like_pattern("a.b", "ev_il"),
-            "a/b/ev\\_il/%",
+            maven_gav_like_pattern("a.b", "ev_il", "1.0"),
+            "a/b/ev\\_il/1.0/%",
             "_ inside artifactId must be escaped"
         );
         // `%` inside the groupId is also escaped (after the
         // dot-to-slash conversion has already happened).
         assert_eq!(
-            maven_ga_like_pattern("a%.b", "c"),
-            "a\\%/b/c/%",
+            maven_gav_like_pattern("a%.b", "c", "1.0"),
+            "a\\%/b/c/1.0/%",
             "% inside groupId must be escaped"
+        );
+        // The version comes straight from the request path, so its
+        // metacharacters must be neutralised too.
+        assert_eq!(
+            maven_gav_like_pattern("a.b", "c", "1%0"),
+            "a/b/c/1\\%0/%",
+            "% inside version must be escaped"
+        );
+        assert_eq!(
+            maven_gav_like_pattern("a.b", "c", "1_0"),
+            "a/b/c/1\\_0/%",
+            "_ inside version must be escaped"
         );
     }
 
     #[test]
-    fn test_maven_ga_like_pattern_escapes_backslash() {
+    fn test_maven_gav_like_pattern_escapes_backslash() {
         // Backslashes get escaped so the ESCAPE '\' clause stays
-        // honest.
-        assert_eq!(maven_ga_like_pattern("a.b", "c\\d"), "a/b/c\\\\d/%");
+        // honest — in every segment, including the version.
+        assert_eq!(
+            maven_gav_like_pattern("a.b", "c\\d", "1.0"),
+            "a/b/c\\\\d/1.0/%"
+        );
+        assert_eq!(maven_gav_like_pattern("a.b", "c", "1\\0"), "a/b/c/1\\\\0/%");
     }
 
     // ── build_remote_repo tests ──────────────────────────────────────

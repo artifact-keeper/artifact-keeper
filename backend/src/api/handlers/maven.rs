@@ -1476,25 +1476,31 @@ async fn serve_artifact(
                 // groupIds: a local `com.example.mylib:common:1.0` shadowed
                 // every remote `com/.../common/...` lookup, returning
                 // 404 instead of falling through to the remote member
-                // (#1287). The Maven-aware variant matches the full
+                // (#1287). The Maven-aware variant matched the full
                 // groupId+artifactId path prefix so only true GA
-                // collisions activate the suppression. The guard
-                // remains a safety net rather than an authority check:
-                // different versions under the same GA still
-                // legitimately share a directory, and we accept the
-                // false-positive within a single GA in exchange for
-                // closing the shadowing attack. If the path fails to
-                // parse as a Maven coordinate (eg. dynamic
-                // metadata.xml requests reach this branch from earlier
-                // fall-through), skip the guard rather than block the
-                // request.
+                // collisions activated the suppression — but GA
+                // granularity was still too coarse: a local member
+                // owning ANY version of a coordinate suppressed remote
+                // resolution for EVERY version, so a request for a
+                // remote-only version 404'd instead of falling through
+                // to the remote member (#2328). The guard now matches
+                // the full groupId+artifactId+version directory, which
+                // is exactly the scope of the dependency-confusion
+                // attack it defends against: only a locally published
+                // G:A:V can be substituted by a remote response, so
+                // only that G:A:V needs remote resolution suppressed.
+                // If the path fails to parse as a Maven coordinate
+                // (eg. dynamic metadata.xml requests reach this branch
+                // from earlier fall-through), skip the guard rather
+                // than block the request.
                 let local_owns = match MavenHandler::parse_coordinates(path) {
                     Ok(coords) => {
-                        proxy_helpers::virtual_non_remote_owns_maven_ga(
+                        proxy_helpers::virtual_non_remote_owns_maven_gav(
                             &state.db,
                             repo.id,
                             &coords.group_id,
                             &coords.artifact_id,
+                            &coords.version,
                         )
                         .await?
                     }
@@ -4716,6 +4722,160 @@ mod tests {
             &body[..],
             pom_body.as_bytes(),
             "virtual must return the upstream POM bytes (#1562)"
+        );
+    }
+
+    /// #2328: a local member owning ONE version of a Maven coordinate must
+    /// not shadow the virtual repo's remote members for OTHER versions of
+    /// the same coordinate. The GA-granular shadowing guard suppressed the
+    /// proxy fan-out for every version once any version existed locally, so
+    /// a request for a remote-only version 404'd. The GAV-granular guard
+    /// only fires for the exact G:A:V the local member owns.
+    ///
+    /// Same topology as the #1562 test ([local prio 1, remote prio 2]) but
+    /// with the local member owning `io.confluent:common:5.2.0`. The
+    /// remote-only `5.3.1` must stream from upstream (was 404), while the
+    /// locally owned `5.2.0` must still be served by the LOCAL member —
+    /// the dependency-confusion protection for the owned GAV is retained.
+    #[tokio::test]
+    async fn test_virtual_serves_remote_only_pom_when_local_owns_other_version_2328() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Remote-only version vs. locally owned version of the SAME GA.
+        let remote_pom_path = "io/confluent/common/5.3.1/common-5.3.1.pom";
+        let remote_pom_body = "<project><version>5.3.1</version></project>";
+        let local_pom_path = "io/confluent/common/5.2.0/common-5.2.0.pom";
+        let local_pom_body = "<project><version>5.2.0</version></project>";
+
+        // Upstream serves the remote body for every GET; the bodies differ
+        // so the response provenance (local vs. upstream) is observable.
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(remote_pom_body))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, _remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+
+        // Local member OWNS 5.2.0 (row + stored bytes), listed at higher
+        // priority than the remote.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("make local member public");
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let local_info = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &local_info,
+            local_pom_path,
+            local_pom_path,
+            "common",
+            "5.2.0",
+            "application/xml",
+            bytes::Bytes::from_static(local_pom_body.as_bytes()),
+            user_id,
+        )
+        .await;
+
+        // Virtual repo with [local (prio 1), remote (prio 2)].
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1), ($1, $3, 2)",
+        )
+        .bind(virtual_id)
+        .bind(local_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("link local (prio 1) and remote (prio 2) as virtual members");
+
+        let auth = tdh::make_auth(user_id, "ph-2328-user");
+
+        // 1) The remote-only 5.3.1 must fall through to the remote member
+        //    even though the local member owns 5.2.0 of the same GA.
+        let remote_resp = download(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((virtual_key.clone(), remote_pom_path.to_string())),
+            HeaderMap::new(),
+            Default::default(),
+        )
+        .await;
+
+        // 2) The locally owned 5.2.0 must still be served by the LOCAL
+        //    member (owned-GAV dependency-confusion protection retained).
+        let local_resp = download(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Path((virtual_key.clone(), local_pom_path.to_string())),
+            HeaderMap::new(),
+            Default::default(),
+        )
+        .await;
+
+        // cleanup (members cascade on repo delete).
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&local_dir);
+
+        let remote_resp =
+            remote_resp.expect("virtual must serve the remote-only 5.3.1 POM, not 404 (#2328)");
+        assert_eq!(
+            remote_resp.status(),
+            StatusCode::OK,
+            "local 5.2.0 must not shadow the remote-only 5.3.1 (#2328)"
+        );
+        let remote_body = axum::body::to_bytes(remote_resp.into_body(), 1 << 20)
+            .await
+            .expect("read remote body");
+        assert_eq!(
+            &remote_body[..],
+            remote_pom_body.as_bytes(),
+            "5.3.1 must stream the upstream POM bytes (#2328)"
+        );
+
+        let local_resp = local_resp.expect("virtual must serve the locally owned 5.2.0 POM");
+        assert_eq!(
+            local_resp.status(),
+            StatusCode::OK,
+            "locally owned 5.2.0 must still resolve through the virtual"
+        );
+        let local_body = axum::body::to_bytes(local_resp.into_body(), 1 << 20)
+            .await
+            .expect("read local body");
+        assert_eq!(
+            &local_body[..],
+            local_pom_body.as_bytes(),
+            "5.2.0 must come from the LOCAL member, not upstream \
+             (owned-GAV protection must be retained, #2328)"
         );
     }
 }
