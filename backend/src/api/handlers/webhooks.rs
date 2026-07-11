@@ -817,8 +817,9 @@ pub async fn test_webhook(
     // delivery id so receivers still get a unique correlation handle.
     let test_delivery_id = Uuid::new_v4();
 
-    // Send webhook
-    let client = crate::services::http_client::default_client();
+    // Send webhook (webhook trust class: connect-time SSRF check honors
+    // WEBHOOK_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS, issue #2380)
+    let client = crate::services::http_client::webhook_client();
     let header_inputs = DeliveryHeaderInputs {
         delivery_id: test_delivery_id,
         event: "test",
@@ -1038,8 +1039,9 @@ pub async fn redeliver(
         .unwrap_or_default();
     let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
 
-    // Send webhook
-    let client = crate::services::http_client::default_client();
+    // Send webhook (webhook trust class: connect-time SSRF check honors
+    // WEBHOOK_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS, issue #2380)
+    let client = crate::services::http_client::webhook_client();
     let header_inputs = DeliveryHeaderInputs {
         delivery_id,
         event: &delivery.event,
@@ -1624,7 +1626,9 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
     tracing::debug!("Processing {} webhook deliveries due for retry", rows.len());
 
-    let client = crate::services::http_client::base_client_builder()
+    // Webhook trust class: the connect-time SSRF check honors
+    // WEBHOOK_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS (issue #2380).
+    let client = crate::services::http_client::webhook_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;

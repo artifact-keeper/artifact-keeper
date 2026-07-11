@@ -180,7 +180,9 @@ impl OidcService {
         Ok(Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            // SSO trust class: connect-time SSRF check honors
+            // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS (issue #2380).
+            http_client: crate::services::http_client::sso_client(),
             discovery: None,
         })
     }
@@ -190,7 +192,9 @@ impl OidcService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            // SSO trust class: connect-time SSRF check honors
+            // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS (issue #2380).
+            http_client: crate::services::http_client::sso_client(),
             discovery: None,
         }
     }

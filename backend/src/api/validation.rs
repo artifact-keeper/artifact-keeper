@@ -297,6 +297,27 @@ pub fn is_blocked_resolved_ip_internal(ip: std::net::IpAddr) -> bool {
     is_blocked_ip_in(ip, OutboundUrlContext::TrustedInternal)
 }
 
+/// Connect-time resolved-IP check for the [`OutboundUrlContext::Webhook`]
+/// context: honors the same `WEBHOOK_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` relaxations as the validation-time check,
+/// so a deployment that has opted webhook delivery into private-IP targets
+/// is not re-blocked by the SSRF DNS resolver (issue #2380). With no toggle
+/// set this is exactly as strict as the upstream context (fail-closed), and
+/// the cloud-metadata / loopback / link-local hard-blocks are never relaxed.
+pub fn is_blocked_resolved_ip_webhook(ip: std::net::IpAddr) -> bool {
+    is_blocked_ip_in(ip, OutboundUrlContext::Webhook)
+}
+
+/// Connect-time resolved-IP check for the [`OutboundUrlContext::SsoDiscovery`]
+/// context: honors `SSO_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS`
+/// so a configured IdP on a private network stays reachable at connect time
+/// once the operator has opted in (issue #2380). With no toggle set this is
+/// exactly as strict as the upstream context (fail-closed), and the
+/// cloud-metadata / loopback / link-local hard-blocks are never relaxed.
+pub fn is_blocked_resolved_ip_sso(ip: std::net::IpAddr) -> bool {
+    is_blocked_ip_in(ip, OutboundUrlContext::SsoDiscovery)
+}
+
 /// Common implementation shared by the per-context validators. The
 /// `ctx` selects which env var the private-IP relaxation toggle reads.
 fn validate_outbound_url_with(url_str: &str, label: &str, ctx: OutboundUrlContext) -> Result<()> {
@@ -343,12 +364,29 @@ fn block_reason_to_error(label: &str, reason: BlockReason) -> AppError {
 /// redirect policy on the shared HTTP client. Uses the `Upstream`
 /// context (i.e. honors `UPSTREAM_ALLOW_PRIVATE_IPS`) because the
 /// redirect policy fires on every outbound HTTP, including upstream
-/// proxy fetches. Webhook delivery code paths re-validate the final URL
-/// with [`validate_outbound_webhook_url`] before sending, so a webhook
-/// that depends on `WEBHOOK_ALLOW_PRIVATE_IPS` does not need the
-/// redirect policy to also relax under the webhook env var.
+/// proxy fetches. Webhook delivery and SSO/OIDC fetch paths use their
+/// own clients (`webhook_client_builder` / `sso_client_builder`) whose
+/// redirect policies consult [`is_blocked_url_webhook`] /
+/// [`is_blocked_url_sso`], so those surfaces relax under their own env
+/// vars without widening this one (issue #2380).
 pub(crate) fn is_blocked_url(url: &reqwest::Url) -> Option<BlockReason> {
     is_blocked_url_in(url, OutboundUrlContext::Upstream)
+}
+
+/// [`is_blocked_url`] variant for the webhook-delivery redirect policy:
+/// honors `WEBHOOK_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS` on
+/// every redirect hop while keeping the metadata / loopback / link-local
+/// hard-blocks (issue #2380).
+pub(crate) fn is_blocked_url_webhook(url: &reqwest::Url) -> Option<BlockReason> {
+    is_blocked_url_in(url, OutboundUrlContext::Webhook)
+}
+
+/// [`is_blocked_url`] variant for the SSO/OIDC-fetch redirect policy:
+/// honors `SSO_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS` on every
+/// redirect hop while keeping the metadata / loopback / link-local
+/// hard-blocks (issue #2380).
+pub(crate) fn is_blocked_url_sso(url: &reqwest::Url) -> Option<BlockReason> {
+    is_blocked_url_in(url, OutboundUrlContext::SsoDiscovery)
 }
 
 /// [`is_blocked_url`] variant for the trusted internal-service redirect

@@ -90,6 +90,67 @@ pub fn internal_service_client_builder() -> ClientBuilder {
     apply_custom_ca_cert(builder)
 }
 
+/// Return a [`ClientBuilder`] for **webhook delivery** requests. Mirrors
+/// [`base_client_builder`] — same custom-CA handling — but wires the SSRF
+/// DNS resolver and redirect policy in the webhook trust class, so the
+/// connect-time IP check honors the same `WEBHOOK_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` opt-ins as the validation-time check
+/// instead of unconditionally re-blocking private targets under the
+/// upstream context (issue #2380). With no toggle set, behavior is
+/// identical to [`base_client_builder`] (fail-closed), and cloud-metadata,
+/// loopback and link-local addresses stay hard-blocked at connect time and
+/// across redirects regardless of any toggle.
+pub fn webhook_client_builder() -> ClientBuilder {
+    log_proxy_env();
+
+    let builder = reqwest::Client::builder()
+        .redirect(ssrf_webhook_redirect_policy())
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_webhook());
+
+    apply_custom_ca_cert(builder)
+}
+
+/// Build and return a ready-to-use webhook-delivery client (see
+/// [`webhook_client_builder`]).
+///
+/// Panics if the client cannot be built (should not happen in practice).
+pub fn webhook_client() -> reqwest::Client {
+    webhook_client_builder()
+        .build()
+        .expect("failed to build webhook HTTP client")
+}
+
+/// Return a [`ClientBuilder`] for **SSO/OIDC identity-provider fetches**
+/// (discovery, token, JWKS, userinfo against a configured IdP). Mirrors
+/// [`base_client_builder`] — same custom-CA handling — but wires the SSRF
+/// DNS resolver and redirect policy in the SSO trust class, so the
+/// connect-time IP check honors `SSO_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` instead of unconditionally re-blocking a
+/// private-network IdP under the upstream context (issue #2380). With no
+/// toggle set, behavior is identical to [`base_client_builder`]
+/// (fail-closed), and cloud-metadata, loopback and link-local addresses
+/// stay hard-blocked at connect time and across redirects regardless of
+/// any toggle.
+pub fn sso_client_builder() -> ClientBuilder {
+    log_proxy_env();
+
+    let builder = reqwest::Client::builder()
+        .redirect(ssrf_sso_redirect_policy())
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso());
+
+    apply_custom_ca_cert(builder)
+}
+
+/// Build and return a ready-to-use SSO/OIDC-fetch client (see
+/// [`sso_client_builder`]).
+///
+/// Panics if the client cannot be built (should not happen in practice).
+pub fn sso_client() -> reqwest::Client {
+    sso_client_builder()
+        .build()
+        .expect("failed to build SSO HTTP client")
+}
+
 /// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
 /// into the builder when configured. Shared by every client builder so the
 /// private-CA handling is identical and lives in one place.
@@ -178,6 +239,27 @@ fn ssrf_internal_redirect_policy() -> Policy {
     )
 }
 
+/// Redirect policy for webhook-delivery clients (#2380). Same per-hop SSRF
+/// re-check as [`ssrf_redirect_policy`], but in the webhook trust class so
+/// a redirect hop honors `WEBHOOK_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` while metadata / loopback / link-local
+/// pivots are still refused.
+fn ssrf_webhook_redirect_policy() -> Policy {
+    ssrf_redirect_policy_with(
+        crate::api::validation::is_blocked_url_webhook,
+        "webhook redirect",
+    )
+}
+
+/// Redirect policy for SSO/OIDC-fetch clients (#2380). Same per-hop SSRF
+/// re-check as [`ssrf_redirect_policy`], but in the SSO trust class so a
+/// redirect hop honors `SSO_ALLOW_PRIVATE_IPS` /
+/// `AK_SSRF_ALLOW_PRIVATE_CIDRS` while metadata / loopback / link-local
+/// pivots are still refused.
+fn ssrf_sso_redirect_policy() -> Policy {
+    ssrf_redirect_policy_with(crate::api::validation::is_blocked_url_sso, "sso redirect")
+}
+
 /// Shared redirect-policy body: re-run `is_blocked` on every hop and refuse
 /// the request if it returns a block reason, capping at [`MAX_REDIRECTS`].
 /// The `is_blocked` fn selects the trust class (upstream vs trusted-internal).
@@ -212,7 +294,7 @@ fn ssrf_redirect_policy_with(
 mod tests {
     use super::{
         base_client_builder, default_client, internal_service_client_builder,
-        large_object_client_builder,
+        large_object_client_builder, sso_client_builder, webhook_client_builder,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -434,6 +516,111 @@ mod tests {
         assert!(
             accept_result.is_err(),
             "internal client must never connect to a loopback listener: {accept_result:?}"
+        );
+    }
+
+    #[test]
+    fn test_webhook_and_sso_client_builders_build_successfully() {
+        assert!(webhook_client_builder().build().is_ok());
+        assert!(sso_client_builder().build().is_ok());
+    }
+
+    /// The webhook and SSO clients (#2380) gate the private-IP class on
+    /// their per-surface toggles, but the loopback / metadata hard-blocks
+    /// must NOT be relaxed even when the toggles are enabled: a host
+    /// resolving to 127.0.0.1 must still be refused before any TCP
+    /// connection is made. Mirrors the discriminating listener assertion
+    /// used for `base_client_builder` / `internal_service_client_builder`.
+    #[tokio::test]
+    async fn test_webhook_and_sso_clients_still_refuse_loopback_host() {
+        use tokio::net::TcpListener;
+
+        // Enabling the toggles makes this test discriminating: it proves
+        // the hard-block holds in the MOST permissive configuration, not
+        // merely that the default-deny path fired.
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+
+        for builder in [webhook_client_builder(), sso_client_builder()] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test listener");
+            let port = listener.local_addr().expect("local addr").port();
+
+            let client = builder.timeout(Duration::from_secs(2)).build().unwrap();
+            let url = format!("http://localhost:{port}/");
+            let err = client
+                .get(&url)
+                .send()
+                .await
+                .expect_err("webhook/sso client must still refuse a loopback host");
+            assert!(
+                err.is_connect()
+                    || err.is_request()
+                    || err.to_string().to_lowercase().contains("ssrf")
+                    || err.to_string().to_lowercase().contains("block"),
+                "expected resolver rejection, got: {err}"
+            );
+
+            let accept_result =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+            assert!(
+                accept_result.is_err(),
+                "webhook/sso client must never connect to a loopback listener even with \
+                 its private-IP toggle enabled: {accept_result:?}"
+            );
+        }
+
+        std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
+        std::env::remove_var("SSO_ALLOW_PRIVATE_IPS");
+    }
+
+    /// A webhook-client redirect hop that pivots onto the cloud-metadata
+    /// endpoint must be refused even with the webhook private-IP toggle
+    /// enabled — the per-hop redirect re-check uses the webhook trust
+    /// class, whose hard-blocks are toggle-independent (#2380).
+    #[tokio::test]
+    async fn test_webhook_client_refuses_redirect_to_metadata() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\n\
+                          Location: http://169.254.169.254/latest/meta-data\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        // The entry hop targets the loopback listener by IP literal, which
+        // never consults the DNS resolver (and the redirect policy fires
+        // only on redirect hops) — this test exercises the redirect policy
+        // specifically, mirroring `test_redirect_to_blocked_ip_is_refused`.
+        let client = webhook_client_builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}/start", addr.port());
+        let result = client.post(&url).send().await;
+
+        let _ = server.await;
+        std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
+
+        let err = result.expect_err("redirect to the metadata endpoint must be refused");
+        assert!(
+            err.to_string().contains("SSRF") || err.is_redirect(),
+            "expected redirect-rejection error, got: {err}"
         );
     }
 

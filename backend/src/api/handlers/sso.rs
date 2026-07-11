@@ -157,7 +157,9 @@ pub async fn oidc_login(
     );
     validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
 
-    let http_client = crate::services::http_client::default_client();
+    // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
+    // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
+    let http_client = crate::services::http_client::sso_client();
     let discovery: serde_json::Value = http_client
         .get(&discovery_url)
         .send()
@@ -403,7 +405,9 @@ async fn oidc_callback_inner(
     );
     validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
 
-    let http_client = crate::services::http_client::default_client();
+    // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
+    // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
+    let http_client = crate::services::http_client::sso_client();
     let discovery: serde_json::Value = http_client
         .get(&discovery_url)
         .send()
