@@ -10003,6 +10003,281 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    // -----------------------------------------------------------------------
+    // npm scope policy handlers (#2327) — DB-backed
+    // -----------------------------------------------------------------------
+
+    /// Drive `set_npm_scope_policy` through its real extractor types.
+    async fn put_npm_policy(
+        state: SharedState,
+        ext: Option<AuthExtension>,
+        key: &str,
+        scopes: &[&str],
+        allow_unscoped: bool,
+    ) -> Result<Json<NpmScopePolicyResponse>> {
+        set_npm_scope_policy(
+            State(state),
+            Extension(ext),
+            Path(key.to_string()),
+            Json(SetNpmScopePolicyRequest {
+                allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                allow_unscoped,
+            }),
+        )
+        .await
+    }
+
+    /// Drive `get_npm_scope_policy` through its real extractor types.
+    async fn get_npm_policy(
+        state: SharedState,
+        ext: Option<AuthExtension>,
+        key: &str,
+    ) -> Result<Json<NpmScopePolicyResponse>> {
+        get_npm_scope_policy(State(state), Extension(ext), Path(key.to_string())).await
+    }
+
+    /// DB-backed: PUT persists a normalised policy into `repository_config`
+    /// and GET round-trips it; the empty/default read reports an inactive,
+    /// unrestricted policy; re-PUTting an unrestricted policy deactivates it.
+    /// Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn npm_scope_policy_put_get_round_trip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+
+        // Default case: nothing stored yet -> inactive and unrestricted.
+        let default = get_npm_policy(state.clone(), Some(admin.clone()), &key)
+            .await
+            .expect("GET default policy")
+            .0;
+        assert!(default.allowed_scopes.is_empty());
+        assert!(default.allow_unscoped, "default must report unrestricted");
+        assert!(!default.active);
+
+        // PUT: mixed case + duplicate scopes are lowercased and deduped.
+        let put = put_npm_policy(
+            state.clone(),
+            Some(admin.clone()),
+            &key,
+            &["@Types", "@types", "@partner"],
+            false,
+        )
+        .await
+        .expect("PUT policy")
+        .0;
+        assert_eq!(put.allowed_scopes, vec!["@partner", "@types"]);
+        assert!(!put.allow_unscoped);
+        assert!(put.active);
+
+        // GET round-trips the stored policy.
+        let got = get_npm_policy(state.clone(), Some(admin.clone()), &key)
+            .await
+            .expect("GET stored policy")
+            .0;
+        assert_eq!(got.allowed_scopes, vec!["@partner", "@types"]);
+        assert!(!got.allow_unscoped);
+        assert!(got.active);
+
+        // The rows landed in repository_config under the documented keys.
+        let stored: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM repository_config \
+             WHERE repository_id = $1 AND key IN ('npm_allowed_scopes', 'npm_allow_unscoped') \
+             ORDER BY key",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read repository_config");
+        assert_eq!(
+            stored,
+            vec![
+                ("npm_allow_unscoped".to_string(), "false".to_string()),
+                (
+                    "npm_allowed_scopes".to_string(),
+                    "[\"@partner\",\"@types\"]".to_string()
+                ),
+            ]
+        );
+
+        // Re-PUT an unrestricted policy: upsert path + deactivation.
+        let cleared = put_npm_policy(state.clone(), Some(admin.clone()), &key, &[], true)
+            .await
+            .expect("PUT unrestricted policy")
+            .0;
+        assert!(!cleared.active);
+        let reread = get_npm_policy(state, Some(admin), &key)
+            .await
+            .expect("GET cleared policy")
+            .0;
+        assert!(reread.allowed_scopes.is_empty());
+        assert!(reread.allow_unscoped);
+        assert!(!reread.active);
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// DB-backed: the npm scope policy endpoints sit on the same
+    /// administrative tier as `set_cache_ttl` — anonymous callers get an
+    /// authentication error, a non-admin with plain write access is denied,
+    /// and a `repository:admin` grant (or global admin) lets them through.
+    /// Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn npm_scope_policy_requires_repo_admin_grant_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let ext = tdh::make_auth(user_id, &username);
+
+        // Anonymous: authentication error on both verbs.
+        let anon_put = put_npm_policy(state.clone(), None, &key, &["@types"], false).await;
+        assert!(
+            matches!(anon_put, Err(AppError::Authentication(_))),
+            "anonymous PUT must fail authentication: {anon_put:?}"
+        );
+        let anon_get = get_npm_policy(state.clone(), None, &key).await;
+        assert!(
+            matches!(anon_get, Err(AppError::Authentication(_))),
+            "anonymous GET must fail authentication: {anon_get:?}"
+        );
+
+        // Non-admin with developer (write) access but no repository:admin.
+        let denied_put =
+            put_npm_policy(state.clone(), Some(ext.clone()), &key, &["@types"], false).await;
+        assert!(
+            matches!(denied_put, Err(AppError::Authorization(_))),
+            "PUT without repository:admin must be denied: {denied_put:?}"
+        );
+        let denied_get = get_npm_policy(state, Some(ext.clone()), &key).await;
+        assert!(
+            matches!(denied_get, Err(AppError::Authorization(_))),
+            "GET without repository:admin must be denied: {denied_get:?}"
+        );
+
+        // Grant repository:admin; a fresh state avoids the per-process
+        // permission cache from the deny lookups above.
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository:admin");
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed_put =
+            put_npm_policy(state2.clone(), Some(ext.clone()), &key, &["@types"], false).await;
+        assert!(
+            allowed_put.is_ok(),
+            "non-admin WITH repository:admin must be allowed to PUT: {allowed_put:?}"
+        );
+        let allowed_get = get_npm_policy(state2, Some(ext), &key).await;
+        assert!(
+            allowed_get.is_ok(),
+            "non-admin WITH repository:admin must be allowed to GET: {allowed_get:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// DB-backed: writes are rejected with a validation error on non-Remote
+    /// repositories, on non-npm formats, and for malformed scope literals —
+    /// the value would otherwise be dead state with no consumer (#2327).
+    /// Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn npm_scope_policy_rejects_unconsumable_targets_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (maven_id, maven_key, _) = tdh::create_repo(&pool, "remote", "maven").await;
+        let (npm_id, npm_key, _) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+
+        // Non-Remote repo type: rejected before any write.
+        let non_remote =
+            put_npm_policy(state.clone(), Some(admin.clone()), &local_key, &[], false).await;
+        match non_remote {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("remote"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Validation error for non-remote repo, got: {other:?}"),
+        }
+
+        // Remote but non-npm format: rejected.
+        let non_npm =
+            put_npm_policy(state.clone(), Some(admin.clone()), &maven_key, &[], false).await;
+        match non_npm {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("npm-format"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Validation error for non-npm format, got: {other:?}"),
+        }
+
+        // Malformed scope literal (no leading '@'): rejected with the scope
+        // named in the message; nothing is persisted.
+        let bad_scope = put_npm_policy(state, Some(admin), &npm_key, &["types"], false).await;
+        match bad_scope {
+            Err(AppError::Validation(msg)) => {
+                assert!(
+                    msg.contains("Invalid npm scope 'types'"),
+                    "unexpected message: {msg}"
+                )
+            }
+            other => panic!("expected Validation error for bad scope, got: {other:?}"),
+        }
+        let leftover: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repository_config \
+             WHERE repository_id = $1 AND key IN ('npm_allowed_scopes', 'npm_allow_unscoped')",
+        )
+        .bind(npm_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count repository_config");
+        assert_eq!(leftover, 0, "rejected PUT must not persist anything");
+
+        // Cleanup.
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![maven_id, npm_id])
+            .execute(&pool)
+            .await;
+    }
+
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
     /// fine-grained `write` action AFTER the tenant gate. A read-only grantee on
     /// a rules-bearing private repo is DENIED; adding `write` lets them through;

@@ -3224,6 +3224,219 @@ mod tests {
         ));
     }
 
+    /// DB-backed: `fetch_npm_scope_policy` / `fetch_npm_scope_policies` read
+    /// the `repository_config` rows written by the admin endpoint and
+    /// tolerate every degenerate stored shape — no rows (default policy),
+    /// malformed JSON in the scope list, an unparseable boolean, mixed-case
+    /// stored scopes (case-folded), and an empty id set (no query at all).
+    /// Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn fetch_npm_scope_policy_parses_stored_config_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let upsert = |key: &'static str, value: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO repository_config (repository_id, key, value) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (repository_id, key) DO UPDATE SET value = $3",
+                )
+                .bind(repo_id)
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("upsert repository_config");
+            }
+        };
+
+        // Empty id slice: no rows requested, empty map back.
+        assert!(fetch_npm_scope_policies(&pool, &[]).await.is_empty());
+
+        // No rows stored: default (inactive, unrestricted) policy.
+        let empty = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(empty, NpmScopePolicy::default());
+        assert!(!empty.is_active());
+
+        // Malformed JSON scope list + unparseable boolean: both degrade to
+        // the unrestricted default rather than erroring the request path.
+        upsert(NPM_ALLOWED_SCOPES_KEY, "not-json").await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
+        let degenerate = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert!(degenerate.allowed_scopes.is_empty());
+        assert_eq!(degenerate.allow_unscoped, None);
+        assert!(!degenerate.is_active());
+
+        // Well-formed rows: scopes case-folded, boolean parsed.
+        upsert(NPM_ALLOWED_SCOPES_KEY, "[\"@Types\",\"@partner\"]").await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
+        let stored = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(stored.allowed_scopes, vec!["@types", "@partner"]);
+        assert_eq!(stored.allow_unscoped, Some(false));
+        assert!(stored.is_active());
+        assert!(stored.allows("@types/node"));
+        assert!(!stored.allows("lodash"));
+
+        // Boolean flips to true: unscoped resolution allowed again.
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "true").await;
+        let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(flipped.allow_unscoped, Some(true));
+        assert!(flipped.allows("lodash"));
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
+    /// the first carrying a scope policy that excludes the requested name,
+    /// the second unrestricted — resolves both the metadata and the
+    /// packument through the second member, and the policy-restricted
+    /// member's upstream is NEVER contacted (wiremock `expect(0)`). Covers
+    /// the candidate-selection wiring in `get_package_metadata` and
+    /// `fetch_virtual_packument`. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_virtual_member_scope_policy_filters_candidates_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "scope-policy-pkg";
+
+        // Member A upstream: would serve the package, but must never be
+        // asked because A's scope policy excludes unscoped names.
+        let blocked_upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package, "versions": {}
+            })))
+            .expect(0)
+            .mount(&blocked_upstream)
+            .await;
+
+        // Member B upstream: unrestricted, serves the packument.
+        let open_upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {"name": package, "version": "1.0.0",
+                          "dist": {"tarball": format!(
+                              "{}/{}/-/{}-1.0.0.tgz", open_upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&open_upstream)
+            .await;
+
+        let mut member_ids = Vec::new();
+        for (upstream, priority) in [(&blocked_upstream, 1), (&open_upstream, 2)] {
+            let (member_id, _mkey, _mdir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
+            )
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member");
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            member_ids.push(member_id);
+        }
+        // Member A: scoped-only policy — the unscoped test package is out of
+        // scope, so A must be skipped by candidate selection.
+        for (key, value) in [
+            (NPM_ALLOWED_SCOPES_KEY, "[\"@types\"]"),
+            (NPM_ALLOW_UNSCOPED_KEY, "false"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(member_ids[0])
+            .bind(key)
+            .bind(value)
+            .execute(&fx.pool)
+            .await
+            .expect("store member policy");
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Metadata loop: resolved via member B (member A skipped by policy).
+        let meta =
+            super::get_package_metadata(&state, &fx.repo_key, package, "http://localhost", false)
+                .await;
+        match meta {
+            Ok(resp) => assert_eq!(resp.status(), StatusCode::OK),
+            Err(r) => panic!(
+                "virtual metadata must resolve via member B: HTTP {}",
+                r.status()
+            ),
+        }
+
+        // Packument loop: same filtering on the version-metadata path.
+        let repo = fx.repo_info("virtual", None);
+        let packument_json = super::fetch_virtual_packument(
+            &state,
+            &repo,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+        )
+        .await;
+        match packument_json {
+            Ok(json) => assert_eq!(json["name"], package),
+            Err(r) => panic!(
+                "virtual packument must resolve via member B: HTTP {}",
+                r.status()
+            ),
+        }
+
+        // Cleanup (wiremock verifies `expect(0)` for member A on drop).
+        for member_id in member_ids {
+            let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+    }
+
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
     // -----------------------------------------------------------------------
