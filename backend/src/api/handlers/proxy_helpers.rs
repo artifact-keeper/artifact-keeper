@@ -556,7 +556,7 @@ pub async fn proxy_fetch_streaming(
 }
 
 /// Streaming sibling of [`proxy_fetch`] that also forwards a
-/// `Content-Disposition: attachment; filename="…"` header on the
+/// `Content-Disposition: attachment; filename="..."` header on the
 /// outbound response.
 ///
 /// Same body and cache semantics as [`proxy_fetch_streaming`]; only the
@@ -592,6 +592,30 @@ pub async fn proxy_fetch_streaming_with_disposition(
     })
 }
 
+/// Streaming sibling of [`proxy_fetch_streaming`] that deliberately skips
+/// proxy-cache reads and writes. Use only for format-level passthrough
+/// policies where the upstream payload must not be persisted.
+pub async fn proxy_fetch_streaming_uncached(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    let result = proxy_service
+        .fetch_artifact_streaming_uncached(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    build_streaming_response_with_disposition(result, default_content_type, None).map_err(|e| {
+        map_proxy_error(
+            repo_key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
+}
 /// Streaming fetch of `path` from a virtual member, using the member's REAL
 /// repository record so its `format` drives cache classification (#2069 bug 1)
 /// instead of the synthesized `Generic` stand-in [`build_remote_repo`] would
@@ -8174,6 +8198,21 @@ mod tests {
             .map(|e| e + 3)
             .unwrap_or(src.len() - start);
         &src[start..start + rel_end]
+    }
+
+    #[test]
+    fn test_proxy_fetch_streaming_uncached_uses_uncached_service() {
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn proxy_fetch_streaming_uncached(")
+            .expect("proxy_fetch_streaming_uncached must exist");
+        let next_section = src[fn_start..]
+            .find("/// Streaming fetch of `path` from a virtual member")
+            .expect("uncached helper must precede virtual member helper");
+        let window = &src[fn_start..fn_start + next_section];
+
+        assert!(window.contains(".fetch_artifact_streaming_uncached("));
+        assert!(!window.contains(".fetch_artifact_streaming(&repo, path)"));
     }
 
     #[test]

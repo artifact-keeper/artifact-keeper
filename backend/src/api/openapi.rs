@@ -47,6 +47,7 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "security", description = "Security policies and scanning"),
         (name = "sbom", description = "Software Bill of Materials"),
         (name = "signing", description = "Signing key management"),
+        (name = "debian", description = "Debian/APT format management endpoints (remote sync)"),
         (name = "plugins", description = "WASM plugin lifecycle"),
         (name = "webhooks", description = "Event webhook management"),
         (name = "peers", description = "Peer replication and sync"),
@@ -152,6 +153,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::email_subscriptions::EmailSubscriptionsApiDoc::openapi(),
         ),
         ("signing", handlers::signing::SigningApiDoc::openapi()),
+        ("debian", handlers::debian::DebianApiDoc::openapi()),
         ("security", handlers::security::SecurityApiDoc::openapi()),
         ("sbom", handlers::sbom::SbomApiDoc::openapi()),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
@@ -707,6 +709,8 @@ mod tests {
                 "/api/v1/sync-policies/",
                 vec![include_str!("handlers/sync_policies.rs")],
             ),
+            // Format-path management triggers (not apt protocol endpoints).
+            ("/debian/", vec![include_str!("handlers/debian.rs")]),
             // Admin routes: includes routes.rs because some routes (e.g. /metrics)
             // are added inline in the route tree rather than in admin.rs
             (
@@ -800,9 +804,12 @@ mod tests {
                 continue;
             }
 
-            if !path.starts_with("/api/v1/") {
+            // Format-path management endpoints (e.g. POST /debian/{repo_key}/sync) are
+            // documented intentionally; apt protocol GETs remain undocumented.
+            let is_format_management = path.starts_with("/debian/");
+            if !path.starts_with("/api/v1/") && !is_format_management {
                 missing.push(format!(
-                    "{method} {path} — unexpected prefix (expected /api/v1/ or known top-level)"
+                    "{method} {path} — unexpected prefix (expected /api/v1/, /debian/, or known top-level)"
                 ));
                 continue;
             }
@@ -819,7 +826,7 @@ mod tests {
                 let route_suffix = &path[prefix.len() - 1..]; // keep leading /
                 let first_segment = route_suffix.split('/').nth(1).unwrap_or("");
 
-                // Skip empty segments and path parameters (e.g. {user_id})
+                // Skip empty segments and path parameters (e.g. {repo_key})
                 if first_segment.is_empty() || first_segment.starts_with('{') {
                     continue;
                 }
@@ -842,6 +849,69 @@ mod tests {
             missing.is_empty(),
             "The following OpenAPI-documented endpoints appear to be missing route registrations:\n{}",
             missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_openapi_documents_debian_remote_sync() {
+        let spec = build_openapi();
+        let path = spec
+            .paths
+            .paths
+            .get("/debian/{repo_key}/sync")
+            .expect("POST /debian/{repo_key}/sync must be documented");
+        let post = path.post.as_ref().expect("sync path must expose POST");
+        assert!(
+            post.tags
+                .as_ref()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "debian")),
+            "sync operation must be tagged debian"
+        );
+        let post_json = serde_json::to_value(post).expect("serialize sync operation");
+        let security = post_json
+            .get("security")
+            .and_then(|value| value.as_array())
+            .expect("sync must declare security");
+        let schemes: Vec<&str> = security
+            .iter()
+            .filter_map(|requirement| requirement.as_object())
+            .flat_map(|object| object.keys().map(String::as_str))
+            .collect();
+        assert!(
+            schemes.contains(&"bearer_auth"),
+            "sync must accept bearer_auth"
+        );
+        assert!(
+            schemes.contains(&"basic_auth"),
+            "sync must accept basic_auth for format clients"
+        );
+
+        let schemas = &spec.components.as_ref().unwrap().schemas;
+        for name in [
+            "DebianSyncResponse",
+            "DebianSyncPlan",
+            "DebianIndexPath",
+            "DebianSourceIndexPath",
+            "DebianSyncPackageFile",
+            "DebianSyncSourceFile",
+        ] {
+            assert!(
+                schemas.contains_key(name),
+                "OpenAPI schemas must include {name}"
+            );
+        }
+
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("debian_sync_remote_repository"));
+        assert!(json.contains("prefetched_packages"));
+        assert!(json.contains("prefetched_sources"));
+
+        // Route registration regression: OpenAPI path-handler test skips
+        // `/{repo_key}/...` first segments, so pin the sync route string here.
+        let debian_src = include_str!("handlers/debian.rs");
+        assert!(
+            debian_src.contains(".route(\"/:repo_key/sync\", post(sync_remote_repository))"),
+            "documented sync path must remain routed in debian.rs"
         );
     }
 

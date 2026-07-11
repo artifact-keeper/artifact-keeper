@@ -1653,6 +1653,41 @@ impl ArtifactService {
         let artifact = self.get_by_id(id).await?;
         let artifact_info = ArtifactInfo::from(&artifact);
 
+        // Reference-aware Debian cleanup: refuse to soft-delete a pool payload that
+        // is still listed in a published/synced Packages index for this repository.
+        // Synced dists keys are hashed (`debian_synced_dists:<dist>:<path>`), so we
+        // load all synced values and inspect Packages stanza text only.
+        if artifact.path.starts_with("pool/") {
+            let synced_values: Vec<String> = sqlx::query_scalar(
+                r#"
+                SELECT value FROM repository_config
+                WHERE repository_id = $1
+                  AND key LIKE 'debian_synced_dists:%'
+                "#,
+            )
+            .bind(artifact.repository_id)
+            .fetch_all(&self.db)
+            .await
+            .unwrap_or_default();
+            let packages_texts: Vec<String> = synced_values
+                .into_iter()
+                .filter(|value| {
+                    !value.starts_with("@ref:")
+                        && value.contains("Filename:")
+                        && value.contains("Package:")
+                })
+                .collect();
+            if crate::formats::debian::debian_pool_path_still_referenced(
+                &packages_texts,
+                &artifact.path,
+            ) {
+                return Err(AppError::Validation(format!(
+                    "Refusing to delete {}: still referenced by published Debian Packages metadata",
+                    artifact.path
+                )));
+            }
+        }
+
         // Trigger BeforeDelete hooks - validators can reject the deletion
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;

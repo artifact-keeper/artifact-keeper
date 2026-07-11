@@ -2637,6 +2637,34 @@ impl ProxyService {
         self.fetch_artifact_streaming_with_cache_path(repo, path, path)
             .await
     }
+    /// Stream an artifact directly from upstream without reading or writing
+    /// the proxy cache. Format handlers use this only for explicit
+    /// passthrough package policies; normal remotes keep the cached streaming
+    /// path above.
+    pub async fn fetch_artifact_streaming_uncached(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<StreamingFetchResult> {
+        let quarantine_config = quarantine_service::resolve_config(&self.db, repo.id).await;
+        if quarantine_service::should_quarantine(&quarantine_config) {
+            return Err(AppError::Conflict(
+                "Artifact is quarantined and pending security review".to_string(),
+            ));
+        }
+
+        let upstream_url = Self::remote_target(repo)?;
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let upstream = self
+            .fetch_from_upstream_streaming(&full_url, repo.id)
+            .await?;
+
+        Ok(StreamingFetchResult {
+            body: upstream.body,
+            content_type: upstream.content_type,
+            content_length: upstream.content_length,
+        })
+    }
 
     /// Streaming sibling of [`Self::fetch_artifact_with_cache_path`]: fetch
     /// from upstream using `fetch_path` for the URL but key the proxy cache
@@ -2745,14 +2773,38 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
-        // Cache hit fast path: load metadata sidecar, stream content
-        // straight from storage. The slow-path SHA verification done by
-        // the buffered `fetch_artifact_with_cache_path` is intentionally
-        // skipped here — we cannot recompute SHA without buffering, and
-        // the storage backend's own integrity guarantees apply just as
-        // they do for presigned redirects (#1018 R-tradeoff already
-        // accepted upstream).
-        if let Some(result) = self
+        // Cache hit fast path: load metadata sidecar, stream content straight from
+        // storage. When `expected_checksum` is Some we additionally verify that the
+        // sidecar's recorded SHA-256 matches before serving the cached bytes. A
+        // mismatch (or a sidecar with an empty checksum) is treated as a miss so the
+        // leader path re-fetches from upstream with the digest gate active — ensuring
+        // the caller always gets bytes that match the expected digest.
+        if let Some(expected) = expected_checksum.as_deref() {
+            // Peek at the sidecar checksum before entering the full cache-hit path.
+            let metadata = self
+                .load_cache_metadata(&metadata_key)
+                .await
+                .unwrap_or(None);
+            let sidecar_sha = metadata
+                .as_ref()
+                .map(|m| m.checksum_sha256.as_str())
+                .unwrap_or("");
+            if sidecar_sha.is_empty() || sidecar_sha != expected {
+                // Treat as a miss: fall through to the upstream fetch so the leader
+                // path applies the expected_checksum gate before caching.
+                tracing::debug!(
+                    cache_path = %cache_path,
+                    expected = %expected,
+                    cached = %sidecar_sha,
+                    "streaming cache miss: expected_checksum present but sidecar checksum absent or mismatched"
+                );
+            } else if let Some(result) = self
+                .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
+                .await?
+            {
+                return Ok(Some(result));
+            }
+        } else if let Some(result) = self
             .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
             .await?
         {

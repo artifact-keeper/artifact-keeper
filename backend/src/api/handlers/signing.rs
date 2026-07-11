@@ -14,13 +14,16 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
-use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
+use crate::services::signing_service::{
+    normalize_key_type, CreateKeyRequest, ImportPublicKeyRequest, SigningService,
+};
 
 /// Create signing key management routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
         // Key CRUD
         .route("/keys", get(list_keys).post(create_key))
+        .route("/keys/import-public", post(import_public_key))
         .route("/keys/:key_id", get(get_key).delete(delete_key))
         .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/keys/:key_id/rotate", post(rotate_key))
@@ -51,6 +54,17 @@ pub struct CreateKeyPayload {
     pub algorithm: Option<String>, // default "rsa4096"
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportPublicKeyPayload {
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    /// ASCII-armored OpenPGP public key (e.g. Debian/Ubuntu archive key).
+    pub public_key: String,
+    pub uid_name: Option<String>,
+    pub uid_email: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -185,6 +199,53 @@ fn resolve_key_type_and_algorithm(
         }
     });
     Ok((family, algorithm))
+}
+
+/// Import a public-only OpenPGP trust anchor (no private key).
+///
+/// Used for Debian/Ubuntu archive keys and other upstream verification
+/// anchors referenced by `upstream_gpg_key_id`.
+#[utoipa::path(
+    post,
+    path = "/keys/import-public",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = ImportPublicKeyPayload,
+    responses(
+        (status = 200, description = "Imported public trust anchor", body = SigningKeyPublic),
+        (status = 400, description = "Invalid public key", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Fingerprint already exists", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn import_public_key(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<ImportPublicKeyPayload>,
+) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
+
+    if let Some(repo_id) = payload.repository_id {
+        RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+    }
+
+    let svc = signing_service(&state);
+    let key = svc
+        .import_public_trust_anchor(ImportPublicKeyRequest {
+            repository_id: payload.repository_id,
+            name: payload.name,
+            public_key: payload.public_key,
+            uid_name: payload.uid_name,
+            uid_email: payload.uid_email,
+            expires_at: payload.expires_at,
+            created_by: Some(auth.user_id),
+        })
+        .await?;
+    Ok(Json(key))
 }
 
 /// Get a signing key by ID.
@@ -463,6 +524,7 @@ fn signing_config_fields(
     paths(
         list_keys,
         create_key,
+        import_public_key,
         get_key,
         delete_key,
         revoke_key,
@@ -475,6 +537,7 @@ fn signing_config_fields(
     components(schemas(
         ListKeysQuery,
         CreateKeyPayload,
+        ImportPublicKeyPayload,
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
@@ -580,6 +643,40 @@ mod tests {
         // handlers enforce, so signing-key management still works.
         let ext = admin_jwt();
         assert!(require_signing_admin(&ext).is_ok());
+    }
+
+    #[test]
+    fn test_import_public_key_requires_admin_gate() {
+        let src = include_str!("signing.rs");
+        let start = src
+            .find("async fn import_public_key(")
+            .expect("import_public_key handler must exist");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        assert!(
+            rest[..end].contains("require_signing_admin"),
+            "import_public_key MUST call require_signing_admin"
+        );
+        match require_signing_admin(&non_admin_jwt()) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 for non-admin import, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_import_public_key_payload_deserialize() {
+        let json = r#"{
+            "name": "ubuntu-archive-key",
+            "public_key": "-----BEGIN PGP PUBLIC KEY BLOCK-----\n...\n-----END PGP PUBLIC KEY BLOCK-----"
+        }"#;
+        let payload: ImportPublicKeyPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.name, "ubuntu-archive-key");
+        assert!(payload.public_key.contains("BEGIN PGP PUBLIC KEY BLOCK"));
+        assert!(payload.repository_id.is_none());
+        assert!(payload.expires_at.is_none());
     }
 
     #[test]
@@ -847,6 +944,7 @@ mod tests {
             fingerprint: Some("ABCD1234".to_string()),
             key_id: Some("1234".to_string()),
             public_key_pem: "-----BEGIN PUBLIC KEY-----".to_string(),
+            can_sign: true,
             algorithm: "rsa4096".to_string(),
             uid_name: None,
             uid_email: None,

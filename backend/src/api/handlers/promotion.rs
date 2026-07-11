@@ -15,12 +15,97 @@ use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::formats::debian::debian_promotion_target_path;
 use crate::models::quality::{QualityGateEvaluation, QualityGateViolation};
 use crate::models::repository::RepositoryType;
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
+
+/// Copy Debian package metadata onto a promoted artifact when the path is a
+/// pool / `.deb` / `.udeb` package and the target row does not already have
+/// metadata. Preserves component, architecture, and distribution fields.
+async fn copy_debian_metadata_on_promotion(
+    db: &sqlx::PgPool,
+    source_artifact_id: Uuid,
+    target_artifact_id: Uuid,
+    source_path: &str,
+) {
+    let is_debian_pkg = source_path.starts_with("pool/")
+        || source_path.ends_with(".deb")
+        || source_path.ends_with(".udeb");
+    if !is_debian_pkg {
+        return;
+    }
+
+    let existing: Option<(Uuid,)> =
+        match sqlx::query_as("SELECT artifact_id FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(target_artifact_id)
+            .fetch_optional(db)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to check target artifact_metadata during Debian promotion"
+                );
+                return;
+            }
+        };
+    if existing.is_some() {
+        return;
+    }
+
+    let row: Option<(String, serde_json::Value, serde_json::Value)> = match sqlx::query_as(
+        r#"
+        SELECT format, metadata, properties
+        FROM artifact_metadata
+        WHERE artifact_id = $1
+        "#,
+    )
+    .bind(source_artifact_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to load source artifact_metadata during Debian promotion"
+            );
+            return;
+        }
+    };
+
+    let Some((format, metadata, properties)) = row else {
+        return;
+    };
+    if format != "debian" {
+        return;
+    }
+
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata, properties)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (artifact_id) DO NOTHING
+        "#,
+    )
+    .bind(target_artifact_id)
+    .bind(&format)
+    .bind(&metadata)
+    .bind(&properties)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            "Failed to copy Debian artifact_metadata during promotion"
+        );
+    }
+}
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -753,6 +838,7 @@ pub async fn promote_artifact(
     let new_artifact_id = Uuid::new_v4();
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
+    let target_path = debian_promotion_target_path(&artifact.path);
 
     // Stream the artifact body across (possibly distinct) storage backends
     // instead of buffering it in memory (#1608, Core Invariant ①). Shares the
@@ -761,7 +847,7 @@ pub async fn promote_artifact(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
+    super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &target_path).await;
 
     sqlx::query!(
         r#"
@@ -774,7 +860,7 @@ pub async fn promote_artifact(
         "#,
         new_artifact_id,
         target_repo.id,
-        artifact.path,
+        target_path,
         artifact.name,
         artifact.version,
         artifact.size_bytes,
@@ -791,12 +877,15 @@ pub async fn promote_artifact(
         if e.to_string().contains("duplicate key") {
             AppError::Conflict(format!(
                 "Artifact already exists in target repository: {}",
-                artifact.path
+                target_path
             ))
         } else {
             AppError::Database(e.to_string())
         }
     })?;
+
+    copy_debian_metadata_on_promotion(&state.db, artifact_id, new_artifact_id, &artifact.path)
+        .await;
 
     let promotion_id = Uuid::new_v4();
     sqlx::query!(
@@ -830,7 +919,7 @@ pub async fn promote_artifact(
     Ok(Json(PromotionResponse {
         promoted: true,
         source: format!("{}/{}", repo_key, artifact.path),
-        target: format!("{}/{}", target_key, artifact.path),
+        target: format!("{}/{}", target_key, target_path),
         promotion_id: Some(promotion_id),
         policy_violations: vec![],
         message: Some("Artifact promoted successfully".to_string()),
@@ -941,7 +1030,8 @@ pub async fn promote_artifacts_bulk(
         };
 
         let source_display = format!("{}/{}", repo_key, artifact.path);
-        let target_display = format!("{}/{}", target_key, artifact.path);
+        let target_path = debian_promotion_target_path(&artifact.path);
+        let target_display = format!("{}/{}", target_key, target_path);
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
         // single-promote gate; a rule-blocked item fails and the batch continues
@@ -1022,7 +1112,7 @@ pub async fn promote_artifacts_bulk(
         }
 
         let new_artifact_id = Uuid::new_v4();
-        super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
+        super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &target_path).await;
         let insert_result: std::result::Result<_, sqlx::Error> = sqlx::query!(
             r#"
             INSERT INTO artifacts (
@@ -1034,7 +1124,7 @@ pub async fn promote_artifacts_bulk(
             "#,
             new_artifact_id,
             target_repo.id,
-            artifact.path,
+            target_path,
             artifact.name,
             artifact.version,
             artifact.size_bytes,
@@ -1058,6 +1148,9 @@ pub async fn promote_artifacts_bulk(
             results.push(failed_response(source_display, target_display, msg));
             continue;
         }
+
+        copy_debian_metadata_on_promotion(&state.db, *artifact_id, new_artifact_id, &artifact.path)
+            .await;
 
         let promotion_id = Uuid::new_v4();
         let policy_result = serde_json::json!({"passed": true, "violations": []});
