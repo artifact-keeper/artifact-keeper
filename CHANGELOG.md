@@ -7,9 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-11
+
+Patch release: eleven validated bug/security fixes across audit correlation, observability noise, virtual-repository resolution and scanning, the Composer and OCI/npm surfaces, and the SSRF trust model — each replicated, fixed, and re-verified on an isolated stack.
+
+### Added
+
+- **Server-side npm scope policy for virtual repositories** (#2327): an optional, admin-defined per-repository scope allow-list (`npm_allowed_scopes` / `npm_allow_unscoped`, stored in `repository_config`) with new admin-only, Remote-only `PUT`/`GET /api/v1/repositories/{key}/npm-scope-policy` endpoints. npm virtual resolution now skips a policy-mismatched Remote member before querying it, so a broad linked remote can be restricted to specific scopes. Default behavior is unchanged (no policy ⇒ allow all); tarball-path, direct-remote, glob patterns and the web UI are tracked as a follow-up (#2424).
+
 ### Security
 
 - **CI-OIDC identity-provider fetches are now context-aware** (#2405): the CI-OIDC discovery/JWKS fetches use the SSO trust-class client, so a CI-OIDC identity provider on a private address is reachable when the operator opts in via the existing `SSO_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS` knobs — completing the #2380/#2389 context-aware SSRF work for the last identity-provider surface still pinned to the fail-closed upstream default. With no toggle set, behavior is unchanged (fail-closed), and cloud-metadata, loopback and link-local addresses remain hard-blocked regardless of any toggle.
+- **OCI `/v2/token` exchange enforces API-token scope** (#2290): the minted OCI bearer now carries the requesting token's `allowed_repo_ids`, and a repo-scope check is applied on the OCI write and scan-pull paths ahead of the admin/public bypass — bringing OCI to parity with the REST token-scope gate (previously only backstopped by downstream per-repo checks).
+- **Vulnerable transitive crates bumped** (#2272): openssl 0.10.78→0.10.80, tar 0.4.45→0.4.46, opentelemetry_sdk 0.28→0.32 (paired set), cmov 0.5.2→0.5.4, and rand patch bumps — clearing the trivy/RUSTSEC advisories (9→0) with no source changes. Supersedes dependabot #1943/#1926.
+
+### Fixed
+
+- **Audit events preserve the request correlation ID** (#2414) instead of generating an unrelated one, so an action and its audit record can be tied together.
+- **Admin Settings environment badge is sourced from runtime config** (#2325) rather than always showing "Production".
+- **Observability noise reduced** (#2308): the duplicate `http_request` span and blanket ERROR-level logging that misclassified routine 4xx responses as failures are removed.
+- **Maven virtual downloads consult Remote members** (#2328, regression of #1562): a remote-only artifact with a valid cached copy is served from a virtual repository instead of 404ing.
+- **Composer remote/proxied metadata emits an absolute `dist.url`** (#2370): `#1652`-rewritten metadata is now RequestBaseUrl-prefixed so Composer clients fetch through the proxy cache instead of falling back to a source clone. (Resolves the #2383 warm-dist-cache report, which was a release-gate test-path issue, not a caching defect.)
+- **Repository-wide scans enumerate virtual-repository members** (#2228): triggering a scan on a virtual repository now resolves its member repos (recursively) and enqueues their artifacts instead of reporting "0 artifacts". The local-repository path is unchanged.
 
 ## [1.5.0] - 2026-07-11
 
