@@ -492,6 +492,30 @@ fn enforce_scan_pull_scope(
     }
 }
 
+/// Per-repository access gate for API-token-scoped OCI bearers (#2290).
+///
+/// An API token can declare a repository allow-list (`allowed_repo_ids`); the
+/// `/v2/token` exchange now mints the OCI bearer with that same allow-list on
+/// `Claims.allowed_repo_ids` (via `generate_tokens_with_repo_scope`). This gate
+/// enforces it on the resource handlers, mirroring the REST path's #504 scope
+/// check (`AuthExtension::can_access_repo` -> `AccessScope::grants`, run before
+/// the fine-grained admin bypass in `auth.rs`): the declared scope is a
+/// **ceiling** that applies even to admins.
+///
+/// `None` = unrestricted (a JWT login session or an unscoped API token) — a
+/// no-op, exactly matching `AccessScope::Admin`. `Some(ids)` denies any repo
+/// not in the allow-list. Pure decision fn (no I/O) so it is unit-testable.
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn enforce_token_repo_scope(
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+) -> Result<(), Response> {
+    match &claims.allowed_repo_ids {
+        Some(ids) if !ids.contains(&repo_id) => Err(oci_denied_repo_access()),
+        _ => Ok(()), // None = unrestricted; matches AccessScope::grants
+    }
+}
+
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
 ///
 /// The REST artifact path enforces a private-repository members-only gate
@@ -521,6 +545,11 @@ async fn require_oci_repo_write_access(
     repo_id: Uuid,
     repo_is_public: bool,
 ) -> Result<(), Response> {
+    // An API-token-scoped bearer may only touch repositories in its declared
+    // allow-list — a ceiling that applies even to admins (#2290). This mirrors
+    // the REST #504 gate, which runs `can_access_repo` before the admin
+    // fine-grained bypass. No-op for unscoped tokens / JWT-login sessions.
+    enforce_token_repo_scope(claims, repo_id)?;
     if claims.is_admin || repo_is_public {
         return Ok(());
     }
@@ -3886,57 +3915,52 @@ async fn token(
     // locks itself out. `validate_api_token` has no failure-counter side
     // effect, so trying it first keeps the lockout counter accurate while
     // still falling through to bcrypt for actual passwords.
-    let (user, tokens, authenticated_via_api_token) =
-        match auth_service.validate_api_token(&credentials.1).await {
-            Ok(validation) => {
-                // TODO: Enforce token scopes and allowed_repo_ids for OCI
-                // token exchange. Currently the generated JWT inherits full
-                // user privileges regardless of token restrictions.
-                if !validation.scopes.is_empty() && !validation.scopes.contains(&"*".to_string()) {
-                    warn!(
-                        user = %validation.user.username,
-                        scopes = ?validation.scopes,
-                        allowed_repo_ids = ?validation.allowed_repo_ids,
-                        "API token has scope/repo restrictions that are not \
-                         enforced during OCI token exchange"
-                    );
-                }
-                let user = validation.user;
-                let tokens = match auth_service.generate_tokens(&user) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return oci_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "INTERNAL_ERROR",
-                            "failed to generate tokens",
-                        )
-                    }
-                };
-                (user, tokens, true)
-            }
-            Err(_) => match auth_service
-                .authenticate(&credentials.0, &credentials.1)
-                .await
+    let (user, tokens, authenticated_via_api_token) = match auth_service
+        .validate_api_token(&credentials.1)
+        .await
+    {
+        Ok(validation) => {
+            // Carry the API token's declared repository allow-list onto the
+            // minted OCI bearer so the resource handlers enforce it (#2290).
+            // `AccessScope::Admin` (an unscoped token) maps to `None` =
+            // unrestricted, preserving prior behaviour for full-scope tokens.
+            let allowed_repo_ids: Option<Vec<Uuid>> = validation.allowed_repo_ids.clone().into();
+            let user = validation.user;
+            let tokens = match auth_service.generate_tokens_with_repo_scope(&user, allowed_repo_ids)
             {
-                Ok((user, tokens)) => (user, tokens, false),
+                Ok(t) => t,
                 Err(_) => {
-                    // Final fallback: accept a valid AK access token (JWT) as the
-                    // Docker password. This enables the CI/CD keyless push flow:
-                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
-                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
-                    //   3. docker push ...
-                    // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service
-                        .validate_access_token_async(&credentials.1)
-                        .await
-                    {
-                        Ok(claims) => {
-                            let user = match sqlx::query_as::<_, User>(
-                                "SELECT * FROM users WHERE id = $1",
-                            )
-                            .bind(claims.sub)
-                            .fetch_one(&state.db)
-                            .await
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        "failed to generate tokens",
+                    )
+                }
+            };
+            (user, tokens, true)
+        }
+        Err(_) => match auth_service
+            .authenticate(&credentials.0, &credentials.1)
+            .await
+        {
+            Ok((user, tokens)) => (user, tokens, false),
+            Err(_) => {
+                // Final fallback: accept a valid AK access token (JWT) as the
+                // Docker password. This enables the CI/CD keyless push flow:
+                //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+                //   2. docker login -u <ci-user> -p <access_token>  (this path)
+                //   3. docker push ...
+                // This mirrors how Artifactory handles its OIDC-issued tokens.
+                match auth_service
+                    .validate_access_token_async(&credentials.1)
+                    .await
+                {
+                    Ok(claims) => {
+                        let user =
+                            match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                                .bind(claims.sub)
+                                .fetch_one(&state.db)
+                                .await
                             {
                                 Ok(u) => u,
                                 Err(_) => {
@@ -3947,30 +3971,35 @@ async fn token(
                                     )
                                 }
                             };
-                            let tokens = match auth_service.generate_tokens(&user) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "INTERNAL_ERROR",
-                                        "failed to generate tokens",
-                                    )
-                                }
-                            };
-                            // Treat like an API token: bypass the TOTP guard below.
-                            (user, tokens, true)
-                        }
-                        Err(_) => {
-                            return oci_error(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                "invalid username or password",
-                            )
-                        }
+                        // Preserve the incoming access token's repository
+                        // scope on the re-minted bearer so this keyless
+                        // fallback cannot re-widen a restricted token (#2290).
+                        let tokens = match auth_service
+                            .generate_tokens_with_repo_scope(&user, claims.allowed_repo_ids.clone())
+                        {
+                            Ok(t) => t,
+                            Err(_) => {
+                                return oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    "failed to generate tokens",
+                                )
+                            }
+                        };
+                        // Treat like an API token: bypass the TOTP guard below.
+                        (user, tokens, true)
+                    }
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::UNAUTHORIZED,
+                            "UNAUTHORIZED",
+                            "invalid username or password",
+                        )
                     }
                 }
-            },
-        };
+            }
+        },
+    };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -4156,6 +4185,12 @@ async fn handle_head_blob(
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
             return resp;
         }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+            return resp;
+        }
     }
 
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
@@ -4322,6 +4357,12 @@ async fn handle_get_blob(
     // a read of any other repo (#2093). No-op for normal tokens.
     if let Some(claims) = &claims {
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
     }
@@ -6458,6 +6499,12 @@ async fn handle_head_manifest(
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
             return resp;
         }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+            return resp;
+        }
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -6607,6 +6654,12 @@ async fn handle_get_manifest(
     // a read of any other repo (#2093). No-op for normal tokens.
     if let Some(claims) = &claims {
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
     }
@@ -8284,6 +8337,82 @@ mod tests {
         let claims = claims_with_scan_scope(None);
         assert!(enforce_scan_pull_scope(&claims, "repo-a").is_ok());
         assert!(enforce_scan_pull_scope(&claims, "any-other-repo").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_token_repo_scope (#2290)
+    // -----------------------------------------------------------------------
+
+    fn claims_with_repo_scope(
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        is_admin: bool,
+    ) -> crate::services::auth_service::Claims {
+        crate::services::auth_service::Claims {
+            sub: uuid::Uuid::new_v4(),
+            username: "ci-bot".to_string(),
+            email: "ci-bot@artifact-keeper.internal".to_string(),
+            is_admin,
+            allowed_repo_ids,
+            iat: 0,
+            iat_ms: None,
+            exp: i64::MAX,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        }
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_noop_when_unrestricted() {
+        // None = unrestricted (JWT login / unscoped API token): every repo Ok.
+        let claims = claims_with_repo_scope(None, false);
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_ok());
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_allows_in_scope_denies_out_of_scope() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let claims = claims_with_repo_scope(Some(vec![repo_a]), false);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("out-of-scope repo must be denied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_caps_admin() {
+        // The declared scope is a ceiling that binds even an admin bearer: an
+        // admin token scoped to repo_a still cannot reach repo_b (#2290 parity
+        // with the REST #504 gate, which precedes the admin bypass).
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let claims = claims_with_repo_scope(Some(vec![repo_a]), true);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("admin token is still capped by its declared scope");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_access_scope_restricted_mints_repo_allow_list() {
+        // Mint round-trip: a Restricted AccessScope lowers to the same
+        // Option<Vec<Uuid>> claim the bearer carries, which the gate then reads.
+        let repo_a = Uuid::new_v4();
+        let scope = crate::models::access_scope::AccessScope::Restricted(vec![repo_a]);
+        let allowed_repo_ids: Option<Vec<Uuid>> = scope.into();
+        assert_eq!(allowed_repo_ids, Some(vec![repo_a]));
+
+        let claims = claims_with_repo_scope(allowed_repo_ids, false);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_err());
+
+        // Admin AccessScope lowers to None = unrestricted.
+        let admin_scope = crate::models::access_scope::AccessScope::Admin;
+        let admin_ids: Option<Vec<Uuid>> = admin_scope.into();
+        assert_eq!(admin_ids, None);
     }
 
     // -----------------------------------------------------------------------
