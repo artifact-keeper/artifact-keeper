@@ -204,6 +204,42 @@ impl AppError {
         }
     }
 
+    /// Log severity for `into_response`'s `"Request error"` line. Previously
+    /// every variant logged at `error`, unconditionally -- so a routine 404
+    /// from a Maven virtual repo checking its members (completely expected
+    /// multi-repo-fallback behavior) was indistinguishable from a genuine
+    /// server fault in error-log-volume dashboards/alerts. This generalizes
+    /// the same distinction #1139 already established for the proxy-fetch
+    /// path (`map_proxy_error`) to every handler that returns an `AppError`
+    /// directly.
+    ///
+    /// Derived from `status_and_code()` rather than a hand-maintained variant
+    /// list so it can't drift from the status mapping: any variant already
+    /// classified as a 4xx (including the `Jwt`/ENAMETOOLONG special cases
+    /// folded into `Storage`/`Io`) is client-caused and logs at `info`.
+    /// Exceptions:
+    /// - Pool-timeout is a transient capacity problem, not the client's
+    ///   fault, but also not proof the server is broken -- `warn` so it's
+    ///   still visible without paging on error-rate alerts.
+    /// - Credential failures (`Authentication`/`Unauthorized`/`Authorization`)
+    ///   can signal credential stuffing or a broken client, not purely
+    ///   routine even though the client caused them -- `warn`.
+    /// - `QuotaExceeded` maps to 507, outside the 4xx range, but is a client
+    ///   condition (they hit their quota), so it's called out explicitly.
+    fn log_level(&self) -> tracing::Level {
+        if self.is_pool_timeout() {
+            return tracing::Level::WARN;
+        }
+        match self {
+            Self::Authentication(_) | Self::Unauthorized(_) | Self::Authorization(_) => {
+                tracing::Level::WARN
+            }
+            Self::QuotaExceeded(_) => tracing::Level::INFO,
+            _ if self.status_and_code().0.is_client_error() => tracing::Level::INFO,
+            _ => tracing::Level::ERROR,
+        }
+    }
+
     /// Return a user-facing message. Internal details are hidden for server-side
     /// errors to avoid leaking table names, SQL queries, file paths, or config
     /// values. The full error is still logged via `tracing::error!` in
@@ -250,7 +286,11 @@ impl IntoResponse for AppError {
         let (status, code) = self.status_and_code();
         let message = self.user_message();
 
-        tracing::error!(error = %self, code = code, "Request error");
+        match self.log_level() {
+            tracing::Level::ERROR => tracing::error!(error = %self, code = code, "Request error"),
+            tracing::Level::WARN => tracing::warn!(error = %self, code = code, "Request error"),
+            _ => tracing::info!(error = %self, code = code, "Request error"),
+        }
 
         let body = Json(json!({
             "code": code,
@@ -612,5 +652,118 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // `log_level`: routine client-caused conditions must not log at `error`,
+    // or error-log-volume dashboards/alerts can't distinguish them from
+    // genuine server faults (this is what made a normal Maven virtual-repo
+    // 404 indistinguishable from a real incident before this fix).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_level_pool_timeout_is_warn() {
+        // Capacity signal, not the client's fault, but not proof the server
+        // is broken either -- worth a glance without paging on error rate.
+        let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
+        assert_eq!(err.log_level(), tracing::Level::WARN);
+        let stringified = AppError::Database(sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(stringified.log_level(), tracing::Level::WARN);
+    }
+
+    #[test]
+    fn test_log_level_credential_failures_are_warn() {
+        // Client-caused, but repeated failures can signal credential
+        // stuffing or a broken client -- more than routine INFO, but not
+        // an error-rate-alert-worthy server fault either.
+        assert_eq!(
+            AppError::Authentication("bad credentials".into()).log_level(),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            AppError::Unauthorized("missing token".into()).log_level(),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            AppError::Authorization("access denied".into()).log_level(),
+            tracing::Level::WARN
+        );
+    }
+
+    #[test]
+    fn test_log_level_routine_client_conditions_are_info() {
+        // The direct case this fix targets: a missing artifact/repo is
+        // completely routine (e.g. Maven checking multiple virtual-repo
+        // members), not a bug.
+        assert_eq!(
+            AppError::NotFound("File not found".into()).log_level(),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            AppError::Conflict("already exists".into()).log_level(),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            AppError::Validation("bad input".into()).log_level(),
+            tracing::Level::INFO
+        );
+        // 507, outside the 4xx range `status_and_code` otherwise keys off of,
+        // so it needs its own arm -- still a client condition (they hit
+        // their quota), not a server fault.
+        assert_eq!(
+            AppError::QuotaExceeded("over limit".into()).log_level(),
+            tracing::Level::INFO
+        );
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert_eq!(AppError::Json(json_err).log_level(), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn test_log_level_jwt_and_name_too_long_are_info() {
+        // Regression coverage for the two variants a hand-maintained variant
+        // list previously missed: both classify as 400/401 via
+        // `status_and_code`, so deriving `log_level` from that mapping picks
+        // them up automatically instead of needing a second list to keep in
+        // sync.
+        let jwt_err: jsonwebtoken::errors::Error = jsonwebtoken::decode::<serde_json::Value>(
+            "not-a-token",
+            &jsonwebtoken::DecodingKey::from_secret(b"x"),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+        )
+        .unwrap_err();
+        assert_eq!(AppError::Jwt(jwt_err).log_level(), tracing::Level::INFO);
+
+        let name_too_long = AppError::Storage("File name too long (os error 36)".into());
+        assert_eq!(name_too_long.log_level(), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn test_log_level_server_faults_are_error() {
+        // Genuine server-side faults must keep logging at `error` --
+        // unchanged from before this fix.
+        assert_eq!(
+            AppError::Database("connection refused".into()).log_level(),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            AppError::Storage("disk full".into()).log_level(),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            AppError::Internal("panic".into()).log_level(),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            AppError::Config("bad config".into()).log_level(),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            AppError::BadGateway("upstream failed".into()).log_level(),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            AppError::ServiceUnavailable("at capacity".into()).log_level(),
+            tracing::Level::ERROR
+        );
     }
 }

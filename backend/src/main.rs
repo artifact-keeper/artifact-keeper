@@ -888,6 +888,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     "http_request",
                     method = %request.method(),
                     uri = %sanitized,
+                    correlation_id = tracing::field::Empty,
                 )
             }),
         );
