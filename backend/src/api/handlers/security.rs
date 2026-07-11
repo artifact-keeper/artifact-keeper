@@ -679,13 +679,13 @@ async fn trigger_scan(
         AppError::Validation("Either artifact_id or repository_id is required".to_string())
     })?;
 
-    let count: i64 = sqlx::query_scalar!(
-        "SELECT COUNT(*) as \"count!\" FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
-        repository_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Use the same enumeration the scan worker uses (virtual repos resolve to
+    // their member repos recursively) so the reported count always matches
+    // what actually gets enqueued (#2228).
+    let count: i64 = scanner
+        .repository_scan_artifact_ids(repository_id)
+        .await?
+        .len() as i64;
 
     tokio::spawn(async move {
         if let Err(e) = scanner

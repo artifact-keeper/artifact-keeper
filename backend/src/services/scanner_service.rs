@@ -94,6 +94,30 @@ pub(crate) const SCAN_MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 // leaving the two knobs inconsistent. Enforced at compile time.
 const _: () = assert!(SCAN_MMAP_THRESHOLD_BYTES < MAX_SCAN_INPUT_BYTES);
 
+/// Enumerate every non-deleted artifact a repository-wide scan should cover.
+///
+/// A virtual repository owns no `artifacts` rows of its own — its content
+/// lives under the repos referenced by `virtual_repo_members`. The recursive
+/// CTE resolves the member tree (virtuals may nest virtuals) and collects the
+/// artifacts of every reachable repo. For local/remote/staging repos the tree
+/// degenerates to the single starting id, so their behavior is unchanged.
+/// `UNION` (not `UNION ALL`) dedups repo ids and terminates on membership
+/// cycles. Shared by the scan worker and the trigger handler's reported count
+/// so the two can never disagree (#2228).
+pub(crate) const REPO_SCAN_ARTIFACT_IDS_SQL: &str = r#"
+WITH RECURSIVE repo_tree AS (
+    SELECT $1::uuid AS repo_id
+    UNION
+    SELECT vrm.member_repo_id
+    FROM virtual_repo_members vrm
+    JOIN repo_tree rt ON vrm.virtual_repo_id = rt.repo_id
+)
+SELECT a.id
+FROM artifacts a
+JOIN repo_tree rt ON a.repository_id = rt.repo_id
+WHERE a.is_deleted = false
+"#;
+
 /// Sanitize a filename to its basename, stripping any directory components
 /// to prevent path traversal attacks. Returns `"artifact"` as a fallback
 /// when the input has no valid filename component.
@@ -3892,6 +3916,18 @@ impl ScannerService {
             .await
     }
 
+    /// Resolve the ids of all non-deleted artifacts a repository-wide scan
+    /// covers, expanding virtual repositories to their member repos
+    /// recursively (see [`REPO_SCAN_ARTIFACT_IDS_SQL`]). Non-virtual repos
+    /// enumerate exactly their own artifacts, as before (#2228).
+    pub async fn repository_scan_artifact_ids(&self, repository_id: Uuid) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar(REPO_SCAN_ARTIFACT_IDS_SQL)
+            .bind(repository_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// Scan all artifacts in a repository.
     /// When `force` is true, bypass the scan-enabled config check (for manual triggers).
     /// When `bypass_dedup` is true, also bypass the hash-based scan dedup so a
@@ -3902,13 +3938,7 @@ impl ScannerService {
         force: bool,
         bypass_dedup: bool,
     ) -> Result<u32> {
-        let artifact_ids: Vec<Uuid> = sqlx::query_scalar!(
-            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
-            repository_id,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let artifact_ids = self.repository_scan_artifact_ids(repository_id).await?;
 
         let count = artifact_ids.len() as u32;
         info!(
@@ -12758,6 +12788,186 @@ mod tests {
             .scan_artifact_with_options(ghost_artifact, true, false)
             .await;
 
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2228 repository_scan_artifact_ids: repository-wide scans must resolve
+    // virtual repositories to their member repos (recursively) instead of
+    // enumerating the virtual's own (always-empty) artifacts set. The same
+    // helper feeds both the worker fan-out and the handler's reported count.
+    // -----------------------------------------------------------------------
+
+    /// Structural guard on the shared query so the recursive member walk
+    /// can't be silently flattened back to a single-repo lookup without a
+    /// DB in the loop (the DB-gated tests below skip without DATABASE_URL).
+    #[test]
+    fn test_repo_scan_artifact_ids_sql_walks_virtual_members() {
+        assert!(
+            REPO_SCAN_ARTIFACT_IDS_SQL.contains("WITH RECURSIVE"),
+            "repo scan enumeration must resolve nested virtual repos via a recursive CTE"
+        );
+        assert!(
+            REPO_SCAN_ARTIFACT_IDS_SQL.contains("virtual_repo_members"),
+            "repo scan enumeration must join through virtual_repo_members"
+        );
+        assert!(
+            REPO_SCAN_ARTIFACT_IDS_SQL.contains("is_deleted = false"),
+            "repo scan enumeration must exclude soft-deleted artifacts"
+        );
+    }
+
+    /// Sorted ids from the helper, computed on a throwaway minimal scanner,
+    /// for order-insensitive comparison. Building the scanner in here (rather
+    /// than per test) keeps the four #2228 tests boilerplate-free.
+    async fn scan_ids_sorted(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        repo_id: Uuid,
+    ) -> Vec<Uuid> {
+        let scanner = build_minimal_scanner_service(
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+        );
+        let mut ids = scanner
+            .repository_scan_artifact_ids(repo_id)
+            .await
+            .expect("repository_scan_artifact_ids must not error");
+        ids.sort();
+        ids
+    }
+
+    /// Create a virtual npm repo that aggregates the fixture's repo and
+    /// return its id plus storage dir (for cleanup via [`drop_extra_repo`]).
+    async fn virtual_over_fixture(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+    ) -> (Uuid, std::path::PathBuf) {
+        let (virtual_id, _key, dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&fx.pool, "virtual", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual_repo_members row");
+        (virtual_id, dir)
+    }
+
+    /// Drop a repo created outside the fixture (member rows cascade).
+    async fn drop_extra_repo(pool: &PgPool, repo_id: Uuid, storage_dir: &std::path::Path) {
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// Soft-delete one artifact row.
+    async fn soft_delete_artifact(pool: &PgPool, artifact_id: Uuid) {
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(artifact_id)
+            .execute(pool)
+            .await
+            .expect("soft-delete artifact");
+    }
+
+    #[tokio::test]
+    async fn test_repository_scan_artifact_ids_local_repo_own_artifacts() {
+        // Base-case regression guard: a non-virtual repo must enumerate
+        // exactly its own non-deleted artifacts — byte-for-byte the
+        // pre-#2228 behavior — and soft-deleted rows stay excluded.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let a1 = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let a2 = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let deleted = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        soft_delete_artifact(&fx.pool, deleted).await;
+
+        let mut expected = vec![a1, a2];
+        expected.sort();
+        assert_eq!(
+            scan_ids_sorted(&fx, fx.repo_id).await,
+            expected,
+            "local repo must enumerate exactly its own non-deleted artifacts"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_repository_scan_artifact_ids_virtual_resolves_members() {
+        // #2228: a virtual repo owns no artifacts rows; enumerating by its
+        // own id returned 0 and repo-wide scans silently enqueued nothing.
+        // The helper must walk virtual_repo_members and return the member
+        // repos' artifacts instead.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let a1 = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let a2 = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+
+        let (virtual_id, virtual_dir) = virtual_over_fixture(&fx).await;
+
+        let mut expected = vec![a1, a2];
+        expected.sort();
+        assert_eq!(
+            scan_ids_sorted(&fx, virtual_id).await,
+            expected,
+            "virtual repo must enumerate its member repo's artifacts (was 0 before #2228)"
+        );
+
+        drop_extra_repo(&fx.pool, virtual_id, &virtual_dir).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_repository_scan_artifact_ids_virtual_without_members_empty() {
+        // A virtual repo with no membership rows has nothing to scan; the
+        // helper must return an empty set (not error).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+
+        assert!(
+            scan_ids_sorted(&fx, fx.repo_id).await.is_empty(),
+            "memberless virtual repo must enumerate zero artifacts"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_repository_scan_artifact_ids_virtual_excludes_deleted_member_artifacts() {
+        // Soft-deleted artifacts in a member repo must stay out of the
+        // virtual repo's scan set, same as the direct (non-virtual) path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let live = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        let deleted = insert_minimal_artifact(&fx.pool, fx.repo_id, &fresh_checksum()).await;
+        soft_delete_artifact(&fx.pool, deleted).await;
+
+        let (virtual_id, virtual_dir) = virtual_over_fixture(&fx).await;
+
+        assert_eq!(
+            scan_ids_sorted(&fx, virtual_id).await,
+            vec![live],
+            "deleted member artifacts must not be enqueued via the virtual repo"
+        );
+
+        drop_extra_repo(&fx.pool, virtual_id, &virtual_dir).await;
         fx.teardown().await;
     }
 
