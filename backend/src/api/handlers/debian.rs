@@ -539,10 +539,9 @@ async fn load_debian_repository_config(
     db: &PgPool,
     repo_id: uuid::Uuid,
 ) -> Option<DebianRepositoryConfig> {
-    match load_debian_repository_config_strict(db, repo_id).await {
-        Ok(config) => config,
-        Err(_) => None,
-    }
+    load_debian_repository_config_strict(db, repo_id)
+        .await
+        .unwrap_or_default()
 }
 
 /// Strict loader: distinguishes between "no config row" (Ok(None)) and a DB/parse
@@ -2962,6 +2961,7 @@ async fn pool_download(
 async fn flat_or_root_package_download(
     State(state): State<SharedState>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     let config = load_debian_repository_config(&state.db, repo.id).await;
@@ -3011,12 +3011,7 @@ async fn flat_or_root_package_download(
                 )
                     .into_response()
             })?;
-        let _ = sqlx::query!(
-            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-            artifact.id
-        )
-        .execute(&state.db)
-        .await;
+        crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
