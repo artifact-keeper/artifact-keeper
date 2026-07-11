@@ -472,12 +472,19 @@ impl ScanResultService {
 
         // Build the UNNEST arrays for a single batched audit INSERT
         // (PR #1212 audit, M1). One statement instead of N.
+        //
+        // One sweep is one logical operation, so every audit row it emits
+        // shares one generated correlation ID (#2414): an operator can pull
+        // the whole sweep out of the audit log with a single
+        // `get_by_correlation` query. The janitor runs outside any request
+        // scope, so the ID is generated here rather than inherited.
+        let sweep_correlation = crate::api::middleware::tracing::CorrelationId::generate();
         let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut actions: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_types: Vec<String> = Vec::with_capacity(reaped.len());
         let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(reaped.len());
         let mut details_blobs: Vec<serde_json::Value> = Vec::with_capacity(reaped.len());
-        let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(reaped.len());
+        let mut correlation_ids: Vec<String> = Vec::with_capacity(reaped.len());
         for row in &reaped {
             let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .resource(row.id)
@@ -489,7 +496,8 @@ impl ScanResultService {
                     row.completed_at,
                     secs,
                 ))
-                .system_actor(STUCK_SCAN_AUDIT_ACTOR);
+                .system_actor(STUCK_SCAN_AUDIT_ACTOR)
+                .correlation(sweep_correlation.as_str());
             user_ids.push(entry.user_id());
             actions.push(entry.action().as_str().to_string());
             resource_types.push(entry.resource_type().as_str().to_string());
@@ -500,7 +508,7 @@ impl ScanResultService {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             );
-            correlation_ids.push(entry.correlation_id());
+            correlation_ids.push(entry.correlation_id().to_string());
         }
 
         // Per-row audit emission (#1063). A scan transitioning running -> failed
@@ -527,7 +535,7 @@ impl ScanResultService {
                  ip_address, correlation_id)
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::text[], $3::text[], $4::uuid[],
-                $5::jsonb[], $6::text[], $7::uuid[]
+                $5::jsonb[], $6::text[], $7::text[]
             )
             "#,
         )
@@ -4098,6 +4106,55 @@ mod tests {
             assert_eq!(
                 still_running, 3,
                 "exactly 3 rows must remain stuck for the next tick"
+            );
+
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = ANY($1)")
+                .bind(&stuck_ids)
+                .execute(&pool)
+                .await;
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #2414: one janitor sweep is one logical operation, so every audit
+        /// row it emits must share a single correlation ID — that is what
+        /// lets an operator pull the whole sweep out of the audit log with
+        /// one `get_by_correlation` query. The `::text` cast reads the value
+        /// identically under the legacy UUID column and the #2414 TEXT
+        /// column, so this pins the contract red before the fix (each row
+        /// gets its own random UUID today) and green after.
+        #[tokio::test]
+        async fn cleanup_stuck_scans_stamps_one_correlation_id_per_sweep() {
+            let _serial = CLEANUP_TEST_LOCK.lock().await;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "cid").await;
+            let mut stuck_ids = Vec::with_capacity(3);
+            for _ in 0..3 {
+                stuck_ids.push(insert_stuck_running_scan(&pool, aid, repo_id, 3600).await);
+            }
+
+            let reaped = svc
+                .cleanup_stuck_scans(Duration::from_secs(60))
+                .await
+                .expect("janitor returned Ok");
+            assert!(reaped >= 3, "expected at least 3 reaps, got {}", reaped);
+
+            let distinct: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT correlation_id::text FROM audit_log \
+                 WHERE resource_id = ANY($1) AND action = 'SCAN_REAPED'",
+            )
+            .bind(&stuck_ids)
+            .fetch_all(&pool)
+            .await
+            .expect("read sweep correlation ids");
+            assert_eq!(
+                distinct.len(),
+                1,
+                "all audit rows from one sweep must share one correlation ID \
+                 (#2414); got {distinct:?}"
             );
 
             let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = ANY($1)")

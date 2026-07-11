@@ -881,7 +881,17 @@ async fn test_oidc_callback_emits_audit_records() {
 
     let (user_id, _, _) = get_user(&pool, &external_id).await.expect("provisioned");
     let (login_rows, _) = audit
-        .query(Some(user_id), Some("LOGIN"), None, None, None, None, 0, 50)
+        .query(
+            Some(user_id),
+            Some("LOGIN"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            50,
+        )
         .await
         .expect("audit query LOGIN");
     assert!(
@@ -926,7 +936,17 @@ async fn test_oidc_callback_emits_audit_records() {
     );
 
     let (fail_rows, _) = audit
-        .query(None, Some("LOGIN_FAILED"), None, None, None, None, 0, 200)
+        .query(
+            None,
+            Some("LOGIN_FAILED"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            200,
+        )
         .await
         .expect("audit query LOGIN_FAILED");
     assert!(

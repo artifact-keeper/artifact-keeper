@@ -190,10 +190,22 @@ pub struct AuditEntry {
     resource_id: Option<Uuid>,
     details: Option<serde_json::Value>,
     ip_address: Option<IpAddr>,
-    correlation_id: Uuid,
+    correlation_id: String,
 }
 
 impl AuditEntry {
+    /// Start building an audit entry.
+    ///
+    /// The correlation ID defaults to the in-flight request's correlation ID
+    /// (#2414) — the value `correlation_id_middleware` resolved from
+    /// `X-Correlation-ID` / `traceparent` (or generated), stamped on the
+    /// request span, and echoes to the caller — so every event emitted while
+    /// handling one request shares the ID an operator can join against
+    /// request logs and traces. Outside a request scope (background jobs,
+    /// startup, detached tasks) a fresh UUID is generated, preserving the
+    /// previous behavior; jobs that emit several related events should group
+    /// them under one explicit [`AuditEntry::correlation`] value per logical
+    /// operation.
     pub fn new(action: AuditAction, resource_type: ResourceType) -> Self {
         Self {
             user_id: None,
@@ -202,7 +214,9 @@ impl AuditEntry {
             resource_id: None,
             details: None,
             ip_address: None,
-            correlation_id: Uuid::new_v4(),
+            correlation_id: crate::api::middleware::tracing::current_correlation_id()
+                .map(crate::api::middleware::tracing::CorrelationId::into_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
         }
     }
 
@@ -281,8 +295,17 @@ impl AuditEntry {
         self
     }
 
-    pub fn correlation(mut self, correlation_id: Uuid) -> Self {
-        self.correlation_id = correlation_id;
+    /// Override the correlation ID (#2414: a string — caller-supplied header
+    /// values and W3C trace IDs are not UUIDs). Background jobs use this to
+    /// group all events of one logical operation under one generated value.
+    /// Clamped to `CORRELATION_ID_MAX_BYTES` like every other correlation
+    /// path — copying only the bounded prefix — so no builder input can
+    /// violate the audit_log length CHECK and fail the (fire-and-forget)
+    /// audit write.
+    pub fn correlation(mut self, correlation_id: impl AsRef<str>) -> Self {
+        self.correlation_id =
+            crate::api::middleware::tracing::clamp_correlation_value(correlation_id.as_ref())
+                .to_owned();
         self
     }
 
@@ -322,8 +345,8 @@ impl AuditEntry {
         self.ip_address
     }
 
-    pub(crate) fn correlation_id(&self) -> Uuid {
-        self.correlation_id
+    pub(crate) fn correlation_id(&self) -> &str {
+        &self.correlation_id
     }
 }
 
@@ -337,22 +360,26 @@ impl AuditService {
         Self { db }
     }
 
-    /// Log an audit entry
+    /// Log an audit entry.
+    ///
+    /// Runtime (non-macro) query so the #2414 `correlation_id` type change
+    /// (UUID -> TEXT) needs no offline `.sqlx` prepare, matching the pattern
+    /// [`AuditService::query`] already uses.
     pub async fn log(&self, entry: AuditEntry) -> Result<Uuid> {
-        let id = sqlx::query_scalar!(
+        let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
             "#,
-            entry.user_id,
-            entry.action.as_str(),
-            entry.resource_type.as_str(),
-            entry.resource_id,
-            entry.details,
-            entry.ip_address.map(|ip| ip.to_string()),
-            entry.correlation_id
         )
+        .bind(entry.user_id)
+        .bind(entry.action.as_str())
+        .bind(entry.resource_type.as_str())
+        .bind(entry.resource_id)
+        .bind(entry.details)
+        .bind(entry.ip_address.map(|ip| ip.to_string()))
+        .bind(entry.correlation_id)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -365,7 +392,9 @@ impl AuditService {
     /// A `LEFT JOIN` on `users` embeds `actor_username` without ever dropping
     /// an audit row: system events (`user_id` NULL) and events whose acting
     /// user has since been deleted come back with `actor_username = None`.
-    /// Runtime (non-macro) query so no offline `.sqlx` prepare is needed.
+    /// `correlation_id` is an exact-match filter (#2414) served by
+    /// `idx_audit_log_correlation`. Runtime (non-macro) queries so no offline
+    /// `.sqlx` prepare is needed.
     #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &self,
@@ -373,6 +402,7 @@ impl AuditService {
         action: Option<&str>,
         resource_type: Option<&str>,
         resource_id: Option<Uuid>,
+        correlation_id: Option<&str>,
         from: Option<chrono::DateTime<chrono::Utc>>,
         to: Option<chrono::DateTime<chrono::Utc>>,
         offset: i64,
@@ -390,17 +420,19 @@ impl AuditService {
               AND ($2::text IS NULL OR a.action = $2)
               AND ($3::text IS NULL OR a.resource_type = $3)
               AND ($4::uuid IS NULL OR a.resource_id = $4)
-              AND ($5::timestamptz IS NULL OR a.created_at >= $5)
-              AND ($6::timestamptz IS NULL OR a.created_at <= $6)
+              AND ($5::text IS NULL OR a.correlation_id = $5)
+              AND ($6::timestamptz IS NULL OR a.created_at >= $6)
+              AND ($7::timestamptz IS NULL OR a.created_at <= $7)
             ORDER BY a.created_at DESC
-            OFFSET $7
-            LIMIT $8
+            OFFSET $8
+            LIMIT $9
             "#,
         )
         .bind(user_id)
         .bind(action)
         .bind(resource_type)
         .bind(resource_id)
+        .bind(correlation_id)
         .bind(from)
         .bind(to)
         .bind(offset)
@@ -409,24 +441,26 @@ impl AuditService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let total = sqlx::query_scalar!(
+        let total: i64 = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*) as "count!"
+            SELECT COUNT(*)
             FROM audit_log
             WHERE ($1::uuid IS NULL OR user_id = $1)
               AND ($2::text IS NULL OR action = $2)
               AND ($3::text IS NULL OR resource_type = $3)
               AND ($4::uuid IS NULL OR resource_id = $4)
-              AND ($5::timestamptz IS NULL OR created_at >= $5)
-              AND ($6::timestamptz IS NULL OR created_at <= $6)
+              AND ($5::text IS NULL OR correlation_id = $5)
+              AND ($6::timestamptz IS NULL OR created_at >= $6)
+              AND ($7::timestamptz IS NULL OR created_at <= $7)
             "#,
-            user_id,
-            action,
-            resource_type,
-            resource_id,
-            from,
-            to
         )
+        .bind(user_id)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(correlation_id)
+        .bind(from)
+        .bind(to)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -434,15 +468,17 @@ impl AuditService {
         Ok((entries, total))
     }
 
-    /// Get audit logs for a specific resource
+    /// Get audit logs for a specific resource.
+    ///
+    /// Runtime (non-macro) query so the #2414 `correlation_id` type change
+    /// needs no offline `.sqlx` prepare.
     pub async fn get_resource_history(
         &self,
         resource_type: ResourceType,
         resource_id: Uuid,
         limit: i64,
     ) -> Result<Vec<AuditLogEntry>> {
-        let entries = sqlx::query_as!(
-            AuditLogEntry,
+        let entries = sqlx::query_as::<_, AuditLogEntry>(
             r#"
             SELECT
                 id, user_id, action, resource_type, resource_id,
@@ -452,10 +488,10 @@ impl AuditService {
             ORDER BY created_at DESC
             LIMIT $3
             "#,
-            resource_type.as_str(),
-            resource_id,
-            limit
         )
+        .bind(resource_type.as_str())
+        .bind(resource_id)
+        .bind(limit)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -463,10 +499,13 @@ impl AuditService {
         Ok(entries)
     }
 
-    /// Get audit logs by correlation ID (for tracking related actions)
-    pub async fn get_by_correlation(&self, correlation_id: Uuid) -> Result<Vec<AuditLogEntry>> {
-        let entries = sqlx::query_as!(
-            AuditLogEntry,
+    /// Get audit logs by correlation ID (for tracking related actions).
+    ///
+    /// `correlation_id` is a string (#2414): caller-supplied header values,
+    /// W3C trace IDs, or generated UUIDs. Runtime (non-macro) query so the
+    /// type change needs no offline `.sqlx` prepare.
+    pub async fn get_by_correlation(&self, correlation_id: &str) -> Result<Vec<AuditLogEntry>> {
+        let entries = sqlx::query_as::<_, AuditLogEntry>(
             r#"
             SELECT
                 id, user_id, action, resource_type, resource_id,
@@ -475,8 +514,8 @@ impl AuditService {
             WHERE correlation_id = $1
             ORDER BY created_at
             "#,
-            correlation_id
         )
+        .bind(correlation_id)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -657,7 +696,7 @@ pub fn sessions_invalidated_audit_entry(subject: Uuid, actor: Uuid, trigger: &st
 }
 
 /// Audit log entry from database
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 pub struct AuditLogEntry {
     pub id: Uuid,
     pub user_id: Option<Uuid>,
@@ -666,7 +705,7 @@ pub struct AuditLogEntry {
     pub resource_id: Option<Uuid>,
     pub details: Option<serde_json::Value>,
     pub ip_address: Option<String>,
-    pub correlation_id: Uuid,
+    pub correlation_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -686,7 +725,7 @@ pub struct AuditLogEntryWithActor {
     pub resource_id: Option<Uuid>,
     pub details: Option<serde_json::Value>,
     pub ip_address: Option<String>,
-    pub correlation_id: Uuid,
+    pub correlation_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub actor_username: Option<String>,
 }
@@ -855,8 +894,22 @@ mod tests {
         assert!(entry.resource_id.is_none());
         assert!(entry.details.is_none());
         assert!(entry.ip_address.is_none());
-        // correlation_id should be set (a random UUID)
-        assert!(!entry.correlation_id.is_nil());
+        // Outside a request scope the correlation_id falls back to a
+        // generated UUID (#2414 preserves the pre-existing behavior here).
+        assert!(Uuid::parse_str(&entry.correlation_id).is_ok());
+    }
+
+    /// #2414: inside a correlation scope (what `correlation_id_middleware`
+    /// establishes per request), `new()` inherits the scoped ID instead of
+    /// generating one.
+    #[tokio::test]
+    async fn test_audit_entry_new_inherits_scoped_correlation() {
+        use crate::api::middleware::tracing::{with_correlation_scope, CorrelationId};
+        let entry = with_correlation_scope(CorrelationId::new("scoped-audit-correlation"), async {
+            AuditEntry::new(AuditAction::Login, ResourceType::User)
+        })
+        .await;
+        assert_eq!(entry.correlation_id, "scoped-audit-correlation");
     }
 
     #[test]
@@ -1043,17 +1096,18 @@ mod tests {
 
     #[test]
     fn test_audit_entry_builder_correlation() {
-        let correlation_id = Uuid::new_v4();
+        // #2414: correlation IDs are strings — caller-supplied header values
+        // and W3C trace IDs, not just UUIDs.
         let entry = AuditEntry::new(AuditAction::BackupStarted, ResourceType::Backup)
-            .correlation(correlation_id);
-        assert_eq!(entry.correlation_id, correlation_id);
+            .correlation("caller-supplied-correlation");
+        assert_eq!(entry.correlation_id, "caller-supplied-correlation");
     }
 
     #[test]
     fn test_audit_entry_builder_full_chain() {
         let user_id = Uuid::new_v4();
         let resource_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
+        let correlation_id = "full-chain-correlation".to_string();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let details = serde_json::json!({"action": "test"});
 
@@ -1062,7 +1116,7 @@ mod tests {
             .resource(resource_id)
             .details(details.clone())
             .ip(ip)
-            .correlation(correlation_id);
+            .correlation(correlation_id.clone());
 
         assert_eq!(entry.user_id, Some(user_id));
         assert_eq!(entry.resource_id, Some(resource_id));
@@ -1101,7 +1155,7 @@ mod tests {
             resource_id: Some(Uuid::new_v4()),
             details: Some(serde_json::json!({"ip": "127.0.0.1"})),
             ip_address: Some("127.0.0.1".to_string()),
-            correlation_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4().to_string(),
             created_at: chrono::Utc::now(),
         };
         assert_eq!(entry.action, "LOGIN");
@@ -1120,7 +1174,7 @@ mod tests {
             resource_id: None,
             details: None,
             ip_address: None,
-            correlation_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4().to_string(),
             created_at: chrono::Utc::now(),
         };
         assert!(entry.user_id.is_none());
@@ -1341,6 +1395,7 @@ mod tests {
                 Some(resource_id),
                 None,
                 None,
+                None,
                 0,
                 50,
             )
@@ -1363,6 +1418,7 @@ mod tests {
                 Some("LOGIN"),
                 None,
                 Some(resource_id),
+                None,
                 None,
                 None,
                 0,
@@ -1416,7 +1472,7 @@ mod tests {
             .expect("log system event");
 
         let (rows, total) = service
-            .query(None, None, None, Some(resource_id), None, None, 0, 50)
+            .query(None, None, None, Some(resource_id), None, None, None, 0, 50)
             .await
             .expect("query succeeds");
         assert_eq!(total, 2);
@@ -1439,7 +1495,7 @@ mod tests {
         // ON DELETE SET NULL) with the username now unresolvable -> NULL.
         tdh::cleanup_user(&pool, user_id).await;
         let (rows_after, total_after) = service
-            .query(None, None, None, Some(resource_id), None, None, 0, 50)
+            .query(None, None, None, Some(resource_id), None, None, None, 0, 50)
             .await
             .expect("query after actor deletion succeeds");
         assert_eq!(total_after, 2, "rows survive actor deletion");
@@ -1447,6 +1503,231 @@ mod tests {
             rows_after.iter().all(|r| r.actor_username.is_none()),
             "deleted actor resolves to NULL username"
         );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&service.db)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2414: end-to-end request → audit-row correlation contract. A request
+    // carrying `X-Correlation-ID` is driven through the real
+    // `correlation_id_middleware` into a handler that logs audit entries the
+    // way production emitters do; the STORED rows must carry the caller's
+    // exact value (which is a string, not a UUID) and all rows from one
+    // request must share it.
+    // -----------------------------------------------------------------------
+
+    /// Logs two audit entries tagged with the test's unique resource id,
+    /// mirroring a production handler that audits twice in one request.
+    async fn double_audit_handler(
+        axum::extract::State((pool, resource_id)): axum::extract::State<(PgPool, Uuid)>,
+    ) -> &'static str {
+        let service = AuditService::new(pool);
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("first audit write succeeds");
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("second audit write succeeds");
+        "ok"
+    }
+
+    /// Fetches the stored correlation values for the test's rows as text.
+    /// The `::text` cast reads identically whether the column is the legacy
+    /// UUID type or the #2414 TEXT type, so this test compiles and runs
+    /// against both schemas — red before the fix, green after.
+    async fn stored_correlations(pool: &PgPool, resource_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT correlation_id::text FROM audit_log \
+             WHERE resource_id = $1 ORDER BY created_at, id",
+        )
+        .bind(resource_id)
+        .fetch_all(pool)
+        .await
+        .expect("read stored correlation ids")
+    }
+
+    #[tokio::test]
+    async fn request_correlation_id_round_trips_into_stored_audit_rows_db() {
+        use crate::api::middleware::tracing::{correlation_id_middleware, CORRELATION_ID_HEADER};
+        use axum::{body::Body, http::Request, middleware, routing::post, Router};
+        use tower::ServiceExt;
+
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let resource_id = Uuid::new_v4();
+        let app = Router::new()
+            .route("/audited-op", post(double_audit_handler))
+            .with_state((pool.clone(), resource_id))
+            .layer(middleware::from_fn(correlation_id_middleware));
+
+        let supplied = format!("audit-correlation-test-{}", resource_id.as_simple());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/audited-op")
+                    .header(CORRELATION_ID_HEADER, &supplied)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("audited request");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let stored = stored_correlations(&pool, resource_id).await;
+        assert_eq!(stored.len(), 2, "both audit writes must land");
+        assert!(
+            stored.iter().all(|c| *c == supplied),
+            "stored audit rows must preserve the caller-supplied correlation ID \
+             (#2414); got {stored:?}, want {supplied:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2414: the query correlation filter and `get_by_correlation` retrieve
+    /// exactly the rows sharing a (string) correlation ID.
+    #[tokio::test]
+    async fn test_query_filters_by_correlation_id_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuditService::new(pool);
+
+        let resource_id = Uuid::new_v4();
+        let wanted = format!("corr-a-{}", resource_id.as_simple());
+        let other = format!("corr-b-{}", resource_id.as_simple());
+        for (action, correlation) in [
+            (AuditAction::RepositoryCreated, &wanted),
+            (AuditAction::RepositoryUpdated, &wanted),
+            (AuditAction::RepositoryDeleted, &other),
+        ] {
+            service
+                .log(
+                    AuditEntry::new(action, ResourceType::Repository)
+                        .resource(resource_id)
+                        .correlation(correlation.clone()),
+                )
+                .await
+                .expect("log succeeds");
+        }
+
+        // The admin-endpoint filter path: only rows with the exact
+        // correlation ID come back, and the COUNT agrees.
+        let (rows, total) = service
+            .query(
+                None,
+                None,
+                None,
+                Some(resource_id),
+                Some(&wanted),
+                None,
+                None,
+                0,
+                50,
+            )
+            .await
+            .expect("query succeeds");
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.correlation_id == wanted));
+
+        // get_by_correlation joins the same rows, oldest-first.
+        let related = service
+            .get_by_correlation(&wanted)
+            .await
+            .expect("get_by_correlation succeeds");
+        let ours: Vec<_> = related
+            .iter()
+            .filter(|r| r.resource_id == Some(resource_id))
+            .collect();
+        assert_eq!(ours.len(), 2);
+        assert_eq!(ours[0].action, "REPOSITORY_CREATED");
+        assert_eq!(ours[1].action, "REPOSITORY_UPDATED");
+
+        // get_resource_history returns all three rows for the resource with
+        // their stored (string) correlation IDs intact.
+        let history = service
+            .get_resource_history(ResourceType::Repository, resource_id, 10)
+            .await
+            .expect("get_resource_history succeeds");
+        assert_eq!(history.len(), 3);
+        assert!(history
+            .iter()
+            .all(|r| r.correlation_id == wanted || r.correlation_id == other));
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&service.db)
+            .await;
+    }
+
+    /// #2414 hardening: the 256-byte cap. A value exactly at the cap
+    /// round-trips unchanged; an oversized `.correlation()` input is clamped
+    /// to the cap before it reaches the database, so no builder input can
+    /// trip the `audit_log_correlation_id_len` CHECK and fail the
+    /// (fire-and-forget) audit write.
+    #[test]
+    fn test_audit_entry_correlation_clamps_oversized_values() {
+        use crate::api::middleware::tracing::CORRELATION_ID_MAX_BYTES;
+        let oversized = "c".repeat(CORRELATION_ID_MAX_BYTES + 50);
+        let entry = AuditEntry::new(AuditAction::BackupStarted, ResourceType::Backup)
+            .correlation(oversized.clone());
+        assert_eq!(entry.correlation_id.len(), CORRELATION_ID_MAX_BYTES);
+        assert_eq!(entry.correlation_id, oversized[..CORRELATION_ID_MAX_BYTES]);
+    }
+
+    #[tokio::test]
+    async fn test_correlation_id_at_the_cap_round_trips_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::tracing::CORRELATION_ID_MAX_BYTES;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuditService::new(pool);
+
+        let resource_id = Uuid::new_v4();
+        // Unique suffix keys the value to this test run; padded out to
+        // exactly the 256-byte cap, the largest value the middleware can
+        // ever hand the audit layer and the largest the DB CHECK admits.
+        let mut at_cap = format!("cap-{}", resource_id.as_simple());
+        at_cap.push_str(&"p".repeat(CORRELATION_ID_MAX_BYTES - at_cap.len()));
+        assert_eq!(at_cap.len(), CORRELATION_ID_MAX_BYTES);
+
+        service
+            .log(
+                AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+                    .resource(resource_id)
+                    .correlation(at_cap.clone()),
+            )
+            .await
+            .expect("a cap-length correlation ID must not fail the audit write");
+
+        let related = service
+            .get_by_correlation(&at_cap)
+            .await
+            .expect("get_by_correlation succeeds");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].resource_id, Some(resource_id));
+        assert_eq!(related[0].correlation_id, at_cap);
 
         let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
             .bind(resource_id)

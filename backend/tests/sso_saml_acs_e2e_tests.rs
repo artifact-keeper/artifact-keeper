@@ -515,7 +515,17 @@ async fn test_saml_acs_emits_audit_records() {
 
     let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
     let (login_rows, _) = audit
-        .query(Some(user_id), Some("LOGIN"), None, None, None, None, 0, 50)
+        .query(
+            Some(user_id),
+            Some("LOGIN"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            50,
+        )
         .await
         .expect("audit query LOGIN");
     assert!(
@@ -545,7 +555,17 @@ async fn test_saml_acs_emits_audit_records() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let (fail_rows, _) = audit
-        .query(None, Some("LOGIN_FAILED"), None, None, None, None, 0, 200)
+        .query(
+            None,
+            Some("LOGIN_FAILED"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            200,
+        )
         .await
         .expect("audit query LOGIN_FAILED");
     assert!(
