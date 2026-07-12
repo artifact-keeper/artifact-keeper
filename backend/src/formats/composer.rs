@@ -186,37 +186,38 @@ impl FormatHandler for ComposerHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Validation helpers for upload overrides (#1717)
+// Validation helpers for Composer name and version values.
 //
-// Composer has no `composer publish` command; private registries accept uploads
-// over HTTP. Issue #1717 adds optional `?version=` and `?name=` query overrides
-// to the upload endpoint. These pure functions validate override values against
-// Composer's documented grammar so invalid input is rejected with a 400 before
-// any storage or DB write occurs. They deliberately use `std::result::Result`
-// (not `crate::error::Result`) because the override errors are surfaced as
-// plain 400 messages, not `AppError`s.
+// These pure functions validate package name and version values supplied to the
+// upload endpoint — either as `?name=` / `?version=` query overrides or read
+// directly from `composer.json` — against Composer's documented grammar, so
+// invalid input is rejected with a 400 before any storage or DB write occurs.
+// They use `std::result::Result` (not `crate::error::Result`) because the
+// errors are surfaced as plain 400 messages, not `AppError`s.
 // ---------------------------------------------------------------------------
 
-/// Maximum length for a Composer version override, matching the
-/// `artifacts.version` column (`VARCHAR(255)`).
+/// Maximum length for a Composer version, matching the `artifacts.version`
+/// column (`VARCHAR(255)`).
 const MAX_COMPOSER_VERSION_LEN: usize = 255;
 
-/// Maximum length for a Composer package-name override, matching the
-/// `artifacts.name` column (`VARCHAR(512)`).
+/// Maximum length for a Composer package name, matching the `artifacts.name`
+/// column (`VARCHAR(512)`).
 const MAX_COMPOSER_NAME_LEN: usize = 512;
 
 /// Compiled regex for Composer version strings (case-insensitive).
 ///
-/// Accepts Composer's documented version grammar:
-/// - Semver-ish: `v?X.Y[.Z[.W]]` (2-4 numeric components) with an optional
-///   stability suffix (`-dev`, `-patch`/`-p`, `-alpha`/`-a`, `-beta`/`-b`,
-///   `-RC`/`-rc`, `-stable`), each optionally followed by a number.
+/// Implements the version grammar documented by Composer at
+/// <https://getcomposer.org/doc/articles/versions.md> and
+/// <https://getcomposer.org/doc/04-schema.md#version>:
+/// - Semver: `v?X.Y[.Z[.W]]` (1-4 numeric components) with an optional
+///   dot-separated pre-release suffix (`-<id>(.<id>)*`, e.g. `-alpha.1`,
+///   `-RC1`, `-patch`) and optional build metadata (`+<id>(.<id>)*`).
 /// - Branch versions: `dev-<branch>` (e.g. `dev-main`, `dev-feature-x`).
 fn composer_version_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)^(dev-[a-z0-9][a-z0-9._-]*|v?\d+(\.\d+){1,3}(-(dev|patch|p|alpha|a|beta|b|rc|stable)\d*)?)$",
+            r"(?i)^(dev-[a-z0-9][a-z0-9._-]*|v?\d+(\.\d+){0,3}(-([0-9a-z-]+(\.[0-9a-z-]+)*))?(\+([0-9a-z-]+(\.[0-9a-z-]+)*))?)$",
         )
         .expect("composer version regex must compile")
     })
@@ -233,11 +234,13 @@ fn composer_name_regex() -> &'static Regex {
     })
 }
 
-/// Validate a Composer version override (Issue #1717).
+/// Validate a Composer version string.
 ///
-/// Accepts the full Composer version grammar (semver with stability suffixes
-/// and `dev-<branch>` forms). Rejects empty input, values exceeding 255
-/// characters, path separators (`/`, `\`), `..`, and null/control characters.
+/// Returns `Ok(())` if `version` matches Composer's version grammar, or an
+/// `Err` describing why it is invalid. Used for both `?version=` query
+/// overrides and the `version` field read from `composer.json`. Rejects empty
+/// input, values exceeding 255 characters, path separators (`/`, `\`), `..`,
+/// and null/control characters.
 pub fn validate_composer_version(version: &str) -> std::result::Result<(), String> {
     if version.is_empty() {
         return Err("version must not be empty".to_string());
@@ -265,11 +268,13 @@ pub fn validate_composer_version(version: &str) -> std::result::Result<(), Strin
     Ok(())
 }
 
-/// Validate a Composer package-name override (Issue #1717).
+/// Validate a Composer package name.
 ///
-/// Uses the official Composer name regex (lowercase `vendor/package`). Also
-/// rejects empty input, values exceeding 512 characters, and null/control
-/// characters.
+/// Returns `Ok(())` if `name` matches the official Composer name regex
+/// (`vendor/package`, lowercase), or an `Err` describing why it is invalid.
+/// Used for both `?name=` query overrides and the `name` field read from
+/// `composer.json`. Also rejects empty input, values exceeding 512 characters,
+/// and null/control characters.
 pub fn validate_composer_name(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
         return Err("package name must not be empty".to_string());
@@ -285,7 +290,7 @@ pub fn validate_composer_name(name: &str) -> std::result::Result<(), String> {
     }
     if !composer_name_regex().is_match(name) {
         return Err(format!(
-            "package name '{name}' is not a valid Composer package name; expected lowercase 'vendor/package' form"
+            "package name '{name}' is not a valid Composer package name; expected lowercase 'vendor/package' form (e.g. 'monolog/monolog')"
         ));
     }
     Ok(())
@@ -701,7 +706,7 @@ mod tests {
         }
     }
 
-    // ---- validate_composer_version (#1717) ----
+    // ---- validate_composer_version ----
 
     #[test]
     fn test_validate_composer_version_valid() {
@@ -716,6 +721,11 @@ mod tests {
             "1.0.0-beta",
             "1.0.0-dev",
             "1.0.0-stable",
+            // Dot-separated pre-release identifiers and build metadata (semver).
+            "1.0.0-rc.1",
+            "1.0.0-alpha.1.beta",
+            "1.0.0+build.5",
+            "1.0.0-alpha.1+build",
             "dev-main",
             "dev-feature-x",
             "dev-1.2",
@@ -766,7 +776,7 @@ mod tests {
         assert!(validate_composer_version("1.0.0\0bad").is_err());
     }
 
-    // ---- validate_composer_name (#1717) ----
+    // ---- validate_composer_name ----
 
     #[test]
     fn test_validate_composer_name_valid() {
