@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::api::dto::Pagination;
 use crate::api::handlers::promotion::validate_promotion_repos;
-use crate::api::handlers::repositories::require_visible;
+use crate::api::handlers::repositories::{require_repo_id_visible, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -532,17 +532,34 @@ pub async fn request_approval(
 )]
 pub async fn list_pending_approvals(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<PendingQuery>,
 ) -> Result<Json<ApprovalListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
+    // Cross-repo authorization (#2443): when filtered by source repository, gate
+    // on that repo's visibility. The unfiltered form spans every repo, so it is
+    // admin-only (mirrors the health dashboard aggregate).
+    if query.source_repository.is_none() {
+        auth.require_admin()?;
+    }
+
     let (rows, total): (Vec<ApprovalRow>, i64) = if let Some(ref source_key) =
         query.source_repository
     {
         let repo_service = RepositoryService::new(state.db.clone());
-        let source = repo_service.get_by_key(source_key).await?;
+        let source = repo_service
+            .get_by_key(source_key)
+            .await
+            .map_err(|e| match e {
+                AppError::NotFound(_) => {
+                    AppError::NotFound(format!("Repository '{}' not found", source_key))
+                }
+                other => other,
+            })?;
+        require_visible(&source, &Some(auth.clone()), &repo_service).await?;
 
         let rows: Vec<ApprovalRow> = sqlx::query_as(&format!(
                 "{} WHERE pa.status = 'pending' AND pa.source_repo_id = $1 ORDER BY pa.requested_at DESC LIMIT $2 OFFSET $3",
@@ -615,6 +632,7 @@ pub async fn list_pending_approvals(
 )]
 pub async fn get_approval(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(approval_id): Path<Uuid>,
 ) -> Result<Json<ApprovalResponse>> {
     let row: ApprovalRow = sqlx::query_as(&format!("{} WHERE pa.id = $1", SELECT_APPROVAL))
@@ -623,6 +641,19 @@ pub async fn get_approval(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Approval request not found".to_string()))?;
+
+    // Cross-repo authorization (#2443): an approval discloses the artifact +
+    // source/target repo pairing. Resolve the source repo (the promotion origin
+    // the write path `request_approval` already gates on) and apply the same
+    // visibility check. A caller who cannot see the source repo gets the SAME
+    // 404 as a missing approval so the id is not a cross-tenant existence oracle.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        row.source_repo_id,
+        "Approval request not found",
+    )
+    .await?;
 
     Ok(Json(row.into_response()))
 }
@@ -1008,8 +1039,16 @@ pub async fn reject_promotion(
 )]
 pub async fn list_approval_history(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ApprovalHistoryQuery>,
 ) -> Result<Json<ApprovalListResponse>> {
+    // Cross-repo authorization (#2443): the unfiltered history spans every repo,
+    // so it is admin-only (mirrors the health dashboard aggregate); the
+    // per-source-repo form is gated on that repo's visibility below.
+    if query.source_repository.is_none() {
+        auth.require_admin()?;
+    }
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -1031,7 +1070,16 @@ pub async fn list_approval_history(
 
     let source_repo_id: Option<Uuid> = if let Some(ref source_key) = query.source_repository {
         let repo_service = RepositoryService::new(state.db.clone());
-        let repo = repo_service.get_by_key(source_key).await?;
+        let repo = repo_service
+            .get_by_key(source_key)
+            .await
+            .map_err(|e| match e {
+                AppError::NotFound(_) => {
+                    AppError::NotFound(format!("Repository '{}' not found", source_key))
+                }
+                other => other,
+            })?;
+        require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
         conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
         bind_idx += 1;
         Some(repo.id)
@@ -2354,6 +2402,93 @@ mod tests {
                 .bind(user)
                 .execute(pool)
                 .await;
+        }
+
+        /// #2443: `get_approval` must gate on the approval's source-repo
+        /// visibility. A caller who cannot see the source repo gets the SAME
+        /// existence-hiding 404 as a missing approval; a member gets 200.
+        #[tokio::test]
+        async fn test_get_approval_cross_tenant_authz_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr2443-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr2443-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s2443", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t2443", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let requester = make_requester(&pool, "2443").await;
+            let member = make_requester(&pool, "2443m").await;
+            let outsider = make_requester(&pool, "2443o").await;
+            grant_repo(&pool, member, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg2443").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let denied = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(outsider, "o2443")),
+                Path(approval),
+            )
+            .await;
+            assert!(
+                matches!(denied, Err(AppError::NotFound(_))),
+                "non-member of source repo must 404: {denied:?}"
+            );
+
+            let seen = get_approval(
+                State(state),
+                Extension(tdh::make_auth(member, "m2443")),
+                Path(approval),
+            )
+            .await;
+            assert!(
+                seen.is_ok(),
+                "member of source repo must see approval: {seen:?}"
+            );
+
+            cleanup(&pool, &[src, tgt], requester).await;
+            cleanup_user(&pool, member).await;
+            cleanup_user(&pool, outsider).await;
+        }
+
+        /// #2443: the unfiltered pending-approvals aggregate is admin-only; a
+        /// non-admin gets 403 while an admin gets 200.
+        #[tokio::test]
+        async fn test_list_pending_unfiltered_admin_only_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let user = make_requester(&pool, "2443lp").await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let denied = list_pending_approvals(
+                State(state.clone()),
+                Extension(tdh::make_auth(user, "lp2443")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: None,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(denied, Err(AppError::Authorization(_))),
+                "unfiltered pending list must be admin-only: {denied:?}"
+            );
+            let admin_ok = list_pending_approvals(
+                State(state),
+                Extension(tdh::admin_auth(user, "lp2443")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: None,
+                }),
+            )
+            .await;
+            assert!(admin_ok.is_ok(), "admin sees the aggregate: {admin_ok:?}");
+            cleanup_user(&pool, user).await;
         }
 
         /// The gap PR #1940 closed: approving a rule-UNMET promotion must be

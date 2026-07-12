@@ -1331,9 +1331,26 @@ async fn delete_license_policy(
 )]
 async fn check_license_compliance(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CheckLicenseComplianceRequest>,
 ) -> Result<Json<LicenseCheckResult>> {
+    // Cross-repo authorization (#2443): a repo-scoped license-policy check reads
+    // the targeted private repo's configured policy. Resolve the repo and apply
+    // the same membership gate as the other repo-scoped SBOM routes
+    // (existence-hiding 404) BEFORE reading. Missing repo, not-visible repo, and
+    // no-policy all collapse to the same 404 so the id is not an existence
+    // oracle. The global (no-repository) policy is org-wide and carries no
+    // per-repo data, so it stays open to any authenticated user.
+    if let Some(repo_id) = body.repository_id {
+        let repo: Option<(Uuid, bool)> =
+            sqlx::query_as("SELECT id, is_public FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        require_repo_visibility(&state.db, &auth, repo, "No license policy configured").await?;
+    }
+
     let service = SbomService::new(state.db.clone());
     let policy = service
         .get_license_policy(body.repository_id)
@@ -3693,5 +3710,62 @@ mod tests {
             res.is_ok(),
             "public-repo convert allowed for any authed user"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2443: check_license_compliance must gate on the targeted repo's
+    // visibility. A non-member gets an existence-hiding 404; a member with a
+    // repo-scoped policy gets 200.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_license_compliance_cross_tenant_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // Seed a repo-scoped license policy so a permitted caller reaches 200.
+        sqlx::query(
+            "INSERT INTO license_policies (name, repository_id, allow_unknown, action) \
+             VALUES ('p2443', $1, true, 'warn')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed policy");
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        let denied = super::check_license_compliance(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(outsider, &outname)),
+            axum::Json(CheckLicenseComplianceRequest {
+                licenses: vec!["MIT".to_string()],
+                repository_id: Some(fx.repo_id),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404: {:?}",
+            denied.err()
+        );
+
+        let seen = super::check_license_compliance(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            axum::Json(CheckLicenseComplianceRequest {
+                licenses: vec!["MIT".to_string()],
+                repository_id: Some(fx.repo_id),
+            }),
+        )
+        .await;
+        assert!(seen.is_ok(), "member must pass: {:?}", seen.err());
+
+        let _ = sqlx::query("DELETE FROM license_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
     }
 }

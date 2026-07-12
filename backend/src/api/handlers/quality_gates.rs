@@ -10,10 +10,12 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
+use crate::api::handlers::repositories::require_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::quality_check_service::QualityCheckService;
+use crate::services::repository_service::RepositoryService;
 
 /// Create quality gate routes
 pub fn router() -> Router<SharedState> {
@@ -461,15 +463,21 @@ async fn get_artifact_health(
 )]
 async fn get_repo_health(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(key): Path<String>,
 ) -> Result<Json<RepoHealthResponse>> {
-    let repo_id: Uuid = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
-        .bind(&key)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    // Cross-repo authorization (#2443): a repository's aggregate health score
+    // exposes private-repo posture (grades, artifact counts). Gate on the
+    // canonical repo-visibility check before reading. Resolve the repo and
+    // collapse missing/hidden to the SAME existence-hiding 404 body so the key
+    // cannot be used as a cross-tenant existence oracle.
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await.map_err(|e| match e {
+        AppError::NotFound(_) => AppError::NotFound(format!("Repository '{}' not found", key)),
+        other => other,
+    })?;
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
+    let repo_id = repo.id;
 
     let qc_service = QualityCheckService::new(state.db.clone());
     let health = qc_service
@@ -500,13 +508,20 @@ async fn get_repo_health(
     tag = "quality",
     responses(
         (status = 200, description = "Health dashboard summary", body = HealthDashboardResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_health_dashboard(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<HealthDashboardResponse>> {
+    // Cross-repo authorization (#2443): the health dashboard is a whole-instance
+    // aggregate spanning every repository (including private ones the caller
+    // cannot see), so it is admin-only — mirroring the `/security` dashboard
+    // twin `get_dashboard`, which is already `require_admin`.
+    auth.require_admin()?;
+
     let qc_service = QualityCheckService::new(state.db.clone());
     let all_repo_scores = qc_service.list_repo_health_scores().await?;
 
@@ -2478,5 +2493,113 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         assert_no_qc_leak(&body);
         tdh::cleanup(&pool, repo_id, outsider_id).await;
+    }
+
+    // ----------------------------------------------------------------------
+    // #2443 cross-repo authorization for get_repo_health / get_health_dashboard
+    // ----------------------------------------------------------------------
+
+    async fn seed_repo_health(pool: &sqlx::PgPool, repo_id: Uuid) {
+        sqlx::query("INSERT INTO repo_health_scores (repository_id, health_score, health_grade) VALUES ($1, 90, 'A')")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("seed repo health");
+    }
+
+    // get_repo_health: non-member -> existence-hiding 404, no leak.
+    #[tokio::test]
+    async fn test_get_repo_health_non_member_404_no_leak_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        seed_repo_health(&pool, repo_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(outsider_id, &outsider);
+        let (status, body) = raw_get(
+            quality_app(state, auth),
+            &format!("/health/repositories/{}", key),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, outsider_id).await;
+    }
+
+    // get_repo_health: member -> 200; public flip -> non-member 200.
+    #[tokio::test]
+    async fn test_get_repo_health_member_and_public_200_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        seed_repo_health(&pool, repo_id).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, _b) = raw_get(
+            quality_app(state.clone(), auth),
+            &format!("/health/repositories/{}", key),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "member must see health");
+
+        // Public flip: an unrelated user now passes the gate too.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (status, _b) = raw_get(
+            quality_app(state, tdh::make_auth(outsider_id, &outsider)),
+            &format!("/health/repositories/{}", key),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "public repo health is visible"
+        );
+        tdh::cleanup_user(&pool, outsider_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // get_health_dashboard: non-admin -> 403; admin -> 200.
+    #[tokio::test]
+    async fn test_get_health_dashboard_admin_only_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        seed_repo_health(&pool, repo_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let (status, _b) = raw_get(
+            quality_app(state.clone(), tdh::make_auth(user_id, &username)),
+            "/health/dashboard",
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "non-admin must be blocked from the cross-repo dashboard"
+        );
+
+        let (status, _b) = raw_get(
+            quality_app(state, tdh::admin_auth(user_id, &username)),
+            "/health/dashboard",
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "admin sees the dashboard"
+        );
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 }

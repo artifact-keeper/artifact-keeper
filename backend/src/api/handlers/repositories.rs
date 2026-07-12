@@ -242,6 +242,34 @@ pub(crate) async fn require_visible(
     }
 }
 
+/// Resolve a repository by id and enforce caller visibility, collapsing both
+/// "repository does not exist" and "repository not visible to the caller" to
+/// the same existence-hiding 404 (`not_found_msg`) so the id cannot be used as
+/// a cross-tenant existence oracle.
+///
+/// Thin convenience wrapper over [`require_visible`] for the leaky sub-resource
+/// read handlers in sibling modules (promotion-rule / approval / curation /
+/// signing) that hold a bare `repository_id` rather than a loaded
+/// `Repository`. Public repos + admins pass; members of a private repo pass;
+/// everyone else gets `not_found_msg`.
+pub(crate) async fn require_repo_id_visible(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    not_found_msg: &str,
+) -> Result<()> {
+    let repo_service = RepositoryService::new(db.clone());
+    let repo = match repo_service.get_by_id(repo_id).await {
+        Ok(r) => r,
+        Err(AppError::NotFound(_)) => return Err(AppError::NotFound(not_found_msg.to_string())),
+        Err(e) => return Err(e),
+    };
+    match require_visible(&repo, &Some(auth.clone()), &repo_service).await {
+        Err(AppError::NotFound(_)) => Err(AppError::NotFound(not_found_msg.to_string())),
+        other => other,
+    }
+}
+
 /// Pure decision for the fine-grained privilege gate on virtual-member
 /// mutations: admins always pass; every other caller must hold the
 /// `repository:admin` action on the virtual parent. Mirrors the gate used by
@@ -9829,6 +9857,68 @@ mod tests {
         assert!(seen.is_ok(), "a granted member must see the repo: {seen:?}");
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// DB-backed (#2443): the shared `require_repo_id_visible` resolve-then-gate
+    /// helper (reused by the promotion-rule / approval / curation / signing read
+    /// handlers) collapses missing + not-visible to the same existence-hiding
+    /// 404, admits members/admins/public, and denies non-members.
+    #[tokio::test]
+    async fn test_require_repo_id_visible_gate_matrix_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, member).await;
+
+        // non-member -> existence-hiding 404
+        let denied =
+            require_repo_id_visible(&pool, &tdh::make_auth(outsider, &oname), repo_id, "nope")
+                .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must get 404: {denied:?}"
+        );
+        // missing repo -> same 404 (no existence oracle)
+        let missing = require_repo_id_visible(
+            &pool,
+            &tdh::make_auth(outsider, &oname),
+            Uuid::new_v4(),
+            "nope",
+        )
+        .await;
+        assert!(
+            matches!(missing, Err(AppError::NotFound(_))),
+            "missing repo must also 404: {missing:?}"
+        );
+        // member -> ok
+        let seen =
+            require_repo_id_visible(&pool, &tdh::make_auth(member, &mname), repo_id, "nope").await;
+        assert!(seen.is_ok(), "member must pass: {seen:?}");
+        // admin -> ok
+        let admin =
+            require_repo_id_visible(&pool, &tdh::admin_auth(outsider, &oname), repo_id, "nope")
+                .await;
+        assert!(admin.is_ok(), "admin must pass: {admin:?}");
+        // public flip -> non-member passes
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let public =
+            require_repo_id_visible(&pool, &tdh::make_auth(outsider, &oname), repo_id, "nope")
+                .await;
+        assert!(
+            public.is_ok(),
+            "public repo visible to non-member: {public:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, member).await;
+        tdh::cleanup_user(&pool, outsider).await;
     }
 
     /// DB-backed: a non-admin without `repository:admin` on the virtual parent

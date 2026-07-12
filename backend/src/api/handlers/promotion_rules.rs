@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
@@ -215,8 +216,20 @@ fn eval_to_response(eval: &RuleEvaluationResult) -> RuleEvaluationResponse {
 )]
 async fn list_rules(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListRulesQuery>,
 ) -> Result<Json<PromotionRuleListResponse>> {
+    // Cross-repo authorization (#2443): a rule discloses its source/target repo
+    // pairing and gate config. When filtered by `source_repo_id`, gate on that
+    // repo's visibility (member/admin/public pass; others get an
+    // existence-hiding 404). The unfiltered form is a whole-instance aggregate
+    // over every repo, so it is admin-only (mirrors the health dashboard).
+    match query.source_repo_id {
+        Some(repo_id) => {
+            require_repo_id_visible(&state.db, &auth, repo_id, "Repository not found").await?
+        }
+        None => auth.require_admin()?,
+    }
     let service = PromotionRuleService::new(state.db.clone());
     let rules = service.list(query.source_repo_id).await?;
     let items: Vec<PromotionRuleResponse> = rules.into_iter().map(rule_to_response).collect();
@@ -279,10 +292,21 @@ async fn create_rule(
 )]
 async fn get_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PromotionRuleResponse>> {
     let service = PromotionRuleService::new(state.db.clone());
     let rule = service.get(id).await?;
+    // Cross-repo authorization (#2443): resolve the rule's source repo and gate
+    // before returning it. A caller who cannot see the source repo gets the
+    // SAME 404 as a missing rule so the id is not an existence oracle.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        rule.source_repo_id,
+        "Promotion rule not found",
+    )
+    .await?;
     Ok(Json(rule_to_response(rule)))
 }
 
@@ -368,10 +392,22 @@ async fn delete_rule(
 )]
 async fn evaluate_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BulkEvaluationResponse>> {
     let service = PromotionRuleService::new(state.db.clone());
     let rule = service.get(id).await?;
+
+    // Cross-repo authorization (#2443): evaluation enumerates every artifact in
+    // the rule's source repo, so gate on that repo's visibility BEFORE the
+    // enumeration. Missing rule and hidden source repo return the SAME 404.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        rule.source_repo_id,
+        "Promotion rule not found",
+    )
+    .await?;
 
     // Get all non-deleted artifacts in the source repo
     let artifact_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
@@ -689,5 +725,151 @@ mod tests {
         // matching the direct-promotion and approve/reject admin gates.
         assert!(matches!(err, crate::error::AppError::Authorization(_)));
         assert!(err.to_string().contains("admin"));
+    }
+
+    // ----------------------------------------------------------------------
+    // #2443 cross-repo authorization for list_rules / get_rule / evaluate_rule
+    // ----------------------------------------------------------------------
+
+    #[cfg(test)]
+    async fn seed_rule(pool: &sqlx::PgPool, source: Uuid, target: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO promotion_rules (name, source_repo_id, target_repo_id) \
+             VALUES ('r2443', $1, $2) RETURNING id",
+        )
+        .bind(source)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .expect("seed rule")
+    }
+
+    // get_rule: a caller who cannot see the source repo gets the SAME 404 as a
+    // missing rule; a member of the source repo gets 200.
+    #[tokio::test]
+    async fn test_get_rule_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::error::AppError;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (src, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (tgt, _tk, _td) = tdh::create_repo(&pool, "local", "rpm").await;
+        let rule = seed_rule(&pool, src, tgt).await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, src, member).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let denied = super::get_rule(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(rule),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member of source repo must 404: {denied:?}"
+        );
+
+        let seen = super::get_rule(
+            State(state),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(rule),
+        )
+        .await;
+        assert!(
+            seen.is_ok(),
+            "member of source repo must see rule: {seen:?}"
+        );
+
+        tdh::cleanup(&pool, src, member).await;
+        tdh::cleanup(&pool, tgt, outsider).await;
+    }
+
+    // evaluate_rule: gate runs BEFORE artifact enumeration — non-member 404.
+    #[tokio::test]
+    async fn test_evaluate_rule_non_member_404_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::error::AppError;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (src, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (tgt, _tk, _td) = tdh::create_repo(&pool, "local", "rpm").await;
+        let rule = seed_rule(&pool, src, tgt).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let denied = super::evaluate_rule(
+            State(state),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(rule),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404 before enumeration: {denied:?}"
+        );
+        tdh::cleanup(&pool, src, outsider).await;
+        tdh::cleanup(&pool, tgt, outsider).await;
+    }
+
+    // list_rules: unfiltered aggregate is admin-only (403 for non-admin, 200 for
+    // admin); the per-source-repo filter admits a member.
+    #[tokio::test]
+    async fn test_list_rules_aggregate_admin_only_and_filter_member_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::error::AppError;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (src, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (tgt, _tk, _td) = tdh::create_repo(&pool, "local", "rpm").await;
+        let _rule = seed_rule(&pool, src, tgt).await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, src, member).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Unfiltered aggregate: non-admin 403.
+        let denied = super::list_rules(
+            State(state.clone()),
+            Extension(tdh::make_auth(member, &mname)),
+            Query(ListRulesQuery {
+                source_repo_id: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "unfiltered list must be admin-only: {denied:?}"
+        );
+
+        // Unfiltered aggregate: admin 200.
+        let admin_ok = super::list_rules(
+            State(state.clone()),
+            Extension(tdh::admin_auth(member, &mname)),
+            Query(ListRulesQuery {
+                source_repo_id: None,
+            }),
+        )
+        .await;
+        assert!(admin_ok.is_ok(), "admin sees the aggregate: {admin_ok:?}");
+
+        // Filtered by the member's source repo: 200.
+        let member_ok = super::list_rules(
+            State(state),
+            Extension(tdh::make_auth(member, &mname)),
+            Query(ListRulesQuery {
+                source_repo_id: Some(src),
+            }),
+        )
+        .await;
+        assert!(
+            member_ok.is_ok(),
+            "member sees rules of their source repo: {member_ok:?}"
+        );
+
+        tdh::cleanup(&pool, src, member).await;
+        tdh::cleanup(&pool, tgt, member).await;
     }
 }

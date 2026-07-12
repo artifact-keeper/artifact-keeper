@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -335,9 +336,15 @@ async fn get_public_key(
 )]
 async fn get_repo_signing_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_id): Path<Uuid>,
 ) -> Result<Json<SigningConfigResponse>> {
+    // Cross-repo authorization (#2443): a repo's signing config reveals whether
+    // signatures are required and which key signs its artifacts. Gate on the
+    // repo's visibility before reading. Missing repo and not-visible repo return
+    // the SAME existence-hiding 404 so the id is not a cross-tenant oracle.
+    require_repo_id_visible(&state.db, &auth, repo_id, "Repository not found").await?;
+
     let svc = signing_service(&state);
     let config = svc.get_signing_config(repo_id).await?;
 
@@ -1078,5 +1085,60 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2443: get_repo_signing_config must gate on repo visibility. A non-member
+    // gets an existence-hiding 404; a member (and admin, and public) gets 200.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_repo_signing_config_cross_tenant_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, member).await;
+        let sdir = std::env::temp_dir().join(format!("sk2443-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+
+        let denied = get_repo_signing_config(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404: {denied:?}"
+        );
+
+        let seen = get_repo_signing_config(
+            State(state.clone()),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(seen.is_ok(), "member must see signing config: {seen:?}");
+
+        // Public flip: an unrelated user now passes the gate.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let public = get_repo_signing_config(
+            State(state),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(public.is_ok(), "public repo config is visible: {public:?}");
+
+        tdh::cleanup(&pool, repo_id, member).await;
+        tdh::cleanup_user(&pool, outsider).await;
     }
 }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
@@ -213,10 +214,18 @@ pub struct StatsQuery {
 )]
 async fn list_rules(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<RuleResponse>>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let repo_id = params.get("staging_repo_id").and_then(|s| s.parse().ok());
+    // Cross-repo authorization (#2443): curation rules expose the private
+    // staging repo's package-gating policy. Filtered by staging repo → gate on
+    // that repo's visibility; unfiltered spans every repo → admin-only.
+    match repo_id {
+        Some(id) => require_repo_id_visible(&state.db, &auth, id, "Repository not found").await?,
+        None => auth.require_admin()?,
+    }
     let rules = svc.list_rules(repo_id).await?;
     Ok(Json(rules.into_iter().map(rule_to_response).collect()))
 }
@@ -264,10 +273,24 @@ async fn create_rule(
 )]
 async fn get_rule(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RuleResponse>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let rule = svc.get_rule(id).await?;
+    // Cross-repo authorization (#2443): a curation rule discloses its staging
+    // repo id plus the package/version/arch patterns, action, priority, reason
+    // and author. Resolve the rule's staging repo and gate before returning it.
+    // A caller who cannot see the staging repo gets the SAME 404 as a missing
+    // rule so the id is not a cross-tenant existence oracle. A global rule
+    // (NULL staging repo) is org-wide config, so it is admin-only — mirroring
+    // the unfiltered `list_rules` aggregate.
+    match rule.staging_repo_id {
+        Some(repo_id) => {
+            require_repo_id_visible(&state.db, &auth, repo_id, "Curation rule not found").await?
+        }
+        None => auth.require_admin()?,
+    }
     Ok(Json(rule_to_response(rule)))
 }
 
@@ -332,8 +355,18 @@ async fn delete_rule(
 )]
 async fn list_packages(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<PackageListQuery>,
 ) -> Result<Json<Vec<CurationPackageResponse>>, AppError> {
+    // Cross-repo authorization (#2443): staged packages awaiting curation belong
+    // to a private staging repo. Gate on that repo's visibility before listing.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        query.staging_repo_id,
+        "Repository not found",
+    )
+    .await?;
     let svc = CurationService::new(state.db.clone());
     let packages = svc
         .list_packages(
@@ -356,10 +389,27 @@ async fn list_packages(
 )]
 async fn get_package(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CurationPackageResponse>, AppError> {
     let svc = CurationService::new(state.db.clone());
-    let pkg = svc.get_package(id).await?;
+    // Normalize the missing-package case to an existence-hiding 404 (the raw
+    // `fetch_one` RowNotFound would otherwise surface as a 500) so it is
+    // indistinguishable from the not-visible case gated below.
+    let pkg = svc.get_package(id).await.map_err(|e| match e {
+        sqlx::Error::RowNotFound => AppError::NotFound("Curation package not found".to_string()),
+        other => AppError::from(other),
+    })?;
+    // Cross-repo authorization (#2443): resolve the package's staging repo and
+    // gate before returning it. A caller who cannot see the staging repo gets
+    // the SAME 404 as a missing package so the id is not an existence oracle.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        pkg.staging_repo_id,
+        "Curation package not found",
+    )
+    .await?;
     Ok(Json(pkg_to_response(pkg)))
 }
 
@@ -478,8 +528,18 @@ async fn re_evaluate(
 )]
 async fn stats(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, AppError> {
+    // Cross-repo authorization (#2443): curation stats aggregate a private
+    // staging repo's package pipeline. Gate on that repo's visibility first.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        query.staging_repo_id,
+        "Repository not found",
+    )
+    .await?;
     let svc = CurationService::new(state.db.clone());
     let counts = svc.count_by_status(query.staging_repo_id).await?;
     Ok(Json(StatsResponse {
@@ -695,5 +755,209 @@ mod tests {
         assert_eq!(req.architecture, "*");
         assert_eq!(req.priority, 100);
         assert!(req.staging_repo_id.is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // #2443 cross-repo authorization for the curation read routes.
+    // ----------------------------------------------------------------------
+
+    #[cfg(test)]
+    async fn seed_rule(pool: &sqlx::PgPool, staging: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_rules \
+             (staging_repo_id, package_pattern, version_constraint, architecture, action, \
+              priority, reason, enabled) \
+             VALUES ($1, 'evil-*', '*', '*', 'block', 100, 'qa2443', true) RETURNING id",
+        )
+        .bind(staging)
+        .fetch_one(pool)
+        .await
+        .expect("seed curation rule")
+    }
+
+    // get_rule: non-member -> existence-hiding 404; member -> 200; public -> 200.
+    #[tokio::test]
+    async fn test_get_rule_cross_tenant_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let rule = seed_rule(&pool, staging).await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, member).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let denied = super::get_rule(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(rule),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404: {denied:?}"
+        );
+
+        // hidden vs absent rule id -> same 404 body (no existence oracle).
+        let absent = super::get_rule(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(Uuid::new_v4()),
+        )
+        .await;
+        match (&denied, &absent) {
+            (Err(AppError::NotFound(a)), Err(AppError::NotFound(b))) => {
+                assert_eq!(a, b, "hidden vs absent rule 404 bodies must match")
+            }
+            _ => panic!("both hidden and absent must be NotFound: {denied:?} {absent:?}"),
+        }
+
+        let seen = super::get_rule(
+            State(state.clone()),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(rule),
+        )
+        .await;
+        assert!(
+            seen.is_ok(),
+            "member of staging repo must see rule: {seen:?}"
+        );
+
+        // admin sees it too.
+        let admin = super::get_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(outsider, &oname)),
+            Path(rule),
+        )
+        .await;
+        assert!(admin.is_ok(), "admin must see rule: {admin:?}");
+
+        // public flip -> non-member passes.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(staging)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let public = super::get_rule(
+            State(state),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(rule),
+        )
+        .await;
+        assert!(public.is_ok(), "public repo rule is visible: {public:?}");
+
+        tdh::cleanup(&pool, staging, member).await;
+        tdh::cleanup_user(&pool, outsider).await;
+    }
+
+    #[cfg(test)]
+    async fn seed_package(pool: &sqlx::PgPool, staging: Uuid, remote: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO curation_packages \
+             (staging_repo_id, remote_repo_id, format, package_name, version, upstream_path) \
+             VALUES ($1, $2, 'rpm', 'pkg2443', '1.0', '/pkg2443') RETURNING id",
+        )
+        .bind(staging)
+        .bind(remote)
+        .fetch_one(pool)
+        .await
+        .expect("seed curation package")
+    }
+
+    // get_package: non-member -> existence-hiding 404; member -> 200.
+    #[tokio::test]
+    async fn test_get_package_cross_tenant_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let pkg = seed_package(&pool, staging, remote).await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, member).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let denied = super::get_package(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(pkg),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404: {denied:?}"
+        );
+
+        let seen = super::get_package(
+            State(state),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(pkg),
+        )
+        .await;
+        assert!(
+            seen.is_ok(),
+            "member of staging repo must see package: {seen:?}"
+        );
+
+        tdh::cleanup(&pool, staging, member).await;
+        tdh::cleanup(&pool, remote, outsider).await;
+    }
+
+    // stats: non-member of the staging repo -> 404.
+    #[tokio::test]
+    async fn test_stats_non_member_404_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let denied = super::stats(
+            State(state),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Query(StatsQuery {
+                staging_repo_id: staging,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404 on stats: {denied:?}"
+        );
+        tdh::cleanup(&pool, staging, outsider).await;
+    }
+
+    // list_rules: unfiltered aggregate is admin-only.
+    #[tokio::test]
+    async fn test_list_rules_unfiltered_admin_only_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, uname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let denied = super::list_rules(
+            State(state.clone()),
+            Extension(tdh::make_auth(user, &uname)),
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "unfiltered curation rules list must be admin-only: {denied:?}"
+        );
+        let admin_ok = super::list_rules(
+            State(state),
+            Extension(tdh::admin_auth(user, &uname)),
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert!(admin_ok.is_ok(), "admin sees the aggregate: {admin_ok:?}");
+        tdh::cleanup_user(&pool, user).await;
     }
 }
