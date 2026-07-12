@@ -5,8 +5,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
@@ -181,6 +183,112 @@ impl FormatHandler for ComposerHandler {
         // packages.json is generated on demand from DB state
         Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers for upload overrides (#1717)
+//
+// Composer has no `composer publish` command; private registries accept uploads
+// over HTTP. Issue #1717 adds optional `?version=` and `?name=` query overrides
+// to the upload endpoint. These pure functions validate override values against
+// Composer's documented grammar so invalid input is rejected with a 400 before
+// any storage or DB write occurs. They deliberately use `std::result::Result`
+// (not `crate::error::Result`) because the override errors are surfaced as
+// plain 400 messages, not `AppError`s.
+// ---------------------------------------------------------------------------
+
+/// Maximum length for a Composer version override, matching the
+/// `artifacts.version` column (`VARCHAR(255)`).
+const MAX_COMPOSER_VERSION_LEN: usize = 255;
+
+/// Maximum length for a Composer package-name override, matching the
+/// `artifacts.name` column (`VARCHAR(512)`).
+const MAX_COMPOSER_NAME_LEN: usize = 512;
+
+/// Compiled regex for Composer version strings (case-insensitive).
+///
+/// Accepts Composer's documented version grammar:
+/// - Semver-ish: `v?X.Y[.Z[.W]]` (2-4 numeric components) with an optional
+///   stability suffix (`-dev`, `-patch`/`-p`, `-alpha`/`-a`, `-beta`/`-b`,
+///   `-RC`/`-rc`, `-stable`), each optionally followed by a number.
+/// - Branch versions: `dev-<branch>` (e.g. `dev-main`, `dev-feature-x`).
+fn composer_version_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(dev-[a-z0-9][a-z0-9._-]*|v?\d+(\.\d+){1,3}(-(dev|patch|p|alpha|a|beta|b|rc|stable)\d*)?)$",
+        )
+        .expect("composer version regex must compile")
+    })
+}
+
+/// The official Composer package-name regex from the composer.json schema docs
+/// (<https://getcomposer.org/doc/04-schema.md#name>). Case-sensitive: Composer
+/// package names are lowercase `vendor/package`.
+fn composer_name_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[a-z0-9]([_.-]?[a-z0-9]+)*/[a-z0-9](([_.]|-{1,2})?[a-z0-9]+)*$")
+            .expect("composer name regex must compile")
+    })
+}
+
+/// Validate a Composer version override (Issue #1717).
+///
+/// Accepts the full Composer version grammar (semver with stability suffixes
+/// and `dev-<branch>` forms). Rejects empty input, values exceeding 255
+/// characters, path separators (`/`, `\`), `..`, and null/control characters.
+pub fn validate_composer_version(version: &str) -> std::result::Result<(), String> {
+    if version.is_empty() {
+        return Err("version must not be empty".to_string());
+    }
+    if version.len() > MAX_COMPOSER_VERSION_LEN {
+        return Err(format!(
+            "version must not exceed {MAX_COMPOSER_VERSION_LEN} characters (got {})",
+            version.len()
+        ));
+    }
+    if version.contains('/') || version.contains('\\') {
+        return Err("version must not contain path separators ('/' or '\\')".to_string());
+    }
+    if version.contains("..") {
+        return Err("version must not contain '..'".to_string());
+    }
+    if version.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+        return Err("version must not contain null or control characters".to_string());
+    }
+    if !composer_version_regex().is_match(version) {
+        return Err(format!(
+            "version '{version}' is not a valid Composer version; expected a semver form like '1.0.0' or a dev-branch like 'dev-main'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a Composer package-name override (Issue #1717).
+///
+/// Uses the official Composer name regex (lowercase `vendor/package`). Also
+/// rejects empty input, values exceeding 512 characters, and null/control
+/// characters.
+pub fn validate_composer_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("package name must not be empty".to_string());
+    }
+    if name.len() > MAX_COMPOSER_NAME_LEN {
+        return Err(format!(
+            "package name must not exceed {MAX_COMPOSER_NAME_LEN} characters (got {})",
+            name.len()
+        ));
+    }
+    if name.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+        return Err("package name must not contain null or control characters".to_string());
+    }
+    if !composer_name_regex().is_match(name) {
+        return Err(format!(
+            "package name '{name}' is not a valid Composer package name; expected lowercase 'vendor/package' form"
+        ));
+    }
+    Ok(())
 }
 
 /// Composer path info
@@ -591,5 +699,130 @@ mod tests {
                 absent
             );
         }
+    }
+
+    // ---- validate_composer_version (#1717) ----
+
+    #[test]
+    fn test_validate_composer_version_valid() {
+        let valid = [
+            "1.0.0",
+            "v1.2.3",
+            "1.0",
+            "1.0.0.4",
+            "1.0.0-alpha3",
+            "1.0.0-RC1",
+            "1.0.0-p1",
+            "1.0.0-beta",
+            "1.0.0-dev",
+            "1.0.0-stable",
+            "dev-main",
+            "dev-feature-x",
+            "dev-1.2",
+        ];
+        for v in valid {
+            assert!(
+                validate_composer_version(v).is_ok(),
+                "expected '{v}' to be a valid Composer version"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_composer_version_invalid() {
+        let invalid = [
+            ("", "empty string"),
+            ("../bad", "path traversal"),
+            ("a/b", "forward slash"),
+            ("a\\b", "backslash"),
+            ("1.0.0..0", "double dot"),
+            ("1.0.0 trailing", "embedded space"),
+            ("not-a-version", "garbage"),
+            ("v", "bare v prefix"),
+        ];
+        for (v, label) in invalid {
+            assert!(
+                validate_composer_version(v).is_err(),
+                "expected '{v}' ({label}) to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_composer_version_length_boundary() {
+        // Exactly 255 chars of a valid dev-branch form is accepted.
+        let exactly_255 = format!("dev-{}", "a".repeat(251));
+        assert_eq!(exactly_255.len(), 255);
+        assert!(validate_composer_version(&exactly_255).is_ok());
+
+        // 256 chars is rejected by the length guard.
+        let too_long = format!("dev-{}", "a".repeat(252));
+        assert_eq!(too_long.len(), 256);
+        assert!(validate_composer_version(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_validate_composer_version_rejects_null_byte() {
+        assert!(validate_composer_version("1.0.0\0bad").is_err());
+    }
+
+    // ---- validate_composer_name (#1717) ----
+
+    #[test]
+    fn test_validate_composer_name_valid() {
+        let valid = [
+            "monolog/monolog",
+            "igorw/event-source",
+            "psr/log",
+            "aws/aws-sdk-php-v2",
+            "vendor/pkg.sub",
+            "vendor/pkg_sub",
+            "vendor/pkg--x",
+        ];
+        for n in valid {
+            assert!(
+                validate_composer_name(n).is_ok(),
+                "expected '{n}' to be a valid Composer package name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_composer_name_invalid() {
+        let invalid = [
+            ("no-slash", "missing slash"),
+            ("UPPER/case", "uppercase vendor"),
+            ("has space/pkg", "embedded space"),
+            ("../etc", "path traversal"),
+            ("vendor//pkg", "double slash"),
+            ("vendor/UPPER", "uppercase package"),
+            ("-leading/pkg", "leading dash in vendor"),
+            ("vendor/-leading", "leading dash in package"),
+            ("vendor/pkg!", "special character"),
+        ];
+        for (n, label) in invalid {
+            assert!(
+                validate_composer_name(n).is_err(),
+                "expected '{n}' ({label}) to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_composer_name_length_boundary() {
+        // Exactly 512 chars of a valid form is accepted.
+        let exactly_512 = format!("{}/{}", "a".repeat(254), "b".repeat(257));
+        assert_eq!(exactly_512.len(), 512);
+        assert!(validate_composer_name(&exactly_512).is_ok());
+
+        // 513 chars is rejected by the length guard.
+        let too_long = format!("{}/{}", "a".repeat(256), "b".repeat(256));
+        assert_eq!(too_long.len(), 513);
+        assert!(validate_composer_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_validate_composer_name_rejects_null_byte() {
+        assert!(validate_composer_name("vendor/pk\0g").is_err());
     }
 }

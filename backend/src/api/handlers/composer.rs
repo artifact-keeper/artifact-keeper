@@ -11,6 +11,12 @@
 //!   GET  /composer/{repo_key}/search.json?q=query                     - Search packages
 //!   PUT  /composer/{repo_key}/api/packages                            - Upload/register package
 //!   POST /composer/{repo_key}/api/packages                            - Upload/register package
+//!
+//! Uploads accept optional `?version=X` and `?name=vendor/pkg` query overrides
+//! (#1717). When provided, the override values become the canonical name/version
+//! stored in the DB and served to clients; the uploaded archive is stored
+//! byte-for-byte and the original `composer.json` is preserved verbatim in the
+//! nested metadata. Immutability still keys off the effective name+version.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -1328,10 +1334,24 @@ async fn search(
 // PUT/POST /composer/{repo_key}/api/packages - Upload/register package
 // ---------------------------------------------------------------------------
 
+/// Optional query-parameter overrides for Composer uploads (#1717).
+///
+/// `version` and `name` override the values read from `composer.json` inside
+/// the uploaded archive. Both are optional; omitting either preserves the
+/// existing (archive-derived) behavior. Override values are validated strictly
+/// (Composer version grammar / official name regex) and stored as the canonical
+/// name+version; the uploaded archive itself is never modified.
+#[derive(serde::Deserialize)]
+struct ComposerUploadQuery {
+    version: Option<String>,
+    name: Option<String>,
+}
+
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    Query(query): Query<ComposerUploadQuery>,
     body: Bytes,
 ) -> Result<Response, Response> {
     // Authenticate
@@ -1355,24 +1375,54 @@ async fn upload(
             .into_response()
     })?;
 
-    // Validate package name has vendor/package format
-    let full_name = &composer_json.name;
-    if !full_name.contains('/') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid package name '{}': must be in vendor/package format",
-                full_name
-            ),
-        )
-            .into_response());
-    }
+    // Resolve the canonical package name. A `?name=` override (#1717) is
+    // validated strictly against the official Composer name regex; otherwise
+    // the name is taken from composer.json with the existing loose
+    // `vendor/package` check (preserving backward compatibility).
+    let full_name: String = match query.name.as_deref() {
+        Some(n) => {
+            crate::formats::composer::validate_composer_name(n).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid package name override: {e}"),
+                )
+                    .into_response()
+            })?;
+            n.to_string()
+        }
+        None => {
+            let n = &composer_json.name;
+            if !n.contains('/') {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid package name '{n}': must be in vendor/package format"),
+                )
+                    .into_response());
+            }
+            n.clone()
+        }
+    };
 
-    let version = composer_json
-        .version
-        .as_deref()
-        .unwrap_or("dev-main")
-        .to_string();
+    // Resolve the canonical version. A `?version=` override (#1717) is
+    // validated strictly against Composer's version grammar; otherwise the
+    // version is taken from composer.json, falling back to `dev-main`.
+    let version: String = match query.version.as_deref() {
+        Some(v) => {
+            crate::formats::composer::validate_composer_version(v).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid version override: {e}"),
+                )
+                    .into_response()
+            })?;
+            v.to_string()
+        }
+        None => composer_json
+            .version
+            .as_deref()
+            .unwrap_or("dev-main")
+            .to_string(),
+    };
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -1496,7 +1546,7 @@ async fn upload(
         pkg_svc
             .try_create_or_update_from_artifact(
                 repo.id,
-                full_name,
+                &full_name,
                 &version,
                 size_bytes,
                 &sha256,
@@ -3088,6 +3138,245 @@ mod upload_db_tests {
             size > 0,
             "size_bytes must be the archive length the handler passed, got {}",
             size
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1717: optional `?version=` and `?name=` query overrides on the upload
+    // endpoint. The override values become the canonical name+version stored
+    // in the DB and returned to the client; the archive is stored untouched
+    // and immutability still keys off the effective name+version. These tests
+    // no-op without `DATABASE_URL` (CI provides one).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_with_version_override_stores_override_version() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // composer.json carries 0.0.1; the override must win.
+        let zip = build_composer_zip("acme/widget", "0.0.1", "version override (#1717)");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?version=2.0.0", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "override upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // Response reports the override version.
+        let resp: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse override upload response");
+        assert_eq!(
+            resp["version"], "2.0.0",
+            "response must echo the override version"
+        );
+        assert_eq!(resp["package"], "acme/widget");
+
+        // The artifact row carries the override version, not 0.0.1.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind("acme/widget")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query artifacts");
+        let (ver,) = row.expect("artifact row must exist after override upload");
+        assert_eq!(
+            ver, "2.0.0",
+            "override version must be stored, not composer.json's 0.0.1"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_name_override_stores_override_name() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // composer.json carries old/pkg; the override must win.
+        let zip = build_composer_zip("old/pkg", "1.0.0", "name override (#1717)");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?name=new/pkg", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "override upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // The override name is stored under new/pkg, not old/pkg.
+        let new_row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind("new/pkg")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query artifacts for override name");
+        assert_eq!(
+            new_row.0, 1,
+            "override name 'new/pkg' must be stored, not composer.json's 'old/pkg'"
+        );
+
+        let old_row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM artifacts \
+             WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("old/pkg")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query artifacts for composer.json name");
+        assert_eq!(
+            old_row.0, 0,
+            "composer.json name 'old/pkg' must not be stored when a name override is given"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_both_overrides_stores_override_name_and_version() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // composer.json carries old/pkg @ 0.0.1; both overrides must win.
+        let zip = build_composer_zip("old/pkg", "0.0.1", "both overrides (#1717)");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(
+            format!(
+                "/{}/api/packages?version=3.0.0&name=acme/widget",
+                f.repo_key
+            ),
+            zip,
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "override upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT name, version FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query artifacts for both-overrides upload");
+        assert_eq!(row.0, "acme/widget", "override name must be stored");
+        assert_eq!(row.1, "3.0.0", "override version must be stored");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_version_override_conflict_returns_409() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let zip = build_composer_zip("acme/widget", "0.0.1", "conflict (#1717)");
+
+        // First upload with override succeeds.
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(
+            format!("/{}/api/packages?version=2.0.0", f.repo_key),
+            zip.clone(),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "first override upload must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // Re-upload with the same override name+version must 409 (immutability
+        // now keys off the effective override name+version).
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?version=2.0.0", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "re-upload with same override version must 409: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_invalid_version_override_returns_400() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let zip = build_composer_zip("acme/widget", "0.0.1", "invalid version (#1717)");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?version=../bad", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid version override must 400: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // No artifact should have been stored.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query artifacts after rejected override");
+        assert_eq!(
+            count.0, 0,
+            "no artifact should be stored when an override is rejected"
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_invalid_name_override_returns_400() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let zip = build_composer_zip("acme/widget", "0.0.1", "invalid name (#1717)");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?name=NoSlash", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid name override must 400: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query artifacts after rejected override");
+        assert_eq!(
+            count.0, 0,
+            "no artifact should be stored when an override is rejected"
         );
 
         f.teardown().await;
