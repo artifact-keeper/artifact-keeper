@@ -21,6 +21,24 @@ use crate::services::repository_service::RepositoryService;
 use crate::services::scan_config_service::{ScanConfigService, UpsertScanConfigRequest};
 use crate::services::scan_result_service::ScanResultService;
 
+/// Canonical 404 body for the scan-by-id read routes. Both "this scan id does
+/// not exist" (from `ScanResultService::get_scan`) and "the scan exists but the
+/// caller may not see its repository" (from `check_artifact_visibility`) must
+/// return this SAME message so the response is not a boolean existence oracle
+/// for hidden scans. Kept identical to the string `get_scan` emits for a truly
+/// absent id. (#2439 residual.)
+const SCAN_NOT_FOUND_MSG: &str = "Scan result not found";
+
+/// Normalize a cross-repo-visibility `NotFound` (which carries an
+/// artifact-flavored message) to the canonical scan-not-found body, so a
+/// no-access scan is indistinguishable from an absent one.
+fn unify_scan_not_found(e: AppError) -> AppError {
+    match e {
+        AppError::NotFound(_) => AppError::NotFound(SCAN_NOT_FOUND_MSG.to_string()),
+        other => other,
+    }
+}
+
 /// Create security routes
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -798,8 +816,11 @@ async fn get_scan(
 
     // Cross-repo authorization (#2439): resolve the scan's owning artifact,
     // then apply the canonical visibility gate (existence-hiding 404) before
-    // returning any scan detail.
-    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db).await?;
+    // returning any scan detail. Normalize the no-access 404 body to the same
+    // message an absent id produces so it is not an existence oracle.
+    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db)
+        .await
+        .map_err(unify_scan_not_found)?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -841,8 +862,11 @@ async fn list_findings(
 
     // Cross-repo authorization (#2439): resolve the scan's owning artifact and
     // apply the canonical visibility gate (existence-hiding 404) before
-    // returning any CVE finding for it.
-    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db).await?;
+    // returning any CVE finding for it. Normalize the no-access 404 body to the
+    // same message an absent id produces so it is not an existence oracle.
+    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db)
+        .await
+        .map_err(unify_scan_not_found)?;
 
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(200);
@@ -3076,5 +3100,96 @@ mod tests {
         tdh::cleanup_user(&fx.pool, admin_id).await;
         fx.teardown().await;
         assert!(res.is_ok(), "admin may list all scans unfiltered");
+    }
+
+    // --- 404-body uniformity: hidden-exists vs truly-absent (#2439 residual) --
+    //
+    // A hidden-but-existing scan (no-access) and a nonexistent scan id must
+    // return the SAME 404 body, else the status/message is a boolean existence
+    // oracle. Extract the NotFound message in both cases and assert equality.
+
+    #[cfg(test)]
+    fn not_found_msg<T>(res: &Result<T>) -> String {
+        match res {
+            Err(AppError::NotFound(m)) => m.clone(),
+            Err(other) => panic!("expected NotFound, got {:?}", other),
+            Ok(_) => panic!("expected NotFound, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_scan_404_body_uniform_hidden_vs_absent_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        // hidden-but-existing scan, seen by a non-member.
+        let hidden = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(scan_id),
+        )
+        .await;
+        // truly-absent scan id.
+        let absent = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(Uuid::new_v4()),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        let hm = not_found_msg(&hidden);
+        let am = not_found_msg(&absent);
+        assert_eq!(
+            hm, am,
+            "hidden and absent get_scan 404 bodies must be identical (no oracle)"
+        );
+        assert_eq!(hm, SCAN_NOT_FOUND_MSG, "canonical scan-not-found message");
+    }
+
+    #[tokio::test]
+    async fn test_list_findings_404_body_uniform_hidden_vs_absent_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+
+        let hidden = list_findings(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(scan_id),
+            Query(ListFindingsQuery::default()),
+        )
+        .await;
+        let absent = list_findings(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(Uuid::new_v4()),
+            Query(ListFindingsQuery::default()),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        let hm = not_found_msg(&hidden);
+        let am = not_found_msg(&absent);
+        assert_eq!(
+            hm, am,
+            "hidden and absent list_findings 404 bodies must be identical (no oracle)"
+        );
+        assert_eq!(hm, SCAN_NOT_FOUND_MSG, "canonical scan-not-found message");
     }
 }

@@ -693,10 +693,18 @@ async fn get_sbom_components(
 )]
 async fn convert_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<ConvertSbomRequest>,
 ) -> Result<Json<SbomContentResponse>> {
+    // Cross-repo authorization (#2439): converting reads the SBOM's full
+    // component inventory and persists convert rows, so resolve the SBOM's
+    // owning repository and apply the same membership gate as the other
+    // by-id SBOM routes (existence-hiding 404) BEFORE any read or write.
+    // Member-visibility is the correct level: a member converting an SBOM
+    // they can already see is legitimate.
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
+
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
@@ -3551,6 +3559,139 @@ mod tests {
         assert!(
             res.is_ok(),
             "public repo must be accessible to any authed user"
+        );
+    }
+
+    // --- convert_sbom cross-repo authorization (#2439 residual) -----------
+
+    /// Seed one `sbom_documents` row for (artifact, repo, format). Returns id.
+    #[cfg(test)]
+    async fn seed_sbom_for_handler(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        format: &str,
+    ) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO sbom_documents (artifact_id, repository_id, format, format_version, \
+                 content, content_hash) \
+             VALUES ($1, $2, $3, '1.5', '{}'::jsonb, $4) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(format)
+        .bind(format!("hash-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .expect("seed sbom_document")
+    }
+
+    #[cfg(test)]
+    async fn sbom_format_count(pool: &sqlx::PgPool, artifact_id: Uuid, format: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sbom_documents WHERE artifact_id = $1 AND format = $2",
+        )
+        .bind(artifact_id)
+        .bind(format)
+        .fetch_one(pool)
+        .await
+        .expect("count sbom by format")
+    }
+
+    #[tokio::test]
+    async fn test_convert_sbom_non_member_404_and_no_write_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = super::convert_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(outsider, &outname)),
+            axum::extract::Path(sbom_id),
+            axum::Json(ConvertSbomRequest {
+                target_format: "spdx".to_string(),
+            }),
+        )
+        .await;
+        let spdx_rows = sbom_format_count(&fx.pool, artifact_id, "spdx").await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "non-member convert must be an existence-hiding 404, got {:?}",
+            res.err()
+        );
+        assert_eq!(
+            spdx_rows, 0,
+            "denied convert must not persist a converted SBOM row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convert_sbom_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        // fixture user is auto-granted repo access (member).
+        let res = super::convert_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            axum::extract::Path(sbom_id),
+            axum::Json(ConvertSbomRequest {
+                target_format: "spdx".to_string(),
+            }),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "member must be able to convert: {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convert_sbom_public_repo_non_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_public(&fx.pool, fx.repo_id, true).await;
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = super::convert_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(outsider, &outname)),
+            axum::extract::Path(sbom_id),
+            axum::Json(ConvertSbomRequest {
+                target_format: "spdx".to_string(),
+            }),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "public-repo convert allowed for any authed user"
         );
     }
 }

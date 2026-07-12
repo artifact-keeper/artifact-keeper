@@ -1049,6 +1049,85 @@ mod scan_sbom_leak_2439 {
             "member generate must write an sbom row"
         );
 
+        // --- convert_sbom (#2439 residual): non-member 404 + no convert row;
+        //     member 200. Use the SBOM the member just generated. ------------
+        let sbom_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM sbom_documents WHERE artifact_id = $1 LIMIT 1")
+                .bind(artifact_id)
+                .fetch_one(&pool)
+                .await
+                .expect("member-generated sbom must exist");
+
+        let (status, body) = send(
+            sb(),
+            post_json(
+                &format!("/{sbom_id}/convert"),
+                "{\"target_format\":\"spdx\"}",
+            ),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "non-member convert must 404");
+        assert_no_leak(&body);
+        let spdx_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sbom_documents WHERE artifact_id = $1 AND format = 'spdx'",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            spdx_rows, 0,
+            "denied convert must not persist a convert row"
+        );
+
+        let (status, _body) = send(
+            sb(),
+            post_json(
+                &format!("/{sbom_id}/convert"),
+                "{\"target_format\":\"spdx\"}",
+            ),
+            auth_for(user_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "member convert must 200");
+
+        // --- 404-body uniformity: a hidden-but-existing scan and an absent
+        //     scan id must return the SAME body (no existence oracle). --------
+        let (hs, hidden_body) =
+            send(sec(), get(&format!("/scans/{scan_id}")), auth_for(user_b)).await;
+        let (as_, absent_body) = send(
+            sec(),
+            get(&format!("/scans/{}", Uuid::new_v4())),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(hs, StatusCode::NOT_FOUND);
+        assert_eq!(as_, StatusCode::NOT_FOUND);
+        assert_eq!(
+            hidden_body, absent_body,
+            "hidden vs absent get_scan 404 bodies must be byte-identical"
+        );
+
+        let (hs, hidden_fbody) = send(
+            sec(),
+            get(&format!("/scans/{scan_id}/findings")),
+            auth_for(user_b),
+        )
+        .await;
+        let (as_, absent_fbody) = send(
+            sec(),
+            get(&format!("/scans/{}/findings", Uuid::new_v4())),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(hs, StatusCode::NOT_FOUND);
+        assert_eq!(as_, StatusCode::NOT_FOUND);
+        assert_eq!(
+            hidden_fbody, absent_fbody,
+            "hidden vs absent list_findings 404 bodies must be byte-identical"
+        );
+
         cleanup(&pool, repo_id, &[user_a, user_b]).await;
     }
 }
