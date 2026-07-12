@@ -2195,11 +2195,11 @@ mod audit_db_tests {
         );
 
         let _ = sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
-            .bind(&[old_token_id, replacement_token_id])
+            .bind([old_token_id, replacement_token_id])
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
-            .bind(&[sa.id, admin_id])
+            .bind([sa.id, admin_id])
             .execute(&pool)
             .await;
     }
