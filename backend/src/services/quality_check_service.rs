@@ -943,6 +943,66 @@ impl QualityCheckService {
         .map_err(|e| AppError::Database(e.to_string()))
     }
 
+    /// List quality check results across all artifacts/repositories, with
+    /// optional filters and pagination (#2419, admin list-all).
+    ///
+    /// Unlike [`list_checks`] this is not artifact-scoped: it powers the admin
+    /// quality-checks page which needs a repository-scoped (or unscoped) view.
+    /// Every filter is optional via the static null-guard predicate pattern
+    /// (`$N IS NULL OR col = $N`) — mirroring [`crate::services::audit_service::AuditService::query`]
+    /// — so a single prepared statement serves every filter combination. Returns
+    /// the requested page (newest-first) plus the total matching row count.
+    pub async fn list_checks_filtered(
+        &self,
+        repository_id: Option<Uuid>,
+        artifact_id: Option<Uuid>,
+        status: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<QualityCheckResult>, i64)> {
+        let rows = sqlx::query_as::<_, QualityCheckResult>(
+            r#"
+            SELECT id, artifact_id, repository_id, check_type, status,
+                   score, passed, details, issues_count,
+                   critical_count, high_count, medium_count, low_count, info_count,
+                   checker_version, error_message, started_at, completed_at, created_at
+            FROM quality_check_results
+            WHERE ($1::uuid IS NULL OR repository_id = $1)
+              AND ($2::uuid IS NULL OR artifact_id = $2)
+              AND ($3::text IS NULL OR status = $3)
+            ORDER BY created_at DESC
+            OFFSET $4
+            LIMIT $5
+            "#,
+        )
+        .bind(repository_id)
+        .bind(artifact_id)
+        .bind(status)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM quality_check_results
+            WHERE ($1::uuid IS NULL OR repository_id = $1)
+              AND ($2::uuid IS NULL OR artifact_id = $2)
+              AND ($3::text IS NULL OR status = $3)
+            "#,
+        )
+        .bind(repository_id)
+        .bind(artifact_id)
+        .bind(status)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok((rows, total))
+    }
+
     /// Get a specific quality check result by ID.
     pub async fn get_check(&self, check_id: Uuid) -> Result<QualityCheckResult> {
         sqlx::query_as(

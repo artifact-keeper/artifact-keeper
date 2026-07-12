@@ -723,6 +723,11 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
             .nest("/smtp", handlers::smtp::router())
             .nest("/age-gate", handlers::age_gate::admin_router())
+            // Admin quality-checks list-all (#2419). Kept inside the `/admin`
+            // block so `admin_middleware` gates it; the artifact-scoped
+            // `/quality/checks` (auth-only, 400s without artifact_id) is the
+            // separate #2334 contract and is unchanged.
+            .nest("/quality-checks", handlers::quality_gates::admin_router())
             .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .layer(middleware::from_fn_with_state(
                 auth_service.clone(),
