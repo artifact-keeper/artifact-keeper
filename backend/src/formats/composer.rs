@@ -209,15 +209,18 @@ const MAX_COMPOSER_NAME_LEN: usize = 512;
 /// Implements the version grammar documented by Composer at
 /// <https://getcomposer.org/doc/articles/versions.md> and
 /// <https://getcomposer.org/doc/04-schema.md#version>:
-/// - Semver: `v?X.Y[.Z[.W]]` (1-4 numeric components) with an optional
-///   dot-separated pre-release suffix (`-<id>(.<id>)*`, e.g. `-alpha.1`,
-///   `-RC1`, `-patch`) and optional build metadata (`+<id>(.<id>)*`).
+/// - Semver: `v?X.Y[.Z[.W]]` where the first component is numeric and each
+///   subsequent component is numeric or a wildcard (`x`/`*`), with an
+///   optional dot-separated pre-release suffix (`-<id>(.<id>)*`, e.g.
+///   `-alpha.1`, `-RC1`, `-dev`) and optional build metadata
+///   (`+<id>(.<id>)*`). Wildcard components cover Composer branch-alias
+///   versions (e.g. `1.0.x-dev`, `1.2.*-dev`).
 /// - Branch versions: `dev-<branch>` (e.g. `dev-main`, `dev-feature-x`).
 fn composer_version_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)^(dev-[a-z0-9][a-z0-9._-]*|v?\d+(\.\d+){0,3}(-([0-9a-z-]+(\.[0-9a-z-]+)*))?(\+([0-9a-z-]+(\.[0-9a-z-]+)*))?)$",
+            r"(?i)^(dev-[a-z0-9][a-z0-9._-]*|v?\d+(\.(\d+|[x*])){0,3}(-([0-9a-z-]+(\.[0-9a-z-]+)*))?(\+([0-9a-z-]+(\.[0-9a-z-]+)*))?)$",
         )
         .expect("composer version regex must compile")
     })
@@ -257,7 +260,7 @@ pub fn validate_composer_version(version: &str) -> std::result::Result<(), Strin
     if version.contains("..") {
         return Err("version must not contain '..'".to_string());
     }
-    if version.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+    if version.bytes().any(|b| b.is_ascii_control()) {
         return Err("version must not contain null or control characters".to_string());
     }
     if !composer_version_regex().is_match(version) {
@@ -285,7 +288,7 @@ pub fn validate_composer_name(name: &str) -> std::result::Result<(), String> {
             name.len()
         ));
     }
-    if name.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+    if name.bytes().any(|b| b.is_ascii_control()) {
         return Err("package name must not contain null or control characters".to_string());
     }
     if !composer_name_regex().is_match(name) {
@@ -726,6 +729,11 @@ mod tests {
             "1.0.0-alpha.1.beta",
             "1.0.0+build.5",
             "1.0.0-alpha.1+build",
+            // Branch-alias versions with `x`/`*` wildcard components.
+            "1.0.x-dev",
+            "1.2.*-dev",
+            "1.x-dev",
+            "1.0.x",
             "dev-main",
             "dev-feature-x",
             "dev-1.2",
@@ -749,6 +757,10 @@ mod tests {
             ("1.0.0 trailing", "embedded space"),
             ("not-a-version", "garbage"),
             ("v", "bare v prefix"),
+            // Wildcards are only valid as a non-first semver component.
+            ("*", "bare wildcard"),
+            ("x", "bare x wildcard"),
+            ("*.x-dev", "leading wildcard"),
         ];
         for (v, label) in invalid {
             assert!(
