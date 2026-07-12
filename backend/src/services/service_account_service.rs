@@ -108,6 +108,7 @@ impl ServiceAccountService {
             LEFT JOIN (
                 SELECT user_id, COUNT(*) as cnt
                 FROM api_tokens
+                WHERE revoked_at IS NULL
                 GROUP BY user_id
             ) t ON t.user_id = u.id
             WHERE u.is_service_account = true

@@ -2103,6 +2103,107 @@ mod audit_db_tests {
         .expect("audit_log count query")
     }
 
+    async fn mint_service_account_token(
+        state: SharedState,
+        auth: AuthExtension,
+        service_account_id: Uuid,
+        name: &str,
+    ) -> Uuid {
+        let body = json!({ "name": name, "scopes": ["read"] }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{service_account_id}/tokens"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state, auth), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "service-account mint failed: {}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+    }
+
+    async fn listed_token_count(
+        state: SharedState,
+        auth: AuthExtension,
+        service_account_id: Uuid,
+    ) -> i64 {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state, auth), req).await;
+        assert_eq!(status, StatusCode::OK, "service-account list failed");
+
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let service_account_id = service_account_id.to_string();
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"].as_str() == Some(service_account_id.as_str()))
+            .and_then(|item| item["token_count"].as_i64())
+            .expect("created service account must be present in list response")
+    }
+
+    /// Regression for artifact-keeper-web#554: revoking a service-account
+    /// token soft-deletes it, so the summary count must agree with the token
+    /// management endpoint, which only lists non-revoked tokens.
+    #[tokio::test]
+    async fn service_account_count_excludes_revoked_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+
+        let sa = ServiceAccountService::new(pool.clone())
+            .create(&format!("token-count-{}", Uuid::new_v4()), None)
+            .await
+            .expect("create service account");
+
+        let old_token_id =
+            mint_service_account_token(state.clone(), auth.clone(), sa.id, "old-token").await;
+        assert_eq!(
+            listed_token_count(state.clone(), auth.clone(), sa.id).await,
+            1,
+            "one freshly minted token must be counted"
+        );
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}/tokens/{old_token_id}", sa.id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "token revoke failed");
+
+        let replacement_token_id =
+            mint_service_account_token(state.clone(), auth.clone(), sa.id, "replacement-token")
+                .await;
+        assert_eq!(
+            listed_token_count(state, auth, sa.id).await,
+            1,
+            "revoked token must not remain in the service-account token count"
+        );
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = ANY($1)")
+            .bind([old_token_id, replacement_token_id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind([sa.id, admin_id])
+            .execute(&pool)
+            .await;
+    }
+
     /// `POST /service-accounts/:id/tokens` must emit `API_TOKEN_CREATED`, and
     /// the matching revoke must emit `API_TOKEN_REVOKED`, attributed to the
     /// acting admin.
