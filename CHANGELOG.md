@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-07-12
+
+Security hotfix: closes a token-exchange privilege-escalation where a scope-restricted API token could be exchanged (via docker-login `/v2/token` or Conan `users/authenticate`) into an unrestricted JWT — a read-only token could gain write/delete. Also completes the GHSA-vvc3 write-scope enforcement on the eight remaining format publish handlers.
+
 ### Security
 
 - **Token-exchange no longer launders away an API token's action-scope ceiling** (#2430): a JWT minted in exchange for an API token (Conan `users/authenticate`, OCI `/v2/token` docker-login, Bearer/JWT-as-password swaps, and refresh rotation) now carries the presenting token's action-scope allowlist on a new `Claims.scopes` claim. `AuthExtension::has_scope` keys the decision on that inherited ceiling rather than on `is_api_token`, so a read-only token can no longer be exchanged into a write/delete-capable credential. Interactive password/TOTP logins and federated CI-OIDC continue to mint action-unrestricted tokens (`scopes: None` ⇒ full), and the download-ticket path (`scopes: Some([])`) still denies. Complements the repo-scope ceiling from #2290.
