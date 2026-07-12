@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-07-12
+
+Security hotfix: closes a systemic cross-repository authorization gap where artifact/repository-scoped routes returned (and in some cases mutated) another repository's data for any authenticated non-member. Found by red-team; the HIGH-impact subset (vulnerability/SBOM data) is fixed here, with the remaining medium/low routes tracked for the next feature release (#2443).
+
+### Security
+
+- **Cross-repo vulnerability & SBOM authorization enforced** (#2439): the security-scan reads (`GET /security/scans`, `/security/scans/{id}`, `/security/scans/{id}/findings`, `/security/artifacts/{id}/scans`), the SBOM reads (`GET /sbom/{id}`, `/sbom/{id}/components`, `/sbom?artifact_id=`, `/sbom/by-artifact/{id}`, `POST /sbom/{id}/convert`), and the SBOM writes (`POST /sbom` generate, `POST /sbom/cve/status/{id}`) now enforce the canonical repository-visibility gate — token repo-scope + admin bypass + private-repository membership — returning an existence-hiding 404 to non-members. Previously any authenticated user could read another repository's CVE findings and SBOM inventory, and generate/convert SBOMs on artifacts in repositories they could not see. The `require_repo_access` helper was upgraded to check membership (not just token scope), and the scan-not-found responses were unified to remove an existence oracle. CVE-status writes remain admin-gated (#2321). Public repositories stay public; members and admins are unaffected.
+- **Cross-repo quality-check metadata authorization enforced** (#2437): the artifact-scoped quality-check routes (`GET /quality/checks`, `/quality/checks/{id}`, `/quality/checks/{id}/issues`, `/quality/health/artifacts/{id}`) now apply the same repository-visibility gate, so quality-check results/scores no longer leak across repositories.
+
+### Added
+
+- **Admin quality-checks list-all endpoint** (#2419): `GET /api/v1/admin/quality-checks` (admin-only, paginated, filterable by `repository_id`/`artifact_id`/`status`) backs the admin quality-checks view. The artifact-scoped `GET /api/v1/quality/checks` contract (400 without `artifact_id`) is unchanged.
+
+
+
 ## [1.5.2] - 2026-07-12
 
 Security hotfix: closes a token-exchange privilege-escalation where a scope-restricted API token could be exchanged (via docker-login `/v2/token` or Conan `users/authenticate`) into an unrestricted JWT — a read-only token could gain write/delete. Also completes the GHSA-vvc3 write-scope enforcement on the eight remaining format publish handlers.
