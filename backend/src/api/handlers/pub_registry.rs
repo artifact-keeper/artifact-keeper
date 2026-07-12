@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -580,7 +580,7 @@ async fn new_upload_url(
     Path(repo_key): Path<String>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "pub")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
     let _repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
     let upload_url = format!(
@@ -611,7 +611,7 @@ async fn upload_package(
     base_url: RequestBaseUrl,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "pub")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
