@@ -148,6 +148,19 @@ pub struct Claims {
     /// with a serde default so pre-existing tokens deserialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_pull_repo: Option<String>,
+    /// Action-scope ceiling copied from the presenting API token (#2430).
+    ///
+    /// `None` = action-unrestricted (interactive password/TOTP login,
+    /// federated CI-OIDC, or a scan token) — full read/write/delete. `Some(v)`
+    /// = the exact action-scope allowlist copied from the API token that
+    /// minted this JWT (e.g. `["read:artifacts"]`); enforced by
+    /// [`AuthExtension::has_scope`]. The presence of `Some` — not
+    /// `is_api_token` — is the token-derived-vs-interactive discriminator, so
+    /// a JWT exchanged from a read-only API token can never be laundered up to
+    /// write/delete. `Option` with a serde default so pre-existing tokens
+    /// deserialize unchanged (and remain full, matching prior behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 impl Claims {
@@ -1189,7 +1202,7 @@ impl AuthService {
     /// here; callers persist it through
     /// [`AuthService::record_refresh_token_jti`] after generation.
     pub fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
-        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), None)
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), None, None)
     }
 
     /// Generate access and refresh tokens for a user, restricting the access
@@ -1199,22 +1212,44 @@ impl AuthService {
         user: &User,
         allowed_repo_ids: Option<Vec<Uuid>>,
     ) -> Result<TokenPair> {
-        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids)
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids, None)
+    }
+
+    /// Generate tokens carrying an action-scope ceiling copied from the
+    /// presenting API token (#2430).
+    ///
+    /// Used by the credential-exchange endpoints (Conan / OCI `/v2/token`) that
+    /// mint a JWT in return for an API token: the minted JWT inherits both the
+    /// token's repository allow-list AND its action-scope allowlist, so a
+    /// read-only token can never be laundered into a write/delete-capable JWT.
+    /// Pass `scopes = None` for action-unrestricted (interactive) mints.
+    pub fn generate_tokens_with_scope(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<TokenPair> {
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids, scopes)
     }
 
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
-        self.generate_tokens_with_family_and_scope(user, family_id, None)
+        self.generate_tokens_with_family_and_scope(user, family_id, None, None)
     }
 
-    /// Generate tokens with a specific refresh-token family and optional
-    /// access-token repository allow-list.
+    /// Generate tokens with a specific refresh-token family, optional
+    /// access-token repository allow-list, and optional action-scope ceiling.
+    ///
+    /// `scopes = None` mints an action-unrestricted (interactive/CI) token;
+    /// `Some(list)` stamps the exact action-scope allowlist onto BOTH the
+    /// access and refresh claims so the ceiling survives a refresh (#2430).
     fn generate_tokens_with_family_and_scope(
         &self,
         user: &User,
         family_id: Uuid,
         allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
     ) -> Result<TokenPair> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
@@ -1236,6 +1271,7 @@ impl AuthService {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: scopes.clone(),
         };
 
         let refresh_jti = Uuid::new_v4();
@@ -1252,6 +1288,7 @@ impl AuthService {
             jti: Some(refresh_jti),
             family_id: Some(family_id),
             scan_pull_repo: None,
+            scopes,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -1306,6 +1343,7 @@ impl AuthService {
             jti: None,
             family_id: None,
             scan_pull_repo: Some(repo_key.to_string()),
+            scopes: None,
         };
 
         encode(&Header::default(), &claims, &self.encoding_key)
@@ -1560,15 +1598,29 @@ impl AuthService {
 
             // Fetch fresh user data.
             let user = self.load_active_user(token_data.claims.sub).await?;
-            let tokens = self.generate_tokens_with_family(&user, family_id)?;
+            // Preserve the presenting token's action-scope ceiling and repo
+            // allow-list across rotation so a refresh can never widen the
+            // grant of a token minted from a scoped API token (#2430,
+            // defense-in-depth).
+            let tokens = self.generate_tokens_with_family_and_scope(
+                &user,
+                family_id,
+                token_data.claims.allowed_repo_ids.clone(),
+                token_data.claims.scopes.clone(),
+            )?;
             self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
             return Ok((user, tokens));
         }
 
         // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
         // open a new family so subsequent rotations get replay detection.
+        // Still preserve the action-scope ceiling and repo allow-list (#2430).
         let user = self.load_active_user(token_data.claims.sub).await?;
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens_with_scope(
+            &user,
+            token_data.claims.scopes.clone(),
+            token_data.claims.allowed_repo_ids.clone(),
+        )?;
         self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
     }
@@ -2695,6 +2747,7 @@ impl AuthService {
             jti: Some(Uuid::new_v4()),
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -3487,6 +3540,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let refresh_claims = Claims {
@@ -3502,6 +3556,7 @@ mod tests {
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -3587,6 +3642,68 @@ mod tests {
         assert_eq!(access_claims.allowed_repo_ids, None);
     }
 
+    // #2430: the exchange-mint helper stamps the action-scope ceiling onto BOTH
+    // the access and refresh claims so the ceiling survives a refresh, while
+    // the plain `generate_tokens` path leaves it `None` (interactive = full).
+
+    #[tokio::test]
+    async fn test_generate_tokens_with_scope_stamps_access_and_refresh() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+        let repo = Uuid::new_v4();
+        let ceiling = Some(vec!["read:artifacts".to_string()]);
+
+        let tokens = service
+            .generate_tokens_with_scope(&user, ceiling.clone(), Some(vec![repo]))
+            .expect("scoped token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.scopes, ceiling);
+        assert_eq!(access_claims.allowed_repo_ids, Some(vec![repo]));
+
+        let refresh_claims = decode::<Claims>(
+            &tokens.refresh_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("refresh token should decode")
+        .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        // Ceiling rides on the refresh token so rotation cannot widen it.
+        assert_eq!(refresh_claims.scopes, ceiling);
+    }
+
+    #[tokio::test]
+    async fn test_generate_tokens_leaves_scopes_none() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+
+        let tokens = service
+            .generate_tokens(&user)
+            .expect("token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+        // Interactive/CI login is action-unrestricted.
+        assert_eq!(access_claims.scopes, None);
+    }
+
     #[test]
     fn test_validate_access_token_rejects_refresh_token() {
         let config = make_test_config();
@@ -3608,6 +3725,7 @@ mod tests {
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -3640,6 +3758,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3666,6 +3785,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3693,6 +3813,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -3722,6 +3843,7 @@ mod tests {
             jti: Some(jti),
             family_id: Some(family),
             scan_pull_repo: None,
+            scopes: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(json.contains("jti"));
@@ -4601,6 +4723,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),
@@ -4901,6 +5024,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         // The fallback is exactly `iat * 1000`.
         assert_eq!(legacy.effective_iat_ms(), iat_sec.saturating_mul(1000));
@@ -5390,6 +5514,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         let payload_json = serde_json::to_vec(&claims).unwrap();
         let payload_b64 = {
@@ -6247,6 +6372,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),
@@ -6696,6 +6822,65 @@ mod tests {
             .expect("t1 -> t2");
 
         // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2430: a refresh of a token minted from a read-only API token must
+    /// preserve the action-scope ceiling (and repo allow-list) so rotation
+    /// cannot be used to launder a scoped token up to full access.
+    #[tokio::test]
+    async fn test_refresh_tokens_preserves_scope_ceiling() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("scoperot_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let ceiling = Some(vec!["read:artifacts".to_string()]);
+        let t0 = service
+            .generate_tokens_with_scope(&user, ceiling.clone(), None)
+            .expect("scoped mint");
+        service
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+
+        let (_, t1) = service
+            .refresh_tokens(&t0.refresh_token)
+            .await
+            .expect("t0 -> t1");
+
+        let decoding_key = DecodingKey::from_secret(cfg.jwt_secret.as_bytes());
+        let rotated = decode::<Claims>(
+            &t1.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("rotated access token should decode")
+        .claims;
+        // The action-scope ceiling rides on BOTH the access and refresh claims
+        // (see generate_tokens_with_family_and_scope), so it survives rotation:
+        // a refresh cannot launder a read-only token up to full access (#2430).
+        // (Repository allow-lists are access-token-only and are deliberately not
+        // carried on refresh tokens, so they are out of scope for this check.)
+        assert_eq!(rotated.scopes, ceiling);
+
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
             .execute(&pool)
             .await;

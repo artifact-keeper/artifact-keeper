@@ -342,11 +342,13 @@ async fn authenticate_oci_with_scopes(
             // Bearer token presented to OCI must be rejected if the user's
             // credentials changed on a peer replica after the token was minted.
             //
-            // First, try as a JWT access token. JWTs carry no scope claim and
-            // are minted only via interactive login flows, so they are not
-            // restricted here.
+            // First, try as a JWT access token. Interactive/CI JWTs carry
+            // `scopes: None` (unrestricted); a JWT exchanged from a scoped API
+            // token carries `Some(ceiling)` (#2430). Surface whatever the JWT
+            // carries so a laundered exchange JWT keeps its ceiling here.
             if let Ok(claims) = auth_service.validate_access_token_async(&token).await {
-                return Ok((claims, None));
+                let scopes = claims.scopes.clone();
+                return Ok((claims, scopes));
             }
             // Otherwise, accept a raw API token in the Bearer slot (common
             // for `docker login --password-stdin` with API token). Surface
@@ -411,6 +413,10 @@ async fn authenticate_oci_with_scopes(
             // password. Enables the CI/CD keyless push flow where the token from
             // the OIDC exchange is used directly as the Docker credential.
             if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+                // Preserve the presented JWT's action-scope ceiling (#2430): a
+                // JWT-as-password that was itself exchanged from a scoped API
+                // token must keep its `Some(ceiling)` here, not reset to full.
+                let scopes = claims.scopes.clone();
                 if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
                     .bind(claims.sub)
                     .fetch_one(db)
@@ -424,7 +430,7 @@ async fn authenticate_oci_with_scopes(
                                 .validate_access_token(&tokens.access_token)
                                 .map_err(|_| ())
                         })
-                        .map(|claims| (claims, None));
+                        .map(|claims| (claims, scopes));
                 }
             }
 
@@ -3839,7 +3845,15 @@ async fn token(
                             }
                         }
                     } else {
-                        match auth_service.generate_tokens(&user) {
+                        // Preserve the presented JWT's action-scope ceiling and
+                        // repository allow-list across the swap (#2430/#2290): a
+                        // JWT exchanged from a scoped API token must not be
+                        // re-widened to full access here.
+                        match auth_service.generate_tokens_with_scope(
+                            &user,
+                            claims.scopes.clone(),
+                            claims.allowed_repo_ids.clone(),
+                        ) {
                             Ok(t) => (t.access_token, t.expires_in),
                             Err(_) => {
                                 return oci_error(
@@ -3925,9 +3939,17 @@ async fn token(
             // `AccessScope::Admin` (an unscoped token) maps to `None` =
             // unrestricted, preserving prior behaviour for full-scope tokens.
             let allowed_repo_ids: Option<Vec<Uuid>> = validation.allowed_repo_ids.clone().into();
+            // Carry the API token's action-scope allowlist onto the minted OCI
+            // bearer so write/delete handlers enforce it (#2430): a read-only
+            // `docker login` token must not exchange up into a push-capable
+            // bearer.
+            let token_scopes = Some(validation.scopes.clone());
             let user = validation.user;
-            let tokens = match auth_service.generate_tokens_with_repo_scope(&user, allowed_repo_ids)
-            {
+            let tokens = match auth_service.generate_tokens_with_scope(
+                &user,
+                token_scopes,
+                allowed_repo_ids,
+            ) {
                 Ok(t) => t,
                 Err(_) => {
                     return oci_error(
@@ -3971,12 +3993,15 @@ async fn token(
                                     )
                                 }
                             };
-                        // Preserve the incoming access token's repository
-                        // scope on the re-minted bearer so this keyless
-                        // fallback cannot re-widen a restricted token (#2290).
-                        let tokens = match auth_service
-                            .generate_tokens_with_repo_scope(&user, claims.allowed_repo_ids.clone())
-                        {
+                        // Preserve the incoming access token's action-scope
+                        // ceiling and repository scope on the re-minted bearer
+                        // so this keyless fallback cannot re-widen a restricted
+                        // token (#2430/#2290).
+                        let tokens = match auth_service.generate_tokens_with_scope(
+                            &user,
+                            claims.scopes.clone(),
+                            claims.allowed_repo_ids.clone(),
+                        ) {
                             Ok(t) => t,
                             Err(_) => {
                                 return oci_error(
@@ -8313,6 +8338,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: scope.map(|s| s.to_string()),
+            scopes: None,
         }
     }
 
@@ -8360,6 +8386,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         }
     }
 
@@ -9975,6 +10002,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),

@@ -389,6 +389,7 @@ mod credential_change_grpc {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),

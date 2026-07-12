@@ -91,12 +91,16 @@ impl AuthExtension {
     }
 
     /// Check whether this auth context has a required scope.
-    /// JWT sessions (non-API-token auth) always pass since they have no scope
-    /// restrictions. API tokens must explicitly include the scope (or `*`/`admin`).
+    ///
+    /// The action-scope ceiling is carried by `scopes`, NOT by `is_api_token`
+    /// (#2430): `None` = action-unrestricted (interactive login / federated CI
+    /// / scan token) and always passes; `Some(list)` = the exact allowlist the
+    /// presenting credential was minted with. Keying on `scopes` rather than
+    /// `is_api_token` is what stops a JWT exchanged from a read-only API token
+    /// from being laundered up to write/delete — the exchanged JWT carries
+    /// `is_api_token = false` but inherits the token's `Some(scopes)` ceiling.
+    /// The download-ticket path (`Some(vec![])`) therefore still denies.
     pub fn has_scope(&self, scope: &str) -> bool {
-        if !self.is_api_token {
-            return true; // JWT sessions are not scope-restricted
-        }
         match &self.scopes {
             None => true,
             // Delegate the wildcard-aware scope decision to the single
@@ -183,7 +187,10 @@ impl From<Claims> for AuthExtension {
             is_admin: claims.is_admin,
             is_api_token: false,
             is_service_account: false,
-            scopes: None,
+            // Propagate the action-scope ceiling minted onto the JWT (#2430).
+            // `None` for interactive/CI logins (full); `Some(list)` for JWTs
+            // exchanged from an API token — enforced by `has_scope`.
+            scopes: claims.scopes,
             allowed_repo_ids: AccessScope::from(claims.allowed_repo_ids),
             iat_ms,
         }
@@ -1042,12 +1049,11 @@ async fn try_resolve_ticket_auth(
     // can recognise the request as ticket-authenticated.
     ext.is_admin = false;
 
-    // Scope hardening: `AuthExtension::has_scope` returns `true` for any
-    // non-API-token auth (the JWT-session shortcut at the top of the impl).
-    // No handler today calls `has_scope("admin")` for elevation, but a
-    // future one could, and a ticket-authenticated request would silently
-    // pass that check. Pretend the ticket is an API token with an empty
-    // scope set so any explicit scope check defaults to deny.
+    // Scope hardening: `AuthExtension::has_scope` returns `true` only when
+    // `scopes` is `None` (action-unrestricted). No handler today calls
+    // `has_scope("admin")` for elevation, but a future one could, and a
+    // ticket-authenticated request must not silently pass that check. Stamp an
+    // empty scope allowlist so any explicit scope check defaults to deny.
     //
     // This intentionally does not modify `is_service_account` or
     // `must_change_password`: a ticket inherits the minter's identity for
@@ -1877,6 +1883,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let effective = claims.effective_iat_ms();
@@ -1945,6 +1952,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
 
         let ext = AuthExtension::from(claims);
@@ -2034,6 +2042,91 @@ mod tests {
             iat_ms: None,
         };
         assert!(ext.has_scope("anything"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2430: `has_scope` keys on the `scopes` ceiling, NOT `is_api_token`, so a
+    // JWT exchanged from a scoped API token (is_api_token = false, but
+    // scopes = Some(ceiling)) cannot launder up to write/delete.
+    // -----------------------------------------------------------------------
+
+    /// Build a non-API-token principal (is_api_token = false, as a
+    /// `From<Claims>`-derived JWT session would be) carrying an inherited
+    /// action-scope ceiling.
+    fn make_exchanged_jwt_ext(scopes: Option<Vec<String>>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "exchanged".to_string(),
+            email: "exchanged@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_has_scope_none_is_action_unrestricted() {
+        // Interactive login / federated CI / scan token: scopes = None => full.
+        let ext = make_exchanged_jwt_ext(None);
+        assert!(ext.has_scope("read:artifacts"));
+        assert!(ext.has_scope("write:artifacts"));
+        assert!(ext.has_scope("delete:artifacts"));
+    }
+
+    #[test]
+    fn test_has_scope_exchanged_jwt_enforces_read_only_ceiling() {
+        // The laundering case: a JWT minted from a read-only API token carries
+        // is_api_token = false but Some(["read:artifacts"]). It must NOT be
+        // able to write or delete despite not being an API token.
+        let ext = make_exchanged_jwt_ext(Some(vec!["read:artifacts".to_string()]));
+        assert!(ext.has_scope("read:artifacts"));
+        assert!(!ext.has_scope("write:artifacts"));
+        assert!(!ext.has_scope("delete:artifacts"));
+    }
+
+    #[test]
+    fn test_has_scope_exchanged_jwt_wildcard_grants_all() {
+        let ext = make_exchanged_jwt_ext(Some(vec!["*".to_string()]));
+        assert!(ext.has_scope("write:artifacts"));
+        assert!(ext.has_scope("delete:artifacts"));
+    }
+
+    #[test]
+    fn test_has_scope_empty_ceiling_denies_everything() {
+        // Download-ticket path stamps Some(vec![]) — deny-all, must stay denied
+        // now that the is_api_token shortcut is gone.
+        let ext = make_exchanged_jwt_ext(Some(vec![]));
+        assert!(!ext.has_scope("read:artifacts"));
+        assert!(!ext.has_scope("write:artifacts"));
+    }
+
+    #[test]
+    fn test_from_claims_propagates_scopes_ceiling() {
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "exchanged".to_string(),
+            email: "exchanged@example.com".to_string(),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: 1000,
+            iat_ms: None,
+            exp: 2000,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+        };
+        let ext = AuthExtension::from(claims);
+        // is_api_token stays false (this is a JWT session), but the ceiling
+        // rides along and is enforced by has_scope.
+        assert!(!ext.is_api_token);
+        assert_eq!(ext.scopes, Some(vec!["read:artifacts".to_string()]));
+        assert!(ext.has_scope("read:artifacts"));
+        assert!(!ext.has_scope("write:artifacts"));
     }
 
     #[test]
@@ -3592,6 +3685,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),

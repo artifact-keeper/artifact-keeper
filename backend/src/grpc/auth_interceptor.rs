@@ -139,21 +139,29 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use uuid::Uuid;
 
-    fn make_token(jwt_secret: &str, is_admin: bool, token_type: &str) -> String {
-        let claims = Claims {
-            sub: Uuid::new_v4(),
+    /// Shared builder for the test `Claims` values used across this module's
+    /// token helpers. Keeping the (long) field list in one place avoids a
+    /// copy-paste clone between `make_token` and `make_token_for_sub`.
+    fn test_claims(sub: Uuid, is_admin: bool, token_type: &str, iat_ms: Option<i64>) -> Claims {
+        Claims {
+            sub,
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
             is_admin,
             allowed_repo_ids: None,
             iat: chrono::Utc::now().timestamp(),
-            iat_ms: None,
+            iat_ms,
             exp: chrono::Utc::now().timestamp() + 3600,
             token_type: token_type.to_string(),
             jti: None,
             family_id: None,
             scan_pull_repo: None,
-        };
+            scopes: None,
+        }
+    }
+
+    fn make_token(jwt_secret: &str, is_admin: bool, token_type: &str) -> String {
+        let claims = test_claims(Uuid::new_v4(), is_admin, token_type, None);
         encode(
             &Header::default(),
             &claims,
@@ -268,20 +276,9 @@ mod tests {
         let user_id = Uuid::new_v4();
         // Issue the token in the past so invalidation timestamp is strictly later
         let iat = chrono::Utc::now().timestamp() - 10;
-        let claims = Claims {
-            sub: user_id,
-            username: "testuser".to_string(),
-            email: "test@example.com".to_string(),
-            is_admin: true,
-            allowed_repo_ids: None,
-            iat,
-            iat_ms: Some(iat.saturating_mul(1000)),
-            exp: iat + 3600,
-            token_type: "access".to_string(),
-            jti: None,
-            family_id: None,
-            scan_pull_repo: None,
-        };
+        let mut claims = test_claims(user_id, true, "access", Some(iat.saturating_mul(1000)));
+        claims.iat = iat;
+        claims.exp = iat + 3600;
         let token = encode(
             &Header::default(),
             &claims,
@@ -309,20 +306,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_token_for_sub(jwt_secret: &str, sub: Uuid, is_admin: bool) -> String {
-        let claims = Claims {
+        let mut claims = test_claims(
             sub,
-            username: "forged".to_string(),
-            email: "forged@test.local".to_string(),
             is_admin,
-            allowed_repo_ids: None,
-            iat: chrono::Utc::now().timestamp(),
-            iat_ms: Some(chrono::Utc::now().timestamp_millis()),
-            exp: chrono::Utc::now().timestamp() + 3600,
-            token_type: "access".to_string(),
-            jti: None,
-            family_id: None,
-            scan_pull_repo: None,
-        };
+            "access",
+            Some(chrono::Utc::now().timestamp_millis()),
+        );
+        claims.username = "forged".to_string();
+        claims.email = "forged@test.local".to_string();
         encode(
             &Header::default(),
             &claims,

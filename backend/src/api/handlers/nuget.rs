@@ -1193,6 +1193,7 @@ mod tests {
             jti: None,
             family_id: None,
             scan_pull_repo: None,
+            scopes: None,
         };
         encode(
             &Header::default(),

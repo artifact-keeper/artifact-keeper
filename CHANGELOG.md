@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Token-exchange no longer launders away an API token's action-scope ceiling** (#2430): a JWT minted in exchange for an API token (Conan `users/authenticate`, OCI `/v2/token` docker-login, Bearer/JWT-as-password swaps, and refresh rotation) now carries the presenting token's action-scope allowlist on a new `Claims.scopes` claim. `AuthExtension::has_scope` keys the decision on that inherited ceiling rather than on `is_api_token`, so a read-only token can no longer be exchanged into a write/delete-capable credential. Interactive password/TOTP logins and federated CI-OIDC continue to mint action-unrestricted tokens (`scopes: None` ⇒ full), and the download-ticket path (`scopes: Some([])`) still denies. Complements the repo-scope ceiling from #2290.
+
 ## [1.5.1] - 2026-07-11
 
 Patch release: eleven validated bug/security fixes across audit correlation, observability noise, virtual-repository resolution and scanning, the Composer and OCI/npm surfaces, and the SSRF trust model — each replicated, fixed, and re-verified on an isolated stack.

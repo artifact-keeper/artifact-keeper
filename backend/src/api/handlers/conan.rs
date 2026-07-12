@@ -325,8 +325,12 @@ async fn users_authenticate(
     let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
     // Authenticate user via Basic auth (middleware has already resolved the
-    // credential into an AuthExtension).
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // credential into an AuthExtension). Keep the full extension so the minted
+    // JWT can inherit the presenting credential's action-scope ceiling and
+    // repository allow-list (#2430) — a read-only API token presented here
+    // must not exchange up into a full-access Bearer JWT.
+    let ext = require_auth_basic(auth, "conan")?;
+    let user_id = ext.user_id;
 
     // Issue a real JWT access token. The Conan client stores the body of this
     // response and sends it back as `Authorization: Bearer <token>` on later
@@ -359,12 +363,18 @@ async fn users_authenticate(
 
     let auth_service =
         AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
-    let tokens = auth_service.generate_tokens(&user).map_err(|_| {
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("token generation failed"))
-            .unwrap()
-    })?;
+    let tokens = auth_service
+        .generate_tokens_with_scope(
+            &user,
+            ext.scopes.clone(),
+            ext.access_scope().as_allowed_repo_ids().map(<[_]>::to_vec),
+        )
+        .map_err(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("token generation failed"))
+                .unwrap()
+        })?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
