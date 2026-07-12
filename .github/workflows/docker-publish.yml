@@ -88,7 +88,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
@@ -178,7 +178,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
 
@@ -257,7 +257,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
 
@@ -333,7 +333,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
@@ -659,7 +659,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           tags: |
@@ -675,7 +675,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           tags: |
@@ -780,7 +780,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           tags: |
@@ -796,7 +796,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
           tags: |
@@ -908,7 +908,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           # Tags come from the adapter's own VERSION file, NOT the AK git-tag
@@ -926,7 +926,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: docker.io/${{ env.DOCKERHUB_SCANNER_ADAPTER }}
           # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
@@ -1017,7 +1017,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           flavor: |
@@ -1035,7 +1035,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           flavor: |
