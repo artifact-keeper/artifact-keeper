@@ -1375,9 +1375,15 @@ async fn upload(
             .into_response()
     })?;
 
-    // Resolve the canonical package name. A `?name=` override takes
-    // precedence over the name in composer.json; either way the value is
-    // validated with the official Composer name regex.
+    // The name in composer.json is always validated, even when a `?name=`
+    // override is supplied: the archive's own name is preserved verbatim in
+    // the nested metadata, so a malformed archive name must be rejected
+    // regardless of any override.
+    crate::formats::composer::validate_composer_name(&composer_json.name)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+
+    // Resolve the canonical package name. A `?name=` override takes precedence
+    // over the (already-validated) name in composer.json.
     let full_name: String = match query.name.as_deref() {
         Some(n) => {
             crate::formats::composer::validate_composer_name(n).map_err(|e| {
@@ -1389,17 +1395,20 @@ async fn upload(
             })?;
             n.to_string()
         }
-        None => {
-            crate::formats::composer::validate_composer_name(&composer_json.name)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
-            composer_json.name.clone()
-        }
+        None => composer_json.name.clone(),
     };
 
+    // The version in composer.json is always validated when present, even when
+    // a `?version=` override is supplied — same rationale as the name above
+    // (the archive's version is preserved in the nested metadata).
+    if let Some(v) = composer_json.version.as_deref() {
+        crate::formats::composer::validate_composer_version(v)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+    }
+
     // Resolve the canonical version. A `?version=` override takes precedence
-    // over the version in composer.json; either way the value is validated
-    // with Composer's version grammar. When neither is present, fall back to
-    // `dev-main`.
+    // over the (already-validated) version in composer.json; when neither is
+    // present, fall back to `dev-main`.
     let version: String = match query.version.as_deref() {
         Some(v) => {
             crate::formats::composer::validate_composer_version(v).map_err(|e| {
@@ -1411,14 +1420,11 @@ async fn upload(
             })?;
             v.to_string()
         }
-        None => match composer_json.version.as_deref() {
-            Some(v) => {
-                crate::formats::composer::validate_composer_version(v)
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
-                v.to_string()
-            }
-            None => "dev-main".to_string(),
-        },
+        None => composer_json
+            .version
+            .as_deref()
+            .unwrap_or("dev-main")
+            .to_string(),
     };
 
     // Compute SHA256
@@ -3445,6 +3451,78 @@ mod upload_db_tests {
             count.0, 0,
             "no artifact should be stored when the archive version is invalid"
         );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // The name and version read from composer.json are validated even when a
+    // valid override is supplied for them: a malformed archive value is still
+    // rejected because it is preserved verbatim in the nested metadata.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_with_invalid_archive_name_and_name_override_returns_400() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // Archive name is invalid ("no-slash") even though a valid override is
+        // supplied — the archive name must still be rejected.
+        let zip = build_composer_zip("no-slash", "1.0.0", "invalid archive name with override");
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(
+            format!("/{}/api/packages?name=acme/widget", f.repo_key),
+            zip,
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid archive name must 400 even with a name override: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query artifacts after rejected archive name");
+        assert_eq!(count.0, 0, "no artifact should be stored");
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn upload_with_invalid_archive_version_and_version_override_returns_400() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // Archive version is invalid even though a valid override is supplied.
+        let zip = build_composer_zip(
+            "acme/widget",
+            "not-a-version",
+            "invalid archive version with override",
+        );
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages?version=2.0.0", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid archive version must 400 even with a version override: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("query artifacts after rejected archive version");
+        assert_eq!(count.0, 0, "no artifact should be stored");
 
         f.teardown().await;
     }
