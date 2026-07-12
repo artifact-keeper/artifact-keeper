@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -137,7 +138,7 @@ pub struct TriggerScanResponse {
     pub scan_result_ids: Vec<Uuid>,
 }
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ListScansQuery {
     pub repository_id: Option<Uuid>,
     pub artifact_id: Option<Uuid>,
@@ -343,7 +344,7 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
         .collect())
 }
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ListFindingsQuery {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
@@ -722,9 +723,38 @@ async fn trigger_scan(
 )]
 async fn list_scans(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
+    // Cross-repo authorization (#2439): this global scan list is
+    // artifact/repo-scoped data. Gate on whichever filter the caller
+    // supplied so a non-member cannot enumerate another repo's scans:
+    //   - artifact_id → canonical artifact-visibility gate;
+    //   - repository_id → canonical repo-visibility gate;
+    //   - neither → an unfiltered listing would expose every repo's scans,
+    //     so restrict it to admins (non-admins must scope by repo/artifact).
+    // Existence-hiding NotFound (never Forbidden) for the scoped branches.
+    let auth = Some(auth);
+    match (query.artifact_id, query.repository_id) {
+        (Some(artifact_id), _) => {
+            check_artifact_visibility(&auth, artifact_id, &state.db).await?;
+        }
+        (None, Some(repository_id)) => {
+            let repo_service = RepositoryService::new(state.db.clone());
+            let repo = repo_service.get_by_id(repository_id).await?;
+            require_visible(&repo, &auth, &repo_service).await?;
+        }
+        (None, None) => {
+            if !auth.as_ref().is_some_and(|a| a.is_admin) {
+                return Err(AppError::Authorization(
+                    "Listing all scans requires admin; scope the request with \
+                     repository_id or artifact_id"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -760,11 +790,16 @@ async fn list_scans(
 )]
 async fn get_scan(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ScanResponse>> {
     let svc = ScanResultService::new(state.db.clone());
     let s = svc.get_scan(id).await?;
+
+    // Cross-repo authorization (#2439): resolve the scan's owning artifact,
+    // then apply the canonical visibility gate (existence-hiding 404) before
+    // returning any scan detail.
+    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db).await?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -791,7 +826,7 @@ async fn get_scan(
 )]
 async fn list_findings(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(scan_id): Path<Uuid>,
     Query(query): Query<ListFindingsQuery>,
 ) -> Result<Json<FindingListResponse>> {
@@ -802,7 +837,12 @@ async fn list_findings(
     // an empty envelope, contradicting the 404 documented in the OpenAPI
     // annotation above. Clients can't distinguish "unknown scan" from "real
     // scan with zero findings" without this pre-check.
-    svc.get_scan(scan_id).await?;
+    let scan = svc.get_scan(scan_id).await?;
+
+    // Cross-repo authorization (#2439): resolve the scan's owning artifact and
+    // apply the canonical visibility gate (existence-hiding 404) before
+    // returning any CVE finding for it.
+    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db).await?;
 
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(200);
@@ -1137,10 +1177,14 @@ async fn update_repo_security(
 )]
 async fn list_artifact_scans(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
+    // Cross-repo authorization (#2439): apply the canonical artifact-visibility
+    // gate (existence-hiding 404) before listing any scan for this artifact.
+    check_artifact_visibility(&Some(auth), artifact_id, &state.db).await?;
+
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -2649,5 +2693,388 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["total"], 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-repo scan/finding-read authorization (#2439).
+    //
+    // The global (non repo-nested) scan read routes -- `list_scans`,
+    // `get_scan`, `list_findings`, `list_artifact_scans` -- query
+    // artifact/repo-scoped data with NO per-repo authorization before this
+    // fix, leaking CVE/supply-chain data to any authenticated non-member.
+    // Each now runs the canonical `check_artifact_visibility` / `require_visible`
+    // gate. These DB-backed tests call the handlers directly (matching the
+    // `trigger_scan` sibling) and no-op when `DATABASE_URL` is unset.
+    // -----------------------------------------------------------------------
+
+    /// Insert an `artifacts` row owned by `repo_id` and return its id.
+    #[cfg(test)]
+    async fn seed_artifact_row(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{}/{}", repo_id, id);
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, $3, $4, '1.0.0', 1024, $5, 'application/octet-stream', $4, false)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("scan-art-{}", id))
+        .bind(&path)
+        .bind(format!("sha256-scan-{}", id))
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+        id
+    }
+
+    /// Insert a completed `scan_results` row + one `scan_findings` row for
+    /// `(repo_id, artifact_id)`. Returns `(scan_id, finding_id)`.
+    #[cfg(test)]
+    async fn seed_scan_with_finding(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        artifact_id: Uuid,
+    ) -> (Uuid, Uuid) {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW())",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_result");
+        let finding_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+             source, is_acknowledged) \
+             VALUES ($1, $2, 'critical', 'seed finding', 'CVE-2024-9999', 'trivy', false) \
+             RETURNING id",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed scan_finding");
+        (scan_id, finding_id)
+    }
+
+    #[cfg(test)]
+    async fn teardown_scans(pool: &sqlx::PgPool, repo_id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn set_public(pool: &sqlx::PgPool, repo_id: Uuid, public: bool) {
+        sqlx::query("UPDATE repositories SET is_public = $1 WHERE id = $2")
+            .bind(public)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set is_public");
+    }
+
+    /// A denial (404) message must not leak any scan/finding metadata field.
+    #[cfg(test)]
+    fn assert_no_scan_leak(err: &AppError) {
+        let msg = format!("{:?}", err);
+        for needle in ["repository_id", "cve", "CVE-", "severity", "critical"] {
+            assert!(
+                !msg.contains(needle),
+                "denial message must not leak `{needle}`: {msg}"
+            );
+        }
+    }
+
+    // --- get_scan ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_scan_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        // fixture user is auto-granted repo access (a member).
+        let res = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Path(scan_id),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "member must see the scan, got {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_get_scan_non_member_404_no_leak_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(scan_id),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        match res {
+            Err(ref e @ AppError::NotFound(_)) => assert_no_scan_leak(e),
+            other => panic!("non-member must get 404, got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_scan_admin_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
+        let res = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(admin_id, &admin_name)),
+            Path(scan_id),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, admin_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "admin bypass must see the scan");
+    }
+
+    #[tokio::test]
+    async fn test_get_scan_public_repo_non_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_public(&fx.pool, fx.repo_id, true).await;
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = get_scan(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(scan_id),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "public-repo scan is visible to any authed user"
+        );
+    }
+
+    // --- list_findings ----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_findings_non_member_404_no_leak_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = list_findings(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(scan_id),
+            Query(ListFindingsQuery::default()),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        match res {
+            Err(ref e @ AppError::NotFound(_)) => assert_no_scan_leak(e),
+            other => panic!("non-member must get 404, got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_findings_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let res = list_findings(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Path(scan_id),
+            Query(ListFindingsQuery::default()),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        let body = res.expect("member sees findings");
+        assert_eq!(body.0.total, 1);
+    }
+
+    // --- list_artifact_scans ---------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_artifact_scans_non_member_404_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (_s, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = list_artifact_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Path(art),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "non-member must get 404 on artifact scans, got {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_artifact_scans_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (_s, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let res = list_artifact_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Path(art),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        let body = res.expect("member sees artifact scans");
+        assert_eq!(body.0.total, 1);
+    }
+
+    // --- list_scans (filtered + unfiltered) -------------------------------
+
+    #[tokio::test]
+    async fn test_list_scans_artifact_filter_non_member_404_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (_s, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(outsider, &outname)),
+            Query(ListScansQuery {
+                artifact_id: Some(art),
+                ..Default::default()
+            }),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "non-member filtering by hidden artifact must 404, got {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_scans_repo_filter_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (_s, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let res = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Query(ListScansQuery {
+                repository_id: Some(fx.repo_id),
+                ..Default::default()
+            }),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "member filtering by own repo must 200");
+    }
+
+    #[tokio::test]
+    async fn test_list_scans_unfiltered_non_admin_denied_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let res = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "unfiltered global scan list must be admin-only, got {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_scans_unfiltered_admin_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
+        let res = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(admin_id, &admin_name)),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        tdh::cleanup_user(&fx.pool, admin_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "admin may list all scans unfiltered");
     }
 }

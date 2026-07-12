@@ -710,3 +710,345 @@ mod qc_metadata_leak_2437 {
         cleanup(&pool, repo_id, &[user_a, user_b]).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2439  Cross-repo authorization: ungated /security scan+finding reads and
+//        /sbom generate/cve-status writes.
+// ---------------------------------------------------------------------------
+// Class:  Broken object-level authorization on artifact/repo-scoped
+//         security-scan reads and SBOM/CVE writes.
+// Seam:   the `/security/scans*` + `/security/artifacts/:id/scans` read
+//         handlers and the `/sbom` generate + `/sbom/cve/status/:id` write
+//         handlers, exercised end-to-end over the real routers against a live
+//         DB (the external HTTP vantage), not a helper.
+// What:   `GET /scans?artifact_id=<X>`, `/scans/:id`, `/scans/:id/findings`,
+//         `/artifacts/:id/scans` returned CVE/scan data for ANY authenticated
+//         caller with no check they can see the artifact's (private) repo;
+//         `POST /sbom {artifact_id:<X>}` let any authed caller write an SBOM
+//         attestation on another tenant's artifact; `POST /sbom/cve/status/:id`
+//         let any authed caller mutate CVE triage state.
+// Asserts: a non-member (tenant B) gets an existence-hiding 404 on the reads
+//         and the SBOM generate (with NO sbom_documents row written), a 403 on
+//         the CVE-status write, while the repo member (tenant A / owner) still
+//         gets 200 on reads + generate.
+//
+// DB-gated; run with:
+//   DATABASE_URL="postgresql://.../artifact_registry" \
+//     cargo test --test security_regression_tests -- --ignored
+// ---------------------------------------------------------------------------
+mod scan_sbom_leak_2439 {
+    // streaming-invariant: test file exempt — buffering a 404/200 response body
+    // in an assertion is not an artifact path (#1608).
+    #![allow(clippy::disallowed_methods)]
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Extension;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use artifact_keeper_backend::api::handlers::{sbom, security};
+    use artifact_keeper_backend::api::middleware::auth::AuthExtension;
+    use artifact_keeper_backend::api::{AppState, SharedState};
+    use artifact_keeper_backend::config::Config;
+    use artifact_keeper_backend::models::access_scope::AccessScope;
+
+    use super::common;
+
+    fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+        let config = Config {
+            database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+            storage_path: storage_path.into(),
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            ..Default::default()
+        };
+        let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        let registry = Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    fn auth_for(user_id: Uuid) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: format!("u-{}", &user_id.to_string()[..8]),
+            email: "u@test.local".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    async fn create_private_repo(pool: &PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("sc2439-{}", &id.to_string()[..8]);
+        let dir = std::env::temp_dir().join(&key);
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local', 'rpm'::repository_format, false)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert private repo");
+        (id, dir.to_string_lossy().to_string())
+    }
+
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid) -> Uuid {
+        let path = format!("sc2439/{}", Uuid::new_v4());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 'sc2439', '1.0', 1, 'deadbeef', 'application/octet-stream', $3, NULL) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(&path)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact")
+    }
+
+    /// Seed a completed scan + one finding for (repo, artifact). Returns scan id.
+    async fn seed_scan(pool: &PgPool, repo_id: Uuid, artifact_id: Uuid) -> Uuid {
+        let scan_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                 findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 1, NOW(), NOW()) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed scan_result");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                 source, is_acknowledged) \
+             VALUES ($1, $2, 'critical', 'seed', 'CVE-2024-1212', 'trivy', false)",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_finding");
+        scan_id
+    }
+
+    async fn grant_member(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("grant developer role");
+    }
+
+    async fn send(
+        app: axum::Router,
+        req: Request<Body>,
+        auth: AuthExtension,
+    ) -> (StatusCode, String) {
+        let resp = app.layer(Extension(auth)).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn post_json(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn assert_no_leak(body: &str) {
+        for needle in ["repository_id", "cve", "CVE-", "severity", "critical"] {
+            assert!(
+                !body.contains(needle),
+                "cross-tenant denial body must not leak `{needle}`: {body}"
+            );
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, repo_id: Uuid, users: &[Uuid]) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        for tbl in [
+            "scan_results",
+            "sbom_documents",
+            "role_assignments",
+            "artifacts",
+        ] {
+            let _ = sqlx::query(&format!("DELETE FROM {tbl} WHERE repository_id = $1"))
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        for u in users {
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(u)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    async fn sbom_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count sboms")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+    async fn regression_2439_cross_repo_scan_sbom_bola() {
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+
+        // Tenant A owns a private repo + artifact + scan/finding; tenant B has
+        // no membership on it.
+        let user_a = common::insert_active_user(&pool, "sc2439-a").await;
+        let user_b = common::insert_active_user(&pool, "sc2439-b").await;
+        let (repo_id, storage) = create_private_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = seed_scan(&pool, repo_id, artifact_id).await;
+        grant_member(&pool, repo_id, user_a).await;
+
+        let state = build_state(pool.clone(), &storage);
+        let sec = || security::router().with_state(state.clone());
+        let sb = || sbom::router().with_state(state.clone());
+
+        // --- Non-member (tenant B) reads: existence-hiding 404, no leak. ----
+        let (status, body) = send(
+            sec(),
+            get(&format!("/scans?artifact_id={artifact_id}")),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "list_scans artifact filter");
+        assert_no_leak(&body);
+
+        let (status, body) = send(sec(), get(&format!("/scans/{scan_id}")), auth_for(user_b)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "get_scan");
+        assert_no_leak(&body);
+
+        let (status, body) = send(
+            sec(),
+            get(&format!("/scans/{scan_id}/findings")),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "list_findings");
+        assert_no_leak(&body);
+
+        let (status, body) = send(
+            sec(),
+            get(&format!("/artifacts/{artifact_id}/scans")),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "list_artifact_scans");
+        assert_no_leak(&body);
+
+        // --- Non-member SBOM generate (WRITE): 404 and NO row written. ------
+        let (status, body) = send(
+            sb(),
+            post_json(
+                "/",
+                &format!("{{\"artifact_id\":\"{artifact_id}\",\"format\":\"cyclonedx\"}}"),
+            ),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "generate_sbom non-member");
+        assert_no_leak(&body);
+        assert_eq!(
+            sbom_count(&pool, artifact_id).await,
+            0,
+            "denied generate must not write an sbom_documents row"
+        );
+
+        // --- Non-member CVE-status write: admin-only -> 403. ----------------
+        let (status, _body) = send(
+            sb(),
+            post_json(
+                &format!("/cve/status/{}", Uuid::new_v4()),
+                "{\"status\":\"acknowledged\"}",
+            ),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "CVE-status write is admin-only (mirrors update_cve_status_by_artifact_cve)"
+        );
+
+        // --- Owner (tenant A member) legitimate use is intact. --------------
+        let (status, _body) =
+            send(sec(), get(&format!("/scans/{scan_id}")), auth_for(user_a)).await;
+        assert_eq!(status, StatusCode::OK, "member get_scan must still 200");
+
+        let (status, _body) = send(
+            sec(),
+            get(&format!("/artifacts/{artifact_id}/scans")),
+            auth_for(user_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "member list_artifact_scans 200");
+
+        let (status, _body) = send(
+            sb(),
+            post_json(
+                "/",
+                &format!("{{\"artifact_id\":\"{artifact_id}\",\"format\":\"cyclonedx\"}}"),
+            ),
+            auth_for(user_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "member generate_sbom must 200");
+        assert!(
+            sbom_count(&pool, artifact_id).await >= 1,
+            "member generate must write an sbom row"
+        );
+
+        cleanup(&pool, repo_id, &[user_a, user_b]).await;
+    }
+}

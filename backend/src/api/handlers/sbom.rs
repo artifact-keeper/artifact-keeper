@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -351,6 +352,13 @@ async fn generate_sbom(
     Extension(auth): Extension<AuthExtension>,
     Json(body): Json<GenerateSbomRequest>,
 ) -> Result<Json<SbomResponse>> {
+    // Cross-repo authorization (#2439): generating/regenerating an SBOM is a
+    // write against a specific artifact. A member who can see the artifact's
+    // repository is legitimately allowed to do this, so gate on the canonical
+    // artifact-visibility check (token scope + admin bypass + private-repo
+    // membership, existence-hiding 404) BEFORE any write lands.
+    check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db).await?;
+
     let service = SbomService::new(state.db.clone());
     let format = SbomFormat::parse(&body.format)
         .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.format)))?;
@@ -999,6 +1007,7 @@ async fn get_cve_history_by_cve(
     request_body = UpdateCveStatusRequest,
     responses(
         (status = 200, description = "Updated CVE entry", body = crate::models::sbom::CveHistoryEntry),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1009,6 +1018,23 @@ async fn update_cve_status(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateCveStatusRequest>,
 ) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    // Cross-repo authorization (#2439): mutating vulnerability triage state
+    // (accept/dismiss a CVE) is an administrative security decision, not a
+    // per-repo-member action — mirror the sibling
+    // `update_cve_status_by_artifact_cve` (#2321 G3) and the finding
+    // acknowledge/revoke writes (which all `require_admin`). Gate on global
+    // admin BEFORE any validation or lookup, and record the RBAC-deny so an
+    // unauthorized attempt is audited rather than silently 403'd.
+    crate::services::audit_service::enforce_admin_audited(
+        auth.is_admin,
+        state.db.clone(),
+        auth.user_id,
+        crate::services::audit_service::ResourceType::ScanResult,
+        "/api/v1/sbom/cve/status/{id}",
+        "POST",
+    )
+    .await?;
+
     let service = SbomService::new(state.db.clone());
     let status = CveStatus::parse(&body.status)
         .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
@@ -1609,20 +1635,58 @@ fn require_repo_access(
     Ok(())
 }
 
-/// Resolve `artifact_id → repository_id` and apply [`require_repo_access`].
+/// Full per-repo authorization for the SBOM repo-scoped read/write routes.
+///
+/// Combines the pure token-scope decision ([`require_repo_access`]) with a
+/// private-repo membership check (`user_can_access_repo`) — i.e. the same
+/// semantics as [`check_artifact_visibility`]. Before #2439 the `ensure_*`
+/// wrappers ran token-scope ONLY, so any unrestricted JWT/token (which
+/// `can_access_repo` always accepts) could read a private repo's SBOM/CVE
+/// data. Admins bypass the membership check; public repos pass for everyone.
+///
+/// `repo` carries `(repository_id, is_public)`; `None` means the resource row
+/// does not exist (or is soft-deleted) and yields the existence-hiding 404
+/// `missing_msg`. Membership denials also 404 (never 403) so a non-member
+/// cannot enumerate resource ids by status code.
+async fn require_repo_visibility(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    repo: Option<(Uuid, bool)>,
+    missing_msg: &'static str,
+) -> Result<()> {
+    // Token-scope + existence (the pure, unit-tested decision).
+    require_repo_access(auth, repo.map(|(id, _)| id), missing_msg)?;
+    let (repo_id, is_public) = repo.expect("require_repo_access rejects None repo");
+    if !is_public && !auth.is_admin {
+        let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
+        if !repo_service
+            .user_can_access_repo(repo_id, auth.user_id)
+            .await?
+        {
+            return Err(AppError::NotFound(missing_msg.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `artifact_id → (repository_id, is_public)` and apply
+/// [`require_repo_visibility`].
 async fn ensure_artifact_repo_access(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
     artifact_id: Uuid,
 ) -> Result<()> {
-    let repo_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1 AND NOT is_deleted")
-            .bind(artifact_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT r.id, r.is_public FROM artifacts a \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 AND NOT a.is_deleted",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_access(auth, repo_id, ARTIFACT_NOT_ANALYZABLE_MSG)
+    require_repo_visibility(db, auth, repo, ARTIFACT_NOT_ANALYZABLE_MSG).await
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -1632,14 +1696,17 @@ async fn ensure_sbom_repo_access(
     auth: &AuthExtension,
     sbom_id: Uuid,
 ) -> Result<()> {
-    let repo_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT repository_id FROM sbom_documents WHERE id = $1")
-            .bind(sbom_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT r.id, r.is_public FROM sbom_documents s \
+         JOIN repositories r ON r.id = s.repository_id \
+         WHERE s.id = $1",
+    )
+    .bind(sbom_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_access(auth, repo_id, "SBOM not found")
+    require_repo_visibility(db, auth, repo, "SBOM not found").await
 }
 
 #[derive(OpenApi)]
@@ -3260,5 +3327,230 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2439 cross-repo authorization for the SBOM routes.
+    //
+    // (a) generate_sbom (WRITE): a member of the artifact's repo may generate;
+    //     a non-member gets an existence-hiding 404 and NO sbom_documents row
+    //     is written; public repos + admins pass.
+    // (b) update_cve_status (WRITE): admin-only (mirrors the sibling
+    //     update_cve_status_by_artifact_cve / finding-acknowledge gate); a
+    //     non-admin member is 403'd before any lookup or write.
+    // (c) require_repo_access upgrade via ensure_artifact_repo_access: token
+    //     scope alone no longer suffices for a private repo — a non-member
+    //     unrestricted JWT is denied; members + admins + public repos pass.
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    async fn set_repo_public(pool: &sqlx::PgPool, repo_id: Uuid, public: bool) {
+        sqlx::query("UPDATE repositories SET is_public = $1 WHERE id = $2")
+            .bind(public)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set is_public");
+    }
+
+    #[cfg(test)]
+    async fn sbom_row_count(pool: &sqlx::PgPool, artifact_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count sbom rows")
+    }
+
+    #[tokio::test]
+    async fn test_generate_sbom_non_member_404_and_no_write_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = super::generate_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(outsider, &outname)),
+            axum::Json(GenerateSbomRequest {
+                artifact_id,
+                format: "cyclonedx".to_string(),
+                force_regenerate: false,
+            }),
+        )
+        .await;
+        let count = sbom_row_count(&fx.pool, artifact_id).await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "non-member must get 404, got {:?}",
+            res.err()
+        );
+        assert_eq!(count, 0, "no SBOM row must be written on a denied generate");
+    }
+
+    #[tokio::test]
+    async fn test_generate_sbom_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        // fixture user is auto-granted repo access (member).
+        let res = super::generate_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            axum::Json(GenerateSbomRequest {
+                artifact_id,
+                format: "cyclonedx".to_string(),
+                force_regenerate: false,
+            }),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "member must be able to generate: {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_sbom_public_repo_non_member_ok_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_public(&fx.pool, fx.repo_id, true).await;
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let res = super::generate_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(outsider, &outname)),
+            axum::Json(GenerateSbomRequest {
+                artifact_id,
+                format: "cyclonedx".to_string(),
+                force_regenerate: false,
+            }),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "public-repo generate allowed for any authed user"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_cve_status_non_admin_denied_no_write_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-7788", "high").await;
+        // A legitimate repo member is still denied: the CVE-triage write is
+        // gated on GLOBAL admin (mirrors update_cve_status_by_artifact_cve).
+        let res = super::update_cve_status(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            axum::extract::Path(Uuid::new_v4()),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "non-admin CVE-status write must be 403, got {:?}",
+            res.err()
+        );
+    }
+
+    // --- require_repo_access upgrade (ensure_artifact_repo_access) ---------
+
+    #[tokio::test]
+    async fn test_ensure_artifact_repo_access_non_member_private_denied_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        // Unrestricted JWT (allowed_repo_ids = Admin scope) — passes the old
+        // token-scope-only gate but must now fail on private-repo membership.
+        let auth = tdh::make_auth(outsider, &outname);
+        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            matches!(res, Err(AppError::NotFound(_))),
+            "non-member unrestricted token must be denied on a private repo, got {:?}",
+            res.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_artifact_repo_access_member_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "member must pass: {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_artifact_repo_access_admin_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        tdh::cleanup_user(&fx.pool, admin_id).await;
+        fx.teardown().await;
+        assert!(res.is_ok(), "admin bypass must pass: {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_artifact_repo_access_public_repo_non_member_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_public(&fx.pool, fx.repo_id, true).await;
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let auth = tdh::make_auth(outsider, &outname);
+        let res = super::ensure_artifact_repo_access(&fx.pool, &auth, artifact_id).await;
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+        assert!(
+            res.is_ok(),
+            "public repo must be accessible to any authed user"
+        );
     }
 }
