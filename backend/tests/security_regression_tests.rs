@@ -466,3 +466,247 @@ mod credential_change_grpc {
         );
     }
 }
+
+mod common;
+
+// ---------------------------------------------------------------------------
+// Bug — #2437: cross-repo quality-check metadata leak (BOLA).
+// Class:  Broken object-level authorization on artifact-scoped QC reads.
+// Seam:   the artifact-scoped `/quality/checks*` + `/quality/health/artifacts`
+//         handlers, exercised end-to-end over the real router against a live
+//         DB (the external HTTP vantage), not a helper.
+// What:   `GET /quality/checks?artifact_id=<X>`, `/quality/checks/:id`,
+//         `/quality/checks/:id/issues` and `/quality/health/artifacts/:id`
+//         returned quality-check metadata for ANY authenticated caller with no
+//         check that the caller can see the artifact's (private) repository,
+//         leaking cross-tenant `repository_id` / `check_type` / `score` data.
+// Asserts: a non-member (tenant B) gets an existence-hiding 404 whose body
+//         leaks none of those fields, while the repo member (tenant A / owner)
+//         still gets 200 with the row. Covers `/checks` and `/checks/:id`.
+//
+// DB-gated (this is the one live-DB seam in this file); run with:
+//   DATABASE_URL="postgresql://.../artifact_registry" \
+//     cargo test --test security_regression_tests -- --ignored
+// ---------------------------------------------------------------------------
+mod qc_metadata_leak_2437 {
+    // streaming-invariant: test file exempt — buffering a 404/200 response body
+    // in an assertion is not an artifact path (#1608).
+    #![allow(clippy::disallowed_methods)]
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Extension;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use artifact_keeper_backend::api::handlers::quality_gates;
+    use artifact_keeper_backend::api::middleware::auth::AuthExtension;
+    use artifact_keeper_backend::api::{AppState, SharedState};
+    use artifact_keeper_backend::config::Config;
+    use artifact_keeper_backend::models::access_scope::AccessScope;
+
+    use super::common;
+
+    fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+        let config = Config {
+            database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+            storage_path: storage_path.into(),
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            ..Default::default()
+        };
+        let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        let registry = Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    /// A non-admin, unrestricted-scope caller for `user_id` (the shape the
+    /// real `auth_middleware` injects for a JWT-authenticated local user).
+    fn auth_for(user_id: Uuid) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: format!("u-{}", &user_id.to_string()[..8]),
+            email: "u@test.local".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    async fn create_private_repo(pool: &PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("qc2437-{}", &id.to_string()[..8]);
+        let dir = std::env::temp_dir().join(&key);
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local', 'rpm'::repository_format, false)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert private repo");
+        (id, dir.to_string_lossy().to_string())
+    }
+
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid) -> Uuid {
+        let path = format!("qc2437/{}", Uuid::new_v4());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 'qc2437', '1.0', 1, 'deadbeef', 'application/octet-stream', $3, NULL) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .bind(&path)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact")
+    }
+
+    async fn seed_check(pool: &PgPool, repo_id: Uuid, artifact_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO quality_check_results (artifact_id, repository_id, check_type, status) \
+             VALUES ($1, $2, 'metadata', 'completed') RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed quality_check_result")
+    }
+
+    async fn grant_member(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("grant developer role");
+    }
+
+    async fn get_status_body(
+        app: axum::Router,
+        uri: &str,
+        auth: AuthExtension,
+    ) -> (StatusCode, String) {
+        let resp = app
+            .layer(Extension(auth))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn assert_no_leak(body: &str) {
+        for needle in ["repository_id", "check_type", "score"] {
+            assert!(
+                !body.contains(needle),
+                "cross-tenant 404 body must not leak `{needle}`: {body}"
+            );
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, repo_id: Uuid, users: &[Uuid]) {
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        for u in users {
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(u)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+    async fn regression_2437_cross_repo_qc_metadata_bola() {
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+
+        // Tenant A owns a private repo + artifact + quality check; tenant B has
+        // no membership on it.
+        let user_a = common::insert_active_user(&pool, "qc2437-a").await;
+        let user_b = common::insert_active_user(&pool, "qc2437-b").await;
+        let (repo_id, storage) = create_private_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let check_id = seed_check(&pool, repo_id, artifact_id).await;
+        grant_member(&pool, repo_id, user_a).await;
+
+        let state = build_state(pool.clone(), &storage);
+        let app = || quality_gates::router().with_state(state.clone());
+
+        // The exact BOLA: tenant B lists another tenant's checks -> 404, no leak.
+        let (status, body) = get_status_body(
+            app(),
+            &format!("/checks?artifact_id={artifact_id}"),
+            auth_for(user_b),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-tenant list must be an existence-hiding 404"
+        );
+        assert_no_leak(&body);
+
+        // ... and the /checks/:id sibling route is equally gated.
+        let (status, body) =
+            get_status_body(app(), &format!("/checks/{check_id}"), auth_for(user_b)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cross-tenant get_check 404");
+        assert_no_leak(&body);
+
+        // Owner (tenant A member) still sees the row: legitimate use intact.
+        let (status, body) = get_status_body(
+            app(),
+            &format!("/checks?artifact_id={artifact_id}"),
+            auth_for(user_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "owner list must still succeed");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "owner sees the seeded check"
+        );
+
+        let (status, _body) =
+            get_status_body(app(), &format!("/checks/{check_id}"), auth_for(user_a)).await;
+        assert_eq!(status, StatusCode::OK, "owner get_check must still succeed");
+
+        cleanup(&pool, repo_id, &[user_a, user_b]).await;
+    }
+}

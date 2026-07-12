@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -400,7 +401,7 @@ impl From<crate::models::quality::QualityGateViolation> for GateViolationRespons
 )]
 async fn get_artifact_health(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<ArtifactHealthResponse>> {
     let qc_service = QualityCheckService::new(state.db.clone());
@@ -409,6 +410,10 @@ async fn get_artifact_health(
         .get_artifact_health(artifact_id)
         .await?
         .ok_or_else(|| AppError::NotFound("No health score found for artifact".to_string()))?;
+    // Cross-repo authorization: the caller must be allowed to see this
+    // artifact's repository (token scope + admin bypass + private-repo
+    // membership), else existence-hiding NotFound (#2437).
+    check_artifact_visibility(&Some(auth), artifact_id, &state.db).await?;
     let checks = qc_service.list_checks(artifact_id).await?;
 
     let check_summaries: Vec<CheckSummary> = checks
@@ -673,12 +678,24 @@ async fn trigger_checks(
 )]
 async fn list_checks(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListChecksQuery>,
 ) -> Result<Json<Vec<CheckResponse>>> {
     let artifact_id = query.artifact_id.ok_or_else(|| {
         AppError::Validation("artifact_id query parameter is required".to_string())
     })?;
+    // Resolve existence first so a nonexistent artifact 404s uniformly with a
+    // no-access one (mirrors get_artifact), then enforce cross-repo
+    // authorization before returning any check metadata (#2437).
+    let _repo_id: Uuid = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    check_artifact_visibility(&Some(auth), artifact_id, &state.db).await?;
     let qc_service = QualityCheckService::new(state.db.clone());
     let checks = qc_service.list_checks(artifact_id).await?;
     let response: Vec<CheckResponse> = checks.into_iter().map(CheckResponse::from).collect();
@@ -758,11 +775,14 @@ pub fn admin_router() -> Router<SharedState> {
 )]
 async fn get_check(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CheckResponse>> {
     let qc_service = QualityCheckService::new(state.db.clone());
     let check = qc_service.get_check(id).await?;
+    // Enforce cross-repo authorization on the check's artifact before
+    // returning any check metadata (#2437).
+    check_artifact_visibility(&Some(auth), check.artifact_id, &state.db).await?;
     Ok(Json(CheckResponse::from(check)))
 }
 
@@ -782,10 +802,14 @@ async fn get_check(
 )]
 async fn list_check_issues(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(check_id): Path<Uuid>,
 ) -> Result<Json<Vec<IssueResponse>>> {
     let qc_service = QualityCheckService::new(state.db.clone());
+    // Resolve the check (404s if missing) so we can authorize its artifact
+    // before returning any issue metadata (#2437).
+    let check = qc_service.get_check(check_id).await?;
+    check_artifact_visibility(&Some(auth), check.artifact_id, &state.db).await?;
     let issues = qc_service.list_check_issues(check_id).await?;
     let response: Vec<IssueResponse> = issues.into_iter().map(IssueResponse::from).collect();
     Ok(Json(response))
@@ -2200,6 +2224,9 @@ mod tests {
         let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "rpm").await;
         let artifact_id = seed_artifact(&pool, repo_id).await;
         seed_check(&pool, repo_id, artifact_id, "completed", 5.0).await;
+        // The caller must now be authorized for the artifact's (private) repo
+        // (#2437); grant membership so the #2334 shape assertions still hold.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
 
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
         let auth = tdh::make_auth(user_id, &username);
@@ -2222,5 +2249,234 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 1);
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-repo QC metadata authorization (#2437): the artifact-scoped read
+    // routes (`/checks`, `/checks/:id`, `/checks/:id/issues`,
+    // `/health/artifacts/:id`) must run the canonical
+    // `check_artifact_visibility` gate, so a caller with no access to the
+    // artifact's private repo gets an existence-hiding 404 that leaks no QC
+    // metadata, while members/admins/public-repo callers are unaffected.
+    // -----------------------------------------------------------------------
+
+    /// Wire the public quality router to a concrete caller (the real
+    /// `auth_middleware` inserts `Extension<AuthExtension>`, which these
+    /// handlers read).
+    fn quality_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        router().with_state(state).layer(axum::Extension(auth))
+    }
+
+    /// Fetch a URI returning the status plus the RAW response body string, so
+    /// leak assertions can inspect the exact bytes sent to the client.
+    async fn raw_get(app: axum::Router, uri: &str) -> (axum::http::StatusCode, String) {
+        let (status, body) = tdh::send(app, tdh::get(uri.to_string())).await;
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// A no-access 404 body must not leak any quality-check metadata field.
+    fn assert_no_qc_leak(body: &str) {
+        for needle in ["repository_id", "check_type", "score"] {
+            assert!(
+                !body.contains(needle),
+                "404 body must not leak `{needle}`: {body}"
+            );
+        }
+    }
+
+    /// Seed a private repo + artifact + one completed check.
+    /// Returns (repo_id, artifact_id, check_id, storage_dir).
+    async fn seed_repo_artifact_check(
+        pool: &sqlx::PgPool,
+    ) -> (Uuid, Uuid, Uuid, std::path::PathBuf) {
+        let (repo_id, _k, dir) = tdh::create_repo(pool, "local", "rpm").await;
+        let art = seed_artifact(pool, repo_id).await;
+        let check = seed_check(pool, repo_id, art, "completed", 5.0).await;
+        (repo_id, art, check, dir)
+    }
+
+    // (1) accessible/member user + existing artifact -> 200 with rows.
+    #[tokio::test]
+    async fn test_list_checks_member_user_ok_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, v) = json_body(
+            quality_app(state, auth),
+            &format!("/checks?artifact_id={}", art),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // (2) authenticated no-access user -> 404 with no leaked metadata.
+    #[tokio::test]
+    async fn test_list_checks_no_access_404_no_leak_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (repo_id, art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(outsider_id, &outsider);
+        let (status, body) = raw_get(
+            quality_app(state, auth),
+            &format!("/checks?artifact_id={}", art),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, outsider_id).await;
+    }
+
+    // (3) missing artifact_id still 400 — the #2334 guard stays FIRST, ahead
+    // of any existence/authz work.
+    #[tokio::test]
+    async fn test_list_checks_missing_artifact_id_still_400_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, _v) = json_body(quality_app(state, auth), "/checks").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // (4) admin -> 200 (visibility bypass), even with no explicit membership.
+    #[tokio::test]
+    async fn test_list_checks_admin_bypass_ok_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let (status, v) = json_body(
+            quality_app(state, admin),
+            &format!("/checks?artifact_id={}", art),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // (5) nonexistent artifact_id -> 404 (uniform with no-access), no leak.
+    #[tokio::test]
+    async fn test_list_checks_nonexistent_artifact_404_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _k, dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let (status, body) = raw_get(
+            quality_app(state, admin),
+            &format!("/checks?artifact_id={}", Uuid::new_v4()),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // (6) public-repo artifact + any authed non-member -> 200.
+    #[tokio::test]
+    async fn test_list_checks_public_repo_ok_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        let _ = sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, v) = json_body(
+            quality_app(state, auth),
+            &format!("/checks?artifact_id={}", art),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // get_check: no-access user -> 404, no leak.
+    #[tokio::test]
+    async fn test_get_check_no_access_404_no_leak_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (repo_id, _art, check, dir) = seed_repo_artifact_check(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(outsider_id, &outsider);
+        let (status, body) = raw_get(quality_app(state, auth), &format!("/checks/{}", check)).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, outsider_id).await;
+    }
+
+    // list_check_issues: no-access user -> 404, no leak.
+    #[tokio::test]
+    async fn test_list_check_issues_no_access_404_no_leak_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (repo_id, _art, check, dir) = seed_repo_artifact_check(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(outsider_id, &outsider);
+        let (status, body) = raw_get(
+            quality_app(state, auth),
+            &format!("/checks/{}/issues", check),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, outsider_id).await;
+    }
+
+    // get_artifact_health: no-access user -> 404, no leak.
+    #[tokio::test]
+    async fn test_get_artifact_health_no_access_404_no_leak_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (outsider_id, outsider) = tdh::create_user(&pool).await;
+        let (repo_id, art, _c, dir) = seed_repo_artifact_check(&pool).await;
+        // Give the artifact a health score so the existence handling passes and
+        // control reaches the authorization gate.
+        let _ = sqlx::query(
+            "INSERT INTO artifact_health_scores (artifact_id, health_score) VALUES ($1, 90)",
+        )
+        .bind(art)
+        .execute(&pool)
+        .await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(outsider_id, &outsider);
+        let (status, body) = raw_get(
+            quality_app(state, auth),
+            &format!("/health/artifacts/{}", art),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_no_qc_leak(&body);
+        tdh::cleanup(&pool, repo_id, outsider_id).await;
     }
 }
