@@ -1,8 +1,8 @@
 name: Release Branch Gate
 
-# Required process gate for `release/*` maintenance branches.
+# Required process gate for `maintenance/*` (and legacy `release/*`) maintenance branches.
 #
-# Default policy: PRs against `release/*` MUST consist of commits that are
+# Default policy: PRs against a maintenance branch MUST consist of commits that are
 # either already on `main` or are cherry-picks of commits already on `main`.
 # This enforces the "land on main first, then cherry-pick" workflow.
 #
@@ -20,7 +20,7 @@ name: Release Branch Gate
 
 on:
   pull_request:
-    branches: ['release/**']
+    branches: ['release/**', 'maintenance/**']
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:

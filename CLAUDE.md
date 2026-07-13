@@ -192,29 +192,29 @@ Additionally, before pushing:
 
 ### Maintenance Branches
 
-Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older release series:
+Long-lived `maintenance/X.Y.x` branches exist for shipping bug fixes to a release series independently of `main`:
 
-- **`release/1.0.x`** — maintenance branch for the 1.0 series (created from `v1.0.0-rc.5`)
-- **`release/1.1.x`** — maintenance branch for the 1.1 series (created from `v1.1.2`)
-- **`main`** — continues with 1.2.x (and beyond) development
+- **`maintenance/1.5.x`** — current maintenance branch for the 1.5 series (created from `v1.5.5`)
+- **`maintenance/1.0.x`** — historical maintenance branch for the 1.0 series
+- **`main`** — continues with 1.6.x (and beyond) development
 
 **Bug fix workflow for maintenance branches:**
 1. Create a fix branch from the maintenance branch:
    ```bash
-   git checkout release/1.1.x && git pull
+   git checkout maintenance/1.5.x && git pull
    git checkout -b fix/short-description
    ```
-2. Push and create a PR **targeting `release/1.1.x`** (not main):
+2. Push and create a PR **targeting `maintenance/1.5.x`** (not main):
    ```bash
    git push -u origin fix/short-description
-   gh pr create --base release/1.1.x --fill
+   gh pr create --base maintenance/1.5.x --fill
    ```
 3. Tag releases from the maintenance branch:
    ```bash
-   git checkout release/1.1.x && git pull
-   git tag v1.1.3 && git push origin v1.1.3
+   git checkout maintenance/1.5.x && git pull
+   git tag v1.5.6 && git push origin v1.5.6
    ```
-4. Cherry-pick fixes between maintenance and `main` so both lines stay in sync. Bug fixes typically land on the maintenance branch first, then cherry-pick forward to main.
+4. Keep both lines in sync by cherry-picking between the maintenance branch and `main`. Either direction is fine as long as both end up with the fix: land on the maintenance branch first then cherry-pick forward to `main`, OR (as we typically do) merge the fix PR to `main` first then cherry-pick back to the maintenance branch. Features go to `main` only, never to a maintenance branch — the release-branch-gate enforces that every maintenance-branch commit is a cherry-pick of a `main` commit.
 
 **Docker image tags** (set by `docker/metadata-action` in `docker-publish.yml`):
 - Version tags **strip the `v` prefix**: git tag `v1.1.0-rc.2` → Docker tag `:1.1.0-rc.2`

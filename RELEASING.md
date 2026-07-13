@@ -1,7 +1,7 @@
 # Releasing Artifact Keeper
 
 Runbook for cutting a release from `main`. Maintenance releases from
-`release/X.Y.x` branches follow the same sequence; the only difference is
+`maintenance/X.Y.x` branches follow the same sequence; the only difference is
 that fixes reach the branch by cherry-pick from `main` first (see
 "Release Branch Strategy" in [CLAUDE.md](CLAUDE.md) and the
 release-branch-gate workflow).
