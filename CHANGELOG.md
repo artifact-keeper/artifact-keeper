@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-07-13
+
+Regression hotfix: restores Docker remote/proxy image pulls, which failed with `invalid username or password` on 1.5.4/1.5.5.
+
+### Fixed
+
+- **Docker remote/proxy pulls no longer fail after the first token exchange** (#2477): the OCI `/v2/token` endpoint minted the Docker offline token as a single-use, family-rotating web-session refresh token, so the second token exchange the Docker client performs on every pull tripped replay detection and revoked the token family — every subsequent `docker pull` then returned `invalid username or password` until re-login. The registry offline token is now a distinct, reusable credential (marked `registry_refresh`) minted and validated on the OCI path only, while the interactive web-session refresh flow keeps its single-use rotation + replay-family-revocation. The registry token stays bounded by explicit revocation, credential changes, and account deactivation, and preserves the presenting credential's scope ceiling (#2430). Interactive/web logins and scope-restricted tokens are unaffected.
+
 ## [1.5.5] - 2026-07-13
 
 Data-fidelity hotfix: Docker/OCI repositories imported via the Nexus/Artifactory migration are now correctly registered in the container registry index, so migrated images are pullable. Includes an automatic one-time repair on upgrade for already-migrated repositories.
