@@ -79,6 +79,21 @@ pub struct RoleMapping {
     pub roles: Vec<String>,
 }
 
+/// `token_type` marker for OCI registry offline refresh tokens (#2487).
+///
+/// The Docker `/v2/token` offline token is byte-identical in shape to a
+/// web-session refresh token except for this discriminator. It exists so the
+/// two refresh classes are mutually exclusive across endpoints:
+///   * `mint_access_from_registry_refresh` (the reusable, non-rotating
+///     `/v2/token` path) REQUIRES this marker and rejects a bare `"refresh"`
+///     web token — otherwise the non-consuming path would be a replay oracle
+///     that revives already-rotated/consumed web tokens, bypassing single-use
+///     rotation + replay-family-revocation.
+///   * `refresh_tokens` (the interactive `/api/v1/auth/refresh` path) keeps
+///     its `token_type != "refresh"` guard, so a registry token carrying this
+///     marker is rejected there too.
+pub(crate) const REGISTRY_REFRESH_TOKEN_TYPE: &str = "registry_refresh";
+
 /// Result of API token validation: the user plus the token's constraints.
 #[derive(Debug, Clone)]
 pub struct ApiTokenValidation {
@@ -1251,6 +1266,26 @@ impl AuthService {
         allowed_repo_ids: Option<Vec<Uuid>>,
         scopes: Option<Vec<String>>,
     ) -> Result<TokenPair> {
+        // Web/interactive refresh tokens carry the bare "refresh" type. The
+        // registry offline path uses `generate_registry_offline_token`
+        // (REGISTRY_REFRESH_TOKEN_TYPE) instead so the two token classes are
+        // never interchangeable across the two refresh endpoints (#2487).
+        self.generate_token_pair_typed(user, family_id, allowed_repo_ids, scopes, "refresh")
+    }
+
+    /// Core token-pair minter. `refresh_token_type` stamps the refresh JWT's
+    /// `token_type` claim: `"refresh"` for the interactive web-session path
+    /// (single-use rotation via [`refresh_tokens`]) or
+    /// [`REGISTRY_REFRESH_TOKEN_TYPE`] for the reusable, non-rotating OCI
+    /// registry path (#2487). The access claims are identical either way.
+    fn generate_token_pair_typed(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        refresh_token_type: &str,
+    ) -> Result<TokenPair> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
@@ -1284,7 +1319,7 @@ impl AuthService {
             iat: now.timestamp(),
             iat_ms: Some(now_ms),
             exp: refresh_exp.timestamp(),
-            token_type: "refresh".to_string(),
+            token_type: refresh_token_type.to_string(),
             jti: Some(refresh_jti),
             family_id: Some(family_id),
             scan_pull_repo: None,
@@ -1623,6 +1658,154 @@ impl AuthService {
         )?;
         self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
+    }
+
+    /// Non-rotating refresh for the OCI registry flow (`/v2/token` with
+    /// `grant_type=refresh_token`, #2477).
+    ///
+    /// Per the [Docker Distribution OAuth2 spec](https://distribution.github.io/distribution/spec/auth/oauth/),
+    /// the offline token is a long-lived **reusable** credential: the Docker
+    /// daemon stores it once and presents the SAME token every time its
+    /// short-lived access token expires. Running that flow through
+    /// [`AuthService::refresh_tokens`] (single-use rotation +
+    /// replay-family-revocation per RFC 9700 §2.2.2) mis-classified the
+    /// second presentation as a replay, revoked the whole family, and broke
+    /// every subsequent pull with `invalid username or password` (#2477).
+    /// Rotation is an interactive web-session semantic
+    /// (`POST /api/v1/auth/refresh`); the registry grant uses this dedicated
+    /// path instead.
+    ///
+    /// The reusable token remains fully bounded:
+    ///   * signature + expiry via [`decode_token`](Self::decode_token) and
+    ///     the [`REGISTRY_REFRESH_TOKEN_TYPE`] discriminator check — a
+    ///     web-session refresh token (bare `token_type == "refresh"`, even one
+    ///     already consumed/rotated) is rejected here (#2487), so this
+    ///     non-consuming path can never be used as a replay oracle for the
+    ///     interactive single-use rotation family;
+    ///   * the replica-safe credential-change watermark (password change,
+    ///     TOTP toggle, privilege change since issuance) via
+    ///     [`is_token_invalidated_replica_safe`] → 401;
+    ///   * explicit revocation: `refresh_token_jti.revoked_at` on the
+    ///     presented `jti` (logout, deactivation sweep, admin family
+    ///     revocation) → 401;
+    ///   * account state: `users.is_active = true` via
+    ///     [`load_active_user`](Self::load_active_user) → 401.
+    ///
+    /// It does NOT consume the `jti` and does NOT revoke the family on
+    /// reuse. The minted access token preserves the presenting token's
+    /// `allowed_repo_ids` and action-scope ceiling so a refresh can never
+    /// widen the grant (#2430). The returned `TokenPair.refresh_token` is
+    /// the presented token, unchanged.
+    pub async fn mint_access_from_registry_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> Result<(User, TokenPair)> {
+        let token_data = self.decode_token(refresh_token)?;
+
+        // REQUIRE the registry marker. A bare web-session refresh token
+        // (`token_type == "refresh"`) must NOT be accepted on this
+        // non-consuming path, or it would bypass the single-use rotation +
+        // replay-family-revocation that contains web token theft (#2487).
+        if token_data.claims.token_type != REGISTRY_REFRESH_TOKEN_TYPE {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+
+        if is_token_invalidated_replica_safe(
+            &self.db,
+            token_data.claims.sub,
+            token_data.claims.effective_iat_ms(),
+        )
+        .await?
+        {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
+
+        // Honor explicit revocation WITHOUT consuming the row: reuse is
+        // expected on this path, so `consumed_at` is neither set nor checked
+        // here. Tokens minted before the jti table existed have no row and
+        // fall through to the watermark + is_active bounds above/below.
+        if let Some(jti) = token_data.claims.jti {
+            let row = sqlx::query!(
+                r#"
+                SELECT revoked_at
+                FROM refresh_token_jti
+                WHERE jti = $1
+                "#,
+                jti
+            )
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if row.is_some_and(|r| r.revoked_at.is_some()) {
+                tracing::warn!(
+                    user_id = %token_data.claims.sub,
+                    jti = %jti,
+                    "Registry refresh token rejected: revoked",
+                );
+                return Err(AppError::Authentication(
+                    "Refresh token has been revoked".to_string(),
+                ));
+            }
+        }
+
+        let user = self.load_active_user(token_data.claims.sub).await?;
+
+        // Mint a fresh short-lived access token under the presenting token's
+        // repo allow-list and action-scope ceiling (#2430). The refresh JWT
+        // that `generate_tokens_with_family_and_scope` also mints is
+        // discarded here — never returned to any caller and never persisted
+        // to `refresh_token_jti` — so this path cannot spawn additional
+        // refresh credentials: the client keeps exactly the token it
+        // presented.
+        let minted = self.generate_tokens_with_family_and_scope(
+            &user,
+            token_data.claims.family_id.unwrap_or_else(Uuid::new_v4),
+            token_data.claims.allowed_repo_ids.clone(),
+            token_data.claims.scopes.clone(),
+        )?;
+
+        Ok((
+            user,
+            TokenPair {
+                access_token: minted.access_token,
+                refresh_token: refresh_token.to_string(),
+                expires_in: minted.expires_in,
+            },
+        ))
+    }
+
+    /// Mint a reusable OCI registry offline refresh token (#2477/#2487).
+    ///
+    /// Stamps the refresh JWT with [`REGISTRY_REFRESH_TOKEN_TYPE`] so it is
+    /// accepted ONLY by [`mint_access_from_registry_refresh`] (the
+    /// non-rotating `/v2/token` path) and rejected by [`refresh_tokens`] (the
+    /// interactive `/api/v1/auth/refresh` path). Persists the `jti` so
+    /// logout / deactivation / admin family-revocation still bound it exactly
+    /// like a web-session token. `allowed_repo_ids` / `scopes` carry the
+    /// presenting credential's ceiling forward (#2430).
+    ///
+    /// Returns the bare refresh-token string; the access token minted
+    /// alongside it is discarded (the OCI handler returns its own access
+    /// token from the password/credential grant), so this never spawns an
+    /// extra usable access credential.
+    pub async fn generate_registry_offline_token(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+    ) -> Result<String> {
+        let pair = self.generate_token_pair_typed(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            scopes,
+            REGISTRY_REFRESH_TOKEN_TYPE,
+        )?;
+        self.persist_refresh_jti_from_pair(&pair, user.id).await?;
+        Ok(pair.refresh_token)
     }
 
     /// Fetch a user row by id, rejecting deactivated accounts. Shared by the
@@ -6881,6 +7064,417 @@ mod tests {
         // carried on refresh tokens, so they are out of scope for this check.)
         assert_eq!(rotated.scopes, ceiling);
 
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2477: non-rotating registry refresh (OCI /v2/token refresh grant).
+    // The interactive-rotation guarantees are covered separately above
+    // (`test_refresh_token_replay_revokes_family`,
+    // `test_refresh_token_legitimate_rotation_succeeds`) and are unchanged.
+    // -----------------------------------------------------------------------
+
+    /// Runtime (non-macro) row check so the test compiles without a `.sqlx`
+    /// cache entry. Returns `(consumed, revoked)` counts for the user's rows.
+    async fn jti_counts(pool: &sqlx::PgPool, user_id: Uuid) -> (i64, i64) {
+        let consumed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti \
+             WHERE user_id = $1 AND consumed_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count consumed");
+        let revoked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti \
+             WHERE user_id = $1 AND revoked_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count revoked");
+        (consumed, revoked)
+    }
+
+    /// #2477 regression: the SAME offline token presented repeatedly must
+    /// keep minting access tokens — no single-use consumption, no
+    /// replay-family-revocation — and the presented refresh token comes
+    /// back unchanged.
+    #[tokio::test]
+    async fn test_registry_refresh_is_reusable_and_does_not_consume_jti() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("regref_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let offline = service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+            .expect("mint registry offline token");
+
+        for attempt in 1..=3 {
+            let (_, minted) = service
+                .mint_access_from_registry_refresh(&offline)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("registry refresh attempt {attempt} must succeed, got {e:?}")
+                });
+            assert_eq!(
+                minted.refresh_token, offline,
+                "presented refresh token must be returned unchanged"
+            );
+            assert!(!minted.access_token.is_empty());
+        }
+
+        let (consumed, revoked) = jti_counts(&pool, user_id).await;
+        assert_eq!(consumed, 0, "registry refresh must NOT consume the jti");
+        assert_eq!(
+            revoked, 0,
+            "registry refresh reuse must NOT revoke the token family"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Explicit revocation (logout / kill-all-sessions / admin sweep) still
+    /// bounds the reusable registry token.
+    #[tokio::test]
+    async fn test_registry_refresh_rejects_explicitly_revoked_token() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("regrev_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let offline = service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+            .expect("mint registry offline token");
+
+        // Control: reusable before revocation.
+        assert!(
+            service
+                .mint_access_from_registry_refresh(&offline)
+                .await
+                .is_ok(),
+            "control registry refresh must succeed before revocation"
+        );
+
+        service
+            .revoke_all_refresh_token_families(user_id)
+            .await
+            .expect("revoke families");
+
+        let err = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect_err("revoked registry token must be rejected");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Deactivated account: `load_active_user` filters `is_active = true`
+    /// with a direct DB read, so the reusable token dies with the account
+    /// even if the watermark cache is warm.
+    #[tokio::test]
+    async fn test_registry_refresh_rejects_deactivated_user() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("regdeact_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let offline = service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+            .expect("mint registry offline token");
+
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("deactivate user");
+
+        let err = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect_err("deactivated user's registry token must be rejected");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Credential-change watermark: a registry token minted BEFORE a
+    /// password change / TOTP toggle must be rejected, same as the
+    /// interactive path. Sleep first so the second-granularity comparison
+    /// is unambiguous (mirrors `refresh_grant_after_totp_toggle_returns_401`
+    /// in oci_v2.rs).
+    #[tokio::test]
+    async fn test_registry_refresh_rejects_pre_credential_change_token() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("regwm_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let offline = service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+            .expect("mint registry offline token");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        invalidate_user_tokens(user_id);
+
+        let err = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect_err("pre-credential-change registry token must be rejected");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2430 ceiling: the access token minted by the registry refresh must
+    /// carry the presenting refresh token's action-scope ceiling (and its
+    /// repo allow-list, which is deliberately access-token-only and thus
+    /// `None` on every refresh claim) — reuse must never widen the grant.
+    #[tokio::test]
+    async fn test_registry_refresh_preserves_scope_ceiling() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("regscope_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let ceiling = Some(vec!["read:artifacts".to_string()]);
+        let offline = service
+            .generate_registry_offline_token(&user, None, ceiling.clone())
+            .await
+            .expect("mint scoped registry offline token");
+
+        let (_, minted) = service
+            .mint_access_from_registry_refresh(&offline)
+            .await
+            .expect("registry refresh of a scoped token");
+
+        let decoding_key = DecodingKey::from_secret(cfg.jwt_secret.as_bytes());
+        let claims = decode::<Claims>(
+            &minted.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("minted access token should decode")
+        .claims;
+        assert_eq!(
+            claims.scopes, ceiling,
+            "registry refresh must preserve the action-scope ceiling (#2430)"
+        );
+        assert_eq!(
+            claims.allowed_repo_ids, None,
+            "repo allow-list mirrors the presenting refresh claims (access-token-only field)"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2487 (probe #5, family confusion): a bare web-session refresh token
+    /// must NOT be accepted on the non-consuming registry path — otherwise
+    /// that path is a replay oracle that revives web tokens, bypassing
+    /// single-use rotation + replay-family-revocation. Covers a fresh web
+    /// token AND an already-consumed/rotated one.
+    #[tokio::test]
+    async fn test_web_refresh_token_rejected_on_registry_path() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("webconf_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        // A fresh web-session refresh token (token_type "refresh").
+        let web = service.generate_tokens(&user).expect("mint web pair");
+        service
+            .persist_refresh_jti_from_pair(&web, user_id)
+            .await
+            .expect("persist web jti");
+
+        let err = service
+            .mint_access_from_registry_refresh(&web.refresh_token)
+            .await
+            .expect_err("web refresh token must be rejected on the registry path");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Rotate it once on the web path (consumes the jti), then replay the
+        // ORIGINAL consumed token against the registry path: still 401. This
+        // is the replay-oracle repro — pre-#2487 the non-consuming path would
+        // have minted access from a token the web path had already retired.
+        let (_, _rotated) = service
+            .refresh_tokens(&web.refresh_token)
+            .await
+            .expect("web rotation consumes the token");
+        let err = service
+            .mint_access_from_registry_refresh(&web.refresh_token)
+            .await
+            .expect_err("consumed web refresh token must still be rejected on the registry path");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2487: the inverse — a registry offline token (marked) must NOT be
+    /// usable on the interactive web `/api/v1/auth/refresh` path
+    /// (`refresh_tokens`), which requires the bare `"refresh"` type.
+    #[tokio::test]
+    async fn test_registry_token_rejected_on_web_refresh_path() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let service = AuthService::new(pool.clone(), make_test_config());
+
+        let username = format!("regconf_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let offline = service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+            .expect("mint registry offline token");
+
+        let err = service
+            .refresh_tokens(&offline)
+            .await
+            .expect_err("registry offline token must be rejected on the web refresh path");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication error, got {err:?}"
+        );
+
+        // Cleanup.
         let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
             .execute(&pool)
             .await;
