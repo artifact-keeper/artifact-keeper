@@ -1084,6 +1084,89 @@ impl MigrationWorker {
             });
         }
 
+        // #2457: Docker/OCI destinations need format-aware registration.
+        // The generic path below stores bytes under a CAS key and inserts an
+        // `artifacts` row, but V2 pulls resolve ONLY through `oci_tags` +
+        // `oci-manifests/<digest>` / `oci_blobs`, so a migrated image was
+        // unpullable (MANIFEST_UNKNOWN) even though the job reported success.
+        // Derive the artifact's role from the source path layout; anything
+        // unrecognized (and every non-docker format) keeps the generic path
+        // byte-for-byte.
+        let oci_role = if is_oci_package_type(package_type) {
+            classify_oci_source_artifact(artifact_path)
+        } else {
+            OciRole::NotOci
+        };
+        let computed_digest = format!("sha256:{sha256_hex}");
+
+        // Content-addressed identity guard: when the source path itself names
+        // a digest (blob files, content-addressed child-manifest folders), the
+        // downloaded bytes MUST hash to it. Registering under the path digest
+        // would serve corrupt bytes; registering under the computed digest
+        // would leave the referenced digest dangling. Fail the item instead.
+        let path_digest = match &oci_role {
+            OciRole::Blob { digest } => Some(digest.as_str()),
+            OciRole::Manifest { reference, .. } if reference.starts_with("sha256:") => {
+                Some(reference.as_str())
+            }
+            _ => None,
+        };
+        if let Some(path_digest) = path_digest {
+            if path_digest != computed_digest {
+                return Err(MigrationError::ChecksumMismatch {
+                    path: artifact_path.to_string(),
+                    expected: path_digest.to_string(),
+                    actual: computed_digest,
+                });
+            }
+        }
+
+        // Manifests must be buffered (they are handed to the OCI tag/ref
+        // registration as JSON) — but only manifests. Layer blobs stay on the
+        // streamed path below, preserving the O(chunk) memory guarantee
+        // (#1422/#1512). A "manifest" beyond the index-manifest cap is not a
+        // real manifest; fail the item rather than buffer it.
+        let oci_manifest_body: Option<bytes::Bytes> = if matches!(
+            oci_role,
+            OciRole::Manifest { .. }
+        ) {
+            if content_size > crate::services::oci_manifest_refs_backfill::MAX_INDEX_MANIFEST_BYTES
+            {
+                return Err(MigrationError::Other(format!(
+                    "Docker/OCI manifest '{artifact_path}' exceeds the {} byte manifest cap (got {content_size} bytes)",
+                    crate::services::oci_manifest_refs_backfill::MAX_INDEX_MANIFEST_BYTES
+                )));
+            }
+            let body = tokio::fs::read(&temp_path).await.map_err(|e| {
+                MigrationError::StorageError(format!(
+                    "Failed to read manifest temp file for OCI registration: {e}"
+                ))
+            })?;
+            Some(bytes::Bytes::from(body))
+        } else {
+            None
+        };
+
+        // Classify manifest bodies by CONTENT, mirroring the live push path
+        // (`handle_put_manifest`). A body that is neither an image nor an
+        // index must surface as a per-item failure — silently importing it
+        // would reproduce the unpullable-tag bug this fixes.
+        let oci_manifest_class = match &oci_manifest_body {
+            Some(body) => {
+                let class = crate::api::handlers::oci_v2::classify_manifest(body);
+                if matches!(
+                    class,
+                    crate::api::handlers::oci_v2::ManifestClass::Malformed
+                ) {
+                    return Err(MigrationError::Other(format!(
+                        "Docker/OCI manifest '{artifact_path}' is neither an image manifest nor an image index (or is not valid JSON)"
+                    )));
+                }
+                Some(class)
+            }
+            None => None,
+        };
+
         // Extract format-specific package metadata (npm package.json, helm
         // Chart.yaml, etc.) from the on-disk temp file BEFORE storage takes
         // ownership of it. Reading from disk (vs. an in-memory buffer)
@@ -1107,8 +1190,18 @@ impl MigrationWorker {
             None
         };
 
-        // Upload to Artifact Keeper storage using CAS key
-        let storage_key = ArtifactService::storage_key_from_checksum(&sha256_hex);
+        // Upload to Artifact Keeper storage. Docker/OCI manifests and blobs
+        // go to the digest-addressed keys the V2 pull path resolves
+        // (`oci-manifests/<digest>`, `oci-blobs/<digest>`); everything else
+        // keeps the generic CAS key. The `artifacts` row below points at the
+        // same key in all cases, so the UI/download API keep working.
+        let storage_key = match &oci_role {
+            OciRole::Blob { digest } => crate::api::handlers::oci_v2::blob_storage_key(digest),
+            OciRole::Manifest { .. } => {
+                crate::api::handlers::oci_v2::manifest_storage_key(&computed_digest)
+            }
+            OciRole::NotOci => ArtifactService::storage_key_from_checksum(&sha256_hex),
+        };
 
         if !self.config.dry_run {
             // Check if content already exists (deduplication)
@@ -1245,6 +1338,74 @@ impl MigrationWorker {
                         .execute(&self.db)
                         .await?;
                     }
+                }
+
+                // #2457: register Docker/OCI content in the OCI index so the
+                // migrated image is actually pullable through the V2 API.
+                // Reuses the live push path's registration
+                // (`persist_tag_and_refs`) so tag rows, index→child edges and
+                // manifest→blob edges land exactly as a native `docker push`
+                // would write them. Failures propagate as per-item failures
+                // (the caller routes them through `fail_item`) — a migrated
+                // tag must never be acked without its index registration.
+                match &oci_role {
+                    OciRole::Blob { digest } => {
+                        // Mirrors the monolithic-upload insert in oci_v2:
+                        // resurrect a GC-marked blob on conflict.
+                        sqlx::query(
+                            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                             VALUES ($1, $2, $3, $4) \
+                             ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+                        )
+                        .bind(repository_id)
+                        .bind(digest)
+                        .bind(content_size as i64)
+                        .bind(&storage_key)
+                        .execute(&self.db)
+                        .await?;
+                    }
+                    OciRole::Manifest { image, reference } => {
+                        let body = oci_manifest_body.as_ref().ok_or_else(|| {
+                            MigrationError::Other(
+                                "OCI manifest body missing after buffering".to_string(),
+                            )
+                        })?;
+                        let class = oci_manifest_class.as_ref().ok_or_else(|| {
+                            MigrationError::Other(
+                                "OCI manifest class missing after classification".to_string(),
+                            )
+                        })?;
+                        // Derive the stored media type from the BODY's own
+                        // `mediaType` (there is no client Content-Type header
+                        // on this path). Serving a Docker schema2 body under
+                        // the OCI media type makes `docker pull` reject the
+                        // manifest as a mediaType mismatch; the sniff keeps
+                        // the two consistent, and `stored_media_type_for`
+                        // still canonicalizes it against the content class.
+                        let content_type = crate::api::handlers::oci_v2::stored_media_type_for(
+                            class,
+                            &crate::api::handlers::oci_v2::resolve_manifest_content_type(
+                                None, body,
+                            ),
+                        );
+                        crate::api::handlers::oci_v2::persist_tag_and_refs(
+                            &self.db,
+                            repository_id,
+                            image,
+                            reference,
+                            &computed_digest,
+                            &content_type,
+                            class,
+                            body,
+                        )
+                        .await
+                        .map_err(|e| {
+                            MigrationError::Other(format!(
+                                "Failed to register OCI manifest '{artifact_path}' in the index: {e}"
+                            ))
+                        })?;
+                    }
+                    OciRole::NotOci => {}
                 }
             }
         }
@@ -1957,6 +2118,125 @@ fn migration_artifact_path(
 /// segment must never reach the INSERT.
 fn has_unsafe_path(path: &str) -> bool {
     path.starts_with('/') || path.split('/').any(|seg| seg == "..")
+}
+
+/// Whether a destination package type is Docker/OCI and therefore needs
+/// format-aware registration into the OCI index during import (#2457).
+pub(crate) fn is_oci_package_type(package_type: &str) -> bool {
+    package_type.eq_ignore_ascii_case("docker") || package_type.eq_ignore_ascii_case("oci")
+}
+
+/// Normalize a digest-shaped path segment to the canonical `sha256:<hex>`
+/// form. Accepts both the Artifactory filesystem form (`sha256__<hex>`) and
+/// the registry form (`sha256:<hex>`); returns `None` for anything else
+/// (including non-lowercase or wrong-length hex), so a tag that merely
+/// *looks* digest-ish is left alone.
+pub(crate) fn normalize_digest_segment(segment: &str) -> Option<String> {
+    let hex = segment
+        .strip_prefix("sha256__")
+        .or_else(|| segment.strip_prefix("sha256:"))?;
+    if hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Some(format!("sha256:{hex}"))
+    } else {
+        None
+    }
+}
+
+/// Role a Docker/OCI source artifact plays in the OCI index, derived from
+/// the source path layout (#2457).
+///
+/// Both supported source layouts are recognized by shape:
+/// - Artifactory: `<image>/<reference>/manifest.json`,
+///   `<image>/<reference>/list.manifest.json` (the `<reference>` folder is a
+///   tag or a content-addressed `sha256__<hex>` folder), and layer/config
+///   blobs stored as `.../sha256__<hex>` files.
+/// - Nexus: `v2/<image>/manifests/<reference>` and blobs enumerated as
+///   `v2/.../blobs/sha256:<hex>`.
+///
+/// Whether a manifest is an image or an index is NOT decided here — that
+/// classification comes from the downloaded bytes
+/// ([`crate::api::handlers::oci_v2::classify_manifest`]), never the filename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OciRole {
+    /// A manifest (image or index). `image` is the image name within the
+    /// destination repository; `reference` is a tag or a `sha256:<hex>`
+    /// digest.
+    Manifest { image: String, reference: String },
+    /// A layer or config blob addressed by `sha256:<hex>` digest.
+    Blob { digest: String },
+    /// Not recognizably part of a Docker/OCI source layout; the artifact
+    /// takes the generic import path unchanged.
+    NotOci,
+}
+
+/// Classify a Docker/OCI source artifact path into its [`OciRole`].
+///
+/// Only called for docker/oci destination repositories; every other format
+/// bypasses this entirely (see [`is_oci_package_type`]). Unrecognized shapes
+/// return [`OciRole::NotOci`] and fall through to the generic import path,
+/// which matches the pre-#2457 behavior byte-for-byte.
+pub(crate) fn classify_oci_source_artifact(artifact_path: &str) -> OciRole {
+    let segments: Vec<&str> = artifact_path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some((&last, dirs)) = segments.split_last() else {
+        return OciRole::NotOci;
+    };
+
+    // Blob shapes. Artifactory stores layer/config blobs as `sha256__<hex>`
+    // files; Nexus enumerates them under a `blobs/` segment as
+    // `blobs/sha256:<hex>`.
+    if last.starts_with("sha256__") {
+        if let Some(digest) = normalize_digest_segment(last) {
+            return OciRole::Blob { digest };
+        }
+    }
+    if dirs.last() == Some(&"blobs") {
+        if let Some(digest) = normalize_digest_segment(last) {
+            return OciRole::Blob { digest };
+        }
+    }
+
+    // Artifactory manifest shape: `<image>/<reference>/(list.)manifest.json`.
+    // A content-addressed `sha256__<hex>` reference folder (multi-arch child
+    // manifest) normalizes to a digest reference; anything else is a tag.
+    if last == "manifest.json" || last == "list.manifest.json" {
+        if let Some((&ref_seg, image_segs)) = dirs.split_last() {
+            if !image_segs.is_empty() {
+                let reference =
+                    normalize_digest_segment(ref_seg).unwrap_or_else(|| ref_seg.to_string());
+                return OciRole::Manifest {
+                    image: image_segs.join("/"),
+                    reference,
+                };
+            }
+        }
+        return OciRole::NotOci;
+    }
+
+    // Nexus manifest shape: `v2/<image>/manifests/<reference>`. Strip the
+    // registry-API prefix segments (`v2`, and the `-` catch-all namespace)
+    // so `image` matches what a client pulls through AK's own V2 endpoint.
+    if dirs.last() == Some(&"manifests") {
+        let mut image_segs = &dirs[..dirs.len() - 1];
+        if image_segs.first() == Some(&"v2") {
+            image_segs = &image_segs[1..];
+        }
+        if image_segs.first() == Some(&"-") {
+            image_segs = &image_segs[1..];
+        }
+        if !image_segs.is_empty() {
+            let reference = normalize_digest_segment(last).unwrap_or_else(|| last.to_string());
+            return OciRole::Manifest {
+                image: image_segs.join("/"),
+                reference,
+            };
+        }
+    }
+
+    OciRole::NotOci
 }
 
 /// Detect Docker/OCI manifest paths laid out by Artifactory's filesystem
@@ -4345,5 +4625,655 @@ mod tests {
             0,
             "transfer_artifact must NOT call put_file (would buffer on cloud backends)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2457: Docker/OCI source-path classification (pure, no DB)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_oci_package_type() {
+        assert!(is_oci_package_type("docker"));
+        assert!(is_oci_package_type("Docker"));
+        assert!(is_oci_package_type("oci"));
+        assert!(!is_oci_package_type("maven"));
+        assert!(!is_oci_package_type("npm"));
+        assert!(!is_oci_package_type("helm_oci"));
+    }
+
+    #[test]
+    fn test_normalize_digest_segment_accepts_both_forms() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            normalize_digest_segment(&format!("sha256__{hex}")),
+            Some(format!("sha256:{hex}"))
+        );
+        assert_eq!(
+            normalize_digest_segment(&format!("sha256:{hex}")),
+            Some(format!("sha256:{hex}"))
+        );
+    }
+
+    #[test]
+    fn test_normalize_digest_segment_rejects_non_digests() {
+        assert_eq!(normalize_digest_segment("latest"), None);
+        assert_eq!(normalize_digest_segment("sha256__short"), None);
+        // Uppercase hex is not a canonical registry digest.
+        let upper = "A".repeat(64);
+        assert_eq!(normalize_digest_segment(&format!("sha256__{upper}")), None);
+        // Wrong length.
+        let long = "a".repeat(65);
+        assert_eq!(normalize_digest_segment(&format!("sha256:{long}")), None);
+        // Non-hex characters.
+        let bad = "g".repeat(64);
+        assert_eq!(normalize_digest_segment(&format!("sha256__{bad}")), None);
+    }
+
+    #[test]
+    fn test_classify_artifactory_tag_manifest() {
+        assert_eq!(
+            classify_oci_source_artifact("hello-world/latest/manifest.json"),
+            OciRole::Manifest {
+                image: "hello-world".to_string(),
+                reference: "latest".to_string(),
+            }
+        );
+        // Nested image namespaces keep every segment.
+        assert_eq!(
+            classify_oci_source_artifact("org/team/app/v1.2/manifest.json"),
+            OciRole::Manifest {
+                image: "org/team/app".to_string(),
+                reference: "v1.2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_artifactory_list_manifest_and_child() {
+        let hex = "b".repeat(64);
+        assert_eq!(
+            classify_oci_source_artifact("app/latest/list.manifest.json"),
+            OciRole::Manifest {
+                image: "app".to_string(),
+                reference: "latest".to_string(),
+            }
+        );
+        // Content-addressed child manifest folder => digest reference.
+        assert_eq!(
+            classify_oci_source_artifact(&format!("app/sha256__{hex}/manifest.json")),
+            OciRole::Manifest {
+                image: "app".to_string(),
+                reference: format!("sha256:{hex}"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_artifactory_blob() {
+        let hex = "c".repeat(64);
+        assert_eq!(
+            classify_oci_source_artifact(&format!("app/latest/sha256__{hex}")),
+            OciRole::Blob {
+                digest: format!("sha256:{hex}"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_nexus_manifest_tag_and_digest() {
+        let hex = "d".repeat(64);
+        assert_eq!(
+            classify_oci_source_artifact("v2/myimage/manifests/latest"),
+            OciRole::Manifest {
+                image: "myimage".to_string(),
+                reference: "latest".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_oci_source_artifact(&format!("v2/org/app/manifests/sha256:{hex}")),
+            OciRole::Manifest {
+                image: "org/app".to_string(),
+                reference: format!("sha256:{hex}"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_nexus_blob() {
+        let hex = "e".repeat(64);
+        assert_eq!(
+            classify_oci_source_artifact(&format!("v2/-/blobs/sha256:{hex}")),
+            OciRole::Blob {
+                digest: format!("sha256:{hex}"),
+            }
+        );
+        assert_eq!(
+            classify_oci_source_artifact(&format!("v2/myimage/blobs/sha256:{hex}")),
+            OciRole::Blob {
+                digest: format!("sha256:{hex}"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_rejects_non_oci_shapes() {
+        // Generic files fall through to the generic import path.
+        assert_eq!(
+            classify_oci_source_artifact("com/example/lib/1.0/lib-1.0.jar"),
+            OciRole::NotOci
+        );
+        // A manifest.json with no image segment is not addressable.
+        assert_eq!(
+            classify_oci_source_artifact("manifest.json"),
+            OciRole::NotOci
+        );
+        assert_eq!(
+            classify_oci_source_artifact("latest/manifest.json"),
+            OciRole::NotOci
+        );
+        // A blobs/ segment whose leaf is not a digest is not a blob.
+        assert_eq!(
+            classify_oci_source_artifact("v2/app/blobs/notadigest"),
+            OciRole::NotOci
+        );
+        // Empty path.
+        assert_eq!(classify_oci_source_artifact(""), OciRole::NotOci);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2457: OCI-aware import (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// Mock source registry that serves a fixed path->bytes map through the
+    /// buffered download API (the default stream impl wraps it), mirroring
+    /// what Artifactory/Nexus enumerate.
+    struct MapSource {
+        files: std::collections::HashMap<String, bytes::Bytes>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for MapSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![])
+        }
+        async fn list_artifacts(
+            &self,
+            _repo_key: &str,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!()
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            self.files.get(path).cloned().ok_or_else(|| {
+                crate::services::artifactory_client::ArtifactoryError::NotFound(format!(
+                    "Artifact not found: {path}"
+                ))
+            })
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn sha256_hex_of(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex::encode(hasher.finalize())
+    }
+
+    /// Build a worker + filesystem storage rooted in a fresh temp dir and a
+    /// repository row pointing at it. Returns everything a #2457 import test
+    /// needs.
+    async fn setup_repo_for_import(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        format: &str,
+    ) -> (
+        MigrationWorker,
+        Arc<dyn StorageBackend>,
+        tempfile::TempDir,
+        Uuid,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = Uuid::new_v4();
+        let repo_key = format!("{prefix}-{}", &repo_id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local', $4::repository_format, true)",
+        )
+        .bind(repo_id)
+        .bind(&repo_key)
+        .bind(tmp.path().to_str().unwrap())
+        .bind(format)
+        .execute(pool)
+        .await
+        .expect("insert repo");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(tmp.path().to_str().unwrap()),
+        );
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig::default(),
+            CancellationToken::new(),
+        );
+        (worker, storage, tmp, repo_id, repo_key)
+    }
+
+    async fn transfer_one(
+        worker: &MigrationWorker,
+        storage: &Arc<dyn StorageBackend>,
+        files: &std::collections::HashMap<String, bytes::Bytes>,
+        repo_key: &str,
+        package_type: &str,
+        path: &str,
+    ) -> Result<TransferResult, MigrationError> {
+        worker
+            .transfer_artifact(
+                Arc::new(MapSource {
+                    files: files.clone(),
+                }),
+                storage.clone(),
+                repo_key,
+                package_type,
+                path,
+                false,
+                &ExpectedChecksums {
+                    sha256: None,
+                    sha1: None,
+                },
+            )
+            .await
+    }
+
+    /// End-to-end #2457 import over the Artifactory source layout: a config
+    /// blob, a layer blob, and a tagged image manifest must land in the OCI
+    /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
+    /// digest-addressed keys the V2 pull path reads. Pre-fix, none of these
+    /// rows existed and the tag pulled as MANIFEST_UNKNOWN.
+    #[tokio::test]
+    async fn test_docker_import_registers_manifest_and_blobs_artifactory_layout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-art", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-2457");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let layer_hex = sha256_hex_of(&layer_bytes);
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+              \"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
+            config_bytes.len(),
+            config_hex,
+            layer_bytes.len(),
+            layer_hex
+        );
+        let manifest_bytes = bytes::Bytes::from(manifest);
+        let manifest_digest = format!("sha256:{}", sha256_hex_of(&manifest_bytes));
+
+        let config_path = format!("hello/latest/sha256__{config_hex}");
+        let layer_path = format!("hello/latest/sha256__{layer_hex}");
+        let manifest_path = "hello/latest/manifest.json".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(config_path.clone(), config_bytes.clone());
+        files.insert(layer_path.clone(), layer_bytes.clone());
+        files.insert(manifest_path.clone(), manifest_bytes.clone());
+
+        for path in [&config_path, &layer_path, &manifest_path] {
+            transfer_one(&worker, &storage, &files, &repo_key, "docker", path)
+                .await
+                .unwrap_or_else(|e| panic!("transfer of {path} failed: {e}"));
+        }
+
+        // Tag row resolves the migrated tag to the manifest digest.
+        let tag_row: Option<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags \
+             WHERE repository_id = $1 AND name = 'hello' AND tag = 'latest'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_tags");
+        let (digest, content_type) = tag_row.expect("migrated tag must be registered in oci_tags");
+        assert_eq!(digest, manifest_digest);
+        // Stored media type must match the body's own mediaType — a Docker
+        // schema2 body stored under the OCI type breaks `docker pull`.
+        assert_eq!(
+            content_type,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+
+        // Manifest bytes live at the digest-addressed key the V2 GET reads.
+        let stored = storage
+            .get(&format!("oci-manifests/{manifest_digest}"))
+            .await
+            .expect("manifest bytes at oci-manifests/<digest>");
+        assert_eq!(stored, manifest_bytes);
+
+        // Both blobs registered and their bytes at oci-blobs/<digest>.
+        for hex in [&config_hex, &layer_hex] {
+            let blob: Option<(String,)> = sqlx::query_as(
+                "SELECT storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+            )
+            .bind(repo_id)
+            .bind(format!("sha256:{hex}"))
+            .fetch_optional(&pool)
+            .await
+            .expect("query oci_blobs");
+            let (key,) = blob.expect("blob must be registered in oci_blobs");
+            assert!(storage.exists(&key).await.unwrap(), "blob bytes at {key}");
+        }
+
+        // Image manifest edges recorded for GC protection.
+        let ref_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("count manifest_blob_refs");
+        assert_eq!(ref_count.0, 2, "config + layer edges must be recorded");
+
+        // The artifacts row is preserved for the UI/download API.
+        let artifact_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+        assert_eq!(artifact_count.0, 3);
+
+        // Re-import is idempotent (ON CONFLICT paths, no errors).
+        transfer_one(
+            &worker,
+            &storage,
+            &files,
+            &repo_key,
+            "docker",
+            &manifest_path,
+        )
+        .await
+        .expect("re-import of the manifest must be idempotent");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// Multi-arch over the Nexus source layout: the child image manifest
+    /// (digest reference) and the index (tag reference) are separate source
+    /// artifacts; importing both must record the parent->child edge in
+    /// oci_manifest_refs and register the child under its digest.
+    #[tokio::test]
+    async fn test_docker_import_multiarch_index_nexus_layout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-nx", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let child = format!(
+            "{{\"schemaVersion\":2,\
+              \"config\":{{\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[]}}",
+            config_bytes.len(),
+            config_hex
+        );
+        let child_bytes = bytes::Bytes::from(child);
+        let child_hex = sha256_hex_of(&child_bytes);
+        let index = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.index.v1+json\",\
+              \"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"size\":{},\"digest\":\"sha256:{}\",\
+              \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}",
+            child_bytes.len(),
+            child_hex
+        );
+        let index_bytes = bytes::Bytes::from(index);
+        let index_digest = format!("sha256:{}", sha256_hex_of(&index_bytes));
+
+        let blob_path = format!("v2/app/blobs/sha256:{config_hex}");
+        let child_path = format!("v2/app/manifests/sha256:{child_hex}");
+        let index_path = "v2/app/manifests/latest".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(blob_path.clone(), config_bytes.clone());
+        files.insert(child_path.clone(), child_bytes.clone());
+        files.insert(index_path.clone(), index_bytes.clone());
+
+        for path in [&blob_path, &child_path, &index_path] {
+            transfer_one(&worker, &storage, &files, &repo_key, "docker", path)
+                .await
+                .unwrap_or_else(|e| panic!("transfer of {path} failed: {e}"));
+        }
+
+        // Tag resolves to the index, stored with an index media type so the
+        // GC gate treats it as an index.
+        let tag_row: Option<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_content_type FROM oci_tags \
+             WHERE repository_id = $1 AND name = 'app' AND tag = 'latest'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_tags");
+        let (digest, content_type) = tag_row.expect("index tag must be registered");
+        assert_eq!(digest, index_digest);
+        assert_eq!(content_type, "application/vnd.oci.image.index.v1+json");
+
+        // Parent->child edge recorded; child registered under its digest.
+        let edge: Option<(String,)> = sqlx::query_as(
+            "SELECT child_digest FROM oci_manifest_refs \
+             WHERE repository_id = $1 AND parent_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&index_digest)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_manifest_refs");
+        assert_eq!(edge.expect("index edge").0, format!("sha256:{child_hex}"));
+
+        let child_row: Option<(String,)> = sqlx::query_as(
+            "SELECT manifest_digest FROM oci_tags \
+             WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(format!("sha256:{child_hex}"))
+        .fetch_optional(&pool)
+        .await
+        .expect("query child tag row");
+        assert!(
+            child_row.is_some(),
+            "child manifest must resolve by digest (as the live push path records it)"
+        );
+        assert!(
+            storage
+                .exists(&format!("oci-manifests/sha256:{child_hex}"))
+                .await
+                .unwrap(),
+            "child manifest bytes at its digest-addressed key"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// A malformed manifest body (valid path shape, degenerate content) must
+    /// fail the item — silently importing it would recreate the unpullable
+    /// state this fix removes.
+    #[tokio::test]
+    async fn test_docker_import_rejects_malformed_manifest_body() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-bad", "docker").await;
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "broken/latest/manifest.json".to_string(),
+            bytes::Bytes::from_static(b"not-json-at-all"),
+        );
+
+        let result = transfer_one(
+            &worker,
+            &storage,
+            &files,
+            &repo_key,
+            "docker",
+            "broken/latest/manifest.json",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "malformed manifest must fail the item, not import silently"
+        );
+
+        let tags: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count oci_tags");
+        assert_eq!(tags.0, 0);
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// A blob whose bytes do not hash to the digest in its path must fail
+    /// (registering either digest would corrupt or dangle the reference).
+    #[tokio::test]
+    async fn test_docker_import_rejects_blob_digest_mismatch() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-mm", "docker").await;
+
+        let wrong_hex = "f".repeat(64);
+        let blob_path = format!("app/latest/sha256__{wrong_hex}");
+        let mut files = std::collections::HashMap::new();
+        files.insert(blob_path.clone(), bytes::Bytes::from_static(b"whatever"));
+
+        let result = transfer_one(&worker, &storage, &files, &repo_key, "docker", &blob_path).await;
+        assert!(
+            matches!(result, Err(MigrationError::ChecksumMismatch { .. })),
+            "digest mismatch must surface as ChecksumMismatch, got {result:?}"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// Regression guard: non-docker formats keep the generic import path
+    /// byte-for-byte — CAS storage key, artifacts row, and NO OCI rows, even
+    /// for a path that looks like a Docker layout.
+    #[tokio::test]
+    async fn test_non_docker_import_keeps_generic_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-gen", "generic").await;
+
+        let body = bytes::Bytes::from_static(b"generic payload that is not oci");
+        let body_hex = sha256_hex_of(&body);
+        let path = "hello/latest/manifest.json";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+
+        transfer_one(&worker, &storage, &files, &repo_key, "generic", path)
+            .await
+            .expect("generic transfer must succeed");
+
+        // Bytes at the CAS key, exactly as before #2457.
+        let cas_key = ArtifactService::storage_key_from_checksum(&body_hex);
+        assert!(storage.exists(&cas_key).await.unwrap(), "CAS key populated");
+
+        let oci_rows: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1), \
+                    (SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci rows");
+        assert_eq!((oci_rows.0, oci_rows.1), (0, 0), "no OCI rows for generic");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
     }
 }
