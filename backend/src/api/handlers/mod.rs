@@ -257,6 +257,7 @@ pub mod peers;
 pub mod permissions;
 pub mod plugins;
 pub mod profile;
+pub mod projects;
 pub mod promotion;
 pub mod promotion_rules;
 pub mod protobuf;

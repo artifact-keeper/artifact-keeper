@@ -169,8 +169,20 @@ impl PermissionService {
 
         debug!(target_type, %target_id, "rules cache miss, querying database");
 
+        // Projects (#2472): a repository target also has rules when its owning
+        // project carries a grant, so the fine-grained gate engages for
+        // project-only repositories instead of falling back to the default
+        // access model. The `$1 = 'repository'` guard keeps every other target
+        // type (group/artifact/system) unaffected, and a NULL `project_id`
+        // subquery result never matches (`target_id = NULL` is not true).
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM permissions WHERE target_type = $1 AND target_id = $2)",
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM permissions
+                 WHERE (target_type = $1 AND target_id = $2)
+                    OR ($1 = 'repository' AND target_type = 'project' AND target_id = (
+                        SELECT project_id FROM repositories WHERE id = $2
+                    ))
+               )"#,
         )
         .bind(target_type)
         .bind(target_id)
@@ -321,6 +333,11 @@ impl PermissionService {
         target_type: &str,
         target_id: Uuid,
     ) -> Result<Vec<String>> {
+        // Projects (#2472): when resolving actions on a repository target, a
+        // grant on the repository's owning project is inherited. The
+        // `$2 = 'repository'` guard confines inheritance to repository
+        // targets; for a project-less repository the subquery yields NULL and
+        // the project arm never matches, so behavior is unchanged.
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"
             SELECT DISTINCT unnest(actions) as action
@@ -332,8 +349,12 @@ impl PermissionService {
                     SELECT group_id FROM user_group_members WHERE user_id = $1
                 ))
             )
-            AND target_type = $2
-            AND target_id = $3
+            AND (
+                (target_type = $2 AND target_id = $3)
+                OR ($2 = 'repository' AND target_type = 'project' AND target_id = (
+                    SELECT project_id FROM repositories WHERE id = $3
+                ))
+            )
             "#,
         )
         .bind(user_id)
@@ -684,6 +705,65 @@ mod tests {
             inserted_at: Instant::now() - CACHE_TTL + Duration::from_secs(1),
         };
         assert!(!entry.is_expired());
+    }
+
+    // -----------------------------------------------------------------------
+    // Projects (#2472): structural guards for the write-plane inheritance.
+    //
+    // Both predicates must carry the project arm TOGETHER:
+    // `has_any_rules_for_target` gates whether `check_permission` is consulted
+    // at all (upload.rs), so a project-only repository with the arm missing
+    // from the EXISTS would report has_rules=false and the write path would
+    // fall open. These source-level guards pin both queries without a DB,
+    // matching the source-grep contract style used by sibling handler tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_any_rules_query_includes_project_inheritance_arm() {
+        let src = include_str!("permission_service.rs");
+        let fn_start = src
+            .find("pub async fn has_any_rules_for_target")
+            .expect("has_any_rules_for_target must exist");
+        let fn_end = src[fn_start..]
+            .find("pub fn invalidate_cache")
+            .expect("invalidate_cache follows has_any_rules_for_target");
+        let body = &src[fn_start..fn_start + fn_end];
+        assert!(
+            body.contains("target_type = $1 AND target_id = $2"),
+            "direct target arm missing from has_any_rules_for_target"
+        );
+        assert!(
+            body.contains("$1 = 'repository' AND target_type = 'project'"),
+            "guarded project arm missing from has_any_rules_for_target: a \
+             project-only repository would report has_rules=false and the \
+             write gate would fall open"
+        );
+        assert!(
+            body.contains("SELECT project_id FROM repositories WHERE id = $2"),
+            "project arm must resolve the repository's project_id"
+        );
+    }
+
+    #[test]
+    fn test_query_actions_includes_project_inheritance_arm() {
+        let src = include_str!("permission_service.rs");
+        let fn_start = src
+            .find("async fn query_actions")
+            .expect("query_actions must exist");
+        let body = &src[fn_start..];
+        assert!(
+            body.contains("(target_type = $2 AND target_id = $3)"),
+            "direct target arm missing from query_actions"
+        );
+        assert!(
+            body.contains("$2 = 'repository' AND target_type = 'project'"),
+            "guarded project arm missing from query_actions: project members \
+             would never inherit actions on assigned repositories"
+        );
+        assert!(
+            body.contains("SELECT project_id FROM repositories WHERE id = $3"),
+            "project arm must resolve the repository's project_id"
+        );
     }
 
     // -----------------------------------------------------------------------

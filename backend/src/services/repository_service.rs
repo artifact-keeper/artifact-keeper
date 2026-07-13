@@ -36,6 +36,9 @@ pub struct CreateRepositoryRequest {
     pub versioning_enabled: bool,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
+    /// Optional project to assign the repository to at creation (#2472).
+    /// `None` leaves the repository unassigned (legacy behavior).
+    pub project_id: Option<Uuid>,
     /// User who is creating this repository. When set, the repository records
     /// this user as `created_by` and the creator is auto-granted the
     /// `developer` role scoped to the new repository (owner auto-grant), so the
@@ -57,6 +60,11 @@ pub struct UpdateRepositoryRequest {
     /// When `Some`, sets the `versioning_enabled` flag (#2367); `None` leaves
     /// it unchanged.
     pub versioning_enabled: Option<bool>,
+    /// When `Some`, sets the repository's project assignment (#2472);
+    /// `None` leaves it unchanged. Mirrors `quota_bytes`: the outer `Option`
+    /// is the "field present" marker and the inner value is what is stored
+    /// (P1 exposes set-only, so handlers pass `Some(Some(id))`).
+    pub project_id: Option<Option<Uuid>>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -222,12 +230,24 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
 /// denied" rule. The repository scoping deliberately excludes any
 /// `target_type = 'system'` arm so visibility never widens beyond what the data
 /// plane honours for repository access.
+///
+/// Projects (#2472): a grant on the repository's owning project
+/// (`target_type = 'project'`, `target_id = repositories.project_id`) is
+/// honoured alongside the direct repository grant. When the repository has no
+/// project (`project_id IS NULL`) the project arm's subquery yields NULL and
+/// `p.target_id = NULL` is never true, so unassigned repositories behave
+/// exactly as before. The subquery aliases `repositories` as `rp` to avoid
+/// colliding with any `r`/`repositories` reference in the caller's query.
 fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
     format!(
         r#"EXISTS (
             SELECT 1 FROM permissions p
-            WHERE p.target_type = 'repository'
-              AND p.target_id = {repo_id_expr}
+            WHERE (
+                  (p.target_type = 'repository' AND p.target_id = {repo_id_expr})
+                  OR (p.target_type = 'project' AND p.target_id = (
+                      SELECT rp.project_id FROM repositories rp WHERE rp.id = {repo_id_expr}
+                  ))
+              )
               AND p.actions <> '{{}}'
               AND (
                   (p.principal_type = 'user' AND p.principal_id = ${user_param})
@@ -618,9 +638,10 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, promotion_only, versioning_enabled
+                is_public, quota_bytes, promotion_only, versioning_enabled,
+                project_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
@@ -631,7 +652,7 @@ impl RepositoryService {
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 age_gate_enabled, age_gate_min_age_days, versioning_enabled,
-                created_at, updated_at
+                project_id, created_at, updated_at
             "#,
             req.key,
             req.name,
@@ -645,6 +666,7 @@ impl RepositoryService {
             req.quota_bytes,
             req.promotion_only,
             req.versioning_enabled,
+            req.project_id,
         )
         .fetch_one(&mut *tx)
         .await;
@@ -777,7 +799,7 @@ impl RepositoryService {
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 age_gate_enabled, age_gate_min_age_days, versioning_enabled,
-                created_at, updated_at
+                project_id, created_at, updated_at
             FROM repositories
             WHERE id = $1
             "#,
@@ -806,7 +828,7 @@ impl RepositoryService {
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 age_gate_enabled, age_gate_min_age_days, versioning_enabled,
-                created_at, updated_at
+                project_id, created_at, updated_at
             FROM repositories
             WHERE key = $1
             "#,
@@ -826,6 +848,10 @@ impl RepositoryService {
     /// - `All`: every repository (admin callers).
     /// - `User(id)`: public repositories plus private repositories where the
     ///   user holds at least one role assignment (direct or global).
+    ///
+    /// `project_filter` narrows the listing to repositories assigned to the
+    /// given project (#2472); `None` applies no project restriction.
+    #[allow(clippy::too_many_arguments)] // mirrors the listing filter surface 1:1
     pub async fn list(
         &self,
         offset: i64,
@@ -834,6 +860,7 @@ impl RepositoryService {
         type_filter: Option<RepositoryType>,
         visibility: RepoVisibility,
         search_query: Option<&str>,
+        project_filter: Option<Uuid>,
     ) -> Result<(Vec<Repository>, i64)> {
         let search_pattern = build_search_pattern(search_query);
         let (visibility_clause, visibility_bind) = build_visibility_clause(&visibility);
@@ -847,6 +874,9 @@ impl RepositoryService {
         };
 
         // -- fetch page --
+        // NOTE: the project-filter bind index differs between the page query
+        // ($7: offset/limit occupy $5/$6) and the count query ($5: no
+        // offset/limit); each `$N` matches its own query's positional order.
         let select_sql = format!(
             r#"
             SELECT
@@ -858,12 +888,13 @@ impl RepositoryService {
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 age_gate_enabled, age_gate_min_age_days, versioning_enabled,
-                created_at, updated_at
+                project_id, created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($7::uuid IS NULL OR project_id = $7)
             ORDER BY name
             OFFSET $5
             LIMIT $6
@@ -882,6 +913,7 @@ impl RepositoryService {
             .bind(search_pattern.clone())
             .bind(offset)
             .bind(limit)
+            .bind(project_filter)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -895,6 +927,7 @@ impl RepositoryService {
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($5::uuid IS NULL OR project_id = $5)
             "#
         );
 
@@ -907,6 +940,7 @@ impl RepositoryService {
         };
         let total: i64 = count_query
             .bind(search_pattern)
+            .bind(project_filter)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -938,6 +972,7 @@ impl RepositoryService {
                 upstream_url = COALESCE($7, upstream_url),
                 promotion_only = COALESCE($8, promotion_only),
                 versioning_enabled = COALESCE($9, versioning_enabled),
+                project_id = COALESCE($10, project_id),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -950,7 +985,7 @@ impl RepositoryService {
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
                 age_gate_enabled, age_gate_min_age_days, versioning_enabled,
-                created_at, updated_at
+                project_id, created_at, updated_at
             "#,
             id,
             req.key,
@@ -961,6 +996,7 @@ impl RepositoryService {
             req.upstream_url,
             req.promotion_only,
             req.versioning_enabled,
+            req.project_id.flatten(),
         )
         .fetch_optional(&self.db)
         .await
@@ -1314,7 +1350,7 @@ impl RepositoryService {
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
                 r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
-                r.created_at, r.updated_at
+                r.project_id, r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
             WHERE vrm.virtual_repo_id = $1
@@ -1481,6 +1517,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -1551,6 +1588,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -1611,6 +1649,7 @@ mod tests {
             quota_bytes: Some(1_000_000_000),
             promotion_only: false,
             format_key: None,
+            project_id: None,
             created_by: None,
         };
         assert_eq!(req.key, "my-repo");
@@ -1636,6 +1675,7 @@ mod tests {
             quota_bytes: None,
             promotion_only: false,
             format_key: None,
+            project_id: None,
             created_by: None,
         };
         assert_eq!(
@@ -1660,6 +1700,7 @@ mod tests {
             quota_bytes: None,
             upstream_url: None,
             promotion_only: None,
+            project_id: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -1680,6 +1721,7 @@ mod tests {
             quota_bytes: Some(Some(2_000_000_000)),
             upstream_url: None,
             promotion_only: None,
+            project_id: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -1698,6 +1740,7 @@ mod tests {
             quota_bytes: Some(None),
             upstream_url: None,
             promotion_only: None,
+            project_id: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -2200,6 +2243,40 @@ mod tests {
         );
         // The permissions predicate reuses the SAME user bind ($3); no new bind.
         assert!(clause.contains("p.principal_id = $3"));
+    }
+
+    #[test]
+    fn test_permissions_grant_exists_has_repository_and_project_arms() {
+        // #2472: the shared grant fragment must honour BOTH the direct
+        // repository grant and the project-inherited grant, and nothing else.
+        let sql = permissions_grant_exists("r.id", 3);
+        assert!(
+            sql.contains("p.target_type = 'repository' AND p.target_id = r.id"),
+            "direct repository arm missing: {sql}"
+        );
+        assert!(
+            sql.contains("p.target_type = 'project'"),
+            "project inheritance arm missing: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT rp.project_id FROM repositories rp WHERE rp.id = r.id"),
+            "project arm must resolve the repo's project_id via the rp alias: {sql}"
+        );
+        // Still fails closed on empty action lists and never widens to
+        // system-scoped grants.
+        assert!(sql.contains("p.actions <> '{}'"));
+        assert!(!sql.contains("'system'"));
+    }
+
+    #[test]
+    fn test_permissions_grant_exists_project_arm_uses_caller_repo_expr() {
+        // The single-repo instantiation (`$2`, as used by
+        // `user_can_access_repo`) must thread the same expression into the
+        // project subquery so both arms describe the same repository.
+        let sql = permissions_grant_exists("$2", 1);
+        assert!(sql.contains("p.target_type = 'repository' AND p.target_id = $2"));
+        assert!(sql.contains("SELECT rp.project_id FROM repositories rp WHERE rp.id = $2"));
+        assert!(sql.contains("p.principal_id = $1"));
     }
 
     #[test]
@@ -2780,6 +2857,7 @@ mod tests {
                 quota_bytes: None,
                 promotion_only: false,
                 format_key: None,
+                project_id: None,
                 created_by: None,
             }
         }
@@ -3139,6 +3217,7 @@ mod tests {
                     None,
                     RepoVisibility::User(grantee_id),
                     search.as_deref(),
+                    None,
                 )
                 .await
                 .expect("grantee list");
@@ -3197,6 +3276,7 @@ mod tests {
                     None,
                     RepoVisibility::User(owner_id),
                     search.as_deref(),
+                    None,
                 )
                 .await
                 .expect("user list");
@@ -3212,6 +3292,7 @@ mod tests {
                     None,
                     RepoVisibility::Ids(vec![repo_a.id]),
                     search.as_deref(),
+                    None,
                 )
                 .await
                 .expect("ids list");
@@ -3232,6 +3313,7 @@ mod tests {
                     None,
                     RepoVisibility::Ids(vec![]),
                     search.as_deref(),
+                    None,
                 )
                 .await
                 .expect("empty ids list");

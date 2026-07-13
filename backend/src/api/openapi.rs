@@ -175,6 +175,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "permissions",
             handlers::permissions::PermissionsApiDoc::openapi(),
         ),
+        ("projects", handlers::projects::ProjectsApiDoc::openapi()),
         ("migration", handlers::migration::MigrationApiDoc::openapi()),
         ("sso", handlers::sso::SsoApiDoc::openapi()),
         ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),

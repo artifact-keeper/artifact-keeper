@@ -1316,6 +1316,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: true,
             age_gate_min_age_days: 14,
+            project_id: None,
             created_at: now,
             updated_at: now,
         }

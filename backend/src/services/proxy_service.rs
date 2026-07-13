@@ -9723,6 +9723,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9801,6 +9802,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9885,6 +9887,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9968,6 +9971,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10055,6 +10059,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10200,6 +10205,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -11075,6 +11081,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
