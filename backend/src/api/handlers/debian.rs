@@ -17,7 +17,8 @@
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
 
 use std::collections::BTreeSet;
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -28,11 +29,13 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use flate2::Compression;
 use flate2::GzBuilder;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
+use xz2::read::XzDecoder;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -584,6 +587,18 @@ impl<'a> DebianProxy<'a> {
             )
             .await
             .map_err(map_proxy_err)?;
+        // #2459 Tier A: reject an index the signed Release does not vouch for.
+        enforce_dists_integrity(
+            proxy,
+            repo.id,
+            self.repo_key,
+            upstream_url,
+            self.distribution,
+            &upstream_path,
+            suffix,
+            &content,
+        )
+        .await?;
         Err(build_dists_response(content, upstream_ct, content_type))
     }
 
@@ -678,6 +693,258 @@ fn remote_member_upstream(member: &crate::models::repository::Repository) -> Opt
         return None;
     }
     member.upstream_url.as_deref()
+}
+
+// ---------------------------------------------------------------------------
+// Remote-proxy integrity verification (#2459)
+//
+// Tier A (mandatory): every dists index proxied from a Remote upstream is
+// checked against the checksum table of the repo's signed Release/InRelease
+// before it is served or persisted. A mismatch means the upstream (or a MITM)
+// answered a signed-Release-covered path with content the signature does not
+// vouch for, so the fetch is rejected with 502 and the poisoned cache entry
+// is evicted.
+//
+// Tier B (best-effort): a pool `.deb` download is gated on the SHA-256 the
+// cached Packages index records for its `Filename`, so a mismatching body is
+// still streamed to the client (which verifies it itself) but never written
+// to the proxy cache. Both tiers apply to `repo_type == Remote` only.
+// ---------------------------------------------------------------------------
+
+/// Outcome of checking a proxied dists index against the signed Release.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexVerification {
+    /// The path is covered by the signed Release (or is a by-hash path) and
+    /// the fetched content matched.
+    Verified,
+    /// The signed Release does not cover this path; nothing to enforce.
+    NotCovered,
+    /// The content did not match the signed Release entry (or by-hash digest).
+    Mismatch,
+}
+
+/// If `path` is a `by-hash/SHA256/<hex>` index variant, return the embedded
+/// digest. Such paths are content-addressed, so the digest in the path is the
+/// integrity claim apt selected from the (already-verified) signed Release.
+fn by_hash_sha256(path: &str) -> Option<&str> {
+    let idx = path.find("by-hash/SHA256/")?;
+    let tail = &path[idx + "by-hash/SHA256/".len()..];
+    let hex = tail.split('/').next()?;
+    if hex.is_empty() {
+        None
+    } else {
+        Some(hex)
+    }
+}
+
+/// Verify a fetched dists index (`dist_relative_path`, relative to
+/// `dists/{distribution}/`) against the signed Release checksum table. Pure so
+/// the match / sha-mismatch / size-mismatch / by-hash / not-covered branches
+/// are unit-testable without a runtime or storage.
+fn verify_index_against_release(
+    release_checksums: &HashMap<String, (String, u64)>,
+    dist_relative_path: &str,
+    content: &[u8],
+) -> IndexVerification {
+    let actual_sha = hex::encode(Sha256::digest(content));
+    let actual_size = content.len() as u64;
+
+    if let Some(expected) = by_hash_sha256(dist_relative_path) {
+        return if actual_sha.eq_ignore_ascii_case(expected) {
+            IndexVerification::Verified
+        } else {
+            IndexVerification::Mismatch
+        };
+    }
+
+    match release_checksums.get(dist_relative_path) {
+        Some((sha, size)) => {
+            if actual_sha.eq_ignore_ascii_case(sha) && actual_size == *size {
+                IndexVerification::Verified
+            } else {
+                IndexVerification::Mismatch
+            }
+        }
+        None => IndexVerification::NotCovered,
+    }
+}
+
+/// Load and parse the SHA256 checksum table from the repo's signed Release,
+/// preferring `InRelease` and falling back to `Release`. Best-effort: returns
+/// `None` when neither can be loaded or neither carries a SHA256 section (in
+/// which case the caller serves the fetch unchanged, mirroring apt, which
+/// itself refuses unsigned indices downstream).
+async fn load_release_checksums(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    distribution: &str,
+) -> Option<HashMap<String, (String, u64)>> {
+    let pseudo_repo = proxy_helpers::build_remote_repo(repo_id, repo_key, upstream_url);
+    for name in ["InRelease", "Release"] {
+        let path = format!("dists/{}/{}", distribution, name);
+        if let Ok((bytes, _ct, _changed)) = proxy
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                &path,
+                distribution,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+        {
+            let text = String::from_utf8_lossy(&bytes);
+            let table = crate::formats::debian::parse_release_checksums(&text);
+            if !table.is_empty() {
+                return Some(table);
+            }
+        }
+    }
+    None
+}
+
+/// Tier A guard: verify a freshly-proxied dists index against the signed
+/// Release and, on a checksum/size mismatch, evict the just-written cache
+/// entry and return a 502. `dist_relative_path` is the tail of `upstream_path`
+/// beneath `dists/{distribution}/`.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_dists_integrity(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    distribution: &str,
+    upstream_path: &str,
+    dist_relative_path: &str,
+    content: &[u8],
+) -> Result<(), Response> {
+    let Some(table) =
+        load_release_checksums(proxy, repo_id, repo_key, upstream_url, distribution).await
+    else {
+        return Ok(());
+    };
+    if verify_index_against_release(&table, dist_relative_path, content)
+        == IndexVerification::Mismatch
+    {
+        // Evict the poisoned entry so a later read cannot serve it.
+        let _ = proxy.invalidate_cache_by_key(repo_key, upstream_path).await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Upstream index failed integrity verification against the signed Release",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Resolve the expected SHA-256 for a pool artifact from a parsed Packages
+/// `Filename` -> (sha, size) map. The Packages `Filename` field carries the
+/// full pool-relative path, so a direct lookup suffices. Pure (map lookup).
+fn resolve_pool_deb_checksum(
+    packages: &HashMap<String, (String, u64)>,
+    artifact_path: &str,
+) -> Option<String> {
+    packages.get(artifact_path).map(|(sha, _)| sha.clone())
+}
+
+/// True when `cache_path` names a cached Packages index for `component` and
+/// `arch` (any distribution / compression). Pure so the shape match is
+/// unit-testable. Used to narrow the cached-index scan at pool download time.
+fn is_matching_packages_index(cache_path: &str, component: &str, arch: &str) -> bool {
+    if !cache_path.starts_with("dists/") {
+        return false;
+    }
+    let needle = format!("/{}/binary-{}/Packages", component, arch);
+    if !cache_path.contains(&needle) {
+        return false;
+    }
+    let leaf = cache_path.rsplit('/').next().unwrap_or("");
+    matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz")
+}
+
+/// Ceiling on the *decompressed* size of a cached Packages index we will
+/// expand while resolving a pool `.deb`'s expected checksum (#2459 Tier B DoS
+/// guard). A signed Release can vouch for a small compressed index that passes
+/// Tier A (checksum + size ≤ the metadata cap) yet expands unbounded (>100x →
+/// multi-GiB) — capping the decode bounds worst-case memory. A stream that
+/// would exceed this is treated as "unresolvable" (returns `None`) so the pool
+/// download falls back to the Content-Length-gated cache commit; Tier B is
+/// best-effort and must never hard-fail the download.
+const MAX_DECOMPRESSED_INDEX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Skip decompressing a cached *compressed* index whose body is already this
+/// large. A legitimately-published Packages index compresses far smaller
+/// (tens of MiB for the largest suites), so this bounds the work before the
+/// decoder even starts and cheaply rejects an oversized bomb payload.
+const MAX_COMPRESSED_INDEX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Decompress a cached Packages index body into text based on the cache
+/// path's extension (`.gz` / `.xz` / plain). Returns `None` on a decode error
+/// or when the input would exceed the decompression-bomb caps
+/// ([`MAX_COMPRESSED_INDEX_BYTES`] / [`MAX_DECOMPRESSED_INDEX_BYTES`]).
+fn decompress_packages_index(cache_path: &str, bytes: &[u8]) -> Option<String> {
+    let compressed = cache_path.ends_with(".gz") || cache_path.ends_with(".xz");
+    if compressed && bytes.len() > MAX_COMPRESSED_INDEX_BYTES {
+        return None;
+    }
+    if cache_path.ends_with(".gz") {
+        read_index_capped(GzDecoder::new(bytes))
+    } else if cache_path.ends_with(".xz") {
+        read_index_capped(XzDecoder::new(bytes))
+    } else {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Read a decoder to completion, bounded at [`MAX_DECOMPRESSED_INDEX_BYTES`].
+/// Returns `None` on a decode error OR when the decompressed stream would
+/// exceed the cap (a decompression bomb), so the caller treats the index as
+/// unresolvable rather than expanding it into memory unbounded.
+fn read_index_capped<R: Read>(reader: R) -> Option<String> {
+    // Read one byte past the cap so a stream that exactly fills it but carries
+    // more data is still detected as over-limit.
+    let mut buf = Vec::new();
+    reader
+        .take(MAX_DECOMPRESSED_INDEX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_DECOMPRESSED_INDEX_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Tier B resolver: find the SHA-256 the cached Packages index records for a
+/// pool artifact, so the streamed `.deb` download can gate its cache commit on
+/// it. Best-effort: `None` when no cached Packages index covers the file
+/// (which leaves the download's cache behaviour unchanged from before #2459).
+async fn resolve_pool_expected_checksum(
+    proxy: &ProxyService,
+    repo_key: &str,
+    component: &str,
+    artifact_path: &str,
+) -> Option<String> {
+    let filename = artifact_path.rsplit('/').next()?;
+    let (_, _, arch) = DebianHandler::parse_deb_filename(filename).ok()?;
+    for cache_path in proxy.list_cached_paths(repo_key).await {
+        if !is_matching_packages_index(&cache_path, component, &arch) {
+            continue;
+        }
+        let Ok(Some((bytes, _))) = proxy
+            .get_cached_artifact_by_path(repo_key, &cache_path)
+            .await
+        else {
+            continue;
+        };
+        let Some(text) = decompress_packages_index(&cache_path, &bytes) else {
+            continue;
+        };
+        let map = crate::formats::debian::parse_packages_index(&text);
+        if let Some(sha) = resolve_pool_deb_checksum(&map, artifact_path) {
+            return Some(sha);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1673,18 @@ async fn dists_proxy_catchall(
         )
         .await
         .map_err(map_proxy_err)?;
+    // #2459 Tier A: reject an index the signed Release does not vouch for.
+    enforce_dists_integrity(
+        proxy,
+        repo.id,
+        &repo_key,
+        upstream_url,
+        &distribution,
+        &upstream_path,
+        &dists_path,
+        &content,
+    )
+    .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
 
@@ -1490,15 +1769,38 @@ async fn pool_download(
                     // (apt clients don't care; the registration just
                     // gives downstream proxies a meaningful Content-Type
                     // when upstream omits it).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    //
+                    // #2459 Tier B: gate the proxy-cache commit on the
+                    // SHA-256 the cached Packages index records for this
+                    // `Filename`. A body that does not match is still
+                    // streamed to the client (which verifies it itself)
+                    // but never persisted, so a mismatching upstream cannot
+                    // poison the cache. The body STAYS streamed — it is
+                    // never buffered (#1608). `None` (no covering Packages
+                    // index cached) preserves the prior cache behaviour.
+                    let expected_checksum = resolve_pool_expected_checksum(
+                        proxy,
+                        &repo_key,
+                        &component,
+                        &artifact_path,
+                    )
+                    .await;
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
-                        DEBIAN_BINARY_CONTENT_TYPE,
+                        &upstream_path,
+                        expected_checksum,
+                        RepositoryFormat::Debian,
                     )
-                    .await;
+                    .await?;
+                    return proxy_helpers::stream_fetch_result(
+                        result,
+                        DEBIAN_BINARY_CONTENT_TYPE,
+                        None,
+                    );
                 }
             }
 
@@ -3460,6 +3762,183 @@ mod virtual_dists_cap_tests {
             matches!(out, Ok(None)),
             "a 404 member must fall through to Ok(None), got {:?}",
             out.map(|o| o.map(|r| r.status())),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2459 remote-proxy integrity verification (pure helpers)
+    // -----------------------------------------------------------------------
+
+    fn release_table(path: &str, sha: &str, size: u64) -> HashMap<String, (String, u64)> {
+        let mut m = HashMap::new();
+        m.insert(path.to_string(), (sha.to_string(), size));
+        m
+    }
+
+    #[test]
+    fn test_verify_index_against_release_ok_on_match() {
+        let content = b"Packages index body";
+        let sha = hex::encode(Sha256::digest(content));
+        let table = release_table("main/binary-amd64/Packages", &sha, content.len() as u64);
+        assert_eq!(
+            verify_index_against_release(&table, "main/binary-amd64/Packages", content),
+            IndexVerification::Verified
+        );
+    }
+
+    #[test]
+    fn test_verify_index_against_release_err_on_sha_mismatch() {
+        let content = b"poisoned body";
+        // Correct size, wrong sha.
+        let table = release_table(
+            "main/binary-amd64/Packages",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            content.len() as u64,
+        );
+        assert_eq!(
+            verify_index_against_release(&table, "main/binary-amd64/Packages", content),
+            IndexVerification::Mismatch
+        );
+    }
+
+    #[test]
+    fn test_verify_index_against_release_err_on_size_mismatch() {
+        let content = b"body";
+        let sha = hex::encode(Sha256::digest(content));
+        // Correct sha, wrong size.
+        let table = release_table("main/binary-amd64/Packages", &sha, 999_999);
+        assert_eq!(
+            verify_index_against_release(&table, "main/binary-amd64/Packages", content),
+            IndexVerification::Mismatch
+        );
+    }
+
+    #[test]
+    fn test_verify_index_against_release_not_covered() {
+        let table = release_table("main/binary-amd64/Packages", "abc", 3);
+        assert_eq!(
+            verify_index_against_release(&table, "main/i18n/Translation-en", b"anything"),
+            IndexVerification::NotCovered
+        );
+    }
+
+    #[test]
+    fn test_verify_index_against_release_by_hash() {
+        let content = b"by-hash body";
+        let sha = hex::encode(Sha256::digest(content));
+        let path = format!("main/binary-amd64/by-hash/SHA256/{}", sha);
+        let empty = HashMap::new();
+        assert_eq!(
+            verify_index_against_release(&empty, &path, content),
+            IndexVerification::Verified
+        );
+        // Wrong bytes for the claimed by-hash digest -> mismatch.
+        assert_eq!(
+            verify_index_against_release(&empty, &path, b"tampered"),
+            IndexVerification::Mismatch
+        );
+    }
+
+    #[test]
+    fn test_resolve_pool_deb_checksum_hit_and_miss() {
+        let mut map = HashMap::new();
+        map.insert(
+            "pool/main/n/nginx/nginx_1.24.0-1_amd64.deb".to_string(),
+            ("deadbeef".to_string(), 512u64),
+        );
+        assert_eq!(
+            resolve_pool_deb_checksum(&map, "pool/main/n/nginx/nginx_1.24.0-1_amd64.deb"),
+            Some("deadbeef".to_string())
+        );
+        assert_eq!(
+            resolve_pool_deb_checksum(&map, "pool/main/c/curl/curl_8.0.1-1_amd64.deb"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_matching_packages_index() {
+        assert!(is_matching_packages_index(
+            "dists/bookworm/main/binary-amd64/Packages.gz",
+            "main",
+            "amd64"
+        ));
+        assert!(is_matching_packages_index(
+            "dists/jammy/main/binary-amd64/Packages",
+            "main",
+            "amd64"
+        ));
+        // Wrong component / arch / not a Packages leaf.
+        assert!(!is_matching_packages_index(
+            "dists/bookworm/contrib/binary-amd64/Packages.gz",
+            "main",
+            "amd64"
+        ));
+        assert!(!is_matching_packages_index(
+            "dists/bookworm/main/binary-arm64/Packages.gz",
+            "main",
+            "amd64"
+        ));
+        assert!(!is_matching_packages_index(
+            "dists/bookworm/main/binary-amd64/Release",
+            "main",
+            "amd64"
+        ));
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzBuilder::new().write(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decompress_packages_index_honest_gz_and_xz() {
+        let body = b"Package: hello\nFilename: pool/main/h/hello/hello_1.0_amd64.deb\nSHA256: abc\nSize: 10\n";
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &gzip(body)),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.xz", &xz(body)),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+        // Plain (uncompressed) passes through unchanged.
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages", body),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_decompress_packages_index_bomb_hits_cap_returns_none() {
+        // A highly-compressible payload that expands past the decompressed cap.
+        // ~200 MiB of zeros compresses to a few hundred KiB but must NOT be
+        // expanded into memory — the cap returns None (unresolvable), no OOM.
+        let bomb = vec![0u8; (MAX_DECOMPRESSED_INDEX_BYTES as usize) + (16 * 1024 * 1024)];
+        let gz = gzip(&bomb);
+        assert!(
+            gz.len() <= MAX_COMPRESSED_INDEX_BYTES,
+            "test bomb should slip past the compressed-size pre-check to exercise the decode cap"
+        );
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &gz),
+            None
+        );
+    }
+
+    #[test]
+    fn test_decompress_packages_index_oversized_compressed_skipped() {
+        let too_big = vec![7u8; MAX_COMPRESSED_INDEX_BYTES + 1];
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &too_big),
+            None
         );
     }
 }

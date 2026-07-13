@@ -116,6 +116,15 @@ pub(crate) fn validate_remote_upstream(
                             .to_string(),
                     ));
                 }
+                if *format == RepositoryFormat::Debian && is_debian_flat_or_mirrorlist(url) {
+                    return Err(AppError::Validation(
+                        "Debian remote upstream must be a concrete archive root (apt expands \
+                         `dists/<suite>/...` beneath it), not a flat repository, mirrorlist, or \
+                         `mirror://` URL. Point it at the archive root (e.g. \
+                         http://deb.debian.org/debian)."
+                            .to_string(),
+                    ));
+                }
             }
         }
     } else if let Some(url) = upstream_url {
@@ -128,6 +137,43 @@ pub(crate) fn validate_remote_upstream(
 fn is_mirrorlist_or_metalink(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("mirrorlist") || lower.contains("metalink")
+}
+
+/// Heuristic: a Debian remote upstream that is a flat repository, a
+/// mirrorlist, or the apt `mirror://` method rather than a concrete archive
+/// root. apt expands `dists/<suite>/...` beneath a proper archive root
+/// (e.g. `http://deb.debian.org/debian`), which this must NOT reject; it
+/// rejects the shapes the remote-proxy trust model cannot verify against a
+/// signed Release:
+///   * the apt mirror method (`mirror://`, `mirror+http(s)://`) and any
+///     mirrorlist/metalink naming,
+///   * a baseurl aimed straight at a dists index file (`.../Packages`,
+///     `.../Release`, `.../InRelease`, `.../Release.gpg`) — the flat-repo /
+///     misconfiguration shape, and
+///   * an explicit flat-repo distribution component (`deb <url> ./`).
+fn is_debian_flat_or_mirrorlist(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("mirror://")
+        || lower.starts_with("mirror+http://")
+        || lower.starts_with("mirror+https://")
+    {
+        return true;
+    }
+    if lower.contains("mirrorlist") || lower.contains("metalink") {
+        return true;
+    }
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    // Explicit flat-repo component (`deb <url> ./`).
+    if path.ends_with("/./") || path.ends_with(" ./") || path.ends_with("/.") {
+        return true;
+    }
+    let trimmed = path.trim_end_matches('/');
+    trimmed.ends_with("/packages")
+        || trimmed.ends_with("/packages.gz")
+        || trimmed.ends_with("/packages.xz")
+        || trimmed.ends_with("/inrelease")
+        || trimmed.ends_with("/release")
+        || trimmed.ends_with("/release.gpg")
 }
 
 /// Derive a format key string from a RepositoryFormat enum.
@@ -1791,6 +1837,40 @@ mod tests {
             validate_remote_upstream(&RepositoryType::Remote, &base, &RepositoryFormat::Rpm)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_debian_remote_rejects_flat_repo_and_mirrorlist() {
+        let mirror = Some("mirror://mirrors.ubuntu.com/mirrors.txt".to_string());
+        let mirrorlist = Some("https://mirrors.example.org/mirrorlist?dist=bookworm".to_string());
+        let flat_index = Some(
+            "http://apt.example.com/debian/dists/stable/main/binary-amd64/Packages".to_string(),
+        );
+        let flat_component = Some("http://apt.example.com/flat/ ./".to_string());
+        // A well-formed archive root (apt expands `dists/<suite>/...` beneath).
+        let base = Some("http://deb.debian.org/debian".to_string());
+        let ubuntu = Some("http://archive.ubuntu.com/ubuntu".to_string());
+
+        for bad in [&mirror, &mirrorlist, &flat_index, &flat_component] {
+            assert!(
+                validate_remote_upstream(&RepositoryType::Remote, bad, &RepositoryFormat::Debian)
+                    .is_err(),
+                "expected rejection for {:?}",
+                bad
+            );
+        }
+        assert!(validate_remote_upstream(
+            &RepositoryType::Remote,
+            &base,
+            &RepositoryFormat::Debian
+        )
+        .is_ok());
+        assert!(validate_remote_upstream(
+            &RepositoryType::Remote,
+            &ubuntu,
+            &RepositoryFormat::Debian
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------

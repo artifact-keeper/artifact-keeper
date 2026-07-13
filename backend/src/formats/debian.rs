@@ -595,6 +595,92 @@ pub fn generate_release(
     release
 }
 
+/// Parse the `SHA256:` checksum section of a signed `Release`/`InRelease`
+/// document into a map of dist-relative path -> (sha256_hex, size).
+///
+/// Only the SHA256 section is honoured; the weaker `MD5Sum:` / `SHA1:`
+/// sections are ignored so they can never become a source of truth. A
+/// clearsigned `InRelease` wrapper is handled transparently: the PGP armor
+/// lines and the `Hash:` header do not match a checksum-entry shape, and the
+/// trailing signature block terminates the section like any other top-level
+/// field. Malformed or empty input yields an empty map.
+pub fn parse_release_checksums(release_text: &str) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    let mut in_sha256 = false;
+    for line in release_text.lines() {
+        // Indented continuation lines inside the active section are entries.
+        if in_sha256 && (line.starts_with(' ') || line.starts_with('\t')) {
+            if let Some(h) = parse_release_hash_line(line) {
+                out.insert(h.path, (h.hash, h.size));
+            }
+            continue;
+        }
+        // A non-indented line is a field header; it switches sections.
+        in_sha256 = line.trim_end().eq_ignore_ascii_case("SHA256:");
+    }
+    out
+}
+
+/// Parse a single indented `Release` hash entry (`<hash> <size> <path>`) into
+/// a [`ReleaseHash`]. Returns `None` when the line does not carry exactly the
+/// three whitespace-separated fields or the size is not a number.
+fn parse_release_hash_line(line: &str) -> Option<ReleaseHash> {
+    let mut it = line.split_whitespace();
+    let hash = it.next()?.to_string();
+    let size = it.next()?.parse::<u64>().ok()?;
+    let path = it.next()?.to_string();
+    if it.next().is_some() || hash.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(ReleaseHash { hash, size, path })
+}
+
+/// Parse a `Packages` index into a map of `Filename` -> (sha256_hex, size).
+///
+/// Stanzas are separated by blank lines; a stanza missing any of `Filename`,
+/// `SHA256`, or `Size` (or with a non-numeric size) is skipped. Malformed or
+/// empty input yields an empty map.
+pub fn parse_packages_index(packages_text: &str) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    let mut filename: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    let mut size: Option<u64> = None;
+    for line in packages_text.lines() {
+        if line.trim().is_empty() {
+            insert_package_stanza(&mut out, &mut filename, &mut sha256, &mut size);
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Filename:") {
+            filename = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("SHA256:") {
+            sha256 = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Size:") {
+            size = v.trim().parse::<u64>().ok();
+        }
+    }
+    insert_package_stanza(&mut out, &mut filename, &mut sha256, &mut size);
+    out
+}
+
+/// Flush a completed `Packages` stanza into `out`, resetting the accumulators.
+/// A stanza that did not collect all three required fields is discarded.
+fn insert_package_stanza(
+    out: &mut HashMap<String, (String, u64)>,
+    filename: &mut Option<String>,
+    sha256: &mut Option<String>,
+    size: &mut Option<u64>,
+) {
+    if let (Some(f), Some(s), Some(z)) = (filename.take(), sha256.take(), size.take()) {
+        if !f.is_empty() && !s.is_empty() {
+            out.insert(f, (s, z));
+        }
+    } else {
+        filename.take();
+        sha256.take();
+        size.take();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,5 +1342,117 @@ Source: full-pkg-src
     #[test]
     fn test_debian_handler_default() {
         let _handler = DebianHandler;
+    }
+
+    // ========================================================================
+    // parse_release_checksums tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_release_checksums_sha256_only() {
+        let release = "\
+Origin: Debian
+Suite: bookworm
+Date: Sat, 10 Jun 2023 10:00:00 UTC
+MD5Sum:
+ d41d8cd98f00b204e9800998ecf8427e 1024 main/binary-amd64/Packages
+SHA1:
+ da39a3ee5e6b4b0d3255bfef95601890afd80709 1024 main/binary-amd64/Packages
+SHA256:
+ aaa111 1024 main/binary-amd64/Packages
+ bbb222 512 main/binary-amd64/Packages.gz
+";
+        let table = parse_release_checksums(release);
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table.get("main/binary-amd64/Packages"),
+            Some(&("aaa111".to_string(), 1024))
+        );
+        assert_eq!(
+            table.get("main/binary-amd64/Packages.gz"),
+            Some(&("bbb222".to_string(), 512))
+        );
+    }
+
+    #[test]
+    fn test_parse_release_checksums_inrelease_clearsigned() {
+        let inrelease = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: Debian
+Suite: bookworm
+SHA256:
+ cafe01 4096 main/binary-amd64/Packages.xz
+-----BEGIN PGP SIGNATURE-----
+
+iQwertyBase64SignatureBytesabcdef==
+-----END PGP SIGNATURE-----
+";
+        let table = parse_release_checksums(inrelease);
+        assert_eq!(
+            table.get("main/binary-amd64/Packages.xz"),
+            Some(&("cafe01".to_string(), 4096))
+        );
+        // The base64 signature line must not be mistaken for an entry.
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_release_checksums_empty_and_malformed() {
+        assert!(parse_release_checksums("").is_empty());
+        assert!(parse_release_checksums("Suite: bookworm\nDate: today\n").is_empty());
+        // SHA256 header but a malformed (2-field) entry -> skipped.
+        assert!(parse_release_checksums("SHA256:\n deadbeef 1024\n").is_empty());
+    }
+
+    // ========================================================================
+    // parse_packages_index tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_packages_index_multi_stanza() {
+        let packages = "\
+Package: nginx
+Version: 1.24.0-1
+Architecture: amd64
+Filename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb
+Size: 512000
+MD5sum: 0123456789abcdef0123456789abcdef
+SHA256: 1111aaaa
+
+Package: curl
+Version: 8.0.1-1
+Architecture: amd64
+Filename: pool/main/c/curl/curl_8.0.1-1_amd64.deb
+Size: 250000
+SHA256: 2222bbbb
+";
+        let map = parse_packages_index(packages);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("pool/main/n/nginx/nginx_1.24.0-1_amd64.deb"),
+            Some(&("1111aaaa".to_string(), 512000))
+        );
+        assert_eq!(
+            map.get("pool/main/c/curl/curl_8.0.1-1_amd64.deb"),
+            Some(&("2222bbbb".to_string(), 250000))
+        );
+    }
+
+    #[test]
+    fn test_parse_packages_index_partial_stanza_skipped() {
+        // Missing SHA256 -> stanza dropped.
+        let packages = "\
+Package: broken
+Filename: pool/main/b/broken/broken_1_amd64.deb
+Size: 100
+";
+        assert!(parse_packages_index(packages).is_empty());
+    }
+
+    #[test]
+    fn test_parse_packages_index_empty() {
+        assert!(parse_packages_index("").is_empty());
     }
 }
