@@ -4,6 +4,7 @@
 //! Okta, Azure AD, ADFS, Shibboleth, etc.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use quick_xml::escape::unescape;
@@ -230,6 +231,34 @@ fn acs_urls_match(expected: &str, asserted: &str) -> bool {
     expected.trim_end_matches('/') == asserted.trim_end_matches('/')
 }
 
+/// Decide whether the assertion AK will actually consume is cryptographically
+/// covered by a verified XML-DSig signature — the core defense against XML
+/// Signature Wrapping (XSW).
+///
+/// `signed_ids` is the set of `ID` strings whose digest `bergshamra` actually
+/// verified on the `VerifyResult::Valid` path (each `<Reference URI>` with its
+/// leading `#` stripped; empty and `cid:` URIs excluded — see
+/// [`SamlService::validate_response`]). We accept the consumed assertion when
+/// either:
+///   * the signature directly covers the assertion element (`assertion_id` is
+///     signed) — AK's own assertion-level signing posture; or
+///   * the signature covers the enclosing `<Response>` (`response_id` is
+///     signed) — the Response-level signing that ADFS / Azure AD emit.
+///
+/// Both forms are legitimate, so we must not collapse to assertion-only signing
+/// or we would break those IdPs. An empty `signed_ids` (nothing verified)
+/// always returns `false`, so an unsigned or unbound assertion can never be
+/// consumed. Binding is by ID *string* (not tree position): `bergshamra`
+/// rejects documents with duplicate IDs on the `Valid` path, so a signed ID is
+/// unambiguous.
+fn consumed_assertion_is_signed(
+    assertion_id: &str,
+    response_id: &str,
+    signed_ids: &HashSet<String>,
+) -> bool {
+    signed_ids.contains(assertion_id) || signed_ids.contains(response_id)
+}
+
 /// Mutable state used while walking a SAML response XML document.
 struct SamlResponseParser {
     response: SamlResponse,
@@ -238,6 +267,12 @@ struct SamlResponseParser {
     in_assertion: bool,
     current_attr_name: Option<String>,
     current_attr_values: Vec<String>,
+    /// Number of `<saml:Assertion>` elements seen. AK only ever consumes a
+    /// single assertion (`response.assertion: Option<..>`, last-wins), so a
+    /// Response carrying more than one is rejected at parse time — this removes
+    /// the "second assertion to smuggle" precondition for XML Signature
+    /// Wrapping and applies even on the no-certificate dev path.
+    assertion_count: usize,
 }
 
 impl SamlResponseParser {
@@ -268,6 +303,7 @@ impl SamlResponseParser {
             in_assertion: false,
             current_attr_name: None,
             current_attr_values: Vec::new(),
+            assertion_count: 0,
         }
     }
 
@@ -366,6 +402,7 @@ impl SamlResponseParser {
 
     fn handle_assertion_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         self.in_assertion = true;
+        self.assertion_count += 1;
         if let Some(id) = get_xml_attr(e, "ID") {
             self.assertion.id = id;
         }
@@ -636,6 +673,22 @@ impl SamlService {
             buf.clear();
         }
 
+        // Structural XML Signature Wrapping (XSW) defense: reject any Response
+        // carrying more than one `<saml:Assertion>`. AK only ever consumes a
+        // single assertion, and the parser is last-wins, so a second assertion
+        // exists only to smuggle attacker-controlled claims (e.g. an admin
+        // group) past a signature that covers a different, benign assertion.
+        // Enforced unconditionally at parse time so it also guards the no-cert
+        // dev path where `validate_response` skips signature verification.
+        if parser.assertion_count > 1 {
+            return Err(AppError::Authentication(format!(
+                "SAML response contains {} assertions; only a single assertion is \
+                 supported (multi-assertion responses are rejected to prevent XML \
+                 signature wrapping)",
+                parser.assertion_count
+            )));
+        }
+
         Ok(parser.finish())
     }
 
@@ -742,8 +795,45 @@ impl SamlService {
             ctx.trusted_keys_only = true;
 
             match bergshamra::verify(&ctx, xml) {
-                Ok(bergshamra::VerifyResult::Valid { .. }) => {
-                    tracing::debug!("SAML response signature verified successfully");
+                Ok(bergshamra::VerifyResult::Valid { references, .. }) => {
+                    // The signature is cryptographically valid, but that alone
+                    // does not say *which* element it covers. Build the set of
+                    // IDs whose digest was actually verified and require the
+                    // assertion AK will consume to be among them (or the
+                    // enclosing Response, for Response-level signers). Without
+                    // this, an XSW attacker can present a valid signature over a
+                    // benign assertion while the parser consumes a different,
+                    // unsigned one — the core of the escalation. `bergshamra`
+                    // parses its own tree, so bind by ID *string* (safe: the
+                    // `Valid` path rejects duplicate IDs document-wide).
+                    let signed_ids: HashSet<String> = references
+                        .iter()
+                        .filter(|r| r.digest_verified)
+                        .filter_map(|r| {
+                            let id = r.uri.strip_prefix('#').unwrap_or(&r.uri);
+                            if id.is_empty() || id.starts_with("cid:") {
+                                None
+                            } else {
+                                Some(id.to_string())
+                            }
+                        })
+                        .collect();
+
+                    let assertion_id = response
+                        .assertion
+                        .as_ref()
+                        .map(|a| a.id.as_str())
+                        .unwrap_or("");
+                    if !consumed_assertion_is_signed(assertion_id, &response.id, &signed_ids) {
+                        return Err(AppError::Authentication(
+                            "SAML signature does not cover the consumed assertion \
+                             (possible XML signature wrapping)"
+                                .into(),
+                        ));
+                    }
+                    tracing::debug!(
+                        "SAML response signature verified and bound to the consumed assertion"
+                    );
                 }
                 Ok(bergshamra::VerifyResult::Invalid { reason }) => {
                     return Err(AppError::Authentication(format!(
@@ -1580,6 +1670,157 @@ mod tests {
         let response = service.parse_saml_response(xml).unwrap();
         assert_eq!(response.id, "_resp1");
         assert!(response.status_code.contains("Success"));
+    }
+
+    // =======================================================================
+    // XML Signature Wrapping (XSW) structural defense (#2449)
+    // =======================================================================
+
+    /// A `<Response>` carrying a single `<Assertion>` parses successfully and
+    /// that assertion is the one consumed.
+    #[tokio::test]
+    async fn test_parse_saml_response_single_assertion_ok() {
+        let service = make_test_saml_service();
+        let xml = sample_saml_response_xml();
+
+        let response = service.parse_saml_response(&xml).unwrap();
+        let assertion = response.assertion.expect("single assertion consumed");
+        assert_eq!(assertion.id, "_assertion789");
+    }
+
+    /// A `<Response>` carrying more than one `<Assertion>` is rejected at parse
+    /// time (the XSW precondition: a second, unsigned assertion smuggled in to
+    /// be consumed in place of the signed one). AK only ever consumes a single
+    /// assertion, so this is safe and unconditional.
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_multiple_assertions() {
+        let service = make_test_saml_service();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_resp_multi" Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_signed_benign" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID>benign@example.com</saml:NameID>
+        </saml:Subject>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>Developers</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+    <saml:Assertion ID="_unsigned_evil" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID>attacker@example.com</saml:NameID>
+        </saml:Subject>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+</samlp:Response>"#;
+
+        let result = service.parse_saml_response(xml);
+        assert!(
+            result.is_err(),
+            "a multi-assertion response must be rejected at parse time"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("single assertion") || err.contains("2 assertions"),
+            "rejection must name the multi-assertion cause, got: {err}"
+        );
+    }
+
+    /// A duplicate-ID variant (two assertions sharing the signed ID) is also a
+    /// multi-assertion response, so it is rejected by the same structural check
+    /// (defense-in-depth ahead of bergshamra's own duplicate-ID rejection).
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_duplicate_id_assertions() {
+        let service = make_test_saml_service();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_resp_dup" Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_shared" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject><saml:NameID>benign@example.com</saml:NameID></saml:Subject>
+    </saml:Assertion>
+    <saml:Assertion ID="_shared" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject><saml:NameID>attacker@example.com</saml:NameID></saml:Subject>
+    </saml:Assertion>
+</samlp:Response>"#;
+
+        assert!(
+            service.parse_saml_response(xml).is_err(),
+            "a duplicate-ID (two-assertion) response must be rejected at parse time"
+        );
+    }
+
+    /// The pure signature-binding helper: the consumed assertion is accepted
+    /// only when its ID (assertion-level signing) or the Response ID
+    /// (Response-level signing) is in the verified set.
+    #[test]
+    fn test_consumed_assertion_is_signed_assertion_level() {
+        let signed: HashSet<String> = ["_assertion789".to_string()].into_iter().collect();
+        assert!(consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_response_level() {
+        // ADFS / Azure AD sign the enclosing <Response>, not the assertion.
+        let signed: HashSet<String> = ["_resp1".to_string()].into_iter().collect();
+        assert!(consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_neither_covered() {
+        // The signature covers some *other* element (classic XSW) → reject.
+        let signed: HashSet<String> = ["_some_other_elem".to_string()].into_iter().collect();
+        assert!(!consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_empty_set() {
+        // Nothing verified (e.g. all references were empty/cid:) → reject.
+        let signed: HashSet<String> = HashSet::new();
+        assert!(!consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_empty_ids_never_match() {
+        // Empty/cid: URIs are excluded from `signed_ids` upstream, so an empty
+        // assertion/response id can never be satisfied by a stray empty entry.
+        let signed: HashSet<String> = ["_assertion789".to_string()].into_iter().collect();
+        assert!(!consumed_assertion_is_signed("", "", &signed));
     }
 
     // =======================================================================

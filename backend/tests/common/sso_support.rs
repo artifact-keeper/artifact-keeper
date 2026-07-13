@@ -460,6 +460,88 @@ impl SamlResponseSpec {
     pub fn signed_b64(&self) -> String {
         base64_standard(sign_saml_document(&self.to_unsigned_xml()).as_bytes())
     }
+
+    /// Build the XML Signature Wrapping (XSW) attack payload (#2449) and
+    /// base64-encode it for the `SAMLResponse` form field.
+    ///
+    /// The legitimate, single signed assertion in `self` is signed normally,
+    /// then a SECOND, UNSIGNED `<saml:Assertion>` is spliced in immediately
+    /// before the closing `</samlp:Response>`. That injected assertion carries
+    /// attacker-controlled `attacker_groups` (e.g. the provider `admin_group`)
+    /// and the given `attacker_name_id`. Because the historical parser was
+    /// last-wins over `<Assertion>`, the *unsigned* assertion is the one that
+    /// would be consumed while the signature still verifies over the benign
+    /// one — the escalation. When `dup_id` is set, the injected assertion
+    /// reuses the signed assertion's ID (the duplicate-ID XSW variant).
+    pub fn xsw_wrapped_b64(
+        &self,
+        attacker_name_id: &str,
+        attacker_groups: &[&str],
+        dup_id: bool,
+    ) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+
+        // Recover the signed assertion's ID so the dup-ID variant can reuse it.
+        let signed_assertion_id = signed
+            .split("<saml:Assertion ID=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("_signed")
+            .to_string();
+        let injected_id = if dup_id {
+            signed_assertion_id
+        } else {
+            format!("_xsw{}", Uuid::new_v4().as_simple())
+        };
+
+        let now = chrono::Utc::now();
+        let issue_instant = now.format("%Y-%m-%dT%H:%M:%SZ");
+        let not_before = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
+        let not_on_or_after = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
+        let group_values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+
+        let injected = format!(
+            r##"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{injected_id}" Version="2.0" IssueInstant="{issue_instant}">
+        <saml:Issuer>{issuer}</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">{name_id}</saml:NameID>
+            <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                <saml:SubjectConfirmationData NotOnOrAfter="{not_on_or_after}"/>
+            </saml:SubjectConfirmation>
+        </saml:Subject>
+        <saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_on_or_after}">
+            <saml:AudienceRestriction>
+                <saml:Audience>{audience}</saml:Audience>
+            </saml:AudienceRestriction>
+        </saml:Conditions>
+        <saml:AuthnStatement AuthnInstant="{issue_instant}"/>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="email">
+                <saml:AttributeValue>{name_id}@attacker.test</saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Attribute Name="groups">{group_values}</saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>"##,
+            issuer = xml_escape(&self.issuer),
+            audience = xml_escape(&self.audience),
+            name_id = xml_escape(attacker_name_id),
+        );
+
+        let wrapped = signed.replacen(
+            "</samlp:Response>",
+            &format!("{injected}\n</samlp:Response>"),
+            1,
+        );
+        base64_standard(wrapped.as_bytes())
+    }
 }
 
 /// Base64 (standard alphabet, padded) — the encoding `saml_acs` decodes the
