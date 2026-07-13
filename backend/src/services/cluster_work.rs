@@ -38,8 +38,11 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -161,6 +164,73 @@ impl<T> Deref for Claimed<T> {
     fn deref(&self) -> &T {
         &self.row
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable claim renewal
+// ---------------------------------------------------------------------------
+
+/// Background heartbeat for a durable claim.
+///
+/// Dropping the guard aborts the heartbeat. It does not release the claim;
+/// the owning service must still finalize through its token-guarded path.
+#[derive(Debug)]
+pub struct RenewalGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RenewalGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn renewal_interval(ttl_secs: f64) -> Duration {
+    let ttl_secs = if ttl_secs.is_finite() && ttl_secs > 0.0 {
+        ttl_secs
+    } else {
+        1.0
+    };
+    Duration::from_secs_f64((ttl_secs / 3.0).clamp(5.0, 300.0))
+}
+
+/// Spawn a best-effort token-guarded heartbeat for a durable claim.
+///
+/// `Ok(false)` means ownership was lost and stops the loop. Transient errors
+/// are logged and retried; the original TTL remains the failover boundary if
+/// the database stays unavailable.
+pub fn spawn_renewal_loop<F, Fut>(
+    label: impl Into<String>,
+    ttl_secs: f64,
+    mut renew: F,
+) -> RenewalGuard
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
+{
+    let label = label.into();
+    let every = renewal_interval(ttl_secs);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            match renew().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(claim = %label, "claim renewal stopped because ownership was lost");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(claim = %label, error = %e, "claim renewal failed; will retry");
+                }
+            }
+        }
+    });
+
+    RenewalGuard { handle }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +397,13 @@ mod tests {
         let a = WorkerIdentity::for_process().as_str().to_string();
         let b = WorkerIdentity::for_process().as_str().to_string();
         assert_eq!(a, b, "identity must be stable for the process lifetime");
+    }
+
+    #[test]
+    fn renewal_interval_is_bounded() {
+        assert_eq!(renewal_interval(0.0), Duration::from_secs(5));
+        assert_eq!(renewal_interval(90.0), Duration::from_secs(30));
+        assert_eq!(renewal_interval(6.0 * 3600.0), Duration::from_secs(300));
     }
 
     #[test]

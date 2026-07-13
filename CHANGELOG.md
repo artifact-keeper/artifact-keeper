@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Scheduled backups claim one durable run per due occurrence** (#2219): multi-replica schedulers no longer create duplicate archives for the same schedule tick. Long runs renew their token-fenced claim, and run finalization plus advancement of the unchanged schedule occurrence is transactional. A schedule whose cron expression has no further occurrence is now disabled with a warning instead of being left permanently due, where it consumed a due-schedule slot and could starve other schedules.
+- **Password-expiry notifications are claimed before SMTP** (#2219): concurrent replicas no longer email the same password-version warning in one scheduler tick. Failed attempts observe a retry delay, stale account/password candidates are rejected at claim time, and usernames are escaped in HTML mail.
+
 ## [1.7.0] - 2026-07-31
 
 A supply-chain-enforcement and release-assurance release closing the 1.7.0 milestone. The headline is that scan and curation policy now *block at serve time*: an inline scan-and-block gate rejects vulnerable artifacts on download across proxy and hosted repositories (PyPI, npm, Docker/OCI) and the virtual repos that aggregate them, while a new typed curation engine adds publisher-trust and popularity/typo-squat rules — including Unicode-confusable (homoglyph) and affix detection — that stop suspect packages before they reach a client. Underneath the features, the release re-architects the release pipeline into a real assurance gate (blocking security suite, DTF gate against the candidate digest, promote-by-digest, dispatch-rehearsable dry runs), makes the repository usage ledger authoritative to enable O(1) quota admission, and lands a broad performance pass (keyset pagination, GIN-indexed full-text search, off-hot-path side effects). It also closes a cluster of token, refresh, and federated-admin authorization gaps (several with GHSA advisories) and a deep set of cloud-storage, migration, and native-format fidelity fixes.
