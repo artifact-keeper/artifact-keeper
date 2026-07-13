@@ -554,6 +554,48 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // One-shot repair for Docker/OCI artifacts imported by migration runs
+    // that pre-date #2457: those runs stored manifest/blob bytes under
+    // generic CAS keys with only `artifacts` rows, so migrated tags were
+    // unpullable (MANIFEST_UNKNOWN). The repair registers them in the OCI
+    // index (`oci_tags`/`oci_blobs`/refs) via the same code path a live
+    // push uses. Additive-only, idempotent (no-op once every candidate has
+    // its `oci_tags` row), and backgrounded so it never delays the HTTP
+    // listener bind (same rationale as the manifest_blob_refs backfill).
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            let repair_stats =
+                artifact_keeper_backend::services::oci_migration_reindex::run_repair(
+                    &db_pool,
+                    storage_registry,
+                )
+                .await;
+            if repair_stats.candidates_failed > 0 {
+                tracing::warn!(
+                    candidates_scanned = repair_stats.candidates_scanned,
+                    manifests_registered = repair_stats.manifests_registered,
+                    blobs_registered = repair_stats.blobs_registered,
+                    candidates_skipped = repair_stats.candidates_skipped,
+                    candidates_failed = repair_stats.candidates_failed,
+                    "OCI migration reindex left {} candidate(s) unregistered; \
+                     they stay unpullable until repaired (re-run migration or \
+                     restart after fixing storage)",
+                    repair_stats.candidates_failed
+                );
+            } else {
+                tracing::info!(
+                    candidates_scanned = repair_stats.candidates_scanned,
+                    manifests_registered = repair_stats.manifests_registered,
+                    blobs_registered = repair_stats.blobs_registered,
+                    candidates_skipped = repair_stats.candidates_skipped,
+                    "OCI migration reindex complete"
+                );
+            }
+        });
+    }
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));

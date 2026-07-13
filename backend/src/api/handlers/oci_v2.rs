@@ -645,7 +645,7 @@ fn push_scope(image_name: &str) -> String {
 // Storage helpers
 // ---------------------------------------------------------------------------
 
-fn blob_storage_key(digest: &str) -> String {
+pub(crate) fn blob_storage_key(digest: &str) -> String {
     format!("oci-blobs/{}", digest)
 }
 
@@ -659,7 +659,7 @@ fn blob_storage_key(digest: &str) -> String {
 /// Postgres cannot read the Rust constant, so those sites pin the literal to
 /// [`OCI_MANIFEST_STORAGE_PREFIX`] with compile-time assertions; changing the
 /// constant forces those assertions (and the SQL) to be updated in lockstep.
-fn manifest_storage_key(digest: &str) -> String {
+pub(crate) fn manifest_storage_key(digest: &str) -> String {
     format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, digest)
 }
 
@@ -720,7 +720,7 @@ fn upload_complete_created_response(image_name: &str, digest: &str) -> Response 
         .unwrap()
 }
 
-fn compute_sha256(data: &[u8]) -> String {
+pub(crate) fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("sha256:{:x}", hasher.finalize())
@@ -6281,7 +6281,7 @@ fn sniff_manifest_media_type(body: &[u8]) -> Option<String> {
 /// body's `mediaType`, and finally to the OCI image-manifest default. An
 /// untagged manifest served content-addressably has no stored content type, so
 /// the body sniff is what gives it a correct media type.
-fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -> String {
+pub(crate) fn resolve_manifest_content_type(stored: Option<&str>, body: &[u8]) -> String {
     if let Some(stored) = stored {
         let stored = stored.trim();
         if !stored.is_empty() && is_header_safe(stored) {
