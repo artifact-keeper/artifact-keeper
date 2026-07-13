@@ -402,8 +402,67 @@ mod tests {
     #[test]
     fn renewal_interval_is_bounded() {
         assert_eq!(renewal_interval(0.0), Duration::from_secs(5));
+        assert_eq!(renewal_interval(f64::NAN), Duration::from_secs(5));
+        assert_eq!(renewal_interval(f64::INFINITY), Duration::from_secs(5));
         assert_eq!(renewal_interval(90.0), Duration::from_secs(30));
         assert_eq!(renewal_interval(6.0 * 3600.0), Duration::from_secs(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_loop_retries_errors_and_stops_after_ownership_loss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let guard = spawn_renewal_loop("test claim", 15.0, move || {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match attempt {
+                    0 => Err("temporary database error".to_string()),
+                    1 => Ok(true),
+                    _ => Ok(false),
+                }
+            }
+        });
+
+        // Let the spawned task create its delayed interval before advancing
+        // paused time. The first immediate tick is intentionally consumed by
+        // spawn_renewal_loop, so renewal begins one interval later.
+        tokio::task::yield_now().await;
+        for expected in 1..=3 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(attempts.load(Ordering::SeqCst), expected);
+        }
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "ownership loss must terminate the renewal task"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_renewal_guard_aborts_before_the_next_heartbeat() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let guard = spawn_renewal_loop("aborted claim", 15.0, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(true) }
+        });
+
+        tokio::task::yield_now().await;
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
