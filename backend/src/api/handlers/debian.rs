@@ -210,7 +210,8 @@ fn push_dependency_field(text: &mut String, key: &str, values: Option<&Vec<Strin
 }
 
 fn push_control_field(text: &mut String, key: &str, value: &str) {
-    let mut lines = value.lines();
+    let normalized = normalize_newlines(value);
+    let mut lines = normalized.lines();
     let Some(first) = lines.next() else {
         return;
     };
@@ -344,6 +345,148 @@ async fn fetch_package_entries(
 // Release content generation (shared by Release, InRelease, Release.gpg)
 // ---------------------------------------------------------------------------
 
+/// Default values for Debian/APT Release Origin and Label fields.
+const DEFAULT_APT_ORIGIN: &str = "artifact-keeper";
+const DEFAULT_APT_LABEL: &str = "artifact-keeper";
+
+/// Returns `true` when `s` contains any line-ending character
+/// (`\n`, `\r\n`, or bare `\r`).
+fn contains_newline(s: &str) -> bool {
+    s.contains('\n') || s.contains('\r')
+}
+
+/// Normalize `\r\n` and bare `\r` to plain `\n` so that
+/// `.lines()` and friends operate on a single canonical form.
+fn normalize_newlines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Format a multi-line description string according to the deb822
+/// continuation convention: the first line carries no leading
+/// space; every subsequent non-empty line is trimmed and prefixed with
+/// a single space; empty lines are rendered as a bare ` .` (space-dot).
+///
+/// Example input:
+///   "Cross-binutils for Win32\n\nMinGW-w64 provides a runtime\n\nLast line"
+///
+/// Example output:
+///   "Cross-binutils for Win32\n .\n MinGW-w64 provides a runtime\n .\n Last line"
+fn format_deb822_description(desc: &str) -> String {
+    let normalized = normalize_newlines(desc);
+    let mut out = String::with_capacity(normalized.len());
+    let mut lines = normalized.lines();
+    if let Some(first) = lines.next() {
+        out.push_str(first.trim());
+    }
+    for line in lines {
+        out.push('\n');
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push_str(" .");
+        } else {
+            out.push(' ');
+            out.push_str(trimmed);
+        }
+    }
+    out
+}
+
+/// Read per-repository APT release metadata overrides from
+/// `repository_config`. `apt_origin` and `apt_label` fall back to
+/// defaults (`DEFAULT_APT_ORIGIN` / `DEFAULT_APT_LABEL`) when unset.
+/// `apt_release_version` and `apt_description` are returned as
+/// `Option<String>` — `None` when unset or empty, meaning the caller
+/// omits those lines from the Release file.
+async fn fetch_apt_release_metadata(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> (String, String, Option<String>, Option<String>) {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config \
+         WHERE repository_id = $1 \
+           AND key IN ('apt_origin', 'apt_label', 'apt_release_version', 'apt_description')",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut origin: Option<String> = None;
+    let mut label: Option<String> = None;
+    let mut release_version: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for (key, value) in &rows {
+        let raw = value.as_deref().unwrap_or("");
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "apt_origin" | "apt_label" | "apt_release_version" => {
+                let single_line = take_first_line(trimmed);
+                if contains_newline(trimmed) {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        key = %key,
+                        "{} is multi-line; only the first line will be used",
+                        key
+                    );
+                }
+                match key.as_str() {
+                    "apt_origin" => origin = Some(single_line),
+                    "apt_label" => label = Some(single_line),
+                    "apt_release_version" => release_version = Some(single_line),
+                    _ => unreachable!(),
+                }
+            }
+            "apt_description" => {
+                if contains_newline(trimmed) {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        "apt_description is multi-line; will be formatted per deb822"
+                    );
+                }
+                description = Some(trimmed.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    (
+        origin.unwrap_or_else(|| DEFAULT_APT_ORIGIN.to_string()),
+        label.unwrap_or_else(|| DEFAULT_APT_LABEL.to_string()),
+        release_version,
+        description,
+    )
+}
+
+/// Return the first line of `s` (up to but not including the first
+/// newline of any style).
+fn take_first_line(s: &str) -> String {
+    // Normalize \r\n and bare \r to \n so `.lines()` splits correctly.
+    let normalized = normalize_newlines(s);
+    normalized
+        .lines()
+        .next()
+        .unwrap_or(&normalized)
+        .trim()
+        .to_string()
+}
+
 async fn generate_release_content(
     state: &SharedState,
     repo_id: uuid::Uuid,
@@ -391,11 +534,22 @@ async fn generate_release_content(
     let now = chrono::Utc::now();
     let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
 
+    let (origin, label, version, description) =
+        fetch_apt_release_metadata(&state.db, repo_id).await;
+
     let mut release = String::new();
-    release.push_str("Origin: artifact-keeper\n");
-    release.push_str("Label: artifact-keeper\n");
+    release.push_str(&format!("Origin: {}\n", origin));
+    release.push_str(&format!("Label: {}\n", label));
     release.push_str(&format!("Suite: {}\n", distribution));
     release.push_str(&format!("Codename: {}\n", distribution));
+    if let Some(ref ver) = version {
+        release.push_str(&format!("Version: {}\n", ver));
+    }
+    if let Some(ref desc) = description {
+        release.push_str("Description: ");
+        release.push_str(&format_deb822_description(desc));
+        release.push('\n');
+    }
     release.push_str(&format!("Date: {}\n", date_str));
     release.push_str(&format!("Architectures: {}\n", arch_str));
     release.push_str(&format!("Components: {}\n", component_str));
@@ -3941,5 +4095,157 @@ mod virtual_dists_cap_tests {
             decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &too_big),
             None
         );
+    }
+}
+
+// --------------------------------------------------------------------------
+// Unit tests: newline normalization & deb822 formatting helpers
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod apt_release_helpers_tests {
+    use super::*;
+
+    // -- contains_newline ---------------------------------------------------
+
+    #[test]
+    fn test_contains_newline_no_newline() {
+        assert!(!contains_newline("plain text"));
+        assert!(!contains_newline(""));
+    }
+
+    #[test]
+    fn test_contains_newline_lf() {
+        assert!(contains_newline("line1\nline2"));
+    }
+
+    #[test]
+    fn test_contains_newline_crlf() {
+        assert!(contains_newline("line1\r\nline2"));
+    }
+
+    #[test]
+    fn test_contains_newline_cr() {
+        assert!(contains_newline("line1\rline2"));
+    }
+
+    // -- normalize_newlines -------------------------------------------------
+
+    #[test]
+    fn test_normalize_newlines_no_change() {
+        assert_eq!(normalize_newlines("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_normalize_newlines_lf_unchanged() {
+        assert_eq!(normalize_newlines("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn test_normalize_newlines_crlf_to_lf() {
+        assert_eq!(normalize_newlines("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn test_normalize_newlines_cr_to_lf() {
+        assert_eq!(normalize_newlines("a\rb"), "a\nb");
+    }
+
+    #[test]
+    fn test_normalize_newlines_mixed() {
+        let input = "line1\r\nline2\nline3\rline4";
+        let expected = "line1\nline2\nline3\nline4";
+        assert_eq!(normalize_newlines(input), expected);
+    }
+
+    // -- take_first_line ----------------------------------------------------
+
+    #[test]
+    fn test_take_first_line_single() {
+        assert_eq!(take_first_line("hello"), "hello");
+    }
+
+    #[test]
+    fn test_take_first_line_lf() {
+        assert_eq!(take_first_line("hello\nworld"), "hello");
+    }
+
+    #[test]
+    fn test_take_first_line_crlf() {
+        assert_eq!(take_first_line("hello\r\nworld"), "hello");
+    }
+
+    #[test]
+    fn test_take_first_line_cr() {
+        assert_eq!(take_first_line("hello\rworld"), "hello");
+    }
+
+    #[test]
+    fn test_take_first_line_trims() {
+        assert_eq!(take_first_line("  hello  \nworld"), "hello");
+    }
+
+    // -- format_deb822_description ------------------------------------------
+
+    #[test]
+    fn test_format_deb822_single_line() {
+        assert_eq!(format_deb822_description("A single line"), "A single line");
+    }
+
+    #[test]
+    fn test_format_deb822_multi_line_continuation() {
+        let input = "First line\nSecond line";
+        assert_eq!(format_deb822_description(input), "First line\n Second line");
+    }
+
+    #[test]
+    fn test_format_deb822_empty_lines_bare_dot() {
+        let input = "Header\n\nBody\n\nFooter";
+        assert_eq!(
+            format_deb822_description(input),
+            "Header\n .\n Body\n .\n Footer"
+        );
+    }
+
+    #[test]
+    fn test_format_deb822_trims_continuation_lines() {
+        let input = "First\n  indented line  ";
+        assert_eq!(format_deb822_description(input), "First\n indented line");
+    }
+
+    #[test]
+    fn test_format_deb822_crlf_handling() {
+        let input = "Header\r\n\r\nBody";
+        assert_eq!(format_deb822_description(input), "Header\n .\n Body");
+    }
+
+    // -- push_control_field -------------------------------------------------
+
+    #[test]
+    fn test_push_control_field_single_line() {
+        let mut text = String::new();
+        push_control_field(&mut text, "Key", "value");
+        assert_eq!(text, "Key: value\n");
+    }
+
+    #[test]
+    fn test_push_control_field_multi_line() {
+        let mut text = String::new();
+        push_control_field(&mut text, "Desc", "Line1\nLine2");
+        assert_eq!(text, "Desc: Line1\n Line2\n");
+    }
+
+    #[test]
+    fn test_push_control_field_empty_line_bare_dot() {
+        let mut text = String::new();
+        push_control_field(&mut text, "Desc", "Line1\n\nLine3");
+        assert_eq!(text, "Desc: Line1\n .\n Line3\n");
+    }
+
+    #[test]
+    fn test_push_control_field_empty_value() {
+        let mut text = String::new();
+        push_control_field(&mut text, "Key", "");
+        assert_eq!(text, "");
     }
 }

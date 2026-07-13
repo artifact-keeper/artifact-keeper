@@ -559,6 +559,18 @@ pub struct CreateRepositoryRequest {
     /// project (permissions with `target_type = 'project'`) are inherited by
     /// the repository. Omit to leave the repository unassigned.
     pub project_id: Option<Uuid>,
+    /// Custom Origin field for Debian/APT Release files.
+    /// Stored in `repository_config` under `apt_origin`.
+    pub apt_origin: Option<String>,
+    /// Custom Label field for Debian/APT Release files.
+    /// Stored in `repository_config` under `apt_label`.
+    pub apt_label: Option<String>,
+    /// Custom Version field for Debian/APT Release files.
+    /// Stored in `repository_config` under `apt_release_version`.
+    pub apt_release_version: Option<String>,
+    /// Custom Description field for Debian/APT Release files.
+    /// Stored in `repository_config` under `apt_description`.
+    pub apt_description: Option<String>,
 }
 
 impl CreateRepositoryRequest {
@@ -631,6 +643,22 @@ pub struct UpdateRepositoryRequest {
     /// the field leaves the assignment unchanged (unassignment ships with the
     /// project-admin surface in P2).
     pub project_id: Option<Uuid>,
+    /// Custom Origin field for Debian/APT Release files. Pass an empty string
+    /// to reset to the default ("artifact-keeper").
+    /// Stored in `repository_config` under `apt_origin`.
+    pub apt_origin: Option<String>,
+    /// Custom Label field for Debian/APT Release files. Pass an empty string
+    /// to reset to the default ("artifact-keeper").
+    /// Stored in `repository_config` under `apt_label`.
+    pub apt_label: Option<String>,
+    /// Custom Version field for Debian/APT Release files. Pass an empty
+    /// string to remove (omits the field entirely from the Release file).
+    /// Stored in `repository_config` under `apt_release_version`.
+    pub apt_release_version: Option<String>,
+    /// Custom Description field for Debian/APT Release files. Pass an empty
+    /// string to remove (omits the field entirely from the Release file).
+    /// Stored in `repository_config` under `apt_description`.
+    pub apt_description: Option<String>,
 }
 
 impl UpdateRepositoryRequest {
@@ -679,6 +707,20 @@ pub struct RepositoryResponse {
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
+    /// Custom Origin field for Debian/APT Release files (default: "artifact-keeper").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apt_origin: Option<String>,
+    /// Custom Label field for Debian/APT Release files (default: "artifact-keeper").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apt_label: Option<String>,
+    /// Custom Version field for Debian/APT Release files. Omitted from the
+    /// Release file when `None` or empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apt_release_version: Option<String>,
+    /// Custom Description field for Debian/APT Release files. Omitted from the
+    /// Release file when `None` or empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apt_description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -717,6 +759,10 @@ fn repo_to_response(
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
         custom_user_agent: None,
+        apt_origin: None,
+        apt_label: None,
+        apt_release_version: None,
+        apt_description: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -754,6 +800,63 @@ async fn with_custom_user_agent(
     .await;
     if let Ok(Some(ua)) = result {
         response.custom_user_agent = Some(ua);
+    }
+    response
+}
+
+/// Populate `RepositoryResponse` APT release fields (`apt_origin`,
+/// `apt_label`, `apt_release_version`, `apt_description`) from
+/// `repository_config`.
+async fn with_apt_settings(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config \
+         WHERE repository_id = $1 \
+           AND key IN ('apt_origin', 'apt_label', 'apt_release_version', 'apt_description')",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for (key, value) in &rows {
+        if let Some(v) = value {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "apt_origin" | "apt_label" | "apt_release_version" => {
+                    let single_line = trimmed.lines().next().unwrap_or("").trim().to_string();
+                    if contains_newline(trimmed) {
+                        tracing::warn!(
+                            repo_id = %repo_id,
+                            key = %key,
+                            "{} is multi-line; only the first line will be used",
+                            key
+                        );
+                    }
+                    match key.as_str() {
+                        "apt_origin" => response.apt_origin = Some(single_line),
+                        "apt_label" => response.apt_label = Some(single_line),
+                        "apt_release_version" => response.apt_release_version = Some(single_line),
+                        _ => unreachable!(),
+                    }
+                }
+                "apt_description" => {
+                    if contains_newline(trimmed) {
+                        tracing::warn!(
+                            repo_id = %repo_id,
+                            "apt_description is multi-line; will be formatted per deb822"
+                        );
+                    }
+                    response.apt_description = Some(trimmed.to_string());
+                }
+                _ => {}
+            }
+        }
     }
     response
 }
@@ -807,6 +910,23 @@ fn validate_custom_user_agent(ua: &str) -> Result<()> {
             "custom_user_agent must not contain control characters (see RFC 7230 §3.2.6)"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Returns `true` when `s` contains any line-ending character
+/// (`\n`, `\r\n`, or bare `\r`).
+fn contains_newline(s: &str) -> bool {
+    s.contains('\n') || s.contains('\r')
+}
+
+/// Reject multi-line values for APT Release fields that must be single-line
+/// (`Origin`, `Label`, `Version`).
+fn ensure_single_line(value: &str, field_name: &str) -> Result<()> {
+    if contains_newline(value) {
+        return Err(AppError::Validation(format!(
+            "{field_name} must be a single-line value"
+        )));
     }
     Ok(())
 }
@@ -1764,6 +1884,7 @@ pub async fn create_repository(
     let service = state.create_repository_service();
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
+    let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
 
     // Validate up-front that virtual repos do not arrive with an explicit
     // empty `member_repos: []`. Omitted-field (deferred-population) is
@@ -1880,6 +2001,50 @@ pub async fn create_repository(
         }
     }
 
+    if !is_apt_hosted
+        && (payload.apt_origin.is_some()
+            || payload.apt_label.is_some()
+            || payload.apt_release_version.is_some()
+            || payload.apt_description.is_some())
+    {
+        return Err(AppError::Validation(
+            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
+        ));
+    }
+
+    if is_apt_hosted {
+        if let Some(ref origin) = payload.apt_origin {
+            let trimmed = origin.trim();
+            if !trimmed.is_empty() {
+                ensure_single_line(trimmed, "apt_origin")?;
+                upsert_repo_config(&state.db, repo.id, "apt_origin", trimmed).await?;
+            }
+        }
+        if let Some(ref label) = payload.apt_label {
+            let trimmed = label.trim();
+            if !trimmed.is_empty() {
+                ensure_single_line(trimmed, "apt_label")?;
+                upsert_repo_config(&state.db, repo.id, "apt_label", trimmed).await?;
+            }
+        }
+        if let Some(ref ver) = payload.apt_release_version {
+            let trimmed = ver.trim();
+            if !trimmed.is_empty() {
+                ensure_single_line(trimmed, "apt_release_version")?;
+                upsert_repo_config(&state.db, repo.id, "apt_release_version", trimmed).await?;
+            }
+        }
+        if let Some(ref desc) = payload.apt_description {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                if contains_newline(trimmed) {
+                    tracing::warn!("apt_description is multi-line; will be formatted per deb822");
+                }
+                upsert_repo_config(&state.db, repo.id, "apt_description", trimmed).await?;
+            }
+        }
+    }
+
     // Add virtual repository members. Post-#1444, the validator accepts
     // `member_repos == None` (deferred-population pattern: caller will
     // POST /members later) and only rejects `Some(empty_vec)`. Treat the
@@ -1961,6 +2126,10 @@ pub async fn create_repository(
         response.upstream_auth_configured = true;
     }
     response.custom_user_agent = payload.custom_user_agent.filter(|ua| !ua.is_empty());
+    response.apt_origin = payload.apt_origin.filter(|v| !v.trim().is_empty());
+    response.apt_label = payload.apt_label.filter(|v| !v.trim().is_empty());
+    response.apt_release_version = payload.apt_release_version.filter(|v| !v.trim().is_empty());
+    response.apt_description = payload.apt_description.filter(|v| !v.trim().is_empty());
     Ok(Json(response))
 }
 
@@ -1991,11 +2160,18 @@ pub async fn get_repository(
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
     let repo_id = repo.id;
+    let is_apt_hosted =
+        repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let mut response = repo_to_response(repo, storage_used);
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
     let response = with_custom_user_agent(&state.db, repo_id, response).await;
+    let response = if is_apt_hosted {
+        with_apt_settings(&state.db, repo_id, response).await
+    } else {
+        response
+    };
     Ok(Json(response))
 }
 
@@ -2185,6 +2361,81 @@ pub async fn update_repository(
         }
     }
 
+    let is_apt_hosted =
+        existing.repo_type.is_hosted() && matches!(existing.format, RepositoryFormat::Debian);
+
+    if !is_apt_hosted
+        && (payload.apt_origin.is_some()
+            || payload.apt_label.is_some()
+            || payload.apt_release_version.is_some()
+            || payload.apt_description.is_some())
+    {
+        return Err(AppError::Validation(
+            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
+        ));
+    }
+
+    if is_apt_hosted {
+        if let Some(ref origin) = payload.apt_origin {
+            let trimmed = origin.trim();
+            if trimmed.is_empty() {
+                sqlx::query(
+                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_origin'",
+                )
+                .bind(repo.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            } else {
+                ensure_single_line(trimmed, "apt_origin")?;
+                upsert_repo_config(&state.db, repo.id, "apt_origin", trimmed).await?;
+            }
+        }
+        if let Some(ref label) = payload.apt_label {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                sqlx::query(
+                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_label'",
+                )
+                .bind(repo.id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            } else {
+                ensure_single_line(trimmed, "apt_label")?;
+                upsert_repo_config(&state.db, repo.id, "apt_label", trimmed).await?;
+            }
+        }
+        if let Some(ref ver) = payload.apt_release_version {
+            let trimmed = ver.trim();
+            if trimmed.is_empty() {
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_release_version'")
+                    .bind(repo.id)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            } else {
+                ensure_single_line(trimmed, "apt_release_version")?;
+                upsert_repo_config(&state.db, repo.id, "apt_release_version", trimmed).await?;
+            }
+        }
+        if let Some(ref desc) = payload.apt_description {
+            let trimmed = desc.trim();
+            if trimmed.is_empty() {
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_description'")
+                    .bind(repo.id)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            } else {
+                if contains_newline(trimmed) {
+                    tracing::warn!("apt_description is multi-line; will be formatted per deb822");
+                }
+                upsert_repo_config(&state.db, repo.id, "apt_description", trimmed).await?;
+            }
+        }
+    }
+
     // Invalidate the in-memory repo cache so that visibility changes take
     // effect immediately instead of waiting for the TTL to expire. Remove
     // both the old key and the new key (in case the key was renamed). This
@@ -2227,6 +2478,8 @@ pub async fn update_repository(
     .await;
 
     let repo_id = repo.id;
+    let is_apt_hosted =
+        repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let response = repo_to_response(repo, storage_used);
     let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
     if let Some(ref ua) = payload.custom_user_agent {
@@ -2236,6 +2489,11 @@ pub async fn update_repository(
             Some(ua.clone())
         };
     }
+    let response = if is_apt_hosted {
+        with_apt_settings(&state.db, repo_id, response).await
+    } else {
+        response
+    };
     Ok(Json(response))
 }
 
@@ -7947,6 +8205,10 @@ mod tests {
             quarantine_duration_minutes: None,
             custom_user_agent: None,
             project_id: None,
+            apt_origin: None,
+            apt_label: None,
+            apt_release_version: None,
+            apt_description: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9275,6 +9537,10 @@ mod tests {
             quarantine_duration_minutes: Some(525600),
             custom_user_agent: None,
             project_id: None,
+            apt_origin: None,
+            apt_label: None,
+            apt_release_version: None,
+            apt_description: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -15072,6 +15338,10 @@ mod tests {
             quarantine_duration_minutes: None,
             custom_user_agent: None,
             project_id: None,
+            apt_origin: None,
+            apt_label: None,
+            apt_release_version: None,
+            apt_description: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -15984,5 +16254,64 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Unit tests: APT field validation helpers
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod apt_validation_tests {
+    use super::*;
+
+    // -- contains_newline ---------------------------------------------------
+
+    #[test]
+    fn test_contains_newline_plain() {
+        assert!(!contains_newline("plain text"));
+    }
+
+    #[test]
+    fn test_contains_newline_lf() {
+        assert!(contains_newline("a\nb"));
+    }
+
+    #[test]
+    fn test_contains_newline_crlf() {
+        assert!(contains_newline("a\r\nb"));
+    }
+
+    #[test]
+    fn test_contains_newline_cr() {
+        assert!(contains_newline("a\rb"));
+    }
+
+    // -- ensure_single_line -------------------------------------------------
+
+    #[test]
+    fn test_ensure_single_line_passes() {
+        assert!(ensure_single_line("valid value", "apt_origin").is_ok());
+    }
+
+    #[test]
+    fn test_ensure_single_line_rejects_lf() {
+        let err = ensure_single_line("line1\nline2", "apt_origin").unwrap_err();
+        assert!(err.to_string().contains("apt_origin"));
+        assert!(err.to_string().contains("single-line"));
+    }
+
+    #[test]
+    fn test_ensure_single_line_rejects_crlf() {
+        let err = ensure_single_line("line1\r\nline2", "apt_label").unwrap_err();
+        assert!(err.to_string().contains("apt_label"));
+        assert!(err.to_string().contains("single-line"));
+    }
+
+    #[test]
+    fn test_ensure_single_line_rejects_cr() {
+        let err = ensure_single_line("line1\rline2", "apt_release_version").unwrap_err();
+        assert!(err.to_string().contains("apt_release_version"));
+        assert!(err.to_string().contains("single-line"));
     }
 }
