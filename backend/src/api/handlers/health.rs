@@ -126,16 +126,35 @@ fn gate_detailed_health_fields(
     }
 }
 
+/// Build the HTTP client used to probe operator-configured internal
+/// services (Trivy, OpenSCAP).
+///
+/// Uses the **trusted-internal** client class
+/// ([`internal_service_client_builder`]), not the fail-closed upstream
+/// class: the probe targets come exclusively from server configuration
+/// (`TRIVY_URL` / `OPENSCAP_URL`), never from request input, and in the
+/// normal in-cluster / Compose topology they resolve to private-network
+/// addresses that the upstream class rejects at DNS time — making
+/// `/health` misreport a reachable sidecar as `unavailable` (issue
+/// #2478). This matches the trust class already used by the periodic
+/// `HealthMonitorService` and the scan clients for the same endpoints.
+/// Cloud-metadata, loopback and link-local targets stay hard-blocked.
+///
+/// [`internal_service_client_builder`]: crate::services::http_client::internal_service_client_builder
+fn service_probe_client() -> reqwest::Client {
+    crate::services::http_client::internal_service_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default()
+}
+
 /// Probe an external service health endpoint and return a CheckStatus.
 async fn check_service_health(
     base_url: &str,
     health_path: &str,
     service_name: &str,
 ) -> CheckStatus {
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = service_probe_client();
     let url = format!("{}{}", base_url.trim_end_matches('/'), health_path);
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => CheckStatus {
@@ -799,6 +818,132 @@ mod tests {
             active_connections: 5,
             size: 20,
         }
+    }
+
+    /// #2478: the internal-service health probe (`TRIVY_URL` /
+    /// `OPENSCAP_URL`) must be in the **trusted-internal** client class,
+    /// not the fail-closed upstream class. Discriminating check: the
+    /// per-hop redirect policy is wired per trust class, and a redirect to
+    /// a private RFC1918 target is rejected by the upstream class but
+    /// permitted by the trusted-internal class. Serve a `302` to a private
+    /// address from a loopback listener (the entry hop uses an IP literal,
+    /// which never consults the DNS resolver — mirroring
+    /// `http_client.rs::test_webhook_client_refuses_redirect_to_metadata`)
+    /// and assert the probe client does NOT fail with the redirect-policy
+    /// rejection. With `base_client_builder` (the pre-#2478 code) this
+    /// test fails with the "SSRF policy" redirect error.
+    #[tokio::test]
+    async fn test_service_probe_client_permits_private_redirect_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\n\
+                          Location: http://10.255.255.9:9/healthz\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let client = service_probe_client();
+        let url = format!("http://127.0.0.1:{}/healthz", addr.port());
+        let result = client.get(&url).send().await;
+        let _ = server.await;
+
+        // Following the redirect means attempting to connect to
+        // 10.255.255.9:9, which is expected to fail at the connect layer
+        // (nothing routable there). The assertion is only that the
+        // redirect POLICY did not reject the private target — that is
+        // what distinguishes the trusted-internal class from the
+        // fail-closed upstream class.
+        if let Err(err) = result {
+            assert!(
+                !err.is_redirect() && !err.to_string().contains("SSRF"),
+                "probe client must not reject a private redirect target \
+                 (it must use the trusted-internal class), got: {err}"
+            );
+        }
+    }
+
+    /// #2478 companion: moving the probe to the trusted-internal class
+    /// must NOT drop the SSRF guard entirely — a probe target resolving
+    /// to loopback (e.g. `TRIVY_URL=http://localhost:...`) is still
+    /// refused at DNS time, before any TCP connection. Mirrors the
+    /// discriminating listener assertion in `http_client.rs`: an
+    /// unguarded client WOULD connect to this listener, so asserting the
+    /// listener never accepts a connection proves the resolver blocked
+    /// the request.
+    #[tokio::test]
+    async fn test_service_probe_client_still_refuses_loopback_host() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let client = service_probe_client();
+        let url = format!("http://localhost:{port}/healthz");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("probe client must refuse a host resolving to loopback");
+        assert!(
+            err.is_connect()
+                || err.is_request()
+                || err.to_string().to_lowercase().contains("ssrf")
+                || err.to_string().to_lowercase().contains("block"),
+            "expected resolver rejection, got: {err}"
+        );
+
+        let accept_result =
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accept_result.is_err(),
+            "probe client must never connect to a loopback listener: {accept_result:?}"
+        );
+    }
+
+    /// End-to-end regression guard: `check_service_health` against a live
+    /// local endpoint returns `healthy` — the legitimate probe path still
+    /// works after the trust-class change.
+    #[tokio::test]
+    async fn test_check_service_health_reports_healthy_on_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let status =
+            check_service_health(&format!("http://127.0.0.1:{port}"), "/healthz", "Trivy").await;
+        let _ = server.await;
+
+        assert_eq!(status.status, STATUS_HEALTHY);
+        assert!(status.message.is_none());
     }
 
     #[test]
