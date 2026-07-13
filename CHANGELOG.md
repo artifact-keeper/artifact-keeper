@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-07-13
+
+Security hotfix: closes a critical SAML XML Signature Wrapping (XSW) authentication bypass (CWE-347) where an authenticated SSO user could escalate to platform administrator by attaching attacker-controlled, unsigned claims to their own validly-signed SAML response. Found and confirmed closed by red-team across successive adversarial passes.
+
+### Security
+
+- **SAML assertion consumption bound to the cryptographically-signed content** (#2449): the SAML ACS handler previously verified that *an* assertion was signed but then extracted the acted-on claims (NameID, group/role attributes, audiences, conditions) from a whole-document, last-wins parse, so claim values sourced from outside the signed assertion were consumed as if signed. An SSO user with a valid, no-groups assertion could append an unsigned `groups` attribute — before the assertion, or within the enveloped `<ds:Signature>` subtree that the signature transform removes before digesting — and be provisioned as admin; a comment inserted into a signed NameID could likewise truncate the provisioned identity. Assertion consumption is now confined to the verified content: responses carrying more than one assertion are rejected, the consumed assertion is bound to a verified signature reference by ID, every claim is harvested only from within the signed assertion subtree (excluding the enveloped `<ds:Signature>` subtree), and comment-split text is canonicalized by concatenation. Legitimate single-signed logins and in-assertion group-to-admin mapping are unaffected.
+
 ## [1.5.3] - 2026-07-12
 
 Security hotfix: closes a systemic cross-repository authorization gap where artifact/repository-scoped routes returned (and in some cases mutated) another repository's data for any authenticated non-member. Found by red-team; the HIGH-impact subset (vulnerability/SBOM data) is fixed here, with the remaining medium/low routes tracked for the next feature release (#2443).
