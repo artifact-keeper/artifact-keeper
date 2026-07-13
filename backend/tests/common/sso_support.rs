@@ -396,6 +396,16 @@ impl SamlResponseSpec {
                 )
             })
             .collect::<String>();
+        // Emit the `groups` attribute only when there are groups. A spec with
+        // `groups: vec![]` produces a signed assertion carrying NO groups
+        // attribute — the precondition for the attribute-injection variant,
+        // where an attacker splices a `groups` attribute outside the signed
+        // subtree.
+        let groups_attribute = if self.groups.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<saml:Attribute Name="groups">{group_values}</saml:Attribute>"#)
+        };
 
         format!(
             r##"<?xml version="1.0" encoding="UTF-8"?>
@@ -443,7 +453,7 @@ impl SamlResponseSpec {
             <saml:Attribute Name="displayName">
                 <saml:AttributeValue>{display_name}</saml:AttributeValue>
             </saml:Attribute>
-            <saml:Attribute Name="groups">{group_values}</saml:Attribute>
+            {groups_attribute}
         </saml:AttributeStatement>
     </saml:Assertion>
 </samlp:Response>"##,
@@ -538,6 +548,75 @@ impl SamlResponseSpec {
         let wrapped = signed.replacen(
             "</samlp:Response>",
             &format!("{injected}\n</samlp:Response>"),
+            1,
+        );
+        base64_standard(wrapped.as_bytes())
+    }
+
+    /// Attribute-injection XSW variant (#2453 layer-2): the assertion is signed
+    /// normally, then a `<saml:Attribute Name="groups">` carrying
+    /// `attacker_groups` is spliced in as a child of `<samlp:Response>` —
+    /// OUTSIDE the signed `<saml:Assertion>` subtree — either before or after
+    /// the assertion. The assertion's digest is unchanged, so the signature
+    /// still verifies; a parser that harvests claims whole-document (rather than
+    /// scoping to the signed assertion) would consume the injected groups.
+    ///
+    /// Pair with `SamlResponseSpec { groups: vec![], .. }` so the signed
+    /// assertion carries no groups attribute of its own.
+    pub fn attribute_xsw_b64(&self, attacker_groups: &[&str], before_assertion: bool) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+        let injected = format!(
+            r#"<saml:Attribute xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Name="groups">{values}</saml:Attribute>"#
+        );
+        let wrapped = if before_assertion {
+            signed.replacen(
+                "<saml:Assertion ",
+                &format!("{injected}\n    <saml:Assertion "),
+                1,
+            )
+        } else {
+            signed.replacen(
+                "</saml:Assertion>",
+                &format!("</saml:Assertion>\n    {injected}"),
+                1,
+            )
+        };
+        base64_standard(wrapped.as_bytes())
+    }
+
+    /// Comment-splitting variant (#2453 layer-2 / Case-5): the assertion is
+    /// signed normally, then an XML comment is injected INTO the signed NameID
+    /// text, splitting it before its last `-`-delimited segment
+    /// (`victim-prefix-<!--c-->suffix`). Because the signature uses
+    /// exclusive-c14n#(no-comments), the comment is stripped before digesting
+    /// and the signature still verifies; a last-wins parser would keep only the
+    /// trailing text node (`suffix`), whereas the canonical value is the full
+    /// concatenation.
+    pub fn nameid_comment_b64(&self) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let escaped = xml_escape(&self.name_id);
+        // Split before the last `-`-delimited segment; fall back to the midpoint
+        // (on a char boundary) when there is no `-`.
+        let split = escaped.rfind('-').map(|i| i + 1).unwrap_or_else(|| {
+            let mut m = escaped.len() / 2;
+            while m < escaped.len() && !escaped.is_char_boundary(m) {
+                m += 1;
+            }
+            m
+        });
+        let (first_half, second_half) = escaped.split_at(split);
+        let wrapped = signed.replacen(
+            &format!("{escaped}</saml:NameID>"),
+            &format!("{first_half}<!--c-->{second_half}</saml:NameID>"),
             1,
         );
         base64_standard(wrapped.as_bytes())

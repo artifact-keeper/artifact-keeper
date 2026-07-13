@@ -273,6 +273,12 @@ struct SamlResponseParser {
     /// the "second assertion to smuggle" precondition for XML Signature
     /// Wrapping and applies even on the no-certificate dev path.
     assertion_count: usize,
+    /// Text accumulated for the current leaf element, committed on its `End`.
+    /// Accumulating (rather than last-wins on each `Text` event) canonicalises
+    /// a signed value an attacker split across two text nodes with an
+    /// intervening comment — `foo<!--c-->bar` yields `foobar`, matching the
+    /// exclusive-c14n#(no-comments) view under which the signature was verified.
+    current_text: String,
 }
 
 impl SamlResponseParser {
@@ -304,6 +310,7 @@ impl SamlResponseParser {
             current_attr_name: None,
             current_attr_values: Vec::new(),
             assertion_count: 0,
+            current_text: String::new(),
         }
     }
 
@@ -311,6 +318,9 @@ impl SamlResponseParser {
     fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
         self.current_element = name.clone();
+        // Start of a new element: reset the leaf-text accumulator so each
+        // element's text is committed fresh on its own `End`.
+        self.current_text.clear();
 
         match name.as_str() {
             "Response" => self.handle_response_start(e),
@@ -348,14 +358,12 @@ impl SamlResponseParser {
             return;
         }
 
-        match self.current_element.as_str() {
-            "Issuer" => self.handle_issuer_text(text),
-            "NameID" => self.assertion.name_id = text,
-            "Audience" => self.assertion.audiences.push(text),
-            "AttributeValue" => self.current_attr_values.push(text),
-            "StatusMessage" => self.response.status_message = Some(text),
-            _ => {}
-        }
+        // Accumulate rather than commit here: a comment splitting a signed value
+        // into two text nodes (`foo<!--c-->bar`) arrives as two `Text` events
+        // with no intervening `Start`, so both segments concatenate into the
+        // canonical value. The accumulated text is committed on the element's
+        // `End`. Comments are `Event::Comment` and never reach this method.
+        self.current_text.push_str(&text);
     }
 
     /// Handle an `Event::End` element.
@@ -366,13 +374,46 @@ impl SamlResponseParser {
                 self.in_assertion = false;
                 self.response.assertion = Some(self.assertion.clone());
             }
+            // Text commits happen here (on `End`) from the accumulator. Every
+            // assertion-scoped claim is gated on `self.in_assertion` so a claim
+            // element spliced outside the verified `<Assertion>` subtree (e.g. a
+            // sibling of `<Assertion>` under `<Response>`) is never consumed.
+            "Issuer" => {
+                let text = std::mem::take(&mut self.current_text);
+                self.handle_issuer_text(text);
+            }
+            "NameID" => {
+                if self.in_assertion && !self.current_text.is_empty() {
+                    self.assertion.name_id = std::mem::take(&mut self.current_text);
+                }
+            }
+            "Audience" => {
+                if self.in_assertion && !self.current_text.is_empty() {
+                    self.assertion
+                        .audiences
+                        .push(std::mem::take(&mut self.current_text));
+                }
+            }
+            "AttributeValue" => {
+                if self.in_assertion && !self.current_text.is_empty() {
+                    self.current_attr_values
+                        .push(std::mem::take(&mut self.current_text));
+                }
+            }
+            "StatusMessage" => {
+                if !self.current_text.is_empty() {
+                    self.response.status_message = Some(std::mem::take(&mut self.current_text));
+                }
+            }
             "Attribute" => {
                 if let Some(attr_name) = self.current_attr_name.take() {
-                    self.assertion
-                        .attributes
-                        .insert(attr_name, self.current_attr_values.clone());
-                    self.current_attr_values.clear();
+                    if self.in_assertion {
+                        self.assertion
+                            .attributes
+                            .insert(attr_name, self.current_attr_values.clone());
+                    }
                 }
+                self.current_attr_values.clear();
             }
             _ => {}
         }
@@ -395,8 +436,10 @@ impl SamlResponseParser {
     /// URL the IdP asserts this assertion was minted for. Captured here and
     /// bound against the SP's own ACS URL in `validate_response`.
     fn handle_subject_confirmation_data(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(recipient) = get_xml_attr(e, "Recipient") {
-            self.assertion.recipient = Some(recipient);
+        if self.in_assertion {
+            if let Some(recipient) = get_xml_attr(e, "Recipient") {
+                self.assertion.recipient = Some(recipient);
+            }
         }
     }
 
@@ -415,31 +458,39 @@ impl SamlResponseParser {
     }
 
     fn handle_name_id_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(format) = get_xml_attr(e, "Format") {
-            self.assertion.name_id_format = Some(format);
+        if self.in_assertion {
+            if let Some(format) = get_xml_attr(e, "Format") {
+                self.assertion.name_id_format = Some(format);
+            }
         }
     }
 
     fn handle_conditions_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        for (key, value) in collect_xml_attrs(e) {
-            match key.as_str() {
-                "NotBefore" => self.assertion.not_before = Some(value),
-                "NotOnOrAfter" => self.assertion.not_on_or_after = Some(value),
-                _ => {}
+        if self.in_assertion {
+            for (key, value) in collect_xml_attrs(e) {
+                match key.as_str() {
+                    "NotBefore" => self.assertion.not_before = Some(value),
+                    "NotOnOrAfter" => self.assertion.not_on_or_after = Some(value),
+                    _ => {}
+                }
             }
         }
     }
 
     fn handle_authn_statement(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(session_index) = get_xml_attr(e, "SessionIndex") {
-            self.assertion.session_index = Some(session_index);
+        if self.in_assertion {
+            if let Some(session_index) = get_xml_attr(e, "SessionIndex") {
+                self.assertion.session_index = Some(session_index);
+            }
         }
     }
 
     fn handle_attribute_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(name) = get_xml_attr(e, "Name") {
-            self.current_attr_name = Some(name);
-            self.current_attr_values.clear();
+        if self.in_assertion {
+            if let Some(name) = get_xml_attr(e, "Name") {
+                self.current_attr_name = Some(name);
+                self.current_attr_values.clear();
+            }
         }
     }
 
@@ -3222,12 +3273,16 @@ mod tests {
         let start = BytesStart::from_content(r#"Attribute Name="groups""#, 9);
         parser.handle_start(&start);
 
-        // Simulate AttributeValue text nodes
-        parser.current_element = "AttributeValue".to_string();
-        let text1 = quick_xml::events::BytesText::new("GroupA");
-        parser.handle_text(&text1);
-        let text2 = quick_xml::events::BytesText::new("GroupB");
-        parser.handle_text(&text2);
+        // Simulate two `<AttributeValue>` children: each value is accumulated
+        // between its Start and End and committed on End.
+        let av_start = BytesStart::from_content("AttributeValue", 14);
+        let av_end = BytesEnd::new("AttributeValue");
+        parser.handle_start(&av_start);
+        parser.handle_text(&quick_xml::events::BytesText::new("GroupA"));
+        parser.handle_end(&av_end);
+        parser.handle_start(&av_start);
+        parser.handle_text(&quick_xml::events::BytesText::new("GroupB"));
+        parser.handle_end(&av_end);
 
         // Close the Attribute element
         let end = BytesEnd::new("Attribute");
@@ -3262,6 +3317,153 @@ mod tests {
         let response = parser.finish();
         assert!(response.assertion.is_some());
         assert_eq!(response.assertion.as_ref().unwrap().id, "_test_end");
+    }
+
+    // --- Subtree-scoping (claims confined to the verified `<Assertion>`) ---
+
+    /// A `<saml:Attribute Name="groups">` spliced as a sibling of the assertion
+    /// (BEFORE it, directly under `<Response>`) must not be consumed: it is not
+    /// within the assertion the signature covers.
+    #[test]
+    fn test_parser_attribute_before_assertion_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert!(
+            !assertion.attributes.contains_key("groups"),
+            "attribute spliced before the assertion must not be consumed"
+        );
+        assert_eq!(assertion.name_id, "alice@example.com");
+    }
+
+    /// Control: the same splice AFTER the assertion (still a `<Response>` child)
+    /// is likewise outside the assertion subtree and must not be consumed.
+    #[test]
+    fn test_parser_attribute_after_assertion_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert!(
+            !assertion.attributes.contains_key("groups"),
+            "attribute spliced after the assertion must not be consumed"
+        );
+    }
+
+    /// A `<saml:NameID>` under `<Response>` before the assertion must not win
+    /// over the assertion's own NameID.
+    #[test]
+    fn test_parser_name_id_before_assertion_ignored() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:NameID>attacker@evil.com</saml:NameID>
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>victim@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "victim@example.com");
+    }
+
+    // --- Comment-split signed values canonicalise by concatenation ---
+
+    /// A comment splitting the NameID text (`foo<!--x-->bar`) yields the whole
+    /// value `foobar`, matching the exclusive-c14n#(no-comments) signed view.
+    #[test]
+    fn test_parser_name_id_comment_split_concatenates() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>foo<!--x-->bar</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "foobar");
+    }
+
+    /// The same for an `<AttributeValue>`: `ak-<!--x-->admins` is the single
+    /// value `ak-admins`, not the trailing `admins` segment.
+    #[test]
+    fn test_parser_attribute_value_comment_split_concatenates() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>ak-<!--x-->admins</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["ak-admins".to_string()]);
+    }
+
+    /// Sanity: NameID and a groups attribute genuinely inside the assertion are
+    /// still recorded (subtree scoping does not drop legitimate claims).
+    #[test]
+    fn test_parser_in_assertion_claims_still_recorded() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>developers</saml:AttributeValue>
+                        <saml:AttributeValue>ak-admins</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "alice@example.com");
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(
+            groups,
+            &vec!["developers".to_string(), "ak-admins".to_string()]
+        );
     }
 
     #[test]
