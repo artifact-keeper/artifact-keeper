@@ -1135,4 +1135,413 @@ mod tests {
             tdh::cleanup(&pool, repo_id, user_id).await;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // DB-gated HANDLER tests: drive the actual axum endpoints end-to-end
+    // through the router (oneshot), so the CRUD/member handler bodies are
+    // exercised under the coverage job's live Postgres. Skip cleanly when
+    // DATABASE_URL is unset, mirroring the tdh convention.
+    // -----------------------------------------------------------------------
+
+    mod http {
+        use super::super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use sqlx::PgPool;
+
+        /// Connect + build a SharedState over a temp storage dir.
+        async fn setup() -> Option<(PgPool, crate::api::SharedState)> {
+            let pool = tdh::try_pool().await?;
+            let dir = std::env::temp_dir().join(format!("prj-http-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("storage dir");
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            Some((pool, state))
+        }
+
+        /// Router wired exactly like production nesting (auth injected).
+        fn app(state: &crate::api::SharedState, auth: AuthExtension) -> axum::Router {
+            tdh::router_with_auth(router(), state.clone(), auth)
+        }
+
+        fn admin() -> AuthExtension {
+            tdh::admin_auth(Uuid::new_v4(), "prj-http-admin")
+        }
+
+        /// Build a JSON request for any method (tdh has no DELETE builder).
+        fn req(method: &str, uri: &str, body: &str) -> Request<Body> {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("build request")
+        }
+
+        async fn create_via_api(
+            state: &crate::api::SharedState,
+            key: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let body = format!(
+                r#"{{"key":"{key}","name":"{key} name","description":"d","quota_bytes":1024}}"#
+            );
+            let (status, bytes) = tdh::send(app(state, admin()), req("POST", "/", &body)).await;
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        async fn cleanup_project_rows(pool: &PgPool, key: &str) {
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'project' AND target_id IN \
+                 (SELECT id FROM projects WHERE key = $1)",
+            )
+            .bind(key)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM projects WHERE key = $1")
+                .bind(key)
+                .execute(pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn http_project_crud_lifecycle() {
+            let Some((pool, state)) = setup().await else {
+                return;
+            };
+            let key = format!("prj-http-crud-{}", Uuid::new_v4().simple());
+
+            // Create -> 200 with the persisted row echoed back.
+            let (status, created) = create_via_api(&state, &key).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(created["key"], key.as_str());
+            assert_eq!(created["quota_bytes"], 1024);
+            let id = created["id"].as_str().expect("project id").to_string();
+
+            // Duplicate key -> 409.
+            let (dup_status, _) = create_via_api(&state, &key).await;
+            assert_eq!(dup_status, StatusCode::CONFLICT);
+
+            // Get -> 200; unknown id -> 404.
+            let (status, bytes) = tdh::send(app(&state, admin()), tdh::get(format!("/{id}"))).await;
+            assert_eq!(status, StatusCode::OK);
+            let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(got["name"], format!("{key} name"));
+            let (nf, _) = tdh::send(
+                app(&state, admin()),
+                tdh::get(format!("/{}", Uuid::new_v4())),
+            )
+            .await;
+            assert_eq!(nf, StatusCode::NOT_FOUND);
+
+            // List -> contains the created key.
+            let (status, bytes) = tdh::send(app(&state, admin()), tdh::get("/".into())).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["key"] == key.as_str()));
+
+            // Update (COALESCE): only description changes; name survives.
+            let (status, bytes) = tdh::send(
+                app(&state, admin()),
+                req("PUT", &format!("/{id}"), r#"{"description":"updated"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let upd: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(upd["description"], "updated");
+            assert_eq!(upd["name"], format!("{key} name"));
+            // Update of an unknown project -> 404.
+            let (nf, _) = tdh::send(
+                app(&state, admin()),
+                req("PUT", &format!("/{}", Uuid::new_v4()), r#"{"name":"x"}"#),
+            )
+            .await;
+            assert_eq!(nf, StatusCode::NOT_FOUND);
+
+            // Delete -> 200, then Get/Delete -> 404.
+            let (status, _) =
+                tdh::send(app(&state, admin()), req("DELETE", &format!("/{id}"), "")).await;
+            assert_eq!(status, StatusCode::OK);
+            let (gone, _) = tdh::send(app(&state, admin()), tdh::get(format!("/{id}"))).await;
+            assert_eq!(gone, StatusCode::NOT_FOUND);
+            let (gone, _) =
+                tdh::send(app(&state, admin()), req("DELETE", &format!("/{id}"), "")).await;
+            assert_eq!(gone, StatusCode::NOT_FOUND);
+
+            cleanup_project_rows(&pool, &key).await;
+        }
+
+        #[tokio::test]
+        async fn http_create_project_validation_branches() {
+            let Some((_pool, state)) = setup().await else {
+                return;
+            };
+            // Malformed JSON -> 400 (post-gate parse maps to Validation).
+            let (status, _) = tdh::send(app(&state, admin()), req("POST", "/", "{ not json")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            // Invalid key shape -> 400.
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req("POST", "/", r#"{"key":".bad","name":"x"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            // Malformed JSON on update -> 400.
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req("PUT", &format!("/{}", Uuid::new_v4()), "{ not json"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn http_member_grant_list_revoke_flow() {
+            let Some((pool, state)) = setup().await else {
+                return;
+            };
+            let key = format!("prj-http-mem-{}", Uuid::new_v4().simple());
+            let (_, created) = create_via_api(&state, &key).await;
+            let id = created["id"].as_str().expect("project id").to_string();
+            let user_id = Uuid::new_v4();
+            let group_id = Uuid::new_v4();
+
+            // Grant a user -> 200 with the row echoed.
+            let (status, bytes) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"user","principal_id":"{user_id}","actions":["read"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(row["actions"], serde_json::json!(["read"]));
+
+            // Re-grant with different actions -> upsert (ON CONFLICT DO UPDATE).
+            let (status, bytes) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"user","principal_id":"{user_id}","actions":["read","write"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(row["actions"], serde_json::json!(["read", "write"]));
+
+            // Grant a group too, then list -> exactly 2 grants.
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"group","principal_id":"{group_id}","actions":["read"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, bytes) =
+                tdh::send(app(&state, admin()), tdh::get(format!("/{id}/members"))).await;
+            assert_eq!(status, StatusCode::OK);
+            let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(list["items"].as_array().unwrap().len(), 2);
+
+            // Validation branches: bad principal / empty actions -> 400;
+            // unknown project -> 404 for grant + member list.
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"robot","principal_id":"{user_id}","actions":["read"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"user","principal_id":"{user_id}","actions":[]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let ghost = Uuid::new_v4();
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{ghost}/members"),
+                    &format!(
+                        r#"{{"principal_type":"user","principal_id":"{user_id}","actions":["read"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) =
+                tdh::send(app(&state, admin()), tdh::get(format!("/{ghost}/members"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            // Revoke the user grant -> 200; revoke again -> 404; list -> 1 left.
+            let revoke_body = format!(r#"{{"principal_type":"user","principal_id":"{user_id}"}}"#);
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req("DELETE", &format!("/{id}/members"), &revoke_body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req("DELETE", &format!("/{id}/members"), &revoke_body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (_, bytes) =
+                tdh::send(app(&state, admin()), tdh::get(format!("/{id}/members"))).await;
+            let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(list["items"].as_array().unwrap().len(), 1);
+
+            // Malformed revoke payload -> 400.
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req("DELETE", &format!("/{id}/members"), "{ not json"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            cleanup_project_rows(&pool, &key).await;
+        }
+
+        #[tokio::test]
+        async fn http_project_delete_unassigns_repos_and_removes_grants() {
+            let Some((pool, state)) = setup().await else {
+                return;
+            };
+            let key = format!("prj-http-del-{}", Uuid::new_v4().simple());
+            let (_, created) = create_via_api(&state, &key).await;
+            let id = created["id"].as_str().expect("project id").to_string();
+            let project_id: Uuid = id.parse().unwrap();
+
+            let (user_id, _) = tdh::create_user(&pool).await;
+            let (repo_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(repo_id)
+                .bind(project_id)
+                .execute(&pool)
+                .await
+                .expect("assign repo");
+            let (status, _) = tdh::send(
+                app(&state, admin()),
+                req(
+                    "POST",
+                    &format!("/{id}/members"),
+                    &format!(
+                        r#"{{"principal_type":"user","principal_id":"{user_id}","actions":["read"]}}"#
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+
+            // Delete the project through the handler (single tx: grants +
+            // project row; repos auto-unassign via ON DELETE SET NULL).
+            let (status, _) =
+                tdh::send(app(&state, admin()), req("DELETE", &format!("/{id}"), "")).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let repo_project: Option<Uuid> =
+                sqlx::query_scalar("SELECT project_id FROM repositories WHERE id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("repo row");
+            assert_eq!(repo_project, None, "repo must be auto-unassigned");
+            let grants: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM permissions \
+                 WHERE target_type = 'project' AND target_id = $1",
+            )
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("grant count");
+            assert_eq!(grants, 0, "project grants must be removed with the project");
+
+            tdh::cleanup(&pool, repo_id, user_id).await;
+            cleanup_project_rows(&pool, &key).await;
+        }
+
+        #[tokio::test]
+        async fn http_admin_and_scope_gates() {
+            let Some((_pool, state)) = setup().await else {
+                return;
+            };
+            // Non-admin user: every endpoint is 403 in P1.
+            let non_admin = tdh::make_auth(Uuid::new_v4(), "prj-http-user");
+            let (status, _) = tdh::send(app(&state, non_admin.clone()), tdh::get("/".into())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, _) = tdh::send(
+                app(&state, non_admin.clone()),
+                req("POST", "/", r#"{"key":"x","name":"x"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, _) = tdh::send(
+                app(&state, non_admin),
+                req("DELETE", &format!("/{}", Uuid::new_v4()), ""),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            // Admin identity behind a READ-scoped API token: scope gate wins
+            // on mutations (403 before any parse/DB write).
+            let read_scope_admin = AuthExtension {
+                is_api_token: true,
+                is_service_account: true,
+                scopes: Some(vec!["read".to_string()]),
+                ..tdh::admin_auth(Uuid::new_v4(), "prj-http-ro-admin")
+            };
+            let (status, _) = tdh::send(
+                app(&state, read_scope_admin.clone()),
+                req("POST", "/", r#"{"key":"x","name":"x"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, _) = tdh::send(
+                app(&state, read_scope_admin),
+                req("DELETE", &format!("/{}", Uuid::new_v4()), ""),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+
+            // Anonymous -> 401 from the in-handler require_auth.
+            let (status, _) = tdh::send(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get("/".into()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
 }
