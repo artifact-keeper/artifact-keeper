@@ -123,5 +123,46 @@ INSTALLED_CONTENT=$(cat "/opt/$PKG_NAME/test-file.txt" 2>/dev/null) || fail "Ins
 echo "$INSTALLED_CONTENT" | grep -q "$TEST_VERSION" || fail "Version mismatch in installed file"
 log "Installed file content verified"
 
+# ---------------------------------------------------------------------------
+# Remote-proxy variant (#2459 regression guard): a Remote debian repo whose
+# upstream is the signed hosted repo above must still serve apt metadata and
+# packages through the proxy. This exercises the Tier A signed-Release
+# integrity check (which must pass for honest, matching content) and the
+# Tier B pool-download cache-key gating without breaking a well-formed remote.
+# ---------------------------------------------------------------------------
+REMOTE_KEY="e2e-debian-remote-$(date +%s)"
+UPSTREAM_URL="$BACKEND_URL/debian/$REPO_KEY"
+log "Creating Remote debian repo $REMOTE_KEY -> $UPSTREAM_URL"
+REMOTE_CODE=$(curl -s -o /tmp/remote-repo.json -w "%{http_code}" -X POST \
+    "$BACKEND_URL/api/v1/repositories" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"key\":\"$REMOTE_KEY\",\"name\":\"E2E $REMOTE_KEY\",\"format\":\"debian\",\"repo_type\":\"remote\",\"upstream_url\":\"$UPSTREAM_URL\",\"is_public\":true}")
+[ "$REMOTE_CODE" = "200" ] || [ "$REMOTE_CODE" = "201" ] \
+    || fail "Failed to create remote debian repo (HTTP $REMOTE_CODE): $(cat /tmp/remote-repo.json)"
+log "Remote repo created ($REMOTE_CODE)"
+
+log "Adding apt source for the remote proxy (signed-by same key)..."
+echo "deb [signed-by=/etc/apt/keyrings/e2e-registry.gpg] $BACKEND_URL/debian/$REMOTE_KEY stable main" \
+    > /etc/apt/sources.list.d/e2e-remote.list
+# Isolate to the remote source so the fetch is provably through the proxy.
+mv /etc/apt/sources.list.d/e2e-registry.list /tmp/e2e-registry.list.bak
+
+log "apt-get update through the remote proxy..."
+apt-get update 2>&1 | tail -10
+apt-cache show "$PKG_NAME" 2>&1 | grep -q "Package: $PKG_NAME" \
+    || fail "remote proxy did not serve a verified Packages index for $PKG_NAME"
+
+log "Downloading $PKG_NAME through the remote pool proxy..."
+REMOTE_DL_DIR="$(mktemp -d)"
+( cd "$REMOTE_DL_DIR" && apt-get download "$PKG_NAME" ) 2>&1 || fail "apt-get download via remote proxy failed"
+[ -n "$(find "$REMOTE_DL_DIR" -name '*.deb' | head -1)" ] \
+    || fail "remote pool proxy produced no .deb"
+log "Remote-proxy Packages + pool download verified"
+
+# Restore the hosted source for any later stages.
+mv /tmp/e2e-registry.list.bak /etc/apt/sources.list.d/e2e-registry.list
+rm -rf "$REMOTE_DL_DIR"
+
 echo ""
 echo "=== Debian/APT E2E test PASSED ==="
