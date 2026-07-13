@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-07-13
+
+Data-fidelity hotfix: Docker/OCI repositories imported via the Nexus/Artifactory migration are now correctly registered in the container registry index, so migrated images are pullable. Includes an automatic one-time repair on upgrade for already-migrated repositories.
+
+### Fixed
+
+- **Migrated Docker/OCI images are now pullable** (#2457): the migration path stored manifest and blob bytes but never registered them in the OCI registry index (`oci_tags` / `oci_blobs` / manifest refs), so a completed migration reported success and the images showed in the UI and download API, yet `docker pull` returned `MANIFEST_UNKNOWN` (only natively-pushed tags were pullable). Migrated Docker/OCI manifests and blobs are now registered through the same path a native `docker push` uses — correct `oci-manifests`/`oci-blobs` storage layout, media-type-faithful manifests, single- and multi-arch — so migrated tags resolve over the Registry V2 API. On upgrade, a one-time background repair automatically re-registers already-migrated Docker/OCI repositories from their stored bytes, so affected installs recover without re-migrating.
+
 ## [1.5.4] - 2026-07-13
 
 Security hotfix: closes a critical SAML XML Signature Wrapping (XSW) authentication bypass (CWE-347) where an authenticated SSO user could escalate to platform administrator by attaching attacker-controlled, unsigned claims to their own validly-signed SAML response. Found and confirmed closed by red-team across successive adversarial passes.
