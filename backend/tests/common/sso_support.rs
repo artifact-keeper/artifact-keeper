@@ -396,6 +396,16 @@ impl SamlResponseSpec {
                 )
             })
             .collect::<String>();
+        // Emit the `groups` attribute only when there are groups. A spec with
+        // `groups: vec![]` produces a signed assertion carrying NO groups
+        // attribute — the precondition for the attribute-injection variant,
+        // where an attacker splices a `groups` attribute outside the signed
+        // subtree.
+        let groups_attribute = if self.groups.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<saml:Attribute Name="groups">{group_values}</saml:Attribute>"#)
+        };
 
         format!(
             r##"<?xml version="1.0" encoding="UTF-8"?>
@@ -443,7 +453,7 @@ impl SamlResponseSpec {
             <saml:Attribute Name="displayName">
                 <saml:AttributeValue>{display_name}</saml:AttributeValue>
             </saml:Attribute>
-            <saml:Attribute Name="groups">{group_values}</saml:Attribute>
+            {groups_attribute}
         </saml:AttributeStatement>
     </saml:Assertion>
 </samlp:Response>"##,
@@ -459,6 +469,194 @@ impl SamlResponseSpec {
     /// `SAMLResponse` form value the ACS endpoint consumes.
     pub fn signed_b64(&self) -> String {
         base64_standard(sign_saml_document(&self.to_unsigned_xml()).as_bytes())
+    }
+
+    /// Build the XML Signature Wrapping (XSW) attack payload (#2449) and
+    /// base64-encode it for the `SAMLResponse` form field.
+    ///
+    /// The legitimate, single signed assertion in `self` is signed normally,
+    /// then a SECOND, UNSIGNED `<saml:Assertion>` is spliced in immediately
+    /// before the closing `</samlp:Response>`. That injected assertion carries
+    /// attacker-controlled `attacker_groups` (e.g. the provider `admin_group`)
+    /// and the given `attacker_name_id`. Because the historical parser was
+    /// last-wins over `<Assertion>`, the *unsigned* assertion is the one that
+    /// would be consumed while the signature still verifies over the benign
+    /// one — the escalation. When `dup_id` is set, the injected assertion
+    /// reuses the signed assertion's ID (the duplicate-ID XSW variant).
+    pub fn xsw_wrapped_b64(
+        &self,
+        attacker_name_id: &str,
+        attacker_groups: &[&str],
+        dup_id: bool,
+    ) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+
+        // Recover the signed assertion's ID so the dup-ID variant can reuse it.
+        let signed_assertion_id = signed
+            .split("<saml:Assertion ID=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("_signed")
+            .to_string();
+        let injected_id = if dup_id {
+            signed_assertion_id
+        } else {
+            format!("_xsw{}", Uuid::new_v4().as_simple())
+        };
+
+        let now = chrono::Utc::now();
+        let issue_instant = now.format("%Y-%m-%dT%H:%M:%SZ");
+        let not_before = (now - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
+        let not_on_or_after = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
+        let group_values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+
+        let injected = format!(
+            r##"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{injected_id}" Version="2.0" IssueInstant="{issue_instant}">
+        <saml:Issuer>{issuer}</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">{name_id}</saml:NameID>
+            <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                <saml:SubjectConfirmationData NotOnOrAfter="{not_on_or_after}"/>
+            </saml:SubjectConfirmation>
+        </saml:Subject>
+        <saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_on_or_after}">
+            <saml:AudienceRestriction>
+                <saml:Audience>{audience}</saml:Audience>
+            </saml:AudienceRestriction>
+        </saml:Conditions>
+        <saml:AuthnStatement AuthnInstant="{issue_instant}"/>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="email">
+                <saml:AttributeValue>{name_id}@attacker.test</saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Attribute Name="groups">{group_values}</saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>"##,
+            issuer = xml_escape(&self.issuer),
+            audience = xml_escape(&self.audience),
+            name_id = xml_escape(attacker_name_id),
+        );
+
+        let wrapped = signed.replacen(
+            "</samlp:Response>",
+            &format!("{injected}\n</samlp:Response>"),
+            1,
+        );
+        base64_standard(wrapped.as_bytes())
+    }
+
+    /// Attribute-injection XSW variant (#2453 layer-2): the assertion is signed
+    /// normally, then a `<saml:Attribute Name="groups">` carrying
+    /// `attacker_groups` is spliced in as a child of `<samlp:Response>` —
+    /// OUTSIDE the signed `<saml:Assertion>` subtree — either before or after
+    /// the assertion. The assertion's digest is unchanged, so the signature
+    /// still verifies; a parser that harvests claims whole-document (rather than
+    /// scoping to the signed assertion) would consume the injected groups.
+    ///
+    /// Pair with `SamlResponseSpec { groups: vec![], .. }` so the signed
+    /// assertion carries no groups attribute of its own.
+    pub fn attribute_xsw_b64(&self, attacker_groups: &[&str], before_assertion: bool) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+        let injected = format!(
+            r#"<saml:Attribute xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Name="groups">{values}</saml:Attribute>"#
+        );
+        let wrapped = if before_assertion {
+            signed.replacen(
+                "<saml:Assertion ",
+                &format!("{injected}\n    <saml:Assertion "),
+                1,
+            )
+        } else {
+            signed.replacen(
+                "</saml:Assertion>",
+                &format!("</saml:Assertion>\n    {injected}"),
+                1,
+            )
+        };
+        base64_standard(wrapped.as_bytes())
+    }
+
+    /// Comment-splitting variant (#2453 layer-2 / Case-5): the assertion is
+    /// signed normally, then an XML comment is injected INTO the signed NameID
+    /// text, splitting it before its last `-`-delimited segment
+    /// (`victim-prefix-<!--c-->suffix`). Because the signature uses
+    /// exclusive-c14n#(no-comments), the comment is stripped before digesting
+    /// and the signature still verifies; a last-wins parser would keep only the
+    /// trailing text node (`suffix`), whereas the canonical value is the full
+    /// concatenation.
+    pub fn nameid_comment_b64(&self) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let escaped = xml_escape(&self.name_id);
+        // Split before the last `-`-delimited segment; fall back to the midpoint
+        // (on a char boundary) when there is no `-`.
+        let split = escaped.rfind('-').map(|i| i + 1).unwrap_or_else(|| {
+            let mut m = escaped.len() / 2;
+            while m < escaped.len() && !escaped.is_char_boundary(m) {
+                m += 1;
+            }
+            m
+        });
+        let (first_half, second_half) = escaped.split_at(split);
+        let wrapped = signed.replacen(
+            &format!("{escaped}</saml:NameID>"),
+            &format!("{first_half}<!--c-->{second_half}</saml:NameID>"),
+            1,
+        );
+        base64_standard(wrapped.as_bytes())
+    }
+
+    /// In-`<ds:Signature>` `<ds:Object>` claim-injection variant (#2453 layer-3):
+    /// the assertion is signed normally with NO groups of its own, then a
+    /// `<saml:Attribute Name="groups">` carrying `attacker_groups` is spliced
+    /// into a `<ds:Object>` INSIDE the assertion's own `<ds:Signature>` — AFTER
+    /// signing. The enveloped-signature transform removes the entire
+    /// `<ds:Signature>` element before the digest is computed, and the injected
+    /// `<ds:Object>` is not referenced by any `<ds:Reference>`, so it is not
+    /// covered by the signature and verification still passes. Because the
+    /// `<ds:Signature>` is a CHILD of `<saml:Assertion>`, a parser that scopes
+    /// claims to the assertion subtree but does NOT exclude the transform-removed
+    /// `<ds:Signature>` subtree would harvest the injected groups as an
+    /// in-assertion claim.
+    ///
+    /// Pair with `SamlResponseSpec { groups: vec![], .. }` so the signed
+    /// assertion carries no groups attribute of its own.
+    pub fn ds_object_groups_injection_b64(&self, attacker_groups: &[&str]) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+        let injected = format!(
+            r#"<ds:Object><saml:Attribute xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Name="groups">{values}</saml:Attribute></ds:Object>"#
+        );
+        // Splice the `<ds:Object>` just before the enveloped signature closes,
+        // inside the assertion's own `<ds:Signature>`. Adding a sibling of
+        // `<ds:SignedInfo>` does not change `<ds:SignedInfo>`, so the
+        // `<ds:SignatureValue>` still verifies.
+        let wrapped = signed.replacen("</ds:Signature>", &format!("{injected}</ds:Signature>"), 1);
+        base64_standard(wrapped.as_bytes())
     }
 }
 

@@ -648,3 +648,277 @@ async fn test_saml_login_then_acs_full_flow() {
     delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;
 }
+
+/// XML Signature Wrapping (XSW) escalation (#2449): a response with the legit,
+/// benign, single signed assertion PLUS an appended UNSIGNED second assertion
+/// whose `groups` include the provider `admin_group`. Pre-fix the last-wins
+/// parser consumed the unsigned assertion (307 + admin). Post-fix the parser
+/// rejects any multi-assertion response outright → 401, and NO user (admin or
+/// otherwise) is provisioned for the attacker NameID.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_xsw_dual_assertion_rejected() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    // Benign, correctly-signed assertion for a normal user (non-admin groups).
+    let victim = format!("saml-xsw-victim-{}", Uuid::new_v4().as_simple());
+    let attacker = format!("saml-xsw-attacker-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let spec = happy_spec(&request_id, &victim);
+
+    // Splice an UNSIGNED assertion (attacker NameID, groups=[ak-admins]) after
+    // the signed one.
+    let payload = spec.xsw_wrapped_b64(&attacker, &["ak-admins", "Developers"], false);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an XSW dual-assertion response must be rejected (was 307 + admin escalation)"
+    );
+
+    // Neither the smuggled attacker identity nor the wrapped victim may be
+    // provisioned, and specifically no admin user is created.
+    assert!(
+        get_saml_user(&pool, &attacker).await.is_none(),
+        "the smuggled (unsigned) assertion must NOT provision a user — this is the escalation"
+    );
+    assert!(
+        get_saml_user(&pool, &victim).await.is_none(),
+        "the wrapped response must be rejected wholesale; no user provisioned"
+    );
+
+    delete_saml_user(&pool, &attacker).await;
+    delete_saml_user(&pool, &victim).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Duplicate-ID XSW variant (#2449): two assertions sharing the signed
+/// assertion's ID — the second unsigned one carrying the admin group. Rejected
+/// (multi-assertion) → 401, no admin user provisioned.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_xsw_duplicate_id_rejected() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let victim = format!("saml-xswdup-victim-{}", Uuid::new_v4().as_simple());
+    let attacker = format!("saml-xswdup-attacker-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let spec = happy_spec(&request_id, &victim);
+
+    // dup_id = true → the injected unsigned assertion reuses the signed ID.
+    let payload = spec.xsw_wrapped_b64(&attacker, &["ak-admins"], true);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a duplicate-ID XSW response must be rejected"
+    );
+    assert!(get_saml_user(&pool, &attacker).await.is_none());
+    assert!(get_saml_user(&pool, &victim).await.is_none());
+
+    delete_saml_user(&pool, &attacker).await;
+    delete_saml_user(&pool, &victim).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Attribute-injection XSW variant (#2453 layer-2): the assertion is validly
+/// signed but carries NO groups attribute; a `<saml:Attribute Name="groups">`
+/// with the provider admin group is spliced in as a `<samlp:Response>` child
+/// BEFORE the signed `<saml:Assertion>`. The splice is outside the signed
+/// subtree so the signature still verifies (single assertion → no multi-assert
+/// reject), but claims are now scoped to the verified assertion, so the injected
+/// group must NOT grant admin. Login succeeds (307) as a non-admin.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_xsw_attribute_before_assertion_not_admin() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let name_id = format!("saml-attrxsw-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![]; // signed assertion carries no groups attribute
+
+    let payload = spec.attribute_xsw_b64(&["ak-admins"], true);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a valid signature with an out-of-subtree attribute must still authenticate"
+    );
+    let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the signed subject must still provision");
+    assert!(
+        !is_admin,
+        "a groups attribute spliced BEFORE the signed assertion must NOT grant admin"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Control for the attribute-injection variant: the same `groups` attribute
+/// spliced AFTER `</saml:Assertion>` (still a `<Response>` child, still outside
+/// the signed subtree) likewise must not grant admin.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_xsw_attribute_after_assertion_not_admin() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let name_id = format!("saml-attrxsw-after-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![];
+
+    let payload = spec.attribute_xsw_b64(&["ak-admins"], false);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the signed subject must still provision");
+    assert!(
+        !is_admin,
+        "a groups attribute spliced AFTER the signed assertion must NOT grant admin"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// In-`<ds:Signature>` `<ds:Object>` injection variant (#2453 layer-3): the
+/// assertion is validly signed but carries NO groups attribute; a
+/// `<saml:Attribute Name="groups">` with the provider admin group is spliced
+/// into a `<ds:Object>` INSIDE the assertion's enveloped `<ds:Signature>` after
+/// signing. The signature transform removes the whole `<ds:Signature>` before
+/// digesting, so the injection is unsigned and the signature still verifies —
+/// but the `<ds:Signature>` is a child of the assertion, so a parser that scopes
+/// claims to the assertion subtree WITHOUT excluding the Signature subtree would
+/// harvest the injected group. Login must succeed (307) as a NON-admin.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_ds_object_groups_injection_not_admin() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let name_id = format!("saml-dsobjxsw-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![]; // signed assertion carries no groups attribute
+
+    let payload = spec.ds_object_groups_injection_b64(&["ak-admins"]);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a valid signature with an in-<ds:Signature> <ds:Object> attribute must still authenticate"
+    );
+    let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the signed subject must still provision");
+    assert!(
+        !is_admin,
+        "a groups attribute spliced into a <ds:Object> inside the assertion's \
+         <ds:Signature> must NOT grant admin"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Comment-split NameID variant (#2453 layer-2 / Case-5): the signed NameID text
+/// is split by an XML comment (`victim-prefix-<!--c-->suffix`). exc-c14n#
+/// (no-comments) strips the comment before digesting, so the signature stays
+/// valid. The parser now accumulates leaf text across the comment, so the
+/// provisioned `external_id` is the FULL signed NameID — not the trailing
+/// segment a last-wins parser would have stored.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_comment_split_nameid_uses_full_value() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+
+    let name_id = format!("victim-prefix-suffix-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let spec = happy_spec(&request_id, &name_id);
+
+    let payload = spec.nameid_comment_b64();
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a comment-split (but validly signed) NameID must authenticate"
+    );
+
+    // The provisioned user is keyed on the FULL NameID value.
+    assert!(
+        get_saml_user(&pool, &name_id).await.is_some(),
+        "the provisioned external_id must equal the full signed NameID"
+    );
+    // A last-wins parser would have stored only the trailing text node; assert
+    // no user exists under that truncated value.
+    let truncated = name_id.rsplit('-').next().unwrap();
+    assert!(
+        get_saml_user(&pool, truncated).await.is_none(),
+        "no user may be provisioned under the truncated (trailing-segment) NameID"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}

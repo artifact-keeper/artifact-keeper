@@ -4,6 +4,7 @@
 //! Okta, Azure AD, ADFS, Shibboleth, etc.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use quick_xml::escape::unescape;
@@ -230,14 +231,62 @@ fn acs_urls_match(expected: &str, asserted: &str) -> bool {
     expected.trim_end_matches('/') == asserted.trim_end_matches('/')
 }
 
+/// Decide whether the assertion AK will actually consume is cryptographically
+/// covered by a verified XML-DSig signature — the core defense against XML
+/// Signature Wrapping (XSW).
+///
+/// `signed_ids` is the set of `ID` strings whose digest `bergshamra` actually
+/// verified on the `VerifyResult::Valid` path (each `<Reference URI>` with its
+/// leading `#` stripped; empty and `cid:` URIs excluded — see
+/// [`SamlService::validate_response`]). We accept the consumed assertion when
+/// either:
+///   * the signature directly covers the assertion element (`assertion_id` is
+///     signed) — AK's own assertion-level signing posture; or
+///   * the signature covers the enclosing `<Response>` (`response_id` is
+///     signed) — the Response-level signing that ADFS / Azure AD emit.
+///
+/// Both forms are legitimate, so we must not collapse to assertion-only signing
+/// or we would break those IdPs. An empty `signed_ids` (nothing verified)
+/// always returns `false`, so an unsigned or unbound assertion can never be
+/// consumed. Binding is by ID *string* (not tree position): `bergshamra`
+/// rejects documents with duplicate IDs on the `Valid` path, so a signed ID is
+/// unambiguous.
+fn consumed_assertion_is_signed(
+    assertion_id: &str,
+    response_id: &str,
+    signed_ids: &HashSet<String>,
+) -> bool {
+    signed_ids.contains(assertion_id) || signed_ids.contains(response_id)
+}
+
 /// Mutable state used while walking a SAML response XML document.
 struct SamlResponseParser {
     response: SamlResponse,
     assertion: SamlAssertion,
     current_element: String,
     in_assertion: bool,
+    /// Depth of the current `<ds:Signature>` subtree. The enveloped signature is
+    /// a CHILD of `<saml:Assertion>`, but the enveloped-signature transform
+    /// removes the entire `<ds:Signature>` element before the digest is computed,
+    /// so nothing inside it is covered by the signature. A depth counter (not a
+    /// bool) keeps nested/decoy `<Signature>` elements from underflowing the
+    /// guard. Claim harvesting is suppressed while this is `> 0` so an attacker
+    /// cannot splice a claim into an unsigned `<ds:Object>` and have it consumed.
+    in_signature_depth: u32,
     current_attr_name: Option<String>,
     current_attr_values: Vec<String>,
+    /// Number of `<saml:Assertion>` elements seen. AK only ever consumes a
+    /// single assertion (`response.assertion: Option<..>`, last-wins), so a
+    /// Response carrying more than one is rejected at parse time — this removes
+    /// the "second assertion to smuggle" precondition for XML Signature
+    /// Wrapping and applies even on the no-certificate dev path.
+    assertion_count: usize,
+    /// Text accumulated for the current leaf element, committed on its `End`.
+    /// Accumulating (rather than last-wins on each `Text` event) canonicalises
+    /// a signed value an attacker split across two text nodes with an
+    /// intervening comment — `foo<!--c-->bar` yields `foobar`, matching the
+    /// exclusive-c14n#(no-comments) view under which the signature was verified.
+    current_text: String,
 }
 
 impl SamlResponseParser {
@@ -266,8 +315,11 @@ impl SamlResponseParser {
             },
             current_element: String::new(),
             in_assertion: false,
+            in_signature_depth: 0,
             current_attr_name: None,
             current_attr_values: Vec::new(),
+            assertion_count: 0,
+            current_text: String::new(),
         }
     }
 
@@ -275,6 +327,18 @@ impl SamlResponseParser {
     fn handle_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
         self.current_element = name.clone();
+        // Start of a new element: reset the leaf-text accumulator so each
+        // element's text is committed fresh on its own `End`.
+        self.current_text.clear();
+
+        // Enter a `<ds:Signature>` subtree (namespace-agnostic local name). The
+        // signature transform strips this element before the digest, so anything
+        // inside it is unsigned and must not be harvested as a claim. Tracked
+        // regardless of `in_assertion` — guarding a response-level Signature too
+        // is harmless.
+        if name == "Signature" {
+            self.in_signature_depth += 1;
+        }
 
         match name.as_str() {
             "Response" => self.handle_response_start(e),
@@ -312,14 +376,12 @@ impl SamlResponseParser {
             return;
         }
 
-        match self.current_element.as_str() {
-            "Issuer" => self.handle_issuer_text(text),
-            "NameID" => self.assertion.name_id = text,
-            "Audience" => self.assertion.audiences.push(text),
-            "AttributeValue" => self.current_attr_values.push(text),
-            "StatusMessage" => self.response.status_message = Some(text),
-            _ => {}
-        }
+        // Accumulate rather than commit here: a comment splitting a signed value
+        // into two text nodes (`foo<!--c-->bar`) arrives as two `Text` events
+        // with no intervening `Start`, so both segments concatenate into the
+        // canonical value. The accumulated text is committed on the element's
+        // `End`. Comments are `Event::Comment` and never reach this method.
+        self.current_text.push_str(&text);
     }
 
     /// Handle an `Event::End` element.
@@ -330,13 +392,53 @@ impl SamlResponseParser {
                 self.in_assertion = false;
                 self.response.assertion = Some(self.assertion.clone());
             }
+            // Leave the `<ds:Signature>` subtree (namespace-agnostic local name).
+            // `saturating_sub` keeps a stray/decoy `</Signature>` from underflowing
+            // the guard below `0`.
+            "Signature" => {
+                self.in_signature_depth = self.in_signature_depth.saturating_sub(1);
+            }
+            // Text commits happen here (on `End`) from the accumulator. Every
+            // assertion-scoped claim is gated on `self.claims_active()` so a claim
+            // element spliced outside the verified `<Assertion>` subtree (e.g. a
+            // sibling of `<Assertion>` under `<Response>`) — or inside the
+            // transform-removed `<ds:Signature>` subtree — is never consumed.
+            "Issuer" => {
+                let text = std::mem::take(&mut self.current_text);
+                self.handle_issuer_text(text);
+            }
+            "NameID" => {
+                if self.claims_active() && !self.current_text.is_empty() {
+                    self.assertion.name_id = std::mem::take(&mut self.current_text);
+                }
+            }
+            "Audience" => {
+                if self.claims_active() && !self.current_text.is_empty() {
+                    self.assertion
+                        .audiences
+                        .push(std::mem::take(&mut self.current_text));
+                }
+            }
+            "AttributeValue" => {
+                if self.claims_active() && !self.current_text.is_empty() {
+                    self.current_attr_values
+                        .push(std::mem::take(&mut self.current_text));
+                }
+            }
+            "StatusMessage" => {
+                if !self.current_text.is_empty() {
+                    self.response.status_message = Some(std::mem::take(&mut self.current_text));
+                }
+            }
             "Attribute" => {
                 if let Some(attr_name) = self.current_attr_name.take() {
-                    self.assertion
-                        .attributes
-                        .insert(attr_name, self.current_attr_values.clone());
-                    self.current_attr_values.clear();
+                    if self.claims_active() {
+                        self.assertion
+                            .attributes
+                            .insert(attr_name, self.current_attr_values.clone());
+                    }
                 }
+                self.current_attr_values.clear();
             }
             _ => {}
         }
@@ -358,14 +460,26 @@ impl SamlResponseParser {
     /// `<SubjectConfirmationData>` carries the `Recipient` attribute — the ACS
     /// URL the IdP asserts this assertion was minted for. Captured here and
     /// bound against the SP's own ACS URL in `validate_response`.
+    /// A claim may be consumed only inside the signed `<Assertion>` subtree AND
+    /// outside any `<ds:Signature>` subtree. The enveloped signature (a child of
+    /// the assertion) is transform-removed before the digest, so its contents are
+    /// unsigned even though `in_assertion` is still true there — this excludes an
+    /// in-`<ds:Signature>` `<ds:Object>` claim-injection path.
+    fn claims_active(&self) -> bool {
+        self.in_assertion && self.in_signature_depth == 0
+    }
+
     fn handle_subject_confirmation_data(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(recipient) = get_xml_attr(e, "Recipient") {
-            self.assertion.recipient = Some(recipient);
+        if self.claims_active() {
+            if let Some(recipient) = get_xml_attr(e, "Recipient") {
+                self.assertion.recipient = Some(recipient);
+            }
         }
     }
 
     fn handle_assertion_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
         self.in_assertion = true;
+        self.assertion_count += 1;
         if let Some(id) = get_xml_attr(e, "ID") {
             self.assertion.id = id;
         }
@@ -378,31 +492,39 @@ impl SamlResponseParser {
     }
 
     fn handle_name_id_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(format) = get_xml_attr(e, "Format") {
-            self.assertion.name_id_format = Some(format);
+        if self.claims_active() {
+            if let Some(format) = get_xml_attr(e, "Format") {
+                self.assertion.name_id_format = Some(format);
+            }
         }
     }
 
     fn handle_conditions_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        for (key, value) in collect_xml_attrs(e) {
-            match key.as_str() {
-                "NotBefore" => self.assertion.not_before = Some(value),
-                "NotOnOrAfter" => self.assertion.not_on_or_after = Some(value),
-                _ => {}
+        if self.claims_active() {
+            for (key, value) in collect_xml_attrs(e) {
+                match key.as_str() {
+                    "NotBefore" => self.assertion.not_before = Some(value),
+                    "NotOnOrAfter" => self.assertion.not_on_or_after = Some(value),
+                    _ => {}
+                }
             }
         }
     }
 
     fn handle_authn_statement(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(session_index) = get_xml_attr(e, "SessionIndex") {
-            self.assertion.session_index = Some(session_index);
+        if self.claims_active() {
+            if let Some(session_index) = get_xml_attr(e, "SessionIndex") {
+                self.assertion.session_index = Some(session_index);
+            }
         }
     }
 
     fn handle_attribute_start(&mut self, e: &quick_xml::events::BytesStart<'_>) {
-        if let Some(name) = get_xml_attr(e, "Name") {
-            self.current_attr_name = Some(name);
-            self.current_attr_values.clear();
+        if self.claims_active() {
+            if let Some(name) = get_xml_attr(e, "Name") {
+                self.current_attr_name = Some(name);
+                self.current_attr_values.clear();
+            }
         }
     }
 
@@ -636,6 +758,22 @@ impl SamlService {
             buf.clear();
         }
 
+        // Structural XML Signature Wrapping (XSW) defense: reject any Response
+        // carrying more than one `<saml:Assertion>`. AK only ever consumes a
+        // single assertion, and the parser is last-wins, so a second assertion
+        // exists only to smuggle attacker-controlled claims (e.g. an admin
+        // group) past a signature that covers a different, benign assertion.
+        // Enforced unconditionally at parse time so it also guards the no-cert
+        // dev path where `validate_response` skips signature verification.
+        if parser.assertion_count > 1 {
+            return Err(AppError::Authentication(format!(
+                "SAML response contains {} assertions; only a single assertion is \
+                 supported (multi-assertion responses are rejected to prevent XML \
+                 signature wrapping)",
+                parser.assertion_count
+            )));
+        }
+
         Ok(parser.finish())
     }
 
@@ -742,8 +880,45 @@ impl SamlService {
             ctx.trusted_keys_only = true;
 
             match bergshamra::verify(&ctx, xml) {
-                Ok(bergshamra::VerifyResult::Valid { .. }) => {
-                    tracing::debug!("SAML response signature verified successfully");
+                Ok(bergshamra::VerifyResult::Valid { references, .. }) => {
+                    // The signature is cryptographically valid, but that alone
+                    // does not say *which* element it covers. Build the set of
+                    // IDs whose digest was actually verified and require the
+                    // assertion AK will consume to be among them (or the
+                    // enclosing Response, for Response-level signers). Without
+                    // this, an XSW attacker can present a valid signature over a
+                    // benign assertion while the parser consumes a different,
+                    // unsigned one — the core of the escalation. `bergshamra`
+                    // parses its own tree, so bind by ID *string* (safe: the
+                    // `Valid` path rejects duplicate IDs document-wide).
+                    let signed_ids: HashSet<String> = references
+                        .iter()
+                        .filter(|r| r.digest_verified)
+                        .filter_map(|r| {
+                            let id = r.uri.strip_prefix('#').unwrap_or(&r.uri);
+                            if id.is_empty() || id.starts_with("cid:") {
+                                None
+                            } else {
+                                Some(id.to_string())
+                            }
+                        })
+                        .collect();
+
+                    let assertion_id = response
+                        .assertion
+                        .as_ref()
+                        .map(|a| a.id.as_str())
+                        .unwrap_or("");
+                    if !consumed_assertion_is_signed(assertion_id, &response.id, &signed_ids) {
+                        return Err(AppError::Authentication(
+                            "SAML signature does not cover the consumed assertion \
+                             (possible XML signature wrapping)"
+                                .into(),
+                        ));
+                    }
+                    tracing::debug!(
+                        "SAML response signature verified and bound to the consumed assertion"
+                    );
                 }
                 Ok(bergshamra::VerifyResult::Invalid { reason }) => {
                     return Err(AppError::Authentication(format!(
@@ -1580,6 +1755,157 @@ mod tests {
         let response = service.parse_saml_response(xml).unwrap();
         assert_eq!(response.id, "_resp1");
         assert!(response.status_code.contains("Success"));
+    }
+
+    // =======================================================================
+    // XML Signature Wrapping (XSW) structural defense (#2449)
+    // =======================================================================
+
+    /// A `<Response>` carrying a single `<Assertion>` parses successfully and
+    /// that assertion is the one consumed.
+    #[tokio::test]
+    async fn test_parse_saml_response_single_assertion_ok() {
+        let service = make_test_saml_service();
+        let xml = sample_saml_response_xml();
+
+        let response = service.parse_saml_response(&xml).unwrap();
+        let assertion = response.assertion.expect("single assertion consumed");
+        assert_eq!(assertion.id, "_assertion789");
+    }
+
+    /// A `<Response>` carrying more than one `<Assertion>` is rejected at parse
+    /// time (the XSW precondition: a second, unsigned assertion smuggled in to
+    /// be consumed in place of the signed one). AK only ever consumes a single
+    /// assertion, so this is safe and unconditional.
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_multiple_assertions() {
+        let service = make_test_saml_service();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_resp_multi" Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_signed_benign" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID>benign@example.com</saml:NameID>
+        </saml:Subject>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>Developers</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+    <saml:Assertion ID="_unsigned_evil" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID>attacker@example.com</saml:NameID>
+        </saml:Subject>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+</samlp:Response>"#;
+
+        let result = service.parse_saml_response(xml);
+        assert!(
+            result.is_err(),
+            "a multi-assertion response must be rejected at parse time"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("single assertion") || err.contains("2 assertions"),
+            "rejection must name the multi-assertion cause, got: {err}"
+        );
+    }
+
+    /// A duplicate-ID variant (two assertions sharing the signed ID) is also a
+    /// multi-assertion response, so it is rejected by the same structural check
+    /// (defense-in-depth ahead of bergshamra's own duplicate-ID rejection).
+    #[tokio::test]
+    async fn test_parse_saml_response_rejects_duplicate_id_assertions() {
+        let service = make_test_saml_service();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_resp_dup" Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_shared" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject><saml:NameID>benign@example.com</saml:NameID></saml:Subject>
+    </saml:Assertion>
+    <saml:Assertion ID="_shared" Version="2.0">
+        <saml:Issuer>https://idp.example.com</saml:Issuer>
+        <saml:Subject><saml:NameID>attacker@example.com</saml:NameID></saml:Subject>
+    </saml:Assertion>
+</samlp:Response>"#;
+
+        assert!(
+            service.parse_saml_response(xml).is_err(),
+            "a duplicate-ID (two-assertion) response must be rejected at parse time"
+        );
+    }
+
+    /// The pure signature-binding helper: the consumed assertion is accepted
+    /// only when its ID (assertion-level signing) or the Response ID
+    /// (Response-level signing) is in the verified set.
+    #[test]
+    fn test_consumed_assertion_is_signed_assertion_level() {
+        let signed: HashSet<String> = ["_assertion789".to_string()].into_iter().collect();
+        assert!(consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_response_level() {
+        // ADFS / Azure AD sign the enclosing <Response>, not the assertion.
+        let signed: HashSet<String> = ["_resp1".to_string()].into_iter().collect();
+        assert!(consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_neither_covered() {
+        // The signature covers some *other* element (classic XSW) → reject.
+        let signed: HashSet<String> = ["_some_other_elem".to_string()].into_iter().collect();
+        assert!(!consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_empty_set() {
+        // Nothing verified (e.g. all references were empty/cid:) → reject.
+        let signed: HashSet<String> = HashSet::new();
+        assert!(!consumed_assertion_is_signed(
+            "_assertion789",
+            "_resp1",
+            &signed
+        ));
+    }
+
+    #[test]
+    fn test_consumed_assertion_is_signed_empty_ids_never_match() {
+        // Empty/cid: URIs are excluded from `signed_ids` upstream, so an empty
+        // assertion/response id can never be satisfied by a stray empty entry.
+        let signed: HashSet<String> = ["_assertion789".to_string()].into_iter().collect();
+        assert!(!consumed_assertion_is_signed("", "", &signed));
     }
 
     // =======================================================================
@@ -2981,12 +3307,16 @@ mod tests {
         let start = BytesStart::from_content(r#"Attribute Name="groups""#, 9);
         parser.handle_start(&start);
 
-        // Simulate AttributeValue text nodes
-        parser.current_element = "AttributeValue".to_string();
-        let text1 = quick_xml::events::BytesText::new("GroupA");
-        parser.handle_text(&text1);
-        let text2 = quick_xml::events::BytesText::new("GroupB");
-        parser.handle_text(&text2);
+        // Simulate two `<AttributeValue>` children: each value is accumulated
+        // between its Start and End and committed on End.
+        let av_start = BytesStart::from_content("AttributeValue", 14);
+        let av_end = BytesEnd::new("AttributeValue");
+        parser.handle_start(&av_start);
+        parser.handle_text(&quick_xml::events::BytesText::new("GroupA"));
+        parser.handle_end(&av_end);
+        parser.handle_start(&av_start);
+        parser.handle_text(&quick_xml::events::BytesText::new("GroupB"));
+        parser.handle_end(&av_end);
 
         // Close the Attribute element
         let end = BytesEnd::new("Attribute");
@@ -3021,6 +3351,248 @@ mod tests {
         let response = parser.finish();
         assert!(response.assertion.is_some());
         assert_eq!(response.assertion.as_ref().unwrap().id, "_test_end");
+    }
+
+    // --- Subtree-scoping (claims confined to the verified `<Assertion>`) ---
+
+    /// A `<saml:Attribute Name="groups">` spliced as a sibling of the assertion
+    /// (BEFORE it, directly under `<Response>`) must not be consumed: it is not
+    /// within the assertion the signature covers.
+    #[test]
+    fn test_parser_attribute_before_assertion_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert!(
+            !assertion.attributes.contains_key("groups"),
+            "attribute spliced before the assertion must not be consumed"
+        );
+        assert_eq!(assertion.name_id, "alice@example.com");
+    }
+
+    /// Control: the same splice AFTER the assertion (still a `<Response>` child)
+    /// is likewise outside the assertion subtree and must not be consumed.
+    #[test]
+    fn test_parser_attribute_after_assertion_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+            </saml:Attribute>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert!(
+            !assertion.attributes.contains_key("groups"),
+            "attribute spliced after the assertion must not be consumed"
+        );
+    }
+
+    /// A `<saml:NameID>` under `<Response>` before the assertion must not win
+    /// over the assertion's own NameID.
+    #[test]
+    fn test_parser_name_id_before_assertion_ignored() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:NameID>attacker@evil.com</saml:NameID>
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>victim@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "victim@example.com");
+    }
+
+    // --- Comment-split signed values canonicalise by concatenation ---
+
+    /// A comment splitting the NameID text (`foo<!--x-->bar`) yields the whole
+    /// value `foobar`, matching the exclusive-c14n#(no-comments) signed view.
+    #[test]
+    fn test_parser_name_id_comment_split_concatenates() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>foo<!--x-->bar</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "foobar");
+    }
+
+    /// The same for an `<AttributeValue>`: `ak-<!--x-->admins` is the single
+    /// value `ak-admins`, not the trailing `admins` segment.
+    #[test]
+    fn test_parser_attribute_value_comment_split_concatenates() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>ak-<!--x-->admins</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["ak-admins".to_string()]);
+    }
+
+    /// Sanity: NameID and a groups attribute genuinely inside the assertion are
+    /// still recorded (subtree scoping does not drop legitimate claims).
+    #[test]
+    fn test_parser_in_assertion_claims_still_recorded() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>developers</saml:AttributeValue>
+                        <saml:AttributeValue>ak-admins</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "alice@example.com");
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(
+            groups,
+            &vec!["developers".to_string(), "ak-admins".to_string()]
+        );
+    }
+
+    /// The enveloped `<ds:Signature>` is a CHILD of `<saml:Assertion>`, but the
+    /// signature transform removes it before the digest — so anything spliced into
+    /// a `<ds:Object>` inside it is unsigned. A `groups` attribute injected there
+    /// must NOT be harvested as a claim even though it is nominally "in assertion".
+    #[test]
+    fn test_parser_attribute_in_ds_signature_object_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <ds:Signature>
+                    <ds:SignedInfo/>
+                    <ds:SignatureValue>abc</ds:SignatureValue>
+                    <ds:Object>
+                        <saml:AttributeStatement>
+                            <saml:Attribute Name="groups">
+                                <saml:AttributeValue>ak-admins</saml:AttributeValue>
+                            </saml:Attribute>
+                        </saml:AttributeStatement>
+                    </ds:Object>
+                </ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        // The injected in-Signature groups attribute is NOT consumed.
+        assert!(!assertion.attributes.contains_key("groups"));
+        // The genuine, out-of-Signature NameID is still recorded.
+        assert_eq!(assertion.name_id, "alice@example.com");
+    }
+
+    /// A `<saml:NameID>` spliced inside the `<ds:Signature>` subtree is ignored;
+    /// the assertion's own NameID (outside the Signature) is what is recorded.
+    #[test]
+    fn test_parser_nameid_in_ds_signature_not_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <ds:Signature>
+                    <ds:Object>
+                        <saml:Subject>
+                            <saml:NameID>attacker@evil.com</saml:NameID>
+                        </saml:Subject>
+                    </ds:Object>
+                </ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "alice@example.com");
+    }
+
+    /// The depth counter decrements on `</ds:Signature>`: a claim placed AFTER the
+    /// Signature closes, but still inside the assertion, IS consumed (proves the
+    /// guard does not over-suppress legitimate post-Signature claims).
+    #[test]
+    fn test_parser_claims_after_signature_end_still_consumed() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <ds:Signature>
+                    <ds:SignedInfo/>
+                    <ds:SignatureValue>abc</ds:SignatureValue>
+                </ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>alice@example.com</saml:NameID>
+                </saml:Subject>
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>ak-admins</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.name_id, "alice@example.com");
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["ak-admins".to_string()]);
     }
 
     #[test]
