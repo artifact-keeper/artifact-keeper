@@ -862,20 +862,56 @@ fn is_matching_packages_index(cache_path: &str, component: &str, arch: &str) -> 
     matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz")
 }
 
+/// Ceiling on the *decompressed* size of a cached Packages index we will
+/// expand while resolving a pool `.deb`'s expected checksum (#2459 Tier B DoS
+/// guard). A signed Release can vouch for a small compressed index that passes
+/// Tier A (checksum + size ≤ the metadata cap) yet expands unbounded (>100x →
+/// multi-GiB) — capping the decode bounds worst-case memory. A stream that
+/// would exceed this is treated as "unresolvable" (returns `None`) so the pool
+/// download falls back to the Content-Length-gated cache commit; Tier B is
+/// best-effort and must never hard-fail the download.
+const MAX_DECOMPRESSED_INDEX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Skip decompressing a cached *compressed* index whose body is already this
+/// large. A legitimately-published Packages index compresses far smaller
+/// (tens of MiB for the largest suites), so this bounds the work before the
+/// decoder even starts and cheaply rejects an oversized bomb payload.
+const MAX_COMPRESSED_INDEX_BYTES: usize = 32 * 1024 * 1024;
+
 /// Decompress a cached Packages index body into text based on the cache
-/// path's extension (`.gz` / `.xz` / plain). Returns `None` on a decode error.
+/// path's extension (`.gz` / `.xz` / plain). Returns `None` on a decode error
+/// or when the input would exceed the decompression-bomb caps
+/// ([`MAX_COMPRESSED_INDEX_BYTES`] / [`MAX_DECOMPRESSED_INDEX_BYTES`]).
 fn decompress_packages_index(cache_path: &str, bytes: &[u8]) -> Option<String> {
+    let compressed = cache_path.ends_with(".gz") || cache_path.ends_with(".xz");
+    if compressed && bytes.len() > MAX_COMPRESSED_INDEX_BYTES {
+        return None;
+    }
     if cache_path.ends_with(".gz") {
-        let mut s = String::new();
-        GzDecoder::new(bytes).read_to_string(&mut s).ok()?;
-        Some(s)
+        read_index_capped(GzDecoder::new(bytes))
     } else if cache_path.ends_with(".xz") {
-        let mut s = String::new();
-        XzDecoder::new(bytes).read_to_string(&mut s).ok()?;
-        Some(s)
+        read_index_capped(XzDecoder::new(bytes))
     } else {
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
+}
+
+/// Read a decoder to completion, bounded at [`MAX_DECOMPRESSED_INDEX_BYTES`].
+/// Returns `None` on a decode error OR when the decompressed stream would
+/// exceed the cap (a decompression bomb), so the caller treats the index as
+/// unresolvable rather than expanding it into memory unbounded.
+fn read_index_capped<R: Read>(reader: R) -> Option<String> {
+    // Read one byte past the cap so a stream that exactly fills it but carries
+    // more data is still detected as over-limit.
+    let mut buf = Vec::new();
+    reader
+        .take(MAX_DECOMPRESSED_INDEX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_DECOMPRESSED_INDEX_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// Tier B resolver: find the SHA-256 the cached Packages index records for a
@@ -3848,5 +3884,61 @@ mod virtual_dists_cap_tests {
             "main",
             "amd64"
         ));
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzBuilder::new().write(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decompress_packages_index_honest_gz_and_xz() {
+        let body = b"Package: hello\nFilename: pool/main/h/hello/hello_1.0_amd64.deb\nSHA256: abc\nSize: 10\n";
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &gzip(body)),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.xz", &xz(body)),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+        // Plain (uncompressed) passes through unchanged.
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages", body),
+            Some(String::from_utf8(body.to_vec()).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_decompress_packages_index_bomb_hits_cap_returns_none() {
+        // A highly-compressible payload that expands past the decompressed cap.
+        // ~200 MiB of zeros compresses to a few hundred KiB but must NOT be
+        // expanded into memory — the cap returns None (unresolvable), no OOM.
+        let bomb = vec![0u8; (MAX_DECOMPRESSED_INDEX_BYTES as usize) + (16 * 1024 * 1024)];
+        let gz = gzip(&bomb);
+        assert!(
+            gz.len() <= MAX_COMPRESSED_INDEX_BYTES,
+            "test bomb should slip past the compressed-size pre-check to exercise the decode cap"
+        );
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &gz),
+            None
+        );
+    }
+
+    #[test]
+    fn test_decompress_packages_index_oversized_compressed_skipped() {
+        let too_big = vec![7u8; MAX_COMPRESSED_INDEX_BYTES + 1];
+        assert_eq!(
+            decompress_packages_index("dists/x/main/binary-amd64/Packages.gz", &too_big),
+            None
+        );
     }
 }
