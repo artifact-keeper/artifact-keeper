@@ -3658,18 +3658,23 @@ fn offline_access_type_from_query(offline_token: Option<&str>) -> Option<String>
     }
 }
 
-/// Exchange a refresh token for a fresh access token plus the rotated
-/// replacement refresh token (rotation is mandatory — see the comment on
-/// the response construction below). Per
-/// [the Docker Distribution OAuth2 spec](https://distribution.github.io/distribution/spec/auth/oauth/),
+/// Exchange a (reusable) offline refresh token for a fresh access token.
+/// Per [the Docker Distribution OAuth2 spec](https://distribution.github.io/distribution/spec/auth/oauth/),
 /// the refresh-grant request body is just `grant_type=refresh_token` +
 /// `refresh_token=…` with no credentials — the refresh token itself
-/// authenticates.
+/// authenticates — and the SAME offline token is presented every time the
+/// access token expires. This path therefore uses
+/// `auth_service::mint_access_from_registry_refresh` (non-rotating; #2477)
+/// rather than the interactive `refresh_tokens` rotation used by
+/// `POST /api/v1/auth/refresh`, whose single-use + replay-family-revocation
+/// semantics treated the daemon's expected reuse as an attack and revoked
+/// the family, failing every subsequent pull.
 ///
-/// `auth_service::refresh_tokens` filters `is_active = true` and consults
-/// `is_token_invalidated`, so any of (a) deactivated user, (b) password
-/// change since issue, (c) TOTP enable/disable since issue, will surface
-/// here as a 401.
+/// `mint_access_from_registry_refresh` still filters `is_active = true`,
+/// consults the credential-change watermark, and honors explicit
+/// `refresh_token_jti.revoked_at`, so any of (a) deactivated user,
+/// (b) password change since issue, (c) TOTP enable/disable since issue,
+/// (d) logout/admin family revocation, will surface here as a 401.
 async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response {
     let refresh = match form.refresh_token.as_deref() {
         Some(s) if !s.is_empty() => s,
@@ -3682,7 +3687,10 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
         }
     };
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = match auth_service.refresh_tokens(refresh).await {
+    let (_user, tokens) = match auth_service
+        .mint_access_from_registry_refresh(refresh)
+        .await
+    {
         Ok(pair) => pair,
         Err(_) => {
             return oci_error(
@@ -3697,14 +3705,11 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
     // suppression already prevented one being issued for an API-token
     // session.
     //
-    // The rotated refresh token is ALWAYS returned here, regardless of
-    // `access_type`. `auth_service::refresh_tokens` performs mandatory
-    // single-use rotation (#1174): the presented refresh token was just
-    // marked consumed and a replacement minted. Gating the replacement on
-    // `access_type=offline` (as the first-issuance path correctly does)
-    // would discard the only live refresh token — the client would retry
-    // with the consumed one, trip replay detection, and get its whole
-    // token family revoked.
+    // A refresh token is ALWAYS returned here, regardless of `access_type`,
+    // and it is the PRESENTED token unchanged
+    // (`mint_access_from_registry_refresh` does not rotate, #2477). Docker
+    // clients replace their stored offline token with whatever this field
+    // carries, so echoing the same token keeps their credential live.
     let resp = TokenResponse {
         token: tokens.access_token.clone(),
         access_token: tokens.access_token.clone(),
@@ -4040,15 +4045,44 @@ async fn token(
         );
     }
 
+    // Emit a REUSABLE, registry-marked offline refresh token (#2477/#2487)
+    // only when the client asked for one AND did not authenticate via an API
+    // token (see `offline_refresh_token` for the suppression rationale, which
+    // still governs the decision here). It is minted FRESH with
+    // `REGISTRY_REFRESH_TOKEN_TYPE` rather than echoing the web-shaped refresh
+    // token from `authenticate`, so it is usable only on this `/v2/token`
+    // path and can never be replayed against the interactive
+    // `/api/v1/auth/refresh` endpoint. Interactive auth is always
+    // unrestricted, so the offline token inherits no repo/scope ceiling here.
+    let refresh_token = if offline_refresh_token(
+        access_type.as_deref(),
+        authenticated_via_api_token,
+        &tokens.refresh_token,
+    )
+    .is_some()
+    {
+        match auth_service
+            .generate_registry_offline_token(&user, None, None)
+            .await
+        {
+            Ok(rt) => Some(rt),
+            Err(_) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "failed to generate tokens",
+                )
+            }
+        }
+    } else {
+        None
+    };
+
     let resp = TokenResponse {
         token: tokens.access_token.clone(),
         access_token: tokens.access_token.clone(),
         expires_in: tokens.expires_in,
-        refresh_token: offline_refresh_token(
-            access_type.as_deref(),
-            authenticated_via_api_token,
-            &tokens.refresh_token,
-        ),
+        refresh_token,
         issued_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -22470,13 +22504,13 @@ mod token_refresh_grant_tests {
     }
 
     /// Refresh-grant default (no `access_type`) → new access token AND the
-    /// rotated refresh token. `auth_service::refresh_tokens` consumes the
-    /// presented refresh token unconditionally (#1174), so the response must
-    /// always hand back the replacement — omitting it would strand the
-    /// client with a consumed token and trip replay detection on its next
-    /// refresh (see `refresh_grant_rotated_token_can_refresh_again`).
+    /// PRESENTED refresh token echoed back unchanged. The registry offline
+    /// token is reusable per the Distribution OAuth2 spec (#2477):
+    /// `mint_access_from_registry_refresh` neither consumes nor rotates it,
+    /// and the handler must return it so Docker clients that overwrite their
+    /// stored credential with the response field keep a live token.
     #[tokio::test]
-    async fn refresh_grant_default_returns_rotated_refresh_token() {
+    async fn refresh_grant_returns_presented_refresh_token_unrotated() {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
@@ -22505,24 +22539,21 @@ mod token_refresh_grant_tests {
         assert!(body["access_token"]
             .as_str()
             .is_some_and(|s| !s.is_empty() && s != "anonymous"));
-        let rotated = body["refresh_token"]
-            .as_str()
-            .expect("refresh-grant must return the rotated refresh token");
-        assert_ne!(
-            rotated, refresh,
-            "returned refresh token must be the rotated replacement, not the consumed original"
+        assert_eq!(
+            body["refresh_token"].as_str(),
+            Some(refresh.as_str()),
+            "refresh-grant must echo the presented (reusable) refresh token unchanged"
         );
     }
 
-    /// Two-call regression for the rotation/DoS bug: refresh, then refresh
-    /// AGAIN with the token returned by the first refresh. Because
-    /// `auth_service::refresh_tokens` consumes the presented token and mints
-    /// a replacement, the handler must return that replacement — a client
-    /// that only ever sees the original would replay it, trip
-    /// `revoke_all_refresh_token_families`, and lose its whole session. The
-    /// second call succeeding proves the client was handed a live token.
+    /// The #2477 regression test: the SAME offline refresh token presented
+    /// twice must succeed BOTH times. Docker daemons re-POST the stored
+    /// token on every access-token expiry; before the fix the second
+    /// presentation went through `auth_service::refresh_tokens`, tripped
+    /// replay detection, revoked the whole token family, and every
+    /// subsequent pull failed with `invalid username or password`.
     #[tokio::test]
-    async fn refresh_grant_rotated_token_can_refresh_again() {
+    async fn refresh_grant_same_token_twice_succeeds_no_family_revocation() {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
@@ -22542,47 +22573,52 @@ mod token_refresh_grant_tests {
             .expect("issued refresh")
             .to_string();
 
-        // First refresh (default, no access_type) — must return the rotated
-        // refresh token.
-        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
-        let resp = app
-            .clone()
-            .oneshot(form_post("/token", body))
-            .await
-            .unwrap();
-        let first_status = resp.status();
-        let json = read_body(resp).await;
-        let rotated = json["refresh_token"].as_str().map(str::to_string);
+        let mut statuses = Vec::new();
+        let mut last_json = serde_json::Value::Null;
+        for _ in 0..3 {
+            let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+            let resp = app
+                .clone()
+                .oneshot(form_post("/token", body))
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+            last_json = read_body(resp).await;
+        }
 
-        // Second refresh with whatever the first refresh handed back.
-        let Some(rotated) = rotated else {
-            cleanup(&pool, user_id).await;
-            panic!("first refresh-grant response did not include a refresh token: {json}");
-        };
-        let body = format!("grant_type=refresh_token&refresh_token={rotated}");
-        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
-        let second_status = resp.status();
-        let json = read_body(resp).await;
+        // The family must not have been revoked by the reuse: no row for
+        // this user may carry `revoked_at`.
+        let revoked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti \
+             WHERE user_id = $1 AND revoked_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count revoked rows");
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
         cleanup(&pool, user_id).await;
 
-        assert_eq!(first_status, StatusCode::OK);
-        assert_eq!(
-            second_status,
-            StatusCode::OK,
-            "second refresh with the rotated token must succeed (no family revocation): {json}"
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "every reuse of the offline token must succeed, got {statuses:?}: {last_json}"
         );
-        assert!(json["access_token"]
+        assert!(last_json["access_token"]
             .as_str()
             .is_some_and(|s| !s.is_empty() && s != "anonymous"));
-        assert!(
-            json["refresh_token"].as_str().is_some(),
-            "second refresh must also return a rotated refresh token: {json}"
+        assert_eq!(
+            revoked, 0,
+            "reusing the registry offline token must NOT revoke the token family"
         );
     }
 
-    /// Refresh-grant + `access_type=offline` rotates the refresh token.
+    /// Refresh-grant + `access_type=offline` also echoes the presented
+    /// token (the offline flag changes nothing on this path).
     #[tokio::test]
-    async fn refresh_grant_offline_rotates_refresh_token() {
+    async fn refresh_grant_offline_echoes_presented_refresh_token() {
         let Some((pool, user_id, username, state, _)) = setup().await else {
             return;
         };
@@ -22609,9 +22645,66 @@ mod token_refresh_grant_tests {
         cleanup(&pool, user_id).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["access_token"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(
-            body["refresh_token"].as_str().is_some(),
-            "offline refresh-grant should mint a new refresh: {body}"
+        assert_eq!(
+            body["refresh_token"].as_str(),
+            Some(refresh.as_str()),
+            "offline refresh-grant must echo the presented refresh token: {body}"
+        );
+    }
+
+    /// Explicit revocation still bounds the reusable token: after
+    /// `revoke_all_refresh_token_families` (logout / kill-all-sessions /
+    /// deactivation sweep) the refresh-grant must return 401 even though
+    /// this path never revokes on reuse.
+    #[tokio::test]
+    async fn refresh_grant_after_family_revocation_returns_401() {
+        let Some((pool, user_id, username, state, auth_service)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let json = read_body(resp).await;
+        let refresh = json["refresh_token"]
+            .as_str()
+            .expect("issued refresh")
+            .to_string();
+
+        // Reusable before revocation (control).
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let pre_status = resp.status();
+
+        auth_service
+            .revoke_all_refresh_token_families(user_id)
+            .await
+            .expect("revoke families");
+
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let post_status = resp.status();
+        let _ = sqlx::query("DELETE FROM refresh_token_jti WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(pre_status, StatusCode::OK, "control reuse must succeed");
+        assert_eq!(
+            post_status,
+            StatusCode::UNAUTHORIZED,
+            "explicitly revoked offline token must be rejected"
         );
     }
 
@@ -22832,6 +22925,62 @@ mod token_refresh_grant_tests {
             status,
             StatusCode::UNAUTHORIZED,
             "deactivated user must not mint fresh tokens via refresh-grant"
+        );
+    }
+
+    /// #2487 (probe #5): a web-session refresh token (bare `token_type
+    /// "refresh"`, minted by `authenticate` for the interactive login flow)
+    /// presented to `/v2/token grant_type=refresh_token` must be rejected —
+    /// the registry path requires the registry marker, so it cannot be used
+    /// as a replay oracle for the web single-use rotation family. Also covers
+    /// an already-CONSUMED web token (rotated once on the web path first).
+    #[tokio::test]
+    async fn refresh_grant_rejects_web_session_refresh_token() {
+        let Some((pool, user_id, username, state, auth_service)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        // Interactive login mints a web-session refresh token.
+        let (_user, web) = auth_service
+            .authenticate(&username, "real-test-password")
+            .await
+            .expect("interactive authenticate");
+
+        // Fresh web token → /v2/token → 401.
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            web.refresh_token
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let fresh_status = resp.status();
+
+        // Consume it on the web path, then replay the original at /v2/token.
+        auth_service
+            .refresh_tokens(&web.refresh_token)
+            .await
+            .expect("web rotation consumes the token");
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            web.refresh_token
+        );
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let consumed_status = resp.status();
+
+        cleanup(&pool, user_id).await;
+        assert_eq!(
+            fresh_status,
+            StatusCode::UNAUTHORIZED,
+            "a web-session refresh token must not mint via the /v2/token registry path"
+        );
+        assert_eq!(
+            consumed_status,
+            StatusCode::UNAUTHORIZED,
+            "an already-consumed web refresh token must not be revived via /v2/token"
         );
     }
 }
