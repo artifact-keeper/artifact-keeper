@@ -13506,4 +13506,99 @@ mod tests {
              SSRF rejection as Validation, got {err:?}",
         );
     }
+
+    // -- custom User-Agent application (#2080) -------------------------------
+
+    /// `apply_custom_ua` is the single choke point that puts the configured
+    /// value on the wire: `Some` must set exactly the `User-Agent` header,
+    /// `None` must leave the request builder untouched.
+    #[tokio::test]
+    async fn test_apply_custom_ua_sets_header_only_when_some() {
+        let client = Client::new();
+
+        let req = apply_custom_ua(
+            client.get("http://upstream.example.test/x"),
+            Some("UA-X/1.0"),
+        )
+        .build()
+        .expect("build request");
+        assert_eq!(
+            req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some("UA-X/1.0"),
+            "Some(ua) must set the User-Agent header",
+        );
+        assert_eq!(
+            req.headers().len(),
+            1,
+            "apply_custom_ua must set ONLY the User-Agent header",
+        );
+
+        let req = apply_custom_ua(client.get("http://upstream.example.test/x"), None)
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers().get(USER_AGENT).is_none(),
+            "None must not add a per-request User-Agent (client default applies)",
+        );
+    }
+
+    /// `get_custom_user_agent` contract: a repo without a config row resolves
+    /// (and caches) `None`; a configured repo resolves the stored value; and
+    /// within the 60s TTL the cached value is served without re-querying —
+    /// proven by deleting the DB row and observing the same answer.
+    #[tokio::test]
+    async fn test_get_custom_user_agent_db_load_and_ttl_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+
+        // No config row: first call takes the DB path and caches None.
+        let uc = UpstreamClient::new(pool.clone(), Client::new());
+        assert_eq!(uc.get_custom_user_agent(repo_id).await, None);
+
+        // Insert a row; the same client must still answer from its cache.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .bind("Cached/3.0")
+        .execute(&pool)
+        .await
+        .expect("insert repository_config");
+        assert_eq!(
+            uc.get_custom_user_agent(repo_id).await,
+            None,
+            "within the TTL the cached None must be served, not the new DB row",
+        );
+
+        // A fresh client (empty cache) loads the configured value from the DB.
+        let uc2 = UpstreamClient::new(pool.clone(), Client::new());
+        assert_eq!(
+            uc2.get_custom_user_agent(repo_id).await.as_deref(),
+            Some("Cached/3.0"),
+        );
+
+        // Delete the row: the second client keeps serving from its cache.
+        sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+            .bind(repo_id)
+            .bind(CUSTOM_USER_AGENT_KEY)
+            .execute(&pool)
+            .await
+            .expect("delete repository_config");
+        assert_eq!(
+            uc2.get_custom_user_agent(repo_id).await.as_deref(),
+            Some("Cached/3.0"),
+            "within the TTL the cached value must be served after the row is gone",
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
 }

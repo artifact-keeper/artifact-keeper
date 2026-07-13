@@ -14782,6 +14782,268 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // custom_user_agent: handler plumbing (create / update / get round-trips)
+    // -----------------------------------------------------------------------
+
+    /// `custom_user_agent` on a REMOTE create must be persisted to
+    /// `repository_config`, echoed in the create response, and read back by
+    /// the GET handler via `with_custom_user_agent`.
+    #[tokio::test]
+    async fn test_custom_user_agent_create_remote_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ua-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("ua-remote-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "UA remote repo",
+            "maven",
+            serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.test",
+                "custom_user_agent": "RoundTrip/1.0"
+            }),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        let Json(created) = result.expect("remote create with custom_user_agent must succeed");
+        assert_eq!(
+            created.custom_user_agent.as_deref(),
+            Some("RoundTrip/1.0"),
+            "create response must echo the configured custom_user_agent",
+        );
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(created.id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(
+            stored.as_deref(),
+            Some("RoundTrip/1.0"),
+            "custom_user_agent must be persisted to repository_config",
+        );
+
+        let Json(fetched) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+        )
+        .await
+        .expect("GET must succeed");
+        assert_eq!(
+            fetched.custom_user_agent.as_deref(),
+            Some("RoundTrip/1.0"),
+            "GET must read custom_user_agent back from repository_config",
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// `custom_user_agent` on a non-remote create must be rejected with a
+    /// Validation error before any row is written.
+    #[tokio::test]
+    async fn test_custom_user_agent_create_rejected_on_local_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ua-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("ua-local-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "UA local repo",
+            "maven",
+            serde_json::json!({ "custom_user_agent": "Nope/1.0" }),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        let err = result.expect_err("custom_user_agent on a local repo must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// PATCH plumbing: a non-empty value validates + upserts and is echoed;
+    /// an empty string deletes the config row and echoes `None`; a value with
+    /// control characters is rejected; a non-remote repo is rejected.
+    #[tokio::test]
+    async fn test_custom_user_agent_update_set_clear_and_reject_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+
+        // Set: validate + upsert + response echo (Some branch).
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":"Updated/2.0"}"#)),
+        )
+        .await
+        .expect("update set must succeed");
+        assert_eq!(resp.custom_user_agent.as_deref(), Some("Updated/2.0"));
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(stored.as_deref(), Some("Updated/2.0"));
+
+        // Control characters must be rejected on the update path too.
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":"bad\r\nheader"}"#)),
+        )
+        .await
+        .expect_err("control characters must be rejected on update");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("control characters")),
+            "expected control-character Validation error, got {err:?}",
+        );
+
+        // Clear: empty string deletes the row and echoes None.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":""}"#)),
+        )
+        .await
+        .expect("update clear must succeed");
+        assert_eq!(resp.custom_user_agent, None, "clear must echo None");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(stored, None, "clear must delete the config row");
+
+        // GET after clear exercises the with_custom_user_agent miss path.
+        let Json(fetched) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+        )
+        .await
+        .expect("GET must succeed");
+        assert_eq!(fetched.custom_user_agent, None);
+
+        // Non-remote repo: the update path must reject the field.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(local_key.clone()),
+            Json(update(r#"{"custom_user_agent":"Nope/1.0"}"#)),
+        )
+        .await
+        .expect_err("custom_user_agent on a local repo must be rejected on update");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+
+        tdh::cleanup(&pool, local_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// `custom_user_agent` serialization contract: omitted when `None`
+    /// (skip_serializing_if), present when set.
+    #[test]
+    fn test_repository_response_serializes_custom_user_agent() {
+        let mut resp = RepositoryResponse {
+            id: Uuid::new_v4(),
+            key: "ua-serde".to_string(),
+            name: "ua-serde".to_string(),
+            description: None,
+            format: "maven".to_string(),
+            repo_type: "remote".to_string(),
+            is_public: false,
+            allow_anonymous_access: false,
+            promotion_only: false,
+            versioning_enabled: false,
+            storage_used_bytes: 0,
+            quota_bytes: None,
+            upstream_url: None,
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
+            quarantine_enabled: None,
+            quarantine_duration_minutes: None,
+            custom_user_agent: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("custom_user_agent"),
+            "None must be omitted from the JSON body",
+        );
+        resp.custom_user_agent = Some("Serde/1.0".to_string());
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            json.contains(r#""custom_user_agent":"Serde/1.0""#),
+            "Some must serialize the configured value",
+        );
+    }
+
     /// When the format string is unknown and has **no** `format_handlers` row
     /// at all, `create_repository` must return a `Validation` error.
     #[tokio::test]
