@@ -75,6 +75,37 @@ pub async fn invalidate_maven_metadata_cache(repo_id: Uuid, group_id: &str, arti
 }
 
 // ---------------------------------------------------------------------------
+// Virtual-repo GA-level metadata merge cache (#2302)
+// ---------------------------------------------------------------------------
+//
+// A GET of `maven-metadata.xml` on a *virtual* repository fans out across every
+// member (proxying upstream metadata and generating local metadata) then merges
+// the version sets. That fan-out is the expensive part of a Maven resolve; for a
+// multi-thousand-dependency build the same GA tuple is requested repeatedly in a
+// short window. This LRU memoizes the merged result so those repeats skip the
+// member iteration entirely.
+//
+// KNOWN GAP: invalidation is TTL-only (60 s). Unlike the #2079 per-GAV cache
+// above, this merge cache is NOT actively invalidated when a member repo
+// receives an upload — a freshly published version can therefore be masked for
+// up to the TTL. This is acceptable under Maven's own release semantics (release
+// coordinates are immutable and clients already tolerate metadata propagation
+// delay), so the bounded staleness is the intended trade-off rather than active
+// cross-member invalidation.
+const VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY: u64 = 4_000;
+const VIRTUAL_MAVEN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
+
+type VirtualMetadataCacheKey = (Uuid, String, String);
+
+static VIRTUAL_MAVEN_METADATA_CACHE: Lazy<MokaCache<VirtualMetadataCacheKey, Option<Bytes>>> =
+    Lazy::new(|| {
+        MokaCache::builder()
+            .max_capacity(VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY)
+            .time_to_live(VIRTUAL_MAVEN_METADATA_CACHE_TTL)
+            .build()
+    });
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -1068,72 +1099,97 @@ async fn fetch_maven_metadata_bytes(
                 .await;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
-            let mut all_versions: Vec<String> = Vec::new();
-            // Newest `<lastUpdated>` reported by any member. Reused for the
-            // merged body so it is byte-identical across the separate metadata
-            // and checksum requests (#1922) instead of a per-request wall clock.
-            let mut max_last_updated: Option<String> = None;
+            let cache_key: VirtualMetadataCacheKey =
+                (repo.id, group_id.clone(), artifact_id.clone());
 
-            // Fan out across members CONCURRENTLY (#2069) in priority-order
-            // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
-            // metadata from upstream, Local/Staging members generate it from
-            // artifact rows. Batching bounds concurrent upstream connections;
-            // `join_all` preserves within-batch (member) order.
-            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
-                let member_docs = futures::future::join_all(chunk.iter().map(|member| async {
-                    if member.repo_type == RepositoryType::Remote {
-                        fetch_remote_member_metadata(state, member, path).await
-                    } else {
-                        generate_metadata_for_artifact(
-                            &state.db,
-                            member.id,
-                            &group_id,
-                            &artifact_id,
-                        )
-                        .await
-                        .ok()
-                    }
-                }))
-                .await;
-                for xml in member_docs.into_iter().flatten() {
-                    if let Some(ts) = crate::formats::maven::parse_metadata_last_updated(&xml) {
-                        if max_last_updated.as_deref() < Some(ts.as_str()) {
-                            max_last_updated = Some(ts);
+            // Consult the GA-level merge cache before iterating members (#2302).
+            // A hit — including a definitive `Some(None)` empty-merge — skips the
+            // fan-out entirely; a miss runs the merge below and stores its result.
+            let ga_merge: Option<Bytes> = match VIRTUAL_MAVEN_METADATA_CACHE.get(&cache_key).await {
+                Some(cached) => cached,
+                None => {
+                    let mut all_versions: Vec<String> = Vec::new();
+                    // Newest `<lastUpdated>` reported by any member. Reused for the
+                    // merged body so it is byte-identical across the separate metadata
+                    // and checksum requests (#1922) instead of a per-request wall clock.
+                    let mut max_last_updated: Option<String> = None;
+
+                    // Fan out across members CONCURRENTLY (#2069) in priority-order
+                    // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
+                    // metadata from upstream, Local/Staging members generate it from
+                    // artifact rows. Batching bounds concurrent upstream connections;
+                    // `join_all` preserves within-batch (member) order.
+                    for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                        let member_docs =
+                            futures::future::join_all(chunk.iter().map(|member| async {
+                                if member.repo_type == RepositoryType::Remote {
+                                    fetch_remote_member_metadata(state, member, path).await
+                                } else {
+                                    generate_metadata_for_artifact(
+                                        &state.db,
+                                        member.id,
+                                        &group_id,
+                                        &artifact_id,
+                                    )
+                                    .await
+                                    .ok()
+                                }
+                            }))
+                            .await;
+                        for xml in member_docs.into_iter().flatten() {
+                            if let Some(ts) =
+                                crate::formats::maven::parse_metadata_last_updated(&xml)
+                            {
+                                if max_last_updated.as_deref() < Some(ts.as_str()) {
+                                    max_last_updated = Some(ts);
+                                }
+                            }
+                            if let Some((_, _, versions)) =
+                                crate::formats::maven::parse_metadata_versions(&xml)
+                            {
+                                all_versions.extend(versions);
+                            }
                         }
                     }
-                    if let Some((_, _, versions)) =
-                        crate::formats::maven::parse_metadata_versions(&xml)
-                    {
-                        all_versions.extend(versions);
-                    }
+
+                    let merged = if all_versions.is_empty() {
+                        None
+                    } else {
+                        all_versions.sort();
+                        all_versions.dedup();
+
+                        use crate::formats::maven_version;
+                        let sorted = maven_version::sort_maven_versions(&all_versions);
+                        let latest = sorted.last().unwrap().clone();
+                        let release = maven_version::latest_release(&sorted).cloned();
+
+                        // Reuse the newest member `<lastUpdated>` so the merged body is
+                        // reproducible across the separate metadata and checksum
+                        // requests (#1922); fall back to wall clock only if no member
+                        // reported one (e.g. all-remote members omitting the element).
+                        let last_updated = max_last_updated.unwrap_or_else(|| {
+                            chrono::Utc::now().format("%Y%m%d%H%M%S").to_string()
+                        });
+                        let xml = generate_metadata_xml(
+                            &group_id,
+                            &artifact_id,
+                            &sorted,
+                            &latest,
+                            release.as_deref(),
+                            &last_updated,
+                        );
+                        Some(Bytes::from(xml))
+                    };
+
+                    VIRTUAL_MAVEN_METADATA_CACHE
+                        .insert(cache_key, merged.clone())
+                        .await;
+                    merged
                 }
-            }
+            };
 
-            if !all_versions.is_empty() {
-                all_versions.sort();
-                all_versions.dedup();
-
-                use crate::formats::maven_version;
-                let sorted = maven_version::sort_maven_versions(&all_versions);
-                let latest = sorted.last().unwrap().clone();
-                let release = maven_version::latest_release(&sorted).cloned();
-
-                // Reuse the newest member `<lastUpdated>` so the merged body is
-                // reproducible across the separate metadata and checksum
-                // requests (#1922); fall back to wall clock only if no member
-                // reported one (e.g. all-remote members omitting the element).
-                let last_updated = max_last_updated
-                    .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
-                let xml = generate_metadata_xml(
-                    &group_id,
-                    &artifact_id,
-                    &sorted,
-                    &latest,
-                    release.as_deref(),
-                    &last_updated,
-                );
-
-                return Ok(Bytes::from(xml));
+            if let Some(xml) = ga_merge {
+                return Ok(xml);
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -4723,6 +4779,70 @@ mod tests {
             pom_body.as_bytes(),
             "virtual must return the upstream POM bytes (#1562)"
         );
+    }
+
+    // -- #2302: in-process virtual-repo metadata merge cache --------------
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_positive_result() {
+        let repo_id = Uuid::new_v4();
+        let group = format!("g-{}", Uuid::new_v4());
+        let artifact = format!("a-{}", Uuid::new_v4());
+        let key: VirtualMetadataCacheKey = (repo_id, group.clone(), artifact.clone());
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key.clone(), Some(Bytes::from_static(b"<merged/>")))
+            .await;
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        assert!(
+            matches!(cached, Some(Some(_))),
+            "Some(Some(_)) on a positive cache entry"
+        );
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_definitive_miss() {
+        let repo_id = Uuid::new_v4();
+        let key: VirtualMetadataCacheKey = (repo_id, "g".to_string(), "a".to_string());
+        VIRTUAL_MAVEN_METADATA_CACHE.insert(key.clone(), None).await;
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        assert!(
+            matches!(cached, Some(None)),
+            "Some(None) signals a known-empty merge (do not re-iterate members)"
+        );
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_isolates_keys() {
+        let repo_id = Uuid::new_v4();
+        let key_a: VirtualMetadataCacheKey = (repo_id, "g1".to_string(), "a1".to_string());
+        let key_b: VirtualMetadataCacheKey = (repo_id, "g2".to_string(), "a2".to_string());
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key_a.clone(), Some(Bytes::from_static(b"a")))
+            .await;
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key_b.clone(), Some(Bytes::from_static(b"b")))
+            .await;
+        assert_eq!(
+            VIRTUAL_MAVEN_METADATA_CACHE
+                .get(&key_a)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"a"),
+        );
+        assert_eq!(
+            VIRTUAL_MAVEN_METADATA_CACHE
+                .get(&key_b)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"b"),
+        );
+        assert_ne!(key_a, key_b);
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key_a).await;
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key_b).await;
     }
 
     /// #2328: a local member owning ONE version of a Maven coordinate must
