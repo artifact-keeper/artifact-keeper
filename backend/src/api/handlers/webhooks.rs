@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::cluster_work::{Claimed, WorkerIdentity};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
 use crate::services::webhook_secret_crypto;
 
@@ -1582,43 +1583,151 @@ async fn load_active_secrets(
     Ok(out)
 }
 
+/// TTL for one webhook retry-delivery claim, in seconds.
+///
+/// Sized to comfortably cover one send attempt (30s HTTP timeout) plus result
+/// bookkeeping; the processor re-extends the claim immediately before each
+/// send, so a large claimed batch does not need a batch-sized TTL. If a
+/// replica dies mid-send, the delivery becomes claimable again after this
+/// long, which is well under the shortest retry backoff step.
+const WEBHOOK_RETRY_CLAIM_TTL_SECS: f64 = 120.0;
+
+/// Atomically claim up to `limit` deliveries that are due for retry
+/// (RowClaimedQueue pattern, see [`crate::services::cluster_work`]).
+///
+/// Rows are selected with `FOR UPDATE SKIP LOCKED` and stamped with a fresh
+/// `claim_token` in the same statement, so concurrent replicas drain disjoint
+/// deliveries. A row whose previous claim expired (owner crashed mid-send) is
+/// claimable again once `next_retry_at` keeps it due.
+async fn claim_due_webhook_deliveries(
+    db: &sqlx::PgPool,
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    use sqlx::Row;
+
+    let raw_rows = sqlx::query(
+        r#"
+        WITH candidate AS (
+            SELECT id
+            FROM webhook_deliveries
+            WHERE success = false
+              AND next_retry_at IS NOT NULL
+              AND next_retry_at <= NOW()
+              AND attempts < max_attempts
+              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+            ORDER BY next_retry_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE webhook_deliveries d
+        SET claimed_by = $2,
+            claim_token = gen_random_uuid(),
+            claim_expires_at = NOW() + make_interval(secs => $3)
+        FROM candidate
+        WHERE d.id = candidate.id
+        RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
+                  d.claim_token, d.claimed_by, d.claim_expires_at
+        "#,
+    )
+    .bind(limit)
+    .bind(claimed_by)
+    .bind(claim_ttl_secs)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("Failed to claim retry queue: {}", e))?;
+
+    Ok(raw_rows
+        .into_iter()
+        .map(|row| {
+            Claimed::from_claim_row(
+                RetryDeliveryRow {
+                    id: row.get("id"),
+                    webhook_id: row.get("webhook_id"),
+                    event: row.get("event"),
+                    payload: row.get("payload"),
+                    attempts: row.get("attempts"),
+                    max_attempts: row.get("max_attempts"),
+                },
+                row.get("claim_token"),
+                row.get("claimed_by"),
+                row.get("claim_expires_at"),
+            )
+        })
+        .collect())
+}
+
+/// Re-extend the caller's claim on one delivery immediately before the send.
+///
+/// Returns `false` when the claim was lost (expired and re-claimed by another
+/// replica while earlier batch items were being processed) — the caller must
+/// then skip the send entirely, because the new owner will POST it.
+async fn extend_webhook_delivery_claim(
+    db: &sqlx::PgPool,
+    delivery: &Claimed<RetryDeliveryRow>,
+    claim_ttl_secs: f64,
+) -> bool {
+    let result = sqlx::query(
+        r#"
+        UPDATE webhook_deliveries
+        SET claim_expires_at = NOW() + make_interval(secs => $2)
+        WHERE id = $1
+          AND claim_token = $3
+        "#,
+    )
+    .bind(delivery.id)
+    .bind(claim_ttl_secs)
+    .bind(delivery.claim_token())
+    .execute(db)
+    .await;
+
+    match result {
+        Ok(r) => r.rows_affected() == 1,
+        Err(e) => {
+            tracing::warn!(
+                delivery_id = %delivery.id,
+                error = %e,
+                "Failed to extend webhook delivery claim; skipping send"
+            );
+            false
+        }
+    }
+}
+
+/// Mark a claimed delivery as dead (no further retries) without recording an
+/// attempt result: webhook deleted/disabled, URL failed validation, or the
+/// payload could not be serialized. Token-guarded like every other finalizer.
+async fn dead_letter_claimed_delivery(db: &sqlx::PgPool, delivery: &Claimed<RetryDeliveryRow>) {
+    let _ = sqlx::query(
+        "UPDATE webhook_deliveries \
+         SET next_retry_at = NULL, \
+             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+         WHERE id = $1 AND claim_token = $2",
+    )
+    .bind(delivery.id)
+    .bind(delivery.claim_token())
+    .execute(db)
+    .await;
+}
+
 /// Process failed webhook deliveries that are due for retry.
 ///
-/// Queries the retry queue for deliveries where `next_retry_at <= NOW()`,
-/// attempts the HTTP POST again, and updates the delivery record with the
-/// result. Uses `sqlx::query()` (not the macro) because the new columns
-/// are not in the offline SQLx cache.
+/// Claims due rows (`next_retry_at <= NOW()`) with an atomic
+/// FOR UPDATE SKIP LOCKED batch — so concurrent replicas drain disjoint
+/// deliveries instead of each POSTing the same one — then attempts the HTTP
+/// POST and updates the delivery record by claim token. Uses `sqlx::query()`
+/// (not the macro) because the new columns are not in the offline SQLx cache.
 pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(), String> {
     use sqlx::Row;
 
-    // Fetch deliveries due for retry (using sqlx::query, not the macro)
-    let raw_rows = sqlx::query(
-        r#"
-        SELECT id, webhook_id, event, payload, attempts, max_attempts
-        FROM webhook_deliveries
-        WHERE success = false
-          AND next_retry_at IS NOT NULL
-          AND next_retry_at <= NOW()
-          AND attempts < max_attempts
-        ORDER BY next_retry_at ASC
-        LIMIT 50
-        "#,
+    let rows = claim_due_webhook_deliveries(
+        db,
+        50,
+        WorkerIdentity::for_process().as_str(),
+        WEBHOOK_RETRY_CLAIM_TTL_SECS,
     )
-    .fetch_all(db)
-    .await
-    .map_err(|e| format!("Failed to fetch retry queue: {}", e))?;
-
-    let rows: Vec<RetryDeliveryRow> = raw_rows
-        .into_iter()
-        .map(|row| RetryDeliveryRow {
-            id: row.get("id"),
-            webhook_id: row.get("webhook_id"),
-            event: row.get("event"),
-            payload: row.get("payload"),
-            attempts: row.get("attempts"),
-            max_attempts: row.get("max_attempts"),
-        })
-        .collect();
+    .await?;
 
     if rows.is_empty() {
         return Ok(());
@@ -1650,11 +1759,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             Some(w) => w,
             None => {
                 // Webhook deleted or disabled: mark delivery as dead letter
-                let _ =
-                    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                        .bind(delivery.id)
-                        .execute(db)
-                        .await;
+                dead_letter_claimed_delivery(db, delivery).await;
                 continue;
             }
         };
@@ -1664,10 +1769,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
         // Validate URL before delivery (SSRF prevention)
         if validate_webhook_url(&url).is_err() {
-            let _ = sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                .bind(delivery.id)
-                .execute(db)
-                .await;
+            dead_letter_claimed_delivery(db, delivery).await;
             tracing::warn!(
                 "Webhook URL failed validation during retry, delivery {} dead-lettered",
                 delivery.id
@@ -1684,11 +1786,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                     error = %e,
                     "Failed to serialize webhook payload; dead-lettering"
                 );
-                let _ =
-                    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                        .bind(delivery.id)
-                        .execute(db)
-                        .await;
+                dead_letter_claimed_delivery(db, delivery).await;
                 continue;
             }
         };
@@ -1720,6 +1818,18 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             unix_secs,
             body_bytes: &body_bytes,
         };
+        // Re-assert ownership immediately before the side effect: earlier
+        // items in this batch may have taken long enough (30s timeout each)
+        // that this row's claim lapsed and another replica took it over. The
+        // new owner will POST it; sending here too would duplicate it.
+        if !extend_webhook_delivery_claim(db, delivery, WEBHOOK_RETRY_CLAIM_TTL_SECS).await {
+            tracing::info!(
+                delivery_id = %delivery.id,
+                "Webhook retry claim lost before send; skipping (new owner will deliver)"
+            );
+            continue;
+        }
+
         let mut request = client.post(&url);
         for (name, value) in build_delivery_request_headers(&header_inputs) {
             request = request.header(name, value);
@@ -1752,69 +1862,91 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                     response_body = $3,
                     attempts = $4,
                     delivered_at = NOW(),
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $5
                 "#,
             )
             .bind(delivery.id)
             .bind(response_status)
             .bind(&response_body)
             .bind(new_attempts)
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
         } else if outcome == RetryOutcome::DeadLetter {
-            // Max attempts exhausted: dead letter
-            let _ = sqlx::query(
+            // Max attempts exhausted: dead letter. Token-guarded so a stale
+            // owner cannot dead-letter (and auto-disable the webhook for) a
+            // delivery that a new owner is still driving.
+            let dead_lettered = sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
                 SET response_status = $2,
                     response_body = $3,
                     attempts = $4,
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $5
                 "#,
             )
             .bind(delivery.id)
             .bind(response_status)
             .bind(&response_body)
             .bind(new_attempts)
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
 
-            tracing::info!(
-                "Webhook delivery {} exhausted {} attempts, dead-lettered",
-                delivery.id,
-                new_attempts
-            );
-
-            // Auto-disable + notifier. Failures here are logged but do
-            // not retry the (already dead-lettered) delivery.
-            if let Err(e) = crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
-                db,
-                delivery.webhook_id,
-                delivery.id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    delivery_id = %delivery.id,
-                    webhook_id = %delivery.webhook_id,
-                    error = %e,
-                    "auto-disable on dead-letter failed"
+            let owns_dead_letter =
+                matches!(dead_lettered, Ok(ref result) if result.rows_affected() == 1);
+            if owns_dead_letter {
+                tracing::info!(
+                    "Webhook delivery {} exhausted {} attempts, dead-lettered",
+                    delivery.id,
+                    new_attempts
                 );
-            }
 
-            crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
+                // Auto-disable + notifier. Failures here are logged but do
+                // not retry the (already dead-lettered) delivery.
+                if let Err(e) =
+                    crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
+                        db,
+                        delivery.webhook_id,
+                        delivery.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        delivery_id = %delivery.id,
+                        webhook_id = %delivery.webhook_id,
+                        error = %e,
+                        "auto-disable on dead-letter failed"
+                    );
+                }
+
+                crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
+            }
         } else if let RetryOutcome::Retry { delay_secs } = outcome {
-            // Schedule next retry
+            // Schedule next retry, releasing the claim so any replica can
+            // pick the delivery up once the backoff elapses.
             let _ = sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
                 SET response_status = $2,
                     response_body = $3,
                     attempts = $4,
-                    next_retry_at = NOW() + ($5 || ' seconds')::interval
+                    next_retry_at = NOW() + ($5 || ' seconds')::interval,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $6
                 "#,
             )
             .bind(delivery.id)
@@ -1822,6 +1954,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             .bind(&response_body)
             .bind(new_attempts)
             .bind(delay_secs.to_string())
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
         }
@@ -3870,6 +4003,192 @@ mod tests {
                 "non-admin create_webhook must be 403, got: {result:?}"
             );
             assert_eq!(count, 0, "a denied create must not persist a webhook");
+        }
+    }
+
+    // =======================================================================
+    // Retry-delivery claims (Tier-2: no-op without DATABASE_URL)
+    // =======================================================================
+
+    mod retry_claim_tests {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        async fn insert_claim_test_webhook(pool: &sqlx::PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO webhooks (id, name, url, events, is_enabled) \
+                 VALUES ($1, $2, 'http://198.51.100.7/hook', ARRAY['artifact.created'], true)",
+            )
+            .bind(id)
+            .bind(format!("wh-claim-{}", &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert webhook");
+            id
+        }
+
+        async fn insert_due_delivery(pool: &sqlx::PgPool, webhook_id: Uuid) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO webhook_deliveries \
+                     (webhook_id, event, payload, success, attempts, max_attempts, next_retry_at) \
+                 VALUES ($1, 'artifact.created', '{}'::jsonb, false, 1, 5, \
+                         NOW() - INTERVAL '1 minute') \
+                 RETURNING id",
+            )
+            .bind(webhook_id)
+            .fetch_one(pool)
+            .await
+            .expect("insert delivery")
+        }
+
+        async fn cleanup_claim_test(pool: &sqlx::PgPool, webhook_id: Uuid) {
+            let _ = sqlx::query("DELETE FROM webhook_deliveries WHERE webhook_id = $1")
+                .bind(webhook_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                .bind(webhook_id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn release_test_claim(pool: &sqlx::PgPool, delivery: &Claimed<RetryDeliveryRow>) {
+            let _ = sqlx::query(
+                "UPDATE webhook_deliveries \
+                 SET claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+                 WHERE id = $1 AND claim_token = $2",
+            )
+            .bind(delivery.id)
+            .bind(delivery.claim_token())
+            .execute(pool)
+            .await;
+        }
+
+        async fn release_foreign_test_claims(
+            pool: &sqlx::PgPool,
+            deliveries: &[Claimed<RetryDeliveryRow>],
+            fixture_delivery_id: Uuid,
+        ) {
+            for delivery in deliveries {
+                if delivery.id != fixture_delivery_id {
+                    release_test_claim(pool, delivery).await;
+                }
+            }
+        }
+
+        async fn claim_fixture_delivery(
+            pool: &sqlx::PgPool,
+            fixture_delivery_id: Uuid,
+            claimed_by: &str,
+            claim_ttl_secs: f64,
+        ) -> Claimed<RetryDeliveryRow> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+
+            loop {
+                let mut claimed =
+                    claim_due_webhook_deliveries(pool, 50, claimed_by, claim_ttl_secs)
+                        .await
+                        .expect("claim ok");
+
+                let fixture_index = claimed
+                    .iter()
+                    .position(|delivery| delivery.id == fixture_delivery_id);
+
+                release_foreign_test_claims(pool, &claimed, fixture_delivery_id).await;
+
+                if let Some(index) = fixture_index {
+                    return claimed.swap_remove(index);
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+                        sqlx::query_as(
+                            "SELECT claimed_by, claim_expires_at \
+                             FROM webhook_deliveries WHERE id = $1",
+                        )
+                        .bind(fixture_delivery_id)
+                        .fetch_optional(pool)
+                        .await
+                        .expect("fetch fixture delivery claim state");
+                    panic!(
+                        "fixture delivery {fixture_delivery_id} was not claimed by {claimed_by}; \
+                         current claim state: {row:?}"
+                    );
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        /// One due delivery is handed to exactly one claimer while the claim
+        /// lives — the property that stops one failed delivery being POSTed
+        /// once per replica per tick.
+        #[tokio::test]
+        async fn claim_due_webhook_deliveries_is_exactly_once() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook_id = insert_claim_test_webhook(&pool).await;
+            let delivery_id = insert_due_delivery(&pool, webhook_id).await;
+
+            let first = claim_fixture_delivery(&pool, delivery_id, "replica-a", 60.0).await;
+            assert_eq!(first.id, delivery_id);
+            assert_eq!(first.claimed_by(), "replica-a");
+
+            let second = claim_due_webhook_deliveries(&pool, 50, "replica-b", 60.0)
+                .await
+                .expect("claim ok");
+            release_foreign_test_claims(&pool, &second, delivery_id).await;
+            assert!(
+                second.iter().all(|d| d.id != delivery_id),
+                "a claimed delivery must not be handed to a second replica"
+            );
+
+            cleanup_claim_test(&pool, webhook_id).await;
+        }
+
+        /// A crashed owner's claim expires and the delivery becomes claimable
+        /// again; the stale owner is then fenced out of both the pre-send
+        /// extension and the dead-letter finalizer.
+        #[tokio::test]
+        async fn expired_webhook_claim_recovers_and_fences_stale_owner() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook_id = insert_claim_test_webhook(&pool).await;
+            let delivery_id = insert_due_delivery(&pool, webhook_id).await;
+
+            // "Dead" owner claims with an already-expired TTL.
+            let stale_delivery =
+                claim_fixture_delivery(&pool, delivery_id, "replica-dead", -1.0).await;
+
+            // A new owner can claim the same delivery once the TTL lapsed.
+            let fresh_delivery =
+                claim_fixture_delivery(&pool, delivery_id, "replica-new", 60.0).await;
+            assert_eq!(fresh_delivery.id, delivery_id);
+            assert_eq!(fresh_delivery.claimed_by(), "replica-new");
+
+            // The stale owner cannot re-extend its lapsed claim before a send.
+            assert!(
+                !extend_webhook_delivery_claim(&pool, &stale_delivery, 60.0).await,
+                "stale owner must not be able to extend a superseded claim"
+            );
+
+            // Nor can it dead-letter the row out from under the new owner.
+            dead_letter_claimed_delivery(&pool, &stale_delivery).await;
+            let next_retry_at: Option<chrono::DateTime<chrono::Utc>> =
+                sqlx::query_scalar("SELECT next_retry_at FROM webhook_deliveries WHERE id = $1")
+                    .bind(delivery_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch delivery");
+            assert!(
+                next_retry_at.is_some(),
+                "stale owner must not dead-letter a re-claimed delivery"
+            );
+
+            cleanup_claim_test(&pool, webhook_id).await;
         }
     }
 }
