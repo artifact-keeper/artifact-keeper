@@ -493,6 +493,8 @@ pub struct ListRepositoriesQuery {
     #[serde(rename = "type", alias = "repo_type")]
     pub repo_type: Option<String>,
     pub q: Option<String>,
+    /// Filter the listing to repositories assigned to this project (#2472).
+    pub project: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -553,6 +555,10 @@ pub struct CreateRepositoryRequest {
     /// Custom User-Agent sent on outbound HTTP requests to the upstream for
     /// this repository. Only valid for remote repositories. Max 256 characters.
     pub custom_user_agent: Option<String>,
+    /// Optional project to assign this repository to (#2472). Grants on the
+    /// project (permissions with `target_type = 'project'`) are inherited by
+    /// the repository. Omit to leave the repository unassigned.
+    pub project_id: Option<Uuid>,
 }
 
 impl CreateRepositoryRequest {
@@ -621,6 +627,10 @@ pub struct UpdateRepositoryRequest {
     /// Only valid for remote repositories. Pass an empty string to remove.
     /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
     pub custom_user_agent: Option<String>,
+    /// Assign this repository to a project (#2472). P1 is set-only: omitting
+    /// the field leaves the assignment unchanged (unassignment ships with the
+    /// project-admin surface in P2).
+    pub project_id: Option<Uuid>,
 }
 
 impl UpdateRepositoryRequest {
@@ -651,6 +661,8 @@ pub struct RepositoryResponse {
     pub versioning_enabled: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
+    /// Project this repository is assigned to (#2472), if any.
+    pub project_id: Option<Uuid>,
     pub upstream_url: Option<String>,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
@@ -695,6 +707,7 @@ fn repo_to_response(
         versioning_enabled: repo.versioning_enabled,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
+        project_id: repo.project_id,
         upstream_url: repo.upstream_url,
         upstream_auth_type: None,
         upstream_auth_configured: false,
@@ -1647,6 +1660,7 @@ pub async fn list_repositories(
             type_filter,
             visibility,
             query.q.as_deref(),
+            query.project,
         )
         .await?;
 
@@ -1797,6 +1811,23 @@ pub async fn create_repository(
         payload.key.clone()
     };
 
+    // Projects (#2472): surface a clean 404 when the requested project does
+    // not exist, instead of letting the FK violation bubble up as a 500.
+    if let Some(project_id) = payload.project_id {
+        let project_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
+                .bind(project_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        if !project_exists {
+            return Err(AppError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )));
+        }
+    }
+
     // Issue #850: silently coerce `is_public` to false when guest access is
     // disabled server-wide so the persisted state matches the runtime policy.
     let (is_public, coerced) = coerce_is_public_for_create(
@@ -1828,6 +1859,7 @@ pub async fn create_repository(
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
             format_key: plugin_format_key.or(payload.format_key),
+            project_id: payload.project_id,
             // Owner auto-grant: record the creator and grant them per-repo
             // access so they retain access under per-repo authorization.
             created_by: Some(auth.user_id),
@@ -2054,6 +2086,9 @@ pub async fn update_repository(
                 upstream_url: None,
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
+                // P1 set-only (#2472): a present field maps to Some(Some(id));
+                // an omitted field leaves the assignment unchanged.
+                project_id: payload.project_id.map(Some),
             },
         )
         .await?;
@@ -7911,6 +7946,7 @@ mod tests {
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             custom_user_agent: None,
+            project_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9191,6 +9227,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -9237,6 +9274,7 @@ mod tests {
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
             custom_user_agent: None,
+            project_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9273,6 +9311,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -9318,6 +9357,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -9356,6 +9396,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -9472,6 +9513,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -10964,6 +11006,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -15028,6 +15071,7 @@ mod tests {
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             custom_user_agent: None,
+            project_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

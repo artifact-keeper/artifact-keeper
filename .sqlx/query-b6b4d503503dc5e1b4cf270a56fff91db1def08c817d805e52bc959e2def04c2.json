@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only, versioning_enabled\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only, versioning_enabled,\n                project_id\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -199,11 +199,16 @@
       },
       {
         "ordinal": 22,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 23,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -293,7 +298,8 @@
         "Bool",
         "Int8",
         "Bool",
-        "Bool"
+        "Bool",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -319,9 +325,10 @@
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "c3bb632681fcd5dd9d1eaef67a7860c2eb39a023728000d1ff94b8d1475bc01c"
+  "hash": "b6b4d503503dc5e1b4cf270a56fff91db1def08c817d805e52bc959e2def04c2"
 }

@@ -2251,7 +2251,7 @@ pub async fn fetch_virtual_members(
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
             r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
-            r.created_at, r.updated_at
+            r.project_id, r.created_at, r.updated_at
         FROM repositories r
         INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1
@@ -4262,6 +4262,7 @@ pub(crate) fn build_remote_repo_with_format(
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
         versioning_enabled: false,
+        project_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -9015,6 +9016,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 0,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

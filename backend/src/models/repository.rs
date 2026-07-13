@@ -178,6 +178,11 @@ pub struct Repository {
     /// the prior content at the same path (#2367). Defaults to false: no
     /// behavior change for existing repositories.
     pub versioning_enabled: bool,
+    /// Optional project this repository belongs to (#2472). `None` means the
+    /// repository is unassigned and behaves exactly as before projects
+    /// existed. Grants on the owning project (permissions rows with
+    /// `target_type = 'project'`) are inherited by this repository.
+    pub project_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            r.id, r.key, r.name, r.description,\n            r.format as \"format: RepositoryFormat\",\n            r.repo_type as \"repo_type: RepositoryType\",\n            r.storage_backend, r.storage_path, r.upstream_url,\n            r.is_public, r.quota_bytes, r.promotion_only,\n            r.replication_priority as \"replication_priority: ReplicationPriority\",\n            r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n            r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n            r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,\n            r.created_at, r.updated_at\n        FROM repositories r\n        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n        WHERE vrm.virtual_repo_id = $1\n        ORDER BY vrm.priority\n        ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -199,11 +199,16 @@
       },
       {
         "ordinal": 22,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 23,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -236,9 +241,10 @@
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "4d0331821000e8d59726256ff25115715a969f379b1f6675329dec38c90981c9"
+  "hash": "4203282367d8d6faf7811f78ab948738383612e88022415a4da239e559c66fc7"
 }

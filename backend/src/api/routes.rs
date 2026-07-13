@@ -621,6 +621,18 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     auth_middleware,
                 )),
         )
+        // Project routes (#2472). Same shape as /permissions: hard auth (401
+        // for anonymous) via auth_middleware, admin gating inside the
+        // handlers, and a small body cap for the JSON CRUD payloads.
+        .nest(
+            "/projects",
+            handlers::projects::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+        )
         // Build routes with optional auth
         .nest(
             "/builds",
