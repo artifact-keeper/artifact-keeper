@@ -15,7 +15,7 @@ use futures::stream::{BoxStream, StreamExt};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::{
-    ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
+    ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, USER_AGENT, WWW_AUTHENTICATE,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -1470,6 +1470,22 @@ pub(crate) struct UpstreamClient {
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+    /// In-memory cache for per-repo custom user-agents. TTL: 60 s.
+    /// Key: repo_id, Value: (custom_ua, cached_at)
+    user_agent_cache: RwLock<HashMap<Uuid, (Option<String>, Instant)>>,
+}
+
+const CUSTOM_USER_AGENT_KEY: &str = "custom_user_agent";
+
+/// TTL for cached custom user-agent entries.
+const USER_AGENT_CACHE_TTL_SECS: u64 = 60;
+
+/// Apply a custom User-Agent header to a request builder if one is configured.
+fn apply_custom_ua(req: reqwest::RequestBuilder, ua: Option<&str>) -> reqwest::RequestBuilder {
+    match ua {
+        Some(ua) => req.header(USER_AGENT, ua),
+        None => req,
+    }
 }
 
 impl UpstreamClient {
@@ -1481,6 +1497,7 @@ impl UpstreamClient {
             db,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
+            user_agent_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1513,11 +1530,13 @@ impl UpstreamClient {
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
+        request = apply_custom_ua(request, custom_ua.as_deref());
         // BUFFERED path sets `Accept` on the INITIAL request. The streaming
         // path deliberately does NOT — see `exchange_bearer_then` /
         // `fetch_stream` for why this asymmetry is intentional (#1618 S8).
@@ -1538,12 +1557,13 @@ impl UpstreamClient {
         // Handle 401 with bearer token exchange (required by Docker Hub and
         // other OCI registries, even for anonymous/public pulls).
         if status == StatusCode::UNAUTHORIZED {
-            // The buffered closure RE-ADDS `Accept` on the bearer retry,
-            // mirroring the initial request. The bearer-exchange helper itself
-            // never touches `Accept`; the closure owns that decision so the
-            // buffered/streaming asymmetry is preserved (#1618 S8).
+            // The buffered closure RE-ADDS `Accept` (and the custom UA) on the
+            // bearer retry, mirroring the initial request. The bearer-exchange
+            // helper itself never touches these headers; the closure owns that
+            // decision so the buffered/streaming asymmetry is preserved (#1618 S8).
             if let Some(retry_response) = self
                 .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    let req = apply_custom_ua(req, custom_ua.as_deref());
                     if let Some(accept_value) = accept {
                         req.header(ACCEPT, accept_value)
                     } else {
@@ -1681,11 +1701,13 @@ impl UpstreamClient {
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
+        request = apply_custom_ua(request, custom_ua.as_deref());
         // NOTE: the streaming path intentionally sets NO `Accept` header on the
         // initial request, in contrast to the buffered path which sets it on
         // both the initial request and the retry. This asymmetry is deliberate
@@ -1702,11 +1724,13 @@ impl UpstreamClient {
         let status = response.status();
 
         if status == StatusCode::UNAUTHORIZED {
-            // The streaming closure is the IDENTITY transform: it adds NO
-            // `Accept` header on the bearer retry, preserving the asymmetry
-            // with the buffered path (#1618 S8).
+            // The streaming closure re-applies the custom UA on the bearer retry
+            // but adds NO `Accept` header, preserving the asymmetry with the
+            // buffered path (#1618 S8).
             if let Some(retry_response) = self
-                .exchange_bearer_then(response, url, &upstream_auth, |req| req)
+                .exchange_bearer_then(response, url, &upstream_auth, |req| {
+                    apply_custom_ua(req, custom_ua.as_deref())
+                })
                 .await?
             {
                 return Self::read_upstream_response_streaming(retry_response, url);
@@ -1938,6 +1962,33 @@ impl UpstreamClient {
         } else {
             None
         }
+    }
+
+    /// Return the custom user-agent for a repo, hitting the in-memory cache
+    /// first (60 s TTL) to avoid a DB round-trip on every upstream request.
+    async fn get_custom_user_agent(&self, repo_id: Uuid) -> Option<String> {
+        {
+            let cache = self.user_agent_cache.read().await;
+            if let Some((ua, cached_at)) = cache.get(&repo_id) {
+                if cached_at.elapsed() < Duration::from_secs(USER_AGENT_CACHE_TTL_SECS) {
+                    return ua.clone();
+                }
+            }
+        }
+        let ua = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten();
+        self.user_agent_cache
+            .write()
+            .await
+            .insert(repo_id, (ua.clone(), Instant::now()));
+        ua
     }
 
     /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
@@ -13630,5 +13681,100 @@ mod tests {
             size_bytes: 12,
             checksum_sha256: "deadbeef".to_string(),
         }
+    }
+
+    // -- custom User-Agent application (#2080) -------------------------------
+
+    /// `apply_custom_ua` is the single choke point that puts the configured
+    /// value on the wire: `Some` must set exactly the `User-Agent` header,
+    /// `None` must leave the request builder untouched.
+    #[tokio::test]
+    async fn test_apply_custom_ua_sets_header_only_when_some() {
+        let client = Client::new();
+
+        let req = apply_custom_ua(
+            client.get("http://upstream.example.test/x"),
+            Some("UA-X/1.0"),
+        )
+        .build()
+        .expect("build request");
+        assert_eq!(
+            req.headers().get(USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some("UA-X/1.0"),
+            "Some(ua) must set the User-Agent header",
+        );
+        assert_eq!(
+            req.headers().len(),
+            1,
+            "apply_custom_ua must set ONLY the User-Agent header",
+        );
+
+        let req = apply_custom_ua(client.get("http://upstream.example.test/x"), None)
+            .build()
+            .expect("build request");
+        assert!(
+            req.headers().get(USER_AGENT).is_none(),
+            "None must not add a per-request User-Agent (client default applies)",
+        );
+    }
+
+    /// `get_custom_user_agent` contract: a repo without a config row resolves
+    /// (and caches) `None`; a configured repo resolves the stored value; and
+    /// within the 60s TTL the cached value is served without re-querying —
+    /// proven by deleting the DB row and observing the same answer.
+    #[tokio::test]
+    async fn test_get_custom_user_agent_db_load_and_ttl_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+
+        // No config row: first call takes the DB path and caches None.
+        let uc = UpstreamClient::new(pool.clone(), Client::new());
+        assert_eq!(uc.get_custom_user_agent(repo_id).await, None);
+
+        // Insert a row; the same client must still answer from its cache.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .bind("Cached/3.0")
+        .execute(&pool)
+        .await
+        .expect("insert repository_config");
+        assert_eq!(
+            uc.get_custom_user_agent(repo_id).await,
+            None,
+            "within the TTL the cached None must be served, not the new DB row",
+        );
+
+        // A fresh client (empty cache) loads the configured value from the DB.
+        let uc2 = UpstreamClient::new(pool.clone(), Client::new());
+        assert_eq!(
+            uc2.get_custom_user_agent(repo_id).await.as_deref(),
+            Some("Cached/3.0"),
+        );
+
+        // Delete the row: the second client keeps serving from its cache.
+        sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+            .bind(repo_id)
+            .bind(CUSTOM_USER_AGENT_KEY)
+            .execute(&pool)
+            .await
+            .expect("delete repository_config");
+        assert_eq!(
+            uc2.get_custom_user_agent(repo_id).await.as_deref(),
+            Some("Cached/3.0"),
+            "within the TTL the cached value must be served after the row is gone",
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 }

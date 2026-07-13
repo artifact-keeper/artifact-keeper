@@ -363,6 +363,10 @@ async fn authorize_virtual_member_mutation(
     Ok(())
 }
 
+/// `repository_config` key under which a remote repository's custom outbound
+/// User-Agent is stored.
+const CUSTOM_USER_AGENT_KEY: &str = "custom_user_agent";
+
 /// Generic upsert helper for repository_config key-value pairs.
 ///
 /// Inserts a new row or updates an existing one for the given repository and
@@ -546,6 +550,9 @@ pub struct CreateRepositoryRequest {
     pub upstream_username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned in responses.
     pub upstream_password: Option<String>,
+    /// Custom User-Agent sent on outbound HTTP requests to the upstream for
+    /// this repository. Only valid for remote repositories. Max 256 characters.
+    pub custom_user_agent: Option<String>,
 }
 
 impl CreateRepositoryRequest {
@@ -610,6 +617,10 @@ pub struct UpdateRepositoryRequest {
     /// Pass an empty string to remove the link.
     /// Stored in `repository_config` under `release_repository_id`.
     pub release_repository_key: Option<String>,
+    /// Update the custom User-Agent for outbound HTTP requests to the upstream.
+    /// Only valid for remote repositories. Pass an empty string to remove.
+    /// Max 256 characters. Stored in `repository_config` under `custom_user_agent`.
+    pub custom_user_agent: Option<String>,
 }
 
 impl UpdateRepositoryRequest {
@@ -652,6 +663,10 @@ pub struct RepositoryResponse {
     /// `repository_config` (#1770 B). `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_duration_minutes: Option<i64>,
+    /// Custom User-Agent used for outbound HTTP requests to the upstream,
+    /// read back from `repository_config`. `None` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_user_agent: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -688,6 +703,7 @@ fn repo_to_response(
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
+        custom_user_agent: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -705,6 +721,27 @@ async fn with_quarantine_settings(
     let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
+    response
+}
+
+/// Populate `RepositoryResponse.custom_user_agent` from `repository_config`.
+/// Split out like `with_quarantine_settings` so only the handlers with a DB
+/// handle echo the configured value back to clients.
+async fn with_custom_user_agent(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    let result = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(CUSTOM_USER_AGENT_KEY)
+    .fetch_optional(db)
+    .await;
+    if let Ok(Some(ua)) = result {
+        response.custom_user_agent = Some(ua);
+    }
     response
 }
 
@@ -731,6 +768,31 @@ fn validate_repository_key(key: &str) -> Result<()> {
     if key.contains("..") {
         return Err(AppError::Validation(
             "Repository key must not contain consecutive dots".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a custom outbound User-Agent string for a remote repository.
+///
+/// Enforces a pragmatic 256-character cap and rejects control characters per
+/// [RFC 7230 §3.2.6](https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6)
+/// `field-value` rules. Rejecting CR/LF (and every other control byte) closes
+/// the header-injection vector: the value is later applied verbatim as an
+/// outbound `User-Agent` header in `UpstreamClient`.
+fn validate_custom_user_agent(ua: &str) -> Result<()> {
+    if ua.len() > 256 {
+        return Err(AppError::Validation(
+            "custom_user_agent must be 256 characters or fewer".to_string(),
+        ));
+    }
+    // RFC 7230 §3.2.6: field-value = *( field-vchar / SP / HTAB ) where field-vchar = VCHAR / obs-text.
+    // VCHAR is %x21-7E; SP (0x20) and HTAB (0x09) are the only allowed non-printable bytes.
+    // Everything below SP except HTAB, and DEL (0x7F), is forbidden.
+    if ua.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+        return Err(AppError::Validation(
+            "custom_user_agent must not contain control characters (see RFC 7230 §3.2.6)"
+                .to_string(),
         ));
     }
     Ok(())
@@ -1695,6 +1757,15 @@ pub async fn create_repository(
     // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
+    if let Some(ref ua) = payload.custom_user_agent {
+        if repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        validate_custom_user_agent(ua)?;
+    }
+
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
         None => state.config.storage_backend.clone(),
@@ -1769,6 +1840,12 @@ pub async fn create_repository(
 
     if let Some(ref index_path) = payload.pypi_upstream_index_path {
         upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
+    if let Some(ref ua) = payload.custom_user_agent {
+        if !ua.is_empty() {
+            upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
+        }
     }
 
     // Add virtual repository members. Post-#1444, the validator accepts
@@ -1851,6 +1928,7 @@ pub async fn create_repository(
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
     }
+    response.custom_user_agent = payload.custom_user_agent.filter(|ua| !ua.is_empty());
     Ok(Json(response))
 }
 
@@ -1885,6 +1963,7 @@ pub async fn get_repository(
     response.upstream_auth_configured = auth_type.is_some();
     response.upstream_auth_type = auth_type;
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let response = with_custom_user_agent(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -2052,6 +2131,25 @@ pub async fn update_repository(
         }
     }
 
+    if let Some(ref ua) = payload.custom_user_agent {
+        if existing.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        if ua.is_empty() {
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                .bind(repo.id)
+                .bind(CUSTOM_USER_AGENT_KEY)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        } else {
+            validate_custom_user_agent(ua)?;
+            upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
+        }
+    }
+
     // Invalidate the in-memory repo cache so that visibility changes take
     // effect immediately instead of waiting for the TTL to expire. Remove
     // both the old key and the new key (in case the key was renamed). This
@@ -2095,7 +2193,14 @@ pub async fn update_repository(
 
     let repo_id = repo.id;
     let response = repo_to_response(repo, storage_used);
-    let response = with_quarantine_settings(&state.db, repo_id, response).await;
+    let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
+    if let Some(ref ua) = payload.custom_user_agent {
+        response.custom_user_agent = if ua.is_empty() {
+            None
+        } else {
+            Some(ua.clone())
+        };
+    }
     Ok(Json(response))
 }
 
@@ -7423,6 +7528,69 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_custom_user_agent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_custom_user_agent_valid() {
+        assert!(validate_custom_user_agent("MyClient/1.0").is_ok());
+        assert!(validate_custom_user_agent("artifact-keeper-proxy/2.0 (internal)").is_ok());
+        assert!(validate_custom_user_agent(&"a".repeat(256)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_user_agent_too_long() {
+        let ua = "a".repeat(257);
+        let err = validate_custom_user_agent(&ua).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("256")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_custom_user_agent_rejects_control_chars() {
+        // LF, CR, NUL, BEL — all forbidden per RFC 7230 §3.2.6 field-value
+        for bad in ["\n", "\r", "\x00", "\x07"] {
+            let ua = format!("bad{bad}value");
+            let err = validate_custom_user_agent(&ua).unwrap_err();
+            match err {
+                AppError::Validation(msg) => assert!(msg.contains("control characters"), "{ua:?}"),
+                other => panic!("Expected Validation error, got: {:?}", other),
+            }
+        }
+        // DEL (0x7F) is also forbidden
+        let err = validate_custom_user_agent("bad\x7Fvalue").unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("control characters")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+        // HT (0x09) is explicitly allowed
+        assert!(validate_custom_user_agent("MyClient/1.0\t(tab ok)").is_ok());
+    }
+
+    #[test]
+    fn test_create_request_deserializes_custom_user_agent() {
+        let json = r#"{"key":"npm-proxy","name":"NPM Proxy","format":"npm","repo_type":"remote","custom_user_agent":"MyClient/2.0"}"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some("MyClient/2.0"));
+    }
+
+    #[test]
+    fn test_update_request_deserializes_custom_user_agent() {
+        let json = r#"{"custom_user_agent":"MyClient/2.0"}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some("MyClient/2.0"));
+    }
+
+    #[test]
+    fn test_update_request_empty_custom_user_agent_clears() {
+        let json = r#"{"custom_user_agent":""}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.custom_user_agent.as_deref(), Some(""));
+    }
+
+    // -----------------------------------------------------------------------
     // parse_format
     // -----------------------------------------------------------------------
 
@@ -7742,6 +7910,7 @@ mod tests {
             upstream_auth_configured: false,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
+            custom_user_agent: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9067,6 +9236,7 @@ mod tests {
             upstream_auth_configured: false,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
+            custom_user_agent: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -14609,6 +14779,268 @@ mod tests {
         assert!(
             matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
             "disabled plugin format must produce a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // custom_user_agent: handler plumbing (create / update / get round-trips)
+    // -----------------------------------------------------------------------
+
+    /// `custom_user_agent` on a REMOTE create must be persisted to
+    /// `repository_config`, echoed in the create response, and read back by
+    /// the GET handler via `with_custom_user_agent`.
+    #[tokio::test]
+    async fn test_custom_user_agent_create_remote_roundtrip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ua-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("ua-remote-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "UA remote repo",
+            "maven",
+            serde_json::json!({
+                "repo_type": "remote",
+                "upstream_url": "https://upstream.example.test",
+                "custom_user_agent": "RoundTrip/1.0"
+            }),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        let Json(created) = result.expect("remote create with custom_user_agent must succeed");
+        assert_eq!(
+            created.custom_user_agent.as_deref(),
+            Some("RoundTrip/1.0"),
+            "create response must echo the configured custom_user_agent",
+        );
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(created.id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(
+            stored.as_deref(),
+            Some("RoundTrip/1.0"),
+            "custom_user_agent must be persisted to repository_config",
+        );
+
+        let Json(fetched) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+        )
+        .await
+        .expect("GET must succeed");
+        assert_eq!(
+            fetched.custom_user_agent.as_deref(),
+            Some("RoundTrip/1.0"),
+            "GET must read custom_user_agent back from repository_config",
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// `custom_user_agent` on a non-remote create must be rejected with a
+    /// Validation error before any row is written.
+    #[tokio::test]
+    async fn test_custom_user_agent_create_rejected_on_local_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ua-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("ua-local-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(
+            &repo_key,
+            "UA local repo",
+            "maven",
+            serde_json::json!({ "custom_user_agent": "Nope/1.0" }),
+        );
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+        let err = result.expect_err("custom_user_agent on a local repo must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// PATCH plumbing: a non-empty value validates + upserts and is echoed;
+    /// an empty string deletes the config row and echoes `None`; a value with
+    /// control characters is rejected; a non-remote repo is rejected.
+    #[tokio::test]
+    async fn test_custom_user_agent_update_set_clear_and_reject_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+
+        // Set: validate + upsert + response echo (Some branch).
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":"Updated/2.0"}"#)),
+        )
+        .await
+        .expect("update set must succeed");
+        assert_eq!(resp.custom_user_agent.as_deref(), Some("Updated/2.0"));
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(stored.as_deref(), Some("Updated/2.0"));
+
+        // Control characters must be rejected on the update path too.
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":"bad\r\nheader"}"#)),
+        )
+        .await
+        .expect_err("control characters must be rejected on update");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("control characters")),
+            "expected control-character Validation error, got {err:?}",
+        );
+
+        // Clear: empty string deletes the row and echoes None.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+            Json(update(r#"{"custom_user_agent":""}"#)),
+        )
+        .await
+        .expect("update clear must succeed");
+        assert_eq!(resp.custom_user_agent, None, "clear must echo None");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(CUSTOM_USER_AGENT_KEY)
+        .fetch_optional(&pool)
+        .await
+        .expect("query repository_config");
+        assert_eq!(stored, None, "clear must delete the config row");
+
+        // GET after clear exercises the with_custom_user_agent miss path.
+        let Json(fetched) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+        )
+        .await
+        .expect("GET must succeed");
+        assert_eq!(fetched.custom_user_agent, None);
+
+        // Non-remote repo: the update path must reject the field.
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(local_key.clone()),
+            Json(update(r#"{"custom_user_agent":"Nope/1.0"}"#)),
+        )
+        .await
+        .expect_err("custom_user_agent on a local repo must be rejected on update");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("remote")),
+            "expected remote-only Validation error, got {err:?}",
+        );
+
+        tdh::cleanup(&pool, local_id, user_id).await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    /// `custom_user_agent` serialization contract: omitted when `None`
+    /// (skip_serializing_if), present when set.
+    #[test]
+    fn test_repository_response_serializes_custom_user_agent() {
+        let mut resp = RepositoryResponse {
+            id: Uuid::new_v4(),
+            key: "ua-serde".to_string(),
+            name: "ua-serde".to_string(),
+            description: None,
+            format: "maven".to_string(),
+            repo_type: "remote".to_string(),
+            is_public: false,
+            allow_anonymous_access: false,
+            promotion_only: false,
+            versioning_enabled: false,
+            storage_used_bytes: 0,
+            quota_bytes: None,
+            upstream_url: None,
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
+            quarantine_enabled: None,
+            quarantine_duration_minutes: None,
+            custom_user_agent: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("custom_user_agent"),
+            "None must be omitted from the JSON body",
+        );
+        resp.custom_user_agent = Some("Serde/1.0".to_string());
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            json.contains(r#""custom_user_agent":"Serde/1.0""#),
+            "Some must serialize the configured value",
         );
     }
 
