@@ -829,6 +829,56 @@ async fn test_saml_acs_xsw_attribute_after_assertion_not_admin() {
     delete_saml_provider(&pool, provider_id).await;
 }
 
+/// In-`<ds:Signature>` `<ds:Object>` injection variant (#2453 layer-3): the
+/// assertion is validly signed but carries NO groups attribute; a
+/// `<saml:Attribute Name="groups">` with the provider admin group is spliced
+/// into a `<ds:Object>` INSIDE the assertion's enveloped `<ds:Signature>` after
+/// signing. The signature transform removes the whole `<ds:Signature>` before
+/// digesting, so the injection is unsigned and the signature still verifies —
+/// but the `<ds:Signature>` is a child of the assertion, so a parser that scopes
+/// claims to the assertion subtree WITHOUT excluding the Signature subtree would
+/// harvest the injected group. Login must succeed (307) as a NON-admin.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_ds_object_groups_injection_not_admin() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            admin_group: Some("ak-admins".to_string()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let name_id = format!("saml-dsobjxsw-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![]; // signed assertion carries no groups attribute
+
+    let payload = spec.ds_object_groups_injection_b64(&["ak-admins"]);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a valid signature with an in-<ds:Signature> <ds:Object> attribute must still authenticate"
+    );
+    let (_, _, _, is_admin) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the signed subject must still provision");
+    assert!(
+        !is_admin,
+        "a groups attribute spliced into a <ds:Object> inside the assertion's \
+         <ds:Signature> must NOT grant admin"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
 /// Comment-split NameID variant (#2453 layer-2 / Case-5): the signed NameID text
 /// is split by an XML comment (`victim-prefix-<!--c-->suffix`). exc-c14n#
 /// (no-comments) strips the comment before digesting, so the signature stays

@@ -621,6 +621,43 @@ impl SamlResponseSpec {
         );
         base64_standard(wrapped.as_bytes())
     }
+
+    /// In-`<ds:Signature>` `<ds:Object>` claim-injection variant (#2453 layer-3):
+    /// the assertion is signed normally with NO groups of its own, then a
+    /// `<saml:Attribute Name="groups">` carrying `attacker_groups` is spliced
+    /// into a `<ds:Object>` INSIDE the assertion's own `<ds:Signature>` — AFTER
+    /// signing. The enveloped-signature transform removes the entire
+    /// `<ds:Signature>` element before the digest is computed, and the injected
+    /// `<ds:Object>` is not referenced by any `<ds:Reference>`, so it is not
+    /// covered by the signature and verification still passes. Because the
+    /// `<ds:Signature>` is a CHILD of `<saml:Assertion>`, a parser that scopes
+    /// claims to the assertion subtree but does NOT exclude the transform-removed
+    /// `<ds:Signature>` subtree would harvest the injected groups as an
+    /// in-assertion claim.
+    ///
+    /// Pair with `SamlResponseSpec { groups: vec![], .. }` so the signed
+    /// assertion carries no groups attribute of its own.
+    pub fn ds_object_groups_injection_b64(&self, attacker_groups: &[&str]) -> String {
+        let signed = sign_saml_document(&self.to_unsigned_xml());
+        let values = attacker_groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "<saml:AttributeValue>{}</saml:AttributeValue>",
+                    xml_escape(g)
+                )
+            })
+            .collect::<String>();
+        let injected = format!(
+            r#"<ds:Object><saml:Attribute xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Name="groups">{values}</saml:Attribute></ds:Object>"#
+        );
+        // Splice the `<ds:Object>` just before the enveloped signature closes,
+        // inside the assertion's own `<ds:Signature>`. Adding a sibling of
+        // `<ds:SignedInfo>` does not change `<ds:SignedInfo>`, so the
+        // `<ds:SignatureValue>` still verifies.
+        let wrapped = signed.replacen("</ds:Signature>", &format!("{injected}</ds:Signature>"), 1);
+        base64_standard(wrapped.as_bytes())
+    }
 }
 
 /// Base64 (standard alphabet, padded) — the encoding `saml_acs` decodes the
