@@ -8248,23 +8248,32 @@ mod tests {
 
     const STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming(";
 
+    /// The digest-gated streaming sibling: same streaming/tee semantics as
+    /// `proxy_fetch_streaming` (no buffering), plus a cache commit gated on
+    /// an expected SHA-256. The debian pool `.deb` download moved to this
+    /// helper in #2459 (Tier B cache-poisoning protection), so its pin
+    /// asserts this token instead — a revert to either the buffered
+    /// `proxy_fetch` OR the unverified streaming helper must fail the pin.
+    const VERIFIED_STREAMING_CALL_TOKEN: &str =
+        "proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(";
+
     /// One pin test per handler. Kept as separate `#[test]` functions
     /// (rather than a single loop) so a CI failure points directly at
     /// the regressing handler. The macro keeps the surface area small
     /// and stops the five near-identical functions from tripping the
     /// 3% duplication gate.
     macro_rules! streaming_pin_test {
-        ($name:ident, $module_file:literal, $what:literal) => {
+        ($name:ident, $module_file:literal, $token:expr, $what:literal) => {
             #[test]
             fn $name() {
                 let src = include_str!($module_file);
                 assert!(
-                    src.contains(STREAMING_CALL_TOKEN),
+                    src.contains($token),
                     "{} handler MUST call `{}` for {} (#1183). A revert \
                      to the buffered `proxy_fetch` helper would re-introduce \
                      the OOM regression closed by #895/#1181.",
                     $module_file,
-                    STREAMING_CALL_TOKEN,
+                    $token,
                     $what,
                 );
             }
@@ -8274,27 +8283,32 @@ mod tests {
     streaming_pin_test!(
         test_maven_remote_fetch_uses_streaming_helper_1183,
         "maven.rs",
+        STREAMING_CALL_TOKEN,
         "the remote catch-all download"
     );
     streaming_pin_test!(
         test_goproxy_remote_fetch_uses_streaming_helper_1183,
         "goproxy.rs",
+        STREAMING_CALL_TOKEN,
         "the remote `@v/<ver>.zip` download"
     );
     streaming_pin_test!(
         test_gitlfs_remote_fetch_uses_streaming_helper_1183,
         "gitlfs.rs",
+        STREAMING_CALL_TOKEN,
         "the remote LFS blob download (large binaries)"
     );
     streaming_pin_test!(
         test_alpine_remote_fetch_uses_streaming_helper_1183,
         "alpine.rs",
+        STREAMING_CALL_TOKEN,
         "the remote `.apk` download"
     );
     streaming_pin_test!(
         test_debian_remote_fetch_uses_streaming_helper_1183,
         "debian.rs",
-        "the remote pool `.deb` download"
+        VERIFIED_STREAMING_CALL_TOKEN,
+        "the remote pool `.deb` download (digest-gated cache commit, #2459)"
     );
 
     // -------------------------------------------------------------------
