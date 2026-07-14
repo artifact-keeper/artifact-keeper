@@ -521,6 +521,8 @@ async fn upload_module(
         "terraform/modules/{}/{}/{}/{}.tar.gz",
         namespace, name, provider, version
     );
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -917,6 +919,8 @@ async fn upload_provider(
         "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
         namespace, type_name, version, type_name, platform
     );
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
 
     // Store the file
     let storage = state

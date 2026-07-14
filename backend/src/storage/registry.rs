@@ -81,6 +81,20 @@ impl StorageRegistry {
     }
 }
 
+/// Whether a storage backend gives each repository a physically isolated key
+/// space.
+///
+/// Only `"filesystem"` does: [`StorageRegistry::backend_for`] roots a fresh
+/// [`FilesystemStorage`] at the repository's `storage_path`, so every repository
+/// gets its own directory tree. Cloud backends (S3/GCS/Azure) resolve to a
+/// single shared instance and share one flat object namespace, so a bare
+/// `{format}/{coords}` key on cloud is not provably owned by the requesting
+/// repository. Callers use this to gate row-bypass reads (which are only sound
+/// where the backend physically isolates repositories).
+pub fn backend_is_repo_isolated(backend: &str) -> bool {
+    backend == "filesystem"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +293,22 @@ mod tests {
     fn test_default_backend_can_be_filesystem() {
         let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string());
         assert_eq!(registry.default_backend(), "filesystem");
+    }
+
+    // -- backend_is_repo_isolated (#2504) -------------------------------------
+
+    #[test]
+    fn test_backend_is_repo_isolated_only_filesystem() {
+        // Only filesystem physically isolates each repository's key space; every
+        // cloud backend shares one flat namespace, so row-bypass reads must not
+        // trust the key's implicit ownership there.
+        assert!(backend_is_repo_isolated("filesystem"));
+        for cloud in ["s3-primary", "gcs-archive", "azure-blob", "s3", "gcs", ""] {
+            assert!(
+                !backend_is_repo_isolated(cloud),
+                "cloud backend {cloud:?} must NOT be treated as repo-isolated"
+            );
+        }
     }
 
     // -- #1054: registry / primary-storage coincidence ------------------------

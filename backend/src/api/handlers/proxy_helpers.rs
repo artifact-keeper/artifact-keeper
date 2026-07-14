@@ -3767,6 +3767,37 @@ pub async fn parse_multipart_file_with_json(
 /// Replaces the duplicated "let storage = state.storage_for_repo(...) ;
 /// storage.put(...).await.map_err(...)" block that every multipart upload
 /// handler otherwise repeats.
+/// Refuse a flat-key hosted write that would overwrite a *different*
+/// repository's object on a shared cloud namespace. Thin response-mapping
+/// wrapper over [`crate::services::artifact_service::guard_foreign_storage_key`]
+/// so `Result<_, Response>` handlers can call it with `?`. Maps a cross-repo
+/// collision to `409 Conflict`; same-repo re-uploads and repo-scoped keys pass.
+///
+/// The guard applies **only to shared-namespace (cloud) backends**. On a
+/// repo-isolated backend (filesystem) each repository has its own physically
+/// separate directory tree, so two repositories legitimately hold the same
+/// coordinate key without colliding — running the guard there would wrongly
+/// reject the second repository's upload. `storage_backend` is therefore checked
+/// first and the guard is skipped for filesystem.
+#[allow(clippy::result_large_err)]
+pub async fn guard_cross_repo_write(
+    state: &crate::api::SharedState,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<(), Response> {
+    if crate::storage::backend_is_repo_isolated(storage_backend) {
+        return Ok(());
+    }
+    crate::services::artifact_service::guard_foreign_storage_key(
+        &state.db,
+        repository_id,
+        storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())
+}
+
 #[allow(clippy::result_large_err)]
 pub async fn put_artifact_bytes(
     state: &crate::api::SharedState,
@@ -3774,6 +3805,7 @@ pub async fn put_artifact_bytes(
     storage_key: &str,
     body: Bytes,
 ) -> Result<(), Response> {
+    guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -3927,6 +3959,7 @@ pub async fn put_artifact_stream(
     storage_key: &str,
     staged: StagedUpload,
 ) -> Result<crate::storage::PutStreamResult, Response> {
+    guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;

@@ -907,7 +907,14 @@ async fn download(
         // under `maven/`. (The SNAPSHOT branch below is inherently hosted-only:
         // `resolve_snapshot_artifact` reads the `artifacts` table, which never
         // has rows for Remote/Virtual repos, so it short-circuits for them.)
-        if checksum_compute_eligible(&repo.repo_type) {
+        // The stored-sidecar reads below fetch a bare `maven/<path>` key with no
+        // artifact row scoped to the caller's repository, so they are only sound
+        // on repo-isolated (filesystem) backends. On shared cloud namespaces
+        // (S3/GCS/Azure) that flat key can belong to a *different* repository, so
+        // skip the stored sidecar there and fall through to the row-gated
+        // computed-checksum path below (#2504).
+        let repo_isolated = crate::storage::backend_is_repo_isolated(&repo.storage_backend);
+        if checksum_compute_eligible(&repo.repo_type) && repo_isolated {
             // First try to find a stored checksum file
             let checksum_storage_key = format!("maven/{}", path);
             if let Ok(content) = storage.get(&checksum_storage_key).await {
@@ -920,8 +927,10 @@ async fn download(
         }
 
         // If this is a SNAPSHOT path, try the stored checksum under the
-        // timestamp-resolved filename before falling through to compute.
-        if base_path.contains("-SNAPSHOT") {
+        // timestamp-resolved filename before falling through to compute. Same
+        // shared-namespace hazard as above: the sidecar key is unanchored, so
+        // gate it to repo-isolated backends (#2504).
+        if base_path.contains("-SNAPSHOT") && repo_isolated {
             if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
                 let resolved_checksum_key =
                     format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
@@ -1212,7 +1221,12 @@ async fn fetch_maven_metadata_bytes(
                 let batch = futures::future::join_all(chunk.iter().map(|member| async {
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
-                    } else {
+                    } else if crate::storage::backend_is_repo_isolated(&member.storage_backend) {
+                        // Unanchored `maven/<path>` read: only sound where the
+                        // member's backend physically isolates repositories
+                        // (filesystem). On a shared cloud namespace this key can
+                        // hold a non-member repository's metadata, so skip it
+                        // there (#2504).
                         let member_storage_key = format!("maven/{}", path);
                         match state.storage_for_repo(&member.storage_location()) {
                             Ok(member_storage) => {
@@ -1224,6 +1238,8 @@ async fn fetch_maven_metadata_bytes(
                             }
                             Err(_) => None,
                         }
+                    } else {
+                        None
                     }
                 }))
                 .await;
@@ -1255,13 +1271,19 @@ async fn fetch_maven_metadata_bytes(
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                     } else {
-                        let member_storage_key = format!("maven/{}", path);
-                        if let Ok(member_storage) =
-                            state.storage_for_repo(&member.storage_location())
-                        {
-                            if let Ok(content) = member_storage.get(&member_storage_key).await {
-                                if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                    entries.extend(parse_snapshot_versions_xml(xml_str));
+                        // Unanchored `maven/<path>` read: only sound where the
+                        // member's backend physically isolates repositories
+                        // (filesystem); on a shared cloud namespace skip it and
+                        // rely on the row-scoped snapshot entries below (#2504).
+                        if crate::storage::backend_is_repo_isolated(&member.storage_backend) {
+                            let member_storage_key = format!("maven/{}", path);
+                            if let Ok(member_storage) =
+                                state.storage_for_repo(&member.storage_location())
+                            {
+                                if let Ok(content) = member_storage.get(&member_storage_key).await {
+                                    if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                        entries.extend(parse_snapshot_versions_xml(xml_str));
+                                    }
                                 }
                             }
                         }
@@ -1301,9 +1323,16 @@ async fn fetch_maven_metadata_bytes(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    let meta_storage_key = format!("maven/{}", path);
-    if let Ok(content) = storage.get(&meta_storage_key).await {
-        return Ok(content);
+    // The stored maven-metadata.xml read fetches a bare `maven/<path>` key with
+    // no artifact row scoped to the caller's repository, so it is only sound on
+    // repo-isolated (filesystem) backends. On shared cloud namespaces the same
+    // key can hold a *different* repository's metadata, so skip the stored read
+    // there and fall through to row-gated dynamic generation below (#2504).
+    if crate::storage::backend_is_repo_isolated(&repo.storage_backend) {
+        let meta_storage_key = format!("maven/{}", path);
+        if let Ok(content) = storage.get(&meta_storage_key).await {
+            return Ok(content);
+        }
     }
 
     if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
@@ -1700,7 +1729,17 @@ async fn serve_artifact(
             // uploads started indexing every physical asset as an artifact row.
             // Direct byte access remains available for those older companion
             // files while new uploads resolve through the exact `artifacts.path`.
-            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            //
+            // This fallback reads a bare `maven/{path}` key with no artifact row
+            // scoped to the caller's repository, so it is only sound on backends
+            // that physically isolate each repository's key space (filesystem,
+            // rooted at the repo's storage_path). On shared cloud namespaces
+            // (S3/GCS/Azure) the same flat key can belong to a *different*
+            // repository, so the fallback is skipped there and the request 404s
+            // rather than serving another repository's bytes.
+            if (repo.repo_type == RepositoryType::Local
+                || repo.repo_type == RepositoryType::Staging)
+                && crate::storage::backend_is_repo_isolated(&repo.storage_backend)
             {
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
@@ -2014,6 +2053,10 @@ async fn upload(
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
     let storage_key = format!("maven/{}", path);
+    // Refuse to overwrite a different repository's object living at this exact
+    // flat key on a shared cloud namespace (cross-repo poisoning guard).
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
