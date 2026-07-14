@@ -194,7 +194,15 @@ pub async fn repair_release_1_1_9_divergence(db: &PgPool) -> Result<()> {
         return Ok(());
     }
 
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    // This is a FROM-less SELECT of three scalar sub-queries, so PostgreSQL
+    // always returns exactly one row. When a migration row (73/74/75) is
+    // absent, its sub-query yields SQL NULL rather than a missing row, so
+    // `fetch_optional` returns `Some((NULL, NULL, NULL))` - never `None`.
+    // Decode into `Option<Vec<u8>>` columns so an absent row surfaces as
+    // `None` instead of failing to decode a NULL into `Vec<u8>` (which would
+    // abort startup and cause a restart loop; see #2456).
+    type ChecksumRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+    let row: Option<ChecksumRow> = sqlx::query_as(
         "SELECT \
              (SELECT checksum FROM _sqlx_migrations WHERE version = 73), \
              (SELECT checksum FROM _sqlx_migrations WHERE version = 74), \
@@ -204,7 +212,9 @@ pub async fn repair_release_1_1_9_divergence(db: &PgPool) -> Result<()> {
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((stored_73, stored_74, stored_75)) = row else {
+    // All three diverged v1.1.9 rows must be present; any NULL means this is
+    // not the v1.1.9 -> main upgrade we recover, so no-op.
+    let Some((Some(stored_73), Some(stored_74), Some(stored_75))) = row else {
         return Ok(());
     };
 
@@ -387,27 +397,51 @@ mod tests {
         }
     }
 
+    /// Create a fresh isolation schema (named `<prefix>_<uuid>`) and return a
+    /// pool whose connections are pinned to it, together with the resolved
+    /// `DATABASE_URL` and schema name (both needed for `drop_isolation_schema`
+    /// cleanup). Returns `None` when `DATABASE_URL` is unset or the database
+    /// is unreachable, so the DB-backed tests skip silently (local `cargo test
+    /// --lib` without a Postgres just no-ops).
+    async fn setup_isolated_pool(prefix: &str) -> Option<(String, String, PgPool)> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let bootstrap = PgPool::connect(&url).await.ok()?;
+        let schema = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+        create_isolation_schema(&bootstrap, &schema).await;
+        drop(bootstrap);
+        let pool = schema_isolated_pool(&url, &schema).await;
+        Some((url, schema, pool))
+    }
+
+    /// Stand up the `_sqlx_migrations` table in the same shape sqlx creates
+    /// it, so the tests can seed migration rows the repair function inspects.
+    async fn create_sqlx_migrations_table(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations ( \
+                 version BIGINT PRIMARY KEY, \
+                 description TEXT NOT NULL, \
+                 installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+                 success BOOLEAN NOT NULL, \
+                 checksum BYTEA NOT NULL, \
+                 execution_time BIGINT NOT NULL \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create _sqlx_migrations");
+    }
+
     /// DB-backed regression test for the v1.1.9 -> main upgrade path.
     /// Requires `DATABASE_URL` (the CI coverage job sets this; local
     /// `cargo test --lib` skips silently when the var is missing).
     #[tokio::test]
     async fn repair_release_1_1_9_divergence_rewrites_checksums_and_applies_schema() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(v) => v,
-            Err(_) => return,
-        };
         // Use a schema-isolated pool: install the repair scenario into
         // a fresh test schema so we don't disturb the migrator's
         // production state on shared CI databases.
-        let bootstrap = match PgPool::connect(&url).await {
-            Ok(p) => p,
-            Err(_) => return,
+        let Some((url, schema, pool)) = setup_isolated_pool("issue1277").await else {
+            return;
         };
-
-        let schema = format!("issue1277_{}", uuid::Uuid::new_v4().simple());
-        create_isolation_schema(&bootstrap, &schema).await;
-        drop(bootstrap);
-        let pool = schema_isolated_pool(&url, &schema).await;
 
         // Minimal `users` and `artifacts` skeleton matching the columns
         // the repair function touches. Real installs always have these
@@ -434,22 +468,9 @@ mod tests {
         .await
         .expect("create artifacts");
 
-        // Stand up the _sqlx_migrations table in the same shape sqlx
-        // creates it, then seed the three rows with the v1.1.9
-        // checksums to simulate a freshly-upgraded customer.
-        sqlx::query(
-            "CREATE TABLE _sqlx_migrations ( \
-                 version BIGINT PRIMARY KEY, \
-                 description TEXT NOT NULL, \
-                 installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                 success BOOLEAN NOT NULL, \
-                 checksum BYTEA NOT NULL, \
-                 execution_time BIGINT NOT NULL \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create _sqlx_migrations");
+        // Stand up the _sqlx_migrations table, then seed the three rows
+        // with the v1.1.9 checksums to simulate a freshly-upgraded customer.
+        create_sqlx_migrations_table(&pool).await;
         for (version, label, checksum) in [
             (
                 73i64,
@@ -577,36 +598,14 @@ mod tests {
     /// install that already migrated past slot 75.
     #[tokio::test]
     async fn repair_release_1_1_9_divergence_no_op_when_checksums_differ() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Some((url, schema, pool)) = setup_isolated_pool("issue1277_noop").await else {
+            return;
         };
-        let bootstrap = match PgPool::connect(&url).await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let schema = format!("issue1277_noop_{}", uuid::Uuid::new_v4().simple());
-        create_isolation_schema(&bootstrap, &schema).await;
-        drop(bootstrap);
-        let pool = schema_isolated_pool(&url, &schema).await;
 
         // Seed _sqlx_migrations with NOT-v1.1.9 checksums (e.g. fresh
         // main install where rows 73-75 were applied from main's own
         // files). The function must not touch this DB.
-        sqlx::query(
-            "CREATE TABLE _sqlx_migrations ( \
-                 version BIGINT PRIMARY KEY, \
-                 description TEXT NOT NULL, \
-                 installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                 success BOOLEAN NOT NULL, \
-                 checksum BYTEA NOT NULL, \
-                 execution_time BIGINT NOT NULL \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create _sqlx_migrations");
+        create_sqlx_migrations_table(&pool).await;
 
         let bogus_checksum = vec![0xaau8; 48];
         for version in [73i64, 74, 75] {
@@ -660,24 +659,79 @@ mod tests {
     /// table does not exist (fresh install).
     #[tokio::test]
     async fn repair_release_1_1_9_divergence_no_op_on_fresh_install() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Some((url, schema, pool)) = setup_isolated_pool("issue1277_fresh").await else {
+            return;
         };
-        let bootstrap = match PgPool::connect(&url).await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let schema = format!("issue1277_fresh_{}", uuid::Uuid::new_v4().simple());
-        create_isolation_schema(&bootstrap, &schema).await;
-        drop(bootstrap);
-        let pool = schema_isolated_pool(&url, &schema).await;
 
         // No _sqlx_migrations table at all. The repair must early-return.
         repair_release_1_1_9_divergence(&pool)
             .await
             .expect("repair must succeed (as no-op) on fresh install");
+
+        drop(pool);
+        drop_isolation_schema(&url, &schema).await;
+    }
+
+    /// The repair must be a strict no-op when the `_sqlx_migrations` table
+    /// exists but rows 73/74/75 are absent - the reporter's 1.1.0-rc.8 ->
+    /// 1.2.0 case (#2456). The detection query is a FROM-less SELECT of
+    /// three scalar sub-queries, so it always returns exactly one row whose
+    /// columns are NULL when the rows are missing. Before the fix this NULL
+    /// failed to decode into `Vec<u8>` ("unexpected null; try decoding as an
+    /// `Option`") and aborted startup into a restart loop; after the fix the
+    /// columns decode into `Option<Vec<u8>>` and the missing rows are treated
+    /// as a clean no-op, leaving the schema untouched.
+    #[tokio::test]
+    async fn repair_release_1_1_9_divergence_no_op_when_rows_absent() {
+        let Some((url, schema, pool)) = setup_isolated_pool("issue2456_absent").await else {
+            return;
+        };
+
+        // Stand up the _sqlx_migrations table but seed NO rows for versions
+        // 73/74/75. Seed a lower row (72) so the table is non-empty and
+        // realistic for a pre-73 (1.1.0-rc.8) database.
+        create_sqlx_migrations_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (72, 'pre_v1_1_9_baseline', true, $1, 0)",
+        )
+        .bind(vec![0x11u8; 48])
+        .execute(&pool)
+        .await
+        .expect("seed baseline row 72");
+
+        // Must be a clean no-op (pre-fix: Err with the "unexpected null"
+        // decode failure that aborted startup).
+        repair_release_1_1_9_divergence(&pool)
+            .await
+            .expect("repair must be a no-op when rows 73/74/75 are absent");
+
+        // Schema must be untouched: the repair's account-lockout columns and
+        // password_history table must NOT have been created.
+        let users_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'users')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("users exists check");
+        assert!(
+            !users_exists,
+            "no-op path must not create the users table / lockout columns"
+        );
+
+        let ph_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'password_history')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("password_history exists check");
+        assert!(
+            !ph_exists,
+            "no-op path must not create the password_history table"
+        );
 
         drop(pool);
         drop_isolation_schema(&url, &schema).await;
