@@ -5160,6 +5160,7 @@ async fn record_redirect_download(
         client_ip: ip_address.and_then(|s| s.parse().ok()),
         user_id,
         user_agent: user_agent.map(str::to_string),
+        is_head: false,
     };
     crate::services::artifact_service::record_download(db, artifact_id, &ctx).await;
 }

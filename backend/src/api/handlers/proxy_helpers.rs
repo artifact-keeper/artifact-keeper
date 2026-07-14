@@ -7547,6 +7547,7 @@ mod tests {
             client_ip: Some("203.0.113.77".parse().unwrap()),
             user_id: Some(user_id),
             user_agent: Some("serve-local-test/1.0".to_string()),
+            is_head: false,
         };
         let resp = serve_local_artifact(
             &state,
@@ -7813,6 +7814,7 @@ mod tests {
                 client_ip: None,
                 user_id: None,
                 user_agent: None,
+                is_head: false,
             },
             opts,
         )
@@ -7861,6 +7863,7 @@ mod tests {
                 client_ip: None,
                 user_id: None,
                 user_agent: None,
+                is_head: false,
             },
             opts,
         )
@@ -7908,6 +7911,7 @@ mod tests {
                 client_ip: None,
                 user_id: None,
                 user_agent: None,
+                is_head: false,
             },
             opts,
         )
@@ -8726,6 +8730,7 @@ mod tests {
                 client_ip: None,
                 user_id: None,
                 user_agent: None,
+                is_head: false,
             },
             // Remote member must redirect before reaching any local fetch.
             |_id, _loc| async {
@@ -8990,6 +8995,7 @@ mod tests {
                 client_ip: None,
                 user_id: None,
                 user_agent: None,
+                is_head: false,
             },
             |_id, _loc| async {
                 panic!("local_fetch must NOT run: the held entry must 409 before any fallback");
@@ -9079,6 +9085,7 @@ mod tests {
             client_ip: None,
             user_id: None,
             user_agent: None,
+            is_head: false,
         };
         let result = super::local_fetch_or_redirect(
             &fx.pool,
@@ -9177,6 +9184,7 @@ mod tests {
             client_ip: None,
             user_id: None,
             user_agent: None,
+            is_head: false,
         };
 
         super::local_fetch_or_redirect(
@@ -9209,6 +9217,102 @@ mod tests {
         assert_eq!(
             after_two, 2,
             "a second serve records a second row (append-only COUNT tracks downloads 1:1)"
+        );
+    }
+
+    /// #2260 §5: a HEAD request served through the shared local-serve choke
+    /// point records ZERO download-statistics rows, while a GET on the same
+    /// artifact records exactly one. axum's `get()` auto-dispatches HEAD to the
+    /// GET handler for the format routes (pypi/npm/rubygems/rpm/cran/hex/puppet/
+    /// ansible/huggingface/maven), so the `DownloadContext.is_head` flag — set
+    /// from the request method — must suppress the recorder even though the
+    /// helper runs. Guards against the HEAD over-count QA caught on the format
+    /// download routes.
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_head_does_not_count_2260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state(fx.pool.clone(), &storage_path);
+        let repo_info =
+            tdh::make_repo_info(fx.repo_id, &fx.repo_key, &fx.storage_dir, "local", None);
+
+        let body: &[u8] = b"head-guard-bytes";
+        let artifact_path = "pkg/pkg-3.0.0.bin";
+        let storage_key = format!("{}/{}", fx.repo_key, artifact_path);
+        super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
+            .await
+            .expect("seed hosted payload on disk");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(fx.repo_id)
+        .bind(artifact_path)
+        .bind("pkg")
+        .bind("3.0.0")
+        .bind(body.len() as i64)
+        .bind("test-pkg3")
+        .bind("application/octet-stream")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed hosted artifact row");
+
+        let location = repo_info.storage_location();
+        // A HEAD-flagged context (as the extractor builds it for a HEAD request).
+        let head_ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: true,
+        };
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &head_ctx,
+        )
+        .await
+        .expect("HEAD serve must still succeed");
+        let after_head = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        // A GET (is_head == false) on the same artifact must record one row.
+        let get_ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &get_ctx,
+        )
+        .await
+        .expect("GET serve must succeed");
+        let after_get = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            after_head, 0,
+            "a HEAD must NOT record a download row (#2260 §5)"
+        );
+        assert_eq!(
+            after_get, 1,
+            "a GET on the same artifact records exactly one"
         );
     }
 
@@ -9267,6 +9371,7 @@ mod tests {
             client_ip: None,
             user_id: None,
             user_agent: None,
+            is_head: false,
         };
         let db = pool.clone();
         let state_arc = state.clone();
