@@ -112,6 +112,12 @@ pub struct SamlConfigRow {
     /// historical relative path. Defaults to false so existing
     /// configurations keep their pre-138 wire format.
     pub use_absolute_acs_url: bool,
+    /// When true, SAML assertion group values are reflected as Artifact
+    /// Keeper group memberships (auto-created, tagged
+    /// `external_source = 'saml'`, reconciled per login). Mirrors the OIDC
+    /// flag from #1094; defaults to false so existing providers keep the
+    /// admin-role-only group behavior (migration 157, #2333).
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -124,6 +130,7 @@ redacted_debug!(SamlConfigRow {
     redact certificate,
     show sp_entity_id,
     show use_absolute_acs_url,
+    show map_groups_to_groups,
     show is_enabled,
 });
 
@@ -211,6 +218,10 @@ pub struct SamlConfigResponse {
     /// emits an absolute ACS URL. Defaults to false so existing providers
     /// keep their pre-138 wire format.
     pub use_absolute_acs_url: bool,
+    /// Opt-in flag (see migration 157, #2333): when true, SAML assertion
+    /// group values are reflected as Artifact Keeper group memberships,
+    /// mirroring the OIDC flag from #1094. Defaults to false.
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -327,6 +338,10 @@ pub struct CreateSamlConfigRequest {
     /// emits an absolute ACS URL for stricter IdPs that reject the
     /// historical relative path. Defaults to false.
     pub use_absolute_acs_url: Option<bool>,
+    /// Opt-in flag (see migration 157, #2333): when true, SAML assertion
+    /// group values are reflected as Artifact Keeper group memberships.
+    /// Defaults to false.
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -345,6 +360,7 @@ pub struct UpdateSamlConfigRequest {
     pub admin_group: Option<String>,
     pub is_enabled: Option<bool>,
     pub use_absolute_acs_url: Option<bool>,
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1156,7 +1172,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             ORDER BY name
             "#,
@@ -1174,7 +1190,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1194,7 +1210,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1222,18 +1238,19 @@ impl AuthConfigService {
         let require_signed_assertions = req.require_signed_assertions.unwrap_or(true);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let use_absolute_acs_url = req.use_absolute_acs_url.unwrap_or(false);
+        let map_groups_to_groups = req.map_groups_to_groups.unwrap_or(false);
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
             INSERT INTO saml_configs (id, name, entity_id, sso_url, slo_url, certificate,
                                       name_id_format, attribute_mapping, sp_entity_id,
                                       sign_requests, require_signed_assertions, admin_group,
-                                      is_enabled, use_absolute_acs_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                      is_enabled, use_absolute_acs_url, map_groups_to_groups)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -1250,6 +1267,7 @@ impl AuthConfigService {
         .bind(&req.admin_group)
         .bind(is_enabled)
         .bind(use_absolute_acs_url)
+        .bind(map_groups_to_groups)
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create SAML config: {e}")))?;
@@ -1267,7 +1285,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1295,6 +1313,9 @@ impl AuthConfigService {
         let use_absolute_acs_url = req
             .use_absolute_acs_url
             .unwrap_or(existing.use_absolute_acs_url);
+        let map_groups_to_groups = req
+            .map_groups_to_groups
+            .unwrap_or(existing.map_groups_to_groups);
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
@@ -1303,12 +1324,12 @@ impl AuthConfigService {
                 certificate = $5, name_id_format = $6, attribute_mapping = $7,
                 sp_entity_id = $8, sign_requests = $9, require_signed_assertions = $10,
                 admin_group = $11, is_enabled = $12, use_absolute_acs_url = $13,
-                updated_at = NOW()
-            WHERE id = $14
+                map_groups_to_groups = $14, updated_at = NOW()
+            WHERE id = $15
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(&name)
@@ -1324,6 +1345,7 @@ impl AuthConfigService {
         .bind(&admin_group)
         .bind(is_enabled)
         .bind(use_absolute_acs_url)
+        .bind(map_groups_to_groups)
         .bind(id)
         .fetch_one(pool)
         .await
@@ -1357,7 +1379,7 @@ impl AuthConfigService {
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(toggle.enabled)
@@ -1386,6 +1408,7 @@ impl AuthConfigService {
             admin_group: row.admin_group,
             is_enabled: row.is_enabled,
             use_absolute_acs_url: row.use_absolute_acs_url,
+            map_groups_to_groups: row.map_groups_to_groups,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -1966,6 +1989,7 @@ mod tests {
             admin_group: Some("admins".to_string()),
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         }
@@ -2334,6 +2358,7 @@ mod tests {
             admin_group: None,
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         };
@@ -2429,6 +2454,7 @@ mod tests {
             admin_group: None,
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -3077,6 +3103,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: Some(true),
                 use_absolute_acs_url: None,
+                map_groups_to_groups: None,
             }
         }
 
@@ -3177,6 +3204,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: None,
                 use_absolute_acs_url: None,
+                map_groups_to_groups: None,
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -3212,6 +3240,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: None,
                 use_absolute_acs_url: Some(false),
+                map_groups_to_groups: None,
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -3260,6 +3289,125 @@ mod tests {
                 toggled.use_absolute_acs_url,
                 "toggle must not zero out the new column (the RETURNING field list pins this)"
             );
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // SAML map_groups_to_groups column (migration 157, #2333). Same SQL
+        // touchpoints as the use_absolute_acs_url suite above: defaults on
+        // create, explicit create, get round-trip, get_decrypted, update
+        // preserve-existing, update flip, list.
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_create_saml_defaults_map_groups_to_groups_to_false() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let req = make_saml_create_req("mg-default");
+            let resp = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(
+                !resp.map_groups_to_groups,
+                "omitted map_groups_to_groups must default to false (migration 157 invariant)"
+            );
+            cleanup_saml(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_map_groups_to_groups_round_trips_create_get_decrypted_list() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("mg-roundtrip");
+            req.map_groups_to_groups = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(created.map_groups_to_groups);
+
+            let fetched = AuthConfigService::get_saml(&pool, created.id)
+                .await
+                .expect("get_saml");
+            assert!(fetched.map_groups_to_groups);
+
+            // get_saml_decrypted is what saml_acs reads the flag from.
+            let row = AuthConfigService::get_saml_decrypted(&pool, created.id)
+                .await
+                .expect("get_saml_decrypted");
+            assert!(row.map_groups_to_groups);
+
+            let listed = AuthConfigService::list_saml(&pool)
+                .await
+                .expect("list_saml");
+            let found = listed
+                .iter()
+                .find(|r| r.id == created.id)
+                .expect("created row must appear in list_saml");
+            assert!(found.map_groups_to_groups);
+
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_saml_preserves_and_flips_map_groups_to_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("mg-update");
+            req.map_groups_to_groups = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+
+            // An update that does not mention the flag must preserve it.
+            let update = UpdateSamlConfigRequest {
+                name: Some(format!("mg-renamed-{}", created.id)),
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: None,
+                map_groups_to_groups: None,
+            };
+            let updated = AuthConfigService::update_saml(&pool, created.id, update)
+                .await
+                .expect("update_saml");
+            assert!(
+                updated.map_groups_to_groups,
+                "map_groups_to_groups must survive an update that does not mention it"
+            );
+
+            // An explicit update must flip it.
+            let flip = UpdateSamlConfigRequest {
+                name: None,
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: None,
+                map_groups_to_groups: Some(false),
+            };
+            let flipped = AuthConfigService::update_saml(&pool, created.id, flip)
+                .await
+                .expect("update_saml flip");
+            assert!(!flipped.map_groups_to_groups);
+
             cleanup_saml(&pool, created.id).await;
         }
     }

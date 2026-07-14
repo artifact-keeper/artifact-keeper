@@ -908,6 +908,10 @@ pub async fn saml_acs(
         }
     };
 
+    // Keep a copy of the assertion group values for the membership sync
+    // below; `saml_user.groups` itself moves into FederatedCredentials.
+    let saml_groups = saml_user.groups.clone();
+
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -935,6 +939,26 @@ pub async fn saml_acs(
         serde_json::json!({ "username": user.username }),
     )
     .await;
+
+    // Issue #2333 (parity with OIDC #1094): when map_groups_to_groups is
+    // enabled, reflect the SAML assertion group values as Artifact Keeper
+    // group memberships. Auto-create groups (tagged with
+    // external_source = 'saml') on first sight and reconcile membership so
+    // removed groups drop their members. Non-fatal: login still succeeds if
+    // the sync fails.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "saml", &saml_groups)
+                .await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %id,
+                "Failed to sync SAML groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -1130,32 +1154,48 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
 }
 
 /// Reconcile an OIDC user's group memberships against the `groups` table.
-///
-/// For each group name in `oidc_groups`:
-/// - Find the group by name; if missing, auto-create it tagged with
-///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
-/// - Ensure a `user_group_members` row exists.
-///
-/// Then remove the user from any group that:
-/// - is tagged with this same `external_source` + `external_provider_id`, AND
-/// - is not present in `oidc_groups`.
-///
-/// Operator-managed groups (NULL `external_source`) are never modified by
-/// this sync. (Issue #1094.)
+/// Thin wrapper over [`sync_federated_groups_to_local_groups`] with the
+/// `oidc` source tag, preserved so the #1094 call site and tests stay
+/// unchanged.
 pub(crate) async fn sync_oidc_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
     provider_id: Uuid,
     oidc_groups: &[String],
 ) -> Result<()> {
+    sync_federated_groups_to_local_groups(pool, user_id, provider_id, "oidc", oidc_groups).await
+}
+
+/// Reconcile a federated user's group memberships against the `groups` table.
+///
+/// For each group name in `idp_groups`:
+/// - Find the group by name; if missing, auto-create it tagged with
+///   `external_source = source` and `external_provider_id = provider_id`.
+/// - Ensure a `user_group_members` row exists.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `idp_groups`.
+///
+/// The prune is scoped to `(source, provider_id)`, so SAML-managed and
+/// OIDC-managed memberships never strip each other, and operator-managed
+/// groups (NULL `external_source`) are never modified by this sync.
+/// (Issues #1094, #2333.)
+pub(crate) async fn sync_federated_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    idp_groups: &[String],
+) -> Result<()> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Upsert each OIDC group: find-or-create, then ensure membership.
-    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
-    for name in oidc_groups {
+    // Upsert each external group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(idp_groups.len());
+    for name in idp_groups {
         if name.trim().is_empty() {
             continue;
         }
@@ -1175,13 +1215,18 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
         let (group_id,): (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
-            VALUES ($1, $2, 'oidc', $3)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
             RETURNING id
             "#,
         )
         .bind(name)
-        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(if source == "saml" {
+            format!("Auto-created from SAML group attribute: {name}")
+        } else {
+            format!("Auto-created from OIDC group claim: {name}")
+        })
+        .bind(source)
         .bind(provider_id)
         .fetch_one(&mut *tx)
         .await
@@ -1203,18 +1248,19 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
         current_group_ids.push(group_id);
     }
 
-    // Remove the user from any OIDC-managed group (same provider) that they
-    // are no longer a member of according to the latest claims. We deliberately
-    // limit the scope to groups marked external_source = 'oidc' AND
-    // external_provider_id = provider_id so we never strip membership in
-    // operator-managed groups or groups owned by other IdPs.
+    // Remove the user from any group managed by this same source (and same
+    // provider) that they are no longer a member of according to the latest
+    // values. We deliberately limit the scope to groups marked
+    // external_source = source AND external_provider_id = provider_id so we
+    // never strip membership in operator-managed groups, groups owned by
+    // other IdPs, or groups managed by the other protocol (SAML vs OIDC).
     sqlx::query(
         r#"
         DELETE FROM user_group_members
         WHERE user_id = $1
           AND group_id IN (
               SELECT id FROM groups
-              WHERE external_source = 'oidc'
+              WHERE external_source = $4
                 AND external_provider_id = $2
                 AND NOT (id = ANY($3))
           )
@@ -1223,6 +1269,7 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
     .bind(user_id)
     .bind(provider_id)
     .bind(&current_group_ids)
+    .bind(source)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2602,7 +2649,9 @@ mod tests {
     // =======================================================================
 
     mod sync_db {
-        use super::super::sync_oidc_groups_to_local_groups;
+        use super::super::{
+            sync_federated_groups_to_local_groups, sync_oidc_groups_to_local_groups,
+        };
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
         use uuid::Uuid;
@@ -2945,6 +2994,236 @@ mod tests {
             let gid = group_id_by_name(&pool, &name).await.unwrap();
             assert!(user_is_in_group(&pool, user_id, gid).await);
             cleanup_groups(&pool, &[gid]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // SAML variant (#2333) — same reconciler via the "saml" source
+        // wrapper. Mirrors the #1094 OIDC suite above; the isolation test is
+        // the one that pins the NEW contract: the prune must be scoped by
+        // external_source, not just provider id.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_saml_sync_creates_groups_tagged_saml_and_membership() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("saml-eng");
+            let g2 = rand_group_name("saml-ops");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[g1.clone(), g2.clone()],
+            )
+            .await
+            .expect("saml sync");
+
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            // Auto-created groups must be tagged with external_source = 'saml'.
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
+                Some("saml")
+            );
+            assert_eq!(
+                group_external_source(&pool, g2_id).await.as_deref(),
+                Some("saml")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_sync_prunes_removed_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let eng = rand_group_name("saml-keep");
+            let ops = rand_group_name("saml-drop");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[eng.clone(), ops.clone()],
+            )
+            .await
+            .expect("first saml sync");
+            let eng_id = group_id_by_name(&pool, &eng).await.unwrap();
+            let ops_id = group_id_by_name(&pool, &ops).await.unwrap();
+
+            // Second sync drops `ops`: its membership must be pruned while
+            // `eng` survives.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&eng),
+            )
+            .await
+            .expect("second saml sync");
+
+            assert!(user_is_in_group(&pool, user_id, eng_id).await);
+            assert!(
+                !user_is_in_group(&pool, user_id, ops_id).await,
+                "membership in a group absent from the latest assertion must be pruned"
+            );
+
+            cleanup_groups(&pool, &[eng_id, ops_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// The #2333 isolation contract: a SAML sync must never strip
+        /// membership in operator-managed groups (NULL external_source) NOR
+        /// in OIDC-managed groups — even when the OIDC group carries the
+        /// SAME provider UUID. This is what the `source` scoping in the
+        /// shared reconciler's DELETE buys over provider-id scoping alone.
+        #[tokio::test]
+        async fn test_saml_sync_isolated_from_operator_and_oidc_memberships() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let saml_name = rand_group_name("saml-owned");
+
+            // Operator-managed group (NULL external_source).
+            let op_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(op_id)
+                .bind(rand_group_name("op-managed"))
+                .execute(&pool)
+                .await
+                .expect("create operator group");
+
+            // OIDC-managed group tagged with the SAME provider UUID.
+            let oidc_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO groups (id, name, external_source, external_provider_id) \
+                 VALUES ($1, $2, 'oidc', $3)",
+            )
+            .bind(oidc_id)
+            .bind(rand_group_name("oidc-managed"))
+            .bind(provider_id)
+            .execute(&pool)
+            .await
+            .expect("create oidc group");
+
+            for gid in [op_id, oidc_id] {
+                sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                    .bind(user_id)
+                    .bind(gid)
+                    .execute(&pool)
+                    .await
+                    .expect("seed membership");
+            }
+
+            // A SAML sync that names NEITHER group must leave both intact.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&saml_name),
+            )
+            .await
+            .expect("saml sync");
+
+            assert!(
+                user_is_in_group(&pool, user_id, op_id).await,
+                "operator-managed membership must survive a SAML sync"
+            );
+            assert!(
+                user_is_in_group(&pool, user_id, oidc_id).await,
+                "OIDC-managed membership (same provider UUID) must survive a SAML sync"
+            );
+
+            let saml_id = group_id_by_name(&pool, &saml_name).await.unwrap();
+            cleanup_groups(&pool, &[saml_id, op_id, oidc_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// Symmetric isolation: an OIDC sync must not strip SAML-managed
+        /// memberships either (the pre-#2333 prune would have, had it been
+        /// provider-scoped only).
+        #[tokio::test]
+        async fn test_oidc_sync_isolated_from_saml_memberships() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let saml_name = rand_group_name("saml-side");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&saml_name),
+            )
+            .await
+            .expect("saml sync");
+            let saml_id = group_id_by_name(&pool, &saml_name).await.unwrap();
+
+            // An OIDC sync with an empty claim list on the SAME provider UUID
+            // must not prune the SAML-managed membership.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &[])
+                .await
+                .expect("oidc sync");
+
+            assert!(
+                user_is_in_group(&pool, user_id, saml_id).await,
+                "SAML-managed membership must survive an OIDC sync on the same provider"
+            );
+
+            cleanup_groups(&pool, &[saml_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_sync_skips_empty_and_whitespace_group_names() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let real = rand_group_name("saml-real");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[
+                    String::new(),
+                    "   ".to_string(),
+                    "\t".to_string(),
+                    real.clone(),
+                ],
+            )
+            .await
+            .expect("saml sync");
+
+            let real_id = group_id_by_name(&pool, &real).await.expect("real group");
+            assert!(user_is_in_group(&pool, user_id, real_id).await);
+            assert!(group_id_by_name(&pool, "").await.is_none());
+            assert!(group_id_by_name(&pool, "   ").await.is_none());
+
+            cleanup_groups(&pool, &[real_id]).await;
             cleanup_user(&pool, user_id).await;
         }
     }

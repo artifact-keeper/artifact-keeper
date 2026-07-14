@@ -30,6 +30,11 @@
 //!     `use_absolute_acs_url` provider pair — matching accepted, mismatch 401.
 //!   - group → role mapping: admin group present → admin user; absent →
 //!     non-admin.
+//!   - group → membership sync (#2333): with `map_groups_to_groups` enabled,
+//!     assertion groups become AK group memberships (auto-created, tagged
+//!     `external_source='saml'`), reconciled on re-login, and scoped so
+//!     operator-managed and OIDC-managed memberships survive; with the flag
+//!     off (the default), no memberships are touched.
 //!   - audit: happy path emits `LOGIN` `details.provider="saml"`; a rejected
 //!     assertion emits `LOGIN_FAILED` `details.provider="saml"`.
 //!   - login → acs full flow: `GET /saml/{id}/login` persists a pending
@@ -98,6 +103,7 @@ fn expected_acs(provider_id: Uuid) -> String {
 struct SamlProviderOpts {
     admin_group: Option<String>,
     use_absolute_acs_url: bool,
+    map_groups_to_groups: bool,
 }
 
 /// Insert an enabled SAML provider that trusts the ephemeral IdP cert and
@@ -120,6 +126,7 @@ async fn create_saml_provider(pool: &PgPool, opts: SamlProviderOpts) -> Uuid {
             admin_group: opts.admin_group,
             is_enabled: Some(true),
             use_absolute_acs_url: Some(opts.use_absolute_acs_url),
+            map_groups_to_groups: Some(opts.map_groups_to_groups),
         },
     )
     .await
@@ -487,6 +494,282 @@ async fn test_saml_acs_admin_group_mapping() {
 
     delete_saml_user(&pool, &name_id_admin).await;
     delete_saml_user(&pool, &name_id_plain).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// Group → membership sync (#2333, parity with OIDC #1094)
+// ---------------------------------------------------------------------------
+
+async fn group_id_by_name(pool: &PgPool, name: &str) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM groups WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .expect("group lookup")
+}
+
+async fn group_external_source(pool: &PgPool, group_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT external_source FROM groups WHERE id = $1")
+        .bind(group_id)
+        .fetch_optional(pool)
+        .await
+        .expect("group source lookup")
+        .flatten()
+}
+
+async fn user_is_in_group(pool: &PgPool, user_id: Uuid, group_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT group_id FROM user_group_members WHERE user_id = $1 AND group_id = $2",
+    )
+    .bind(user_id)
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    .expect("membership lookup")
+    .is_some()
+}
+
+async fn cleanup_groups(pool: &PgPool, ids: &[Uuid]) {
+    for id in ids {
+        let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await;
+    }
+}
+
+/// Issue #2333 happy path + reconcile + isolation, driven end-to-end through
+/// the live ACS handler with signed assertions:
+///   1. first login with groups [eng, ops] → both groups auto-created tagged
+///      `external_source='saml'`, user a member of both;
+///   2. re-login with [eng] only → ops membership pruned, eng survives;
+///   3. an operator-managed membership (NULL external_source) and an
+///      OIDC-managed membership (external_source='oidc', same provider UUID)
+///      both survive the SAML re-sync (source-scoped prune).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_group_membership_sync_and_isolation() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            map_groups_to_groups: true,
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let eng = format!("saml-e2e-eng-{suffix}");
+    let ops = format!("saml-e2e-ops-{suffix}");
+    let name_id = format!("saml-gsync-{suffix}");
+
+    // 1. First login: groups [eng, ops].
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![eng.clone(), ops.clone()];
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
+    let eng_id = group_id_by_name(&pool, &eng)
+        .await
+        .expect("eng auto-created");
+    let ops_id = group_id_by_name(&pool, &ops)
+        .await
+        .expect("ops auto-created");
+    assert!(user_is_in_group(&pool, user_id, eng_id).await);
+    assert!(user_is_in_group(&pool, user_id, ops_id).await);
+    assert_eq!(
+        group_external_source(&pool, eng_id).await.as_deref(),
+        Some("saml"),
+        "auto-created groups must be tagged external_source='saml'"
+    );
+    assert_eq!(
+        group_external_source(&pool, ops_id).await.as_deref(),
+        Some("saml")
+    );
+
+    // 3-prep. Seed an operator-managed and an OIDC-managed membership that
+    // the SAML re-sync must NOT touch. The OIDC group deliberately reuses
+    // the SAME provider UUID to prove the prune is source-scoped, not just
+    // provider-scoped.
+    let op_group = Uuid::new_v4();
+    sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+        .bind(op_group)
+        .bind(format!("saml-e2e-op-{suffix}"))
+        .execute(&pool)
+        .await
+        .expect("operator group");
+    let oidc_group = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO groups (id, name, external_source, external_provider_id) \
+         VALUES ($1, $2, 'oidc', $3)",
+    )
+    .bind(oidc_group)
+    .bind(format!("saml-e2e-oidc-{suffix}"))
+    .bind(provider_id)
+    .execute(&pool)
+    .await
+    .expect("oidc group");
+    for gid in [op_group, oidc_group] {
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(gid)
+            .execute(&pool)
+            .await
+            .expect("seed membership");
+    }
+
+    // 2. Re-login with [eng] only → ops pruned, eng kept.
+    let request_id2 = seed_session(&pool, provider_id).await;
+    let mut spec2 = happy_spec(&request_id2, &name_id);
+    spec2.groups = vec![eng.clone()];
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec2.signed_b64()).await;
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    assert!(
+        user_is_in_group(&pool, user_id, eng_id).await,
+        "eng membership must survive the re-sync"
+    );
+    assert!(
+        !user_is_in_group(&pool, user_id, ops_id).await,
+        "ops membership must be pruned when absent from the assertion"
+    );
+    // 3. Isolation: operator- and OIDC-managed memberships survive.
+    assert!(
+        user_is_in_group(&pool, user_id, op_group).await,
+        "operator-managed membership must survive a SAML sync"
+    );
+    assert!(
+        user_is_in_group(&pool, user_id, oidc_group).await,
+        "OIDC-managed membership (same provider UUID) must survive a SAML sync"
+    );
+
+    cleanup_groups(&pool, &[eng_id, ops_id, op_group, oidc_group]).await;
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Issue #2333 default-off: with `map_groups_to_groups` left false (the
+/// default), a login carrying group values must not create groups or
+/// memberships — the pre-157 behavior (groups only feed admin_group role
+/// mapping) is preserved.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_group_sync_disabled_by_default() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(&pool, SamlProviderOpts::default()).await;
+
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let group_name = format!("saml-e2e-off-{suffix}");
+    let name_id = format!("saml-gsync-off-{suffix}");
+
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![group_name.clone()];
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "login itself must still succeed with the flag off"
+    );
+
+    assert!(
+        group_id_by_name(&pool, &group_name).await.is_none(),
+        "no group may be auto-created when map_groups_to_groups is false"
+    );
+    let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("membership count");
+    assert_eq!(
+        memberships, 0,
+        "no memberships may be written when map_groups_to_groups is false"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Issue #2333 × XSW composition (#2449/#2453) — security regression: with
+/// `map_groups_to_groups = true` and a signed assertion that carries NO groups,
+/// a `<saml:Attribute Name="groups">` spliced in as a `<samlp:Response>` child
+/// OUTSIDE the signed `<saml:Assertion>` subtree must confer NO local group
+/// membership. The signature still verifies (single assertion), so login
+/// succeeds (307), but the injected groups live outside the cryptographically
+/// verified subtree — so the membership sync, which reads `saml_user.groups`
+/// harvested only from the signed subtree, must never auto-create or join them.
+/// This pins the escalation guarantee: an SSO-completing attacker cannot inject
+/// an unsigned `groups=[<any-group>]` to join arbitrary local groups.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_out_of_subtree_groups_confer_no_membership() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            map_groups_to_groups: true,
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let injected = format!("saml-xsw-inject-{suffix}");
+    let name_id = format!("saml-xsw-memb-{suffix}");
+
+    let request_id = seed_session(&pool, provider_id).await;
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.groups = vec![]; // signed assertion carries no groups attribute
+
+    // Splice groups=[injected] as a <Response> child BEFORE the assertion —
+    // outside the signed subtree (the assertion digest is unchanged).
+    let payload = spec.attribute_xsw_b64(&[injected.as_str()], true);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &payload).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a valid signature with an out-of-subtree groups attribute must still authenticate"
+    );
+
+    let (user_id, _, _, _) = get_saml_user(&pool, &name_id)
+        .await
+        .expect("the signed subject must still provision");
+
+    // The injected (unsigned) group must be neither auto-created nor joined:
+    // group extraction rides the signed-subtree claim path (composes with XSW).
+    assert!(
+        group_id_by_name(&pool, &injected).await.is_none(),
+        "an out-of-subtree groups attribute must NOT auto-create a group"
+    );
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_group_members WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("membership count");
+    assert_eq!(
+        memberships, 0,
+        "an out-of-subtree groups attribute must confer no local group membership (XSW composition)"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;
 }
 
