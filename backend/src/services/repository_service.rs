@@ -256,7 +256,9 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
 
 /// SQL fragment: true when the user bound at `$user_param` holds a non-empty
 /// fine-grained `permissions` grant on `target_type = 'repository'` /
-/// `target_id = repo_id_expr`, either directly (`principal_type = 'user'`) or via
+/// `target_id = repo_id_expr`, either directly (`principal_type IN ('user',
+/// 'service_account')`, both referencing `users(id)` by the caller's own
+/// `user_id`) or via
 /// a group they belong to (`principal_type = 'group'`, resolved through
 /// `user_group_members`).
 ///
@@ -296,7 +298,7 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
               )
               AND p.actions <> '{{}}'
               AND (
-                  (p.principal_type = 'user' AND p.principal_id = ${user_param})
+                  (p.principal_type IN ('user', 'service_account') AND p.principal_id = ${user_param})
                   OR (p.principal_type = 'group' AND p.principal_id IN (
                       SELECT group_id FROM user_group_members WHERE user_id = ${user_param}
                   ))
@@ -2346,6 +2348,13 @@ mod tests {
         // system-scoped grants.
         assert!(sql.contains("p.actions <> '{}'"));
         assert!(!sql.contains("'system'"));
+        // #2433: the direct-principal arm honours service accounts alongside
+        // human users (both reference `users(id)` by the caller's own id),
+        // while keeping the principal_id equality that prevents over-granting.
+        assert!(
+            sql.contains("p.principal_type IN ('user', 'service_account') AND p.principal_id = $3"),
+            "direct-principal arm must accept service_account without relaxing the id match: {sql}"
+        );
     }
 
     #[test]
@@ -3175,6 +3184,132 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             for uid in [owner_id, grantee_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// #2433: a service-account principal must be honoured exactly like a
+        /// user principal. A grant written with `principal_type='service_account'`
+        /// naming the SA's `users.id` restores access on the granted repo; the
+        /// same SA stays denied with no grant, with empty `actions '{}'`, and on
+        /// a *different* private repo it holds no grant for (per-repo scoping).
+        #[tokio::test]
+        async fn test_user_can_access_repo_service_account_grant_honored() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+
+            // A service-account-typed principal (own `users` row, SA flag set).
+            let sa_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users \
+                   (id, username, email, password_hash, auth_provider, is_admin, \
+                    is_active, is_service_account) \
+                 VALUES ($1, $2, $3, 'unused', 'local', false, true, true)",
+            )
+            .bind(sa_id)
+            .bind(format!("sa-{}", sa_id.simple()))
+            .bind(format!("sa-{}@test.local", sa_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("create service account");
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req_a = make_create_req(&format!("{suffix}a"), RepositoryFormat::Generic);
+            req_a.created_by = Some(owner_id);
+            let repo_a = service.create(req_a).await.expect("create private repo A");
+            let mut req_b = make_create_req(&format!("{suffix}b"), RepositoryFormat::Generic);
+            req_b.created_by = Some(owner_id);
+            let repo_b = service.create(req_b).await.expect("create private repo B");
+
+            // Case: SA WITHOUT a grant -> denied.
+            assert!(
+                !service
+                    .user_can_access_repo(repo_a.id, sa_id)
+                    .await
+                    .expect("no-grant SA access check"),
+                "service account without a grant must NOT access a private repo"
+            );
+
+            // Case: SA grant with EMPTY actions -> fail closed (denied).
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('service_account', $1, 'repository', $2, '{}')",
+            )
+            .bind(sa_id)
+            .bind(repo_a.id)
+            .execute(&pool)
+            .await
+            .expect("insert empty-actions SA permission");
+            assert!(
+                !service
+                    .user_can_access_repo(repo_a.id, sa_id)
+                    .await
+                    .expect("empty-actions SA access check"),
+                "empty-actions service-account grant must fail closed"
+            );
+
+            // Case: SA WITH an explicit non-empty grant on repo A -> allowed.
+            sqlx::query(
+                "UPDATE permissions SET actions = ARRAY['read'] \
+                 WHERE principal_type = 'service_account' AND principal_id = $1 \
+                   AND target_type = 'repository' AND target_id = $2",
+            )
+            .bind(sa_id)
+            .bind(repo_a.id)
+            .execute(&pool)
+            .await
+            .expect("populate SA permission actions");
+            assert!(
+                service
+                    .user_can_access_repo(repo_a.id, sa_id)
+                    .await
+                    .expect("granted SA access check"),
+                "service account WITH an explicit grant must access the repo"
+            );
+
+            // Case: per-repo scoping — SA granted on A is still denied on B.
+            assert!(
+                !service
+                    .user_can_access_repo(repo_b.id, sa_id)
+                    .await
+                    .expect("other-repo SA access check"),
+                "SA granted on repo A must NOT reach a different private repo B"
+            );
+
+            // The grant also surfaces the repo in the SA's own listing, and
+            // never leaks the un-granted repo B.
+            let search = Some(format!("acs-repo-{suffix}"));
+            let (repos, total) = service
+                .list(
+                    0,
+                    50,
+                    None,
+                    None,
+                    RepoVisibility::User(sa_id),
+                    search.as_deref(),
+                    None,
+                )
+                .await
+                .expect("SA list");
+            assert_eq!(total, 1, "SA should see only the granted private repo");
+            assert_eq!(repos.len(), 1);
+            assert_eq!(repos[0].id, repo_a.id);
+            assert!(
+                !repos.iter().any(|r| r.id == repo_b.id),
+                "un-granted private repo must not leak into the SA's listing"
+            );
+
+            cleanup_repo(&pool, repo_a.id).await;
+            cleanup_repo(&pool, repo_b.id).await;
+            for uid in [owner_id, sa_id] {
                 let _ = sqlx::query("DELETE FROM users WHERE id = $1")
                     .bind(uid)
                     .execute(&pool)
