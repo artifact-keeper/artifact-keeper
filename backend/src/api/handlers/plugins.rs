@@ -589,6 +589,13 @@ pub async fn update_plugin_config(
     // enforces this; this in-handler check is defense-in-depth.
     auth.require_admin()?;
 
+    // Reject dangerous callback destinations at write time (anti-SSRF,
+    // defense-in-depth). The config is stored as opaque JSON and later drives
+    // external webhook/validator callbacks, so validate any URL-bearing fields
+    // now — before they are persisted — so file://, gopher:// and internal /
+    // cloud-metadata targets never make it into a stored plugin config.
+    validate_plugin_config_urls(&payload.config)?;
+
     let plugin = sqlx::query!(
         r#"
         UPDATE plugins
@@ -609,6 +616,38 @@ pub async fn update_plugin_config(
         config: payload.config,
         schema: plugin.config_schema,
     }))
+}
+
+/// Validate the external-callback URL fields in a plugin config against the
+/// outbound-URL SSRF guard, rejecting the write if any is dangerous.
+///
+/// The plugin config is stored as opaque JSON but the classic `PluginService`
+/// dispatcher reads callback destinations from a fixed set of keys
+/// (`webhook_url`, `validator_url`, `url` at the top level, and per-hook
+/// `hooks.<name>.{url,validator_url}`). We validate exactly those so that
+/// non-http(s) schemes (`file://`, `gopher://`, ...) and internal / cloud-
+/// metadata / loopback / RFC1918 targets are rejected at save time. Fields
+/// that are absent or not strings are ignored (config remains free-form).
+fn validate_plugin_config_urls(config: &serde_json::Value) -> Result<()> {
+    // Top-level callback URL fields.
+    for key in ["webhook_url", "validator_url", "url"] {
+        if let Some(url) = config.get(key).and_then(|v| v.as_str()) {
+            crate::api::validation::validate_outbound_url(url, "Plugin callback URL")?;
+        }
+    }
+
+    // Per-hook callback URL fields: { "hooks": { "<name>": { "url"/"validator_url": ... } } }
+    if let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) {
+        for hook in hooks.values() {
+            for key in ["url", "validator_url"] {
+                if let Some(url) = hook.get(key).and_then(|v| v.as_str()) {
+                    crate::api::validation::validate_outbound_url(url, "Plugin callback URL")?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // =========================================================================
@@ -1799,5 +1838,115 @@ mod tests {
             !router_body.contains("\"/:id/config\""),
             "plugin config route must NOT be in the auth-only router()"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Save-time SSRF validation of plugin config callback URLs (issue #2536)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_urls_reject_metadata_and_loopback() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://127.0.0.1:9090/",
+        ] {
+            let cfg = serde_json::json!({ "webhook_url": url });
+            assert!(
+                validate_plugin_config_urls(&cfg).is_err(),
+                "webhook_url `{url}` must be rejected at save time"
+            );
+            let cfg = serde_json::json!({ "validator_url": url });
+            assert!(
+                validate_plugin_config_urls(&cfg).is_err(),
+                "validator_url `{url}` must be rejected at save time"
+            );
+        }
+    }
+
+    #[test]
+    fn config_urls_reject_rfc1918() {
+        for url in [
+            "http://10.0.0.5/api",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+        ] {
+            let cfg = serde_json::json!({ "validator_url": url });
+            assert!(
+                validate_plugin_config_urls(&cfg).is_err(),
+                "validator_url `{url}` (RFC1918) must be rejected at save time"
+            );
+        }
+    }
+
+    #[test]
+    fn config_urls_reject_dangerous_schemes() {
+        for url in ["file:///etc/passwd", "gopher://127.0.0.1:6379/_INFO"] {
+            let cfg = serde_json::json!({ "webhook_url": url });
+            assert!(
+                validate_plugin_config_urls(&cfg).is_err(),
+                "webhook_url `{url}` (dangerous scheme) must be rejected at save time"
+            );
+        }
+    }
+
+    #[test]
+    fn config_urls_reject_encoded_internal_ips() {
+        // Decimal-encoded 127.0.0.1 and IPv6-encoded internal targets.
+        for url in [
+            "http://2130706433/",
+            "http://[::1]:9090/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+        ] {
+            let cfg = serde_json::json!({ "validator_url": url });
+            assert!(
+                validate_plugin_config_urls(&cfg).is_err(),
+                "validator_url `{url}` (encoded internal IP) must be rejected at save time"
+            );
+        }
+    }
+
+    #[test]
+    fn config_urls_reject_per_hook_targets() {
+        let cfg = serde_json::json!({
+            "hooks": {
+                "before_upload": { "url": "http://169.254.169.254/" }
+            }
+        });
+        assert!(
+            validate_plugin_config_urls(&cfg).is_err(),
+            "per-hook url pointing at metadata must be rejected"
+        );
+        let cfg = serde_json::json!({
+            "hooks": {
+                "before_upload": { "validator_url": "http://127.0.0.1:5432/" }
+            }
+        });
+        assert!(
+            validate_plugin_config_urls(&cfg).is_err(),
+            "per-hook validator_url pointing at loopback must be rejected"
+        );
+    }
+
+    #[test]
+    fn config_urls_allow_legit_external() {
+        let cfg = serde_json::json!({
+            "webhook_url": "https://hooks.example.com/ingest",
+            "validator_url": "https://validator.example.com/check",
+            "hooks": {
+                "before_upload": { "url": "https://cb.example.net/hook" }
+            },
+            "rules": { "max_size_bytes": 1048576 }
+        });
+        assert!(
+            validate_plugin_config_urls(&cfg).is_ok(),
+            "legit external callback URLs must pass save-time validation"
+        );
+    }
+
+    #[test]
+    fn config_urls_allow_config_without_url_fields() {
+        // Free-form config with no callback URLs is unaffected.
+        let cfg = serde_json::json!({ "rules": { "max_size_bytes": 1024 } });
+        assert!(validate_plugin_config_urls(&cfg).is_ok());
     }
 }
