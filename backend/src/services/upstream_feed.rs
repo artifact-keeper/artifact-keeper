@@ -330,7 +330,7 @@ fn feed_root_url(feed_url: &Url) -> Result<Url> {
         // Drop the empty segment a trailing slash leaves behind first.
         segs.pop_if_empty();
     }
-    let ends_in_changes = root.path_segments().and_then(|s| s.last()) == Some("_changes");
+    let ends_in_changes = root.path_segments().and_then(|mut s| s.next_back()) == Some("_changes");
     if ends_in_changes {
         root.path_segments_mut()
             .map_err(|()| AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base")))?
@@ -717,6 +717,24 @@ impl FeedConsumer {
             Ok(None) => match self.adapter.bootstrap_cursor().await {
                 Ok(cursor) => {
                     Self::note_recovery(feed_key, failures);
+                    // Persist the bootstrapped head before the first poll: at
+                    // head the first poll echoes the same seq, so the
+                    // `advanced`-gated save below never fires and the stored
+                    // cursor stays empty until the feed moves. A restart or
+                    // failover in that window would re-bootstrap to a newer
+                    // head and silently skip the interim events (a crashlooping
+                    // consumer would never persist at all). A failed save only
+                    // loses the resume position — continue on the in-memory
+                    // cursor rather than failing the term.
+                    if let Some(seq) = cursor.as_deref() {
+                        if let Err(e) = self.state.save(feed_key, seq).await {
+                            tracing::warn!(
+                                feed = feed_key,
+                                error = %e,
+                                "upstream feed cursor not persisted; continuing"
+                            );
+                        }
+                    }
                     cursor
                 }
                 Err(e) => {
@@ -821,10 +839,14 @@ impl FeedConsumer {
                             return;
                         }
                         backoff = next_backoff(backoff, self.backoff_max);
-                    } else if batch.batch_was_full {
-                        // The poll hit the row limit: a backlog is draining
-                        // (e.g. after downtime). Re-poll immediately instead of
-                        // pacing, but still honour cancellation promptly.
+                    } else if batch.batch_was_full && advanced {
+                        // The poll hit the row limit *and* the cursor moved: a
+                        // backlog is draining (e.g. after downtime). Re-poll
+                        // immediately instead of pacing, but still honour
+                        // cancellation promptly. Draining requires progress — a
+                        // full batch that did not advance (e.g. all rows
+                        // filtered out) falls to the idle-pacing branch below
+                        // rather than hot-looping.
                         if self.cancel.is_cancelled() {
                             return;
                         }
@@ -2111,6 +2133,98 @@ mod tests {
             adapter.sinces().len(),
             polls_at_pace,
             "a partial batch must pace at the idle interval, not keep draining"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_persists_the_bootstrapped_head_before_the_feed_advances() {
+        // At head the first poll echoes the bootstrapped seq (no events, cursor
+        // unmoved), so the advance-gated save never fires. The bootstrapped head
+        // must be persisted up front regardless, or a restart/failover in that
+        // window would re-bootstrap to a newer head and skip the interim events.
+        let echo = || {
+            Ok(FeedBatch {
+                events: Vec::new(),
+                last_seq: Some("100".to_string()),
+                batch_was_full: false,
+            })
+        };
+        let adapter = ScriptedAdapter::with_bootstrap_cursor(vec![echo(), echo(), echo()], "100");
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| state.get("test-feed") == Some("100".to_string())).await,
+            "the bootstrapped head must be persisted before the feed advances; got {:?}",
+            state.get("test-feed")
+        );
+        // The feed only ever echoed the head, so nothing overwrote the cursor.
+        assert_eq!(
+            state.get("test-feed"),
+            Some("100".to_string()),
+            "an echoing (non-advancing) feed must leave the bootstrapped cursor persisted"
+        );
+        assert!(
+            action.applied().is_empty(),
+            "no events means nothing applied"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_does_not_hot_loop_on_full_but_stalled_batches() {
+        // A full batch whose rows were all filtered out (no events) and whose
+        // cursor did not advance must not be drained: without gating the drain
+        // on progress it would re-poll with no sleep — a tight hot-loop. It must
+        // fall to idle pacing instead. A long idle interval makes the two
+        // outcomes distinguishable inside the test window.
+        let stalled = || {
+            Ok(FeedBatch {
+                events: Vec::new(),
+                last_seq: None,
+                batch_was_full: true,
+            })
+        };
+        let polls: Vec<Result<FeedBatch>> = std::iter::repeat_with(stalled).take(50).collect();
+        let adapter = ScriptedAdapter::with_idle(polls, Duration::from_secs(30));
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| !adapter.sinces().is_empty()).await,
+            "the consumer must poll at least once"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let polls = adapter.sinces().len();
+        assert!(
+            polls <= 2,
+            "a full-but-stalled batch must pace at the idle interval, not \
+             hot-loop; observed {polls} polls in 300ms with a 30s idle interval"
+        );
+        assert!(
+            action.applied().is_empty(),
+            "no events means nothing applied"
         );
         cancel.cancel();
         handle.await.expect("join");
