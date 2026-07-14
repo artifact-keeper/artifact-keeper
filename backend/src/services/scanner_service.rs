@@ -847,13 +847,49 @@ impl ScanWorkspace {
         if Self::is_archive(original_filename) {
             if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
                 warn!(
-                    "Failed to extract archive {}: {}. Scanning raw file instead.",
+                    "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
                 );
+                // A breached extraction may have written a partial (potentially
+                // large) tree before aborting. Reset the workspace to just the
+                // original archive so the raw-file fallback scan does not walk
+                // the partial tree (and a bomb cannot leave GiB on the PVC).
+                if let Err(reset_err) =
+                    Self::reset_workspace(&workspace, &artifact_path, content).await
+                {
+                    warn!(
+                        "Failed to reset scan workspace {} after extraction failure: {}",
+                        workspace.display(),
+                        reset_err
+                    );
+                }
             }
         }
 
         Ok(workspace)
+    }
+
+    /// Reset a scan workspace to just the original archive after an extraction
+    /// failure: remove any partially-extracted tree, recreate the directory,
+    /// and re-write the raw artifact so the degraded fallback scan sees only
+    /// the original file.
+    async fn reset_workspace(
+        workspace: &Path,
+        artifact_path: &Path,
+        content: &Bytes,
+    ) -> Result<()> {
+        tokio::fs::remove_dir_all(workspace).await.map_err(|e| {
+            AppError::Internal(format!("Failed to remove partial scan workspace: {}", e))
+        })?;
+        tokio::fs::create_dir_all(workspace)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to recreate scan workspace: {}", e)))?;
+        tokio::fs::write(artifact_path, content)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to re-write artifact to workspace: {}", e))
+            })?;
+        Ok(())
     }
 
     /// Clean up the scan workspace directory, logging warnings on failure.
@@ -970,6 +1006,59 @@ enum ArchiveKind {
     Zip,
 }
 
+/// Default ceiling on the cumulative uncompressed bytes written when extracting
+/// a scan-workspace archive (2 GiB). Bounds decompression bombs that expand a
+/// small `.zip`/`.tar.gz`/`.jar`/`.whl` into a PVC-filling tree. Enforced
+/// *during* extraction so a bomb aborts mid-stream rather than after it has
+/// already hit disk. Comfortably above legit fat-JAR/uber-WAR/wheel trees;
+/// overridable via [`MAX_SCAN_EXTRACTED_BYTES_ENV`] for large-monorepo sites.
+const DEFAULT_MAX_SCAN_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum number of archive entries extracted into a scan workspace. Bounds
+/// inode-exhaustion bombs (millions of tiny files).
+const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
+
+/// Env var overriding the extracted-tree byte ceiling. The value is a plain
+/// decimal byte count (e.g. `4294967296` for 4 GiB).
+const MAX_SCAN_EXTRACTED_BYTES_ENV: &str = "MAX_SCAN_EXTRACTED_BYTES";
+
+/// Effective cumulative-byte ceiling for scan-workspace extraction, honouring
+/// [`MAX_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_SCAN_EXTRACTED_BYTES`].
+/// A blank, non-numeric, or zero override is treated as "unset" (a zero cap
+/// would reject every archive).
+fn max_scan_extracted_bytes() -> u64 {
+    std::env::var(MAX_SCAN_EXTRACTED_BYTES_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_SCAN_EXTRACTED_BYTES)
+}
+
+/// Copy a single archive entry into `writer`, enforcing the shared cumulative
+/// budget `*remaining`. At most `*remaining + 1` bytes are read (the `+1` lets
+/// an exactly-at-cap breach be detected rather than silently truncated); if the
+/// copy exceeds the budget the extraction is aborted as a suspected
+/// decompression bomb. On success the written byte count is subtracted from
+/// `*remaining`. Shared by the tar and zip extractors so the counting copy is
+/// written once.
+fn copy_entry_bounded<R: std::io::Read, W: std::io::Write>(
+    reader: R,
+    mut writer: W,
+    remaining: &mut u64,
+) -> Result<()> {
+    let mut limited = reader.take(*remaining + 1);
+    let written = std::io::copy(&mut limited, &mut writer)
+        .map_err(|e| AppError::Internal(format!("Failed to write archive entry: {}", e)))?;
+    if written > *remaining {
+        return Err(AppError::Internal(
+            "Archive expands beyond the extraction budget; refusing to scan suspected decompression bomb"
+                .to_string(),
+        ));
+    }
+    *remaining -= written;
+    Ok(())
+}
+
 fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result<()> {
     let file = std::fs::File::open(src).map_err(|e| {
         AppError::Internal(format!("Failed to open archive {}: {}", src.display(), e))
@@ -985,20 +1074,149 @@ fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result
     }
 }
 
-fn unpack_tar<R: std::io::Read>(mut archive: tar::Archive<R>, dst: &Path) -> Result<()> {
-    // Guard against path-traversal entries (`../etc/passwd`). The `tar`
-    // crate's `unpack` already refuses absolute paths and `..` components,
-    // but we re-enable the safety flags explicitly for clarity.
+fn unpack_tar<R: std::io::Read>(archive: tar::Archive<R>, dst: &Path) -> Result<()> {
+    unpack_tar_limited(
+        archive,
+        dst,
+        max_scan_extracted_bytes(),
+        MAX_SCAN_EXTRACTED_ENTRIES,
+    )
+}
+
+/// Bounded tar extraction. Iterates entries manually (rather than
+/// `archive.unpack`) so cumulative-byte, per-entry, and entry-count ceilings
+/// are enforced *during* extraction and a decompression/tar bomb aborts
+/// mid-stream. Traversal (`..`/absolute) entries and symlink/hardlink/special
+/// (device/fifo) entries are skipped; only regular files and directories are
+/// written. Archive permissions are not honoured. The `_limited` seam lets
+/// unit tests drive tiny caps without allocating gigabytes.
+fn unpack_tar_limited<R: std::io::Read>(
+    mut archive: tar::Archive<R>,
+    dst: &Path,
+    max_bytes: u64,
+    max_entries: u64,
+) -> Result<()> {
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
-    archive
-        .unpack(dst)
-        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))
+
+    let mut remaining = max_bytes;
+    let mut entries_seen: u64 = 0;
+
+    let entries = archive
+        .entries()
+        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+
+        entries_seen += 1;
+        if entries_seen > max_entries {
+            return Err(AppError::Internal(format!(
+                "Tar archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
+                max_entries
+            )));
+        }
+
+        // Reject symlinks, hardlinks, and special (device/fifo) entries — only
+        // regular files and directories are materialised.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            continue;
+        }
+
+        let path = entry
+            .path()
+            .map_err(|e| AppError::Internal(format!("Failed to read tar entry path: {}", e)))?;
+        // Reject path-traversal / absolute entries BEFORE touching the disk.
+        // `dst.join(path)` followed by a lexical `starts_with(dst)` is NOT
+        // sufficient: `starts_with` compares components without resolving `..`,
+        // so `dst.join("../../evil")` still "starts_with" `dst` yet the OS
+        // resolves the create to a path outside the workspace. Skip any entry
+        // whose path contains a `..` component or is absolute (root/prefix) —
+        // mirroring the guard the `tar` crate's own `unpack` applies natively.
+        if path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            continue;
+        }
+        let full_path = dst.join(&path);
+        // Defence in depth: after normalising away `.`/plain components the join
+        // must still be lexically under the workspace root.
+        if !full_path.starts_with(dst) {
+            continue;
+        }
+
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&full_path).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create tar dir {}: {}",
+                    full_path.display(),
+                    e
+                ))
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to create tar parent {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let mut out = std::fs::File::create(&full_path).map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to create tar output {}: {}",
+                full_path.display(),
+                e
+            ))
+        })?;
+        copy_entry_bounded(&mut entry, &mut out, &mut remaining)?;
+    }
+
+    Ok(())
 }
 
 fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
+    unpack_zip_limited(
+        file,
+        dst,
+        max_scan_extracted_bytes(),
+        MAX_SCAN_EXTRACTED_ENTRIES,
+    )
+}
+
+/// Bounded zip extraction. Enforces an entry-count ceiling up front and a
+/// cumulative/per-entry byte budget *during* each entry copy so a zip bomb
+/// aborts mid-stream instead of filling the scan-workspace PVC. Traversal
+/// entries (rejected by `enclosed_name`) and symlink entries are skipped. The
+/// `_limited` seam lets unit tests drive tiny caps.
+fn unpack_zip_limited(
+    file: std::fs::File,
+    dst: &Path,
+    max_bytes: u64,
+    max_entries: u64,
+) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| AppError::Internal(format!("Failed to open zip archive: {}", e)))?;
+
+    if archive.len() as u64 > max_entries {
+        return Err(AppError::Internal(format!(
+            "Zip archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
+            max_entries
+        )));
+    }
+
+    let mut remaining = max_bytes;
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -1023,6 +1241,16 @@ fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
             continue;
         }
 
+        // Skip symlink entries (unix mode S_IFLNK) — do not materialise links
+        // inside the scan workspace.
+        if entry
+            .unix_mode()
+            .map(|m| m & 0o170000 == 0o120000)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 AppError::Internal(format!(
@@ -1040,8 +1268,7 @@ fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
                 e
             ))
         })?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|e| AppError::Internal(format!("Failed to write zip entry {}: {}", i, e)))?;
+        copy_entry_bounded(&mut entry, &mut out, &mut remaining)?;
     }
 
     Ok(())
@@ -9660,6 +9887,286 @@ mod tests {
         extract_tar_gz_safe(&archive, tmp.path()).unwrap();
         // Should succeed with no files created
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded scan-workspace extraction tests (#2514)
+    // -----------------------------------------------------------------------
+
+    /// Build a zip archive in memory and write it to a temp file, returning
+    /// the tempdir (kept alive) and an opened `File` positioned at the start.
+    fn create_zip_file(entries: &[(&str, &[u8], u32)]) -> (tempfile::TempDir, std::fs::File) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("archive.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, data, mode) in entries {
+                let opts = zip::write::SimpleFileOptions::default().unix_permissions(*mode);
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let file = std::fs::File::open(&zip_path).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn test_zip_bomb_rejected_limited() {
+        // Single entry whose uncompressed size (10 KiB) blows past a tiny cap.
+        let payload = vec![0u8; 10 * 1024];
+        let (_src, file) = create_zip_file(&[("big.bin", &payload, 0o644)]);
+        let out = tempfile::tempdir().unwrap();
+
+        let err = unpack_zip_limited(file, out.path(), 128, 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "unexpected error: {err}"
+        );
+        // Partial output must be reset by the caller; here assert the bounded
+        // write did not exceed the cap+1 on disk.
+        let written = out.path().join("big.bin");
+        if written.exists() {
+            assert!(std::fs::metadata(&written).unwrap().len() <= 129);
+        }
+    }
+
+    #[test]
+    fn test_zip_too_many_entries_rejected_limited() {
+        let entries: Vec<(&str, &[u8], u32)> = vec![
+            ("a.txt", b"a", 0o644),
+            ("b.txt", b"b", 0o644),
+            ("c.txt", b"c", 0o644),
+        ];
+        let (_src, file) = create_zip_file(&entries);
+        let out = tempfile::tempdir().unwrap();
+
+        let err = unpack_zip_limited(file, out.path(), 1_000_000, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("too many entries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_normal_zip_extracts_ok_limited() {
+        let (_src, file) = create_zip_file(&[
+            ("hello.txt", b"hello world", 0o644),
+            ("dir/nested.txt", b"nested", 0o644),
+        ]);
+        let out = tempfile::tempdir().unwrap();
+
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("dir/nested.txt")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn test_zip_symlink_entry_skipped_limited() {
+        // A real symlink entry (unix mode S_IFLNK) must be skipped, not
+        // materialised, by the bounded extractor.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("archive.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.add_symlink("link", "/etc/passwd", opts).unwrap();
+            zip.start_file("real.txt", opts).unwrap();
+            zip.write_all(b"ok").unwrap();
+            zip.finish().unwrap();
+        }
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        assert!(out.path().join("real.txt").exists());
+        assert!(!out.path().join("link").exists());
+    }
+
+    #[test]
+    fn test_tar_gz_bomb_rejected_limited() {
+        // 10 KiB zero-filled file compresses tiny but blows a 128-byte cap.
+        let payload = vec![0u8; 10 * 1024];
+        let archive = create_tar_gz(&[("big.bin", &payload)]);
+        let out = tempfile::tempdir().unwrap();
+
+        let decoder = flate2::read::GzDecoder::new(&archive[..]);
+        let err =
+            unpack_tar_limited(tar::Archive::new(decoder), out.path(), 128, 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tar_too_many_entries_rejected_limited() {
+        let archive = create_tar_gz(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+        let out = tempfile::tempdir().unwrap();
+
+        let decoder = flate2::read::GzDecoder::new(&archive[..]);
+        let err =
+            unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("too many entries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_normal_tar_gz_extracts_ok_limited() {
+        let archive = create_tar_gz(&[
+            ("hello.txt", b"hello world"),
+            ("subdir/nested.txt", b"nested content"),
+        ]);
+        let out = tempfile::tempdir().unwrap();
+
+        let decoder = flate2::read::GzDecoder::new(&archive[..]);
+        unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 1000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("subdir/nested.txt")).unwrap(),
+            "nested content"
+        );
+    }
+
+    #[test]
+    fn test_tar_special_entry_skipped_limited() {
+        // Symlink entry must be skipped by the bounded extractor.
+        let archive =
+            create_tar_gz_with_symlink(&[("legit.txt", b"ok")], &[("evil_link", "/etc/passwd")]);
+        let out = tempfile::tempdir().unwrap();
+
+        let decoder = flate2::read::GzDecoder::new(&archive[..]);
+        unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 1000).unwrap();
+        assert!(out.path().join("legit.txt").exists());
+        assert!(!out.path().join("evil_link").exists());
+    }
+
+    /// Build a tar.gz whose single entry carries an attacker-controlled raw
+    /// path (bypassing `set_path`'s own `..` rejection by writing the GNU
+    /// header name bytes directly), so the extractor's own traversal guard is
+    /// what's under test.
+    fn create_tar_gz_raw_name(raw_name: &[u8], data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("placeholder.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            {
+                let gnu = header.as_gnu_mut().unwrap();
+                // zero the name field, then write the hostile bytes + NUL.
+                for b in gnu.name.iter_mut() {
+                    *b = 0;
+                }
+                let n = raw_name.len().min(gnu.name.len() - 1);
+                gnu.name[..n].copy_from_slice(&raw_name[..n]);
+            }
+            header.set_cksum();
+            tar.append(&header, data).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_tar_path_traversal_rejected_limited() {
+        // Entries that escape the workspace via `..` or an absolute path must
+        // be skipped and MUST NOT create files outside the destination dir.
+        // Regression guard for the manual-iteration extractor: a lexical
+        // `starts_with(dst)` check alone does not resolve `..`.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("workspace");
+        std::fs::create_dir_all(&out).unwrap();
+
+        for raw in [
+            &b"../../escape_up.txt"[..],
+            &b"../sibling.txt"[..],
+            &b"/etc/abs_escape.txt"[..],
+            &b"subdir/../../escape_mid.txt"[..],
+        ] {
+            let archive = create_tar_gz_raw_name(raw, b"PWNED");
+            let decoder = flate2::read::GzDecoder::new(&archive[..]);
+            // Extraction itself succeeds (entry silently skipped), no error.
+            unpack_tar_limited(tar::Archive::new(decoder), &out, 1_000_000, 1000).unwrap();
+        }
+
+        // Nothing was written anywhere under the tempdir root except the
+        // (empty) workspace dir we created.
+        let escaped: Vec<_> = walkdir_files(root.path())
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("escape") || n.contains("sibling"))
+            })
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "path-traversal entries escaped the workspace: {escaped:?}"
+        );
+        // And the workspace itself holds no traversal artefacts.
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    /// Minimal recursive file lister for the traversal test (avoids a new dep).
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_max_scan_extracted_bytes_env_override() {
+        // Default when unset; a valid override wins; zero/blank falls back.
+        let key = MAX_SCAN_EXTRACTED_BYTES_ENV;
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(max_scan_extracted_bytes(), DEFAULT_MAX_SCAN_EXTRACTED_BYTES);
+
+        std::env::set_var(key, "4096");
+        assert_eq!(max_scan_extracted_bytes(), 4096);
+
+        std::env::set_var(key, "0");
+        assert_eq!(max_scan_extracted_bytes(), DEFAULT_MAX_SCAN_EXTRACTED_BYTES);
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     // ===================================================================
