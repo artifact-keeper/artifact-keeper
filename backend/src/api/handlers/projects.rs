@@ -484,6 +484,19 @@ pub async fn add_project_member(
         .map_err(|e| AppError::Validation(format!("Invalid member payload: {}", e)))?;
 
     validate_member_grant(&payload.principal_type, &payload.actions)?;
+    // #2503 (defense-in-depth): `validate_member_grant` only enforces the
+    // project-member *type allowlist* (user|group) and non-empty actions — it
+    // never checks that `principal_id` actually names a principal of that type.
+    // Without this, a mistyped grant (e.g. `principal_type = 'user'` naming a
+    // service-account id) is upserted here and, because project grants are
+    // inherited by every repository in the project and the resolver matches
+    // `principal_type IN ('user','service_account')`, becomes effective for the
+    // mistyped principal — the same class POST /permissions rejects. Reuse the
+    // identical write-time correspondence check so this parallel writer agrees.
+    state
+        .permission_service
+        .validate_principal(&payload.principal_type, payload.principal_id)
+        .await?;
     require_project_exists(&state, id).await?;
 
     let row: ProjectMemberRow = sqlx::query_as(
@@ -889,6 +902,91 @@ mod tests {
             cleanup_project(&pool, project_id).await;
             tdh::cleanup(&pool, repo_id, member_id).await;
             tdh::cleanup(&pool, repo_id, outsider_id).await;
+        }
+
+        /// #2503: `add_project_member` must reject a mistyped grant (a `user`-typed
+        /// grant naming a service-account id) with a 400, exactly as
+        /// `POST /permissions` does — otherwise the mistyped grant is upserted and,
+        /// being inherited by the project's repositories, makes the SA effective.
+        /// A well-typed member is still accepted, and no stray grant is written.
+        #[tokio::test]
+        async fn test_add_project_member_rejects_mistyped_principal() {
+            use axum::extract::{Path, State};
+            use axum::Extension;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("prj-mt-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let (admin_id, admin_name) = tdh::create_user(&pool).await;
+            let admin = AuthExtension {
+                is_admin: true,
+                ..tdh::make_auth(admin_id, &admin_name)
+            };
+            let (user_id, _) = tdh::create_user(&pool).await;
+            let sa_id = Uuid::new_v4();
+            let sa_name = format!("prj-mt-sa-{sa_id}");
+            sqlx::query(
+                r#"INSERT INTO users
+                     (id, username, email, password_hash, auth_provider,
+                      is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, 'unused', 'local', false, true, true)"#,
+            )
+            .bind(sa_id)
+            .bind(&sa_name)
+            .bind(format!("{sa_name}@test.local"))
+            .execute(&pool)
+            .await
+            .expect("seed service account");
+            let (repo_id, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+            let project_id = create_project_row(&pool, "mistype").await;
+            assign_repo_to_project(&pool, repo_id, project_id).await;
+
+            let call = |auth: AuthExtension, ptype: &str, pid: Uuid| {
+                let state = state.clone();
+                let body = axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "principal_type": ptype,
+                        "principal_id": pid,
+                        "actions": ["read", "write"],
+                    }))
+                    .unwrap(),
+                );
+                async move {
+                    add_project_member(State(state), Extension(Some(auth)), Path(project_id), body)
+                        .await
+                }
+            };
+
+            // Exploit: a `user`-typed grant naming a service-account id -> 400.
+            let mistyped = call(admin.clone(), "user", sa_id).await;
+            assert!(
+                matches!(mistyped, Err(AppError::Validation(_))),
+                "mistyped project-member grant (user id = SA) must be a 400, got {mistyped:?}"
+            );
+
+            // Resolve-time: the rejected grant was never written, so the SA has no
+            // inherited access to the project's private repository.
+            let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+            assert!(
+                !svc.user_can_access_repo(repo_id, sa_id).await.unwrap(),
+                "a rejected mistyped grant must not make the SA effective on the project repo"
+            );
+
+            // Legit: a well-typed user member is still accepted (200).
+            assert!(
+                call(admin, "user", user_id).await.is_ok(),
+                "a valid user member must still be accepted"
+            );
+
+            cleanup_project(&pool, project_id).await;
+            tdh::cleanup(&pool, repo_id, user_id).await;
+            let _ = sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
+                .bind(admin_id)
+                .bind(sa_id)
+                .execute(&pool)
+                .await;
         }
 
         /// (2) Cross-project isolation: a grant on project B conveys nothing
@@ -1307,8 +1405,16 @@ mod tests {
             let key = format!("prj-http-mem-{}", Uuid::new_v4().simple());
             let (_, created) = create_via_api(&state, &key).await;
             let id = created["id"].as_str().expect("project id").to_string();
-            let user_id = Uuid::new_v4();
+            // #2503: project-member grants are now validated for principal
+            // type/id correspondence, so the grantees must be real principals.
+            let (user_id, _) = tdh::create_user(&pool).await;
             let group_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(group_id)
+                .bind(format!("prj-http-mem-grp-{group_id}"))
+                .execute(&pool)
+                .await
+                .expect("seed group");
 
             // Grant a user -> 200 with the row echoed.
             let (status, bytes) = tdh::send(
@@ -1432,6 +1538,14 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
 
             cleanup_project_rows(&pool, &key).await;
+            let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(group_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await;
         }
 
         #[tokio::test]

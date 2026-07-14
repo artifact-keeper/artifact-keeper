@@ -271,6 +271,17 @@ pub async fn create_permission(
     let payload: CreatePermissionRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
 
+    // #2503 (defense-in-depth): validate that `principal_id` actually names a
+    // principal of the declared `principal_type`. Since #2433 widened grant
+    // matching to include `service_account`, a mistyped grant (e.g.
+    // `principal_type = 'service_account'` naming a real user id) would resolve
+    // against the wrong principal. Reject the mismatch with a 400 before the
+    // INSERT instead of persisting an effective, misattributed grant.
+    state
+        .permission_service
+        .validate_principal(&payload.principal_type, payload.principal_id)
+        .await?;
+
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
@@ -406,6 +417,13 @@ pub async fn update_permission(
 
     let payload: CreatePermissionRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
+
+    // #2503 (defense-in-depth): mirror the create-path check so an update cannot
+    // reintroduce a type/id mismatch (e.g. `service_account` naming a user id).
+    state
+        .permission_service
+        .validate_principal(&payload.principal_type, payload.principal_id)
+        .await?;
 
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"

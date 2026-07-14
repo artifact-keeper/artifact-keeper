@@ -1724,14 +1724,86 @@ mod tests {
             "admin must read any group"
         );
 
+        // #2503 (finding 2): a *direct* service_account-typed grant on a group
+        // must surface that group in the SA's list_groups (not just group-mediated
+        // repo access). The SA is a non-member of `other`, so only the grant can
+        // make it visible; `visible_groups_predicate`'s
+        // `principal_type IN ('user','service_account')` arm is what carries it.
+        let sa_id = Uuid::new_v4();
+        let sa_username = format!("ph-grp-sa-{sa_id}");
+        sqlx::query(
+            r#"INSERT INTO users
+                 (id, username, email, password_hash, auth_provider,
+                  is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, 'unused', 'local', false, true, true)"#,
+        )
+        .bind(sa_id)
+        .bind(&sa_username)
+        .bind(format!("{sa_username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed service account");
+        let grant_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO permissions
+                 (id, principal_type, principal_id, target_type, target_id, actions)
+               VALUES ($1, 'service_account', $2, 'group', $3, ARRAY['read'])"#,
+        )
+        .bind(grant_id)
+        .bind(sa_id)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("seed direct SA->group grant");
+
+        let sa_auth = AuthExtension {
+            is_service_account: true,
+            is_api_token: true,
+            ..tdh::make_auth(sa_id, &sa_username)
+        };
+        let sa_listed = list_groups(
+            State(state.clone()),
+            Extension(Some(sa_auth.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("SA list ok")
+        .0;
+        let sa_names: Vec<&str> = sa_listed.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            sa_names.contains(&other_name.as_str()),
+            "a direct service_account grant on a group must surface it in list_groups: {sa_names:?}"
+        );
+        assert!(
+            !sa_names.contains(&mine_name.as_str()),
+            "SA must NOT see a group it neither belongs to nor holds a grant on: {sa_names:?}"
+        );
+        // get_group over the same direct grant also resolves (not a NotFound leak-avoider).
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(sa_auth)),
+                Path(other),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "direct SA grant must also make get_group succeed"
+        );
+
         // cleanup (user_group_members cascades on group/user delete).
+        let _ = sqlx::query("DELETE FROM permissions WHERE id = $1")
+            .bind(grant_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM groups WHERE id IN ($1, $2)")
             .bind(mine)
             .bind(other)
             .execute(&pool)
             .await;
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        let _ = sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
             .bind(user_id)
+            .bind(sa_id)
             .execute(&pool)
             .await;
     }
