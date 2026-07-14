@@ -64,7 +64,8 @@ const MAX_IPS_PER_DOWNLOADER: u32 = 50;
 /// Cap on the `affected_repos` block. `summary.affected_repo_count` remains
 /// the true total even when the list is truncated.
 const MAX_AFFECTED_REPOS: u32 = 200;
-/// Fraction of active, non-service users at/above which a restricted repo's
+/// Fraction of active users (the same population the enumeration draws from —
+/// including admins and service accounts) at/above which a restricted repo's
 /// accessible set is treated as "effectively everyone" — the page body is
 /// suppressed (reporting ~all users is not actionable, and this catches the
 /// global NULL-scoped `role_assignment` granted to every user). The count is
@@ -679,12 +680,17 @@ async fn accessible_users_core(
     count_q = bind_target(count_q, &target);
     let accessible_count: i64 = count_q.fetch_one(db).await.map_err(db_err)?;
 
-    // Active, non-service user population for the effectively-everyone check.
-    let active_user_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_active AND NOT is_service_account")
-            .fetch_one(db)
-            .await
-            .map_err(db_err)?;
+    // Candidate population for the effectively-everyone check: ALL active users.
+    // This must match the population the enumeration draws from (`users u WHERE
+    // u.is_active`) so numerator and denominator are apples-to-apples — the
+    // accessible set includes admins and service accounts (both can pull and
+    // both appear in the list), so both must be counted here too. Excluding
+    // service accounts from only the denominator would trip the 90% collapse
+    // early.
+    let active_user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_active")
+        .fetch_one(db)
+        .await
+        .map_err(db_err)?;
 
     let exposure = classify_exposure(&access_scope, accessible_count, active_user_count);
     if exposure != "enumerable" {
@@ -763,11 +769,21 @@ fn bind_target_as<'a>(
     }
 }
 
-/// The affected-artifact subquery for a CVE target: all artifacts flagged with
-/// the CVE (binds `$2`).
-const CVE_AFFECTED_SQL: &str = "SELECT DISTINCT artifact_id FROM scan_findings WHERE cve_id = $2";
+/// The affected-artifact subquery for a CVE target: artifacts flagged with the
+/// CVE (binds `$2`) **restricted to the target repository** (`$1`). The
+/// per-repo scope is essential: the report is scoped to one repository, and the
+/// download anti-join must only exclude users who downloaded the CVE's artifact
+/// *in this repo*. Without the `repository_id = $1` intersection the anti-join
+/// would be CVE-global and wrongly hide a user who downloaded another repo's
+/// (even another tenant's) copy of the same CVE while still having latent access
+/// to this repo's un-downloaded vulnerable artifact — and it would disagree with
+/// the `/artifact/{id}/accessible-users` answer for the very same artifact.
+const CVE_AFFECTED_SQL: &str = "SELECT sf.artifact_id FROM scan_findings sf \
+     JOIN artifacts a ON a.id = sf.artifact_id \
+     WHERE sf.cve_id = $2 AND a.repository_id = $1";
 /// The affected-artifact subquery for a single artifact target: the artifact
-/// itself (binds `$2`), independent of whether a finding row exists.
+/// itself (binds `$2`), independent of whether a finding row exists. Already
+/// repo-scoped because the artifact belongs to the target repository.
 const ARTIFACT_AFFECTED_SQL: &str = "SELECT $2::uuid";
 
 /// Accessible-but-not-downloaded users for a CVE, scoped to one restricted
@@ -1022,6 +1038,12 @@ mod tests {
         assert!(
             sql.contains("NOT EXISTS") && sql.contains("download_statistics"),
             "download anti-join missing: {sql}"
+        );
+        // The CVE affected-artifact set (hence the anti-join) is repo-scoped to
+        // the target repository, not CVE-global.
+        assert!(
+            sql.contains("a.repository_id = $1"),
+            "CVE anti-join must be scoped to the target repository: {sql}"
         );
         // Admin short-circuit.
         assert!(sql.contains("u.is_admin"), "admin arm missing: {sql}");
@@ -1549,6 +1571,113 @@ mod tests {
                 .bind(u)
                 .execute(&pool)
                 .await;
+            tdh::cleanup_user(&pool, u).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accessible_users_cve_antijoin_is_repo_scoped_db() {
+        // Regression: the CVE download anti-join must be scoped to the TARGET
+        // repository, not CVE-global. A user who downloaded another repo's copy
+        // of the same CVE but still has latent (un-downloaded) access to THIS
+        // repo's vulnerable artifact must remain listed — and the cve route must
+        // agree with the artifact route for the same artifact.
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cve = format!("CVE-2386X-{}", &Uuid::new_v4().to_string()[..8]);
+        // Two restricted repos, each with an artifact flagged by the same CVE.
+        let (repo_a, _ka, _da) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, _kb, _db) = tdh::create_repo(&pool, "local", "generic").await;
+        let art_a = seed_artifact_version(&pool, repo_a, "1.0.0").await;
+        let art_b = seed_artifact_version(&pool, repo_b, "1.0.0").await;
+        seed_cve_finding(&pool, repo_a, art_a, &cve).await;
+        seed_cve_finding(&pool, repo_b, art_b, &cve).await;
+
+        // xspan: role access on repo_a; downloaded ONLY repo_b's copy.
+        let (xspan, _n) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_a, xspan).await;
+        seed_download(&pool, art_b, Some(xspan), "203.0.113.77").await;
+        // ydl: role access on repo_a; downloaded repo_a's OWN artifact -> excluded.
+        let (ydl, _n) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_a, ydl).await;
+        seed_download(&pool, art_a, Some(ydl), "203.0.113.78").await;
+
+        // CVE route scoped to repo_a: xspan LISTED (target-repo access, not
+        // downloaded in target repo), ydl EXCLUDED (downloaded in target repo).
+        let cve_resp = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            repo_a,
+            CVE_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                repository_id: Some(repo_a),
+                per_page: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cve accessible users");
+        let cve_ids: std::collections::HashSet<_> = cve_resp
+            .accessible_not_downloaded
+            .iter()
+            .map(|a| a.user_id)
+            .collect();
+        assert!(
+            cve_ids.contains(&xspan),
+            "cve route must LIST xspan (downloaded another repo's copy, not repo_a's)"
+        );
+        assert!(
+            !cve_ids.contains(&ydl),
+            "cve route must EXCLUDE ydl (downloaded repo_a's own artifact)"
+        );
+
+        // Artifact route for repo_a's artifact must AGREE with the cve route.
+        let art_resp = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Artifact(art_a),
+            repo_a,
+            ARTIFACT_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                per_page: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("artifact accessible users");
+        let art_ids: std::collections::HashSet<_> = art_resp
+            .accessible_not_downloaded
+            .iter()
+            .map(|a| a.user_id)
+            .collect();
+        assert!(
+            art_ids.contains(&xspan),
+            "artifact route must LIST xspan too"
+        );
+        assert!(
+            !art_ids.contains(&ydl),
+            "artifact route must EXCLUDE ydl too"
+        );
+        assert_eq!(
+            cve_ids.contains(&xspan),
+            art_ids.contains(&xspan),
+            "cve and artifact routes must agree on xspan"
+        );
+
+        // Cleanup.
+        for repo in [repo_a, repo_b] {
+            for q in [
+                "DELETE FROM scan_findings WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM scan_results WHERE repository_id = $1",
+                "DELETE FROM download_statistics WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM role_assignments WHERE repository_id = $1",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(q).bind(repo).execute(&pool).await;
+            }
+        }
+        for u in [xspan, ydl] {
             tdh::cleanup_user(&pool, u).await;
         }
     }
