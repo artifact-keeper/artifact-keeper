@@ -17,6 +17,7 @@ pub mod models;
 pub mod services;
 pub mod storage;
 pub mod telemetry;
+pub mod util;
 
 pub use config::Config;
 pub use error::{AppError, Result};

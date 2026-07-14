@@ -673,6 +673,139 @@ fn empty_audits_quick_response() -> Response {
     build_json_metadata_response(body.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// npm /-/ meta+audit namespace — scope-policy filtering (#2424)
+//
+// The advisory/audit/search endpoints proxy to upstream. On a scope-restricted
+// Remote repository they must not leak metadata (advisories, audit reports,
+// search hits) for out-of-scope package names. These pure helpers filter the
+// package-name-bearing request/response shapes against the repo's policy;
+// callers only invoke them when `policy.is_active()`, so unset-policy repos are
+// byte-identical (allow-all) and never touch this code path.
+// ---------------------------------------------------------------------------
+
+/// Filter a JSON object whose keys are npm package names, keeping only entries
+/// the policy allows. Returns the filtered map and whether any entry survived.
+/// Shared by the bulk-advisories request/response (`{name: [...]}`) and the
+/// quick-audit `requires` / `dependencies` sub-maps.
+fn filter_pkg_name_map(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    policy: &NpmScopePolicy,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let filtered: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(name, _)| policy.allows(name))
+        .map(|(name, val)| (name.clone(), val.clone()))
+        .collect();
+    let kept = !filtered.is_empty();
+    (filtered, kept)
+}
+
+/// Filter the bulk-advisories request body (`{name: [versions]}`) against the
+/// policy. Returns the re-serialised body and whether any in-scope package
+/// remained. `None` when the body is not the expected object shape — the caller
+/// fails closed (empty response) under an active policy.
+fn filter_bulk_advisory_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object()?;
+    let (filtered, kept) = filter_pkg_name_map(obj, policy);
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(filtered)).ok()?;
+    Some((Bytes::from(bytes), kept))
+}
+
+/// Filter a bulk-advisories response (`{name: [advisories]}`) against the
+/// policy — defence in depth in case upstream returns advisories for names that
+/// were not requested. Parse failure yields an empty object (fail-closed).
+fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> String {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(obj)) => {
+            let (filtered, _) = filter_pkg_name_map(&obj, policy);
+            serde_json::Value::Object(filtered).to_string()
+        }
+        _ => serde_json::Value::Object(serde_json::Map::new()).to_string(),
+    }
+}
+
+/// Filter the quick-audit request body: drop out-of-scope names from the
+/// `requires` and `dependencies` maps so upstream is never asked about them.
+/// Returns the re-serialised body and whether any in-scope dependency remained.
+/// `None` when the body is not an object (caller fails closed).
+fn filter_quick_audit_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object_mut()?;
+    let mut kept = false;
+    for key in ["requires", "dependencies"] {
+        // Compute the filtered sub-map first (borrow ends before the insert).
+        let filtered = obj
+            .get(key)
+            .and_then(|v| v.as_object())
+            .map(|sub| filter_pkg_name_map(sub, policy));
+        if let Some((fmap, k)) = filtered {
+            kept = kept || k;
+            obj.insert(key.to_string(), serde_json::Value::Object(fmap));
+        }
+    }
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some((Bytes::from(bytes), kept))
+}
+
+/// Filter a quick-audit response: keep only `advisories` whose `module_name`
+/// the policy allows. Returns the re-serialised body; `None` when the body is
+/// not an object (caller falls back to the empty audit report).
+fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = value.as_object_mut()?;
+    // Compute the filtered advisories map first so the immutable borrow of
+    // `obj` ends before the mutable `insert`.
+    let filtered = obj
+        .get("advisories")
+        .and_then(|v| v.as_object())
+        .map(|adv| {
+            adv.iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .get("module_name")
+                        .and_then(|m| m.as_str())
+                        .map(|name| policy.allows(name))
+                        // An advisory with no module_name cannot be scoped: drop it.
+                        .unwrap_or(false)
+                })
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        });
+    if let Some(fmap) = filtered {
+        obj.insert("advisories".to_string(), serde_json::Value::Object(fmap));
+    }
+    Some(value.to_string())
+}
+
+/// Best-effort defensive filter of an npm `/-/` meta response against the scope
+/// policy (#2424). Handles the search shape
+/// (`{"objects":[{"package":{"name":...}}], "total":N, ...}`) — dropping
+/// out-of-scope hits and correcting `total`. Other shapes carry no arbitrary
+/// package-name listing and are returned unchanged. `None` on parse failure so
+/// the caller serves the upstream body verbatim.
+fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = value.as_object_mut()?;
+    let mut new_total: Option<usize> = None;
+    if let Some(objects) = obj.get_mut("objects").and_then(|v| v.as_array_mut()) {
+        objects.retain(|entry| {
+            entry
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|name| policy.allows(name))
+                .unwrap_or(false)
+        });
+        new_total = Some(objects.len());
+    }
+    if let Some(total) = new_total {
+        obj.insert("total".to_string(), serde_json::json!(total));
+    }
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
 /// Forward an npm audit POST request to the configured upstream registry.
 ///
 /// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
@@ -681,13 +814,17 @@ fn empty_audits_quick_response() -> Response {
 /// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
 /// well-formed response so the audit degrades gracefully instead of failing
 /// the client command. See issue #1400.
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
-async fn proxy_npm_audit_post(
+/// POST an npm audit body upstream and return the raw 2xx JSON bytes plus the
+/// upstream content-type. Returns `None` on a non-success status or any
+/// transport/read error, mirroring the empty-fallback semantics of
+/// [`proxy_npm_audit_post`]. Split out so the scope-policy path (#2424) can
+/// post-filter the response before serving it.
+#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
+async fn npm_audit_upstream_json(
     upstream_url: &str,
     path: &str,
     body: Bytes,
-    empty_fallback: fn() -> Response,
-) -> Response {
+) -> Option<(String, Bytes)> {
     let base = upstream_url.trim_end_matches('/');
     let url = format!("{}{}", base, path);
     let client = crate::services::http_client::default_client();
@@ -696,46 +833,8 @@ async fn proxy_npm_audit_post(
         .header(CONTENT_TYPE, "application/json")
         .body(body);
 
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let content_type = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
-            match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024)
-                .await
-            {
-                Ok(bytes) => {
-                    if !status.is_success() {
-                        debug!(
-                            target: "npm_audit",
-                            upstream = %url,
-                            status = %status,
-                            "npm audit upstream returned non-success; serving empty advisories"
-                        );
-                        return empty_fallback();
-                    }
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, content_type)
-                        .body(Body::from(bytes))
-                        .unwrap_or_else(|_| empty_fallback())
-                }
-                Err(err) => {
-                    debug!(
-                        target: "npm_audit",
-                        upstream = %url,
-                        error = %err,
-                        "failed to read npm audit upstream body; serving empty advisories"
-                    );
-                    empty_fallback()
-                }
-            }
-        }
+    let resp = match req.send().await {
+        Ok(r) => r,
         Err(err) => {
             debug!(
                 target: "npm_audit",
@@ -743,8 +842,63 @@ async fn proxy_npm_audit_post(
                 error = %err,
                 "failed to reach npm audit upstream; serving empty advisories"
             );
-            empty_fallback()
+            return None;
         }
+    };
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
+    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
+        Ok(bytes) => {
+            if !status.is_success() {
+                debug!(
+                    target: "npm_audit",
+                    upstream = %url,
+                    status = %status,
+                    "npm audit upstream returned non-success; serving empty advisories"
+                );
+                return None;
+            }
+            Some((content_type, bytes))
+        }
+        Err(err) => {
+            debug!(
+                target: "npm_audit",
+                upstream = %url,
+                error = %err,
+                "failed to read npm audit upstream body; serving empty advisories"
+            );
+            None
+        }
+    }
+}
+
+/// Forward an npm audit POST request to the configured upstream registry.
+///
+/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
+/// whichever upstream is configured) so `npm audit` works for cached/mirrored
+/// dependencies. The full client body is forwarded verbatim. On any upstream
+/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
+/// well-formed response so the audit degrades gracefully instead of failing
+/// the client command. See issue #1400.
+async fn proxy_npm_audit_post(
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    empty_fallback: fn() -> Response,
+) -> Response {
+    match npm_audit_upstream_json(upstream_url, path, body).await {
+        Some((content_type, bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| empty_fallback()),
+        None => empty_fallback(),
     }
 }
 
@@ -757,14 +911,23 @@ async fn proxy_npm_audit_post(
 /// Returns the upstream status + body verbatim. On any transport error (DNS,
 /// TLS, timeout) returns `None` so the caller can fall through to the local
 /// fallback.
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
-async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
+#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
+async fn npm_meta_upstream_bytes(
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+) -> Option<(StatusCode, String, Bytes)> {
     let base = upstream_url.trim_end_matches('/');
     // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
     // include a leading slash (`*rest` on `/-/ping` yields `ping`, not `/ping`),
     // so prepend `/-/` and strip any stray leading slash to be robust either way.
     let path_with_dash = format!("/-/{}", meta_path.trim_start_matches('/'));
-    let url = format!("{}{}", base, path_with_dash);
+    // The wildcard capture also drops the query string, so the search term never
+    // reached upstream (`-/v1/search` 400'd with no `text`). Re-append it here.
+    let url = match query {
+        Some(q) if !q.is_empty() => format!("{}{}?{}", base, path_with_dash, q),
+        _ => format!("{}{}", base, path_with_dash),
+    };
     let client = crate::services::http_client::default_client();
 
     let resp = match client.get(&url).send().await {
@@ -790,15 +953,7 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
 
     // STREAMING-EXEMPT: capped metadata read (upstream npm registry packument/meta JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap falls through to local fallback; tracked under #1608
     match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
-        Ok(bytes) => Some(
-            Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, content_type)
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
-                }),
-        ),
+        Ok(bytes) => Some((status, content_type, bytes)),
         Err(err) => {
             debug!(
                 target: "npm_meta",
@@ -809,6 +964,36 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
             None
         }
     }
+}
+
+/// Forward a GET request to the upstream registry at the given meta path,
+/// carrying the original query string. When the repository's scope `policy` is
+/// active (#2424), defensively filter package names out of the response (npm
+/// search results) so a scope-restricted repo does not list out-of-scope
+/// packages. Returns `None` on any transport error so the caller can fall
+/// through to the local fallback.
+async fn proxy_npm_meta_get(
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+    policy: &NpmScopePolicy,
+) -> Option<Response> {
+    let (status, content_type, bytes) =
+        npm_meta_upstream_bytes(upstream_url, meta_path, query).await?;
+    let bytes = if policy.is_active() {
+        filter_meta_response(&bytes, policy).unwrap_or(bytes)
+    } else {
+        bytes
+    };
+    Some(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+            }),
+    )
 }
 
 /// Handler for `GET /npm/{repo_key}/-/*rest`.
@@ -834,20 +1019,27 @@ async fn npm_meta_get(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, rest)): Path<(String, String)>,
+    raw_query: axum::extract::RawQuery,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    let query = raw_query.0;
 
-    // Remote: proxy the whole request to upstream verbatim.
+    // Remote: proxy the whole request to upstream, filtered by this repo's own
+    // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            if let Some(resp) =
+                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            {
                 return Ok(resp);
             }
         }
         // Upstream misconfigured or unreachable — fall through to local stub.
     }
 
-    // Virtual: try the first Remote member whose upstream is reachable.
+    // Virtual: try the first Remote member whose upstream is reachable, applying
+    // that member's scope policy (parity with the metadata/packument loops).
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
         for member in &members {
@@ -857,7 +1049,10 @@ async fn npm_meta_get(
             let Some(ref upstream_url) = member.upstream_url else {
                 continue;
             };
-            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+            let policy = fetch_npm_scope_policy(&state.db, member.id).await;
+            if let Some(resp) =
+                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            {
                 return Ok(resp);
             }
         }
@@ -907,17 +1102,39 @@ async fn security_advisories_bulk(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
+    const PATH: &str = "/-/npm/v1/security/advisories/bulk";
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            return Ok(proxy_npm_audit_post(
-                upstream_url,
-                "/-/npm/v1/security/advisories/bulk",
-                body,
-                empty_advisories_bulk_response,
-            )
-            .await);
+            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
+            if !policy.is_active() {
+                return Ok(proxy_npm_audit_post(
+                    upstream_url,
+                    PATH,
+                    body,
+                    empty_advisories_bulk_response,
+                )
+                .await);
+            }
+            // Active policy (#2424): drop out-of-scope package names from the
+            // request so upstream is never queried about them, then filter the
+            // response as defence in depth. Unparseable body ⇒ fail closed.
+            let Some((filtered_body, kept)) = filter_bulk_advisory_request(&body, &policy) else {
+                return Ok(empty_advisories_bulk_response());
+            };
+            if !kept {
+                return Ok(empty_advisories_bulk_response());
+            }
+            return Ok(
+                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
+                    Some((_ct, bytes)) => {
+                        build_json_metadata_response(filter_bulk_advisory_response(&bytes, &policy))
+                    }
+                    None => empty_advisories_bulk_response(),
+                },
+            );
         }
     }
 
@@ -934,17 +1151,40 @@ async fn security_audits_quick(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
+    const PATH: &str = "/-/npm/v1/security/audits/quick";
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            return Ok(proxy_npm_audit_post(
-                upstream_url,
-                "/-/npm/v1/security/audits/quick",
-                body,
-                empty_audits_quick_response,
-            )
-            .await);
+            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
+            if !policy.is_active() {
+                return Ok(proxy_npm_audit_post(
+                    upstream_url,
+                    PATH,
+                    body,
+                    empty_audits_quick_response,
+                )
+                .await);
+            }
+            // Active policy (#2424): strip out-of-scope names from the request's
+            // requires/dependencies, then filter the response's advisories by
+            // module_name. Unparseable body ⇒ fail closed.
+            let Some((filtered_body, kept)) = filter_quick_audit_request(&body, &policy) else {
+                return Ok(empty_audits_quick_response());
+            };
+            if !kept {
+                return Ok(empty_audits_quick_response());
+            }
+            return Ok(
+                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
+                    Some((_ct, bytes)) => match filter_quick_audit_response(&bytes, &policy) {
+                        Some(filtered) => build_json_metadata_response(filtered),
+                        None => empty_audits_quick_response(),
+                    },
+                    None => empty_audits_quick_response(),
+                },
+            );
         }
     }
 
@@ -1220,6 +1460,14 @@ async fn fetch_npm_artifacts(
 pub(crate) const NPM_ALLOWED_SCOPES_KEY: &str = "npm_allowed_scopes";
 /// `repository_config` key holding the unscoped-package toggle ("true"/"false").
 pub(crate) const NPM_ALLOW_UNSCOPED_KEY: &str = "npm_allow_unscoped";
+/// `repository_config` key holding the JSON array of allowed npm name globs
+/// (#2424). Additive to `npm_allowed_scopes`: an unset key has no effect, so
+/// repositories configured before #2424 behave byte-identically.
+pub(crate) const NPM_ALLOWED_NAME_PATTERNS_KEY: &str = "npm_allowed_name_patterns";
+
+/// Maximum length of a single npm name glob pattern (matches the npm package
+/// name length cap; keeps a stored pattern from growing unbounded).
+pub(crate) const NPM_NAME_PATTERN_MAX_LEN: usize = 214;
 
 /// Parsed shape of an npm package name for scope-policy evaluation.
 #[derive(Debug, PartialEq, Eq)]
@@ -1284,13 +1532,32 @@ pub(crate) struct NpmScopePolicy {
     /// repository. `None` = not configured; treated as "deny" once the
     /// policy is otherwise active (fail-closed) and "allow" otherwise.
     pub(crate) allow_unscoped: Option<bool>,
+    /// Allowed full-package-name glob patterns (`*`/`?`), case-folded to
+    /// lowercase (#2424). Additive to `allowed_scopes`: a name is allowed if
+    /// its scope is in `allowed_scopes` OR any of these globs matches the full
+    /// package name. Empty = no pattern restriction (default, unchanged).
+    pub(crate) allowed_name_patterns: Vec<String>,
 }
 
 impl NpmScopePolicy {
-    /// A policy participates in filtering iff an allow-list is present or
-    /// unscoped resolution was explicitly switched off.
+    /// A policy participates in filtering iff an allow-list is present, a name
+    /// pattern list is present (#2424), or unscoped resolution was explicitly
+    /// switched off.
     pub(crate) fn is_active(&self) -> bool {
-        !self.allowed_scopes.is_empty() || self.allow_unscoped == Some(false)
+        !self.allowed_scopes.is_empty()
+            || !self.allowed_name_patterns.is_empty()
+            || self.allow_unscoped == Some(false)
+    }
+
+    /// Whether any configured name glob matches `package_name` (case-folded).
+    fn pattern_matches(&self, package_name: &str) -> bool {
+        if self.allowed_name_patterns.is_empty() {
+            return false;
+        }
+        let name = package_name.to_ascii_lowercase();
+        self.allowed_name_patterns
+            .iter()
+            .any(|pattern| crate::util::glob::glob_match(&pattern.to_ascii_lowercase(), &name))
     }
 
     /// Whether `package_name` may be resolved through the repository this
@@ -1302,13 +1569,21 @@ impl NpmScopePolicy {
         }
         match npm_name_shape(package_name) {
             NpmNameShape::Scoped(scope) => {
-                self.allowed_scopes.is_empty()
+                // Preserve the #2327 semantics: when neither a scope allow-list
+                // nor a name-pattern allow-list is configured (the policy is
+                // active only because `allow_unscoped == Some(false)`), every
+                // scoped name is still allowed. Otherwise a scoped name passes
+                // iff its scope is allow-listed OR a name glob matches.
+                (self.allowed_scopes.is_empty() && self.allowed_name_patterns.is_empty())
                     || self
                         .allowed_scopes
                         .iter()
                         .any(|allowed| allowed == &scope.to_ascii_lowercase())
+                    || self.pattern_matches(package_name)
             }
-            NpmNameShape::Unscoped => self.allow_unscoped == Some(true),
+            NpmNameShape::Unscoped => {
+                self.allow_unscoped == Some(true) || self.pattern_matches(package_name)
+            }
             NpmNameShape::Invalid => false,
         }
     }
@@ -1330,11 +1605,12 @@ async fn fetch_npm_scope_policies(
     }
     let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
         "SELECT repository_id, key, value FROM repository_config \
-         WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+         WHERE repository_id = ANY($1) AND key IN ($2, $3, $4)",
     )
     .bind(repo_ids)
     .bind(NPM_ALLOWED_SCOPES_KEY)
     .bind(NPM_ALLOW_UNSCOPED_KEY)
+    .bind(NPM_ALLOWED_NAME_PATTERNS_KEY)
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -1349,6 +1625,14 @@ async fn fetch_npm_scope_policies(
                 .collect();
         } else if key == NPM_ALLOW_UNSCOPED_KEY {
             policy.allow_unscoped = value.parse::<bool>().ok();
+        } else if key == NPM_ALLOWED_NAME_PATTERNS_KEY {
+            // Malformed JSON => empty (unrestricted by this key), consistent
+            // with the `npm_allowed_scopes` parse above (#2424).
+            policy.allowed_name_patterns = serde_json::from_str::<Vec<String>>(&value)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
         }
     }
     policies
@@ -1396,6 +1680,15 @@ async fn get_package_metadata(
     // artifacts do not contain enough information to reconstruct the full
     // package metadata that npm clients expect.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // path (#2424). Pointing a client straight at the member key would
+        // otherwise bypass the filter the virtual metadata loops apply. An
+        // out-of-scope name returns 404 (parity with the virtual "skipped by
+        // policy => not found" behaviour; avoids confirming the name exists).
+        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Package not found".to_string()).into_response());
+        }
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
@@ -1621,6 +1914,12 @@ async fn fetch_remote_packument(
     package_name: &str,
     base_url: &str,
 ) -> Result<serde_json::Value, Response> {
+    // Enforce the repository's own npm scope policy on the direct-remote
+    // packument path (#2424); an out-of-scope name returns 404.
+    let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+    if !policy.allows(package_name) {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
     let upstream_url = repo
         .upstream_url
         .as_deref()
@@ -2143,6 +2442,14 @@ async fn serve_tarball(
     // already fetched). The proxy cache stores content under its own storage
     // key which the regular artifact storage cannot resolve.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // tarball path (#2424). A pinned-lockfile tarball GET for an
+        // out-of-scope name would otherwise stream straight through; an
+        // out-of-scope name now returns 404.
+        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
+        }
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
@@ -2227,6 +2534,26 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
+        // #2424: apply the per-member npm scope policy to the direct-tarball
+        // path, exactly as the metadata/packument loops already do. Metadata
+        // filtering alone does not cover a client that already knows the exact
+        // tarball URL (a pinned lockfile), which would otherwise stream an
+        // out-of-scope `@scope/pkg` straight through a Remote member. Fetch the
+        // members once, drop Remote members the policy excludes, and resolve
+        // over the pre-filtered list via `resolve_virtual_download_from_members`
+        // — the established pre-filtered-member seam (cf. maven.rs) — so the
+        // shared generic `resolve_virtual_download` helper is left untouched and
+        // no other format (maven/hex/...) is affected. Non-Remote members are
+        // always eligible, preserving the `virtual_non_remote_owns_name`
+        // shadowing guard and the local-only primitive above.
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+        let members: Vec<_> = members
+            .into_iter()
+            .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
+            .collect();
+
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
         // per-member (see the metadata branch), so an ordinary `npm install`
@@ -2238,7 +2565,6 @@ async fn serve_tarball(
         // shared `resolve_virtual_download` helper is left untouched so no
         // other format (maven/hex/...) is affected.
         if let Some(proxy) = proxy_for_virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -2279,10 +2605,9 @@ async fn serve_tarball(
             }
         }
 
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &upstream_path,
             |member_id, location| {
                 let db = db.clone();
@@ -3083,6 +3408,19 @@ mod tests {
         NpmScopePolicy {
             allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
             allow_unscoped,
+            allowed_name_patterns: Vec::new(),
+        }
+    }
+
+    fn policy_with_patterns(
+        scopes: &[&str],
+        allow_unscoped: Option<bool>,
+        patterns: &[&str],
+    ) -> NpmScopePolicy {
+        NpmScopePolicy {
+            allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allow_unscoped,
+            allowed_name_patterns: patterns.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -3173,6 +3511,177 @@ mod tests {
         assert!(!p.allows("@types"));
         assert!(!p.allows("@/x"));
         assert!(!p.allows(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // npm name-glob patterns (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn glob_patterns_activate_and_allow_scoped_names() {
+        // Patterns-only policy (no scope list, unscoped unset) is active.
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo"));
+        assert!(p.allows("@acme/bar-baz"));
+        // A scoped name outside the glob is denied even though allowed_scopes
+        // is empty (the glob restriction is what makes the policy active).
+        assert!(!p.allows("@evil/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_allow_unscoped_names() {
+        let p = policy_with_patterns(&[], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("internal-utils"));
+        assert!(!p.allows("lodash"));
+        // allow_unscoped=false but the glob still admits matching unscoped names.
+        assert!(p.allows("internal-tools"));
+    }
+
+    #[test]
+    fn glob_patterns_or_compose_with_exact_scopes() {
+        // Exact scope @acme + pattern internal-* + unscoped denied: mirrors the
+        // on-box verification policy.
+        let p = policy_with_patterns(&["@acme"], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo")); // exact scope
+        assert!(p.allows("internal-utils")); // pattern (unscoped)
+        assert!(!p.allows("other-pkg")); // neither, unscoped denied
+        assert!(!p.allows("@evil/pkg")); // neither, scope not allowed
+    }
+
+    #[test]
+    fn glob_patterns_are_case_insensitive() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.allows("@ACME/Foo"));
+        // Constructed with mixed-case pattern (loader lowercases, but be safe).
+        let p2 = policy_with_patterns(&[], None, &["@Acme/*"]);
+        assert!(p2.allows("@acme/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_invalid_names_fail_closed() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(!p.allows("@acme")); // malformed (no package part)
+        assert!(!p.allows(""));
+    }
+
+    #[test]
+    fn glob_patterns_do_not_affect_existing_scope_only_policies() {
+        // A policy with only exact scopes behaves byte-identically: no patterns
+        // means pattern_matches never fires.
+        let p = policy(&["@types"], Some(false));
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@other/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    // -----------------------------------------------------------------------
+    // npm /-/ meta+audit namespace filtering (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bulk_advisory_request_drops_out_of_scope_names() {
+        let p = policy_with_patterns(&["@types"], Some(false), &["lodash*"]);
+        let body = br#"{"@types/node":["18.0.0"],"lodash":["4.17.4"],"express":["4.16.0"]}"#;
+        let (filtered, kept) = filter_bulk_advisory_request(body, &p).expect("parses");
+        assert!(kept);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("@types/node"));
+        assert!(obj.contains_key("lodash"));
+        assert!(!obj.contains_key("express"));
+    }
+
+    #[test]
+    fn bulk_advisory_request_all_out_of_scope_keeps_nothing() {
+        let p = policy_with_patterns(&["@types"], Some(false), &[]);
+        let body = br#"{"express":["4.16.0"],"react":["18.0.0"]}"#;
+        let (_filtered, kept) = filter_bulk_advisory_request(body, &p).expect("parses");
+        assert!(!kept);
+    }
+
+    #[test]
+    fn bulk_advisory_request_unparseable_is_none() {
+        let p = policy_with_patterns(&["@types"], Some(false), &[]);
+        assert!(filter_bulk_advisory_request(b"not-json", &p).is_none());
+    }
+
+    #[test]
+    fn bulk_advisory_response_filters_names() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"lodash":[{"id":1}],"express":[{"id":2}]}"#;
+        let out = filter_bulk_advisory_response(body, &p);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("lodash").is_some());
+        assert!(v.get("express").is_none());
+    }
+
+    #[test]
+    fn quick_audit_request_filters_requires_and_dependencies() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"name":"app","version":"1.0.0",
+            "requires":{"lodash":"^4.17.0","express":"^4.16.0"},
+            "dependencies":{"lodash":{"version":"4.17.4"},"express":{"version":"4.16.0"}}}"#;
+        let (filtered, kept) = filter_quick_audit_request(body, &p).expect("parses");
+        assert!(kept);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        assert!(v["requires"].get("lodash").is_some());
+        assert!(v["requires"].get("express").is_none());
+        assert!(v["dependencies"].get("lodash").is_some());
+        assert!(v["dependencies"].get("express").is_none());
+        // Untouched top-level fields survive.
+        assert_eq!(v["name"], "app");
+    }
+
+    #[test]
+    fn quick_audit_response_filters_advisories_by_module_name() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"actions":[],"advisories":{
+            "1065":{"module_name":"lodash","severity":"high"},
+            "1755":{"module_name":"express","severity":"low"},
+            "9999":{"severity":"low"}
+        },"muted":[],"metadata":{}}"#;
+        let out = filter_quick_audit_response(body, &p).expect("object");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let adv = v["advisories"].as_object().unwrap();
+        assert!(adv.contains_key("1065")); // lodash in scope
+        assert!(!adv.contains_key("1755")); // express out of scope
+        assert!(!adv.contains_key("9999")); // no module_name -> dropped (fail-closed)
+    }
+
+    #[test]
+    fn meta_search_response_filters_objects_and_total() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"objects":[
+            {"package":{"name":"lodash","version":"4.17.21"}},
+            {"package":{"name":"express","version":"4.18.0"}},
+            {"package":{"name":"lodash.merge","version":"4.6.2"}}
+        ],"total":3,"time":"now"}"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let objs = v["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(v["total"], 2);
+        let names: Vec<&str> = objs
+            .iter()
+            .map(|o| o["package"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"lodash.merge"));
+        assert!(!names.contains(&"express"));
+    }
+
+    #[test]
+    fn meta_response_non_search_shape_is_unchanged_bytes() {
+        // A ping/whoami-style object with no `objects` array is returned as
+        // re-serialised JSON with the same logical content.
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"ok":true}"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], true);
     }
 
     #[test]
@@ -3279,6 +3788,28 @@ mod tests {
         let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
         assert_eq!(flipped.allow_unscoped, Some(true));
         assert!(flipped.allows("lodash"));
+
+        // #2424: the new name-pattern key parses into a lowercased Vec and
+        // composes with the scope list; malformed JSON degrades to empty
+        // (unrestricted by that key), consistent with the scope-list parse.
+        upsert(NPM_ALLOWED_NAME_PATTERNS_KEY, "not-json").await;
+        let bad_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert!(bad_patterns.allowed_name_patterns.is_empty());
+        upsert(
+            NPM_ALLOWED_NAME_PATTERNS_KEY,
+            "[\"@Acme/*\",\"internal-*\"]",
+        )
+        .await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
+        let with_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(
+            with_patterns.allowed_name_patterns,
+            vec!["@acme/*", "internal-*"]
+        );
+        assert!(with_patterns.is_active());
+        assert!(with_patterns.allows("@acme/thing"));
+        assert!(with_patterns.allows("internal-utils"));
+        assert!(!with_patterns.allows("random-pkg"));
 
         // Cleanup.
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")

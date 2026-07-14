@@ -27,7 +27,7 @@ impl CurationService {
     /// Check if a package name matches a glob pattern.
     /// Supports `*` (any chars) and `?` (single char).
     pub fn pattern_matches(pattern: &str, name: &str) -> bool {
-        glob_match(pattern, name)
+        crate::util::glob::glob_match(pattern, name)
     }
 
     /// Check if a version satisfies a constraint string.
@@ -469,42 +469,6 @@ impl CurationService {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Simple glob matching: `*` matches any sequence, `?` matches one char.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let p = pattern.chars().collect::<Vec<_>>();
-    let t = text.chars().collect::<Vec<_>>();
-    glob_match_inner(&p, &t, 0, 0)
-}
-
-fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bool {
-    if pi == pattern.len() && ti == text.len() {
-        return true;
-    }
-    if pi == pattern.len() {
-        return false;
-    }
-
-    if pattern[pi] == '*' {
-        // Try matching * against 0..n characters
-        for skip in 0..=(text.len() - ti) {
-            if glob_match_inner(pattern, text, pi + 1, ti + skip) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    if ti == text.len() {
-        return false;
-    }
-
-    if pattern[pi] == '?' || pattern[pi] == text[ti] {
-        return glob_match_inner(pattern, text, pi + 1, ti + 1);
-    }
-
-    false
-}
 
 /// Compare two version strings. Returns -1, 0, or 1.
 /// Splits on `.` and `-`, compares segments numerically when possible.
