@@ -17,7 +17,7 @@
 //! * [`FeedConsumer`] — the runner: cluster-wide single consumer via the
 //!   existing advisory-lock primitive (so N replicas do not open N feed
 //!   connections), resume cursor persisted in `upstream_feed_state`
-//!   (migration 149), reconnect with capped exponential backoff.
+//!   (migration 156), reconnect with capped exponential backoff.
 //!
 //! Best-effort by design: the feed is a freshness optimisation, never the
 //! correctness mechanism — the packument cache's TTL/stale-while-revalidate
@@ -216,6 +216,24 @@ pub struct NpmReplicationFeedAdapter {
 
 impl NpmReplicationFeedAdapter {
     pub fn new(url: &str) -> Result<Self> {
+        // Entry-point SSRF check on the configured feed endpoint, the same
+        // guard the other outbound-fetch paths (cargo/composer/remote
+        // instances) apply before issuing a request. `base_client_builder`'s
+        // redirect policy only re-validates *redirect* hops, so without this
+        // a feed URL pointing straight at a private/link-local/metadata
+        // address (169.254.169.254, internal service names, RFC1918, …)
+        // would be fetched directly. Rejecting here means such a URL simply
+        // never starts a consumer rather than reaching an internal target.
+        crate::api::validation::validate_outbound_url(url, "npm upstream feed URL")?;
+        Self::from_url_unchecked(url)
+    }
+
+    /// Build the adapter without the entry-point SSRF check. Production code
+    /// must use [`Self::new`]; this exists only so unit tests can point the
+    /// adapter at a loopback mock server, which [`Self::new`] correctly
+    /// refuses. The redirect-hop SSRF policy on the shared client still
+    /// applies to every request either constructor's adapter issues.
+    fn from_url_unchecked(url: &str) -> Result<Self> {
         let parsed = Url::parse(url)
             .map_err(|e| AppError::Config(format!("invalid npm feed URL '{url}': {e}")))?;
         // The shared builder carries the custom-CA bundle and the SSRF
@@ -370,7 +388,7 @@ impl FeedAction for PackumentInvalidationAction {
 // ---------------------------------------------------------------------------
 
 /// Postgres-backed [`FeedStateStore`] over `upstream_feed_state`
-/// (migration 149).
+/// (migration 156).
 pub struct PgFeedStateStore {
     pool: PgPool,
 }
@@ -755,7 +773,8 @@ mod tests {
             .await;
 
         let adapter =
-            NpmReplicationFeedAdapter::new(&format!("{}/_changes", server.uri())).expect("adapter");
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
         let batch = adapter.poll(Some("41")).await.expect("poll");
         assert_eq!(
             batch.events,
@@ -787,7 +806,8 @@ mod tests {
             .await;
 
         let adapter =
-            NpmReplicationFeedAdapter::new(&format!("{}/_changes", server.uri())).expect("adapter");
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
         let batch = adapter.poll(None).await.expect("poll");
         assert!(batch.events.is_empty());
         assert_eq!(batch.last_seq, Some("7".to_string()));
@@ -825,7 +845,8 @@ mod tests {
             .await;
 
         let adapter =
-            NpmReplicationFeedAdapter::new(&format!("{}/_changes", server.uri())).expect("adapter");
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
         let batch = adapter.poll(None).await.expect("poll");
         assert_eq!(
             batch.events,
@@ -863,16 +884,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        let unavailable =
-            NpmReplicationFeedAdapter::new(&format!("{}/unavailable/_changes", server.uri()))
-                .expect("adapter");
+        let unavailable = NpmReplicationFeedAdapter::from_url_unchecked(&format!(
+            "{}/unavailable/_changes",
+            server.uri()
+        ))
+        .expect("adapter");
         assert!(
             unavailable.poll(None).await.is_err(),
             "5xx must be an error"
         );
 
-        let garbage = NpmReplicationFeedAdapter::new(&format!("{}/garbage/_changes", server.uri()))
-            .expect("adapter");
+        let garbage = NpmReplicationFeedAdapter::from_url_unchecked(&format!(
+            "{}/garbage/_changes",
+            server.uri()
+        ))
+        .expect("adapter");
         assert!(
             garbage.poll(None).await.is_err(),
             "an unparseable body must be an error"
@@ -882,6 +908,30 @@ mod tests {
     #[test]
     fn npm_adapter_rejects_invalid_urls() {
         assert!(NpmReplicationFeedAdapter::new("not a url").is_err());
+    }
+
+    #[test]
+    fn npm_adapter_rejects_ssrf_feed_urls() {
+        // A feed URL aimed straight at an internal/link-local/metadata
+        // target must be refused at construction (entry-point SSRF guard),
+        // so a misconfigured or hostile NPM_UPSTREAM_FEED_URL can never make
+        // the consumer fetch an internal address. Redirect-hop validation
+        // alone does not cover the initial request.
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/_changes",
+            "http://localhost/_changes",
+            "http://[::1]/_changes",
+            "http://backend:8080/_changes",
+            "http://[::ffff:127.0.0.1]/_changes",
+        ] {
+            assert!(
+                NpmReplicationFeedAdapter::new(url).is_err(),
+                "SSRF-blocked feed URL must be rejected: {url}"
+            );
+        }
+        // A normal public feed endpoint still constructs.
+        assert!(NpmReplicationFeedAdapter::new(NPM_REPLICATION_FEED_DEFAULT_URL).is_ok());
     }
 
     #[test]
