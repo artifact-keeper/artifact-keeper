@@ -62,9 +62,9 @@ pub fn router() -> Router<SharedState> {
         )
         // Packages
         .route("/packages", get(list_packages))
-        .route("/packages/{id}", get(get_package))
-        .route("/packages/{id}/approve", post(approve_package))
-        .route("/packages/{id}/block", post(block_package))
+        .route("/packages/:id", get(get_package))
+        .route("/packages/:id/approve", post(approve_package))
+        .route("/packages/:id/block", post(block_package))
         .route("/packages/bulk-approve", post(bulk_approve))
         .route("/packages/bulk-block", post(bulk_block))
         .route("/packages/re-evaluate", post(re_evaluate))
@@ -958,6 +958,106 @@ mod tests {
         )
         .await;
         assert!(admin_ok.is_ok(), "admin sees the aggregate: {admin_ok:?}");
+        tdh::cleanup_user(&pool, user).await;
+    }
+
+    // ----------------------------------------------------------------------
+    // #2447 router-level (oneshot) coverage for the `/packages/:id` routes.
+    //
+    // The existing curation tests invoke the handler functions directly with a
+    // synthetic `Path(uuid)`, so a broken route *registration* is invisible to
+    // them. These tests drive the real `router()` through `tower::oneshot`, so
+    // a route that does not match (e.g. an axum-0.8 `{id}` string on this
+    // axum-0.7 router) surfaces as a router-layer 404 and fails the assertion.
+    // ----------------------------------------------------------------------
+
+    // GET /packages/:id must reach the handler and, for a real package viewed by
+    // an admin, return 200 with the id echoed back — proving both that the route
+    // matches and that the positional `Path<Uuid>` binds the right segment. On
+    // the pre-fix `{id}` registration this is a router 404.
+    #[tokio::test]
+    async fn test_get_package_route_resolves_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::Request;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let pkg = seed_package(&pool, staging, remote).await;
+        let (admin, aname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let router =
+            tdh::router_with_auth_ext(super::router(), state, tdh::admin_auth(admin, &aname));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/packages/{pkg}"))
+            .body(Body::empty())
+            .expect("build GET request");
+        let (status, body) = tdh::send(router, req).await;
+
+        assert_ne!(
+            status.as_u16(),
+            404,
+            "GET /packages/:id must match a route, not a router 404; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(status.as_u16(), 200, "admin GET of a seeded package is 200");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse body json");
+        assert_eq!(
+            json["id"].as_str(),
+            Some(pkg.to_string().as_str()),
+            "response id must echo the path uuid"
+        );
+
+        tdh::cleanup(&pool, staging, admin).await;
+        tdh::cleanup(&pool, remote, admin).await;
+    }
+
+    // POST /packages/:id/approve and /packages/:id/block must resolve to their
+    // handlers. A non-admin caller hits `require_admin()` first and gets a 403 —
+    // never a router 404 — which proves the routes match without depending on any
+    // seeded package. On the pre-fix `{id}` registration both are router 404s.
+    #[tokio::test]
+    async fn test_approve_block_routes_resolve_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::Request;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, uname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let id = Uuid::new_v4();
+
+        for suffix in ["approve", "block"] {
+            let router = tdh::router_with_auth_ext(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(user, &uname),
+            );
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/packages/{id}/{suffix}"))
+                .body(Body::empty())
+                .expect("build POST request");
+            let (status, body) = tdh::send(router, req).await;
+
+            assert_ne!(
+                status.as_u16(),
+                404,
+                "POST /packages/:id/{suffix} must match a route, not a router 404; body: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                status.as_u16(),
+                403,
+                "non-admin POST /packages/:id/{suffix} is rejected by require_admin (403)"
+            );
+        }
+
         tdh::cleanup_user(&pool, user).await;
     }
 }
