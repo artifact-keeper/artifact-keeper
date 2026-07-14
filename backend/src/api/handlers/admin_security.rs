@@ -8,11 +8,15 @@
 //! download attribution shipped in #2365 (`download_statistics.user_id` /
 //! `ip_address`).
 //!
-//! Scope note: this phase answers "who **downloaded** the vulnerable
-//! artifact". Full enumeration of principals who *could* access it but have
-//! not downloaded it (roles/groups expansion) is deferred to a follow-up
-//! phase; `affected_repos[].access_scope` gives the per-repo exposure signal
-//! in the meantime.
+//! Phase 1 answers "who **downloaded** the vulnerable artifact". Phase 2
+//! (#2386) adds the latent blast radius: the principals who *can read* an
+//! affected artifact in a **restricted** repository but have **no download
+//! record** (`.../accessible-users`). It inverts the shared REST read predicate
+//! (`repository_service::permissions_grant_exists_for` + `role_assignments` +
+//! admin) and anti-joins `download_statistics`, so the report over-approximates
+//! (superset) rather than under-reports who could pull a vulnerable artifact.
+//! Public / global repos are never enumerated (`exposure: everyone` /
+//! `effectively-everyone`).
 //!
 //! Everything here is mounted under the `/admin` nest (admin_middleware),
 //! and each handler re-checks `is_admin` as defense in depth: download
@@ -31,6 +35,7 @@ use crate::api::handlers::admin::parse_rfc3339_bound;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::repository_service::permissions_grant_exists_for;
 
 /// Create admin security-analytics routes (nested at `/admin/security`).
 pub fn router() -> Router<SharedState> {
@@ -39,6 +44,13 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/artifact/:artifact_id/blast-radius",
             get(artifact_blast_radius),
+        )
+        // Phase 2 (#2386): latent blast radius — accessible-but-not-downloaded
+        // users for restricted repos. Same /admin nest, same admin gate.
+        .route("/cve/:cve_id/accessible-users", get(cve_accessible_users))
+        .route(
+            "/artifact/:artifact_id/accessible-users",
+            get(artifact_accessible_users),
         )
 }
 
@@ -52,6 +64,12 @@ const MAX_IPS_PER_DOWNLOADER: u32 = 50;
 /// Cap on the `affected_repos` block. `summary.affected_repo_count` remains
 /// the true total even when the list is truncated.
 const MAX_AFFECTED_REPOS: u32 = 200;
+/// Fraction of active, non-service users at/above which a restricted repo's
+/// accessible set is treated as "effectively everyone" — the page body is
+/// suppressed (reporting ~all users is not actionable, and this catches the
+/// global NULL-scoped `role_assignment` granted to every user). The count is
+/// still returned so admins see the magnitude.
+const BLAST_EVERYONE_THRESHOLD: f64 = 0.90;
 
 /// Normalize/clamp blast-radius pagination into `(offset, limit, page,
 /// per_page)`.
@@ -457,15 +475,427 @@ pub async fn artifact_blast_radius(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 (#2386): accessible-but-not-downloaded enumeration for restricted
+// repositories. Read-only; inverts the shared REST read predicate and
+// anti-joins download_statistics.
+// ---------------------------------------------------------------------------
+
+/// Decide whether an accessible set is large enough to be reported as
+/// "effectively everyone" rather than enumerated. Pure so the coverage gate
+/// exercises the threshold arithmetic without Postgres. Guards against a zero
+/// or negative denominator (never collapses an empty deployment).
+pub(crate) fn is_effectively_everyone(accessible_count: i64, active_user_count: i64) -> bool {
+    active_user_count > 0
+        && (accessible_count as f64) >= BLAST_EVERYONE_THRESHOLD * (active_user_count as f64)
+}
+
+/// Classify the repo's exposure for the accessible-users report:
+/// - `public` scope           -> `everyone` (never enumerated),
+/// - accessible ~ all users   -> `effectively-everyone` (count only, no list),
+/// - otherwise                -> `enumerable`.
+pub(crate) fn classify_exposure(
+    access_scope: &str,
+    accessible_count: i64,
+    active_user_count: i64,
+) -> &'static str {
+    if access_scope == "public" {
+        "everyone"
+    } else if is_effectively_everyone(accessible_count, active_user_count) {
+        "effectively-everyone"
+    } else {
+        "enumerable"
+    }
+}
+
+/// Build the WHERE predicate that selects users who can read an affected
+/// artifact in the repository but have not downloaded one. `affected_sql` is a
+/// single-column `SELECT artifact_id ...` subquery for the target (binds its own
+/// `$2`); `$1` is the repository id.
+///
+/// The permissions arm reuses the EXACT shared fragment
+/// (`permissions_grant_exists_for`, project + group + fail-closed on empty
+/// actions) instead of a hand-rolled copy, so the enumeration cannot drift from
+/// the data-plane read predicate. The role arm mirrors the
+/// `RepoVisibility::User` role_assignments branch (repo-scoped OR global NULL);
+/// admins always read. The trailing anti-join yields `has-access` only.
+fn accessible_users_predicate(affected_sql: &str) -> String {
+    let perms = permissions_grant_exists_for("$1", "u.id");
+    format!(
+        "u.is_active \
+         AND ( \
+             u.is_admin \
+             OR EXISTS ( \
+                 SELECT 1 FROM role_assignments ra \
+                 WHERE ra.user_id = u.id \
+                   AND (ra.repository_id = $1 OR ra.repository_id IS NULL) \
+             ) \
+             OR {perms} \
+         ) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM download_statistics d \
+             WHERE d.user_id = u.id AND d.artifact_id IN ({affected_sql}) \
+         )"
+    )
+}
+
+/// Query parameters for the accessible-users endpoints.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct AccessibleUsersQuery {
+    /// Repository to scope the enumeration to. **Required** for the CVE route
+    /// (a CVE spans many repos); ignored for the artifact route (implied by the
+    /// artifact).
+    pub repository_id: Option<Uuid>,
+    /// 1-based page over the accessible-users list.
+    pub page: Option<u32>,
+    /// Users per page (1..=100, default 20).
+    pub per_page: Option<u32>,
+}
+
+/// Repository exposure descriptor echoed in the response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepoExposure {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    /// `public` | `restricted_acl` | `restricted_roles` — see
+    /// [`classify_access_scope`].
+    pub access_scope: String,
+}
+
+/// One principal that can read an affected artifact but has not downloaded it.
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct AccessibleUser {
+    pub user_id: Uuid,
+    pub username: String,
+    /// Always `has-access` for this endpoint (accessible minus downloaded).
+    pub reason: String,
+    /// How access is granted: `admin` (global), `permission` (fine-grained
+    /// direct **or** group grant, repo or owning project), or `role`
+    /// (role_assignment only). Direct and group grants both surface as
+    /// `permission` because they share one read fragment.
+    pub via: String,
+}
+
+/// Internal row shape for the accessible-users page query.
+#[derive(sqlx::FromRow)]
+struct AccessibleUserRow {
+    user_id: Uuid,
+    username: String,
+    via: String,
+}
+
+/// Full accessible-but-not-downloaded report for a CVE or artifact, scoped to
+/// one restricted repository.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AccessibleUsersResponse {
+    pub target: BlastRadiusTargetInfo,
+    pub repository: RepoExposure,
+    /// `enumerable` | `everyone` | `effectively-everyone`.
+    pub exposure: String,
+    /// The page of accessible-but-not-downloaded principals. Empty when
+    /// `exposure != "enumerable"`.
+    pub accessible_not_downloaded: Vec<AccessibleUser>,
+    /// Total accessible-not-downloaded principals (the pagination total).
+    /// `null` for `public` repos (never enumerated).
+    pub total: Option<i64>,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Fetched repository metadata for the enumeration.
+struct RepoMeta {
+    repository_key: String,
+    is_public: bool,
+    has_acl_rules: bool,
+}
+
+/// Load the repo's key, public flag, and whether any repository-scoped ACL row
+/// exists (mirrors phase-1 `classify_access_scope`'s repository-only EXISTS).
+async fn load_repo_meta(db: &sqlx::PgPool, repo_id: Uuid) -> Result<Option<RepoMeta>> {
+    let row = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT r.key, r.is_public, \
+         EXISTS(SELECT 1 FROM permissions p WHERE p.target_type = 'repository' \
+                AND p.target_id = r.id) AS has_acl_rules \
+         FROM repositories r WHERE r.id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)?;
+    Ok(
+        row.map(|(repository_key, is_public, has_acl_rules)| RepoMeta {
+            repository_key,
+            is_public,
+            has_acl_rules,
+        }),
+    )
+}
+
+/// Shared accessible-users core. `repo_id` is already resolved (from the path
+/// artifact or the required `repository_id` query param); `affected_sql` binds
+/// its own `$2` target value, supplied via `bind_target`.
+async fn accessible_users_core(
+    db: &sqlx::PgPool,
+    target: BlastRadiusTarget,
+    repo_id: Uuid,
+    affected_sql: &str,
+    query: &AccessibleUsersQuery,
+) -> Result<AccessibleUsersResponse> {
+    let (offset, limit, page, per_page) = blast_page_bounds(query.page, query.per_page);
+
+    let meta = load_repo_meta(db, repo_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("repository not found".to_string()))?;
+    let access_scope = classify_access_scope(meta.is_public, meta.has_acl_rules).to_string();
+
+    let repository = RepoExposure {
+        repository_id: repo_id,
+        repository_key: meta.repository_key,
+        access_scope: access_scope.clone(),
+    };
+    let target_info = BlastRadiusTargetInfo {
+        kind: target.kind().to_string(),
+        value: target.value(),
+    };
+
+    // Never enumerate a public/everyone-exposed repository.
+    if meta.is_public {
+        return Ok(AccessibleUsersResponse {
+            target: target_info,
+            repository,
+            exposure: "everyone".to_string(),
+            accessible_not_downloaded: vec![],
+            total: None,
+            page,
+            per_page,
+        });
+    }
+
+    let predicate = accessible_users_predicate(affected_sql);
+
+    // (1) COUNT over the predicate for pagination + everyone-threshold.
+    let count_sql = format!("SELECT COUNT(*) FROM users u WHERE {predicate}");
+    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql).bind(repo_id);
+    count_q = bind_target(count_q, &target);
+    let accessible_count: i64 = count_q.fetch_one(db).await.map_err(db_err)?;
+
+    // Active, non-service user population for the effectively-everyone check.
+    let active_user_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_active AND NOT is_service_account")
+            .fetch_one(db)
+            .await
+            .map_err(db_err)?;
+
+    let exposure = classify_exposure(&access_scope, accessible_count, active_user_count);
+    if exposure != "enumerable" {
+        // effectively-everyone: report the count but suppress the page body.
+        return Ok(AccessibleUsersResponse {
+            target: target_info,
+            repository,
+            exposure: exposure.to_string(),
+            accessible_not_downloaded: vec![],
+            total: Some(accessible_count),
+            page,
+            per_page,
+        });
+    }
+
+    // (2) One page of accessible-not-downloaded users.
+    let page_sql = format!(
+        "SELECT u.id AS user_id, u.username, \
+         CASE WHEN u.is_admin THEN 'admin' \
+              WHEN {perms} THEN 'permission' \
+              ELSE 'role' END AS via \
+         FROM users u WHERE {predicate} \
+         ORDER BY u.username LIMIT $3 OFFSET $4",
+        perms = permissions_grant_exists_for("$1", "u.id"),
+        predicate = predicate,
+    );
+    let mut page_q = sqlx::query_as::<_, AccessibleUserRow>(&page_sql).bind(repo_id);
+    page_q = bind_target_as(page_q, &target);
+    let rows: Vec<AccessibleUserRow> = page_q
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(db_err)?;
+
+    let accessible_not_downloaded = rows
+        .into_iter()
+        .map(|r| AccessibleUser {
+            user_id: r.user_id,
+            username: r.username,
+            reason: "has-access".to_string(),
+            via: r.via,
+        })
+        .collect();
+
+    Ok(AccessibleUsersResponse {
+        target: target_info,
+        repository,
+        exposure: exposure.to_string(),
+        accessible_not_downloaded,
+        total: Some(accessible_count),
+        page,
+        per_page,
+    })
+}
+
+/// Bind the `$2` affected-set target value onto a `query_scalar` builder.
+fn bind_target<'a>(
+    q: sqlx::query::QueryScalar<'a, sqlx::Postgres, i64, sqlx::postgres::PgArguments>,
+    target: &'a BlastRadiusTarget,
+) -> sqlx::query::QueryScalar<'a, sqlx::Postgres, i64, sqlx::postgres::PgArguments> {
+    match target {
+        BlastRadiusTarget::Cve(cve_id) => q.bind(cve_id.clone()),
+        BlastRadiusTarget::Artifact(artifact_id) => q.bind(*artifact_id),
+    }
+}
+
+/// Bind the `$2` affected-set target value onto a `query_as` builder.
+fn bind_target_as<'a>(
+    q: sqlx::query::QueryAs<'a, sqlx::Postgres, AccessibleUserRow, sqlx::postgres::PgArguments>,
+    target: &'a BlastRadiusTarget,
+) -> sqlx::query::QueryAs<'a, sqlx::Postgres, AccessibleUserRow, sqlx::postgres::PgArguments> {
+    match target {
+        BlastRadiusTarget::Cve(cve_id) => q.bind(cve_id.clone()),
+        BlastRadiusTarget::Artifact(artifact_id) => q.bind(*artifact_id),
+    }
+}
+
+/// The affected-artifact subquery for a CVE target: all artifacts flagged with
+/// the CVE (binds `$2`).
+const CVE_AFFECTED_SQL: &str = "SELECT DISTINCT artifact_id FROM scan_findings WHERE cve_id = $2";
+/// The affected-artifact subquery for a single artifact target: the artifact
+/// itself (binds `$2`), independent of whether a finding row exists.
+const ARTIFACT_AFFECTED_SQL: &str = "SELECT $2::uuid";
+
+/// Accessible-but-not-downloaded users for a CVE, scoped to one restricted
+/// repository (#2386). `repository_id` is required and must be a repo the CVE
+/// actually affects.
+#[utoipa::path(
+    get,
+    path = "/cve/{cve_id}/accessible-users",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    params(
+        ("cve_id" = String, Path, description = "CVE id (exact match, e.g. CVE-2021-44228)"),
+        AccessibleUsersQuery
+    ),
+    responses(
+        (status = 200, description = "Accessible-not-downloaded report", body = AccessibleUsersResponse),
+        (status = 400, description = "Invalid parameter"),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "CVE does not affect the repository")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn cve_accessible_users(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(cve_id): Path<String>,
+    Query(query): Query<AccessibleUsersQuery>,
+) -> Result<Json<AccessibleUsersResponse>> {
+    require_admin(&auth)?;
+    let cve_id = cve_id.trim().to_string();
+    if cve_id.is_empty() {
+        return Err(AppError::Validation("cve_id must not be empty".to_string()));
+    }
+    let repo_id = query.repository_id.ok_or_else(|| {
+        AppError::Validation("repository_id query parameter is required".to_string())
+    })?;
+
+    // The CVE must actually flag an artifact in this repository — otherwise the
+    // enumeration would leak an unrelated repo's access graph.
+    let affects: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM scan_findings sf \
+         JOIN artifacts a ON a.id = sf.artifact_id \
+         WHERE sf.cve_id = $1 AND a.repository_id = $2)",
+    )
+    .bind(&cve_id)
+    .bind(repo_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(db_err)?;
+    if !affects {
+        return Err(AppError::NotFound(
+            "CVE does not affect the specified repository".to_string(),
+        ));
+    }
+
+    Ok(Json(
+        accessible_users_core(
+            &state.db,
+            BlastRadiusTarget::Cve(cve_id),
+            repo_id,
+            CVE_AFFECTED_SQL,
+            &query,
+        )
+        .await?,
+    ))
+}
+
+/// Accessible-but-not-downloaded users for one artifact (#2386). The repository
+/// is implied by the artifact.
+#[utoipa::path(
+    get,
+    path = "/artifact/{artifact_id}/accessible-users",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact id"),
+        AccessibleUsersQuery
+    ),
+    responses(
+        (status = 200, description = "Accessible-not-downloaded report", body = AccessibleUsersResponse),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "Artifact not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn artifact_accessible_users(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+    Query(query): Query<AccessibleUsersQuery>,
+) -> Result<Json<AccessibleUsersResponse>> {
+    require_admin(&auth)?;
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(db_err)?;
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
+    Ok(Json(
+        accessible_users_core(
+            &state.db,
+            BlastRadiusTarget::Artifact(artifact_id),
+            repo_id,
+            ARTIFACT_AFFECTED_SQL,
+            &query,
+        )
+        .await?,
+    ))
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(cve_blast_radius, artifact_blast_radius),
+    paths(
+        cve_blast_radius,
+        artifact_blast_radius,
+        cve_accessible_users,
+        artifact_accessible_users
+    ),
     components(schemas(
         BlastRadiusResponse,
         BlastRadiusTargetInfo,
         BlastRadiusSummary,
         AffectedRepo,
         BlastDownloader,
+        AccessibleUsersResponse,
+        RepoExposure,
+        AccessibleUser,
     ))
 )]
 pub struct AdminSecurityApiDoc;
@@ -532,6 +962,69 @@ mod tests {
         let artifact = BlastRadiusTarget::Artifact(id);
         assert_eq!(artifact.kind(), "artifact");
         assert_eq!(artifact.value(), id.to_string());
+    }
+
+    // ---- Phase 2 (#2386): accessible-users pure helpers ----
+
+    #[test]
+    fn test_is_effectively_everyone_threshold() {
+        // 90% boundary is inclusive.
+        assert!(is_effectively_everyone(90, 100));
+        assert!(is_effectively_everyone(100, 100));
+        assert!(!is_effectively_everyone(89, 100));
+        // Empty / zero population never collapses.
+        assert!(!is_effectively_everyone(0, 0));
+        assert!(!is_effectively_everyone(5, 0));
+    }
+
+    #[test]
+    fn test_classify_exposure_branches() {
+        // Public is never enumerated regardless of counts.
+        assert_eq!(classify_exposure("public", 1, 100), "everyone");
+        // Restricted, small accessible set -> enumerable.
+        assert_eq!(classify_exposure("restricted_acl", 3, 100), "enumerable");
+        assert_eq!(classify_exposure("restricted_roles", 3, 100), "enumerable");
+        // Restricted, ~everyone -> collapse.
+        assert_eq!(
+            classify_exposure("restricted_roles", 95, 100),
+            "effectively-everyone"
+        );
+    }
+
+    #[test]
+    fn test_accessible_users_predicate_shape() {
+        let sql = accessible_users_predicate(CVE_AFFECTED_SQL);
+        // Role-assignment arm (repo-scoped OR global NULL).
+        assert!(sql.contains("role_assignments"), "role arm missing: {sql}");
+        assert!(
+            sql.contains("ra.repository_id = $1 OR ra.repository_id IS NULL"),
+            "role arm scoping missing: {sql}"
+        );
+        // The shared permissions fragment: project + group + fail-closed.
+        assert!(
+            sql.contains("p.target_type = 'project'"),
+            "project arm: {sql}"
+        );
+        assert!(
+            sql.contains("user_group_members"),
+            "group UNION missing: {sql}"
+        );
+        assert!(
+            sql.contains("p.actions <> '{}'"),
+            "fail-closed missing: {sql}"
+        );
+        // Correlated over the outer users scan, not a positional bind.
+        assert!(
+            sql.contains("p.principal_id = u.id"),
+            "correlated user: {sql}"
+        );
+        // The download anti-join (has-access ONLY).
+        assert!(
+            sql.contains("NOT EXISTS") && sql.contains("download_statistics"),
+            "download anti-join missing: {sql}"
+        );
+        // Admin short-circuit.
+        assert!(sql.contains("u.is_admin"), "admin arm missing: {sql}");
     }
 
     // -----------------------------------------------------------------------
@@ -827,6 +1320,278 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 (#2386): accessible-but-not-downloaded enumeration.
+    // -----------------------------------------------------------------------
+
+    async fn seed_group_grant(pool: &sqlx::PgPool, repo_id: Uuid, member: Uuid) -> Uuid {
+        let group_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+            .bind(group_id)
+            .bind(format!("ph-grp-{group_id}"))
+            .execute(pool)
+            .await
+            .expect("insert group");
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(member)
+            .bind(group_id)
+            .execute(pool)
+            .await
+            .expect("insert group member");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, \
+             target_id, actions) VALUES ('group', $1, 'repository', $2, '{read}')",
+        )
+        .bind(group_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("insert group grant");
+        group_id
+    }
+
+    #[tokio::test]
+    async fn test_accessible_users_enumeration_db() {
+        use crate::services::repository_service::RepositoryService;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let cve = format!("CVE-2386-{}", &Uuid::new_v4().to_string()[..8]);
+        // Restricted repo (private; create_repo defaults is_public = false) with
+        // an explicit ACL row -> restricted_acl.
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact = seed_artifact_version(&pool, repo_id, "1.0.0").await;
+        seed_cve_finding(&pool, repo_id, artifact, &cve).await;
+
+        // Principals with read access via each distinct grant path.
+        let (u_direct, _n) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, repo_id, u_direct, &["read"]).await; // permission
+        let (u_group, _n) = tdh::create_user(&pool).await;
+        let group_id = seed_group_grant(&pool, repo_id, u_group).await; // permission (group)
+        let (u_role, _n) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, u_role).await; // role (repo-scoped)
+        let (u_global, _n) = tdh::create_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, NULL FROM roles r WHERE r.name = 'reader'",
+        )
+        .bind(u_global)
+        .execute(&pool)
+        .await
+        .expect("global role"); // role (global NULL)
+        let (u_admin, _n) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(u_admin)
+            .execute(&pool)
+            .await
+            .expect("mark admin"); // admin
+                                   // Downloader: has access AND downloaded an affected artifact -> excluded.
+        let (u_dl, _n) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, u_dl).await;
+        seed_download(&pool, artifact, Some(u_dl), "203.0.113.9").await;
+        // No access at all -> excluded.
+        let (u_none, _n) = tdh::create_user(&pool).await;
+
+        let resp = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            repo_id,
+            CVE_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                repository_id: Some(repo_id),
+                per_page: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("accessible users");
+
+        assert_eq!(resp.exposure, "enumerable");
+        assert_eq!(resp.repository.access_scope, "restricted_acl");
+        let via_of = |uid: Uuid| -> Option<String> {
+            resp.accessible_not_downloaded
+                .iter()
+                .find(|a| a.user_id == uid)
+                .map(|a| a.via.clone())
+        };
+        assert_eq!(via_of(u_direct).as_deref(), Some("permission"));
+        assert_eq!(via_of(u_group).as_deref(), Some("permission"));
+        assert_eq!(via_of(u_role).as_deref(), Some("role"));
+        assert_eq!(via_of(u_global).as_deref(), Some("role"));
+        assert_eq!(via_of(u_admin).as_deref(), Some("admin"));
+        // Downloader and no-access are excluded.
+        assert_eq!(via_of(u_dl), None, "downloader must be excluded");
+        assert_eq!(via_of(u_none), None, "no-access user must be excluded");
+        // reason is always has-access.
+        assert!(resp
+            .accessible_not_downloaded
+            .iter()
+            .all(|a| a.reason == "has-access"));
+
+        // Predicate parity: every enumerated NON-admin user is actually granted
+        // access by the shared REST read predicate (superset B). Admins are the
+        // documented exception (user_can_access_repo bypasses is_admin).
+        let repo_svc = RepositoryService::new(pool.clone());
+        for a in &resp.accessible_not_downloaded {
+            if a.via == "admin" {
+                continue;
+            }
+            assert!(
+                repo_svc
+                    .user_can_access_repo(repo_id, a.user_id)
+                    .await
+                    .expect("parity check"),
+                "enumerated user {} must pass user_can_access_repo",
+                a.user_id
+            );
+        }
+
+        // Pagination: page 1 and page 2 with per_page=2 are disjoint and bounded.
+        let total = resp.total.expect("enumerable total");
+        assert!(
+            total >= 5,
+            "at least the 5 seeded accessible users: {total}"
+        );
+        let p1 = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            repo_id,
+            CVE_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                repository_id: Some(repo_id),
+                page: Some(1),
+                per_page: Some(2),
+            },
+        )
+        .await
+        .expect("page 1");
+        assert_eq!(p1.accessible_not_downloaded.len(), 2);
+        assert_eq!(p1.total, Some(total));
+        let p2 = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            repo_id,
+            CVE_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                repository_id: Some(repo_id),
+                page: Some(2),
+                per_page: Some(2),
+            },
+        )
+        .await
+        .expect("page 2");
+        let p1_ids: std::collections::HashSet<_> = p1
+            .accessible_not_downloaded
+            .iter()
+            .map(|a| a.user_id)
+            .collect();
+        assert!(
+            p2.accessible_not_downloaded
+                .iter()
+                .all(|a| !p1_ids.contains(&a.user_id)),
+            "pages must be disjoint"
+        );
+
+        // A public repo target -> exposure everyone, empty list, total null.
+        let (repo_pub, _kp, _dp) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_pub)
+            .execute(&pool)
+            .await
+            .expect("mark public");
+        let art_pub = seed_artifact_version(&pool, repo_pub, "1.0.0").await;
+        seed_cve_finding(&pool, repo_pub, art_pub, &cve).await;
+        let pub_resp = accessible_users_core(
+            &pool,
+            BlastRadiusTarget::Cve(cve.clone()),
+            repo_pub,
+            CVE_AFFECTED_SQL,
+            &AccessibleUsersQuery {
+                repository_id: Some(repo_pub),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("public accessible users");
+        assert_eq!(pub_resp.exposure, "everyone");
+        assert!(pub_resp.accessible_not_downloaded.is_empty());
+        assert_eq!(pub_resp.total, None);
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1 OR principal_id = $2")
+            .bind(repo_id)
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_id, repo_pub] {
+            for q in [
+                "DELETE FROM scan_findings WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM scan_results WHERE repository_id = $1",
+                "DELETE FROM download_statistics WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM role_assignments WHERE repository_id = $1",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(q).bind(repo).execute(&pool).await;
+            }
+        }
+        for u in [u_direct, u_group, u_role, u_global, u_admin, u_dl, u_none] {
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(u)
+                .execute(&pool)
+                .await;
+            tdh::cleanup_user(&pool, u).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accessible_users_admin_only_router_db() {
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Non-admin caller -> 403 before any repo work (require_admin first).
+        let non_admin = tdh::make_auth(user_id, &username);
+        let app = tdh::router_with_auth_ext(router(), state.clone(), non_admin);
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/cve/CVE-2021-44228/accessible-users?repository_id={}",
+                Uuid::new_v4()
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Admin without repository_id -> 400 validation.
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let app = tdh::router_with_auth_ext(router(), state.clone(), admin.clone());
+        let (status, _) =
+            tdh::send(app, tdh::get("/cve/CVE-2021-44228/accessible-users".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Admin, artifact route, unknown artifact -> 404.
+        let app = tdh::router_with_auth_ext(router(), state, admin);
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/artifact/{}/accessible-users", Uuid::new_v4())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         tdh::cleanup_user(&pool, user_id).await;
     }

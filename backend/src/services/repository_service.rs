@@ -287,6 +287,24 @@ pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
 /// exactly as before. The subquery aliases `repositories` as `rp` to avoid
 /// colliding with any `r`/`repositories` reference in the caller's query.
 fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
+    // The positional-bind instantiation used by the listing/visibility callers:
+    // the user principal is a single bound value `$user_param`. Delegates to the
+    // expression-based builder so the generated SQL stays byte-identical.
+    permissions_grant_exists_for(repo_id_expr, &format!("${user_param}"))
+}
+
+/// Expression-based variant of [`permissions_grant_exists`]: `user_ref` is any
+/// SQL expression naming the candidate principal id (e.g. a positional bind
+/// `"$3"` for a single-user check, or a correlated column `"u.id"` when
+/// enumerating over `users u`). The blast-radius accessible-users enumeration
+/// (#2386) inverts the read predicate over the whole users table, so it needs
+/// the correlated-column form; every other caller passes a `"$N"` bind and gets
+/// output identical to the historical `permissions_grant_exists` string.
+///
+/// Kept `pub(crate)` so the enumeration reuses this EXACT fragment (the project
+/// arm, the group UNION, and the `actions <> '{}'` fail-closed rule) instead of
+/// hand-rolling a copy that would drift from the data-plane read predicate.
+pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -> String {
     format!(
         r#"EXISTS (
             SELECT 1 FROM permissions p
@@ -298,9 +316,9 @@ fn permissions_grant_exists(repo_id_expr: &str, user_param: usize) -> String {
               )
               AND p.actions <> '{{}}'
               AND (
-                  (p.principal_type IN ('user', 'service_account') AND p.principal_id = ${user_param})
+                  (p.principal_type IN ('user', 'service_account') AND p.principal_id = {user_ref})
                   OR (p.principal_type = 'group' AND p.principal_id IN (
-                      SELECT group_id FROM user_group_members WHERE user_id = ${user_param}
+                      SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
                   ))
               )
         )"#
