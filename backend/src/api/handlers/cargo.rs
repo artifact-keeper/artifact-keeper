@@ -643,6 +643,8 @@ async fn store_crate_artifact(
 ) -> Result<(), Response> {
     let filename = format!("{}-{}.crate", name_lower, crate_version);
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
+    proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;

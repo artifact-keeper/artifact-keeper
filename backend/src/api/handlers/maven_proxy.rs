@@ -155,6 +155,17 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
+    // Gate 0: This helper ultimately reads a bare `maven/<path>` key that is not
+    // anchored to an artifact row scoped to the caller's repository. That is only
+    // sound on backends that physically isolate each repository's key space
+    // (filesystem, rooted at the repo's storage_path). On shared cloud namespaces
+    // (S3/GCS/Azure) the same flat key can belong to a *different* repository, so
+    // the fallback must not run there — skip straight to 404 rather than risk
+    // serving another repository's bytes.
+    if !crate::storage::backend_is_repo_isolated(&location.backend) {
+        return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+    }
+
     // Gate 1: Only secondaries and bare primaries are eligible; anything else is 404.
     // Compute is_secondary once — is_maven_primary_path_given_not_secondary takes the
     // pre-computed flag so parse_coordinates is only called once per request.

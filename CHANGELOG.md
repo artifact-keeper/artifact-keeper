@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.7] - 2026-07-14
+
+Security hotfix: prevents cross-repository object access on shared cloud storage backends.
+
+### Security
+
+- **Cross-repository object access on shared cloud backends is now blocked** (#2504): on S3/GCS/Azure backends every repository shares a single flat object namespace (the per-repository `storage_path` is only applied for filesystem backends), so a bare coordinate key such as `maven/<path>` was not anchored to the requesting repository. A repository could read another repository's bytes at a colliding flat key, and a hosted flat-key write could overwrite a different repository's object living at the identical key. Flat-key writes now consult the `artifacts` table and refuse (HTTP 409) when the target `storage_key` is already owned by another repository (live or soft-deleted); the unanchored Maven flat-key reads (stored checksum sidecars, `maven-metadata.xml`, snapshot metadata, the direct-byte `serve_artifact` fallback, and the `maven_proxy` storage fallback) are now gated to repo-isolated (filesystem) backends and fall through to row-scoped resolution on shared cloud namespaces. Filesystem-backed repositories, same-repository re-uploads, repository-scoped keys, and content-addressed keys are unaffected.
+
 ## [1.5.6] - 2026-07-13
 
 Regression hotfix: restores Docker remote/proxy image pulls, which failed with `invalid username or password` on 1.5.4/1.5.5.

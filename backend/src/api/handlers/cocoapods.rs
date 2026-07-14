@@ -325,6 +325,8 @@ async fn push_pod(
 
     // Store the pod archive
     let storage_key = format!("cocoapods/{}/{}/{}", pod_name, pod_version, filename);
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -342,6 +344,8 @@ async fn push_pod(
         pod_name, pod_version, pod_name
     );
     let podspec_json = serde_json::to_vec(&podspec).unwrap_or_default();
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &podspec_key)
+        .await?;
     storage
         .put(&podspec_key, Bytes::from(podspec_json))
         .await

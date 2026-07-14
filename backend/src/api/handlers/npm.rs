@@ -2608,6 +2608,7 @@ async fn store_npm_version(
         "npm/{}/{}/{}",
         package_name, ver.version, ver.tarball_filename
     );
+    proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
         .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))

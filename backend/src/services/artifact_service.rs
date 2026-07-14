@@ -1911,6 +1911,71 @@ impl ArtifactService {
     }
 }
 
+/// Cross-repository overwrite guard for flat (coordinate-keyed) storage writes.
+///
+/// Cloud backends (S3/GCS/Azure) resolve to a single shared instance and share
+/// one flat object namespace: the storage registry honors the per-repository
+/// `storage_path` only for filesystem backends, so cloud repositories all write
+/// into the same key space. A hosted write to a bare `{format}/{coords}` key can
+/// therefore land on top of a *different* repository's object that happens to
+/// live at the identical key, clobbering its bytes while the victim's artifact
+/// row still points at that key.
+///
+/// This guard refuses such a write: if the target `storage_key` is already
+/// referenced by an artifact row belonging to a **different** repository —
+/// **whether live OR soft-deleted** — it returns [`AppError::Conflict`]
+/// (HTTP 409) and the caller must not `put`.
+///
+/// Soft-deleted foreign rows are included deliberately: a soft-delete tombstones
+/// the row but the physical object at the flat key persists, so an attacker could
+/// otherwise overwrite a soft-deleted victim object and poison the bytes that the
+/// victim serves after a restore/resurrect. A foreign row owning the physical key
+/// — even a tombstoned one — means the key is not ours to write.
+///
+/// Safe to call at every flat-key write site:
+/// - Same-repository writes are always allowed — the query excludes the writer's
+///   own `repository_id`, so re-publishing (or reclaiming your own soft-deleted)
+///   coordinate passes.
+/// - Repository-scoped keys (rpm/alpine/conda/incus embed the repo id) and
+///   content-addressed keys never collide across repositories, so the query
+///   simply never matches and the write proceeds unchanged.
+///
+/// KNOWN RESIDUAL (TOCTOU): this is a check-then-write guard, not atomic with the
+/// caller's subsequent `put` + row insert. Two repositories racing the very first
+/// publish of the same colliding key can both pass the check and create dual
+/// rows. Closing it fully requires holding a lock across guard→put→insert (or the
+/// structural repo-scoped-key scheme), which is out of scope for this surgical
+/// hotfix; a global UNIQUE index on `storage_key` is intentionally NOT used
+/// because content-addressed formats legitimately share sha-based keys across
+/// repositories. The 1.6.0 repo-scoped-key migration is the real remediation.
+pub async fn guard_foreign_storage_key(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_key: &str,
+) -> Result<()> {
+    // Runtime-checked query (no compile-time sqlx cache needed): return the
+    // owning repository id of any *other* repository holding a row at this exact
+    // key — live or soft-deleted (the physical object persists past soft-delete).
+    let foreign: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts \
+         WHERE storage_key = $1 AND repository_id <> $2 \
+         LIMIT 1",
+    )
+    .bind(storage_key)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if foreign.is_some() {
+        return Err(AppError::Conflict(format!(
+            "storage key '{storage_key}' is already owned by another repository; \
+             refusing cross-repository overwrite"
+        )));
+    }
+    Ok(())
+}
+
 /// Best-effort recorder for a completed local-artifact download (#2365).
 ///
 /// Writes real attribution (validated client IP or NULL, authenticated user
@@ -2026,6 +2091,121 @@ mod tests {
             key,
             "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
         );
+    }
+
+    // -- #2504 cross-repository overwrite guard ----------------------------
+
+    /// Insert a minimal live artifact row at `storage_key` for `repo_id`.
+    #[cfg(test)]
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid, path: &str, storage_key: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(path)
+        .bind("0".repeat(64))
+        .bind(storage_key)
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_foreign_repo_owning_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // repo_b owns a live row at the colliding flat key.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_b, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // repo_a must be refused (409 Conflict) — the cross-tenant poisoning case.
+        let err = guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect_err("foreign-owned key must be rejected");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_same_repo_overwrite() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // Re-publishing your own coordinate must still be allowed.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("same-repo overwrite must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_uncontended_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/org/fresh/{}/fresh.jar", Uuid::new_v4());
+        // No row anywhere references this key.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("uncontended key must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_soft_deleted_foreign_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/dead/1.0/dead-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_b, "com/acme/dead/1.0/dead-1.0.jar", &key).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("soft-delete");
+
+        // The physical object persists past soft-delete, so a tombstoned foreign
+        // row still owns the key: repo_a must NOT be able to overwrite it (guards
+        // against poison-on-resurrect).
+        let err = guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect_err("soft-deleted foreign row must still block");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_same_repo_soft_deleted_reclaim() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/mine/1.0/mine-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/mine/1.0/mine-1.0.jar", &key).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("soft-delete");
+
+        // Reclaiming your OWN (even soft-deleted) key is always allowed.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("same-repo soft-deleted reclaim must be allowed");
     }
 
     // -----------------------------------------------------------------------
