@@ -173,6 +173,8 @@ fn cfg(storage_path: &str) -> Config {
         gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,
+        s3_prefix: None,
+        backup_s3_prefix: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,

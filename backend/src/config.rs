@@ -174,6 +174,14 @@ pub struct Config {
     /// S3 endpoint URL (for MinIO or other S3-compatible services)
     pub s3_endpoint: Option<String>,
 
+    /// Optional S3 key prefix for all objects (when storage_backend = "s3").
+    /// Lets artifacts live under a path other than the bucket root.
+    pub s3_prefix: Option<String>,
+
+    /// Optional dedicated S3 key prefix for backups. Falls back to
+    /// `s3_prefix` when unset. Only applies when storage_backend = "s3".
+    pub backup_s3_prefix: Option<String>,
+
     /// JWT secret key for signing tokens
     pub jwt_secret: String,
 
@@ -719,6 +727,8 @@ redacted_debug!(Config {
     show gcs_bucket,
     show s3_region,
     show s3_endpoint,
+    show s3_prefix,
+    show backup_s3_prefix,
     redact jwt_secret,
     show jwt_expiration_secs,
     show jwt_access_token_expiry_minutes,
@@ -830,6 +840,8 @@ impl Default for Config {
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
+            s3_prefix: None,
+            backup_s3_prefix: None,
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
@@ -965,6 +977,8 @@ impl Config {
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
+            s3_prefix: env::var("S3_PREFIX").ok(),
+            backup_s3_prefix: env::var("BACKUP_S3_PREFIX").ok(),
             jwt_secret: env::var("JWT_SECRET")
                 .map_err(|_| AppError::Config("JWT_SECRET not set".into()))?,
             jwt_expiration_secs: env_parse("JWT_EXPIRATION_SECS", 86400),
@@ -2798,6 +2812,52 @@ mod tests {
             env::set_var("BACKUP_S3_BUCKET", v);
         } else {
             env::remove_var("BACKUP_S3_BUCKET");
+        }
+    }
+
+    #[test]
+    fn test_config_optional_s3_prefix_fields() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_prefix = env::var("S3_PREFIX").ok();
+        let saved_backup_prefix = env::var("BACKUP_S3_PREFIX").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("S3_PREFIX");
+        env::remove_var("BACKUP_S3_PREFIX");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.s3_prefix, None);
+        assert_eq!(config.backup_s3_prefix, None);
+
+        env::set_var("S3_PREFIX", "artifacts");
+        env::set_var("BACKUP_S3_PREFIX", "backups");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.s3_prefix.as_deref(), Some("artifacts"));
+        assert_eq!(config.backup_s3_prefix.as_deref(), Some("backups"));
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_prefix {
+            env::set_var("S3_PREFIX", v);
+        } else {
+            env::remove_var("S3_PREFIX");
+        }
+        if let Some(v) = saved_backup_prefix {
+            env::set_var("BACKUP_S3_PREFIX", v);
+        } else {
+            env::remove_var("BACKUP_S3_PREFIX");
         }
     }
 

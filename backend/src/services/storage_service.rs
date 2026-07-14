@@ -447,7 +447,7 @@ macro_rules! impl_storage_wrapper {
 /// Forwards the facade `StorageBackend` trait — including `supports_redirect`
 /// and `get_presigned_url` — to the inner S3 backend, so the single facade
 /// handle carries presign capability (built with `prefix = None` for the
-/// proxy cache; #1555).
+/// proxy cache, or an operator-configured prefix for backups; #1555).
 pub struct S3BackendWrapper {
     inner: Arc<crate::storage::s3::S3Backend>,
 }
@@ -473,28 +473,41 @@ pub struct StorageService {
     /// parallel side-channel field, so no call site can silently get a
     /// non-presigning handle.
     ///
-    /// For S3 the inner backend is built with `prefix = None` so the signed
-    /// key matches the no-prefix layout the proxy cache writes.
+    /// For S3, `from_config` builds the inner backend with `prefix = None`
+    /// so the signed key matches the no-prefix layout the proxy cache
+    /// writes; `from_config_for_backups` instead applies the resolved
+    /// backup prefix (`BACKUP_S3_PREFIX`/`S3_PREFIX`).
     backend: Arc<dyn StorageBackend>,
 }
 
 impl StorageService {
     /// Create storage service from config
     pub async fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_with_bucket_override(config, None).await
+        // Proxy-cache invariant: content lives at the bucket root
+        // (`proxy-cache/...`), never under S3_PREFIX, so the prefix is
+        // forced to None regardless of what's configured (#1555).
+        Self::from_config_with_overrides(config, None, None).await
     }
 
     /// Create storage service for backups. When `BACKUP_S3_BUCKET` is set
     /// (and storage_backend = "s3"), backups are written to that bucket
     /// instead of `S3_BUCKET`, reusing the same S3 credentials/region/
-    /// endpoint. Falls back to `from_config` behavior otherwise.
+    /// endpoint. The key prefix is `BACKUP_S3_PREFIX` if set, else
+    /// `S3_PREFIX`, else no prefix. Falls back to `from_config` behavior
+    /// on non-s3 backends.
     pub async fn from_config_for_backups(config: &Config) -> Result<Self> {
-        Self::from_config_with_bucket_override(config, config.backup_s3_bucket.clone()).await
+        let prefix_override = config
+            .backup_s3_prefix
+            .clone()
+            .or_else(|| config.s3_prefix.clone());
+        Self::from_config_with_overrides(config, config.backup_s3_bucket.clone(), prefix_override)
+            .await
     }
 
-    async fn from_config_with_bucket_override(
+    async fn from_config_with_overrides(
         config: &Config,
         s3_bucket_override: Option<String>,
+        s3_prefix_override: Option<String>,
     ) -> Result<Self> {
         let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
             "filesystem" => {
@@ -503,17 +516,15 @@ impl StorageService {
                 Arc::new(FilesystemBackend::new(path))
             }
             "s3" => {
-                // Build the proxy-cache S3 backend from the SAME env-derived
-                // config the primary storage uses (redirect_downloads, presign
-                // creds, CloudFront, path_format, TLS, pool tuning), then force
-                // the key prefix to None. Proxy-cache content lives at the
-                // bucket root (`proxy-cache/...`), not under S3_PREFIX, so the
-                // signed key must carry no prefix. Reusing from_env() (instead
-                // of S3Config::new, which hardcodes redirect_downloads=false and
-                // no presign creds) is what makes presigning actually fire on
-                // this handle (#1555).
+                // Build the S3 backend from the SAME env-derived config the
+                // primary storage uses (redirect_downloads, presign creds,
+                // CloudFront, path_format, TLS, pool tuning), then apply the
+                // caller's bucket/prefix overrides. Reusing from_env()
+                // (instead of S3Config::new, which hardcodes
+                // redirect_downloads=false and no presign creds) is what
+                // makes presigning actually fire on this handle (#1555).
                 let mut s3_config = crate::storage::s3::S3Config::from_env()?;
-                s3_config.prefix = None;
+                s3_config = Self::apply_prefix_override(s3_config, s3_prefix_override);
                 s3_config = Self::apply_bucket_override(s3_config, s3_bucket_override);
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
                 Arc::new(S3BackendWrapper { inner })
@@ -551,6 +562,18 @@ impl StorageService {
         if let Some(bucket) = bucket_override {
             s3_config.bucket = bucket;
         }
+        s3_config
+    }
+
+    /// Force `s3_config.prefix` to `prefix_override`, unconditionally. Used
+    /// both to pin the proxy-cache to the bucket root (`None`) and to apply
+    /// the resolved backup prefix, so the value in `S3Config::from_env()`
+    /// (raw `S3_PREFIX`) never leaks through unexamined.
+    fn apply_prefix_override(
+        mut s3_config: crate::storage::s3::S3Config,
+        prefix_override: Option<String>,
+    ) -> crate::storage::s3::S3Config {
+        s3_config.prefix = prefix_override;
         s3_config
     }
 
@@ -1096,6 +1119,72 @@ mod tests {
             result.is_ok(),
             "from_config_for_backups should behave like from_config on non-s3 backends"
         );
+    }
+
+    #[test]
+    fn test_apply_prefix_override_forces_given_value() {
+        let s3_config = crate::storage::s3::S3Config::new(
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            None,
+            Some("original-prefix".to_string()),
+        );
+        let result =
+            StorageService::apply_prefix_override(s3_config, Some("backup-prefix".to_string()));
+        assert_eq!(result.prefix.as_deref(), Some("backup-prefix"));
+    }
+
+    #[test]
+    fn test_apply_prefix_override_forces_none_when_override_is_none() {
+        let s3_config = crate::storage::s3::S3Config::new(
+            "bucket".to_string(),
+            "us-east-1".to_string(),
+            None,
+            Some("original-prefix".to_string()),
+        );
+        let result = StorageService::apply_prefix_override(s3_config, None);
+        assert_eq!(
+            result.prefix, None,
+            "an override of None must clear any prefix S3Config::from_env picked up from S3_PREFIX"
+        );
+    }
+
+    #[test]
+    fn test_backup_prefix_resolution_prefers_backup_s3_prefix_over_s3_prefix() {
+        let config = crate::config::Config {
+            s3_prefix: Some("artifacts".to_string()),
+            backup_s3_prefix: Some("backups".to_string()),
+            ..minimal_config("s3")
+        };
+        let resolved = config
+            .backup_s3_prefix
+            .clone()
+            .or_else(|| config.s3_prefix.clone());
+        assert_eq!(resolved.as_deref(), Some("backups"));
+    }
+
+    #[test]
+    fn test_backup_prefix_resolution_falls_back_to_s3_prefix_when_backup_prefix_unset() {
+        let config = crate::config::Config {
+            s3_prefix: Some("artifacts".to_string()),
+            backup_s3_prefix: None,
+            ..minimal_config("s3")
+        };
+        let resolved = config
+            .backup_s3_prefix
+            .clone()
+            .or_else(|| config.s3_prefix.clone());
+        assert_eq!(resolved.as_deref(), Some("artifacts"));
+    }
+
+    #[test]
+    fn test_backup_prefix_resolution_is_none_when_both_unset() {
+        let config = minimal_config("s3");
+        let resolved = config
+            .backup_s3_prefix
+            .clone()
+            .or_else(|| config.s3_prefix.clone());
+        assert_eq!(resolved, None);
     }
 
     #[tokio::test]

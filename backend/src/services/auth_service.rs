@@ -3445,6 +3445,8 @@ mod tests {
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
+            s3_prefix: None,
+            backup_s3_prefix: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
             jwt_expiration_secs: 86400,
             jwt_access_token_expiry_minutes: 30,
