@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
@@ -22,7 +22,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -1022,16 +1022,64 @@ const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
 /// decimal byte count (e.g. `4294967296` for 4 GiB).
 const MAX_SCAN_EXTRACTED_BYTES_ENV: &str = "MAX_SCAN_EXTRACTED_BYTES";
 
+/// Parse a positive-integer environment override, falling back to `default`
+/// when the variable is unset, blank, non-numeric, or zero. Shared by the
+/// scan-workspace byte cap and the concurrent-extraction cap so the identical
+/// parse/filter logic is written once (a zero cap in either dimension would
+/// wedge scanning, so it is treated as "unset").
+fn positive_env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
 /// Effective cumulative-byte ceiling for scan-workspace extraction, honouring
 /// [`MAX_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_SCAN_EXTRACTED_BYTES`].
 /// A blank, non-numeric, or zero override is treated as "unset" (a zero cap
 /// would reject every archive).
 fn max_scan_extracted_bytes() -> u64 {
-    std::env::var(MAX_SCAN_EXTRACTED_BYTES_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_MAX_SCAN_EXTRACTED_BYTES)
+    positive_env_or(
+        MAX_SCAN_EXTRACTED_BYTES_ENV,
+        DEFAULT_MAX_SCAN_EXTRACTED_BYTES,
+    )
+}
+
+/// Default cap on how many artifact scans may extract into the scan-workspace
+/// PVC *at once*, across ALL scan-trigger paths. #2514/#2533 bound a *single*
+/// archive's extracted tree to [`max_scan_extracted_bytes`] (2 GiB) but place
+/// no bound on the *number* of such trees in flight: every trigger path
+/// fire-and-forgets a detached `tokio::spawn`, so N concurrent scans could
+/// stage N × 2 GiB transiently. This caps that N, making worst-case concurrent
+/// scan-workspace usage `N × per-archive-cap` — a deterministic figure
+/// operators size the PVC against. A small default keeps the out-of-the-box
+/// worst case modest (4 × 2 GiB) while still allowing parallel scans.
+const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
+
+/// Env var overriding [`DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS`]. A blank,
+/// non-numeric, or zero value falls back to the default (min effective 1).
+const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
+
+/// Effective concurrent-extraction cap, honouring
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
+fn max_concurrent_scan_extractions() -> usize {
+    positive_env_or(
+        MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
+        DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
+    ) as usize
+}
+
+/// Process-wide FIFO semaphore bounding concurrent scan-workspace extractions.
+/// Seeded once from [`max_concurrent_scan_extractions`]; every per-artifact
+/// scan holds one permit for the whole of `scan_artifact_inner`. Because the
+/// scanner loop inside that method is sequential, one held permit == at most
+/// one extraction in flight, so in-flight extracted-tree bytes are bounded to
+/// `permits × per-archive-cap`. Never `close()`d — it lives for the process
+/// lifetime.
+fn scan_extraction_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_scan_extractions())))
 }
 
 /// Copy a single archive entry into `writer`, enforcing the shared cumulative
@@ -3376,6 +3424,23 @@ impl ScannerService {
             );
             return Ok(());
         }
+
+        // #2540: bound total in-flight scan-workspace extractions across ALL
+        // scan-trigger paths (security.rs trigger_scan, artifact_service
+        // auto-scan-on-upload, incus scan, admin rescan). Each in-flight
+        // artifact scan holds one permit for the rest of this method; the
+        // scanner loop below runs sequentially, so worst-case concurrent
+        // extracted trees are capped at
+        // `max_concurrent_scan_extractions() * per-archive-cap`. FIFO blocking
+        // acquire — detached background scans have no client latency SLA, so a
+        // legit scan must *complete* (just serialized), never be shed. The
+        // semaphore is never close()d in this binary; on the impossible closed
+        // error we fall through (`.ok()`) rather than drop a legitimate scan.
+        let _extraction_permit = scan_extraction_semaphore()
+            .clone()
+            .acquire_owned()
+            .await
+            .ok();
 
         // Load content from storage (we need the storage key)
         // NOTE: The orchestrator is called with content already available in
@@ -10167,6 +10232,94 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    #[test]
+    fn test_max_concurrent_scan_extractions_env_override() {
+        // #2540: default when unset; a valid override wins; blank / non-numeric
+        // / zero fall back to the default (a zero cap would wedge every scan).
+        let key = MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV;
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(
+            max_concurrent_scan_extractions(),
+            DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS
+        );
+
+        std::env::set_var(key, "2");
+        assert_eq!(max_concurrent_scan_extractions(), 2);
+
+        std::env::set_var(key, "64");
+        assert_eq!(max_concurrent_scan_extractions(), 64);
+
+        for bad in ["0", "", "   ", "abc", "-1"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                max_concurrent_scan_extractions(),
+                DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS,
+                "value {:?} should fall back to default",
+                bad
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// #2540: prove the extraction-concurrency semaphore actually bounds peak
+    /// in-flight work. Uses a *local* `Arc<Semaphore>` with the same shape as
+    /// `scan_extraction_semaphore()` rather than the process `OnceLock` (which
+    /// reads env once per binary and would race the env-override test) — this
+    /// mirrors `auth_service::acquire_permit_from`'s local-semaphore seam. Fire
+    /// N+1 tasks against a cap-N semaphore; assert observed peak concurrency
+    /// never exceeds N and every task still completes (FIFO queue, never shed).
+    #[tokio::test]
+    async fn test_scan_extraction_semaphore_bounds_peak_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 2;
+        const TASKS: usize = 5;
+
+        let sem = Arc::new(Semaphore::new(CAP));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let sem = sem.clone();
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            let done = done.clone();
+            handles.push(tokio::spawn(async move {
+                // Mirror the acquire in scan_artifact_inner exactly.
+                let _permit = sem.clone().acquire_owned().await.ok();
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Hold the permit briefly so contention is observable.
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "peak concurrency {} exceeded cap {}",
+            peak.load(Ordering::SeqCst),
+            CAP
+        );
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            TASKS,
+            "every queued scan must complete (FIFO queue, never shed)"
+        );
     }
 
     // ===================================================================
