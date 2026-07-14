@@ -86,6 +86,26 @@ impl RulesCacheEntry {
     }
 }
 
+/// SQL that checks whether a principal of `principal_type` exists with `id = $1`,
+/// or `None` when the principal type is not recognised.
+///
+/// Service accounts are stored in the `users` table with `is_service_account =
+/// true`; human users have it `false`; groups live in the `groups` table. This
+/// mapping is the single source of truth for the write-time type/id
+/// correspondence check performed by [`PermissionService::validate_principal`].
+fn principal_existence_query(principal_type: &str) -> Option<&'static str> {
+    match principal_type {
+        "user" => {
+            Some("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_service_account = false)")
+        }
+        "service_account" => {
+            Some("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_service_account = true)")
+        }
+        "group" => Some("SELECT EXISTS(SELECT 1 FROM groups WHERE id = $1)"),
+        _ => None,
+    }
+}
+
 /// Service that evaluates permission rules stored in the `permissions` table.
 ///
 /// The service resolves both direct user grants and group-based grants in a
@@ -240,6 +260,37 @@ impl PermissionService {
                 poisoned.into_inner().clear();
             }
         }
+    }
+
+    /// Validate that `principal_id` names an existing principal of the declared
+    /// `principal_type` before a grant is written.
+    ///
+    /// #2503 (defense-in-depth): since #2433 widened grant matching to include
+    /// `service_account`, a mistyped grant — e.g. `principal_type =
+    /// 'service_account'` naming a real *user* id — becomes effective. Principal
+    /// ids are globally-unique UUIDs drawn from distinct tables (`users` for both
+    /// `user` and `service_account`, disambiguated by `is_service_account`;
+    /// `groups` for `group`), so a type/id mismatch is always an authoring error.
+    /// Reject it at write time with a 400 rather than persisting a grant that
+    /// resolves against the wrong principal.
+    pub async fn validate_principal(&self, principal_type: &str, principal_id: Uuid) -> Result<()> {
+        let query = principal_existence_query(principal_type).ok_or_else(|| {
+            AppError::Validation(format!(
+                "Invalid principal_type '{principal_type}': expected one of user, \
+                 service_account, group"
+            ))
+        })?;
+        let exists: bool = sqlx::query_scalar(query)
+            .bind(principal_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !exists {
+            return Err(AppError::Validation(format!(
+                "principal_id {principal_id} does not exist as a {principal_type}"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve the full set of granted actions for a user on a specific target.
@@ -771,6 +822,144 @@ mod tests {
             body.contains("(principal_type IN ('user', 'service_account') AND principal_id = $1)"),
             "direct-principal arm must accept service_account without relaxing the id match"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2503: principal type/id correspondence check for grant writes.
+    //
+    // `validate_principal` needs a DB, but the type->table mapping it relies on
+    // is a pure function. Pin that mapping here without a database: it is the
+    // single source of truth deciding which table a grant's principal_id must
+    // exist in, so a regression (e.g. dropping the is_service_account guard, or
+    // accepting an unknown type) is what would let a mistyped grant slip through.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_principal_existence_query_user_excludes_service_accounts() {
+        let q = principal_existence_query("user").expect("user is a valid principal type");
+        assert!(
+            q.contains("FROM users"),
+            "user check must target the users table"
+        );
+        assert!(
+            q.contains("is_service_account = false"),
+            "user check must exclude service-account rows so a SA id cannot pose as a user"
+        );
+    }
+
+    #[test]
+    fn test_principal_existence_query_service_account_requires_flag() {
+        let q = principal_existence_query("service_account")
+            .expect("service_account is a valid principal type");
+        assert!(
+            q.contains("FROM users"),
+            "service_account check must target the users table"
+        );
+        assert!(
+            q.contains("is_service_account = true"),
+            "service_account check must require the flag so a human user id cannot pose as a SA"
+        );
+    }
+
+    #[test]
+    fn test_principal_existence_query_group_targets_groups_table() {
+        let q = principal_existence_query("group").expect("group is a valid principal type");
+        assert!(
+            q.contains("FROM groups"),
+            "group check must target the groups table"
+        );
+    }
+
+    #[test]
+    fn test_principal_existence_query_rejects_unknown_type() {
+        assert!(principal_existence_query("").is_none());
+        assert!(principal_existence_query("admin").is_none());
+        assert!(principal_existence_query("User").is_none());
+        assert!(principal_existence_query("serviceaccount").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_validate_principal_unknown_type_is_400_without_db() {
+        // The unknown-type arm rejects before any query, so a doomed lazy pool
+        // is fine: we must get a Validation (400), not a Database (500) error.
+        let service = lazy_service();
+        let err = service
+            .validate_principal("root", Uuid::new_v4())
+            .await
+            .expect_err("unknown principal_type must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "unknown principal_type must be a 400 Validation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_principal_type_id_correspondence_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = PermissionService::new(pool.clone());
+
+        // A human user and a service account (both live in `users`).
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let sa_id = Uuid::new_v4();
+        let sa_name = format!("ph-perm-sa-{sa_id}");
+        sqlx::query(
+            r#"INSERT INTO users
+                 (id, username, email, password_hash, auth_provider,
+                  is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, 'unused', 'local', false, true, true)"#,
+        )
+        .bind(sa_id)
+        .bind(&sa_name)
+        .bind(format!("{sa_name}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed service account");
+        let group_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+            .bind(group_id)
+            .bind(format!("ph-perm-grp-{group_id}"))
+            .execute(&pool)
+            .await
+            .expect("seed group");
+
+        // Each type with a matching id is accepted.
+        assert!(service.validate_principal("user", user_id).await.is_ok());
+        assert!(service
+            .validate_principal("service_account", sa_id)
+            .await
+            .is_ok());
+        assert!(service.validate_principal("group", group_id).await.is_ok());
+
+        // Mistyped grants (the #2503 case) are rejected with a 400.
+        let mistyped = service
+            .validate_principal("service_account", user_id)
+            .await
+            .expect_err("a user id declared as service_account must be rejected");
+        assert!(
+            matches!(mistyped, AppError::Validation(_)),
+            "type/id mismatch must be a 400, got {mistyped:?}"
+        );
+        assert!(service.validate_principal("user", sa_id).await.is_err(),);
+        assert!(service.validate_principal("group", user_id).await.is_err());
+        // A well-typed but non-existent id is also rejected.
+        assert!(service
+            .validate_principal("user", Uuid::new_v4())
+            .await
+            .is_err());
+
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
+            .bind(user_id)
+            .bind(sa_id)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
