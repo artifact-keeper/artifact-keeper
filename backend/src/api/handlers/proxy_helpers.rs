@@ -2804,6 +2804,57 @@ pub async fn local_fetch_or_redirect(
         .unwrap())
 }
 
+/// Blob file extensions eligible for presigned-redirect offload (#1945).
+///
+/// Only the large binary assets that actually stream megabytes through the
+/// backend process are redirected. Small text artifacts (`.pom`/`.module`),
+/// checksums (`.sha1`/`.md5`/`.asc`) and generated `maven-metadata.xml` stay
+/// inline so Maven/Ivy dependency resolution — which fetches many of these tiny
+/// files — does not pay an extra redirect round-trip with no offload benefit.
+pub fn is_blob_redirect_eligible(path: &str) -> bool {
+    const BLOB_EXTENSIONS: &[&str] = &[".jar", ".war", ".aar", ".zip", ".tar.gz", ".jmod"];
+    let lower = path.to_ascii_lowercase();
+    BLOB_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Redirect-or-stream decision for a hosted Maven/Ivy artifact-row blob (#1945).
+///
+/// Shared by the Maven `serve_artifact` and Ivy/sbt `download_by_path` hosted
+/// paths so the decision lives in exactly one place. When presigned downloads
+/// are enabled, the resolved storage backend supports redirect, and `path` ends
+/// in a redirect-eligible blob extension, the download is recorded
+/// (count-at-redirect, #2260) and a `302` to the presigned URL is returned. In
+/// every other case — feature disabled, filesystem/non-S3 backend, a non-blob
+/// artifact (POM/module/metadata), or a presigned-URL generation error — this
+/// returns `None` and the caller falls back to byte-identical streaming.
+///
+/// Only ever called on the hosted (Local/Staging) artifact-row path: remote and
+/// virtual repos return earlier via `proxy_fetch_streaming`/`stream_fetch_result`
+/// because their bytes are not in this repo's S3 handle and must never redirect.
+pub async fn try_hosted_blob_redirect(
+    state: &AppState,
+    storage: &dyn crate::storage::StorageBackend,
+    path: &str,
+    storage_key: &str,
+    artifact_id: Uuid,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Option<Response> {
+    if !state.config.presigned_downloads_enabled || !is_blob_redirect_eligible(path) {
+        return None;
+    }
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    // `try_presigned_redirect` additionally verifies `supports_redirect()` and
+    // returns `None` for filesystem backends or on a signing error.
+    let redirect = try_presigned_redirect(storage, storage_key, true, expiry).await?;
+    // Count-at-redirect (#2260): record BEFORE handing back the 302, matching the
+    // generic download handler. A body-less redirect otherwise never counts. This
+    // funnels through the single canonical recorder, which short-circuits on
+    // `ctx.is_head` (#2505), so a HEAD probe on an eligible blob still returns the
+    // 302 but records +0.
+    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+    Some(redirect)
+}
+
 // ---------------------------------------------------------------------------
 // Shared remote/virtual download fallback
 // ---------------------------------------------------------------------------
@@ -9622,5 +9673,287 @@ mod tests {
         assert_eq!(body["package"], "lodash");
         assert_eq!(body["min_age_days"], 7);
         assert_eq!(body["requested_age_days"], 2);
+    }
+
+    // ── #1945: Maven/Ivy hosted-blob presigned-redirect helpers ─────────────
+
+    #[test]
+    fn blob_redirect_eligibility_allowlist() {
+        // Blob binaries that stream megabytes through the backend redirect.
+        for eligible in [
+            "com/example/lib/1.0/lib-1.0.jar",
+            "com/example/app/1.0/app-1.0.war",
+            "com/example/ui/1.0/ui-1.0.aar",
+            "com/example/dist/1.0/dist-1.0.zip",
+            "com/example/bundle/1.0/bundle-1.0.tar.gz",
+            "com/example/mod/1.0/mod-1.0.jmod",
+            // Case-insensitive: uppercase extensions still match.
+            "com/example/lib/1.0/lib-1.0.JAR",
+        ] {
+            assert!(
+                super::is_blob_redirect_eligible(eligible),
+                "{eligible} must be redirect-eligible"
+            );
+        }
+
+        // Small text/metadata/checksum files stay inline (never redirect).
+        for inline in [
+            "com/example/lib/1.0/lib-1.0.pom",
+            "com/example/lib/1.0/lib-1.0.module",
+            "com/example/lib/1.0/lib-1.0.jar.sha1",
+            "com/example/lib/1.0/lib-1.0.jar.md5",
+            "com/example/lib/1.0/lib-1.0.jar.asc",
+            "com/example/lib/maven-metadata.xml",
+            "org/example/ivy/1.0/ivys/ivy.xml",
+        ] {
+            assert!(
+                !super::is_blob_redirect_eligible(inline),
+                "{inline} must stay inline (not redirect-eligible)"
+            );
+        }
+    }
+
+    /// Insert a hosted artifact row and return its id, so the redirect helper's
+    /// count-at-redirect INSERT into `download_statistics` has a valid FK.
+    async fn seed_blob_artifact(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        path: &str,
+        storage_key: &str,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind("lib")
+        .bind("1.0")
+        .bind(9_i64)
+        .bind("test-blob")
+        .bind("application/java-archive")
+        .bind(storage_key)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed blob artifact row")
+    }
+
+    async fn download_stat_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics")
+    }
+
+    fn ctx_for(
+        user_id: Uuid,
+        is_head: bool,
+    ) -> crate::api::middleware::download_telemetry::DownloadContext {
+        crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: Some(user_id),
+            user_agent: Some("nexus-test/1.0".to_string()),
+            // #2260/#2505: a HEAD probe serves no bytes, so the canonical
+            // record_download this helper calls must not write a stat row.
+            is_head,
+        }
+    }
+
+    /// A hosted `.jar` on an S3-backed repo with presigned downloads enabled
+    /// returns a 302 to the presigned URL AND records exactly one download
+    /// (count-at-redirect, #2260) — the core of #1945.
+    #[tokio::test]
+    async fn try_hosted_blob_redirect_jar_redirects_and_counts_once() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _key, _dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        let storage_key = "artifact-keeper/cas/ab/cd/lib-1.0.jar";
+        let artifact_id = seed_blob_artifact(&pool, repo_id, user_id, path, storage_key).await;
+
+        let storage = RecordingStorage::new(/* supports = */ true);
+        let state = db_helpers::build_state_presigned(
+            pool.clone(),
+            "s3-test",
+            StdArc::new(RecordingStorage::new(true)),
+        );
+
+        // GET: eligible hosted .jar -> 302 + exactly one recorded download.
+        let get_ctx = ctx_for(user_id, /* is_head = */ false);
+        let out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            &get_ctx,
+        )
+        .await;
+
+        let after_get = download_stat_count(&pool, artifact_id).await;
+
+        // HEAD on the same redirect-eligible .jar: still 302 (headers only) but
+        // records +0 — the canonical record_download honours ctx.is_head
+        // (#2260/#2505), so a metadata probe never inflates download stats.
+        let head_ctx = ctx_for(user_id, /* is_head = */ true);
+        let head_out = super::try_hosted_blob_redirect(
+            &state,
+            &storage,
+            path,
+            storage_key,
+            artifact_id,
+            &head_ctx,
+        )
+        .await;
+        let after_head = download_stat_count(&pool, artifact_id).await;
+
+        let presign_calls = storage
+            .presigned_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        let resp = out.expect("eligible hosted .jar on S3 must redirect");
+        assert_eq!(resp.status(), StatusCode::FOUND, "jar GET must 302");
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("redirect must carry Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("signed.example.com") && location.contains(storage_key),
+            "Location must be the presigned URL for the storage key, got {location}"
+        );
+        assert_eq!(
+            after_get, 1,
+            "GET on the redirect records exactly one download"
+        );
+
+        let head_resp = head_out.expect("HEAD on an eligible .jar still returns the 302");
+        assert_eq!(head_resp.status(), StatusCode::FOUND, "jar HEAD must 302");
+        assert_eq!(
+            after_head, 1,
+            "HEAD on the redirect records +0 (still 1 total)"
+        );
+
+        // Two presign attempts (one per call), two redirects, but only one stat.
+        assert_eq!(presign_calls, 2, "each call signs the key");
+    }
+
+    /// A hosted `.pom` (non-blob) is NOT eligible: the helper returns `None`
+    /// before signing or recording, so the caller streams it inline unchanged.
+    #[tokio::test]
+    async fn try_hosted_blob_redirect_pom_stays_inline() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _key, _dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+
+        let path = "com/example/lib/1.0/lib-1.0.pom";
+        let storage_key = "artifact-keeper/cas/ab/cd/lib-1.0.pom";
+        let artifact_id = seed_blob_artifact(&pool, repo_id, user_id, path, storage_key).await;
+
+        let storage = RecordingStorage::new(true);
+        let state = db_helpers::build_state_presigned(
+            pool.clone(),
+            "s3-test",
+            StdArc::new(RecordingStorage::new(true)),
+        );
+        let ctx = ctx_for(user_id, /* is_head = */ false);
+
+        let out =
+            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
+                .await;
+
+        let stat_count = download_stat_count(&pool, artifact_id).await;
+        let presign_calls = storage
+            .presigned_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            out.is_none(),
+            "non-blob .pom must fall through to inline stream"
+        );
+        assert_eq!(presign_calls, 0, "no presign for an inline artifact");
+        assert_eq!(stat_count, 0, "inline fallback must not record here");
+    }
+
+    /// A filesystem/non-S3 backend (`supports_redirect() == false`) never
+    /// redirects even for an eligible `.jar`: byte-identical streaming fallback.
+    #[tokio::test]
+    async fn try_hosted_blob_redirect_filesystem_backend_streams() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _key, _dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        let storage_key = "artifact-keeper/cas/ab/cd/lib-1.0.jar";
+        let artifact_id = seed_blob_artifact(&pool, repo_id, user_id, path, storage_key).await;
+
+        // supports_redirect() == false -> presigned path short-circuits.
+        let storage = RecordingStorage::new(/* supports = */ false);
+        let state = db_helpers::build_state_presigned(
+            pool.clone(),
+            "s3-test",
+            StdArc::new(RecordingStorage::new(true)),
+        );
+        let ctx = ctx_for(user_id, /* is_head = */ false);
+
+        let out =
+            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
+                .await;
+
+        let stat_count = download_stat_count(&pool, artifact_id).await;
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(out.is_none(), "non-redirect backend must stream, not 302");
+        assert_eq!(
+            stat_count, 0,
+            "streaming fallback records via the caller, not here"
+        );
+    }
+
+    /// With `presigned_downloads_enabled == false` even an S3-backed `.jar`
+    /// streams: the feature gate is off.
+    #[tokio::test]
+    async fn try_hosted_blob_redirect_feature_disabled_streams() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _key, dir) = db_helpers::create_repo(&pool, "local", "maven").await;
+
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        let storage_key = "artifact-keeper/cas/ab/cd/lib-1.0.jar";
+        let artifact_id = seed_blob_artifact(&pool, repo_id, user_id, path, storage_key).await;
+
+        let storage = RecordingStorage::new(true);
+        // build_state (not _presigned) leaves presigned_downloads_enabled = false.
+        let state = db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+        let ctx = ctx_for(user_id, /* is_head = */ false);
+
+        let out =
+            super::try_hosted_blob_redirect(&state, &storage, path, storage_key, artifact_id, &ctx)
+                .await;
+
+        let presign_calls = storage
+            .presigned_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        assert!(out.is_none(), "feature disabled must stream, not 302");
+        assert_eq!(presign_calls, 0, "no presign when the feature is off");
     }
 }

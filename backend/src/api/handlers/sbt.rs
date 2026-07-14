@@ -149,6 +149,24 @@ async fn download_by_path(
         .await
         .map_err(|e| e.into_response())?;
 
+    // #1945: offload eligible hosted Ivy/sbt blob binaries (.jar/.war/.aar/.zip/
+    // .tar.gz/.jmod) to a presigned S3 redirect instead of streaming them
+    // through the backend process. ivy.xml/POM/checksum files and filesystem
+    // backends fall through to the inline stream below. The helper records the
+    // download before issuing the 302 (count-at-redirect, #2260).
+    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+        &state,
+        storage.as_ref(),
+        artifact_path,
+        &artifact.storage_key,
+        artifact.id,
+        &ctx,
+    )
+    .await
+    {
+        return Ok(redirect);
+    }
+
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
