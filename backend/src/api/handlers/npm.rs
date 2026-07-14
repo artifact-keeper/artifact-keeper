@@ -780,15 +780,26 @@ fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<
 }
 
 /// Best-effort defensive filter of an npm `/-/` meta response against the scope
-/// policy (#2424). Handles the search shape
-/// (`{"objects":[{"package":{"name":...}}], "total":N, ...}`) — dropping
-/// out-of-scope hits and correcting `total`. Other shapes carry no arbitrary
-/// package-name listing and are returned unchanged. `None` on parse failure so
-/// the caller serves the upstream body verbatim.
+/// policy (#2424, #2542). Handles two response shapes:
+///
+/// * The search shape (`{"objects":[{"package":{"name":...}}], "total":N,
+///   ...}`) — dropping out-of-scope hits and correcting `total`.
+/// * The legacy package-name-keyed map shapes returned by `/-/all`
+///   (`{"_updated":<ts>,"<pkg>":{doc},...}`) and `/-/by-user/:user`
+///   (`{"<pkg>":[...],...}`) — dropping entries whose key is an out-of-scope
+///   package name. These carry no `objects` key, so before #2542 they were
+///   re-serialised verbatim and leaked out-of-scope package existence against
+///   upstreams that still honour the endpoints (older verdaccio/Nexus/CouchDB).
+///
+/// Only entries whose value is an object (a package document) or an array (a
+/// package-name list) are scope-checked by key; scalar-valued keys carry
+/// structural metadata (e.g. `/-/all`'s `_updated`, `/-/whoami`'s
+/// `{"username":"..."}`, `/-/ping`'s `{}`) — no package listing — and are
+/// preserved unchanged. `None` on parse failure so the caller serves the
+/// upstream body verbatim.
 fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<Bytes> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object_mut()?;
-    let mut new_total: Option<usize> = None;
     if let Some(objects) = obj.get_mut("objects").and_then(|v| v.as_array_mut()) {
         objects.retain(|entry| {
             entry
@@ -798,10 +809,21 @@ fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<Bytes> 
                 .map(|name| policy.allows(name))
                 .unwrap_or(false)
         });
-        new_total = Some(objects.len());
-    }
-    if let Some(total) = new_total {
+        let total = objects.len();
         obj.insert("total".to_string(), serde_json::json!(total));
+    } else {
+        // Legacy map shapes (#2542): key is a package name, value is a package
+        // document (`/-/all`) or a package-name list (`/-/by-user`). Drop
+        // out-of-scope keys; keep scalar-valued structural metadata (e.g.
+        // `_updated`, whoami's `username`) untouched so those endpoints stay
+        // correct.
+        obj.retain(|key, val| {
+            if val.is_object() || val.is_array() {
+                policy.allows(key)
+            } else {
+                true
+            }
+        });
     }
     serde_json::to_vec(&value).ok().map(Bytes::from)
 }
@@ -3682,6 +3704,83 @@ mod tests {
         let out = filter_meta_response(body, &p).expect("parses");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn meta_response_legacy_all_map_drops_out_of_scope_package_keys() {
+        // `/-/all` shape (#2542): `{"_updated":ts,"<pkg>":{doc},...}`. Package
+        // documents keyed by an out-of-scope name are dropped; in-scope ones
+        // and the structural `_updated` metadata survive.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{
+            "_updated": 1418818799864,
+            "lodash": {"name":"lodash","dist-tags":{"latest":"4.17.21"}},
+            "lodash.merge": {"name":"lodash.merge","dist-tags":{"latest":"4.6.2"}},
+            "@corp/tool": {"name":"@corp/tool","dist-tags":{"latest":"1.0.0"}},
+            "express": {"name":"express","dist-tags":{"latest":"4.18.0"}},
+            "@evil/secret": {"name":"@evil/secret","dist-tags":{"latest":"9.9.9"}}
+        }"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        // In-scope kept.
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("lodash.merge"));
+        assert!(obj.contains_key("@corp/tool"));
+        // Out-of-scope package existence removed.
+        assert!(!obj.contains_key("express"));
+        assert!(!obj.contains_key("@evil/secret"));
+        // Structural metadata (scalar value) preserved.
+        assert_eq!(obj["_updated"], 1418818799864u64);
+    }
+
+    #[test]
+    fn meta_response_legacy_by_user_map_drops_out_of_scope_package_keys() {
+        // `/-/by-user/:user` shape (#2542): package-name keys with array
+        // values. Out-of-scope keys are dropped; in-scope keys kept.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{
+            "lodash": ["read","write"],
+            "@corp/tool": ["read","write"],
+            "express": ["read","write"]
+        }"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("@corp/tool"));
+        assert!(!obj.contains_key("express"));
+    }
+
+    #[test]
+    fn meta_response_legacy_map_unset_policy_is_unchanged() {
+        // Unset (inactive) policy = allow-all: every key survives, matching the
+        // default-behaviour-unchanged guarantee.
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        let body = br#"{
+            "_updated": 1,
+            "lodash": {"name":"lodash"},
+            "express": {"name":"express"}
+        }"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("express"));
+        assert!(obj.contains_key("_updated"));
+    }
+
+    #[test]
+    fn meta_response_whoami_string_value_survives_active_policy() {
+        // A proxied `/-/whoami` (`{"username":"alice"}`) has a scalar value and
+        // must not be treated as a package listing even though "username" is a
+        // syntactically valid unscoped package name the policy would deny.
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"username":"alice"}"#;
+        let out = filter_meta_response(body, &p).expect("parses");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["username"], "alice");
     }
 
     #[test]
