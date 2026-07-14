@@ -23,30 +23,36 @@ fn wasm_service(state: &SharedState) -> Result<&WasmPluginService> {
         .ok_or_else(|| AppError::Internal("WASM plugin service not available".to_string()))
 }
 
-/// Create plugin read-only routes (list, get, config, events).
+/// Create plugin read-only routes (list, get, events).
 ///
 /// These are mounted under the standard auth middleware so any authenticated
-/// user may inspect installed plugins.
+/// user may inspect installed plugins. Plugin *configuration* (GET/POST
+/// `/:id/config`) is intentionally NOT here — it is a global, security-relevant
+/// surface (validator rules + external callback URLs) and lives in
+/// [`admin_router`] under the admin middleware.
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_plugins))
         .route("/:id", get(get_plugin))
-        .route(
-            "/:id/config",
-            get(get_plugin_config).post(update_plugin_config),
-        )
         .route("/:id/events", get(get_plugin_events))
 }
 
-/// Create plugin admin routes (install + lifecycle).
+/// Create plugin admin routes (install + lifecycle + config).
 ///
 /// Installing a plugin loads arbitrary WASM code and enabling/disabling or
 /// uninstalling a plugin changes the running plugin set, so these routes are
-/// mounted under the admin middleware (requires `is_admin`).
+/// mounted under the admin middleware (requires `is_admin`). Reading and
+/// updating plugin configuration (`/:id/config`) is admin-gated for the same
+/// reason: `plugins.config` is global (no owner/repo scope) and drives
+/// validator rules plus external `webhook_url`/`validator_url` callbacks.
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/", post(install_plugin))
         .route("/:id", delete(uninstall_plugin))
+        .route(
+            "/:id/config",
+            get(get_plugin_config).post(update_plugin_config),
+        )
         .route("/:id/enable", post(enable_plugin))
         .route("/:id/disable", post(disable_plugin))
         // WASM plugin endpoints
@@ -510,15 +516,24 @@ pub struct PluginConfigResponse {
     params(
         ("id" = Uuid, Path, description = "Plugin ID")
     ),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Plugin configuration", body = PluginConfigResponse),
+        (status = 403, description = "Admin privileges required"),
         (status = 404, description = "Plugin not found"),
     )
 )]
 pub async fn get_plugin_config(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PluginConfigResponse>> {
+    // Plugin config is a global, security-relevant surface (validator rules +
+    // external callback URLs) with no owner/repo scope to key on, so it is
+    // admin-only. Route placement in `admin_router()` already enforces this;
+    // this is defense-in-depth, matching the sibling lifecycle/policy handlers.
+    auth.require_admin()?;
+
     let plugin = sqlx::query!(
         r#"
         SELECT config, config_schema
@@ -558,15 +573,22 @@ pub struct UpdatePluginConfigRequest {
     request_body = UpdatePluginConfigRequest,
     responses(
         (status = 200, description = "Plugin configuration updated", body = PluginConfigResponse),
+        (status = 403, description = "Admin privileges required"),
         (status = 404, description = "Plugin not found"),
     )
 )]
 pub async fn update_plugin_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdatePluginConfigRequest>,
 ) -> Result<Json<PluginConfigResponse>> {
+    // Plugin config drives validator rules and external callback destinations
+    // (webhook_url/validator_url = SSRF surface); it is global with no owner/
+    // repo scope, so writes are admin-only. Route placement in `admin_router()`
+    // enforces this; this in-handler check is defense-in-depth.
+    auth.require_admin()?;
+
     let plugin = sqlx::query!(
         r#"
         UPDATE plugins
@@ -1689,5 +1711,93 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["name"], "plugin-a");
         assert_eq!(items[1]["name"], "plugin-b");
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin gate: plugin config read (get_plugin_config) and write
+    // (update_plugin_config) now call auth.require_admin()? before touching the
+    // DB. Plugin config is global (the `plugins` table has no owner/repo
+    // column) and drives validator rules + external webhook/validator callback
+    // URLs, so both verbs are admin-only. These tests exercise the exact guard
+    // expression those handlers run (mirrors the sync_policies gate tests, no
+    // DB needed).
+    // -----------------------------------------------------------------------
+
+    /// Build an [`AuthExtension`] with the given admin flag.
+    fn config_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: if is_admin { "admin" } else { "glen.globex" }.to_string(),
+            email: "plugin-config-test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    #[test]
+    fn plugin_config_read_requires_admin() {
+        // get_plugin_config runs `auth.require_admin()?` first.
+        let err = config_auth(false).require_admin().unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-config read must be rejected with an Authorization error, got: {err:?}"
+        );
+        assert!(
+            config_auth(true).require_admin().is_ok(),
+            "admin plugin-config read must pass the guard"
+        );
+    }
+
+    #[test]
+    fn plugin_config_write_requires_admin() {
+        // update_plugin_config runs `auth.require_admin()?` first.
+        let err = config_auth(false).require_admin().unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "non-admin plugin-config write must be rejected with an Authorization error, got: {err:?}"
+        );
+        assert!(
+            config_auth(true).require_admin().is_ok(),
+            "admin plugin-config write must pass the guard"
+        );
+    }
+
+    /// Source-scan routing gate: `/:id/config` must be registered inside
+    /// `admin_router()` (admin_middleware) and NOT inside the auth-only
+    /// `router()`. Pins the routing decision so a future refactor can't
+    /// silently move plugin config back under `auth_middleware` where any
+    /// authenticated user could read/overwrite global plugin config
+    /// (mirrors `plugin_install_and_lifecycle_require_admin` in routes.rs).
+    #[test]
+    fn plugin_config_route_is_admin_gated() {
+        let src = include_str!("plugins.rs");
+
+        let router_body = src
+            .split("pub fn router()")
+            .nth(1)
+            .expect("router() must exist")
+            .split("pub fn admin_router()")
+            .next()
+            .expect("router() body must precede admin_router()");
+        let admin_body = src
+            .split("pub fn admin_router()")
+            .nth(1)
+            .expect("admin_router() must exist")
+            .split("pub fn format_router()")
+            .next()
+            .expect("admin_router() body must precede format_router()");
+
+        assert!(
+            admin_body.contains("\"/:id/config\""),
+            "plugin config route must be registered inside admin_router()"
+        );
+        assert!(
+            !router_body.contains("\"/:id/config\""),
+            "plugin config route must NOT be in the auth-only router()"
+        );
     }
 }
