@@ -203,30 +203,61 @@ pub async fn list_paged(
 }
 
 /// Record one proxy-served download into the sibling `proxy_download_statistics`
-/// table (#2270 / #2260), resolving the catalog id for `(repository_id, path)`
-/// inside the INSERT. Records nothing when no catalog row exists for the path
-/// (e.g. a serve that never touched the cache). The caller applies the HEAD
-/// guard, mirroring `artifact_service::record_download`'s `is_head` short
-/// circuit so a metadata probe never inflates the count. Best-effort: a failure
-/// is logged by the caller, never surfaced to the client.
+/// table (#2270 / #2260), counted against the `proxy_cache_artifacts` catalog
+/// row for `(repository_id, path)`.
+///
+/// On a cache MISS the authoritative catalog row is written asynchronously by
+/// the streaming tee, and only once the client has fully consumed the body
+/// (`CachePersister::tee_stream`'s commit arm). It therefore does not yet exist
+/// when the serve is recorded, which previously made the FIRST download of each
+/// freshly-cached object record +0 while every subsequent hit counted (#2537).
+/// To make the first serve count, this ensures a catalog row for
+/// `(repository_id, path)` exists — inserting a transient placeholder (`size 0`,
+/// `checksum NULL`) the tee later refines IN PLACE with the true size/checksum
+/// via its own `ON CONFLICT (repository_id, path) DO UPDATE` upsert — and
+/// records the serve against that row's id, in one statement. `storage_key` /
+/// `metadata_key` are the derived proxy-cache keys for the placeholder; both are
+/// overwritten by the tee's authoritative upsert (and are only used when this
+/// call actually inserts the row). A cache HIT (row already present) leaves the
+/// authoritative body fields untouched and only bumps `last_accessed_at`, then
+/// records — so exactly one `proxy_download_statistics` row is written per
+/// serve, with no double count and the proxy sibling kept fully separate from
+/// the hot `download_statistics` table.
+///
+/// The caller applies the HEAD guard, mirroring
+/// `artifact_service::record_download`'s `is_head` short circuit so a metadata
+/// probe never inflates the count. Best-effort: a failure is logged by the
+/// caller, never surfaced to the client.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_proxy_download(
     db: &PgPool,
     repository_id: Uuid,
     path: &str,
+    storage_key: &str,
+    metadata_key: &str,
     user_id: Option<Uuid>,
     ip_address: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<u64> {
     let res = sqlx::query!(
         r#"
+        WITH ensured AS (
+            INSERT INTO proxy_cache_artifacts
+                (repository_id, path, storage_key, metadata_key, size_bytes,
+                 cached_at, last_accessed_at)
+            VALUES ($1, $2, $3, $4, 0, now(), now())
+            ON CONFLICT (repository_id, path) DO UPDATE SET
+                last_accessed_at = now()
+            RETURNING id
+        )
         INSERT INTO proxy_download_statistics
             (proxy_cache_id, user_id, ip_address, user_agent)
-        SELECT id, $3, $4, $5
-        FROM proxy_cache_artifacts
-        WHERE repository_id = $1 AND path = $2
+        SELECT id, $5, $6, $7 FROM ensured
         "#,
         repository_id,
         path,
+        storage_key,
+        metadata_key,
         user_id,
         ip_address,
         user_agent,
@@ -388,33 +419,65 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
+    /// #2537: the FIRST serve of a freshly-cached object must count even though
+    /// its authoritative catalog row is written asynchronously by the streaming
+    /// tee only after the client drains the body. The recorder ensures the row
+    /// (transient placeholder) so the first serve records +1, the tee later
+    /// refines that same row in place, and subsequent hits keep counting — with
+    /// exactly one `proxy_download_statistics` row per serve.
     #[tokio::test]
-    async fn test_record_proxy_download_counts_only_when_cataloged() {
+    async fn test_record_proxy_download_counts_first_serve_before_tee_commit() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let repo = insert_repo(&pool).await;
         let path = "simple/pkg/pkg-1.0.whl";
-        let key = format!("proxy-cache/{}/k/__content__", repo.simple());
+        let key = format!("proxy-cache/{}/{path}/__content__", repo.simple());
+        let meta = format!("proxy-cache/{}/{path}/__cache_meta__.json", repo.simple());
 
-        // No catalog row yet -> nothing recorded.
-        let n = record_proxy_download(&pool, repo, path, None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(n, 0, "no catalog row -> no proxy download recorded");
-        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 0);
+        // FIRST serve on a cache miss: no authoritative catalog row exists yet
+        // (the tee has not committed), but the serve must still count.
+        let n = record_proxy_download(
+            &pool,
+            repo,
+            path,
+            &key,
+            &meta,
+            None,
+            Some("1.2.3.4"),
+            Some("pip/24"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 1,
+            "first serve counts even before the tee commits the row"
+        );
+        assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 1);
 
-        upsert(&pool, repo, path, &key, "m", 10, Some("c"), None, None)
-            .await
-            .unwrap();
+        // A transient placeholder row now exists (size 0, awaiting refresh).
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "one catalog row ensured by the first serve");
+        assert_eq!(rows[0].size_bytes, 0, "placeholder awaits the tee refresh");
 
-        let n = record_proxy_download(&pool, repo, path, None, Some("1.2.3.4"), Some("pip/24"))
+        // The tee commit refines the SAME row in place with the true size /
+        // checksum (no duplicate row).
+        upsert(&pool, repo, path, &key, &meta, 4096, Some("c"), None, None)
             .await
             .unwrap();
-        assert_eq!(n, 1, "cataloged object -> one proxy download recorded");
-        record_proxy_download(&pool, repo, path, None, None, None)
+        let rows = list_paged(&pool, repo, None, 100).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "tee upsert refines in place, no duplicate row"
+        );
+        assert_eq!(rows[0].size_bytes, 4096, "tee filled the true size");
+
+        // SECOND serve (a warm cache hit) counts too: exactly one more row.
+        let n = record_proxy_download(&pool, repo, path, &key, &meta, None, None, None)
             .await
             .unwrap();
+        assert_eq!(n, 1, "warm hit records one more download");
         assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 2);
         cleanup_repo(&pool, repo).await;
     }

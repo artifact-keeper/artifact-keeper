@@ -3418,24 +3418,46 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// row for `(repo_id, path)`. This is the counting decision #2505 deferred until
 /// a stable id existed for proxy-cached objects — the catalog now supplies it.
 ///
+/// The recorder ensures the catalog row for `(repo_id, path)` so the FIRST serve
+/// of a freshly-cached object counts even before the async streaming tee commits
+/// the authoritative row (#2537); the derived proxy-cache `storage_key` /
+/// `metadata_key` seed the transient placeholder the tee later refines in place.
+/// `repo_key` is the owning repository's key, needed to derive those cache keys;
+/// a key too long to cache at all is skipped (it could never have a catalog row).
+///
 /// HEAD-guarded (a metadata probe serves no bytes, so it never counts, mirroring
 /// [`crate::services::artifact_service::record_download`]'s `is_head` short
 /// circuit) and best-effort: a failure is logged at `debug`, never surfaced to
-/// the client, and never records when no catalog row exists for the path.
+/// the client.
 pub(crate) async fn record_proxy_download(
     state: &crate::api::SharedState,
     repo_id: Uuid,
+    repo_key: &str,
     path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) {
     if ctx.is_head {
         return;
     }
+    // Derive the proxy-cache keys for the transient catalog placeholder the
+    // recorder ensures. These mirror the keys the streaming tee writes, so its
+    // later authoritative upsert refines the same `(repo, path)` row in place.
+    // A path whose key exceeds the object-store limit can never be cached, so
+    // there is nothing to count — skip.
+    let (storage_key, metadata_key) = match (
+        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(repo_key, path),
+    ) {
+        (Ok(s), Ok(m)) => (s, m),
+        _ => return,
+    };
     let ip = ctx.client_ip.map(|i| i.to_string());
     if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
         &state.db,
         repo_id,
         path,
+        &storage_key,
+        &metadata_key,
         ctx.user_id,
         ip.as_deref(),
         ctx.user_agent.as_deref(),
@@ -3482,7 +3504,7 @@ pub async fn try_remote_or_virtual_download(
         .await?;
         // #2270/#2260: count the proxy serve now that the catalog gives the
         // cached object a stable id. HEAD-guarded + best-effort inside.
-        record_proxy_download(state, repo.id, opts.upstream_path, ctx).await;
+        record_proxy_download(state, repo.id, &repo.key, opts.upstream_path, ctx).await;
         return Ok(Some(response));
     }
 
