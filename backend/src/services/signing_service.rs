@@ -88,9 +88,67 @@ pub(crate) fn derive_key_id(fingerprint: &str) -> String {
     fingerprint[fingerprint.len().saturating_sub(16)..].to_string()
 }
 
+/// Maximum length (in characters) of a signing-key name. Mirrors the
+/// `signing_keys.name` column, which is `VARCHAR(255)` (see migration
+/// `027_signing_keys.sql`). Postgres counts characters, not bytes, for
+/// `varchar(n)`, so this bound is enforced on `char` count below.
+pub(crate) const MAX_KEY_NAME_LEN: usize = 255;
+
+/// If `name` ends with a rotation suffix produced by [`build_rotated_key_name`]
+/// (`" (rotated)"` or `" (rotated N)"`), return the base name and the current
+/// rotation count (`" (rotated)"` counts as 1). Returns `None` when there is no
+/// recognizable rotation suffix.
+fn parse_rotation_suffix(name: &str) -> Option<(&str, u32)> {
+    // The first rotation uses the bare "(rotated)" suffix (count 1).
+    if let Some(base) = name.strip_suffix(" (rotated)") {
+        return Some((base, 1));
+    }
+    // Subsequent rotations use a numeric "(rotated N)" suffix with N >= 2.
+    let without_paren = name.strip_suffix(')')?;
+    let idx = without_paren.rfind(" (rotated ")?;
+    let num_str = &without_paren[idx + " (rotated ".len()..];
+    let n: u32 = num_str.parse().ok()?;
+    if n >= 2 {
+        Some((&without_paren[..idx], n))
+    } else {
+        None
+    }
+}
+
 /// Build a rotated key name from an existing key name.
+///
+/// Rotation uses a *bounded* counter suffix so the name can never grow without
+/// limit. The old scheme unconditionally appended `" (rotated)"` (+10 chars) on
+/// every rotation, so after ~25 rotations the successor name overflowed the
+/// `varchar(255)` column, the INSERT 500'd, and the key became permanently
+/// un-rotatable (#2543). The counter *replaces* the previous suffix instead of
+/// accumulating:
+///
+/// * `my-key`              -> `my-key (rotated)`
+/// * `my-key (rotated)`    -> `my-key (rotated 2)`
+/// * `my-key (rotated 2)`  -> `my-key (rotated 3)`
+///
+/// Each successor stays readable and distinct from its predecessor. If the base
+/// name is long enough that appending the suffix would exceed
+/// [`MAX_KEY_NAME_LEN`] characters, the base is truncated on a `char` boundary
+/// to make room, guaranteeing the result always fits the column.
 pub(crate) fn build_rotated_key_name(original_name: &str) -> String {
-    format!("{} (rotated)", original_name)
+    let next = match parse_rotation_suffix(original_name) {
+        Some((base, n)) => (base, n.saturating_add(1)),
+        None => (original_name, 1),
+    };
+    let (base, count) = next;
+    let suffix = if count <= 1 {
+        " (rotated)".to_string()
+    } else {
+        format!(" (rotated {})", count)
+    };
+    // Reserve room for the suffix and truncate the base on a char boundary so
+    // the final name never exceeds the varchar(255) column, even for a
+    // pathologically long base name.
+    let room = MAX_KEY_NAME_LEN.saturating_sub(suffix.chars().count());
+    let base: String = base.chars().take(room).collect();
+    format!("{}{}", base, suffix)
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,9 +1325,12 @@ mod tests {
 
     #[test]
     fn test_build_rotated_key_name_already_rotated() {
+        // The counter replaces the previous suffix instead of accumulating, so
+        // rotating an already-rotated name yields "(rotated 2)", not a second
+        // "(rotated)" appended on top (the old unbounded behavior — #2543).
         assert_eq!(
             build_rotated_key_name("my-key (rotated)"),
-            "my-key (rotated) (rotated)"
+            "my-key (rotated 2)"
         );
     }
 
@@ -1770,15 +1831,109 @@ mod tests {
     }
 
     #[test]
-    fn test_build_rotated_key_name_already_rotated_still_appends() {
-        // We always append, even on an already-rotated name. Pin this so
-        // a future "smart rename" refactor that changes the shape (e.g.,
-        // appending "(rotated 2)") shows up as an explicit test break
-        // and forces an explicit decision.
+    fn test_build_rotated_key_name_already_rotated_uses_counter() {
+        // Rotating an already-rotated name advances a bounded counter rather
+        // than appending another "(rotated)" suffix, so the name cannot grow
+        // without limit (#2543).
         assert_eq!(
             build_rotated_key_name("debian-stable (rotated)"),
-            "debian-stable (rotated) (rotated)"
+            "debian-stable (rotated 2)"
         );
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_counter_increments() {
+        // "(rotated N)" advances to "(rotated N+1)".
+        assert_eq!(
+            build_rotated_key_name("debian-stable (rotated 2)"),
+            "debian-stable (rotated 3)"
+        );
+        assert_eq!(
+            build_rotated_key_name("debian-stable (rotated 41)"),
+            "debian-stable (rotated 42)"
+        );
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_non_numeric_suffix_is_base() {
+        // A trailing "(rotated <non-number>)" is not a recognized rotation
+        // suffix, so it is treated as part of the base name and the first
+        // rotation suffix is appended.
+        assert_eq!(
+            build_rotated_key_name("my-key (rotated x)"),
+            "my-key (rotated x) (rotated)"
+        );
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_never_exceeds_column_limit() {
+        // A base name at the column limit must still yield a name that fits
+        // varchar(255) — the base is truncated to make room for the suffix.
+        let long = "k".repeat(MAX_KEY_NAME_LEN);
+        let rotated = build_rotated_key_name(&long);
+        assert!(
+            rotated.chars().count() <= MAX_KEY_NAME_LEN,
+            "rotated name of {} chars exceeds the {}-char column limit",
+            rotated.chars().count(),
+            MAX_KEY_NAME_LEN
+        );
+        assert!(rotated.ends_with(" (rotated)"));
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_truncates_on_char_boundary() {
+        // Multi-byte base names must be truncated on a char boundary (never
+        // panic by slicing mid-codepoint) and still fit the limit.
+        let long = "é".repeat(MAX_KEY_NAME_LEN);
+        let rotated = build_rotated_key_name(&long);
+        assert!(rotated.chars().count() <= MAX_KEY_NAME_LEN);
+        assert!(rotated.ends_with(" (rotated)"));
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_many_rotations_bounded_and_distinct() {
+        // The core #2543 regression guard: chaining 40 rotations must never
+        // overflow the varchar(255) column and must keep every successor name
+        // distinct from its predecessor (so the DB unique-ish naming stays
+        // sensible). Previously the name grew +10 chars each time and blew past
+        // 255 after ~25 rotations.
+        let mut name = "org-release-signing-key".to_string();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(name.clone());
+        for i in 1..=40 {
+            let next = build_rotated_key_name(&name);
+            assert!(
+                next.chars().count() <= MAX_KEY_NAME_LEN,
+                "rotation {i} produced a {}-char name (> {MAX_KEY_NAME_LEN})",
+                next.chars().count()
+            );
+            assert_ne!(next, name, "rotation {i} did not change the name");
+            assert!(
+                seen.insert(next.clone()),
+                "rotation {i} produced a duplicate name: {next}"
+            );
+            name = next;
+        }
+        // The final name is a bounded counter suffix, still readable. Rotation
+        // 1 produces the bare "(rotated)" (count 1); rotation N (N>=2) produces
+        // "(rotated N)", so after 40 rotations the counter reads 40.
+        assert_eq!(name, "org-release-signing-key (rotated 40)");
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_long_base_many_rotations_stays_bounded() {
+        // Same many-rotations guard but starting from a base already near the
+        // column limit: truncation must keep every successor within 255 chars.
+        let mut name = "n".repeat(MAX_KEY_NAME_LEN - 4);
+        for i in 1..=40 {
+            let next = build_rotated_key_name(&name);
+            assert!(
+                next.chars().count() <= MAX_KEY_NAME_LEN,
+                "rotation {i} produced a {}-char name (> {MAX_KEY_NAME_LEN})",
+                next.chars().count()
+            );
+            name = next;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2151,5 +2306,52 @@ mod tests {
             total_after_first, total_after_second,
             "a rejected rotation must not mint a key"
         );
+    }
+
+    // (#2543) Chaining 35 rotations of the same repo's key must ALL succeed:
+    // the successor name must never overflow the varchar(255) `name` column.
+    // Under the old unbounded "(rotated)"-append scheme the INSERT 500'd after
+    // ~25 rotations ("value too long for type character varying(255)") and the
+    // key became permanently un-rotatable. The bounded counter suffix keeps
+    // every successor name within the column, so the chain never wedges.
+    #[tokio::test]
+    async fn rotate_many_times_never_overflows_name_column() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let mut current = seed_active_key(&service, repo).await;
+
+        let mut names = std::collections::HashSet::new();
+        for i in 1..=35 {
+            let next = service
+                .rotate_key(current, None)
+                .await
+                .unwrap_or_else(|e| panic!("rotation {i} failed (name overflow?): {e:?}"));
+
+            // Successor name fits the column and is distinct from all prior.
+            assert!(
+                next.name.chars().count() <= MAX_KEY_NAME_LEN,
+                "rotation {i} produced a {}-char name (> {MAX_KEY_NAME_LEN}): {}",
+                next.name.chars().count(),
+                next.name
+            );
+            assert!(
+                names.insert(next.name.clone()),
+                "rotation {i} produced a duplicate name: {}",
+                next.name
+            );
+
+            // Exactly one active key remains after each rotation.
+            assert_eq!(
+                active_key_ids(&pool, repo).await.len(),
+                1,
+                "exactly one active key must remain after rotation {i}"
+            );
+
+            current = next.id;
+        }
     }
 }
