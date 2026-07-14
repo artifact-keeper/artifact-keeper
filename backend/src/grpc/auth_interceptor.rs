@@ -5,12 +5,65 @@
 //! interceptor enforces authorization by requiring the `is_admin` claim. All
 //! current gRPC services (SBOM, CVE History, Security Policy) are admin-only
 //! operations, matching the HTTP layer's `admin_middleware` behaviour.
+//!
+//! On top of the admin floor, the interceptor also stamps the authenticated
+//! principal's action-scope ceiling (`Claims.scopes`) into the request
+//! extensions as a [`GrpcPrincipal`]. Per-method authorization is then enforced
+//! by each service method calling [`authorize_grpc_scope`] as its first line,
+//! mirroring the REST layer's `AuthExtension::has_scope` / `require_scope`
+//! (`api/middleware/auth.rs`). A method-agnostic tonic `Request<()>` interceptor
+//! cannot see the gRPC method path, so the required scope must be selected
+//! per-method at the handler, not in the interceptor.
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use sqlx::PgPool;
 use tonic::{Request, Status};
 
 use crate::services::auth_service::Claims;
+
+/// Authenticated principal stamped into the gRPC request extensions by the
+/// interceptor. Carries the live `is_admin` role and the token's action-scope
+/// ceiling so per-method authorization ([`authorize_grpc_scope`]) can mirror the
+/// REST `AuthExtension` without re-decoding the JWT.
+#[derive(Clone, Debug)]
+pub struct GrpcPrincipal {
+    /// Live server-side admin role (re-derived from the DB when a pool is wired).
+    pub is_admin: bool,
+    /// Action-scope ceiling copied from `Claims.scopes`. `None` = interactive/full
+    /// token (no scope restriction); `Some(list)` = allowlist evaluated by
+    /// `token_service::scopes_grant_access` (exact match | `*` | `admin`).
+    pub scopes: Option<Vec<String>>,
+}
+
+/// Per-method scope authorizer for the gRPC plane. Mirrors REST's
+/// `AuthExtension::has_scope` / `require_scope`: `None` scopes (interactive/full
+/// token) pass everything; `Some(list)` delegates to the canonical
+/// `token_service::scopes_grant_access` (exact | `*` | `admin`) so the two planes
+/// share one wildcard policy and cannot drift.
+///
+/// A missing principal fails closed (`Unauthenticated`) — this only happens if a
+/// method runs without the interceptor having stamped the extension.
+#[allow(clippy::result_large_err)]
+pub fn authorize_grpc_scope<T>(req: &Request<T>, required: &str) -> Result<(), Status> {
+    let principal = req
+        .extensions()
+        .get::<GrpcPrincipal>()
+        .ok_or_else(|| Status::unauthenticated("missing authenticated principal"))?;
+
+    let allowed = match &principal.scopes {
+        None => true,
+        Some(scopes) => crate::services::token_service::scopes_grant_access(scopes, required),
+    };
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "Token does not have required scope: {}",
+            required
+        )))
+    }
+}
 
 /// gRPC auth interceptor that validates JWT Bearer tokens and enforces admin authorization.
 #[derive(Clone)]
@@ -128,6 +181,15 @@ impl AuthInterceptor {
         if self.require_admin && !token_data.claims.is_admin {
             return Err(Status::permission_denied("Admin access required"));
         }
+
+        // Stamp the authenticated principal (live is_admin + the token's
+        // action-scope ceiling) so each service method can enforce its required
+        // scope via `authorize_grpc_scope`, mirroring REST's `has_scope`.
+        let mut req = req;
+        req.extensions_mut().insert(GrpcPrincipal {
+            is_admin: token_data.claims.is_admin,
+            scopes: token_data.claims.scopes.clone(),
+        });
 
         Ok(req)
     }
@@ -375,6 +437,101 @@ mod tests {
             .bind(low_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // authorize_grpc_scope: per-method scope enforcement (mirror of REST
+    // AuthExtension::has_scope). Pure, no DB.
+    // -----------------------------------------------------------------------
+
+    fn request_with_principal(scopes: Option<Vec<String>>) -> Request<()> {
+        let mut req = Request::new(());
+        req.extensions_mut().insert(GrpcPrincipal {
+            is_admin: true,
+            scopes,
+        });
+        req
+    }
+
+    #[test]
+    fn test_authorize_scope_none_passes_everything() {
+        // Interactive / full token (scopes = None) mirrors REST: allowed on any scope.
+        let req = request_with_principal(None);
+        assert!(authorize_grpc_scope(&req, "read:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "write:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "delete:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "write:repositories").is_ok());
+    }
+
+    #[test]
+    fn test_authorize_scope_read_only_denied_on_writes() {
+        let req = request_with_principal(Some(vec!["read:artifacts".to_string()]));
+        assert!(authorize_grpc_scope(&req, "read:artifacts").is_ok());
+
+        for required in ["write:artifacts", "delete:artifacts", "write:repositories"] {
+            let err = authorize_grpc_scope(&req, required).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert!(err.message().contains(required));
+        }
+    }
+
+    #[test]
+    fn test_authorize_scope_wildcard_passes_everything() {
+        let req = request_with_principal(Some(vec!["*".to_string()]));
+        assert!(authorize_grpc_scope(&req, "read:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "delete:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "write:repositories").is_ok());
+    }
+
+    #[test]
+    fn test_authorize_scope_admin_wildcard_passes_everything() {
+        let req = request_with_principal(Some(vec!["admin".to_string()]));
+        assert!(authorize_grpc_scope(&req, "read:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "delete:artifacts").is_ok());
+        assert!(authorize_grpc_scope(&req, "write:repositories").is_ok());
+    }
+
+    #[test]
+    fn test_authorize_scope_missing_principal_fails_closed() {
+        let req = Request::new(());
+        let err = authorize_grpc_scope(&req, "read:artifacts").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn test_intercept_stamps_principal_scopes() {
+        // The interceptor must copy Claims.scopes into the stamped principal so
+        // per-method enforcement sees the token's ceiling.
+        let mut claims = test_claims(Uuid::new_v4(), true, "access", None);
+        claims.scopes = Some(vec!["read:artifacts".to_string()]);
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        let interceptor = AuthInterceptor::new("secret", None);
+        let req = interceptor
+            .intercept(request_with_token(&token))
+            .expect("admin token should pass");
+        let principal = req
+            .extensions()
+            .get::<GrpcPrincipal>()
+            .expect("principal stamped");
+        assert!(principal.is_admin);
+        assert_eq!(
+            principal.scopes,
+            Some(vec!["read:artifacts".to_string()]),
+            "the token's scope ceiling must be carried into the request"
+        );
+        // And it enforces: read passes, write denied.
+        assert!(authorize_grpc_scope(&req, "read:artifacts").is_ok());
+        assert_eq!(
+            authorize_grpc_scope(&req, "write:artifacts")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

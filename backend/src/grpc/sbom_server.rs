@@ -1,5 +1,6 @@
 //! gRPC server implementations for SBOM services.
 
+use crate::grpc::auth_interceptor::authorize_grpc_scope;
 use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{CveStatus, SbomFormat};
 use crate::services::sbom_service::{DependencyInfo, SbomService};
@@ -7,6 +8,47 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
+
+// === Per-method action-scope map ===
+//
+// Every gRPC service method below authorizes the caller's token action-scope
+// ceiling against the required scope in this map via `authorize_grpc_scope`,
+// exactly as the REST handlers do via `AuthExtension::require_scope`
+// (api/middleware/auth.rs). The interceptor already enforces authentication and
+// the admin floor; this adds the same per-scope ceiling REST enforces, so a
+// scoped token is constrained identically on both planes. A full/interactive
+// token (`scopes = None`) and admin-minted `*`/`admin` tokens pass everywhere.
+//
+// SBOM & CVE data are artifact-security metadata -> `*:artifacts`; license
+// policy is repository-level config -> `*:repositories`.
+//
+// | Service.Method                          | Required scope       |
+// |-----------------------------------------|----------------------|
+// | SbomService.generate_sbom               | write:artifacts      |
+// | SbomService.get_sbom                    | read:artifacts       |
+// | SbomService.get_sbom_by_artifact        | read:artifacts       |
+// | SbomService.list_sboms_for_artifact     | read:artifacts       |
+// | SbomService.get_sbom_components         | read:artifacts       |
+// | SbomService.convert_sbom                | read:artifacts       |
+// | SbomService.delete_sbom                 | delete:artifacts     |
+// | SbomService.regenerate_sbom             | write:artifacts      |
+// | SbomService.check_license_compliance    | read:artifacts       |
+// | CveHistoryService.get_cve_history       | read:artifacts       |
+// | CveHistoryService.update_cve_status     | write:artifacts      |
+// | CveHistoryService.get_cve_trends        | read:artifacts       |
+// | CveHistoryService.trigger_retroactive_scan | write:artifacts   |
+// | SecurityPolicyService.get_license_policy   | read:repositories |
+// | SecurityPolicyService.list_license_policies| read:repositories |
+// | SecurityPolicyService.upsert_license_policy| write:repositories|
+// | SecurityPolicyService.delete_license_policy| delete:repositories|
+mod scope {
+    pub const READ_ARTIFACTS: &str = "read:artifacts";
+    pub const WRITE_ARTIFACTS: &str = "write:artifacts";
+    pub const DELETE_ARTIFACTS: &str = "delete:artifacts";
+    pub const READ_REPOSITORIES: &str = "read:repositories";
+    pub const WRITE_REPOSITORIES: &str = "write:repositories";
+    pub const DELETE_REPOSITORIES: &str = "delete:repositories";
+}
 
 use super::generated::{
     cve_history_service_server::CveHistoryService as CveHistoryServiceTrait,
@@ -41,6 +83,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<GenerateSbomRequest>,
     ) -> Result<Response<SbomDocument>, Status> {
+        authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
         let req = request.into_inner();
 
         let artifact_id = parse_uuid(&req.artifact_id)?;
@@ -64,6 +107,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<GetSbomRequest>,
     ) -> Result<Response<SbomDocument>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
 
@@ -81,6 +125,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<GetSbomByArtifactRequest>,
     ) -> Result<Response<SbomDocument>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let artifact_id = parse_uuid(&req.artifact_id)?;
         let format = proto_to_sbom_format(req.format());
@@ -99,6 +144,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<ListSbomsRequest>,
     ) -> Result<Response<ListSbomsResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let artifact_id = parse_uuid(&req.artifact_id)?;
 
@@ -137,6 +183,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<GetSbomComponentsRequest>,
     ) -> Result<Response<GetSbomComponentsResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let sbom_id = parse_uuid(&req.sbom_id)?;
 
@@ -178,6 +225,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<ConvertSbomRequest>,
     ) -> Result<Response<SbomDocument>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let sbom_id = parse_uuid(&req.sbom_id)?;
         let target_format = proto_to_sbom_format(req.target_format());
@@ -195,6 +243,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<DeleteSbomRequest>,
     ) -> Result<Response<DeleteSbomResponse>, Status> {
+        authorize_grpc_scope(&request, scope::DELETE_ARTIFACTS)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
 
@@ -210,6 +259,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<RegenerateSbomRequest>,
     ) -> Result<Response<SbomDocument>, Status> {
+        authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
         let req = request.into_inner();
         let artifact_id = parse_uuid(&req.artifact_id)?;
         let format = proto_to_sbom_format(req.format());
@@ -241,6 +291,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<CheckLicenseComplianceRequest>,
     ) -> Result<Response<LicenseComplianceResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let repo_id = if req.repository_id.is_empty() {
             None
@@ -286,6 +337,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<GetCveHistoryRequest>,
     ) -> Result<Response<GetCveHistoryResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let artifact_id = parse_uuid(&req.artifact_id)?;
 
@@ -307,6 +359,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<UpdateCveStatusRequest>,
     ) -> Result<Response<CveHistoryEntry>, Status> {
+        authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
         let status = proto_to_cve_status(req.status());
@@ -327,6 +380,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<GetCveTrendsRequest>,
     ) -> Result<Response<CveTrendsResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_ARTIFACTS)?;
         let req = request.into_inner();
         let repo_id = if req.repository_id.is_empty() {
             None
@@ -372,6 +426,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<RetroactiveScanRequest>,
     ) -> Result<Response<RetroactiveScanResponse>, Status> {
+        authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
         let _req = request.into_inner();
 
         Err(Status::unimplemented("Retroactive scan queuing is not yet implemented. This feature is planned for a future release."))
@@ -395,6 +450,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<GetLicensePolicyRequest>,
     ) -> Result<Response<LicensePolicy>, Status> {
+        authorize_grpc_scope(&request, scope::READ_REPOSITORIES)?;
         let req = request.into_inner();
         let repo_id = if req.repository_id.is_empty() {
             None
@@ -416,6 +472,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<UpsertLicensePolicyRequest>,
     ) -> Result<Response<LicensePolicy>, Status> {
+        authorize_grpc_scope(&request, scope::WRITE_REPOSITORIES)?;
         let req = request.into_inner();
         let policy = req
             .policy
@@ -465,6 +522,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<DeleteLicensePolicyRequest>,
     ) -> Result<Response<DeleteLicensePolicyResponse>, Status> {
+        authorize_grpc_scope(&request, scope::DELETE_REPOSITORIES)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
 
@@ -481,6 +539,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<ListLicensePoliciesRequest>,
     ) -> Result<Response<ListLicensePoliciesResponse>, Status> {
+        authorize_grpc_scope(&request, scope::READ_REPOSITORIES)?;
         let req = request.into_inner();
 
         let policies: Vec<crate::models::sbom::LicensePolicy> = if req.repository_id.is_empty() {
@@ -648,6 +707,49 @@ fn model_policy_action_to_proto(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    // -----------------------------------------------------------------------
+    // Fail-open guard: every gRPC service-trait method in this file must call
+    // `authorize_grpc_scope` as part of its body. All `async fn`s in this file
+    // are service-trait implementations (the conversion helpers are sync), so a
+    // future method that forgets the scope check fails THIS test, not open.
+    // Mirrors the source-grep handler-dir gate pattern (#1316).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_every_grpc_method_enforces_scope() {
+        let src = include_str!("sbom_server.rs");
+        // Collect each `async fn <name>(` and the slice of source until the next
+        // `async fn ` (or EOF), then assert that slice contains the authorizer.
+        let marker = "async fn ";
+        let positions: Vec<usize> = src.match_indices(marker).map(|(i, _)| i).collect();
+        assert!(
+            positions.len() >= 17,
+            "expected >=17 gRPC service methods, found {} — did the parser break?",
+            positions.len()
+        );
+        for (idx, &start) in positions.iter().enumerate() {
+            let end = positions.get(idx + 1).copied().unwrap_or(src.len());
+            let body = &src[start..end];
+            // Method name for a clear failure message.
+            let name: String = body[marker.len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // Skip the reference to `async fn` that appears inside this very test
+            // string literal (the include_str! self-reference), if any.
+            if name.is_empty() {
+                continue;
+            }
+            assert!(
+                body.contains("authorize_grpc_scope("),
+                "gRPC method `{}` is missing an `authorize_grpc_scope(...)` call \
+                 (fail-open risk): add the per-method scope check per the map at \
+                 the top of sbom_server.rs",
+                name
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // parse_uuid
