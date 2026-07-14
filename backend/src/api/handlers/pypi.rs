@@ -1563,6 +1563,7 @@ async fn serve_file(
                         proxy_helpers::record_proxy_download(
                             state,
                             repo.id,
+                            repo_key,
                             &local_cache_path,
                             ctx,
                         )
@@ -1585,12 +1586,19 @@ async fn serve_file(
                     )
                     .await?;
 
-                    // #2270/#2260: count the proxy serve. The streaming tee
-                    // writes the catalog row on commit; recording resolves it by
-                    // (repo, cache_path) and no-ops if the row is not yet
-                    // present.
-                    proxy_helpers::record_proxy_download(state, repo.id, &local_cache_path, ctx)
-                        .await;
+                    // #2270/#2260 + #2537: count the proxy serve. The streaming
+                    // tee commits the authoritative catalog row only after the
+                    // client drains the body, so the recorder ensures the
+                    // (repo, cache_path) row exists to make this FIRST serve
+                    // count; the tee later refines that same row in place.
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo.id,
+                        repo_key,
+                        &local_cache_path,
+                        ctx,
+                    )
+                    .await;
                     return Ok(build_streaming_file_response(filename, result));
                 }
             }
