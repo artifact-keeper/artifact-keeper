@@ -1915,6 +1915,7 @@ fn is_quarantine_block_response(resp: &Response) -> bool {
 /// `path` must address an **immutable** artifact. The Pass-1 cache probe is
 /// upstream-free only for immutable content; mutable indexes/metadata must go
 /// through [`resolve_virtual_metadata`] / the metadata-merge helpers instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_virtual_download_streaming<F, Fut>(
     state: &AppState,
     proxy_service: Option<&ProxyService>,
@@ -1922,6 +1923,7 @@ pub async fn resolve_virtual_download_streaming<F, Fut>(
     path: &str,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
     local_fetch: F,
 ) -> Result<Response, Response>
 where
@@ -1949,7 +1951,13 @@ where
     // Borrow `local_fetch` so the per-member `probe` closure copies the
     // reference instead of moving the `Fn` into each `async move` future.
     let local_fetch = &local_fetch;
-    let outcome = resolve_members_two_phase::<Response, Response, _, _, _, _>(
+    // The winning hit carries the resolved LOCAL artifact id (`Some`) so a
+    // local-member serve can be recorded exactly once at winner-determination
+    // (#2260). Remote pass-through / proxy-cache hits carry `None` and stay
+    // unrecorded (#1278). Recording in the probe would over-count members that
+    // are probed but lose to a higher-priority upstream candidate in Pass 2, so
+    // the id is threaded to the outcome instead.
+    let outcome = resolve_members_two_phase::<(Response, Option<Uuid>), Response, _, _, _, _>(
         &members,
         |member| async move {
             match virtual_member_fetch_strategy(
@@ -1957,11 +1965,18 @@ where
                 proxy_service.is_some(),
                 member.upstream_url.is_some(),
             ) {
-                VirtualMemberFetchStrategy::Local => classify_streaming_local(
-                    local_fetch(member.id, member.storage_location()).await,
-                    default_content_type,
-                    content_disposition_filename,
-                ),
+                VirtualMemberFetchStrategy::Local => {
+                    let fetched = local_fetch(member.id, member.storage_location()).await;
+                    // Capture the local artifact id before `fetched` is consumed
+                    // into a Response by `classify_streaming_local`.
+                    let artifact_id = fetched.as_ref().ok().and_then(|r| r.artifact_id);
+                    let (class, hit) = classify_streaming_local(
+                        fetched,
+                        default_content_type,
+                        content_disposition_filename,
+                    );
+                    (class, hit.map(|resp| (resp, artifact_id)))
+                }
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
                     Some(proxy) => {
                         // #1555: a fresh proxy-cache hit on a redirect-capable
@@ -1970,13 +1985,15 @@ where
                         if let Some(redirect) =
                             try_member_cache_redirect(state, proxy, member, path).await
                         {
-                            (MemberCacheClass::DefiniteHit, Some(redirect))
+                            // Remote proxy-cache serve: not our artifact (#1278).
+                            (MemberCacheClass::DefiniteHit, Some((redirect, None)))
                         } else {
-                            classify_streaming_cache_probe(
+                            let (class, hit) = classify_streaming_cache_probe(
                                 proxy.streaming_cached_artifact_by_path(member, path).await,
                                 default_content_type,
                                 content_disposition_filename,
-                            )
+                            );
+                            (class, hit.map(|resp| (resp, None)))
                         }
                     }
                     None => (MemberCacheClass::DefiniteMiss, None),
@@ -1986,7 +2003,8 @@ where
         },
         |member| async move {
             match proxy_service {
-                Some(proxy) => classify_streaming_upstream(
+                // Remote upstream serve: not our artifact (#1278), so `None`.
+                Some(proxy) => match classify_streaming_upstream(
                     proxy_fetch_streaming_member(
                         proxy,
                         member,
@@ -1995,7 +2013,13 @@ where
                         content_disposition_filename,
                     )
                     .await,
-                ),
+                ) {
+                    MemberResolveOutcome::Hit(resp) => MemberResolveOutcome::Hit((resp, None)),
+                    MemberResolveOutcome::Quarantine(resp) => {
+                        MemberResolveOutcome::Quarantine(resp)
+                    }
+                    MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
+                },
                 None => MemberResolveOutcome::Miss,
             }
         },
@@ -2003,7 +2027,16 @@ where
     .await;
 
     match outcome {
-        Some(MemberResolveOutcome::Hit(response)) => Ok(response),
+        Some(MemberResolveOutcome::Hit((response, artifact_id))) => {
+            // Record the local-member winner exactly once (#2260). Inline-awaited
+            // so the row is committed before the response is returned; a Remote
+            // pass-through winner has `artifact_id == None` and stays unrecorded.
+            if let Some(artifact_id) = artifact_id {
+                crate::services::artifact_service::record_download(&state.db, artifact_id, ctx)
+                    .await;
+            }
+            Ok(response)
+        }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
         _ => Err((
             StatusCode::NOT_FOUND,
@@ -2510,6 +2543,9 @@ async fn read_local_stream(
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
+        // Local artifact row resolved: surface its id so the virtual-member
+        // streaming resolver can record the download exactly once (#2260).
+        artifact_id: Some(artifact.id),
     })
 }
 
@@ -2634,6 +2670,7 @@ pub async fn local_fetch_or_redirect_by_suffix(
     repo_id: Uuid,
     location: &StorageLocation,
     path_suffix: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let path: String = sqlx::query_scalar(
@@ -2650,7 +2687,7 @@ pub async fn local_fetch_or_redirect_by_suffix(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    local_fetch_or_redirect(db, state, repo_id, location, &path).await
+    local_fetch_or_redirect(db, state, repo_id, location, &path, ctx).await
 }
 
 /// Build the reversed-+-escaped LIKE prefix for a path-suffix query
@@ -2687,6 +2724,7 @@ pub async fn local_fetch_or_redirect(
     repo_id: Uuid,
     location: &StorageLocation,
     artifact_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let (artifact, storage) = local_lookup_artifact(
         db,
@@ -2696,6 +2734,24 @@ pub async fn local_fetch_or_redirect(
         LocalLookup::Path(artifact_path),
     )
     .await?;
+
+    // #2260: this is THE single central recording point for a local-artifact
+    // presigned redirect. A 302 is counted at redirect-issue time because the
+    // client's subsequent S3/CloudFront GET is invisible to us; the streaming
+    // fallback below serves the same local artifact, so it is counted here too.
+    // Recording once, before the response is built, means no local-serve path
+    // through this helper can silently under-report — and any handler that
+    // later adopts it (e.g. Maven presigned redirects, #1945) inherits the
+    // count and MUST NOT add its own second record call. Inline-awaited (never
+    // spawned) so the row is committed before the response is returned.
+    //
+    // A proxy-cache row (a Remote member's cached upstream object, keyed under
+    // `proxy-cache/`) is NOT our artifact, so it stays unrecorded (#1278;
+    // accounting for those is #2270/#2218, out of scope). This helper also
+    // serves those for redirect-capable virtual members, so gate on the key.
+    if !ProxyService::is_proxy_cache_key(&artifact.storage_key) {
+        crate::services::artifact_service::record_download(db, artifact.id, ctx).await;
+    }
 
     // Try presigned redirect before reading content into memory
     if state.config.presigned_downloads_enabled {
@@ -3309,6 +3365,7 @@ pub async fn virtual_non_remote_owns_maven_gav(
 pub async fn try_remote_or_virtual_download(
     state: &crate::api::SharedState,
     repo: &RepoInfo,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
     opts: DownloadResponseOpts<'_>,
 ) -> Result<Option<Response>, Response> {
     if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Remote {
@@ -3366,6 +3423,7 @@ pub async fn try_remote_or_virtual_download(
                     opts.upstream_path,
                     opts.default_content_type,
                     opts.content_disposition_filename,
+                    ctx,
                     move |member_id, location| {
                         let db = db.clone();
                         let state = state_arc.clone();
@@ -3388,6 +3446,7 @@ pub async fn try_remote_or_virtual_download(
                     opts.upstream_path,
                     opts.default_content_type,
                     opts.content_disposition_filename,
+                    ctx,
                     move |member_id, location| {
                         let db = db.clone();
                         let state = state_arc.clone();
@@ -4772,6 +4831,7 @@ mod tests {
             body: Box::pin(futures::stream::empty()),
             content_type: None,
             content_length: Some(0),
+            artifact_id: None,
         }
     }
 
@@ -7487,6 +7547,7 @@ mod tests {
             client_ip: Some("203.0.113.77".parse().unwrap()),
             user_id: Some(user_id),
             user_agent: Some("serve-local-test/1.0".to_string()),
+            is_head: false,
         };
         let resp = serve_local_artifact(
             &state,
@@ -7746,9 +7807,19 @@ mod tests {
             content_disposition_filename: None,
             suppress_upstream_proxy: false,
         };
-        let result = try_remote_or_virtual_download(&state, &repo, opts)
-            .await
-            .expect("ok");
+        let result = try_remote_or_virtual_download(
+            &state,
+            &repo,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            },
+            opts,
+        )
+        .await
+        .expect("ok");
         assert!(result.is_none(), "hosted repo must propagate to caller");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -7785,9 +7856,19 @@ mod tests {
             content_disposition_filename: None,
             suppress_upstream_proxy: false,
         };
-        let result = try_remote_or_virtual_download(&state, &repo, opts)
-            .await
-            .expect("ok");
+        let result = try_remote_or_virtual_download(
+            &state,
+            &repo,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            },
+            opts,
+        )
+        .await
+        .expect("ok");
         assert!(result.is_none(), "no proxy service → Ok(None)");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -7823,9 +7904,19 @@ mod tests {
             content_disposition_filename: None,
             suppress_upstream_proxy: false,
         };
-        let result = try_remote_or_virtual_download(&state, &repo, opts)
-            .await
-            .expect("ok");
+        let result = try_remote_or_virtual_download(
+            &state,
+            &repo,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            },
+            opts,
+        )
+        .await
+        .expect("ok");
         assert!(result.is_none(), "no upstream URL: Ok(None)");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
@@ -8005,6 +8096,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/java-archive".to_string()),
             content_length: None,
+            artifact_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -8024,6 +8116,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            artifact_id: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -8045,6 +8138,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
+            artifact_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -8067,6 +8161,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: None,
+            artifact_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -8083,6 +8178,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            artifact_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -8098,6 +8194,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            artifact_id: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -8118,6 +8215,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/zip".to_string()),
             content_length: Some(1234),
+            artifact_id: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -8145,6 +8243,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            artifact_id: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
@@ -8627,6 +8726,12 @@ mod tests {
             "pkg/pkg-1.0.0-py3-none-any.whl",
             "application/octet-stream",
             None,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            },
             // Remote member must redirect before reaching any local fetch.
             |_id, _loc| async {
                 panic!("local_fetch must NOT run: the redirect fast path should win");
@@ -8886,6 +8991,12 @@ mod tests {
             "pkg/pkg-1.0.0-py3-none-any.whl",
             "application/octet-stream",
             None,
+            &crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            },
             |_id, _loc| async {
                 panic!("local_fetch must NOT run: the held entry must 409 before any fallback");
                 #[allow(unreachable_code)]
@@ -8970,9 +9081,26 @@ mod tests {
         .expect("seed proxy-cache artifact row");
 
         let location = repo_info.storage_location();
-        let result =
-            super::local_fetch_or_redirect(&fx.pool, &state, fx.repo_id, &location, artifact_path)
-                .await;
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        let result = super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &ctx,
+        )
+        .await;
+
+        // #2260/#1278: a proxy-cache-keyed row is a Remote member's cached
+        // upstream object, NOT our artifact, so serving it here must record
+        // ZERO download-statistics rows.
+        let recorded = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
 
         // Clean up before asserting so a panic still leaves the DB clean.
         fx.teardown().await;
@@ -8986,6 +9114,298 @@ mod tests {
         assert!(
             resp.headers().get("location").is_none(),
             "filesystem backend must NOT emit a redirect Location header (#1555)"
+        );
+        assert_eq!(
+            recorded, 0,
+            "a proxy-cache serve must NOT be counted (#1278; out of scope for #2260)"
+        );
+    }
+
+    /// Count `download_statistics` rows attributed to any artifact in `repo_id`.
+    /// Shared by the #2260 count-once tests so the assertion query is defined
+    /// once (jscpd).
+    async fn download_stats_count_for_repo(pool: &PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM download_statistics ds \
+             JOIN artifacts a ON a.id = ds.artifact_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count download_statistics rows")
+    }
+
+    /// #2260: a HOSTED (non-proxy-cache) local artifact served through
+    /// `local_fetch_or_redirect` on a filesystem backend (streaming fallback,
+    /// no presign) records exactly ONE download-statistics row — and a second
+    /// serve records a second, so the append-only `COUNT(*)` metric tracks real
+    /// downloads one-for-one.
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_hosted_records_once_2260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state(fx.pool.clone(), &storage_path);
+        let repo_info =
+            tdh::make_repo_info(fx.repo_id, &fx.repo_key, &fx.storage_dir, "local", None);
+
+        let body: &[u8] = b"hosted-bytes";
+        let artifact_path = "pkg/pkg-1.0.0.bin";
+        // A hosted artifact is content-addressed (NOT a proxy-cache/ key).
+        let storage_key = format!("{}/{}", fx.repo_key, artifact_path);
+        super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
+            .await
+            .expect("seed hosted payload on disk");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(fx.repo_id)
+        .bind(artifact_path)
+        .bind("pkg")
+        .bind("1.0.0")
+        .bind(body.len() as i64)
+        .bind("test-pkg")
+        .bind("application/octet-stream")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed hosted artifact row");
+
+        let location = repo_info.storage_location();
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &ctx,
+        )
+        .await
+        .expect("first hosted fetch must succeed");
+        let after_one = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &ctx,
+        )
+        .await
+        .expect("second hosted fetch must succeed");
+        let after_two = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(after_one, 1, "one hosted serve must record exactly one row");
+        assert_eq!(
+            after_two, 2,
+            "a second serve records a second row (append-only COUNT tracks downloads 1:1)"
+        );
+    }
+
+    /// #2260 §5: a HEAD request served through the shared local-serve choke
+    /// point records ZERO download-statistics rows, while a GET on the same
+    /// artifact records exactly one. axum's `get()` auto-dispatches HEAD to the
+    /// GET handler for the format routes (pypi/npm/rubygems/rpm/cran/hex/puppet/
+    /// ansible/huggingface/maven), so the `DownloadContext.is_head` flag — set
+    /// from the request method — must suppress the recorder even though the
+    /// helper runs. Guards against the HEAD over-count QA caught on the format
+    /// download routes.
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_head_does_not_count_2260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state(fx.pool.clone(), &storage_path);
+        let repo_info =
+            tdh::make_repo_info(fx.repo_id, &fx.repo_key, &fx.storage_dir, "local", None);
+
+        let body: &[u8] = b"head-guard-bytes";
+        let artifact_path = "pkg/pkg-3.0.0.bin";
+        let storage_key = format!("{}/{}", fx.repo_key, artifact_path);
+        super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
+            .await
+            .expect("seed hosted payload on disk");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(fx.repo_id)
+        .bind(artifact_path)
+        .bind("pkg")
+        .bind("3.0.0")
+        .bind(body.len() as i64)
+        .bind("test-pkg3")
+        .bind("application/octet-stream")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed hosted artifact row");
+
+        let location = repo_info.storage_location();
+        // A HEAD-flagged context (as the extractor builds it for a HEAD request).
+        let head_ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: true,
+        };
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &head_ctx,
+        )
+        .await
+        .expect("HEAD serve must still succeed");
+        let after_head = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        // A GET (is_head == false) on the same artifact must record one row.
+        let get_ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        super::local_fetch_or_redirect(
+            &fx.pool,
+            &state,
+            fx.repo_id,
+            &location,
+            artifact_path,
+            &get_ctx,
+        )
+        .await
+        .expect("GET serve must succeed");
+        let after_get = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            after_head, 0,
+            "a HEAD must NOT record a download row (#2260 §5)"
+        );
+        assert_eq!(
+            after_get, 1,
+            "a GET on the same artifact records exactly one"
+        );
+    }
+
+    /// #2260 (G5): a virtual repo whose winning member is a LOCAL artifact,
+    /// resolved through `resolve_virtual_download_streaming`, records exactly
+    /// ONE download-statistics row attributed to that member's artifact — the
+    /// gap that left ansible/cran/hex/rubygems/huggingface/rpm/puppet/npm
+    /// virtual-member downloads uncounted.
+    #[tokio::test]
+    async fn test_resolve_virtual_download_streaming_records_local_member_once_2260() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vkey, _vdir) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (member_id, member_key, mdir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        db_helpers::link_member(&pool, virtual_id, member_id, 0).await;
+
+        let storage_path = mdir.to_str().unwrap().to_string();
+        let state = db_helpers::build_state(pool.clone(), &storage_path);
+        let member_info = crate::api::handlers::test_db_helpers::make_repo_info(
+            member_id,
+            &member_key,
+            &mdir,
+            "local",
+            None,
+        );
+
+        let body: &[u8] = b"virtual-local-member-bytes";
+        let path = "pkg/pkg-2.0.0.bin";
+        let storage_key = format!("{}/{}", member_key, path);
+        put_artifact_bytes(&state, &member_info, &storage_key, Bytes::from_static(body))
+            .await
+            .expect("seed member payload on disk");
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(member_id)
+        .bind(path)
+        .bind("pkg")
+        .bind("2.0.0")
+        .bind(body.len() as i64)
+        .bind("test-vpkg")
+        .bind("application/octet-stream")
+        .bind(&storage_key)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed member artifact row");
+
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: false,
+        };
+        let db = pool.clone();
+        let state_arc = state.clone();
+        let p = path.to_string();
+        // proxy_service = None so only the Local member can win.
+        let result = resolve_virtual_download_streaming(
+            &state,
+            None,
+            virtual_id,
+            path,
+            "application/octet-stream",
+            None,
+            &ctx,
+            move |mid, loc| {
+                let db = db.clone();
+                let st = state_arc.clone();
+                let p = p.clone();
+                async move { local_fetch_by_path(&db, &st, mid, &loc, &p).await }
+            },
+        )
+        .await;
+
+        let recorded = download_stats_count_for_repo(&pool, member_id).await;
+
+        db_helpers::cleanup(&pool, member_id, user_id).await;
+        db_helpers::cleanup(&pool, virtual_id, user_id).await;
+
+        assert!(
+            result.is_ok(),
+            "local virtual member must resolve and serve the artifact"
+        );
+        assert_eq!(
+            recorded, 1,
+            "a virtual-member local resolve must record exactly one download"
         );
     }
 

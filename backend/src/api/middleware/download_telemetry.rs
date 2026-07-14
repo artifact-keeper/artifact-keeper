@@ -41,6 +41,13 @@ pub struct DownloadContext {
     pub user_id: Option<Uuid>,
     /// The request's `User-Agent` header, when present and valid UTF-8.
     pub user_agent: Option<String>,
+    /// True when the request method is `HEAD`. axum's `get(handler)` auto-
+    /// dispatches `HEAD` to the same GET handler, which then runs its full
+    /// serve path (including the shared recorders) even though no body is
+    /// returned. Recording keys off this flag so a `HEAD` — a metadata probe
+    /// that serves no bytes — never writes a `download_statistics` row
+    /// (#2260 §5). Synthesized (non-request) contexts leave this `false`.
+    pub is_head: bool,
 }
 
 impl DownloadContext {
@@ -59,6 +66,9 @@ impl DownloadContext {
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            // Method-agnostic constructor: callers that care about HEAD set the
+            // flag from the request method (see the `FromRequestParts` impl).
+            is_head: false,
         }
     }
 }
@@ -83,12 +93,16 @@ impl FromRequestParts<SharedState> for DownloadContext {
             .get::<Option<AuthExtension>>()
             .and_then(|opt| opt.as_ref())
             .or_else(|| parts.extensions.get::<AuthExtension>());
-        Ok(Self::from_parts_inner(
+        let mut ctx = Self::from_parts_inner(
             &parts.headers,
             peer,
             auth,
             &state.config.rate_limit_trusted_proxy_cidrs,
-        ))
+        );
+        // A HEAD served through an axum `get()` route runs the GET handler and
+        // its recorders; flag it so `record_download` skips the write (#2260).
+        ctx.is_head = parts.method == axum::http::Method::HEAD;
+        Ok(ctx)
     }
 }
 

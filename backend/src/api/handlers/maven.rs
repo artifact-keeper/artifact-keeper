@@ -261,6 +261,7 @@ async fn resolve_snapshot_artifact(
 
     use sqlx::Row;
     Some(ResolvedSnapshot {
+        id: row.get("id"),
         storage_key: row.get("storage_key"),
         checksum_sha256: row.get("checksum_sha256"),
         path: row.get("path"),
@@ -268,6 +269,7 @@ async fn resolve_snapshot_artifact(
 }
 
 struct ResolvedSnapshot {
+    id: uuid::Uuid,
     storage_key: String,
     checksum_sha256: String,
     path: String,
@@ -386,6 +388,9 @@ async fn maven_local_fetch_snapshot(
         body: stream,
         content_type: Some(ct),
         content_length: None,
+        // Local snapshot artifact resolved: surface its id so a virtual
+        // maven-snapshot member download is recorded exactly once (#2260).
+        artifact_id: Some(resolved.id),
     })
 }
 

@@ -5142,6 +5142,13 @@ fn download_filename(path: &str) -> &str {
 ///
 /// Stats recording must never block or fail the download itself, so errors
 /// are logged at `warn` and swallowed rather than propagated.
+/// Test-only shim preserving the historical `record_redirect_download`
+/// entrypoint. Redirect and streaming downloads now share the single canonical
+/// recorder (`artifact_service::record_download`) so there is exactly one
+/// `download_statistics` INSERT in the codebase (#2260); this delegates to it
+/// and keeps the existing redirect-recording behavior tests exercising that one
+/// path (writes a row; swallows a DB error without failing the download).
+#[cfg(test)]
 async fn record_redirect_download(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
@@ -5149,25 +5156,13 @@ async fn record_redirect_download(
     ip_address: Option<&str>,
     user_agent: Option<&str>,
 ) {
-    if let Err(e) = sqlx::query(
-        r#"
-        INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
-        VALUES ($1, $2, $3, $4)
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(user_id)
-    .bind(ip_address)
-    .bind(user_agent)
-    .execute(db)
-    .await
-    {
-        tracing::warn!(
-            %artifact_id,
-            error = %e,
-            "failed to record download statistics for redirect download"
-        );
-    }
+    let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+        client_ip: ip_address.and_then(|s| s.parse().ok()),
+        user_id,
+        user_agent: user_agent.map(str::to_string),
+        is_head: false,
+    };
+    crate::services::artifact_service::record_download(db, artifact_id, &ctx).await;
 }
 
 /// Outcome of parsing an HTTP `Range` request header against a known total
@@ -5563,18 +5558,20 @@ pub async fn download_artifact(
                 .await?
             {
                 // Record download analytics (best-effort; must not block the
-                // redirect). This previously inserted into an events table
-                // that does not exist in the schema — and discarded the
-                // error — so every presigned/redirect download was silently
-                // missing from download statistics (#2260, bug 1).
-                record_redirect_download(
-                    &state.db,
-                    artifact.id,
-                    auth.as_ref().map(|a| a.user_id),
-                    client_ip_str.as_deref(),
-                    user_agent.as_deref(),
-                )
-                .await;
+                // redirect). A presigned 302 is counted at redirect-issue time
+                // because the client's subsequent S3/CloudFront GET is invisible
+                // to us. Recording goes through the single canonical recorder
+                // (`artifact_service::record_download`) so redirect and streaming
+                // downloads share one behavior and one INSERT (#2260). A HEAD
+                // request issues no real download, so it is not counted (§5).
+                if !is_head {
+                    crate::services::artifact_service::record_download(
+                        &state.db,
+                        artifact.id,
+                        &dl_ctx,
+                    )
+                    .await;
+                }
 
                 tracing::info!(
                     repo = %key,
@@ -5597,6 +5594,8 @@ pub async fn download_artifact(
             auth.map(|a| a.user_id),
             client_ip_str.clone(),
             user_agent.as_deref(),
+            // #2260 §5: a HEAD serves no body, so it must not count.
+            !is_head,
         )
         .await;
 
@@ -5717,7 +5716,7 @@ pub async fn download_artifact(
             // no local `artifacts` row and stays unrecorded (#1278). No
             // double-count: the direct-row path records in `download_stream`
             // and cannot reach this arm.
-            if owns_locally {
+            if owns_locally && !is_head {
                 if let Some(artifact_id) =
                     proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
                 {

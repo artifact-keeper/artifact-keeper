@@ -1364,6 +1364,7 @@ impl ArtifactService {
             client_ip: ip_address.and_then(|s| s.parse().ok()),
             user_id,
             user_agent: user_agent.map(str::to_string),
+            is_head: false,
         };
         record_download(&self.db, artifact_id, &ctx).await;
 
@@ -1457,6 +1458,7 @@ impl ArtifactService {
         user_id: Option<Uuid>,
         ip_address: Option<String>,
         user_agent: Option<&str>,
+        count_download: bool,
     ) -> Result<(Artifact, BoxStream<'static, Result<Bytes>>)> {
         let (artifact, artifact_info) = self.prepare_download(repository_id, path).await?;
 
@@ -1465,14 +1467,20 @@ impl ArtifactService {
         // matching the buffered `get` path's NotFound contract.
         let body = self.storage.get_stream(&artifact.storage_key).await?;
 
-        self.finish_download(
-            artifact.id,
-            &artifact_info,
-            user_id,
-            ip_address.as_deref(),
-            user_agent,
-        )
-        .await;
+        // `count_download` is false for a HEAD request: it returns identical
+        // headers but serves no body, so it must not write a download-statistics
+        // row (or fire the AfterDownload epilogue) — that would over-count the
+        // metric (#2260 §5). A real GET counts exactly once here.
+        if count_download {
+            self.finish_download(
+                artifact.id,
+                &artifact_info,
+                user_id,
+                ip_address.as_deref(),
+                user_agent,
+            )
+            .await;
+        }
 
         Ok((artifact, body))
     }
@@ -1931,6 +1939,16 @@ impl ArtifactService {
 /// Call this only after a **local** artifact row has been resolved; remote
 /// pass-through proxy fetches are not our artifacts and stay unrecorded.
 pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+    // A HEAD request serves no body — it must never write a download row
+    // (#2260 §5). This is the single choke point every serving path funnels
+    // through (hosted stream, presigned redirect, virtual-member local resolve,
+    // per-format serve_local_artifact / direct recorders), so guarding here
+    // makes "one row == one real body served" hold for the axum `get()`-
+    // registered format routes that auto-dispatch HEAD to their GET handler,
+    // mirroring the explicit guards on the generic / OCI / incus paths.
+    if ctx.is_head {
+        return;
+    }
     if let Err(e) = sqlx::query(
         "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
          VALUES ($1, $2, $3, $4)",

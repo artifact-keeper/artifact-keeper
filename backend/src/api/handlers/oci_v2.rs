@@ -6681,12 +6681,50 @@ async fn handle_head_manifest(
     )
 }
 
+/// Record one download-statistics row for a local Docker/OCI manifest pull
+/// (#2260). The manifest's `artifacts` row is resolved by its content-addressed
+/// storage key, so a manifest addressable under both a tag-keyed and a
+/// digest-keyed path still counts once per GET. Best-effort: a lookup miss or a
+/// stats failure never affects the pull.
+async fn record_oci_manifest_download(
+    state: &SharedState,
+    repo_id: Uuid,
+    manifest_digest: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    let manifest_key = manifest_storage_key(manifest_digest);
+    match sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM artifacts \
+         WHERE repository_id = $1 AND storage_key = $2 AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&manifest_key)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(artifact_id)) => {
+            crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                %repo_id,
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "failed to resolve manifest artifact for download statistics"
+            );
+        }
+    }
+}
+
 async fn handle_get_manifest(
     state: &SharedState,
     headers: &HeaderMap,
     base_url: &str,
     image_name: &str,
     reference: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Response {
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
@@ -6779,6 +6817,15 @@ async fn handle_get_manifest(
         .await
         {
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: served from local storage (tag row or content-addressable digest)");
+            // #2260: count a Docker/OCI pull exactly ONCE, here on the local
+            // manifest GET — NOT per blob. A `docker pull` fetches one manifest
+            // plus N (often shared/deduplicated) blobs; counting blob GETs would
+            // wildly over-report. Recording against the manifest's `artifacts`
+            // row (resolved by its content-addressed storage key) attributes one
+            // download per pull. Best-effort + inline-awaited; a HEAD manifest
+            // is a separate handler and is never counted. Remote/virtual
+            // pass-through manifests resolve no local row and stay unrecorded.
+            record_oci_manifest_download(state, repo.id, &manifest_digest, ctx).await;
             return build_local_manifest_response(&manifest_digest, &content_type, data, true);
         }
         if let Some(manifest_digest) = tag_row_digest {
@@ -8176,12 +8223,14 @@ async fn handle_delete_manifest(
 // Catch-all handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn catch_all(
     State(state): State<SharedState>,
     method: Method,
     uri: axum::http::Uri,
     headers: HeaderMap,
     base_url: RequestBaseUrl,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
     query: Query<std::collections::HashMap<String, String>>,
     body: Body,
 ) -> Response {
@@ -8260,7 +8309,7 @@ async fn catch_all(
         }
         ("GET", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_get_manifest(&state, &headers, base_url, &image_name, &r).await
+            handle_get_manifest(&state, &headers, base_url, &image_name, &r, &ctx).await
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");

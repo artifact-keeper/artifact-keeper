@@ -1934,11 +1934,13 @@ mod tests {
             client_ip: Some("203.0.113.10".parse().unwrap()),
             user_id: Some(user_id),
             user_agent: Some("admin-dl-test/1.0".to_string()),
+            is_head: false,
         };
         let ctx_anon = crate::api::middleware::download_telemetry::DownloadContext {
             client_ip: Some("203.0.113.11".parse().unwrap()),
             user_id: None,
             user_agent: None,
+            is_head: false,
         };
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
