@@ -1130,6 +1130,11 @@ jobs:
     needs: [merge-backend, merge-openscap, merge-scanner-adapter]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      # Needed to read docker/scanner-adapter/VERSION — the adapter is
+      # independently versioned, so its published tag is NOT the AK release tag.
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - name: Probe ghcr.io manifests for expected semver tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1162,11 +1167,25 @@ jobs:
           # currently suspended (its build/merge jobs are gated `if: false`),
           # so it is intentionally absent here — re-add the
           # `${BACKEND_IMAGE}:${VERSION}-alpine` entry when those jobs return.
+          #
+          # backend/openscap publish the AK release semver (git tag). The
+          # scanner-adapter is INDEPENDENTLY versioned (source of truth:
+          # docker/scanner-adapter/VERSION) and never publishes a tag at the AK
+          # release version, so it must be verified at its OWN version — see
+          # merge-scanner-adapter.
           EXPECTED=(
             "${BACKEND_IMAGE}:${VERSION}"
             "${OPENSCAP_IMAGE}:${VERSION}"
-            "${SCANNER_ADAPTER_IMAGE}:${VERSION}"
           )
+
+          # merge-scanner-adapter only publishes the adapter's semver tag on
+          # clean (non-prerelease) v-tags. Mirror that gate so prerelease cuts
+          # don't flag a tag the publish step intentionally skipped.
+          SCANNER_VERSION="$(cat docker/scanner-adapter/VERSION)"
+          case "${GITHUB_REF}" in
+            *-*) echo "Prerelease tag ${GITHUB_REF}; skipping scanner-adapter semver check (not published)." ;;
+            *)   EXPECTED+=("${SCANNER_ADAPTER_IMAGE}:${SCANNER_VERSION}") ;;
+          esac
 
           missing=()
           for entry in "${EXPECTED[@]}"; do
