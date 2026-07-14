@@ -169,6 +169,7 @@ fn cfg(storage_path: &str) -> Config {
         storage_backend: "filesystem".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,
+        backup_s3_bucket: None,
         gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,

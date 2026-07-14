@@ -765,7 +765,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         return Ok(());
     }
 
-    let storage = match StorageService::from_config(config).await {
+    let storage = match StorageService::from_config_for_backups(config).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::error!(
