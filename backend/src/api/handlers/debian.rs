@@ -4249,3 +4249,180 @@ mod apt_release_helpers_tests {
         assert_eq!(text, "");
     }
 }
+
+// --------------------------------------------------------------------------
+// DB-backed tests: fetch_apt_release_metadata defaults + injection defense
+// (generation-layer, defense-in-depth for #2489)
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod apt_release_metadata_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+
+    /// Insert a hosted (local) Debian repo and return its id + storage dir.
+    async fn insert_hosted_debian(pool: &sqlx::PgPool) -> (Uuid, std::path::PathBuf) {
+        let id = Uuid::new_v4();
+        let key = format!("apt-meta-{}", id.simple());
+        let dir = std::env::temp_dir().join(format!("apt-meta-{id}"));
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local'::repository_type, 'debian'::repository_format)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert hosted debian repo");
+        (id, dir)
+    }
+
+    async fn set_cfg(pool: &sqlx::PgPool, repo_id: Uuid, key: &str, value: &str) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(repo_id)
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("insert repository_config");
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, repo_id: Uuid, dir: &std::path::Path) {
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A repo with no apt_* config must fall back to the "artifact-keeper"
+    /// defaults for Origin/Label and omit Version/Description — i.e. the exact
+    /// pre-#2489 behavior, so existing hosted Debian repos never regress.
+    #[tokio::test]
+    async fn test_fetch_apt_release_metadata_defaults() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        let (origin, label, version, description) =
+            fetch_apt_release_metadata(&pool, repo_id).await;
+        assert_eq!(
+            origin, "artifact-keeper",
+            "default Origin must be preserved"
+        );
+        assert_eq!(label, "artifact-keeper", "default Label must be preserved");
+        assert_eq!(version, None, "Version omitted when unset");
+        assert_eq!(description, None, "Description omitted when unset");
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// Configured values are read back verbatim.
+    #[tokio::test]
+    async fn test_fetch_apt_release_metadata_custom_values() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        set_cfg(&pool, repo_id, "apt_origin", "Acme Corp").await;
+        set_cfg(&pool, repo_id, "apt_label", "Acme Staging").await;
+        set_cfg(&pool, repo_id, "apt_release_version", "2026.07").await;
+        set_cfg(&pool, repo_id, "apt_description", "Internal mirror").await;
+
+        let (origin, label, version, description) =
+            fetch_apt_release_metadata(&pool, repo_id).await;
+        assert_eq!(origin, "Acme Corp");
+        assert_eq!(label, "Acme Staging");
+        assert_eq!(version.as_deref(), Some("2026.07"));
+        assert_eq!(description.as_deref(), Some("Internal mirror"));
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// Defense-in-depth: even if a multi-line value bypasses the API layer and
+    /// lands in `repository_config` directly (e.g. via a migration, an admin
+    /// SQL edit, or a future code path), the generation layer must NOT emit the
+    /// injected trailing content as forged Release fields. `apt_origin`,
+    /// `apt_label`, and `apt_release_version` are reduced to their first line;
+    /// this is what prevents `Origin:`/`Label:`/`Version:` newline injection
+    /// from appending arbitrary lines to the signed Release file.
+    #[tokio::test]
+    async fn test_fetch_apt_release_metadata_strips_injected_newlines() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        // Directly plant forged values that the API would have rejected.
+        set_cfg(&pool, repo_id, "apt_origin", "evil\nForged-Field: pwned").await;
+        set_cfg(&pool, repo_id, "apt_label", "l1\r\nSigned-By: attacker").await;
+        set_cfg(
+            &pool,
+            repo_id,
+            "apt_release_version",
+            "9.9\rNotAutomatic: no",
+        )
+        .await;
+
+        let (origin, label, version, _desc) = fetch_apt_release_metadata(&pool, repo_id).await;
+        assert_eq!(origin, "evil", "Origin must be reduced to its first line");
+        assert!(!origin.contains('\n') && !origin.contains('\r'));
+        assert_eq!(label, "l1", "Label must be reduced to its first line");
+        assert!(!label.contains('\n') && !label.contains('\r'));
+        assert_eq!(
+            version.as_deref(),
+            Some("9.9"),
+            "Version must be reduced to its first line"
+        );
+
+        // Prove it end-to-end at the Release string level: a forged field name
+        // must never appear at column 0 (which is how apt parses a new field).
+        let origin_line = format!("Origin: {origin}\n");
+        assert!(!origin_line.contains("\nForged-Field:"));
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// A multi-line `apt_description` is preserved (it is deb822-formatted at
+    /// render time) but must not be usable to inject a bare field: every
+    /// continuation line is space-prefixed by `format_deb822_description`.
+    #[tokio::test]
+    async fn test_apt_description_multiline_cannot_forge_field() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        set_cfg(
+            &pool,
+            repo_id,
+            "apt_description",
+            "Summary line\nForged-Field: pwned",
+        )
+        .await;
+
+        let (_o, _l, _v, description) = fetch_apt_release_metadata(&pool, repo_id).await;
+        let desc = description.expect("description present");
+        let rendered = format!("Description: {}\n", format_deb822_description(&desc));
+        // The second line must be a space-prefixed continuation, never a field.
+        assert!(
+            rendered.contains("\n Forged-Field: pwned"),
+            "continuation line must be space-prefixed: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\nForged-Field:"),
+            "must not emit a bare (column-0) forged field: {rendered:?}"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+}
