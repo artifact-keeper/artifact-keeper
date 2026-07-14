@@ -22,6 +22,26 @@ use crate::services::remote_instance_service::{RemoteInstanceResponse, RemoteIns
 
 use crate::api::validation::validate_outbound_url;
 
+/// Default request-body limit (bytes) for the remote-instance proxy surface:
+/// 32 MiB. The global body limit is disabled (`routes.rs`), so without a
+/// route-scoped limit this management proxy would buffer an unbounded request
+/// body. This is a control-plane management surface (allow-listed to `api/` /
+/// `health` calls), not a bulk data plane, so a modest ceiling is appropriate.
+const DEFAULT_PROXY_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Resolve the request-body limit for the remote-instance proxy nest.
+///
+/// Defaults to [`DEFAULT_PROXY_BODY_LIMIT_BYTES`] (32 MiB) and is env-tunable
+/// via `REMOTE_PROXY_BODY_LIMIT_BYTES` so an operator who genuinely proxies
+/// larger management payloads can raise it without a code change (avoids a
+/// silent 413 regression).
+pub fn proxy_body_limit_bytes() -> usize {
+    std::env::var("REMOTE_PROXY_BODY_LIMIT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PROXY_BODY_LIMIT_BYTES)
+}
+
 /// Build the router for `/api/v1/instances`.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -151,24 +171,68 @@ fn build_target_url(base: &str, path: &str) -> String {
 
 /// Convert a reqwest response into an axum response, forwarding status and
 /// content-type.
-async fn reqwest_to_axum(resp: reqwest::Response) -> Result<Response> {
+///
+/// The upstream body is *streamed* straight through to the client via
+/// [`Body::from_stream`] rather than being buffered into memory first. This
+/// path is a pure pass-through — it performs no checksum verification and no
+/// cache-tee, so nothing here needs the whole body resident. Streaming removes
+/// the unbounded-memory (OOM) vector for arbitrarily large or endless upstream
+/// responses while preserving correctness for any size (large legitimate
+/// proxied downloads keep working with no artificial ceiling).
+fn reqwest_to_axum(resp: reqwest::Response) -> Result<Response> {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     let content_type = resp.headers().get("content-type").cloned();
-    #[allow(clippy::disallowed_methods)]
-    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to read proxy response: {e}")))?;
+    // Forward the upstream content-length when present; omit it for chunked
+    // upstreams (Body::from_stream yields a chunked response) rather than
+    // fabricate one.
+    let content_length = resp.headers().get("content-length").cloned();
 
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
         builder = builder.header("content-type", ct);
     }
+    if let Some(cl) = content_length {
+        builder = builder.header("content-length", cl);
+    }
     builder
-        .body(Body::from(body))
+        .body(Body::from_stream(resp.bytes_stream()))
         .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")))
+}
+
+/// Shared proxy dispatch for all four verbs. Validates the sub-path, resolves
+/// the decrypted remote URL + API key, forwards the request to the remote
+/// instance and streams the response back. `body` is `Some` only for verbs
+/// that carry a request body (POST/PUT); it is attached zero-copy via
+/// [`reqwest::Body::from`] with a JSON content-type. The proxy client sets a
+/// connect/read timeout so an endless upstream cannot pin a worker task.
+async fn send_proxy_request(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+    path: &str,
+    method: reqwest::Method,
+    body: Option<axum::body::Bytes>,
+) -> Result<Response> {
+    validate_proxy_path(path)?;
+    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
+    let target = build_target_url(&url, path);
+
+    let mut req = crate::services::http_client::proxy_client()
+        .request(method, &target)
+        .bearer_auth(&api_key);
+    if let Some(body) = body {
+        req = req
+            .header("content-type", "application/json")
+            .body(reqwest::Body::from(body));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Proxy request failed: {e}")))?;
+
+    reqwest_to_axum(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,18 +259,7 @@ async fn proxy_get(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
-    validate_proxy_path(&path)?;
-    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
-    let target = build_target_url(&url, &path);
-
-    let resp = crate::services::http_client::default_client()
-        .get(&target)
-        .bearer_auth(&api_key)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Proxy request failed: {e}")))?;
-
-    reqwest_to_axum(resp).await
+    send_proxy_request(&state, &auth, id, &path, reqwest::Method::GET, None).await
 }
 
 /// Proxy a POST request to a remote instance
@@ -231,20 +284,7 @@ async fn proxy_post(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    validate_proxy_path(&path)?;
-    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
-    let target = build_target_url(&url, &path);
-
-    let resp = crate::services::http_client::default_client()
-        .post(&target)
-        .bearer_auth(&api_key)
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Proxy request failed: {e}")))?;
-
-    reqwest_to_axum(resp).await
+    send_proxy_request(&state, &auth, id, &path, reqwest::Method::POST, Some(body)).await
 }
 
 /// Proxy a PUT request to a remote instance
@@ -269,20 +309,7 @@ async fn proxy_put(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    validate_proxy_path(&path)?;
-    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
-    let target = build_target_url(&url, &path);
-
-    let resp = crate::services::http_client::default_client()
-        .put(&target)
-        .bearer_auth(&api_key)
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Proxy request failed: {e}")))?;
-
-    reqwest_to_axum(resp).await
+    send_proxy_request(&state, &auth, id, &path, reqwest::Method::PUT, Some(body)).await
 }
 
 /// Proxy a DELETE request to a remote instance
@@ -305,18 +332,7 @@ async fn proxy_delete(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
-    validate_proxy_path(&path)?;
-    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
-    let target = build_target_url(&url, &path);
-
-    let resp = crate::services::http_client::default_client()
-        .delete(&target)
-        .bearer_auth(&api_key)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Proxy request failed: {e}")))?;
-
-    reqwest_to_axum(resp).await
+    send_proxy_request(&state, &auth, id, &path, reqwest::Method::DELETE, None).await
 }
 
 #[derive(OpenApi)]
@@ -503,5 +519,113 @@ mod tests {
     fn test_build_target_url_preserves_path_slashes() {
         let url = build_target_url("http://example.com", "a/b/c/d/e");
         assert_eq!(url, "http://example.com/a/b/c/d/e");
+    }
+
+    // -----------------------------------------------------------------------
+    // reqwest_to_axum — streaming pass-through
+    // -----------------------------------------------------------------------
+
+    /// Build a mock `reqwest::Response` from an in-memory `http::Response`
+    /// (no network), so the conversion can be exercised offline.
+    fn mock_reqwest_response(
+        status: u16,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> reqwest::Response {
+        let mut builder = http::response::Builder::new().status(status);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        builder = builder.header("content-length", body.len().to_string());
+        reqwest::Response::from(builder.body(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_to_axum_forwards_status_and_content_type() {
+        let resp = mock_reqwest_response(201, Some("application/json"), b"{\"ok\":true}".to_vec());
+        let axum_resp = reqwest_to_axum(resp).expect("conversion should succeed");
+
+        assert_eq!(axum_resp.status().as_u16(), 201);
+        assert_eq!(
+            axum_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // Test-only: drain the streamed body to assert its full contents.
+        #[allow(clippy::disallowed_methods)]
+        let bytes = axum::body::to_bytes(axum_resp.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(&bytes[..], b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_to_axum_forwards_error_status_without_content_type() {
+        let resp = mock_reqwest_response(502, None, b"upstream error".to_vec());
+        let axum_resp = reqwest_to_axum(resp).expect("conversion should succeed");
+
+        assert_eq!(axum_resp.status().as_u16(), 502);
+        assert!(axum_resp.headers().get("content-type").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_to_axum_streams_large_body_without_buffering() {
+        // A large (16 MiB) upstream body must pass through intact. The handler
+        // wraps it in a streaming body (`Body::from_stream`) rather than a
+        // pre-buffered `Bytes`, so it never holds the whole payload before the
+        // client starts receiving it.
+        let size = 16 * 1024 * 1024;
+        let payload = vec![0xABu8; size];
+        let resp = mock_reqwest_response(200, Some("application/octet-stream"), payload.clone());
+        let axum_resp = reqwest_to_axum(resp).expect("conversion should succeed");
+
+        assert_eq!(axum_resp.status().as_u16(), 200);
+        // content-length forwarded from the upstream when present.
+        assert_eq!(
+            axum_resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some(size.to_string().as_str())
+        );
+
+        // Test-only: drain the streamed body to assert its full contents.
+        #[allow(clippy::disallowed_methods)]
+        let bytes = axum::body::to_bytes(axum_resp.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(bytes.len(), size);
+        assert_eq!(&bytes[..], &payload[..]);
+    }
+
+    // -----------------------------------------------------------------------
+    // proxy_body_limit_bytes — env-tunable request-body ceiling
+    // -----------------------------------------------------------------------
+
+    // Default + env override are checked in one test: both mutate the same
+    // process-global env var, so keeping them serial avoids a parallel-run race.
+    #[test]
+    fn test_proxy_body_limit_default_and_env_override() {
+        let saved = std::env::var("REMOTE_PROXY_BODY_LIMIT_BYTES").ok();
+
+        // Default (no override) is 32 MiB.
+        std::env::remove_var("REMOTE_PROXY_BODY_LIMIT_BYTES");
+        assert_eq!(proxy_body_limit_bytes(), 32 * 1024 * 1024);
+
+        // A valid numeric override is honored.
+        std::env::set_var("REMOTE_PROXY_BODY_LIMIT_BYTES", "1048576");
+        assert_eq!(proxy_body_limit_bytes(), 1_048_576);
+
+        // A non-numeric value falls back to the default.
+        std::env::set_var("REMOTE_PROXY_BODY_LIMIT_BYTES", "not-a-number");
+        assert_eq!(proxy_body_limit_bytes(), 32 * 1024 * 1024);
+
+        match saved {
+            Some(v) => std::env::set_var("REMOTE_PROXY_BODY_LIMIT_BYTES", v),
+            None => std::env::remove_var("REMOTE_PROXY_BODY_LIMIT_BYTES"),
+        }
     }
 }

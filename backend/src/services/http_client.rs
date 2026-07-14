@@ -216,6 +216,39 @@ pub fn default_client() -> reqwest::Client {
         .expect("failed to build default HTTP client")
 }
 
+/// Default connect timeout (seconds) for the remote-instance proxy client.
+const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Default read-inactivity timeout (seconds) for the remote-instance proxy
+/// client.
+const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Build a [`reqwest::Client`] for the **remote-instance management proxy**
+/// (`/api/v1/instances/:id/proxy/*`).
+///
+/// Same SSRF trust class, redirect policy and plaintext/HTTP semantics as
+/// [`default_client`] — the proxy target is user-influenceable, so it stays
+/// fail-closed and is deliberately NOT switched to [`large_object_client_builder`],
+/// which would force `https_only` and change the existing behavior. The only
+/// addition is a `connect_timeout` plus a `read_timeout` that bounds inactivity
+/// while reading the upstream response, so a slow-loris / endless upstream
+/// cannot pin a worker task indefinitely. Both are env-tunable via
+/// `REMOTE_PROXY_CONNECT_TIMEOUT_SECS` and `REMOTE_PROXY_READ_TIMEOUT_SECS`.
+pub fn proxy_client() -> reqwest::Client {
+    let connect_secs = std::env::var("REMOTE_PROXY_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROXY_CONNECT_TIMEOUT_SECS);
+    let read_secs = std::env::var("REMOTE_PROXY_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROXY_READ_TIMEOUT_SECS);
+    base_client_builder()
+        .connect_timeout(Duration::from_secs(connect_secs))
+        .read_timeout(Duration::from_secs(read_secs))
+        .build()
+        .expect("failed to build remote-instance proxy HTTP client")
+}
+
 /// Redirect policy that re-runs the SSRF allow-list on every hop. An
 /// upstream returning `302 Location: http://[::ffff:127.0.0.1]/` would
 /// otherwise defeat the entry-point validator. Caps at

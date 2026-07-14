@@ -893,13 +893,22 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 admin_middleware,
             )),
         )
-        // Remote instance management & proxy routes with auth middleware
+        // Remote instance management & proxy routes with auth middleware.
+        // The global body limit is disabled above, so apply a route-scoped
+        // request-body limit here (default 32 MiB, env-tunable via
+        // REMOTE_PROXY_BODY_LIMIT_BYTES) to bound the proxy request path. The
+        // limit is on the REQUEST body only — proxied response downloads stream
+        // through with no ceiling.
         .nest(
             "/instances",
-            handlers::remote_instances::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::remote_instances::router()
+                .layer(DefaultBodyLimit::max(
+                    handlers::remote_instances::proxy_body_limit_bytes(),
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Service account management routes with auth middleware
         .nest(
