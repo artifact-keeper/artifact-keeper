@@ -309,7 +309,7 @@ pub async fn list_backups(
         .as_ref()
         .and_then(|t| parse_backup_type(t));
 
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
     let (backups, total) = service
         .list(status, backup_type, offset, per_page as i64)
@@ -355,7 +355,7 @@ pub async fn get_backup(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
     let backup = service.get_by_id(id).await?;
 
@@ -398,7 +398,7 @@ pub async fn create_backup(
         .and_then(|t| parse_backup_type(t))
         .unwrap_or(BackupType::Full);
 
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
 
     let backup = service
@@ -445,7 +445,7 @@ pub async fn execute_backup(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
 
     let backup = service.execute(id).await?;
@@ -502,7 +502,7 @@ pub async fn restore_backup(
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
     let storage = Arc::new(
-        StorageService::from_config(&state.config)
+        StorageService::from_config_for_backups(&state.config)
             .await
             .map_err(|e: AppError| e)?,
     );
@@ -545,7 +545,7 @@ pub async fn cancel_backup(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
 
     service.cancel(id).await?;
@@ -573,7 +573,7 @@ pub async fn delete_backup(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    let storage = Arc::new(StorageService::from_config(&state.config).await?);
+    let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
     let service = BackupService::new(state.db.clone(), storage);
 
     service.delete(id).await?;
@@ -1104,7 +1104,7 @@ pub async fn run_cleanup(
     }
 
     if request.cleanup_old_backups.unwrap_or(false) {
-        let storage = Arc::new(StorageService::from_config(&state.config).await?);
+        let storage = Arc::new(StorageService::from_config_for_backups(&state.config).await?);
         let backup_service = BackupService::new(state.db.clone(), storage);
         result.backups_deleted = backup_service
             .cleanup(settings.backup_retention_count, settings.retention_days)
