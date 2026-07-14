@@ -1557,6 +1557,16 @@ async fn serve_file(
                     )
                     .await
                     {
+                        // #2270/#2260: proxy-cache serve now counts into the
+                        // sibling proxy_download_statistics table via the
+                        // catalog id (HEAD-guarded + best-effort inside).
+                        proxy_helpers::record_proxy_download(
+                            state,
+                            repo.id,
+                            &local_cache_path,
+                            ctx,
+                        )
+                        .await;
                         return Ok(build_streaming_file_response(filename, result));
                     }
 
@@ -1575,6 +1585,12 @@ async fn serve_file(
                     )
                     .await?;
 
+                    // #2270/#2260: count the proxy serve. The streaming tee
+                    // writes the catalog row on commit; recording resolves it by
+                    // (repo, cache_path) and no-ops if the row is not yet
+                    // present.
+                    proxy_helpers::record_proxy_download(state, repo.id, &local_cache_path, ctx)
+                        .await;
                     return Ok(build_streaming_file_response(filename, result));
                 }
             }

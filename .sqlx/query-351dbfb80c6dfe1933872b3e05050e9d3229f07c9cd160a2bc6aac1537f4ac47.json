@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS \"sum!\"\n        FROM proxy_cache_artifacts\n        WHERE repository_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "351dbfb80c6dfe1933872b3e05050e9d3229f07c9cd160a2bc6aac1537f4ac47"
+}

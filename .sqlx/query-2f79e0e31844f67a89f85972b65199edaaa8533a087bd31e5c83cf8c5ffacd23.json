@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*)::BIGINT AS \"count!\"\n        FROM proxy_download_statistics pds\n        JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id\n        WHERE pca.repository_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2f79e0e31844f67a89f85972b65199edaaa8533a087bd31e5c83cf8c5ffacd23"
+}
