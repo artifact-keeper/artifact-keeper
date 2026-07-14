@@ -880,6 +880,13 @@ impl PluginService {
         event: PluginEventType,
         artifact_info: &ArtifactInfo,
     ) -> Result<()> {
+        // Re-validate URL before dispatch (anti-SSRF), mirroring the guard on
+        // the webhook path in `execute_webhook_hook`. The shared client's DNS
+        // resolver only covers hostnames (not literal IPs) and only fires on
+        // redirect hops, so this string-level check is what actually blocks
+        // literal-IP metadata / loopback / RFC1918 targets on the initial POST.
+        crate::api::validation::validate_outbound_url(url, "Plugin validator URL")?;
+
         let payload = WebhookPayload {
             event: event.as_str().to_string(),
             timestamp: Utc::now().to_rfc3339(),
@@ -1831,5 +1838,115 @@ mod tests {
         let event = PluginEventType::BeforeUpload;
         let event2 = event; // Copy
         assert_eq!(event, event2);
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF guard on the validator callback path (issue #2536)
+    //
+    // `call_validator_url` validates the target with `validate_outbound_url`
+    // before dispatch, mirroring `execute_webhook_hook`. These tests prove the
+    // guard is actually wired into `call_validator_url` (not just present in
+    // the sibling webhook path): the validation runs before any DB / network
+    // access, so a lazily-created pool never connects for the blocked cases.
+    // -----------------------------------------------------------------------
+
+    fn ssrf_test_plugin() -> Plugin {
+        use crate::models::plugin::{PluginSourceType, PluginStatus};
+        Plugin {
+            id: Uuid::new_v4(),
+            name: "test-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            display_name: "Test Plugin".to_string(),
+            description: None,
+            author: None,
+            homepage: None,
+            license: None,
+            status: PluginStatus::Active,
+            plugin_type: PluginType::Webhook,
+            source_type: PluginSourceType::Core,
+            source_url: None,
+            source_ref: None,
+            wasm_path: None,
+            manifest: None,
+            capabilities: None,
+            resource_limits: None,
+            config: None,
+            config_schema: None,
+            error_message: None,
+            installed_at: Utc::now(),
+            enabled_at: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn ssrf_test_artifact_info() -> ArtifactInfo {
+        ArtifactInfo {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path: "com/example/test.jar".to_string(),
+            name: "test.jar".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            content_type: "application/java-archive".to_string(),
+            uploaded_by: None,
+        }
+    }
+
+    async fn assert_validator_url_blocked(url: &str) {
+        // Lazy pool: never connects because the SSRF guard rejects before any
+        // DB/network access, so no live Postgres is needed for these cases.
+        let pool = PgPool::connect_lazy("postgres://registry:registry@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let svc = PluginService::new(pool);
+        let plugin = ssrf_test_plugin();
+        let info = ssrf_test_artifact_info();
+        let res = svc
+            .call_validator_url(url, &plugin, PluginEventType::BeforeUpload, &info)
+            .await;
+        assert!(res.is_err(), "expected `{url}` to be blocked by SSRF guard");
+        let msg = format!("{:?}", res.unwrap_err());
+        assert!(
+            msg.contains("Plugin validator URL"),
+            "`{url}` was not rejected by the outbound-URL guard: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_validator_url_blocks_metadata_and_loopback() {
+        assert_validator_url_blocked("http://169.254.169.254/latest/meta-data").await;
+        assert_validator_url_blocked("http://127.0.0.1:9090/").await;
+    }
+
+    #[tokio::test]
+    async fn call_validator_url_blocks_rfc1918() {
+        assert_validator_url_blocked("http://10.0.0.5/api").await;
+        assert_validator_url_blocked("http://172.16.0.1/api").await;
+        assert_validator_url_blocked("http://192.168.1.1/api").await;
+    }
+
+    #[tokio::test]
+    async fn call_validator_url_blocks_dangerous_schemes() {
+        assert_validator_url_blocked("file:///etc/passwd").await;
+        assert_validator_url_blocked("gopher://127.0.0.1:6379/_INFO").await;
+    }
+
+    #[tokio::test]
+    async fn call_validator_url_blocks_encoded_internal_ips() {
+        // Decimal-encoded 127.0.0.1 (WHATWG host parser normalizes it).
+        assert_validator_url_blocked("http://2130706433/").await;
+        // IPv6 loopback and IPv4-mapped metadata literal.
+        assert_validator_url_blocked("http://[::1]:9090/").await;
+        assert_validator_url_blocked("http://[::ffff:169.254.169.254]/latest/meta-data").await;
+    }
+
+    #[test]
+    fn validator_url_guard_allows_legit_external() {
+        // The guard used by `call_validator_url` accepts ordinary public URLs.
+        assert!(crate::api::validation::validate_outbound_url(
+            "https://validator.example.com/check",
+            "Plugin validator URL"
+        )
+        .is_ok());
     }
 }
