@@ -571,6 +571,19 @@ pub struct CreateRepositoryRequest {
     /// Custom Description field for Debian/APT Release files.
     /// Stored in `repository_config` under `apt_description`.
     pub apt_description: Option<String>,
+    /// Allowed npm `@scope` literals for this npm Remote repository (#2424).
+    /// Only meaningful for npm-format Remote repositories; validated and stored
+    /// in `repository_config` under `npm_allowed_scopes`. Omit to leave the
+    /// repository unrestricted by scope.
+    pub npm_allowed_scopes: Option<Vec<String>>,
+    /// Whether unscoped npm package names may resolve through this npm Remote
+    /// repository (#2424). Stored under `npm_allow_unscoped`.
+    pub npm_allow_unscoped: Option<bool>,
+    /// Allowed npm full-name glob patterns (`*`/`?`) for this npm Remote
+    /// repository (#2424). Additive to `npm_allowed_scopes`; stored under
+    /// `npm_allowed_name_patterns`. A name is allowed if its scope is allowed
+    /// OR any glob matches (e.g. `@acme/*`, `internal-*`).
+    pub npm_allowed_name_patterns: Option<Vec<String>>,
 }
 
 impl CreateRepositoryRequest {
@@ -659,6 +672,16 @@ pub struct UpdateRepositoryRequest {
     /// string to remove (omits the field entirely from the Release file).
     /// Stored in `repository_config` under `apt_description`.
     pub apt_description: Option<String>,
+    /// Update the allowed npm `@scope` literals for this npm Remote repository
+    /// (#2424). When provided, replaces the stored `npm_allowed_scopes` list.
+    pub npm_allowed_scopes: Option<Vec<String>>,
+    /// Update whether unscoped npm package names may resolve through this npm
+    /// Remote repository (#2424). Stored under `npm_allow_unscoped`.
+    pub npm_allow_unscoped: Option<bool>,
+    /// Update the allowed npm full-name glob patterns for this npm Remote
+    /// repository (#2424). When provided, replaces the stored
+    /// `npm_allowed_name_patterns` list.
+    pub npm_allowed_name_patterns: Option<Vec<String>>,
 }
 
 impl UpdateRepositoryRequest {
@@ -721,6 +744,18 @@ pub struct RepositoryResponse {
     /// Release file when `None` or empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apt_description: Option<String>,
+    /// Allowed npm `@scope` literals (#2424), read back from
+    /// `repository_config`. Omitted for non-npm repositories or when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_allowed_scopes: Option<Vec<String>>,
+    /// Whether unscoped npm names may resolve through this npm Remote
+    /// repository (#2424). Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_allow_unscoped: Option<bool>,
+    /// Allowed npm full-name glob patterns (#2424), read back from
+    /// `repository_config`. Omitted for non-npm repositories or when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_allowed_name_patterns: Option<Vec<String>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -763,6 +798,9 @@ fn repo_to_response(
         apt_label: None,
         apt_release_version: None,
         apt_description: None,
+        npm_allowed_scopes: None,
+        npm_allow_unscoped: None,
+        npm_allowed_name_patterns: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -1203,6 +1241,180 @@ fn is_npm_scope_policy_configurable(
     Ok(())
 }
 
+/// Normalise + validate an npm scope allow-list: trim, lowercase (matching is
+/// case-insensitive), sort/dedupe, and require each entry to be a well-formed
+/// `@scope` literal. Shared by the dedicated PUT endpoint and the create/update
+/// repository handlers (#2327/#2424).
+fn normalize_npm_scopes(raw: &[String]) -> Result<Vec<String>> {
+    let mut allowed_scopes: Vec<String> =
+        raw.iter().map(|s| s.trim().to_ascii_lowercase()).collect();
+    allowed_scopes.sort();
+    allowed_scopes.dedup();
+    for scope in &allowed_scopes {
+        if !crate::api::handlers::npm::is_valid_npm_scope(scope) {
+            return Err(AppError::Validation(format!(
+                "Invalid npm scope '{}': scopes must start with '@' followed by \
+                 lowercase letters, digits, '-', '_' or '.' (not leading '.'/'_')",
+                scope
+            )));
+        }
+    }
+    Ok(allowed_scopes)
+}
+
+/// Normalise + validate an npm name-glob allow-list (#2424): trim, lowercase,
+/// sort/dedupe, and reject empty patterns, over-long patterns, path separators
+/// (`\`, `..`) and characters outside the npm package-name + glob alphabet.
+/// The forward slash is retained so scope wildcards (`@acme/*`) are expressible.
+fn normalize_npm_name_patterns(raw: &[String]) -> Result<Vec<String>> {
+    let mut patterns: Vec<String> = Vec::with_capacity(raw.len());
+    for p in raw {
+        let trimmed = p.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Err(AppError::Validation(
+                "npm name pattern must not be empty".to_string(),
+            ));
+        }
+        if trimmed.len() > crate::api::handlers::npm::NPM_NAME_PATTERN_MAX_LEN {
+            return Err(AppError::Validation(format!(
+                "npm name pattern '{}' exceeds {} characters",
+                trimmed,
+                crate::api::handlers::npm::NPM_NAME_PATTERN_MAX_LEN
+            )));
+        }
+        if trimmed.contains('\\') || trimmed.contains("..") {
+            return Err(AppError::Validation(format!(
+                "npm name pattern '{}' must not contain path separators or '..'",
+                trimmed
+            )));
+        }
+        if !trimmed.chars().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || matches!(c, '@' | '/' | '-' | '_' | '.' | '*' | '?')
+        }) {
+            return Err(AppError::Validation(format!(
+                "npm name pattern '{}' contains invalid characters",
+                trimmed
+            )));
+        }
+        patterns.push(trimmed);
+    }
+    patterns.sort();
+    patterns.dedup();
+    Ok(patterns)
+}
+
+/// Validate every provided npm scope-policy field up-front (no persistence).
+/// Returns an error before any repository row is created so a bad glob cannot
+/// leave an orphaned repository behind — mirrors the apt_* up-front validation.
+fn validate_npm_scope_policy_fields(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    allowed_scopes: Option<&[String]>,
+    allow_unscoped: Option<bool>,
+    allowed_name_patterns: Option<&[String]>,
+) -> Result<()> {
+    if allowed_scopes.is_none() && allow_unscoped.is_none() && allowed_name_patterns.is_none() {
+        return Ok(());
+    }
+    is_npm_scope_policy_configurable(repo_type, format)?;
+    if let Some(scopes) = allowed_scopes {
+        normalize_npm_scopes(scopes)?;
+    }
+    if let Some(patterns) = allowed_name_patterns {
+        normalize_npm_name_patterns(patterns)?;
+    }
+    Ok(())
+}
+
+/// Persist any provided npm scope-policy fields to `repository_config`
+/// (#2327/#2424). Validation runs first (via the normalise helpers) so a bad
+/// value never leaves a partial write; only keys whose argument is `Some` are
+/// written, so omitted fields are left unchanged. Shared by the dedicated PUT
+/// endpoint and the create/update repository handlers (no copy-paste).
+async fn apply_npm_scope_policy_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    allowed_scopes: Option<&[String]>,
+    allow_unscoped: Option<bool>,
+    allowed_name_patterns: Option<&[String]>,
+) -> Result<()> {
+    // Validate + serialise everything before the first upsert.
+    let scopes_json = match allowed_scopes {
+        Some(scopes) => Some(
+            serde_json::to_string(&normalize_npm_scopes(scopes)?).map_err(|e| {
+                AppError::Internal(format!("Failed to serialize scope list: {}", e))
+            })?,
+        ),
+        None => None,
+    };
+    let patterns_json = match allowed_name_patterns {
+        Some(patterns) => Some(
+            serde_json::to_string(&normalize_npm_name_patterns(patterns)?).map_err(|e| {
+                AppError::Internal(format!("Failed to serialize name pattern list: {}", e))
+            })?,
+        ),
+        None => None,
+    };
+
+    if let Some(json) = scopes_json {
+        upsert_repo_config(
+            db,
+            repo_id,
+            crate::api::handlers::npm::NPM_ALLOWED_SCOPES_KEY,
+            &json,
+        )
+        .await?;
+    }
+    if let Some(unscoped) = allow_unscoped {
+        upsert_repo_config(
+            db,
+            repo_id,
+            crate::api::handlers::npm::NPM_ALLOW_UNSCOPED_KEY,
+            if unscoped { "true" } else { "false" },
+        )
+        .await?;
+    }
+    if let Some(json) = patterns_json {
+        upsert_repo_config(
+            db,
+            repo_id,
+            crate::api::handlers::npm::NPM_ALLOWED_NAME_PATTERNS_KEY,
+            &json,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Populate `RepositoryResponse` npm scope-policy fields from
+/// `repository_config` (#2424) so create/get/update echo the stored policy.
+/// A no-op for non-npm-Remote repositories and for repositories with no stored
+/// policy (fields stay `None` and are skipped in the serialised JSON).
+async fn with_npm_scope_policy(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
+        return response;
+    }
+    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(db, repo_id).await;
+    if !policy.allowed_scopes.is_empty() {
+        response.npm_allowed_scopes = Some(policy.allowed_scopes);
+    }
+    if let Some(unscoped) = policy.allow_unscoped {
+        response.npm_allow_unscoped = Some(unscoped);
+    }
+    if !policy.allowed_name_patterns.is_empty() {
+        response.npm_allowed_name_patterns = Some(policy.allowed_name_patterns);
+    }
+    response
+}
+
 /// Set the npm scope policy for a Remote repository (#2327).
 ///
 /// Mirrors the auth + repo-access pattern of `set_cache_ttl`: candidate
@@ -1256,47 +1468,19 @@ pub async fn set_npm_scope_policy(
 
     is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
 
-    // Normalise and validate the allow-list: lowercase (matching is
-    // case-insensitive), dedupe, and require each entry to be a well-formed
-    // `@scope` literal.
-    let mut allowed_scopes: Vec<String> = payload
-        .allowed_scopes
-        .iter()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .collect();
-    allowed_scopes.sort();
-    allowed_scopes.dedup();
-    for scope in &allowed_scopes {
-        if !crate::api::handlers::npm::is_valid_npm_scope(scope) {
-            return Err(AppError::Validation(format!(
-                "Invalid npm scope '{}': scopes must start with '@' followed by \
-                 lowercase letters, digits, '-', '_' or '.' (not leading '.'/'_')",
-                scope
-            )));
-        }
-    }
-
-    let scopes_json = serde_json::to_string(&allowed_scopes)
-        .map_err(|e| AppError::Internal(format!("Failed to serialize scope list: {}", e)))?;
-    upsert_repo_config(
+    // Normalise + validate + persist via the shared helper (#2424) so this
+    // endpoint and the create/update repo handlers stay in lock-step.
+    apply_npm_scope_policy_config(
         &state.db,
         repo.id,
-        crate::api::handlers::npm::NPM_ALLOWED_SCOPES_KEY,
-        &scopes_json,
-    )
-    .await?;
-    upsert_repo_config(
-        &state.db,
-        repo.id,
-        crate::api::handlers::npm::NPM_ALLOW_UNSCOPED_KEY,
-        if payload.allow_unscoped {
-            "true"
-        } else {
-            "false"
-        },
+        Some(&payload.allowed_scopes),
+        Some(payload.allow_unscoped),
+        None,
     )
     .await?;
 
+    // Recompute the normalised scopes for the response (same shared validator).
+    let allowed_scopes = normalize_npm_scopes(&payload.allowed_scopes)?;
     let active = !allowed_scopes.is_empty() || !payload.allow_unscoped;
     Ok(Json(NpmScopePolicyResponse {
         repository_key: key,
@@ -1932,6 +2116,19 @@ pub async fn create_repository(
         }
     }
 
+    // npm scope policy (#2424): validate up-front — before the repository row is
+    // created — so a rejected value (wrong repo type/format or a bad glob)
+    // cannot leave an orphaned repository behind, mirroring the apt_* guard
+    // above. Persistence happens after `service.create(...)`, once `repo.id`
+    // exists.
+    validate_npm_scope_policy_fields(
+        &repo_type,
+        &format,
+        payload.npm_allowed_scopes.as_deref(),
+        payload.npm_allow_unscoped,
+        payload.npm_allowed_name_patterns.as_deref(),
+    )?;
+
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
         None => state.config.storage_backend.clone(),
@@ -2030,6 +2227,22 @@ pub async fn create_repository(
         if !ua.is_empty() {
             upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
         }
+    }
+
+    // Persist npm scope policy (#2424). Validation already ran up-front; the
+    // shared helper re-validates and writes only the provided keys.
+    if payload.npm_allowed_scopes.is_some()
+        || payload.npm_allow_unscoped.is_some()
+        || payload.npm_allowed_name_patterns.is_some()
+    {
+        apply_npm_scope_policy_config(
+            &state.db,
+            repo.id,
+            payload.npm_allowed_scopes.as_deref(),
+            payload.npm_allow_unscoped,
+            payload.npm_allowed_name_patterns.as_deref(),
+        )
+        .await?;
     }
 
     // Persist apt_* Release metadata. Validation already ran up-front (before
@@ -2139,6 +2352,9 @@ pub async fn create_repository(
     )
     .await;
 
+    let repo_id = repo.id;
+    let repo_type_out = repo.repo_type.clone();
+    let repo_format_out = repo.format.clone();
     let mut response = repo_to_response(repo, 0);
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
@@ -2154,6 +2370,10 @@ pub async fn create_repository(
     response.apt_label = trimmed_nonempty(payload.apt_label);
     response.apt_release_version = trimmed_nonempty(payload.apt_release_version);
     response.apt_description = trimmed_nonempty(payload.apt_description);
+    // Echo the npm scope policy that was persisted (#2424) so the create
+    // response round-trips with a subsequent GET.
+    let response =
+        with_npm_scope_policy(&state.db, repo_id, &repo_type_out, &repo_format_out, response).await;
     Ok(Json(response))
 }
 
@@ -2184,6 +2404,8 @@ pub async fn get_repository(
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
     let repo_id = repo.id;
+    let repo_type = repo.repo_type.clone();
+    let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let mut response = repo_to_response(repo, storage_used);
@@ -2196,6 +2418,8 @@ pub async fn get_repository(
     } else {
         response
     };
+    let response =
+        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
     Ok(Json(response))
 }
 
@@ -2299,6 +2523,23 @@ pub async fn update_repository(
 
     if let Some(ref index_path) = payload.pypi_upstream_index_path {
         upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
+    // npm scope policy (#2424): validate the target is an npm Remote repo, then
+    // persist only the provided keys via the shared helper.
+    if payload.npm_allowed_scopes.is_some()
+        || payload.npm_allow_unscoped.is_some()
+        || payload.npm_allowed_name_patterns.is_some()
+    {
+        is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
+        apply_npm_scope_policy_config(
+            &state.db,
+            repo.id,
+            payload.npm_allowed_scopes.as_deref(),
+            payload.npm_allow_unscoped,
+            payload.npm_allowed_name_patterns.as_deref(),
+        )
+        .await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -2502,6 +2743,8 @@ pub async fn update_repository(
     .await;
 
     let repo_id = repo.id;
+    let repo_type = repo.repo_type.clone();
+    let repo_format = repo.format.clone();
     let is_apt_hosted =
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let response = repo_to_response(repo, storage_used);
@@ -2518,6 +2761,8 @@ pub async fn update_repository(
     } else {
         response
     };
+    let response =
+        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
     Ok(Json(response))
 }
 
@@ -6855,6 +7100,96 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // npm scope-policy create/update validation (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_npm_scopes_folds_sorts_dedupes() {
+        let out = normalize_npm_scopes(&[
+            "@Types".to_string(),
+            "  @acme ".to_string(),
+            "@types".to_string(),
+        ])
+        .expect("valid scopes");
+        assert_eq!(out, vec!["@acme", "@types"]);
+    }
+
+    #[test]
+    fn normalize_npm_scopes_rejects_bad_literal() {
+        assert!(normalize_npm_scopes(&["types".to_string()]).is_err());
+        assert!(normalize_npm_scopes(&["@sc/ope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn normalize_npm_name_patterns_accepts_globs_and_scope_slash() {
+        let out = normalize_npm_name_patterns(&[
+            "@Acme/*".to_string(),
+            "internal-*".to_string(),
+            "@acme/*".to_string(),
+        ])
+        .expect("valid patterns");
+        // Lowercased, sorted, deduped; the scope `/` is preserved.
+        assert_eq!(out, vec!["@acme/*", "internal-*"]);
+    }
+
+    #[test]
+    fn normalize_npm_name_patterns_rejects_empty_and_path_sep() {
+        assert!(normalize_npm_name_patterns(&["   ".to_string()]).is_err());
+        assert!(normalize_npm_name_patterns(&["..\\evil".to_string()]).is_err());
+        assert!(normalize_npm_name_patterns(&["a/../b".to_string()]).is_err());
+        assert!(normalize_npm_name_patterns(&["bad space".to_string()]).is_err());
+        let too_long = "a".repeat(crate::api::handlers::npm::NPM_NAME_PATTERN_MAX_LEN + 1);
+        assert!(normalize_npm_name_patterns(&[too_long]).is_err());
+    }
+
+    #[test]
+    fn validate_npm_scope_policy_fields_gates_repo_type_and_format() {
+        // No fields => always OK regardless of repo type/format.
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Local,
+            &RepositoryFormat::Generic,
+            None,
+            None,
+            None,
+        )
+        .is_ok());
+        // A field present on a non-remote or non-npm repo => rejected.
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Local,
+            &RepositoryFormat::Npm,
+            Some(&["@acme".to_string()]),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Remote,
+            &RepositoryFormat::Maven,
+            None,
+            Some(false),
+            None,
+        )
+        .is_err());
+        // npm Remote with a valid glob => OK; with a bad glob => rejected.
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Remote,
+            &RepositoryFormat::Npm,
+            Some(&["@acme".to_string()]),
+            Some(false),
+            Some(&["internal-*".to_string()]),
+        )
+        .is_ok());
+        assert!(validate_npm_scope_policy_fields(
+            &RepositoryType::Remote,
+            &RepositoryFormat::Npm,
+            None,
+            None,
+            Some(&["".to_string()]),
+        )
+        .is_err());
+    }
+
     #[test]
     fn download_filename_handles_flat_path() {
         assert_eq!(download_filename("plainfile.bin"), "plainfile.bin");
@@ -8232,6 +8567,9 @@ mod tests {
             apt_label: None,
             apt_release_version: None,
             apt_description: None,
+            npm_allowed_scopes: None,
+            npm_allow_unscoped: None,
+            npm_allowed_name_patterns: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9564,6 +9902,9 @@ mod tests {
             apt_label: None,
             apt_release_version: None,
             apt_description: None,
+            npm_allowed_scopes: None,
+            npm_allow_unscoped: None,
+            npm_allowed_name_patterns: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -15629,6 +15970,9 @@ mod tests {
             apt_label: None,
             apt_release_version: None,
             apt_description: None,
+            npm_allowed_scopes: None,
+            npm_allow_unscoped: None,
+            npm_allowed_name_patterns: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

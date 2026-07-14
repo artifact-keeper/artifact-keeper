@@ -1220,6 +1220,14 @@ async fn fetch_npm_artifacts(
 pub(crate) const NPM_ALLOWED_SCOPES_KEY: &str = "npm_allowed_scopes";
 /// `repository_config` key holding the unscoped-package toggle ("true"/"false").
 pub(crate) const NPM_ALLOW_UNSCOPED_KEY: &str = "npm_allow_unscoped";
+/// `repository_config` key holding the JSON array of allowed npm name globs
+/// (#2424). Additive to `npm_allowed_scopes`: an unset key has no effect, so
+/// repositories configured before #2424 behave byte-identically.
+pub(crate) const NPM_ALLOWED_NAME_PATTERNS_KEY: &str = "npm_allowed_name_patterns";
+
+/// Maximum length of a single npm name glob pattern (matches the npm package
+/// name length cap; keeps a stored pattern from growing unbounded).
+pub(crate) const NPM_NAME_PATTERN_MAX_LEN: usize = 214;
 
 /// Parsed shape of an npm package name for scope-policy evaluation.
 #[derive(Debug, PartialEq, Eq)]
@@ -1284,13 +1292,32 @@ pub(crate) struct NpmScopePolicy {
     /// repository. `None` = not configured; treated as "deny" once the
     /// policy is otherwise active (fail-closed) and "allow" otherwise.
     pub(crate) allow_unscoped: Option<bool>,
+    /// Allowed full-package-name glob patterns (`*`/`?`), case-folded to
+    /// lowercase (#2424). Additive to `allowed_scopes`: a name is allowed if
+    /// its scope is in `allowed_scopes` OR any of these globs matches the full
+    /// package name. Empty = no pattern restriction (default, unchanged).
+    pub(crate) allowed_name_patterns: Vec<String>,
 }
 
 impl NpmScopePolicy {
-    /// A policy participates in filtering iff an allow-list is present or
-    /// unscoped resolution was explicitly switched off.
+    /// A policy participates in filtering iff an allow-list is present, a name
+    /// pattern list is present (#2424), or unscoped resolution was explicitly
+    /// switched off.
     pub(crate) fn is_active(&self) -> bool {
-        !self.allowed_scopes.is_empty() || self.allow_unscoped == Some(false)
+        !self.allowed_scopes.is_empty()
+            || !self.allowed_name_patterns.is_empty()
+            || self.allow_unscoped == Some(false)
+    }
+
+    /// Whether any configured name glob matches `package_name` (case-folded).
+    fn pattern_matches(&self, package_name: &str) -> bool {
+        if self.allowed_name_patterns.is_empty() {
+            return false;
+        }
+        let name = package_name.to_ascii_lowercase();
+        self.allowed_name_patterns
+            .iter()
+            .any(|pattern| crate::util::glob::glob_match(&pattern.to_ascii_lowercase(), &name))
     }
 
     /// Whether `package_name` may be resolved through the repository this
@@ -1302,13 +1329,21 @@ impl NpmScopePolicy {
         }
         match npm_name_shape(package_name) {
             NpmNameShape::Scoped(scope) => {
-                self.allowed_scopes.is_empty()
+                // Preserve the #2327 semantics: when neither a scope allow-list
+                // nor a name-pattern allow-list is configured (the policy is
+                // active only because `allow_unscoped == Some(false)`), every
+                // scoped name is still allowed. Otherwise a scoped name passes
+                // iff its scope is allow-listed OR a name glob matches.
+                (self.allowed_scopes.is_empty() && self.allowed_name_patterns.is_empty())
                     || self
                         .allowed_scopes
                         .iter()
                         .any(|allowed| allowed == &scope.to_ascii_lowercase())
+                    || self.pattern_matches(package_name)
             }
-            NpmNameShape::Unscoped => self.allow_unscoped == Some(true),
+            NpmNameShape::Unscoped => {
+                self.allow_unscoped == Some(true) || self.pattern_matches(package_name)
+            }
             NpmNameShape::Invalid => false,
         }
     }
@@ -1330,11 +1365,12 @@ async fn fetch_npm_scope_policies(
     }
     let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
         "SELECT repository_id, key, value FROM repository_config \
-         WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+         WHERE repository_id = ANY($1) AND key IN ($2, $3, $4)",
     )
     .bind(repo_ids)
     .bind(NPM_ALLOWED_SCOPES_KEY)
     .bind(NPM_ALLOW_UNSCOPED_KEY)
+    .bind(NPM_ALLOWED_NAME_PATTERNS_KEY)
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -1349,6 +1385,14 @@ async fn fetch_npm_scope_policies(
                 .collect();
         } else if key == NPM_ALLOW_UNSCOPED_KEY {
             policy.allow_unscoped = value.parse::<bool>().ok();
+        } else if key == NPM_ALLOWED_NAME_PATTERNS_KEY {
+            // Malformed JSON => empty (unrestricted by this key), consistent
+            // with the `npm_allowed_scopes` parse above (#2424).
+            policy.allowed_name_patterns = serde_json::from_str::<Vec<String>>(&value)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
         }
     }
     policies
@@ -1396,6 +1440,15 @@ async fn get_package_metadata(
     // artifacts do not contain enough information to reconstruct the full
     // package metadata that npm clients expect.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // path (#2424). Pointing a client straight at the member key would
+        // otherwise bypass the filter the virtual metadata loops apply. An
+        // out-of-scope name returns 404 (parity with the virtual "skipped by
+        // policy => not found" behaviour; avoids confirming the name exists).
+        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Package not found".to_string()).into_response());
+        }
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
@@ -1621,6 +1674,12 @@ async fn fetch_remote_packument(
     package_name: &str,
     base_url: &str,
 ) -> Result<serde_json::Value, Response> {
+    // Enforce the repository's own npm scope policy on the direct-remote
+    // packument path (#2424); an out-of-scope name returns 404.
+    let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+    if !policy.allows(package_name) {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
     let upstream_url = repo
         .upstream_url
         .as_deref()
@@ -2143,6 +2202,14 @@ async fn serve_tarball(
     // already fetched). The proxy cache stores content under its own storage
     // key which the regular artifact storage cannot resolve.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // tarball path (#2424). A pinned-lockfile tarball GET for an
+        // out-of-scope name would otherwise stream straight through; an
+        // out-of-scope name now returns 404.
+        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
+        }
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
@@ -2227,6 +2294,26 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
+        // #2424: apply the per-member npm scope policy to the direct-tarball
+        // path, exactly as the metadata/packument loops already do. Metadata
+        // filtering alone does not cover a client that already knows the exact
+        // tarball URL (a pinned lockfile), which would otherwise stream an
+        // out-of-scope `@scope/pkg` straight through a Remote member. Fetch the
+        // members once, drop Remote members the policy excludes, and resolve
+        // over the pre-filtered list via `resolve_virtual_download_from_members`
+        // — the established pre-filtered-member seam (cf. maven.rs) — so the
+        // shared generic `resolve_virtual_download` helper is left untouched and
+        // no other format (maven/hex/...) is affected. Non-Remote members are
+        // always eligible, preserving the `virtual_non_remote_owns_name`
+        // shadowing guard and the local-only primitive above.
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+        let members: Vec<_> = members
+            .into_iter()
+            .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
+            .collect();
+
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
         // per-member (see the metadata branch), so an ordinary `npm install`
@@ -2238,7 +2325,6 @@ async fn serve_tarball(
         // shared `resolve_virtual_download` helper is left untouched so no
         // other format (maven/hex/...) is affected.
         if let Some(proxy) = proxy_for_virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -2279,10 +2365,9 @@ async fn serve_tarball(
             }
         }
 
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &upstream_path,
             |member_id, location| {
                 let db = db.clone();
@@ -3083,6 +3168,19 @@ mod tests {
         NpmScopePolicy {
             allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
             allow_unscoped,
+            allowed_name_patterns: Vec::new(),
+        }
+    }
+
+    fn policy_with_patterns(
+        scopes: &[&str],
+        allow_unscoped: Option<bool>,
+        patterns: &[&str],
+    ) -> NpmScopePolicy {
+        NpmScopePolicy {
+            allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allow_unscoped,
+            allowed_name_patterns: patterns.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -3173,6 +3271,70 @@ mod tests {
         assert!(!p.allows("@types"));
         assert!(!p.allows("@/x"));
         assert!(!p.allows(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // npm name-glob patterns (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn glob_patterns_activate_and_allow_scoped_names() {
+        // Patterns-only policy (no scope list, unscoped unset) is active.
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo"));
+        assert!(p.allows("@acme/bar-baz"));
+        // A scoped name outside the glob is denied even though allowed_scopes
+        // is empty (the glob restriction is what makes the policy active).
+        assert!(!p.allows("@evil/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_allow_unscoped_names() {
+        let p = policy_with_patterns(&[], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("internal-utils"));
+        assert!(!p.allows("lodash"));
+        // allow_unscoped=false but the glob still admits matching unscoped names.
+        assert!(p.allows("internal-tools"));
+    }
+
+    #[test]
+    fn glob_patterns_or_compose_with_exact_scopes() {
+        // Exact scope @acme + pattern internal-* + unscoped denied: mirrors the
+        // on-box verification policy.
+        let p = policy_with_patterns(&["@acme"], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo")); // exact scope
+        assert!(p.allows("internal-utils")); // pattern (unscoped)
+        assert!(!p.allows("other-pkg")); // neither, unscoped denied
+        assert!(!p.allows("@evil/pkg")); // neither, scope not allowed
+    }
+
+    #[test]
+    fn glob_patterns_are_case_insensitive() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.allows("@ACME/Foo"));
+        // Constructed with mixed-case pattern (loader lowercases, but be safe).
+        let p2 = policy_with_patterns(&[], None, &["@Acme/*"]);
+        assert!(p2.allows("@acme/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_invalid_names_fail_closed() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(!p.allows("@acme")); // malformed (no package part)
+        assert!(!p.allows(""));
+    }
+
+    #[test]
+    fn glob_patterns_do_not_affect_existing_scope_only_policies() {
+        // A policy with only exact scopes behaves byte-identically: no patterns
+        // means pattern_matches never fires.
+        let p = policy(&["@types"], Some(false));
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@other/x"));
+        assert!(!p.allows("lodash"));
     }
 
     #[test]
@@ -3279,6 +3441,28 @@ mod tests {
         let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
         assert_eq!(flipped.allow_unscoped, Some(true));
         assert!(flipped.allows("lodash"));
+
+        // #2424: the new name-pattern key parses into a lowercased Vec and
+        // composes with the scope list; malformed JSON degrades to empty
+        // (unrestricted by that key), consistent with the scope-list parse.
+        upsert(NPM_ALLOWED_NAME_PATTERNS_KEY, "not-json").await;
+        let bad_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert!(bad_patterns.allowed_name_patterns.is_empty());
+        upsert(
+            NPM_ALLOWED_NAME_PATTERNS_KEY,
+            "[\"@Acme/*\",\"internal-*\"]",
+        )
+        .await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
+        let with_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
+        assert_eq!(
+            with_patterns.allowed_name_patterns,
+            vec!["@acme/*", "internal-*"]
+        );
+        assert!(with_patterns.is_active());
+        assert!(with_patterns.allows("@acme/thing"));
+        assert!(with_patterns.allows("internal-utils"));
+        assert!(!with_patterns.allows("random-pkg"));
 
         // Cleanup.
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
