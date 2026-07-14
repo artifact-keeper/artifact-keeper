@@ -252,6 +252,8 @@ async fn upload_artifact(
 
     // Store the file
     let storage_key = format!("sbt/{}", artifact_path);
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;

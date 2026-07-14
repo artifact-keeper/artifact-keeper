@@ -1678,7 +1678,17 @@ async fn serve_artifact(
             // uploads started indexing every physical asset as an artifact row.
             // Direct byte access remains available for those older companion
             // files while new uploads resolve through the exact `artifacts.path`.
-            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            //
+            // This fallback reads a bare `maven/{path}` key with no artifact row
+            // scoped to the caller's repository, so it is only sound on backends
+            // that physically isolate each repository's key space (filesystem,
+            // rooted at the repo's storage_path). On shared cloud namespaces
+            // (S3/GCS/Azure) the same flat key can belong to a *different*
+            // repository, so the fallback is skipped there and the request 404s
+            // rather than serving another repository's bytes.
+            if (repo.repo_type == RepositoryType::Local
+                || repo.repo_type == RepositoryType::Staging)
+                && crate::storage::backend_is_repo_isolated(&repo.storage_backend)
             {
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
@@ -1973,6 +1983,10 @@ async fn upload(
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
     let storage_key = format!("maven/{}", path);
+    // Refuse to overwrite a different repository's object living at this exact
+    // flat key on a shared cloud namespace (cross-repo poisoning guard).
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;

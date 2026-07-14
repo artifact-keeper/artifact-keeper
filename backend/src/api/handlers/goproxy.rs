@@ -988,6 +988,8 @@ async fn upload_zip(
 
     let size_bytes = body.len() as i64;
     let storage_key = format!("go/{}/{}/{}.zip", encoded_module, version, version);
+    proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
 
     // Store the file
     let storage = state
@@ -1108,6 +1110,8 @@ async fn upload_mod(
 
     let size_bytes = body.len() as i64;
     let storage_key = format!("go/{}/{}/go.mod", encoded_module, version);
+    proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
 
     // Store the file
     let storage = state
