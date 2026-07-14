@@ -228,6 +228,22 @@ pub struct CreateKeyRequest {
     pub created_by: Option<Uuid>,
 }
 
+/// Freshly generated (and at-rest-encrypted) key material, ready to be
+/// inserted as a `signing_keys` row.
+///
+/// Produced by [`SigningService::generate_key_material`] — the slow, CPU-bound
+/// half of key creation — so that the actual row INSERT can run inside a
+/// caller-supplied transaction without holding a DB lock across keygen.
+struct GeneratedKeyMaterial {
+    /// Normalized key family (`gpg` / `rsa` / `ed25519`).
+    key_type: String,
+    public_key_pem: String,
+    /// Private key, already encrypted for at-rest storage.
+    private_key_enc: Vec<u8>,
+    fingerprint: String,
+    key_id: String,
+}
+
 impl SigningService {
     pub fn new(db: PgPool, encryption_key: &str) -> Self {
         Self {
@@ -238,51 +254,15 @@ impl SigningService {
 
     /// Generate a new signing key pair and store it.
     pub async fn create_key(&self, req: CreateKeyRequest) -> Result<SigningKeyPublic> {
-        // Normalize the key family before generation so an unsupported value
-        // surfaces as a clean 400 Validation error instead of tripping the
-        // signing_keys_key_type_check DB constraint (opaque 500). (#2319)
-        let key_type = normalize_key_type(&req.key_type)
-            .map_err(AppError::Validation)?
-            .to_string();
-
-        let (public_key_out, private_key_material, fingerprint, key_id) = if key_type == "gpg" {
-            self.generate_openpgp_key(&req).await?
-        } else {
-            self.generate_rsa_key(&req.algorithm).await?
-        };
-
-        // Hold the freshly generated armored / PEM private key in a zeroizing
-        // wrapper so the plaintext is wiped from memory after we encrypt it
-        // for at-rest storage (artifact-keeper #1328).
-        let private_key_material = Zeroizing::new(private_key_material);
-        let private_enc = self.encryption.encrypt(private_key_material.as_bytes());
+        // Slow, CPU-bound keygen (+ at-rest encryption) first, then a single
+        // fast INSERT. Split out so `rotate_key` can run the INSERT inside a
+        // transaction without holding a DB lock across keygen.
+        let material = self.generate_key_material(&req).await?;
 
         let id = Uuid::new_v4();
         let now = Utc::now();
 
-        sqlx::query!(
-            r#"
-            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,
-                public_key_pem, private_key_enc, algorithm, uid_name, uid_email, is_active,
-                created_at, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $13)
-            "#,
-            id,
-            req.repository_id,
-            req.name,
-            key_type,
-            fingerprint,
-            key_id,
-            public_key_out,
-            private_enc,
-            req.algorithm,
-            req.uid_name,
-            req.uid_email,
-            now,
-            req.created_by,
-        )
-        .execute(&self.db)
-        .await?;
+        Self::insert_key_row(&self.db, id, &req, &material, true, None, now).await?;
 
         // Audit log
         self.audit_key_action(id, "created", req.created_by, None)
@@ -292,10 +272,10 @@ impl SigningService {
             id,
             repository_id: req.repository_id,
             name: req.name,
-            key_type,
-            fingerprint: Some(fingerprint),
-            key_id: Some(key_id),
-            public_key_pem: public_key_out,
+            key_type: material.key_type,
+            fingerprint: Some(material.fingerprint),
+            key_id: Some(material.key_id),
+            public_key_pem: material.public_key_pem,
             algorithm: req.algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
@@ -304,6 +284,82 @@ impl SigningService {
             created_at: now,
             last_used_at: None,
         })
+    }
+
+    /// Generate a key pair for `req` and encrypt the private material for
+    /// at-rest storage. This is the slow (multi-second RSA/OpenPGP keygen)
+    /// half of key creation; it touches no DB and holds no lock, so callers
+    /// may run it *before* opening a transaction.
+    async fn generate_key_material(&self, req: &CreateKeyRequest) -> Result<GeneratedKeyMaterial> {
+        // Normalize the key family before generation so an unsupported value
+        // surfaces as a clean 400 Validation error instead of tripping the
+        // signing_keys_key_type_check DB constraint (opaque 500). (#2319)
+        let key_type = normalize_key_type(&req.key_type)
+            .map_err(AppError::Validation)?
+            .to_string();
+
+        let (public_key_out, private_key_material, fingerprint, key_id) = if key_type == "gpg" {
+            self.generate_openpgp_key(req).await?
+        } else {
+            self.generate_rsa_key(&req.algorithm).await?
+        };
+
+        // Hold the freshly generated armored / PEM private key in a zeroizing
+        // wrapper so the plaintext is wiped from memory after we encrypt it
+        // for at-rest storage (artifact-keeper #1328).
+        let private_key_material = Zeroizing::new(private_key_material);
+        let private_key_enc = self.encryption.encrypt(private_key_material.as_bytes());
+
+        Ok(GeneratedKeyMaterial {
+            key_type,
+            public_key_pem: public_key_out,
+            private_key_enc,
+            fingerprint,
+            key_id,
+        })
+    }
+
+    /// Insert a `signing_keys` row from already-generated `material`, on any
+    /// executor (the pool for `create_key`, or a `&mut *tx` for `rotate_key`
+    /// so the insert rolls back with the rest of the rotation).
+    async fn insert_key_row<'e, E>(
+        exec: E,
+        id: Uuid,
+        req: &CreateKeyRequest,
+        material: &GeneratedKeyMaterial,
+        is_active: bool,
+        rotated_from: Option<Uuid>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        sqlx::query!(
+            r#"
+            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,
+                public_key_pem, private_key_enc, algorithm, uid_name, uid_email, is_active,
+                created_at, created_by, rotated_from)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            "#,
+            id,
+            req.repository_id,
+            req.name,
+            material.key_type,
+            material.fingerprint,
+            material.key_id,
+            material.public_key_pem,
+            material.private_key_enc,
+            req.algorithm,
+            req.uid_name,
+            req.uid_email,
+            is_active,
+            now,
+            req.created_by,
+            rotated_from,
+        )
+        .execute(exec)
+        .await?;
+        Ok(())
     }
 
     async fn generate_rsa_key(&self, algorithm: &str) -> Result<(String, String, String, String)> {
@@ -650,12 +706,28 @@ impl SigningService {
         Ok(config)
     }
 
-    /// Rotate a key: create new key, link it, deactivate old one.
+    /// Rotate a key: mint an active successor, repoint the repo config at it,
+    /// and deactivate the old key — all atomically.
+    ///
+    /// The whole transition runs in a single transaction, serialized on the
+    /// old key's row with `SELECT ... FOR UPDATE`. Concurrent rotations of the
+    /// same key therefore serialize: the first commit deactivates the old key,
+    /// and every later contender re-reads it as inactive and returns
+    /// `409 Conflict` instead of minting a second active key. Operations are
+    /// ordered create-new-active → repoint-config → deactivate-old so the repo
+    /// config never references an inactive key, and any failure before commit
+    /// rolls the whole thing back (the repo stays on its current active key).
+    ///
+    /// The slow CPU keygen runs *before* the transaction so no DB lock is held
+    /// across it.
     pub async fn rotate_key(
         &self,
         old_key_id: Uuid,
         user_id: Option<Uuid>,
     ) -> Result<SigningKeyPublic> {
+        // Read the old key (off the pool) to derive the successor's params.
+        // The authoritative active-state check happens on the locked row
+        // inside the transaction below.
         let old_key = sqlx::query_as!(
             SigningKey,
             "SELECT * FROM signing_keys WHERE id = $1",
@@ -665,57 +737,106 @@ impl SigningService {
         .await?
         .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
 
-        // Create new key with same params
-        let new_key = self
-            .create_key(CreateKeyRequest {
-                repository_id: old_key.repository_id,
-                name: build_rotated_key_name(&old_key.name),
-                key_type: old_key.key_type.clone(),
-                algorithm: old_key.algorithm.clone(),
-                uid_name: old_key.uid_name.clone(),
-                uid_email: old_key.uid_email.clone(),
-                created_by: user_id,
-            })
-            .await?;
+        // Successor inherits the old key's parameters.
+        let req = CreateKeyRequest {
+            repository_id: old_key.repository_id,
+            name: build_rotated_key_name(&old_key.name),
+            key_type: old_key.key_type.clone(),
+            algorithm: old_key.algorithm.clone(),
+            uid_name: old_key.uid_name.clone(),
+            uid_email: old_key.uid_email.clone(),
+            created_by: user_id,
+        };
 
-        // Mark old key as rotated
+        // Slow keygen OUTSIDE the transaction — no lock held across it.
+        let material = self.generate_key_material(&req).await?;
+        let new_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut tx = self.db.begin().await?;
+
+        // Serialize per-key: lock the old key row, then re-assert it is still
+        // active. Concurrent rotations block here until the winner commits,
+        // then observe is_active=false and bail out (idempotency guard).
+        let locked = sqlx::query_as!(
+            SigningKey,
+            "SELECT * FROM signing_keys WHERE id = $1 FOR UPDATE",
+            old_key_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
+
+        if !locked.is_active {
+            return Err(AppError::Conflict(
+                "Signing key is not active (already rotated or revoked); rotate the current active key"
+                    .to_string(),
+            ));
+        }
+
+        // (1) Insert the new ACTIVE key, with rotated_from set at insert time.
+        Self::insert_key_row(
+            &mut *tx,
+            new_id,
+            &req,
+            &material,
+            true,
+            Some(old_key_id),
+            now,
+        )
+        .await?;
+
+        // (2) Repoint the signing config to the new (active) key — the config
+        //     now references an active key. Guarded on the old id so a
+        //     concurrent winner's repoint is never clobbered.
+        if let Some(repo_id) = locked.repository_id {
+            sqlx::query!(
+                "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE repository_id = $2 AND signing_key_id = $3",
+                new_id,
+                repo_id,
+                old_key_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // (3) Deactivate the old key LAST.
         sqlx::query!(
             "UPDATE signing_keys SET is_active = false WHERE id = $1",
             old_key_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
 
-        // Update rotated_from on new key
-        sqlx::query!(
-            "UPDATE signing_keys SET rotated_from = $1 WHERE id = $2",
-            old_key_id,
-            new_key.id,
-        )
-        .execute(&self.db)
-        .await?;
-
-        // Update signing config to point to new key
-        if let Some(repo_id) = old_key.repository_id {
-            sqlx::query!(
-                "UPDATE repository_signing_config SET signing_key_id = $1, updated_at = NOW() WHERE repository_id = $2 AND signing_key_id = $3",
-                new_key.id,
-                repo_id,
-                old_key_id,
-            )
-            .execute(&self.db)
-            .await?;
-        }
-
-        self.audit_key_action(
+        // (4) Audit rows (created successor + rotated old) inside the txn.
+        Self::audit_key_action_exec(&mut *tx, new_id, "created", user_id, None).await?;
+        Self::audit_key_action_exec(
+            &mut *tx,
             old_key_id,
             "rotated",
             user_id,
-            Some(serde_json::json!({"new_key_id": new_key.id.to_string()})),
+            Some(serde_json::json!({"new_key_id": new_id.to_string()})),
         )
         .await?;
 
-        Ok(new_key)
+        tx.commit().await?;
+
+        Ok(SigningKeyPublic {
+            id: new_id,
+            repository_id: req.repository_id,
+            name: req.name,
+            key_type: material.key_type,
+            fingerprint: Some(material.fingerprint),
+            key_id: Some(material.key_id),
+            public_key_pem: material.public_key_pem,
+            algorithm: req.algorithm,
+            uid_name: req.uid_name,
+            uid_email: req.uid_email,
+            expires_at: None,
+            is_active: true,
+            created_at: now,
+            last_used_at: None,
+        })
     }
 
     async fn audit_key_action(
@@ -725,6 +846,21 @@ impl SigningService {
         user_id: Option<Uuid>,
         details: Option<serde_json::Value>,
     ) -> Result<()> {
+        Self::audit_key_action_exec(&self.db, key_id, action, user_id, details).await
+    }
+
+    /// Executor-generic audit insert, usable on the pool or a `&mut *tx` so
+    /// rotation's audit rows commit atomically with the key changes.
+    async fn audit_key_action_exec<'e, E>(
+        exec: E,
+        key_id: Uuid,
+        action: &str,
+        user_id: Option<Uuid>,
+        details: Option<serde_json::Value>,
+    ) -> Result<()>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
         sqlx::query!(
             "INSERT INTO signing_key_audit (signing_key_id, action, performed_by, details) VALUES ($1, $2, $3, $4)",
             key_id,
@@ -732,7 +868,7 @@ impl SigningService {
             user_id,
             details,
         )
-        .execute(&self.db)
+        .execute(exec)
         .await?;
         Ok(())
     }
@@ -1642,6 +1778,378 @@ mod tests {
         assert_eq!(
             build_rotated_key_name("debian-stable (rotated)"),
             "debian-stable (rotated) (rotated)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rotate_key atomicity / serialization (#2534)
+    //
+    // DB-backed: require a live Postgres via DATABASE_URL (a throwaway,
+    // migrated instance — NOT the rig DB). Each test scopes its assertions to
+    // a freshly-created repository, so they are safe to run against a shared
+    // test database without cross-test interference.
+    // -----------------------------------------------------------------------
+
+    const TEST_PASSPHRASE: &str = "signing-rotation-atomic-test-passphrase";
+
+    async fn rotation_test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    fn rotation_test_service(pool: sqlx::PgPool) -> SigningService {
+        SigningService {
+            db: pool,
+            encryption: CredentialEncryption::from_passphrase(TEST_PASSPHRASE),
+        }
+    }
+
+    async fn seed_repo(pool: &sqlx::PgPool) -> Uuid {
+        let key = format!("rotate-test-{}", Uuid::new_v4().as_simple());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'debian', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository")
+    }
+
+    /// Create an active RSA key for `repo` and point its signing config at it.
+    async fn seed_active_key(service: &SigningService, repo: Uuid) -> Uuid {
+        let key = service
+            .create_key(CreateKeyRequest {
+                repository_id: Some(repo),
+                name: "rotate-test-key".to_string(),
+                key_type: "rsa".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create_key failed");
+        service
+            .update_signing_config(repo, Some(key.id), true, false, false)
+            .await
+            .expect("update_signing_config failed");
+        key.id
+    }
+
+    /// Count `is_active=true` keys for a repository.
+    async fn active_key_ids(pool: &sqlx::PgPool, repo: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM signing_keys WHERE repository_id = $1 AND is_active = true",
+        )
+        .bind(repo)
+        .fetch_all(pool)
+        .await
+        .expect("active key query failed")
+    }
+
+    // (#2534.1) 5 concurrent rotations of the same key must yield exactly ONE
+    // new active key + four 409 Conflict, with no orphaned active keys.
+    #[tokio::test]
+    async fn rotate_concurrent_yields_single_active_key() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = std::sync::Arc::new(rotation_test_service(pool.clone()));
+        let repo = seed_repo(&pool).await;
+        let key_a = seed_active_key(&service, repo).await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let svc = service.clone();
+            set.spawn(async move { svc.rotate_key(key_a, None).await });
+        }
+
+        let mut ok = 0usize;
+        let mut conflicts = 0usize;
+        while let Some(res) = set.join_next().await {
+            match res.expect("join failed") {
+                Ok(_) => ok += 1,
+                Err(AppError::Conflict(_)) => conflicts += 1,
+                Err(other) => panic!("unexpected error from rotate_key: {other:?}"),
+            }
+        }
+
+        assert_eq!(ok, 1, "exactly one rotation should succeed");
+        assert_eq!(conflicts, 4, "the other four should return 409 Conflict");
+
+        // Exactly one active key remains for the repo, and it is the successor.
+        let active = active_key_ids(&pool, repo).await;
+        assert_eq!(
+            active.len(),
+            1,
+            "exactly one active key must remain (no orphans); got {active:?}"
+        );
+        assert_ne!(active[0], key_a, "the old key must not be the active one");
+
+        // Exactly one successor points back at A (only the winner inserted).
+        let successors: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM signing_keys WHERE repository_id = $1 AND rotated_from = $2",
+        )
+        .bind(repo)
+        .bind(key_a)
+        .fetch_all(&pool)
+        .await
+        .expect("successor query failed");
+        assert_eq!(successors.len(), 1, "only one successor should be minted");
+        assert_eq!(successors[0], active[0]);
+
+        // Config points at the active successor.
+        let cfg = service
+            .get_signing_config(repo)
+            .await
+            .expect("get_signing_config failed")
+            .expect("config must exist");
+        assert_eq!(cfg.signing_key_id, Some(active[0]));
+
+        // Old key is deactivated.
+        assert!(!service.get_key(key_a).await.unwrap().is_active);
+    }
+
+    // (#2534.2) Polling the active key concurrently with a chain of rotations
+    // must never observe None (no transient no-active-key window).
+    #[tokio::test]
+    async fn rotate_leaves_no_none_window_under_concurrent_poll() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = std::sync::Arc::new(rotation_test_service(pool.clone()));
+        let repo = seed_repo(&pool).await;
+        let key_a = seed_active_key(&service, repo).await;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Poller: hammer get_active_key_for_repo; assert never None.
+        let poll_svc = service.clone();
+        let poll_stop = stop.clone();
+        let poller = tokio::spawn(async move {
+            let mut polls = 0u32;
+            while !poll_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let active = poll_svc
+                    .get_active_key_for_repo(repo)
+                    .await
+                    .expect("get_active_key_for_repo failed");
+                assert!(
+                    active.is_some(),
+                    "observed a no-active-key window during rotation"
+                );
+                polls += 1;
+            }
+            polls
+        });
+
+        // Rotator: chain 10 sequential rotations (each rotates the current key).
+        let mut current = key_a;
+        for _ in 0..10 {
+            current = service
+                .rotate_key(current, None)
+                .await
+                .expect("rotate_key failed")
+                .id;
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let polls = poller.await.expect("poller panicked");
+        assert!(polls > 0, "poller should have run at least once");
+
+        // Exactly one active key at the end.
+        assert_eq!(active_key_ids(&pool, repo).await.len(), 1);
+    }
+
+    // (#2534.3) A rotation that rolls back mid-transition must leave state
+    // unchanged (no permanent no-active-key state). We mirror the in-txn
+    // create->repoint->deactivate sequence and roll it back, then assert the
+    // repo is untouched.
+    #[tokio::test]
+    async fn rotate_rollback_leaves_state_unchanged() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_a = seed_active_key(&service, repo).await;
+
+        let material = service
+            .generate_key_material(&CreateKeyRequest {
+                repository_id: Some(repo),
+                name: "rollback-successor".to_string(),
+                key_type: "rsa".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("generate_key_material failed");
+        let new_id = Uuid::new_v4();
+        let req = CreateKeyRequest {
+            repository_id: Some(repo),
+            name: "rollback-successor".to_string(),
+            key_type: "rsa".to_string(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: None,
+            uid_email: None,
+            created_by: None,
+        };
+
+        {
+            let mut tx = pool.begin().await.expect("begin failed");
+            SigningService::insert_key_row(
+                &mut *tx,
+                new_id,
+                &req,
+                &material,
+                true,
+                Some(key_a),
+                Utc::now(),
+            )
+            .await
+            .expect("insert_key_row failed");
+            sqlx::query!(
+                "UPDATE repository_signing_config SET signing_key_id = $1 WHERE repository_id = $2 AND signing_key_id = $3",
+                new_id,
+                repo,
+                key_a,
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("repoint failed");
+            sqlx::query!(
+                "UPDATE signing_keys SET is_active = false WHERE id = $1",
+                key_a,
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("deactivate failed");
+            // Drop without commit -> rollback.
+            tx.rollback().await.expect("rollback failed");
+        }
+
+        // State must be exactly as seeded: A active, config->A, no successor.
+        let active = active_key_ids(&pool, repo).await;
+        assert_eq!(active, vec![key_a], "A must still be the only active key");
+        let cfg = service
+            .get_signing_config(repo)
+            .await
+            .unwrap()
+            .expect("config must exist");
+        assert_eq!(cfg.signing_key_id, Some(key_a));
+        assert!(
+            service.get_key(new_id).await.is_err(),
+            "successor must not persist"
+        );
+    }
+
+    // (#2534.4) A single legitimate rotation produces the expected end state.
+    #[tokio::test]
+    async fn rotate_single_produces_expected_end_state() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_a = seed_active_key(&service, repo).await;
+
+        let new_key = service
+            .rotate_key(key_a, None)
+            .await
+            .expect("rotate failed");
+
+        // Old inactive, new active.
+        assert!(!service.get_key(key_a).await.unwrap().is_active);
+        assert!(new_key.is_active);
+
+        // Successor recorded rotated_from = A.
+        let rotated_from: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT rotated_from FROM signing_keys WHERE id = $1",
+        )
+        .bind(new_key.id)
+        .fetch_one(&pool)
+        .await
+        .expect("rotated_from query failed");
+        assert_eq!(rotated_from, Some(key_a));
+
+        // Config repointed to the successor.
+        let cfg = service.get_signing_config(repo).await.unwrap().unwrap();
+        assert_eq!(cfg.signing_key_id, Some(new_key.id));
+
+        // Audit rows: created (for successor) + rotated (for old) present.
+        let created: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit WHERE signing_key_id = $1 AND action = 'created'",
+        )
+        .bind(new_key.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(created, 1, "successor should have a 'created' audit row");
+        let rotated: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit WHERE signing_key_id = $1 AND action = 'rotated'",
+        )
+        .bind(key_a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rotated, 1, "old key should have a 'rotated' audit row");
+    }
+
+    // (#2534.5) Rotating an already-rotated (now inactive) key returns 409 and
+    // mints no further key.
+    #[tokio::test]
+    async fn rotate_already_rotated_key_returns_conflict() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_a = seed_active_key(&service, repo).await;
+
+        // First rotation succeeds.
+        service
+            .rotate_key(key_a, None)
+            .await
+            .expect("first rotate failed");
+        let total_after_first: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_keys WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Second rotation of the now-inactive A returns Conflict, no new key.
+        let err = service
+            .rotate_key(key_a, None)
+            .await
+            .expect_err("second rotate of inactive key should fail");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "expected 409 Conflict, got {err:?}"
+        );
+
+        let total_after_second: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_keys WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            total_after_first, total_after_second,
+            "a rejected rotation must not mint a key"
         );
     }
 }
