@@ -3413,6 +3413,44 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// artifact body (up to gigabytes for some package formats) into
 /// memory before responding — see #895 / #737 for the OOM-kill history
 /// that prompted the streaming migration.
+/// Record one proxy-served download into the `proxy_download_statistics`
+/// sibling table (#2270 / #2260), keyed via the `proxy_cache_artifacts` catalog
+/// row for `(repo_id, path)`. This is the counting decision #2505 deferred until
+/// a stable id existed for proxy-cached objects — the catalog now supplies it.
+///
+/// HEAD-guarded (a metadata probe serves no bytes, so it never counts, mirroring
+/// [`crate::services::artifact_service::record_download`]'s `is_head` short
+/// circuit) and best-effort: a failure is logged at `debug`, never surfaced to
+/// the client, and never records when no catalog row exists for the path.
+pub(crate) async fn record_proxy_download(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    if ctx.is_head {
+        return;
+    }
+    let ip = ctx.client_ip.map(|i| i.to_string());
+    if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
+        &state.db,
+        repo_id,
+        path,
+        ctx.user_id,
+        ip.as_deref(),
+        ctx.user_agent.as_deref(),
+    )
+    .await
+    {
+        tracing::debug!(
+            repo_id = %repo_id,
+            path = %path,
+            error = %e,
+            "best-effort proxy download record failed"
+        );
+    }
+}
+
 pub async fn try_remote_or_virtual_download(
     state: &crate::api::SharedState,
     repo: &RepoInfo,
@@ -3442,6 +3480,9 @@ pub async fn try_remote_or_virtual_download(
             opts.content_disposition_filename,
         )
         .await?;
+        // #2270/#2260: count the proxy serve now that the catalog gives the
+        // cached object a stable id. HEAD-guarded + best-effort inside.
+        record_proxy_download(state, repo.id, opts.upstream_path, ctx).await;
         return Ok(Some(response));
     }
 

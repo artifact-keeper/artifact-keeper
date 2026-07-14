@@ -27,6 +27,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
 use crate::services::metrics_service::record_proxy_cache_lookup;
+use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
     Coordinator, HydrationCoordinator, StreamHandle, StreamHeaders,
 };
@@ -191,6 +192,16 @@ struct CacheMetadataTemplate {
     /// other streaming caller (deb/pypi/plain-Remote), which gate only on the
     /// upstream Content-Length.
     expected_checksum: Option<String>,
+    /// Owning repository id for the persisted proxy-cache catalog row
+    /// (#2218/#2270). Threaded so the streaming Commit arm can upsert
+    /// `proxy_cache_artifacts` with the TRUE `bytes_written`/checksum.
+    repository_id: Uuid,
+    /// Logical cache path (e.g. `simple/click/click-8.0.0-...whl`) — the
+    /// catalog's `(repository_id, path)` identity.
+    path: String,
+    /// Upstream URL the body was fetched from, recorded on the catalog row when
+    /// known (nullable).
+    upstream_url: Option<String>,
 }
 
 /// Bound on the in-flight chunk queue between the upstream-reader task
@@ -1069,13 +1080,19 @@ impl CacheStore {
 /// for cache writes, so writes target the global default backend exactly as
 /// before (#1278).
 pub(crate) struct CachePersister {
+    /// DB handle used to write the persisted proxy-cache catalog row
+    /// (`proxy_cache_artifacts`, #2218/#2270) transactionally with the sidecar
+    /// commit. This is a SEPARATE table from `artifacts`; the format-handler
+    /// serve path never reads it, so it cannot re-open the #1278 doubled-prefix
+    /// 500 (which was caused by an `artifacts` row, removed under #1280).
+    db: PgPool,
     storage: Arc<StorageService>,
 }
 
 impl CachePersister {
-    /// Construct a `CachePersister` over the given storage handle.
-    pub(crate) fn new(storage: Arc<StorageService>) -> Self {
-        Self { storage }
+    /// Construct a `CachePersister` over the given DB + storage handles.
+    pub(crate) fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+        Self { db, storage }
     }
 
     /// Cache artifact content and its metadata sidecar (buffered path).
@@ -1183,8 +1200,34 @@ impl CachePersister {
         // versions stay in `artifacts` and continue to surface in
         // listings until they are explicitly invalidated, which is a
         // graceful degradation, not a regression.
-        let _ = repository_id;
-        let _ = artifact_path;
+        //
+        // #2218/#2270: what DID change is that the object is now also recorded
+        // in the SEPARATE `proxy_cache_artifacts` catalog (never `artifacts`),
+        // using the true `content.len()` + checksum computed above. Best-effort
+        // and transactionally sibling to the sidecar write: a catalog failure
+        // logs at `warn` and never fails the cache write or the client, exactly
+        // like the sidecar-failure semantics. The format-handler serve path
+        // never reads this catalog, so #1278 cannot recur.
+        if let Err(e) = proxy_catalog::upsert(
+            &self.db,
+            repository_id,
+            artifact_path,
+            cache_key,
+            metadata_key,
+            content.len() as i64,
+            Some(metadata.checksum_sha256.as_str()),
+            metadata.content_type.as_deref(),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                cache_key = %cache_key,
+                error = %e,
+                "proxy-cache catalog upsert failed (buffered write); accounting may \
+                 undercount this object until it is re-cached or lazily backfilled"
+            );
+        }
 
         tracing::debug!(
             "Cached artifact {} ({} bytes, expires at {})",
@@ -1234,6 +1277,10 @@ impl CachePersister {
         expected_len: Option<u64>,
     ) -> BoxStream<'static, Result<Bytes>> {
         let storage = Arc::clone(&self.storage);
+        // Cloned into the spawned writer task so the streaming Commit arm can
+        // upsert the persisted proxy-cache catalog row (#2218/#2270) with the
+        // TRUE `bytes_written`/checksum, once the tee has fully written the body.
+        let catalog_db = self.db.clone();
 
         // Channel for chunks flowing reader -> writer. mpsc to keep order
         // (broadcast would let storage skip chunks under backpressure,
@@ -1329,6 +1376,35 @@ impl CachePersister {
                                     );
                                 } else {
                                     invalidate_proxy_metadata_lru(&metadata_key).await;
+                                    // #2218/#2270: persist the catalog row now
+                                    // that the sidecar is committed, using the
+                                    // TRUE streamed byte count + checksum. Best-
+                                    // effort and sibling to the sidecar write —
+                                    // a failure logs at `warn` and never touches
+                                    // the client stream. Written to the SEPARATE
+                                    // `proxy_cache_artifacts` table, never
+                                    // `artifacts`, so #1278 cannot recur.
+                                    if let Err(e) = proxy_catalog::upsert(
+                                        &catalog_db,
+                                        template.repository_id,
+                                        &template.path,
+                                        &cache_key_for_writer,
+                                        &metadata_key,
+                                        metadata.size_bytes,
+                                        Some(metadata.checksum_sha256.as_str()),
+                                        metadata.content_type.as_deref(),
+                                        template.upstream_url.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            cache_key = %cache_key_for_writer,
+                                            error = %e,
+                                            "proxy-cache catalog upsert failed (streaming \
+                                             commit); accounting may undercount this object \
+                                             until re-cache or lazy backfill"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -2166,7 +2242,7 @@ impl ProxyService {
             .expect("Failed to create HTTP client");
 
         let cache_store = CacheStore::new(Arc::clone(&storage));
-        let cache_persister = CachePersister::new(Arc::clone(&storage));
+        let cache_persister = CachePersister::new(db.clone(), Arc::clone(&storage));
         let upstream_client = UpstreamClient::new(db.clone(), http_client);
         // #1631 layer 1/3: select the single-flight coordinator from config.
         // Defaults to the in-process buffered coordinator; multi-replica
@@ -2894,13 +2970,71 @@ impl ProxyService {
             )
             .await?
         {
-            StreamingCacheReadOutcome::Hit(result) => Ok(Some(result)),
+            StreamingCacheReadOutcome::Hit(result) => {
+                // #2218/#2270 back-compat: a cache hit on an object cached
+                // BEFORE this catalog existed has no `proxy_cache_artifacts`
+                // row. Fire-and-forget a best-effort backfill from the sidecar
+                // so pre-upgrade objects self-heal into the catalog on first
+                // access (also bumps `last_accessed_at`). Never blocks the
+                // serve; `ON CONFLICT DO NOTHING` leaves authoritative rows
+                // untouched.
+                self.spawn_lazy_catalog_backfill(repo.id, cache_path, cache_key, metadata_key);
+                Ok(Some(result))
+            }
             StreamingCacheReadOutcome::NegativeHit => Err(AppError::NotFound(format!(
                 "Upstream returned 404 (negative-cached) for {}",
                 cache_path
             ))),
             StreamingCacheReadOutcome::Miss => Ok(None),
         }
+    }
+
+    /// Fire-and-forget lazy backfill of the persisted proxy-cache catalog from a
+    /// cache-hit's sidecar (#2218/#2270 back-compat). Spawned so it never blocks
+    /// the serve; reads the metadata sidecar for the true size/checksum and
+    /// upserts `ON CONFLICT DO NOTHING` (existing authoritative rows only get
+    /// their `last_accessed_at` bumped). Any failure is logged at `debug` and
+    /// swallowed — a warm-hit backfill is strictly best-effort.
+    fn spawn_lazy_catalog_backfill(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        cache_key: &str,
+        metadata_key: &str,
+    ) {
+        let db = self.db.clone();
+        let storage = Arc::clone(&self.storage);
+        let path = path.to_string();
+        let cache_key = cache_key.to_string();
+        let metadata_key = metadata_key.to_string();
+        tokio::spawn(async move {
+            let data = match storage.get(&metadata_key).await {
+                Ok(data) => data,
+                Err(_) => return, // sidecar gone -> nothing to backfill from
+            };
+            let metadata: CacheMetadata = match serde_json::from_slice(&data) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            if let Err(e) = proxy_catalog::backfill_from_sidecar(
+                &db,
+                repository_id,
+                &path,
+                &cache_key,
+                &metadata_key,
+                metadata.size_bytes,
+                Some(metadata.checksum_sha256.as_str()),
+                metadata.content_type.as_deref(),
+            )
+            .await
+            {
+                tracing::debug!(
+                    cache_key = %cache_key,
+                    error = %e,
+                    "best-effort proxy-cache catalog backfill on hit failed"
+                );
+            }
+        });
     }
 
     /// Streaming sibling of [`Self::read_cached_with_revalidation`] (#1611
@@ -3087,6 +3221,11 @@ impl ProxyService {
                 last_modified: None,
                 ttl_secs: cache_ttl,
                 expected_checksum,
+                // #2218/#2270: identity for the persisted catalog row, written
+                // by the streaming Commit arm with the true byte count/checksum.
+                repository_id: repo.id,
+                path: cache_path.to_string(),
+                upstream_url: Some(full_url.clone()),
             },
             upstream.content_length,
         );
@@ -3273,6 +3412,19 @@ impl ProxyService {
     /// identical, so it lives here as a single source of truth (#1618 S3).
     async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
         let keys = CacheKeys::derive(repo_key, path)?;
+        // #2218/#2270: drop the persisted catalog row for the purged object so
+        // storage accounting does not drift after an eviction. Keyed on the
+        // physical content storage key (the catalog's `storage_key`). Best-
+        // effort: a catalog delete failure must not abort the blob eviction,
+        // which is the primary invalidation contract.
+        if let Err(e) = proxy_catalog::delete_by_key(&self.db, &keys.content).await {
+            tracing::warn!(
+                storage_key = %keys.content,
+                error = %e,
+                "proxy-cache catalog delete failed on invalidate; accounting may \
+                 transiently overcount until the next reconcile"
+            );
+        }
         self.cache_store.invalidate(&keys).await
     }
 
@@ -7885,7 +8037,23 @@ mod tests {
         metadata_key: String,
         template: CacheMetadataTemplate,
     ) -> BoxStream<'static, Result<Bytes>> {
-        CachePersister::new(storage).tee_stream(upstream, cache_key, metadata_key, template, None)
+        // The catalog upsert on the Commit arm is a best-effort spawned task; a
+        // lazy pool over an unreachable DB just makes it log-and-swallow, which
+        // is exactly the persister's failure contract, so the tee behaviour
+        // under test (client bytes, sidecar, self-heal) is unaffected.
+        CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream,
+            cache_key,
+            metadata_key,
+            template,
+            None,
+        )
+    }
+
+    /// Lazy, never-connecting pool for tests that exercise the persister without
+    /// a live DB; the best-effort catalog write logs and returns.
+    fn test_catalog_pool() -> PgPool {
+        sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap()
     }
 
     fn template() -> CacheMetadataTemplate {
@@ -7895,6 +8063,9 @@ mod tests {
             last_modified: None,
             ttl_secs: 60,
             expected_checksum: None,
+            repository_id: Uuid::nil(),
+            path: "test/path".to_string(),
+            upstream_url: None,
         }
     }
 
@@ -8076,7 +8247,7 @@ mod tests {
 
         // Upstream advertises 100 bytes but only delivers 11.
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
-        let mut client = CachePersister::new(storage).tee_stream(
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream,
             "cache-key".to_string(),
             "meta-key".to_string(),
@@ -8114,7 +8285,7 @@ mod tests {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
-        let mut client = CachePersister::new(storage).tee_stream(
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream,
             "cache-key".to_string(),
             "meta-key".to_string(),
@@ -8228,6 +8399,9 @@ mod tests {
             last_modified: None,
             ttl_secs: 7200,
             expected_checksum: None,
+            repository_id: Uuid::nil(),
+            path: "test/path".to_string(),
+            upstream_url: None,
         };
         let mut client = tee_upstream_to_cache(
             upstream,
@@ -8439,7 +8613,7 @@ mod tests {
         etag: Option<String>,
     ) -> Vec<(String, Bytes)> {
         let storage = Arc::new(RealStorageService::new(backend.clone()));
-        let persister = CachePersister::new(storage);
+        let persister = CachePersister::new(test_catalog_pool(), storage);
         persister
             .write_buffered(
                 "proxy-cache/repo/path/__content__",

@@ -1415,11 +1415,24 @@ impl RepositoryService {
 
     /// Get repository storage usage
     pub async fn get_storage_usage(&self, repo_id: Uuid) -> Result<i64> {
+        // #2218: single-repo sibling of the list-endpoint UNION. Proxy-cached
+        // bytes come from the `proxy_cache_artifacts` catalog (remote repos have
+        // no `artifacts` rows); legacy `proxy-cache/%` leftovers in `artifacts`
+        // are excluded so a backfilled object is never double counted. Hosted
+        // repos are unaffected (no proxy keys, empty catalog).
         let usage = sqlx::query_scalar!(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "usage!"
-            FROM artifacts
-            WHERE repository_id = $1 AND is_deleted = false
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
+            FROM (
+                SELECT size_bytes AS bytes
+                  FROM artifacts
+                 WHERE repository_id = $1 AND is_deleted = false
+                   AND storage_key NOT LIKE 'proxy-cache/%'
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM proxy_cache_artifacts
+                 WHERE repository_id = $1
+            ) t
             "#,
             repo_id
         )

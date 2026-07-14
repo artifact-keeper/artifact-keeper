@@ -1790,10 +1790,25 @@ pub async fn list_repositories(
     let repo_ids: Vec<Uuid> = repos.iter().map(|r| r.id).collect();
     let storage_map: std::collections::HashMap<Uuid, i64> = if !repo_ids.is_empty() {
         sqlx::query_as::<_, (Uuid, i64)>(
+            // #2218: per-repo storage now UNIONs the persisted proxy-cache
+            // catalog so remote (proxy) repos count their cached bytes (was 0 —
+            // proxy objects carry no `artifacts` row since #1280). Legacy
+            // pre-#1280 `proxy-cache/%` leftovers in `artifacts` are excluded so
+            // an object that is also lazily backfilled into the catalog is not
+            // summed twice. Hosted repos have no `proxy-cache/%` keys and an
+            // empty catalog, so their totals are unchanged.
             r#"
-            SELECT repository_id, COALESCE(SUM(size_bytes), 0)::BIGINT
-            FROM artifacts
-            WHERE repository_id = ANY($1) AND is_deleted = false
+            SELECT repository_id, COALESCE(SUM(bytes), 0)::BIGINT
+            FROM (
+                SELECT repository_id, size_bytes AS bytes
+                  FROM artifacts
+                 WHERE repository_id = ANY($1) AND is_deleted = false
+                   AND storage_key NOT LIKE 'proxy-cache/%'
+                UNION ALL
+                SELECT repository_id, size_bytes AS bytes
+                  FROM proxy_cache_artifacts
+                 WHERE repository_id = ANY($1)
+            ) t
             GROUP BY repository_id
             "#,
         )
