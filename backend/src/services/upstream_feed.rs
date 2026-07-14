@@ -2,14 +2,18 @@
 //!
 //! A proxy can only bound metadata staleness with TTLs unless the upstream
 //! says when packages change. Some upstreams do: npm publishes a public
-//! CouchDB-style replication feed (`replicate.npmjs.com/_changes`) streaming
-//! package-change events. This module is a small, generic subscription
-//! framework over such feeds:
+//! replication feed (`replicate.npmjs.com/_changes`) streaming package-change
+//! events. That endpoint answers to a CouchDB-*shaped* `_changes` document but
+//! is not CouchDB — it self-identifies as `engine: npm-replicate` and rejects
+//! the CouchDB long-poll controls (`feed=`, `timeout=`, `since=now`) with 400.
+//! It supports only a plain numeric `since` cursor plus `limit`. This module is
+//! a small, generic subscription framework over such feeds:
 //!
 //! * [`UpstreamFeedAdapter`] — per-ecosystem driver turning one upstream feed
 //!   into a normalised stream of [`FeedEvent`]s. First implementation:
-//!   [`NpmReplicationFeedAdapter`] (long-poll `_changes`, resuming from the
-//!   last sequence number).
+//!   [`NpmReplicationFeedAdapter`], which polls `_changes?since=<n>&limit=<n>`,
+//!   resuming from the last sequence number and bootstrapping the head cursor
+//!   from the feed root's `update_seq` on first enablement.
 //! * [`FeedAction`] — pluggable per-event action. Default:
 //!   [`PackumentInvalidationAction`], which drops the cached computed
 //!   packuments for the changed package in every remote npm repository
@@ -35,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -60,16 +65,32 @@ pub const NPM_REPLICATION_FEED_DEFAULT_URL: &str = "https://replicate.npmjs.com/
 /// invalidated by it.
 const NPM_PUBLIC_REGISTRY_HOSTS: &[&str] = &["registry.npmjs.org", "registry.npmjs.com"];
 
-/// Server-side wait bound for one long-poll round (CouchDB `timeout=`, ms).
-const NPM_FEED_LONGPOLL_TIMEOUT_MS: u64 = 30_000;
+/// Client-side bound per request. The feed answers immediately (no long-poll),
+/// so this only needs to cover connect + a small body; a black-holed feed
+/// cannot hang the consumer loop past it.
+const NPM_FEED_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Client-side bound per poll request: the server-side long-poll timeout
-/// plus headroom for connect + body, so a black-holed feed cannot hang the
-/// consumer loop.
-const NPM_FEED_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Cap on change rows per poll, bounding memory and per-batch work.
+/// Cap on change rows per poll, bounding memory and per-batch work. Also the
+/// signal for backlog draining: a batch that returns this many rows is treated
+/// as "full" (more likely waiting), so the consumer re-polls immediately
+/// instead of pacing.
 const NPM_FEED_BATCH_LIMIT: u32 = 200;
+
+/// Ceiling on a feed/bootstrap response body. The feed answers with tiny JSON
+/// (a `limit`-bounded row list, or the root's counters), but `bytes_stream()`
+/// is otherwise unbounded — AK has been OOM'd before by an unbounded upstream
+/// metadata body (#1607/#1608), so cap generously and error over it rather
+/// than buffer without limit.
+const FEED_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Idle-poll cadence for the npm adapter: with no server-side long-poll, an
+/// empty answer must be paced or the consumer would poll npm at ~1 Hz forever.
+const NPM_FEED_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default idle-poll cadence for adapters that don't override it. Matches the
+/// original 1 s empty-batch pacing, so a future true-long-poll adapter (which
+/// blocks server-side and rarely returns instantly) keeps the old behaviour.
+const DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Backoff bounds for feed poll failures.
 const FEED_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -88,11 +109,6 @@ const LEADER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// the overlap is harmless while it lasts.
 const LEADER_TERM: Duration = Duration::from_secs(300);
 
-/// Pacing for adapters that return an empty batch instantly (a well-behaved
-/// long-poll blocks server-side instead). Protects against a hot loop when a
-/// feed answers immediately with no changes.
-const EMPTY_BATCH_PACING: Duration = Duration::from_secs(1);
-
 /// A normalised package-change event from an upstream feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedEvent {
@@ -105,6 +121,10 @@ pub struct FeedBatch {
     pub events: Vec<FeedEvent>,
     /// Opaque resume cursor; `None` when the feed did not advance it.
     pub last_seq: Option<String>,
+    /// The poll came back at the adapter's row limit, so more changes are
+    /// almost certainly waiting. The consumer re-polls such a batch
+    /// immediately (backlog drain) instead of pacing to the idle interval.
+    pub batch_was_full: bool,
 }
 
 /// Ecosystem-specific driver turning one upstream change feed into
@@ -113,17 +133,31 @@ pub struct FeedBatch {
 pub trait UpstreamFeedAdapter: Send + Sync {
     /// Stable identity for leadership locking and resume-state keying.
     fn feed_key(&self) -> &str;
-    /// The cursor to poll with when no persisted cursor exists. Feeds whose
-    /// natural start is their genesis (CouchDB `since=0`) MUST return a
-    /// head sentinel here: replaying an upstream's full change history on
-    /// first enablement would invalidate live cache entries for hours while
-    /// delivering no freshness benefit.
-    fn initial_cursor(&self) -> Option<String> {
-        None
+    /// The cursor to start from when no cursor has been persisted yet.
+    ///
+    /// Feeds whose bare start is their genesis MUST resolve a head cursor here
+    /// and return `Err` if they cannot: replaying an upstream's full change
+    /// history on first enablement would invalidate live cache entries for
+    /// hours while delivering no freshness benefit. `Ok(None)` is reserved for
+    /// adapters where polling from an absent cursor is *itself* safe (e.g. a
+    /// true long-poll that begins at the head); the consumer treats `Err` like
+    /// an unreadable persisted cursor — back off and retry, never genesis.
+    ///
+    /// This is async (unlike a static sentinel) because head discovery is a
+    /// network round-trip for feeds like npm-replicate, which dropped
+    /// CouchDB's `since=now`.
+    async fn bootstrap_cursor(&self) -> Result<Option<String>> {
+        Ok(None)
     }
-    /// Run one poll round, resuming after `since` when provided. Long-poll
-    /// adapters block server-side until changes exist or their timeout
-    /// lapses, so an empty batch is a normal outcome, not an error.
+    /// How long to wait after a partial/empty poll before polling again. Feeds
+    /// with no server-side long-poll answer instantly, so without pacing the
+    /// consumer would hot-loop; adapters that block server-side can keep the
+    /// [`DEFAULT_IDLE_POLL_INTERVAL`].
+    fn idle_poll_interval(&self) -> Duration {
+        DEFAULT_IDLE_POLL_INTERVAL
+    }
+    /// Run one poll round, resuming after `since` when provided. An empty
+    /// batch is a normal outcome (no changes since the cursor), not an error.
     async fn poll(&self, since: Option<&str>) -> Result<FeedBatch>;
 }
 
@@ -152,6 +186,44 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     (current * 2).min(max)
 }
 
+/// Log level for a persistent-failure event, by consecutive-failure count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedLogLevel {
+    Debug,
+    Warn,
+}
+
+/// A transient blip should not spam warnings, but a feed that fails forever
+/// must be visible. Keep the first two consecutive failures at debug, escalate
+/// the 3rd to warn, then re-warn roughly every 10th so a permanently-broken
+/// feed stays in the logs without flooding them.
+fn failure_log_level(consecutive: u32) -> FeedLogLevel {
+    if consecutive == 3 || (consecutive > 3 && consecutive % 10 == 0) {
+        FeedLogLevel::Warn
+    } else {
+        FeedLogLevel::Debug
+    }
+}
+
+/// Log one feed failure at the level [`failure_log_level`] dictates, carrying
+/// the consecutive count so an operator can see a feed is stuck, not blipping.
+fn log_feed_failure(feed_key: &str, consecutive: u32, err: &AppError, msg: &str) {
+    match failure_log_level(consecutive) {
+        FeedLogLevel::Warn => tracing::warn!(
+            feed = feed_key,
+            consecutive_failures = consecutive,
+            error = %err,
+            "{msg}"
+        ),
+        FeedLogLevel::Debug => tracing::debug!(
+            feed = feed_key,
+            consecutive_failures = consecutive,
+            error = %err,
+            "{msg}"
+        ),
+    }
+}
+
 /// True when `upstream_url` points at a host the public npm replication feed
 /// covers.
 pub fn upstream_covered_by_npm_feed(upstream_url: &str) -> bool {
@@ -176,9 +248,9 @@ async fn cancelled_within(cancel: &CancellationToken, period: Duration) -> bool 
 // npm replication feed adapter
 // ---------------------------------------------------------------------------
 
-/// Wire shape of a CouchDB `_changes` response. Tolerant by construction:
-/// unknown fields are ignored and every field is optional, so a feed
-/// re-shape degrades to skipped rows or a missing cursor, never a panic.
+/// Wire shape of a `_changes` response. Tolerant by construction: unknown
+/// fields are ignored and every field is optional, so a feed re-shape degrades
+/// to skipped rows or a missing cursor, never a panic.
 #[derive(Debug, Deserialize)]
 struct ChangesResponse {
     #[serde(default)]
@@ -195,8 +267,17 @@ struct ChangeRow {
     seq: Option<serde_json::Value>,
 }
 
-/// Normalise a CouchDB sequence value: classic feeds use numbers, newer ones
-/// opaque strings. Anything else is treated as "no cursor" rather than
+/// Wire shape of the feed root (`GET /`), used only to read the current head
+/// sequence for bootstrap. `replicate.npmjs.com` returns
+/// `{"db_name":"registry","engine":"npm-replicate","update_seq":<n>,…}`.
+#[derive(Debug, Deserialize)]
+struct FeedRoot {
+    #[serde(default)]
+    update_seq: Option<serde_json::Value>,
+}
+
+/// Normalise a sequence value: the feed uses numbers, other/newer feeds may
+/// use opaque strings. Anything else is treated as "no cursor" rather than
 /// guessed at.
 fn seq_to_string(value: &serde_json::Value) -> Option<String> {
     match value {
@@ -206,8 +287,62 @@ fn seq_to_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Adapter for npm's public replication feed (CouchDB `_changes`,
-/// long-poll mode).
+/// Read and JSON-parse a response body under [`FEED_MAX_BODY_BYTES`]. Frames
+/// are accumulated one at a time so an unbounded/hostile body errors out
+/// (feeding normal backoff) instead of OOM-ing the consumer. reqwest transport
+/// errors are stripped of their URL via `without_url()` so a credentialed
+/// `NPM_UPSTREAM_FEED_URL` (`user:pass@host`) can never surface in a log line.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<T> {
+    let mut stream = response.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            AppError::Internal(format!("{what} body unreadable: {}", e.without_url()))
+        })?;
+        if buf.len().saturating_add(chunk.len()) > FEED_MAX_BODY_BYTES {
+            return Err(AppError::Internal(format!(
+                "{what} body exceeded the {FEED_MAX_BODY_BYTES}-byte limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf)
+        .map_err(|e| AppError::Internal(format!("{what} body unparseable: {e}")))
+}
+
+/// Derive the feed root URL (for bootstrap) from a configured `_changes` URL
+/// by stripping a single trailing `_changes` path segment and any query. A
+/// non-standard base path (`…/couch/registry/_changes`) is preserved
+/// (`…/couch/registry/`); a trailing slash on the configured URL is handled.
+/// Only a `_changes` tail is stripped, so an unexpected URL is left intact
+/// rather than mangled.
+fn feed_root_url(feed_url: &Url) -> Result<Url> {
+    let mut root = feed_url.clone();
+    root.set_query(None);
+    root.set_fragment(None);
+    {
+        let mut segs = root.path_segments_mut().map_err(|()| {
+            AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base"))
+        })?;
+        // Drop the empty segment a trailing slash leaves behind first.
+        segs.pop_if_empty();
+    }
+    let ends_in_changes = root.path_segments().and_then(|s| s.last()) == Some("_changes");
+    if ends_in_changes {
+        root.path_segments_mut()
+            .map_err(|()| AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base")))?
+            .pop()
+            .push("");
+    }
+    Ok(root)
+}
+
+/// Adapter for npm's public replication feed. Polls `_changes?since&limit`
+/// (the `npm-replicate` engine rejects CouchDB's long-poll controls) and
+/// bootstraps the head cursor from the feed root's `update_seq`.
 pub struct NpmReplicationFeedAdapter {
     http: reqwest::Client,
     url: Url,
@@ -262,40 +397,67 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
         &self.feed_key
     }
 
-    /// CouchDB understands `since=now` on long-poll feeds: start at the
-    /// current head instead of replaying the registry's entire history.
-    fn initial_cursor(&self) -> Option<String> {
-        Some("now".to_string())
+    fn idle_poll_interval(&self) -> Duration {
+        NPM_FEED_IDLE_POLL_INTERVAL
+    }
+
+    /// Read the current head sequence from the feed root (`GET /`). The engine
+    /// dropped CouchDB's `since=now`, so the head must be discovered over the
+    /// network. Any failure — unreachable root, non-2xx, oversized/unparseable
+    /// body, or a root without a usable `update_seq` — is an `Err`: the
+    /// consumer must back off and retry, never fall through to polling from
+    /// genesis (replaying the registry's entire change history).
+    async fn bootstrap_cursor(&self) -> Result<Option<String>> {
+        let root = feed_root_url(&self.url)?;
+        let response = self.http.get(root).send().await.map_err(|e| {
+            AppError::Internal(format!(
+                "npm feed bootstrap request failed: {}",
+                e.without_url()
+            ))
+        })?;
+        if !response.status().is_success() {
+            return Err(AppError::Internal(format!(
+                "npm feed bootstrap answered {}",
+                response.status()
+            )));
+        }
+        let root: FeedRoot = read_json_capped(response, "npm feed bootstrap").await?;
+        let seq = root
+            .update_seq
+            .as_ref()
+            .and_then(seq_to_string)
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "npm feed bootstrap: root response had no usable update_seq".to_string(),
+                )
+            })?;
+        Ok(Some(seq))
     }
 
     async fn poll(&self, since: Option<&str>) -> Result<FeedBatch> {
         let mut url = self.url.clone();
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("feed", "longpoll");
-            query.append_pair("timeout", &NPM_FEED_LONGPOLL_TIMEOUT_MS.to_string());
             query.append_pair("limit", &NPM_FEED_BATCH_LIMIT.to_string());
             if let Some(since) = since {
                 query.append_pair("since", since);
             }
         }
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("npm feed request failed: {e}")))?;
+        let response = self.http.get(url).send().await.map_err(|e| {
+            AppError::Internal(format!("npm feed request failed: {}", e.without_url()))
+        })?;
         if !response.status().is_success() {
             return Err(AppError::Internal(format!(
                 "npm feed answered {}",
                 response.status()
             )));
         }
-        let changes: ChangesResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::Internal(format!("npm feed body unreadable: {e}")))?;
+        let changes: ChangesResponse = read_json_capped(response, "npm feed").await?;
 
+        // A poll returning the full row limit signals a backlog is draining.
+        // Measured against the raw row count (pre-filter), since the limit
+        // applies to change rows, not to the packages we keep.
+        let batch_was_full = changes.results.len() as u32 >= NPM_FEED_BATCH_LIMIT;
         // The response-level cursor is authoritative; fall back to the last
         // row's seq when a re-shaped feed omits it.
         let last_seq = changes
@@ -313,11 +475,15 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
             .results
             .into_iter()
             .filter_map(|row| row.id)
-            // Design documents are CouchDB internals, not packages.
+            // Design documents are feed internals, not packages.
             .filter(|id| !id.is_empty() && !id.starts_with("_design/"))
             .map(|package| FeedEvent { package })
             .collect();
-        Ok(FeedBatch { events, last_seq })
+        Ok(FeedBatch {
+            events,
+            last_seq,
+            batch_was_full,
+        })
     }
 }
 
@@ -442,7 +608,6 @@ pub struct FeedConsumer {
     leader_term: Duration,
     backoff_initial: Duration,
     backoff_max: Duration,
-    empty_batch_pacing: Duration,
 }
 
 impl FeedConsumer {
@@ -463,12 +628,12 @@ impl FeedConsumer {
             leader_term: LEADER_TERM,
             backoff_initial: FEED_BACKOFF_INITIAL,
             backoff_max: FEED_BACKOFF_MAX,
-            empty_batch_pacing: EMPTY_BATCH_PACING,
         }
     }
 
     /// Test seam: shrink the loop intervals so tests converge in
-    /// milliseconds instead of seconds.
+    /// milliseconds instead of seconds. Idle pacing is adapter-driven
+    /// (`idle_poll_interval`), so the scripted adapter shrinks that.
     #[cfg(test)]
     fn with_timings(
         mut self,
@@ -476,13 +641,11 @@ impl FeedConsumer {
         leader_term: Duration,
         backoff_initial: Duration,
         backoff_max: Duration,
-        empty_batch_pacing: Duration,
     ) -> Self {
         self.leader_retry = leader_retry;
         self.leader_term = leader_term;
         self.backoff_initial = backoff_initial;
         self.backoff_max = backoff_max;
-        self.empty_batch_pacing = empty_batch_pacing;
         self
     }
 
@@ -492,6 +655,10 @@ impl FeedConsumer {
     pub async fn run(self) {
         let feed_key = self.adapter.feed_key().to_string();
         let lock_object = lease_object_id(&feed_key);
+        // Consecutive feed-connectivity failures (poll + bootstrap), tracked
+        // across leadership terms so a permanently-broken feed escalates to
+        // warn even though each bootstrap failure ends its term.
+        let mut failures: u32 = 0;
         loop {
             if self.cancel.is_cancelled() {
                 return;
@@ -528,7 +695,7 @@ impl FeedConsumer {
                 feed = feed_key,
                 "upstream feed consumer: leadership acquired"
             );
-            self.consume_for_one_term(&feed_key).await;
+            self.consume_for_one_term(&feed_key, &mut failures).await;
             // Step down at term end (or cancellation) and re-contend, so a
             // lock silently lost to a dead connection converges back to a
             // single consumer within one term instead of persisting until
@@ -541,18 +708,38 @@ impl FeedConsumer {
     }
 
     /// One leadership term: poll, apply actions, persist the cursor; back
-    /// off on feed errors. Returns at term end or on cancellation.
-    async fn consume_for_one_term(&self, feed_key: &str) {
+    /// off on feed errors. Returns at term end or on cancellation. `failures`
+    /// is the run-wide consecutive-failure counter driving log escalation.
+    async fn consume_for_one_term(&self, feed_key: &str, failures: &mut u32) {
         let mut since = match self.state.load(feed_key).await {
             Ok(Some(seq)) => Some(seq),
-            // First enablement: start at the adapter's head sentinel, never
-            // at the feed's genesis.
-            Ok(None) => self.adapter.initial_cursor(),
+            // First enablement: bootstrap the head cursor from the adapter.
+            Ok(None) => match self.adapter.bootstrap_cursor().await {
+                Ok(cursor) => {
+                    Self::note_recovery(feed_key, failures);
+                    cursor
+                }
+                Err(e) => {
+                    // Bootstrap failed. Falling through to a bare poll could
+                    // replay the upstream's entire history from genesis, so
+                    // sit the term out exactly as for an unreadable cursor;
+                    // the next leader retries the bootstrap.
+                    *failures += 1;
+                    log_feed_failure(
+                        feed_key,
+                        *failures,
+                        &e,
+                        "upstream feed head bootstrap failed; skipping this term",
+                    );
+                    cancelled_within(&self.cancel, self.leader_retry).await;
+                    return;
+                }
+            },
             Err(e) => {
-                // Falling back to the head sentinel here would silently skip
+                // Falling back to a bootstrap here would silently skip
                 // everything between the stored cursor and now, and the next
-                // save would overwrite the stored cursor with the head. Sit
-                // the term out; the next leader retries the load.
+                // save would overwrite the stored cursor. Sit the term out;
+                // the next leader retries the load.
                 tracing::warn!(
                     feed = feed_key,
                     error = %e,
@@ -576,6 +763,9 @@ impl FeedConsumer {
             };
             match polled {
                 Ok(batch) => {
+                    // A successful poll means the feed is reachable and speaking
+                    // the expected dialect; clear any failure streak.
+                    Self::note_recovery(feed_key, failures);
                     if !batch.events.is_empty() && !self.action.apply(&batch.events).await {
                         // Advancing the cursor past an unapplied batch would
                         // lose those invalidations for good; hold position
@@ -591,36 +781,36 @@ impl FeedConsumer {
                         backoff = next_backoff(backoff, self.backoff_max);
                         continue;
                     }
-                    let advanced = batch.last_seq.is_some() && batch.last_seq != since;
+                    let advanced =
+                        batch.last_seq.is_some() && batch.last_seq.as_deref() != since.as_deref();
                     if let Some(last_seq) = batch.last_seq {
-                        // A failed save only loses the resume position:
-                        // consumption continues, and a later leader replays
-                        // from the last persisted cursor (idempotent).
-                        if let Err(e) = self.state.save(feed_key, &last_seq).await {
-                            tracing::warn!(
-                                feed = feed_key,
-                                error = %e,
-                                "upstream feed cursor not persisted; continuing"
-                            );
+                        if advanced {
+                            // Only persist when the cursor actually moved: idle
+                            // rounds echo the same seq, and re-upserting it every
+                            // poll is pure DB churn. A failed save only loses the
+                            // resume position — consumption continues and a later
+                            // leader replays from the last persisted cursor
+                            // (idempotent).
+                            if let Err(e) = self.state.save(feed_key, &last_seq).await {
+                                tracing::warn!(
+                                    feed = feed_key,
+                                    error = %e,
+                                    "upstream feed cursor not persisted; continuing"
+                                );
+                            }
                         }
                         since = Some(last_seq);
                     }
                     if advanced {
                         backoff = self.backoff_initial;
                     }
-                    if batch.events.is_empty() {
-                        // Idle round, whether or not the seq moved (a poll can
-                        // advance the cursor with every row filtered out):
-                        // gentle fixed pacing so an instant-empty feed cannot
-                        // hot-loop.
-                        if cancelled_within(&self.cancel, self.empty_batch_pacing).await {
-                            return;
-                        }
-                    } else if !advanced {
+                    if !batch.events.is_empty() && !advanced {
                         // Events but no cursor progress: the next poll would
                         // replay the same batch (e.g. a feed re-shape whose
-                        // seqs we cannot normalise). Escalating backoff
-                        // bounds the replay rate; actions stay idempotent.
+                        // seqs we cannot normalise). Escalating backoff bounds
+                        // the replay rate; actions stay idempotent. Checked
+                        // before the drain path so a full-but-stalled batch
+                        // still backs off rather than hot-looping.
                         tracing::warn!(
                             feed = feed_key,
                             backoff_secs = backoff.as_secs_f32(),
@@ -631,14 +821,29 @@ impl FeedConsumer {
                             return;
                         }
                         backoff = next_backoff(backoff, self.backoff_max);
+                    } else if batch.batch_was_full {
+                        // The poll hit the row limit: a backlog is draining
+                        // (e.g. after downtime). Re-poll immediately instead of
+                        // pacing, but still honour cancellation promptly.
+                        if self.cancel.is_cancelled() {
+                            return;
+                        }
+                    } else {
+                        // Partial or empty batch — steady state. Pace the next
+                        // poll to the adapter's idle interval so a feed that
+                        // answers instantly cannot hot-loop.
+                        if cancelled_within(&self.cancel, self.adapter.idle_poll_interval()).await {
+                            return;
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        feed = feed_key,
-                        error = %e,
-                        backoff_secs = backoff.as_secs_f32(),
-                        "upstream feed poll failed; backing off"
+                    *failures += 1;
+                    log_feed_failure(
+                        feed_key,
+                        *failures,
+                        &e,
+                        "upstream feed poll failed; backing off",
                     );
                     if cancelled_within(&self.cancel, backoff).await {
                         return;
@@ -646,6 +851,18 @@ impl FeedConsumer {
                     backoff = next_backoff(backoff, self.backoff_max);
                 }
             }
+        }
+    }
+
+    /// Clear the failure streak, logging recovery at info when a streak ended.
+    fn note_recovery(feed_key: &str, failures: &mut u32) {
+        if *failures > 0 {
+            tracing::info!(
+                feed = feed_key,
+                failures_before_recovery = *failures,
+                "upstream feed recovered"
+            );
+            *failures = 0;
         }
     }
 }
@@ -690,10 +907,9 @@ pub fn spawn_npm_feed_consumer(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
-
-    use std::collections::VecDeque;
 
     use crate::services::cluster_lock::{ErroringClusterLock, InMemoryClusterLock};
 
@@ -745,6 +961,55 @@ mod tests {
         assert!(!upstream_covered_by_npm_feed(""));
     }
 
+    #[test]
+    fn failure_log_level_keeps_first_two_at_debug_then_escalates() {
+        // Blips (1-2) stay quiet; the 3rd escalates to warn; the intervening
+        // failures drop back to debug; every ~10th re-warns so a permanently
+        // broken feed stays visible without flooding.
+        assert_eq!(failure_log_level(0), FeedLogLevel::Debug);
+        assert_eq!(failure_log_level(1), FeedLogLevel::Debug);
+        assert_eq!(failure_log_level(2), FeedLogLevel::Debug);
+        assert_eq!(failure_log_level(3), FeedLogLevel::Warn);
+        for n in 4..=9 {
+            assert_eq!(failure_log_level(n), FeedLogLevel::Debug, "n={n}");
+        }
+        assert_eq!(failure_log_level(10), FeedLogLevel::Warn);
+        for n in 11..=19 {
+            assert_eq!(failure_log_level(n), FeedLogLevel::Debug, "n={n}");
+        }
+        assert_eq!(failure_log_level(20), FeedLogLevel::Warn);
+        assert_eq!(failure_log_level(30), FeedLogLevel::Warn);
+    }
+
+    #[test]
+    fn feed_root_url_strips_trailing_changes_segment() {
+        let root = |u: &str| feed_root_url(&Url::parse(u).unwrap()).unwrap().to_string();
+        assert_eq!(
+            root("https://replicate.npmjs.com/_changes"),
+            "https://replicate.npmjs.com/"
+        );
+        assert_eq!(
+            root("https://replicate.npmjs.com/_changes/"),
+            "https://replicate.npmjs.com/",
+            "a trailing slash must not defeat the strip"
+        );
+        assert_eq!(
+            root("https://replicate.npmjs.com/_changes?since=5&limit=200"),
+            "https://replicate.npmjs.com/",
+            "the query is dropped for the root request"
+        );
+        assert_eq!(
+            root("https://mirror.example/couch/registry/_changes"),
+            "https://mirror.example/couch/registry/",
+            "a non-standard base path is preserved"
+        );
+        assert_eq!(
+            root("https://mirror.example/feed"),
+            "https://mirror.example/feed",
+            "a URL that does not end in _changes is left intact"
+        );
+    }
+
     // -- npm adapter (wiremock) -------------------------------------------------
 
     fn changes_body(rows: serde_json::Value, last_seq: serde_json::Value) -> serde_json::Value {
@@ -752,22 +1017,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn npm_adapter_polls_longpoll_and_parses_batch() {
+    async fn npm_adapter_polls_with_since_and_limit_only() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/_changes"))
-            .and(query_param("feed", "longpoll"))
             .and(query_param("since", "41"))
             .and(query_param("limit", NPM_FEED_BATCH_LIMIT.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(changes_body(
                 serde_json::json!([
                     {"seq": 42, "id": "lodash", "changes": [{"rev": "1-x"}]},
-                    {"seq": 43, "id": "@scope/pkg", "changes": [{"rev": "2-y"}]},
+                    // A deletion row (unpublish) carries a normal id and must
+                    // still invalidate the cached packument.
+                    {"seq": 1783991, "id": "gone-pkg", "changes": [{"rev": "2-y"}], "deleted": true},
                 ]),
-                serde_json::json!(43),
+                serde_json::json!(1783991),
             )))
             .mount(&server)
             .await;
@@ -783,11 +1049,27 @@ mod tests {
                     package: "lodash".to_string()
                 },
                 FeedEvent {
-                    package: "@scope/pkg".to_string()
+                    package: "gone-pkg".to_string()
                 },
             ]
         );
-        assert_eq!(batch.last_seq, Some("43".to_string()));
+        assert_eq!(batch.last_seq, Some("1783991".to_string()));
+        assert!(!batch.batch_was_full, "two rows is far below the limit");
+
+        // The npm-replicate engine 400s on CouchDB's long-poll controls; the
+        // adapter must never send them.
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let query = requests[0].url.query().unwrap_or("");
+        assert!(!query.contains("feed="), "must not send feed=; got {query}");
+        assert!(
+            !query.contains("timeout="),
+            "must not send timeout=; got {query}"
+        );
+        assert!(
+            !query.contains("since=now"),
+            "must not send since=now; got {query}"
+        );
     }
 
     #[tokio::test]
@@ -814,10 +1096,70 @@ mod tests {
 
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 1);
+        let query = requests[0].url.query().unwrap_or("");
         assert!(
-            !requests[0].url.query().unwrap_or("").contains("since"),
-            "the first poll must not send a since cursor; got {:?}",
-            requests[0].url.query()
+            !query.contains("since"),
+            "a bare poll must send no since cursor; got {query}"
+        );
+        assert!(
+            query.contains("limit"),
+            "every poll still bounds the batch with limit; got {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_adapter_handles_past_head_since_echo() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A `since` past the head returns no rows and echoes the requested
+        // seq back as last_seq (verified live). That is an idle round, not an
+        // error, and the cursor does not move.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_changes"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(changes_body(serde_json::json!([]), serde_json::json!(999))),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
+        let batch = adapter.poll(Some("999")).await.expect("poll");
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.last_seq, Some("999".to_string()));
+        assert!(!batch.batch_was_full);
+    }
+
+    #[tokio::test]
+    async fn npm_adapter_flags_a_full_batch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let rows: Vec<serde_json::Value> = (0..NPM_FEED_BATCH_LIMIT)
+            .map(|i| serde_json::json!({"seq": i + 1, "id": format!("pkg-{i}")}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/_changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(changes_body(
+                serde_json::json!(rows),
+                serde_json::json!(NPM_FEED_BATCH_LIMIT),
+            )))
+            .mount(&server)
+            .await;
+
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
+        let batch = adapter.poll(Some("0")).await.expect("poll");
+        assert_eq!(batch.events.len(), NPM_FEED_BATCH_LIMIT as usize);
+        assert!(
+            batch.batch_was_full,
+            "a poll returning the row limit must flag a draining backlog"
         );
     }
 
@@ -865,6 +1207,7 @@ mod tests {
             Some("13-jkl".to_string()),
             "with no response-level cursor, the last row seq is the fallback"
         );
+        assert!(!batch.batch_was_full);
     }
 
     #[tokio::test]
@@ -905,6 +1248,154 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn npm_adapter_bootstraps_head_from_root_update_seq() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The real root shape, update_seq as a number.
+        let numeric = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "db_name": "registry",
+                "engine": "npm-replicate",
+                "doc_count": 4_205_429u64,
+                "update_seq": 119_510_110u64,
+            })))
+            .mount(&numeric)
+            .await;
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", numeric.uri()))
+                .expect("adapter");
+        assert_eq!(
+            adapter.bootstrap_cursor().await.expect("bootstrap"),
+            Some("119510110".to_string()),
+            "the head cursor must come from the root update_seq, never genesis"
+        );
+
+        // Some feeds carry an opaque string update_seq; tolerate it too.
+        let stringy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "update_seq": "500-opaque",
+            })))
+            .mount(&stringy)
+            .await;
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", stringy.uri()))
+                .expect("adapter");
+        assert_eq!(
+            adapter.bootstrap_cursor().await.expect("bootstrap"),
+            Some("500-opaque".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_adapter_bootstrap_failure_is_an_error_never_genesis() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Root reachable but carrying no usable update_seq: must be an Err so
+        // the consumer backs off rather than polling from seq 0.
+        let no_seq = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"db_name": "registry"})),
+            )
+            .mount(&no_seq)
+            .await;
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", no_seq.uri()))
+                .expect("adapter");
+        assert!(
+            adapter.bootstrap_cursor().await.is_err(),
+            "a root without update_seq must fail bootstrap, not start from genesis"
+        );
+
+        // Root 5xx: also an Err.
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", down.uri()))
+                .expect("adapter");
+        assert!(
+            adapter.bootstrap_cursor().await.is_err(),
+            "a 5xx root must fail bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_adapter_rejects_oversized_bodies() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A body past FEED_MAX_BODY_BYTES must error (feeding backoff), never
+        // buffer without bound.
+        let server = MockServer::start().await;
+        let oversized = vec![b' '; FEED_MAX_BODY_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/_changes"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let adapter =
+            NpmReplicationFeedAdapter::from_url_unchecked(&format!("{}/_changes", server.uri()))
+                .expect("adapter");
+        assert!(
+            adapter.poll(Some("1")).await.is_err(),
+            "an over-cap body must be rejected, not buffered unbounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_adapter_errors_never_leak_credentials() {
+        // reqwest's Error Display includes the request URL verbatim, userinfo
+        // and all. An operator can configure a credentialed feed URL, so both
+        // the poll and bootstrap error paths must scrub it via without_url().
+        // Port 1 is never listening → an immediate transport error.
+        let adapter = NpmReplicationFeedAdapter::from_url_unchecked(
+            "http://feeduser:sup3rsecret@127.0.0.1:1/_changes",
+        )
+        .expect("adapter");
+
+        let poll_msg = adapter
+            .poll(Some("1"))
+            .await
+            .expect_err("poll must fail against a dead port")
+            .to_string();
+        assert!(
+            !poll_msg.contains("sup3rsecret"),
+            "password leaked in poll error: {poll_msg}"
+        );
+        assert!(
+            !poll_msg.contains("feeduser"),
+            "username leaked in poll error: {poll_msg}"
+        );
+
+        let boot_msg = adapter
+            .bootstrap_cursor()
+            .await
+            .expect_err("bootstrap must fail against a dead port")
+            .to_string();
+        assert!(
+            !boot_msg.contains("sup3rsecret"),
+            "password leaked in bootstrap error: {boot_msg}"
+        );
+        assert!(
+            !boot_msg.contains("feeduser"),
+            "username leaked in bootstrap error: {boot_msg}"
+        );
+    }
+
     #[test]
     fn npm_adapter_rejects_invalid_urls() {
         assert!(NpmReplicationFeedAdapter::new("not a url").is_err());
@@ -934,15 +1425,36 @@ mod tests {
         assert!(NpmReplicationFeedAdapter::new(NPM_REPLICATION_FEED_DEFAULT_URL).is_ok());
     }
 
-    #[test]
-    fn npm_adapter_bootstraps_at_the_feed_head() {
+    #[tokio::test]
+    #[ignore = "hits the live npm replication feed"]
+    async fn npm_adapter_live_bootstrap_and_poll_smoke() {
+        // Proves the fix against reality: bootstrap the head from the real
+        // root, then poll once from that head. Run manually:
+        //   cargo test --lib npm_adapter_live_bootstrap_and_poll_smoke -- --ignored --nocapture
         let adapter =
             NpmReplicationFeedAdapter::new(NPM_REPLICATION_FEED_DEFAULT_URL).expect("adapter");
-        assert_eq!(
-            adapter.initial_cursor().as_deref(),
-            Some("now"),
-            "first enablement must start at the feed head, not replay the \
-             registry's entire change history from seq 0"
+        let cursor = adapter
+            .bootstrap_cursor()
+            .await
+            .expect("live bootstrap must succeed")
+            .expect("live feed must yield a head cursor");
+        assert!(
+            cursor.parse::<u64>().is_ok(),
+            "npm-replicate head cursor is numeric; got {cursor}"
+        );
+        let batch = adapter
+            .poll(Some(&cursor))
+            .await
+            .expect("live poll must succeed");
+        assert!(
+            batch.last_seq.is_some(),
+            "a live poll must carry a resume cursor"
+        );
+        println!(
+            "live npm-replicate: head={cursor} events={} last_seq={:?} full={}",
+            batch.events.len(),
+            batch.last_seq,
+            batch.batch_was_full
         );
     }
 
@@ -950,28 +1462,49 @@ mod tests {
 
     struct ScriptedAdapter {
         feed_key: String,
-        initial_cursor: Option<String>,
+        bootstrap_cursor: Option<String>,
+        bootstrap_fails: AtomicBool,
+        idle: Duration,
         polls: Mutex<VecDeque<Result<FeedBatch>>>,
         sinces: Mutex<Vec<Option<String>>>,
     }
 
     impl ScriptedAdapter {
-        fn new(polls: Vec<Result<FeedBatch>>) -> Arc<Self> {
+        fn build(
+            polls: Vec<Result<FeedBatch>>,
+            bootstrap_cursor: Option<String>,
+            bootstrap_fails: bool,
+            idle: Duration,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 feed_key: "test-feed".to_string(),
-                initial_cursor: None,
+                bootstrap_cursor,
+                bootstrap_fails: AtomicBool::new(bootstrap_fails),
+                idle,
                 polls: Mutex::new(polls.into()),
                 sinces: Mutex::new(Vec::new()),
             })
         }
 
-        fn with_initial_cursor(polls: Vec<Result<FeedBatch>>, cursor: &str) -> Arc<Self> {
-            Arc::new(Self {
-                feed_key: "test-feed".to_string(),
-                initial_cursor: Some(cursor.to_string()),
-                polls: Mutex::new(polls.into()),
-                sinces: Mutex::new(Vec::new()),
-            })
+        fn new(polls: Vec<Result<FeedBatch>>) -> Arc<Self> {
+            Self::build(polls, None, false, Duration::from_millis(10))
+        }
+
+        fn with_bootstrap_cursor(polls: Vec<Result<FeedBatch>>, cursor: &str) -> Arc<Self> {
+            Self::build(
+                polls,
+                Some(cursor.to_string()),
+                false,
+                Duration::from_millis(10),
+            )
+        }
+
+        fn with_bootstrap_failure(polls: Vec<Result<FeedBatch>>) -> Arc<Self> {
+            Self::build(polls, None, true, Duration::from_millis(10))
+        }
+
+        fn with_idle(polls: Vec<Result<FeedBatch>>, idle: Duration) -> Arc<Self> {
+            Self::build(polls, None, false, idle)
         }
 
         fn sinces(&self) -> Vec<Option<String>> {
@@ -984,16 +1517,23 @@ mod tests {
         fn feed_key(&self) -> &str {
             &self.feed_key
         }
-        fn initial_cursor(&self) -> Option<String> {
-            self.initial_cursor.clone()
+        fn idle_poll_interval(&self) -> Duration {
+            self.idle
+        }
+        async fn bootstrap_cursor(&self) -> Result<Option<String>> {
+            if self.bootstrap_fails.load(Ordering::SeqCst) {
+                Err(AppError::Internal("scripted bootstrap failure".to_string()))
+            } else {
+                Ok(self.bootstrap_cursor.clone())
+            }
         }
         async fn poll(&self, since: Option<&str>) -> Result<FeedBatch> {
             self.sinces
                 .lock()
                 .unwrap()
                 .push(since.map(|s| s.to_string()));
-            // Once the script is exhausted, behave like an idle long-poll
-            // that returns empty batches (the consumer paces these).
+            // Once the script is exhausted, behave like an idle feed that
+            // returns empty batches (the consumer paces these).
             self.polls
                 .lock()
                 .unwrap()
@@ -1076,6 +1616,14 @@ mod tests {
                 })
                 .collect(),
             last_seq: Some(last_seq.to_string()),
+            batch_was_full: false,
+        })
+    }
+
+    fn full_batch(packages: &[&str], last_seq: &str) -> Result<FeedBatch> {
+        Ok(FeedBatch {
+            batch_was_full: true,
+            ..batch(packages, last_seq).unwrap()
         })
     }
 
@@ -1091,7 +1639,6 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_millis(10),
             Duration::from_millis(40),
-            Duration::from_millis(10),
         )
     }
 
@@ -1134,7 +1681,8 @@ mod tests {
             wait_until(|| state.get("test-feed") == Some("3".to_string())).await,
             "the cursor must be persisted after each batch"
         );
-        // The second poll must resume from the first batch's cursor.
+        // No persisted cursor and a default (Ok(None)) bootstrap → first poll
+        // sends no since; the second resumes from the first batch's cursor.
         assert_eq!(adapter.sinces()[0], None);
         assert_eq!(adapter.sinces()[1], Some("2".to_string()));
 
@@ -1165,7 +1713,7 @@ mod tests {
         assert_eq!(
             adapter.sinces()[0],
             Some("42".to_string()),
-            "the first poll must resume from the persisted cursor"
+            "the first poll must resume from the persisted cursor (no bootstrap)"
         );
         cancel.cancel();
         handle.await.expect("join");
@@ -1326,8 +1874,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_first_run_polls_from_the_adapters_head_cursor() {
-        let adapter = ScriptedAdapter::with_initial_cursor(vec![batch(&["pkg"], "8")], "now");
+    async fn consumer_first_run_bootstraps_the_head_cursor() {
+        let adapter =
+            ScriptedAdapter::with_bootstrap_cursor(vec![batch(&["pkg"], "8")], "119510110");
         let action = Arc::new(RecordingAction::default());
         let state = Arc::new(MemoryStateStore::default());
         let cancel = CancellationToken::new();
@@ -1346,13 +1895,49 @@ mod tests {
         );
         assert_eq!(
             adapter.sinces()[0].as_deref(),
-            Some("now"),
-            "with no persisted cursor the first poll must use the adapter's \
-             head sentinel"
+            Some("119510110"),
+            "with no persisted cursor the first poll must use the bootstrapped head"
         );
         assert!(
             wait_until(|| state.get("test-feed") == Some("8".to_string())).await,
-            "the first real cursor replaces the sentinel"
+            "the first real cursor replaces the bootstrapped head"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn consumer_skips_the_term_when_bootstrap_fails() {
+        // Mirrors the cursor-load-failure case: a failing head bootstrap must
+        // sit the term out — never poll from genesis — and recover later.
+        let adapter =
+            ScriptedAdapter::with_bootstrap_failure(vec![batch(&["pkg-after-recovery"], "50")]);
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            adapter.sinces().is_empty(),
+            "a failed bootstrap must skip the term, not poll from genesis; got {:?}",
+            adapter.sinces()
+        );
+        assert_eq!(state.get("test-feed"), None, "nothing was persisted");
+
+        // A later term retries the bootstrap and resumes once it succeeds.
+        adapter.bootstrap_fails.store(false, Ordering::SeqCst);
+        assert!(
+            wait_until(|| action.applied() == vec!["pkg-after-recovery"]).await,
+            "consumption resumes once bootstrap recovers; got {:?}",
+            action.applied()
         );
         cancel.cancel();
         handle.await.expect("join");
@@ -1368,6 +1953,7 @@ mod tests {
                 package: "stuck-pkg".to_string(),
             }],
             last_seq: None,
+            batch_was_full: false,
         };
         let adapter = ScriptedAdapter::new(vec![
             Ok(stuck.clone()),
@@ -1456,6 +2042,7 @@ mod tests {
                 Ok(FeedBatch {
                     events: Vec::new(),
                     last_seq: Some(seq.to_string()),
+                    batch_was_full: false,
                 })
             })
             .collect();
@@ -1488,6 +2075,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_drains_full_batches_immediately_but_paces_partial_ones() {
+        // A long idle interval: only immediate draining can consume the full
+        // batches inside the test window. The partial batch that ends the
+        // backlog must then fall back to pacing, so polling stops.
+        let polls = vec![
+            full_batch(&["a"], "1"),
+            full_batch(&["b"], "2"),
+            full_batch(&["c"], "3"),
+            batch(&["d"], "4"),
+        ];
+        let adapter = ScriptedAdapter::with_idle(polls, Duration::from_secs(30));
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        let cancel = CancellationToken::new();
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        );
+        let handle = tokio::spawn(consumer.run());
+
+        assert!(
+            wait_until(|| action.applied() == vec!["a", "b", "c", "d"]).await,
+            "full batches must drain immediately despite the long idle interval; got {:?}",
+            action.applied()
+        );
+        // The partial batch "d" advanced the cursor and then paces at the 30s
+        // idle, so no further poll happens in a short window.
+        let polls_at_pace = adapter.sinces().len();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            adapter.sinces().len(),
+            polls_at_pace,
+            "a partial batch must pace at the idle interval, not keep draining"
+        );
+        cancel.cancel();
+        handle.await.expect("join");
+    }
+
+    #[tokio::test]
     async fn consumer_skips_the_term_when_the_cursor_load_fails() {
         let adapter = ScriptedAdapter::new(vec![batch(&["pkg-after-recovery"], "50")]);
         let action = Arc::new(RecordingAction::default());
@@ -1507,8 +2136,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             adapter.sinces().is_empty(),
-            "an unreadable cursor must skip the term, not resume from the \
-             head sentinel; got {:?}",
+            "an unreadable cursor must skip the term, not resume from a \
+             bootstrapped head; got {:?}",
             adapter.sinces()
         );
         assert_eq!(
@@ -1578,7 +2207,6 @@ mod tests {
             Duration::from_millis(30),
             Duration::from_millis(10),
             Duration::from_millis(40),
-            Duration::from_millis(10),
         );
         let handle = tokio::spawn(consumer.run());
 
