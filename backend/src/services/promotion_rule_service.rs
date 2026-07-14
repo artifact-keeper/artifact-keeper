@@ -614,12 +614,15 @@ impl PromotionRuleService {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> Result<bool> {
+        // #2535: require the signing key to still be active so a signature from
+        // a revoked or rotated-away key does not satisfy the gate.
         let signed: bool = sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS(
                 SELECT 1 FROM signing_key_audit ska
                 JOIN signing_keys sk ON sk.id = ska.signing_key_id
                 WHERE sk.repository_id = $2
+                  AND sk.is_active = true
                   AND ska.action = 'used_for_signing'
                   AND ska.details->>'artifact_id' = $1::TEXT
             )

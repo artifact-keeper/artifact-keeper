@@ -589,7 +589,45 @@ impl SigningService {
         .execute(&self.db)
         .await?;
 
+        // #2535: record that this repository's active signing key attested the
+        // artifacts it covers. The promotion `require_signature` gate looks for
+        // a `used_for_signing` audit row per artifact, but nothing ever wrote
+        // one, so the gate was dead (always fail-closed). Writing the rows here
+        // — at the point the key is actually used to sign the repository's
+        // metadata — makes the gate live.
+        self.record_artifacts_signed(key.id, repo_id).await?;
+
         Ok(Some(signature))
+    }
+
+    /// Record a `used_for_signing` audit row tying `key_id` to every artifact
+    /// in `repo_id`, so the promotion `require_signature` gate can see those
+    /// artifacts as signed (#2535).
+    ///
+    /// Idempotent: a row is inserted only for a (key, artifact) pair that does
+    /// not already have one, so repeated metadata signing (e.g. every repodata
+    /// fetch) does not accumulate duplicate audit rows.
+    async fn record_artifacts_signed(&self, key_id: Uuid, repo_id: Uuid) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO signing_key_audit (signing_key_id, action, details)
+            SELECT $1, 'used_for_signing',
+                   jsonb_build_object('artifact_id', a.id::text)
+            FROM artifacts a
+            WHERE a.repository_id = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM signing_key_audit ska
+                  WHERE ska.signing_key_id = $1
+                    AND ska.action = 'used_for_signing'
+                    AND ska.details->>'artifact_id' = a.id::text
+              )
+            "#,
+        )
+        .bind(key_id)
+        .bind(repo_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     /// Sign data with a specific key.
@@ -2421,5 +2459,77 @@ mod tests {
 
             current = next.id;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2535: sign_data must record a `used_for_signing` audit row per artifact
+    // so the promotion `require_signature` gate is actually satisfiable. The
+    // write is idempotent so repeated metadata signing does not duplicate rows.
+    // -----------------------------------------------------------------------
+
+    async fn seed_artifact(pool: &sqlx::PgPool, repo: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+                (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, repeat('a', 64), 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(format!("pkg-{}.deb", Uuid::new_v4().as_simple()))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    /// Count `used_for_signing` rows for a (key, artifact) pair.
+    async fn used_for_signing_count(pool: &sqlx::PgPool, key_id: Uuid, artifact_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit \
+             WHERE signing_key_id = $1 AND action = 'used_for_signing' \
+               AND details->>'artifact_id' = $2::text",
+        )
+        .bind(key_id)
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("audit count query failed")
+    }
+
+    #[tokio::test]
+    async fn sign_data_records_used_for_signing_idempotently() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_id = seed_active_key(&service, repo).await;
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        // No audit row before the key is ever used.
+        assert_eq!(used_for_signing_count(&pool, key_id, artifact_id).await, 0);
+
+        // Signing the repository's metadata records the artifact as signed.
+        let sig = service
+            .sign_data(repo, b"repomd.xml")
+            .await
+            .expect("sign_data failed");
+        assert!(sig.is_some(), "an active key must produce a signature");
+        assert_eq!(
+            used_for_signing_count(&pool, key_id, artifact_id).await,
+            1,
+            "sign_data must record a used_for_signing row for the artifact"
+        );
+
+        // Signing again must not accumulate duplicate rows.
+        service
+            .sign_data(repo, b"repomd.xml v2")
+            .await
+            .expect("sign_data failed");
+        assert_eq!(
+            used_for_signing_count(&pool, key_id, artifact_id).await,
+            1,
+            "repeated signing must not duplicate the audit row"
+        );
     }
 }
