@@ -1457,6 +1457,7 @@ impl ArtifactService {
         user_id: Option<Uuid>,
         ip_address: Option<String>,
         user_agent: Option<&str>,
+        count_download: bool,
     ) -> Result<(Artifact, BoxStream<'static, Result<Bytes>>)> {
         let (artifact, artifact_info) = self.prepare_download(repository_id, path).await?;
 
@@ -1465,14 +1466,20 @@ impl ArtifactService {
         // matching the buffered `get` path's NotFound contract.
         let body = self.storage.get_stream(&artifact.storage_key).await?;
 
-        self.finish_download(
-            artifact.id,
-            &artifact_info,
-            user_id,
-            ip_address.as_deref(),
-            user_agent,
-        )
-        .await;
+        // `count_download` is false for a HEAD request: it returns identical
+        // headers but serves no body, so it must not write a download-statistics
+        // row (or fire the AfterDownload epilogue) — that would over-count the
+        // metric (#2260 §5). A real GET counts exactly once here.
+        if count_download {
+            self.finish_download(
+                artifact.id,
+                &artifact_info,
+                user_id,
+                ip_address.as_deref(),
+                user_agent,
+            )
+            .await;
+        }
 
         Ok((artifact, body))
     }

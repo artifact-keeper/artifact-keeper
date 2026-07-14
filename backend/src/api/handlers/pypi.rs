@@ -1673,6 +1673,7 @@ async fn serve_file(
                         member.id,
                         &member.storage_location(),
                         filename,
+                        ctx,
                     )
                     .await
                     {
@@ -4210,6 +4211,7 @@ mod tests {
             body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
             content_type: None,
             content_length: len,
+            artifact_id: None,
         }
     }
 
@@ -4323,6 +4325,7 @@ mod tests {
             body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(content.len() as u64),
+            artifact_id: None,
         }
     }
 
@@ -4724,6 +4727,7 @@ mod tests {
                 .boxed(),
             content_type: Some("application/octet-stream".to_string()),
             content_length,
+            artifact_id: None,
         }
     }
 
@@ -7200,6 +7204,7 @@ mod tests {
             body: Box::pin(stream),
             content_type: Some("application/zip".to_string()),
             content_length: Some(data_len),
+            artifact_id: None,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);

@@ -723,7 +723,9 @@ async fn streams_images(
 
 async fn download_image(
     State(state): State<SharedState>,
+    method: axum::http::Method,
     headers: HeaderMap,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -756,6 +758,15 @@ async fn download_image(
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
         .await
         .map_err(|e| e.into_response())?;
+
+    // Record the download exactly once for a real GET (#2260). A HEAD request
+    // returns identical headers but serves no body — axum routes HEAD to this
+    // GET handler — so it must NOT write a download row (guard against the
+    // HEAD over-count in §5). Inline-awaited so the row is committed before the
+    // response is built.
+    if method != axum::http::Method::HEAD {
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
+    }
 
     // Pull the artifact through the repo's configured StorageBackend via
     // `get_stream`. Pre-#1471 the upload path wrote to local disk on the

@@ -766,6 +766,7 @@ async fn download_package(
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
                     &repo,
+                    &ctx,
                     proxy_helpers::DownloadResponseOpts {
                         upstream_path: &upstream_path,
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),

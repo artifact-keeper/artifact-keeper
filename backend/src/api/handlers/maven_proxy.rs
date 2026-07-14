@@ -282,6 +282,8 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         body: stream,
         content_type: None,
         content_length: None,
+        // Remote proxy-cache stream: not our artifact row (#1278), unrecorded.
+        artifact_id: None,
     })
 }
 

@@ -119,6 +119,13 @@ pub struct StreamingFetchResult {
     /// without a length advertised, in which case the outbound response
     /// uses chunked transfer encoding.
     pub content_length: Option<u64>,
+    /// The `artifacts.id` this result was resolved from when it was served
+    /// from a **local** artifact row (hosted / virtual-member local hit).
+    /// `None` for remote pass-through / proxy-cache streams, which are not
+    /// our artifacts and stay unrecorded (#1278). Download-statistics
+    /// recording keys off this field so a local-member serve is counted
+    /// exactly once, at the shared local-serve choke point (#2260).
+    pub artifact_id: Option<Uuid>,
 }
 
 impl From<StreamHandle> for StreamingFetchResult {
@@ -130,6 +137,8 @@ impl From<StreamHandle> for StreamingFetchResult {
             body: handle.body,
             content_type: handle.headers.content_type,
             content_length: handle.headers.content_length,
+            // Remote/cache stream: not a local artifact row, so unrecorded.
+            artifact_id: None,
         }
     }
 }
@@ -2978,6 +2987,8 @@ impl ProxyService {
                 body,
                 content_type: metadata.content_type.clone(),
                 content_length: Some(metadata.size_bytes as u64),
+                // Proxy-cache stream: not our artifact row (#1278), unrecorded.
+                artifact_id: None,
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -9347,6 +9358,7 @@ mod tests {
             body: dummy,
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
+            artifact_id: None,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
