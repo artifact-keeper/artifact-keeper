@@ -1483,6 +1483,23 @@ async fn serve_artifact(
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
+
+                    // #1945: redirect eligible SNAPSHOT blob binaries to a
+                    // presigned URL (records the download before the 302);
+                    // non-blob SNAPSHOT files and filesystem backends stream.
+                    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+                        state,
+                        storage.as_ref(),
+                        path,
+                        &resolved.storage_key,
+                        resolved.id,
+                        ctx,
+                    )
+                    .await
+                    {
+                        return Ok(redirect);
+                    }
+
                     let content = storage
                         .get(&resolved.storage_key)
                         .await
@@ -1711,6 +1728,25 @@ async fn serve_artifact(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+
+    // #1945: offload large hosted blob binaries (.jar/.war/.aar/.zip/.tar.gz/
+    // .jmod) to a presigned S3 redirect instead of streaming them through the
+    // backend process. POM/module/metadata (non-blob extensions) and filesystem
+    // backends fall through to the inline stream below. The helper records the
+    // download before issuing the 302 (count-at-redirect, #2260).
+    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+        state,
+        storage.as_ref(),
+        path,
+        &artifact.storage_key,
+        artifact.id,
+        ctx,
+    )
+    .await
+    {
+        return Ok(redirect);
+    }
+
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
