@@ -289,6 +289,7 @@ async fn rotate_key(
     Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     let new_key = svc.rotate_key(key_id, Some(auth.user_id)).await?;
     Ok(Json(new_key))
@@ -587,6 +588,77 @@ mod tests {
         // handlers enforce, so signing-key management still works.
         let ext = admin_jwt();
         assert!(require_signing_admin(&ext).is_ok());
+    }
+
+    /// Source of an `async fn <name>(...)` handler body in this file, sliced up
+    /// to the next `\nasync fn ` boundary. Shared by the admin-gate regression
+    /// guards so a direct predicate test cannot miss the gate being dropped
+    /// from an individual handler (the exact regression class of #1784/#2513).
+    fn signing_handler_body(name: &str) -> &'static str {
+        let src = include_str!("signing.rs");
+        let start = src
+            .find(&format!("async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} handler must exist"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_rotating_signing_key() {
+        // Regression for #2513: rotate_key previously omitted the admin gate
+        // that create_key, delete_key, revoke_key, and update_repo_signing_config
+        // enforce, letting a non-admin JWT rotate any signing key via
+        // POST /api/v1/signing/keys/{id}/rotate — which deactivates the old key
+        // AND repoints repository_signing_config to a fresh key, moving the repo
+        // trust anchor. rotate_key now calls require_signing_admin(&auth)? first.
+        // (1) sanity: the gate itself rejects a non-admin.
+        let ext = non_admin_jwt();
+        match require_signing_admin(&ext) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "expected 403 Authorization for non-admin rotate, got {:?}",
+                other
+            ),
+        }
+        // (2) load-bearing assertion: pin that `rotate_key` ITSELF calls the
+        // gate. A bare predicate check (1) does NOT catch the gate being dropped
+        // from `rotate_key` — which is exactly the #2513 regression. Assert the
+        // gate appears inside rotate_key's body so removing it fails the suite.
+        assert!(
+            signing_handler_body("rotate_key").contains("require_signing_admin"),
+            "rotate_key MUST call require_signing_admin (admin gate) — #2513 regression guard"
+        );
+    }
+
+    #[test]
+    fn test_admin_allowed_to_rotate_signing_key() {
+        // Legitimate use: an admin passes the same gate, so key rotation still
+        // works for the intended (admin) caller.
+        assert!(require_signing_admin(&admin_jwt()).is_ok());
+    }
+
+    #[test]
+    fn test_every_signing_mutation_handler_requires_admin() {
+        // Uniform-gate guard: every state-changing signing handler must call
+        // require_signing_admin. This is the load-bearing invariant behind both
+        // #1784 (revoke) and #2513 (rotate) — a future mutation added to this
+        // surface cannot silently forget the admin gate without failing here.
+        for name in [
+            "create_key",
+            "delete_key",
+            "revoke_key",
+            "rotate_key",
+            "update_repo_signing_config",
+        ] {
+            assert!(
+                signing_handler_body(name).contains("require_signing_admin"),
+                "{name} MUST call require_signing_admin (admin gate) — CWE-862 regression guard"
+            );
+        }
     }
 
     #[test]
