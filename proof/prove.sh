@@ -81,5 +81,39 @@ OB=$(body GET "/maven/$MVA/$OWNCOORD" "$ATOK")
 echo "   alice PUT $MVA/$OWNCOORD => $OC ; GET => '$OB' (expect 201 + matching bytes)"
 OC2=$(code PUT "/maven/$MVA/$OWNCOORD" "$ATOK" "${OWN}-v2")
 echo "   alice same-repo overwrite PUT again => $OC2 (expect 201, same-repo allowed)"
+
+echo
+echo "== D. READ-LEG sidecars (checksum + metadata) cross-repo =="
+# admin stores a checksum sidecar + a group-level metadata file into MVB (no rows)
+CKSUM="B-CHECKSUM-$SUF"; META="B-PRIVATE-METADATA-$SUF"
+METAPATH="com/secret/app/maven-metadata.xml"
+echo "   [setup] admin PUT $MVB/$COORD.sha1 => $(code PUT "/maven/$MVB/$COORD.sha1" "$TOK" "$CKSUM" "text/plain")"
+echo "   [setup] admin PUT $MVB/$METAPATH => $(code PUT "/maven/$MVB/$METAPATH" "$TOK" "$META" "text/xml")"
+# D1 cross-repo checksum sidecar (maven.rs:907/922)
+CKC=$(code GET "/maven/$MVA/$COORD.sha1" "$ATOK"); CKB=$(body GET "/maven/$MVA/$COORD.sha1" "$ATOK")
+echo "   D1 alice GET $MVA/$COORD.sha1 => HTTP $CKC ; body='$CKB'"
+[ "$CKC" = "200" ] && [ "$CKB" = "$CKSUM" ] && echo "      >>> LEAK: B's checksum bytes" || { [ "$CKC" = "404" ] && echo "      >>> DENIED"; }
+# D2 cross-repo metadata (maven.rs:1299)
+MTC=$(code GET "/maven/$MVA/$METAPATH" "$ATOK"); MTB=$(body GET "/maven/$MVA/$METAPATH" "$ATOK")
+echo "   D2 alice GET $MVA/$METAPATH => HTTP $MTC ; body='$MTB'"
+echo "$MTB" | grep -q "$META" && echo "      >>> LEAK: B's private metadata" || { [ "$MTC" = "404" ] && echo "      >>> DENIED (no B metadata)"; }
+# D3 same-repo checksum still served (computed from alice's OWN row) — no regression
+OWNCK=$(code GET "/maven/$MVA/$OWNCOORD.sha1" "$ATOK")
+echo "   D3 alice GET own $MVA/$OWNCOORD.sha1 => HTTP $OWNCK (expect 200, computed from own row)"
+
+echo
+echo "== E. WRITE soft-delete carve-out =="
+SDCOORD="com/victim/mod/3.0-$SUF/mod-3.0-$SUF.jar"; SDB="VICTIM-BYTES-$SUF"
+echo "   [setup] admin PUT $MVB/$SDCOORD => $(code PUT "/maven/$MVB/$SDCOORD" "$TOK" "$SDB")"
+# soft-delete B's row (physical object persists)
+docker exec "$DBC" psql -U registry -d artifact_registry -tAc \
+  "UPDATE artifacts SET is_deleted=true WHERE storage_key='maven/$SDCOORD';" >/dev/null
+DELCNT=$(docker exec "$DBC" psql -U registry -d artifact_registry -tAc \
+  "SELECT count(*) FROM artifacts WHERE storage_key='maven/$SDCOORD' AND is_deleted=true;")
+echo "   [setup] soft-deleted B rows at key: $DELCNT"
+SDC=$(code PUT "/maven/$MVA/$SDCOORD" "$ATOK" "ALICE-POISON-$SUF")
+echo "   E1 alice PUT colliding $MVA/$SDCOORD (B soft-deleted) => HTTP $SDC"
+[ "$SDC" = "409" ] && echo "      >>> REFUSED (poison-on-resurrect blocked)" || { [ "$SDC" = "201" ] && echo "      >>> ALLOWED (would poison on resurrect)"; }
+
 echo "############ END $LABEL ############"
 echo
