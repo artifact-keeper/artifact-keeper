@@ -481,6 +481,21 @@ pub struct StorageService {
 impl StorageService {
     /// Create storage service from config
     pub async fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with_bucket_override(config, None).await
+    }
+
+    /// Create storage service for backups. When `BACKUP_S3_BUCKET` is set
+    /// (and storage_backend = "s3"), backups are written to that bucket
+    /// instead of `S3_BUCKET`, reusing the same S3 credentials/region/
+    /// endpoint. Falls back to `from_config` behavior otherwise.
+    pub async fn from_config_for_backups(config: &Config) -> Result<Self> {
+        Self::from_config_with_bucket_override(config, config.backup_s3_bucket.clone()).await
+    }
+
+    async fn from_config_with_bucket_override(
+        config: &Config,
+        s3_bucket_override: Option<String>,
+    ) -> Result<Self> {
         let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
             "filesystem" => {
                 let path = PathBuf::from(&config.storage_path);
@@ -499,6 +514,7 @@ impl StorageService {
                 // this handle (#1555).
                 let mut s3_config = crate::storage::s3::S3Config::from_env()?;
                 s3_config.prefix = None;
+                s3_config = Self::apply_bucket_override(s3_config, s3_bucket_override);
                 let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
                 Arc::new(S3BackendWrapper { inner })
             }
@@ -524,6 +540,18 @@ impl StorageService {
         };
 
         Ok(Self { backend })
+    }
+
+    /// Replace `s3_config.bucket` with `bucket_override` when set, otherwise
+    /// leave it as-is (the bucket from `S3_BUCKET`/`from_env`).
+    fn apply_bucket_override(
+        mut s3_config: crate::storage::s3::S3Config,
+        bucket_override: Option<String>,
+    ) -> crate::storage::s3::S3Config {
+        if let Some(bucket) = bucket_override {
+            s3_config.bucket = bucket;
+        }
+        s3_config
     }
 
     /// Create with a specific backend (for testing)
@@ -1030,6 +1058,44 @@ mod tests {
             storage_backend: storage_backend.to_string(),
             ..crate::config::Config::test_config()
         }
+    }
+
+    #[test]
+    fn test_apply_bucket_override_replaces_bucket_when_set() {
+        let s3_config = crate::storage::s3::S3Config::new(
+            "primary-bucket".to_string(),
+            "us-east-1".to_string(),
+            None,
+            None,
+        );
+        let result =
+            StorageService::apply_bucket_override(s3_config, Some("backup-bucket".to_string()));
+        assert_eq!(result.bucket, "backup-bucket");
+    }
+
+    #[test]
+    fn test_apply_bucket_override_keeps_bucket_when_unset() {
+        let s3_config = crate::storage::s3::S3Config::new(
+            "primary-bucket".to_string(),
+            "us-east-1".to_string(),
+            None,
+            None,
+        );
+        let result = StorageService::apply_bucket_override(s3_config, None);
+        assert_eq!(result.bucket, "primary-bucket");
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_for_backups_falls_back_on_non_s3_backend() {
+        let config = crate::config::Config {
+            backup_s3_bucket: Some("ignored-on-filesystem".to_string()),
+            ..minimal_config("filesystem")
+        };
+        let result = StorageService::from_config_for_backups(&config).await;
+        assert!(
+            result.is_ok(),
+            "from_config_for_backups should behave like from_config on non-s3 backends"
+        );
     }
 
     #[tokio::test]

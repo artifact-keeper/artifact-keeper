@@ -160,6 +160,11 @@ pub struct Config {
     /// S3 bucket name (when storage_backend = "s3")
     pub s3_bucket: Option<String>,
 
+    /// Optional dedicated S3 bucket for backups. When set, backups are
+    /// written to this bucket instead of `s3_bucket`, using the same S3
+    /// credentials/region/endpoint. Only applies when storage_backend = "s3".
+    pub backup_s3_bucket: Option<String>,
+
     /// GCS bucket name (when storage_backend = "gcs")
     pub gcs_bucket: Option<String>,
 
@@ -710,6 +715,7 @@ redacted_debug!(Config {
     show storage_backend,
     show storage_path,
     show s3_bucket,
+    show backup_s3_bucket,
     show gcs_bucket,
     show s3_region,
     show s3_endpoint,
@@ -820,6 +826,7 @@ impl Default for Config {
             storage_backend: "filesystem".into(),
             storage_path: "/tmp/artifact-keeper-test".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
@@ -954,6 +961,7 @@ impl Config {
                 }
             }),
             s3_bucket: env::var("S3_BUCKET").ok(),
+            backup_s3_bucket: env::var("BACKUP_S3_BUCKET").ok(),
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
@@ -2754,6 +2762,42 @@ mod tests {
             env::set_var("S3_ENDPOINT", v);
         } else {
             env::remove_var("S3_ENDPOINT");
+        }
+    }
+
+    #[test]
+    fn test_config_optional_backup_s3_bucket() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_backup_bucket = env::var("BACKUP_S3_BUCKET").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("BACKUP_S3_BUCKET");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.backup_s3_bucket, None);
+
+        env::set_var("BACKUP_S3_BUCKET", "my-backup-bucket");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.backup_s3_bucket.as_deref(), Some("my-backup-bucket"));
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_backup_bucket {
+            env::set_var("BACKUP_S3_BUCKET", v);
+        } else {
+            env::remove_var("BACKUP_S3_BUCKET");
         }
     }
 
