@@ -319,10 +319,22 @@ pub struct HelmPathInfo {
     pub filename: Option<String>,
 }
 
+/// Default Helm chart apiVersion, used when an upstream index entry omits it.
+///
+/// Nexus-generated `index.yaml` drops `apiVersion` from every entry, which
+/// would otherwise fail deserialization of the whole index (serde is
+/// all-or-nothing) and leave a virtual repo unable to proxy Nexus-hosted
+/// charts. Helm treats a missing apiVersion as a legacy chart, so defaulting
+/// keeps parsing lenient while still emitting a valid index downstream.
+fn default_chart_api_version() -> String {
+    "v2".to_string()
+}
+
 /// Chart.yaml structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartYaml {
+    #[serde(default = "default_chart_api_version")]
     pub api_version: String,
     pub name: String,
     pub version: String,
@@ -1065,6 +1077,30 @@ version: "1.0.0"
         assert_eq!(parsed.chart.name, "test");
         assert_eq!(parsed.urls.len(), 1);
         assert_eq!(parsed.digest, "sha256:abc");
+    }
+
+    /// Nexus-generated index.yaml omits `apiVersion` from every entry. The
+    /// whole index must still parse (serde is all-or-nothing) with apiVersion
+    /// defaulted, otherwise a virtual repo cannot proxy Nexus-hosted charts.
+    #[test]
+    fn test_index_entry_without_api_version_defaults() {
+        let nexus_style = r#"
+apiVersion: v1
+generated: "2024-01-01T00:00:00Z"
+entries:
+  mychart:
+    - name: mychart
+      version: 1.2.3
+      created: "2024-01-01T00:00:00Z"
+      digest: sha256:deadbeef
+      urls:
+        - https://nexus.example/repository/helm/mychart-1.2.3.tgz
+"#;
+        let index: HelmIndex = serde_yaml::from_str(nexus_style).unwrap();
+        let entry = &index.entries["mychart"][0];
+        assert_eq!(entry.chart.api_version, "v2");
+        assert_eq!(entry.chart.version, "1.2.3");
+        assert_eq!(entry.urls.len(), 1);
     }
 
     // ---- decompression-bomb cap (issue #1806) ----
