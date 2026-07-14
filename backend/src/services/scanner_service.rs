@@ -1128,9 +1128,26 @@ fn unpack_tar_limited<R: std::io::Read>(
         let path = entry
             .path()
             .map_err(|e| AppError::Internal(format!("Failed to read tar entry path: {}", e)))?;
+        // Reject path-traversal / absolute entries BEFORE touching the disk.
+        // `dst.join(path)` followed by a lexical `starts_with(dst)` is NOT
+        // sufficient: `starts_with` compares components without resolving `..`,
+        // so `dst.join("../../evil")` still "starts_with" `dst` yet the OS
+        // resolves the create to a path outside the workspace. Skip any entry
+        // whose path contains a `..` component or is absolute (root/prefix) —
+        // mirroring the guard the `tar` crate's own `unpack` applies natively.
+        if path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            continue;
+        }
         let full_path = dst.join(&path);
-        // Re-check the resolved path stays inside the target (guards `..` and
-        // absolute-path traversal even though the crate normally refuses them).
+        // Defence in depth: after normalising away `.`/plain components the join
+        // must still be lexically under the workspace root.
         if !full_path.starts_with(dst) {
             continue;
         }
@@ -10037,6 +10054,98 @@ mod tests {
         unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 1000).unwrap();
         assert!(out.path().join("legit.txt").exists());
         assert!(!out.path().join("evil_link").exists());
+    }
+
+    /// Build a tar.gz whose single entry carries an attacker-controlled raw
+    /// path (bypassing `set_path`'s own `..` rejection by writing the GNU
+    /// header name bytes directly), so the extractor's own traversal guard is
+    /// what's under test.
+    fn create_tar_gz_raw_name(raw_name: &[u8], data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("placeholder.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            {
+                let gnu = header.as_gnu_mut().unwrap();
+                // zero the name field, then write the hostile bytes + NUL.
+                for b in gnu.name.iter_mut() {
+                    *b = 0;
+                }
+                let n = raw_name.len().min(gnu.name.len() - 1);
+                gnu.name[..n].copy_from_slice(&raw_name[..n]);
+            }
+            header.set_cksum();
+            tar.append(&header, data).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_tar_path_traversal_rejected_limited() {
+        // Entries that escape the workspace via `..` or an absolute path must
+        // be skipped and MUST NOT create files outside the destination dir.
+        // Regression guard for the manual-iteration extractor: a lexical
+        // `starts_with(dst)` check alone does not resolve `..`.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("workspace");
+        std::fs::create_dir_all(&out).unwrap();
+
+        for raw in [
+            &b"../../escape_up.txt"[..],
+            &b"../sibling.txt"[..],
+            &b"/etc/abs_escape.txt"[..],
+            &b"subdir/../../escape_mid.txt"[..],
+        ] {
+            let archive = create_tar_gz_raw_name(raw, b"PWNED");
+            let decoder = flate2::read::GzDecoder::new(&archive[..]);
+            // Extraction itself succeeds (entry silently skipped), no error.
+            unpack_tar_limited(tar::Archive::new(decoder), &out, 1_000_000, 1000).unwrap();
+        }
+
+        // Nothing was written anywhere under the tempdir root except the
+        // (empty) workspace dir we created.
+        let escaped: Vec<_> = walkdir_files(root.path())
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("escape") || n.contains("sibling"))
+            })
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "path-traversal entries escaped the workspace: {escaped:?}"
+        );
+        // And the workspace itself holds no traversal artefacts.
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    /// Minimal recursive file lister for the traversal test (avoids a new dep).
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     #[test]
