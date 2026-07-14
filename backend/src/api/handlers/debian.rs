@@ -463,10 +463,12 @@ struct DebInfo {
     package_type: String,
 }
 
-/// Parse `{name}_{version}_{arch}.deb` or `.udeb` from a filename.
+/// Parse `{name}_{version}_{arch}.deb`, `.udeb`, or `.ddeb` from a filename.
 fn parse_deb_filename(filename: &str) -> Option<DebInfo> {
     let package_type = if filename.ends_with(".udeb") {
         "udeb"
+    } else if filename.ends_with(".ddeb") {
+        "ddeb"
     } else {
         "deb"
     };
@@ -3413,6 +3415,15 @@ mod tests {
         assert_eq!(info.version, "1.200");
         assert_eq!(info.arch, "amd64");
         assert_eq!(info.package_type, "udeb");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_ddeb() {
+        let info = parse_deb_filename("systemd-dbgsym_256_amd64.ddeb").unwrap();
+        assert_eq!(info.name, "systemd-dbgsym");
+        assert_eq!(info.version, "256");
+        assert_eq!(info.arch, "amd64");
+        assert_eq!(info.package_type, "ddeb");
     }
 
     #[test]

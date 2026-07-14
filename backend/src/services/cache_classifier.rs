@@ -388,7 +388,7 @@ fn classify_cargo(lower: &str) -> Mutability {
 /// - **pool/**: The Debian Repository Format spec mandates "A repository must
 ///   not include different packages (different content) with the same package
 ///   name, version, and architecture." The path encodes name+version+arch, so
-///   content is pinned. Covers `.deb`, `.udeb`, `.dsc`, `.orig.tar.*`,
+///   content is pinned. Covers `.deb`, `.udeb`, `.ddeb`, `.dsc`, `.orig.tar.*`,
 ///   `.debian.tar.*`.
 /// - **dists/**: Release, InRelease, Packages, Sources, Translation, Contents,
 ///   dep11, etc. are rewritten in place by upstream on each publish.
