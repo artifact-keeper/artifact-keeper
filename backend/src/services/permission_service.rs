@@ -343,7 +343,7 @@ impl PermissionService {
             SELECT DISTINCT unnest(actions) as action
             FROM permissions
             WHERE (
-                (principal_type = 'user' AND principal_id = $1)
+                (principal_type IN ('user', 'service_account') AND principal_id = $1)
                 OR
                 (principal_type = 'group' AND principal_id IN (
                     SELECT group_id FROM user_group_members WHERE user_id = $1
@@ -763,6 +763,13 @@ mod tests {
         assert!(
             body.contains("SELECT project_id FROM repositories WHERE id = $3"),
             "project arm must resolve the repository's project_id"
+        );
+        // #2433: the direct-principal arm resolves actions for service accounts
+        // alongside human users, keyed by the same `$1` principal_id equality so
+        // the data plane agrees with repository visibility.
+        assert!(
+            body.contains("(principal_type IN ('user', 'service_account') AND principal_id = $1)"),
+            "direct-principal arm must accept service_account without relaxing the id match"
         );
     }
 

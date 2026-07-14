@@ -50,7 +50,7 @@ fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
             SELECT 1 FROM permissions p
             WHERE p.target_type = 'group' AND p.target_id = {group_id_expr}
               AND (
-                (p.principal_type = 'user' AND p.principal_id = {user_param})
+                (p.principal_type IN ('user', 'service_account') AND p.principal_id = {user_param})
                 OR (p.principal_type = 'group' AND p.principal_id IN (
                     SELECT group_id FROM user_group_members WHERE user_id = {user_param}
                 ))
@@ -1577,7 +1577,9 @@ mod tests {
         let sql = visible_groups_predicate("g.id", "$2");
         assert!(sql.contains("FROM permissions p"));
         assert!(sql.contains("p.target_type = 'group'"));
-        assert!(sql.contains("p.principal_type = 'user'"));
+        // Direct-principal arm honours both human users and service accounts
+        // (both reference `users(id)` and are keyed by the caller's own id).
+        assert!(sql.contains("p.principal_type IN ('user', 'service_account')"));
         assert!(sql.contains("p.principal_type = 'group'"));
     }
 
