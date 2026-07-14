@@ -2372,8 +2372,14 @@ pub async fn create_repository(
     response.apt_description = trimmed_nonempty(payload.apt_description);
     // Echo the npm scope policy that was persisted (#2424) so the create
     // response round-trips with a subsequent GET.
-    let response =
-        with_npm_scope_policy(&state.db, repo_id, &repo_type_out, &repo_format_out, response).await;
+    let response = with_npm_scope_policy(
+        &state.db,
+        repo_id,
+        &repo_type_out,
+        &repo_format_out,
+        response,
+    )
+    .await;
     Ok(Json(response))
 }
 
