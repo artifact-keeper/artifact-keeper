@@ -81,6 +81,15 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// The request was well-formed and syntactically valid but asks for a
+    /// configuration that is semantically unsupported in this release (e.g. a
+    /// Debian proxy filter that requests metadata regeneration/re-signing, or
+    /// an internally inconsistent filter). Mapped to 422 so clients can tell
+    /// "the server understood but won't do this yet" apart from a plain 400
+    /// schema/validation error.
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+
     #[error("Quota exceeded: {0}")]
     QuotaExceeded(String),
 
@@ -172,6 +181,9 @@ impl AppError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
+            Self::UnprocessableEntity(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
+            }
             Self::QuotaExceeded(_) => (StatusCode::INSUFFICIENT_STORAGE, "QUOTA_EXCEEDED"),
             // ENAMETOOLONG is a client-supplied path that exceeds the
             // underlying filesystem's name limit (255 bytes on ext4/xfs).
@@ -272,6 +284,7 @@ impl AppError {
             | Self::NotFound(msg)
             | Self::Conflict(msg)
             | Self::Validation(msg)
+            | Self::UnprocessableEntity(msg)
             | Self::QuotaExceeded(msg)
             | Self::BadGateway(msg)
             | Self::ServiceUnavailable(msg)
