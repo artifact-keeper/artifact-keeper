@@ -431,7 +431,10 @@ async fn query_local_member_specs(
 /// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
-    let mut decoder = GzDecoder::new(bytes);
+    // Wrap the upstream gzip stream in the shared total-byte budget (#2556) so a
+    // malicious/compromised upstream index cannot inflate unbounded during a
+    // virtual/remote proxy fetch.
+    let mut decoder = crate::util::bounded_archive::budgeted(GzDecoder::new(bytes));
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed).map_err(|_| {
         (

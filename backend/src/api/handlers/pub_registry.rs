@@ -964,39 +964,24 @@ async fn proxy_pub_meta_get(
 fn extract_pubspec_from_reader<R: std::io::Read>(
     reader: R,
 ) -> Result<crate::formats::r#pub::PubSpec, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    use tar::Archive;
+    // Bound the gzip/tar decompression: total-byte budget + entry-count cap +
+    // per-metadata-entry cap so a crafted package cannot inflate unbounded
+    // during metadata parsing (#2556).
+    let contents = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name()
+            .map(|n| n == "pubspec.yaml")
+            .unwrap_or(false)
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "pubspec.yaml not found in archive".to_string())?;
 
-    let decoder = GzDecoder::new(reader);
-    let mut archive = Archive::new(decoder);
+    let contents =
+        String::from_utf8(contents).map_err(|e| format!("Failed to read pubspec.yaml: {}", e))?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read archive: {}", e))?;
+    let pubspec: crate::formats::r#pub::PubSpec = serde_yaml::from_str(&contents)
+        .map_err(|e| format!("Failed to parse pubspec.yaml: {}", e))?;
 
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        let path = entry
-            .path()
-            .map_err(|e| format!("Failed to read entry path: {}", e))?
-            .to_string_lossy()
-            .to_string();
-
-        if path == "pubspec.yaml" || path.ends_with("/pubspec.yaml") {
-            let mut contents = String::new();
-            entry
-                .read_to_string(&mut contents)
-                .map_err(|e| format!("Failed to read pubspec.yaml: {}", e))?;
-
-            let pubspec: crate::formats::r#pub::PubSpec = serde_yaml::from_str(&contents)
-                .map_err(|e| format!("Failed to parse pubspec.yaml: {}", e))?;
-
-            return Ok(pubspec);
-        }
-    }
-
-    Err("pubspec.yaml not found in archive".to_string())
+    Ok(pubspec)
 }
 
 /// Extract pubspec.yaml from a staged tar.gz archive on disk. The blocking

@@ -150,22 +150,19 @@ impl IncusHandler {
             Box::new(GzDecoder::new(full_reader))
         };
 
-        let mut archive = tar::Archive::new(decompressor);
-        let entries = archive.entries().ok()?;
-
-        for entry in entries {
-            let mut entry = entry.ok()?;
-            let path = entry.path().ok()?;
-            let path_str = path.to_string_lossy();
-
-            if path_str == "metadata.yaml" || path_str == "./metadata.yaml" {
-                let mut yaml_content = String::new();
-                entry.read_to_string(&mut yaml_content).ok()?;
-                return Self::parse_metadata_yaml(&yaml_content);
-            }
-        }
-
-        None
+        // Route the (magic-byte-dispatched) decompressor through the shared
+        // bounded extractor (#2556): the total-byte budget on the DECODED stream
+        // aborts an xz/zstd/gzip bomb mid-inflate, and the entry-count +
+        // per-entry caps bound the walk. A cap breach yields Err -> None here, so
+        // a bomb is bounded (RSS flat) rather than ballooning to hundreds of MiB.
+        let bytes =
+            crate::util::bounded_archive::read_metadata_from_decoded_tar(decompressor, |path| {
+                let s = path.to_string_lossy();
+                s == "metadata.yaml" || s == "./metadata.yaml"
+            })
+            .ok()??;
+        let yaml_content = String::from_utf8(bytes).ok()?;
+        Self::parse_metadata_yaml(&yaml_content)
     }
 
     /// Parse the metadata.yaml content.
@@ -518,6 +515,102 @@ properties:
         assert_eq!(meta.architecture, Some("aarch64".to_string()));
         assert_eq!(meta.os, Some("Debian".to_string()));
         assert_eq!(meta.release, Some("bookworm".to_string()));
+    }
+
+    /// Build an image tar carrying `metadata.yaml`, optionally preceded by a
+    /// huge (highly compressible) filler entry so decoders must inflate past the
+    /// budget before reaching the metadata (the pre-target-inflation bomb).
+    fn image_tar(yaml: &[u8], filler_bytes: usize) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            if filler_bytes > 0 {
+                let filler = vec![0u8; filler_bytes];
+                let mut h = tar::Header::new_gnu();
+                h.set_size(filler.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder.append_data(&mut h, "big.bin", &filler[..]).unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(yaml.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "metadata.yaml", yaml)
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        tar_buf
+    }
+
+    /// #2556: incus image bombs across all three codecs (gzip / xz / zstd) are
+    /// bounded (extraction returns None, RSS flat) rather than ballooning. Here
+    /// the `metadata.yaml` entry itself inflates past the 8 MiB per-metadata cap;
+    /// the pre-target *total-byte* budget path is covered by the fast
+    /// `bounded_archive` module tests (`xz_/zst_..._total_budget_breach`).
+    #[test]
+    fn test_incus_metadata_bombs_bounded_all_codecs_2556() {
+        use std::io::Write;
+        // 9 MiB metadata.yaml (> 8 MiB per-metadata cap); repeated bytes so all
+        // three codecs compress it to a tiny "bomb".
+        let mut yaml = b"architecture: x86_64\nproperties:\n  os: Ubuntu\n".to_vec();
+        yaml.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        let raw = image_tar(&yaml, 0);
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&raw).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(gz.len() < 1024 * 1024, "gzip bomb compresses tiny");
+        assert!(
+            IncusHandler::extract_metadata(&gz).is_none(),
+            "gzip bomb bounded"
+        );
+
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 1);
+        xz.write_all(&raw).unwrap();
+        let xz = xz.finish().unwrap();
+        assert!(xz.len() < 1024 * 1024, "xz bomb compresses tiny");
+        assert!(
+            IncusHandler::extract_metadata(&xz).is_none(),
+            "xz bomb bounded"
+        );
+
+        let zst = zstd::encode_all(std::io::Cursor::new(&raw[..]), 1).unwrap();
+        assert!(zst.len() < 1024 * 1024, "zstd bomb compresses tiny");
+        assert!(
+            IncusHandler::extract_metadata(&zst).is_none(),
+            "zstd bomb bounded"
+        );
+    }
+
+    #[test]
+    fn test_incus_metadata_normal_all_codecs_2556() {
+        use std::io::Write;
+        let yaml = b"architecture: x86_64\nproperties:\n  os: Ubuntu\n  release: noble\n";
+
+        let raw = image_tar(yaml, 0);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        let gz = gz.finish().unwrap();
+        assert_eq!(
+            IncusHandler::extract_metadata(&gz).unwrap().os,
+            Some("Ubuntu".to_string())
+        );
+
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(&image_tar(yaml, 0)).unwrap();
+        let xz = xz.finish().unwrap();
+        assert_eq!(
+            IncusHandler::extract_metadata(&xz).unwrap().release,
+            Some("noble".to_string())
+        );
+
+        let zst = zstd::encode_all(std::io::Cursor::new(image_tar(yaml, 0)), 3).unwrap();
+        assert_eq!(
+            IncusHandler::extract_metadata(&zst).unwrap().os,
+            Some("Ubuntu".to_string())
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
 //!   POST /:repo_key/buf.registry.module.v1.GraphService/GetGraph
 //!   POST /:repo_key/buf.registry.module.v1.ResourceService/GetResources
 
-use std::io::{Read, Write};
+use std::io::Write;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -554,10 +554,20 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
 
 #[allow(clippy::result_large_err)]
 fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response> {
+    use crate::util::bounded_archive::{
+        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+    };
+
+    // This extractor reads EVERY entry into memory and base64-encodes it (~1.33x
+    // amplification on top of decompression), so it is the worst in-memory site.
+    // Wrap the gzip stream in the shared total-byte budget (#2556) so a crafted
+    // bundle aborts mid-inflate, and enforce the entry-count + per-entry caps so
+    // worst-case buffered memory is deterministic.
     let gz_decoder = GzDecoder::new(data);
-    let mut archive = tar::Archive::new(gz_decoder);
+    let mut archive = tar::Archive::new(budgeted(gz_decoder));
 
     let mut files = Vec::new();
+    let mut entries_seen: u64 = 0;
 
     for entry_result in archive.entries().map_err(|e| {
         connect_error(
@@ -574,6 +584,18 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
             )
         })?;
 
+        entries_seen += 1;
+        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+            return Err(connect_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!(
+                    "Bundle contains too many entries (> {}); refusing suspected decompression bomb",
+                    MAX_INGEST_ARCHIVE_ENTRIES
+                ),
+            ));
+        }
+
         let path = entry
             .path()
             .map_err(|e| {
@@ -586,14 +608,10 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
             .to_string_lossy()
             .to_string();
 
-        let mut content_bytes = Vec::new();
-        entry.read_to_end(&mut content_bytes).map_err(|e| {
-            connect_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("Failed to read entry content: {}", e),
-            )
-        })?;
+        let content_bytes =
+            read_capped(&mut entry, MAX_INGEST_METADATA_ENTRY_BYTES, "bundle entry").map_err(
+                |e| connect_error(StatusCode::BAD_REQUEST, "invalid_argument", &e.to_string()),
+            )?;
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(&content_bytes);
 
@@ -2127,6 +2145,29 @@ mod tests {
         let extracted = extract_files_from_bundle(&bundle).unwrap();
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].path, "single.proto");
+    }
+
+    /// #2556: a bundle entry that inflates past the per-entry cap (the worst
+    /// in-memory site: every entry is read + base64-encoded) is rejected with a
+    /// bounded error instead of buffering unbounded. The compressed bundle stays
+    /// tiny (highly repetitive), proving the cap bounds the decompressed size.
+    #[test]
+    fn test_extract_bundle_oversized_entry_rejected_2556() {
+        let oversized = vec![
+            b'A';
+            (crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES + 1024)
+                as usize
+        ];
+        let files = vec![UploadFile {
+            path: "bomb.proto".to_string(),
+            content: base64::engine::general_purpose::STANDARD.encode(&oversized),
+        }];
+        let bundle = build_bundle(&files).unwrap();
+        assert!(bundle.len() < 256 * 1024, "compressed bundle stays tiny");
+        assert!(
+            extract_files_from_bundle(&bundle).is_err(),
+            "oversized bundle entry must be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -956,35 +956,24 @@ fn build_versions_response(
 ///
 /// We parse the metadata.config to extract the name and version fields.
 fn extract_name_version_from_tarball(data: &[u8]) -> Result<(String, String), String> {
-    let mut archive = tar::Archive::new(data);
+    // Bound the (plain) tar walk: entry-count cap + per-metadata-entry cap so a
+    // crafted tarball cannot buffer an unbounded metadata.config during parsing
+    // (#2556).
+    let content = crate::util::bounded_archive::read_metadata_from_tar(data, |path| {
+        path == std::path::Path::new("metadata.config")
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "metadata.config not found in tarball".to_string())?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read tarball entries: {}", e))?;
+    let content =
+        String::from_utf8(content).map_err(|e| format!("Failed to read metadata.config: {}", e))?;
 
-    for entry_result in entries {
-        let mut entry = entry_result.map_err(|e| format!("Failed to read tar entry: {}", e))?;
-        let path = entry
-            .path()
-            .map_err(|e| format!("Failed to read entry path: {}", e))?
-            .to_string_lossy()
-            .to_string();
+    let name = extract_erlang_term_value(&content, "name")
+        .ok_or_else(|| "Missing 'name' in metadata.config".to_string())?;
+    let version = extract_erlang_term_value(&content, "version")
+        .ok_or_else(|| "Missing 'version' in metadata.config".to_string())?;
 
-        if path == "metadata.config" {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)
-                .map_err(|e| format!("Failed to read metadata.config: {}", e))?;
-
-            let name = extract_erlang_term_value(&content, "name")
-                .ok_or_else(|| "Missing 'name' in metadata.config".to_string())?;
-            let version = extract_erlang_term_value(&content, "version")
-                .ok_or_else(|| "Missing 'version' in metadata.config".to_string())?;
-
-            return Ok((name, version));
-        }
-    }
-
-    Err("metadata.config not found in tarball".to_string())
+    Ok((name, version))
 }
 
 /// Extract a string value from Erlang term format metadata.

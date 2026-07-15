@@ -162,39 +162,41 @@ impl HelmHandler {
     /// the Chart.yaml entry is read (capped by `read_capped_entry_to_string`),
     /// so peak memory is a single metadata entry rather than the full artifact.
     pub fn extract_chart_yaml_from_reader<R: Read>(reader: R) -> Result<ChartYaml> {
-        let gz = GzDecoder::new(reader);
-        let mut archive = Archive::new(gz);
+        let content = Self::find_capped_chart_entry(reader, "Chart.yaml")?.ok_or_else(|| {
+            AppError::Validation("Chart.yaml not found in chart package".to_string())
+        })?;
 
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Validation(format!("Invalid chart package: {}", e)))?
-        {
-            let mut entry =
-                entry.map_err(|e| AppError::Validation(format!("Invalid chart entry: {}", e)))?;
-
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Validation(format!("Invalid path in chart: {}", e)))?;
-
-            // Chart.yaml is typically in <chartname>/Chart.yaml
-            if path.ends_with("Chart.yaml") {
-                let content = read_capped_entry_to_string(&mut entry, "Chart.yaml")?;
-
-                return serde_yaml::from_str(&content)
-                    .map_err(|e| AppError::Validation(format!("Invalid Chart.yaml: {}", e)));
-            }
-        }
-
-        Err(AppError::Validation(
-            "Chart.yaml not found in chart package".to_string(),
-        ))
+        serde_yaml::from_str(&content)
+            .map_err(|e| AppError::Validation(format!("Invalid Chart.yaml: {}", e)))
     }
 
     /// Extract values.yaml from chart package (optional)
     pub fn extract_values_yaml(content: &[u8]) -> Result<Option<serde_yaml::Value>> {
-        let gz = GzDecoder::new(content);
-        let mut archive = Archive::new(gz);
+        match Self::find_capped_chart_entry(content, "values.yaml")? {
+            Some(content) => {
+                let values: serde_yaml::Value = serde_yaml::from_str(&content)
+                    .map_err(|e| AppError::Validation(format!("Invalid values.yaml: {}", e)))?;
+                Ok(Some(values))
+            }
+            None => Ok(None),
+        }
+    }
 
+    /// Locate a metadata entry (`Chart.yaml` / `values.yaml`) inside a chart
+    /// `.tgz`, returning its capped contents (`None` when absent).
+    ///
+    /// The gzip stream is wrapped in the shared total-byte budget (#2556) so a
+    /// bomb that inflates *before* the target entry — or an archive that never
+    /// contains it — aborts mid-inflate instead of decompressing unbounded, and
+    /// the entry-count cap bounds entry-count bombs. The matched entry is still
+    /// read through the existing per-entry `MAX_METADATA_ENTRY_BYTES` cap.
+    fn find_capped_chart_entry<R: Read>(reader: R, filename: &str) -> Result<Option<String>> {
+        use crate::util::bounded_archive::{budgeted, MAX_INGEST_ARCHIVE_ENTRIES};
+
+        let gz = GzDecoder::new(reader);
+        let mut archive = Archive::new(budgeted(gz));
+
+        let mut entries_seen: u64 = 0;
         for entry in archive
             .entries()
             .map_err(|e| AppError::Validation(format!("Invalid chart package: {}", e)))?
@@ -202,18 +204,22 @@ impl HelmHandler {
             let mut entry =
                 entry.map_err(|e| AppError::Validation(format!("Invalid chart entry: {}", e)))?;
 
+            entries_seen += 1;
+            if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+                return Err(AppError::Validation(format!(
+                    "Chart package contains too many entries (> {}); refusing suspected decompression bomb",
+                    MAX_INGEST_ARCHIVE_ENTRIES
+                )));
+            }
+
             let path = entry
                 .path()
                 .map_err(|e| AppError::Validation(format!("Invalid path in chart: {}", e)))?;
 
-            // values.yaml is typically in <chartname>/values.yaml
-            if path.ends_with("values.yaml") {
-                let content = read_capped_entry_to_string(&mut entry, "values.yaml")?;
-
-                let values: serde_yaml::Value = serde_yaml::from_str(&content)
-                    .map_err(|e| AppError::Validation(format!("Invalid values.yaml: {}", e)))?;
-
-                return Ok(Some(values));
+            // Chart.yaml / values.yaml is typically in <chartname>/<filename>.
+            if path.ends_with(filename) {
+                let content = read_capped_entry_to_string(&mut entry, filename)?;
+                return Ok(Some(content));
             }
         }
 
@@ -1171,5 +1177,94 @@ entries:
             }
             other => panic!("expected Validation error, got {other:?}"),
         }
+    }
+
+    /// Build a `.tgz` containing multiple named entries (each a regular file).
+    fn build_multi_tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        std::io::Write::write_all(&mut encoder, &tar_buf).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// #2556: a chart whose entries inflate past the total-byte budget *before*
+    /// Chart.yaml is reached must be rejected mid-inflate, not decompressed
+    /// unbounded. Drive it through the shared `_limited` seam with a tiny budget
+    /// so the fixture stays small.
+    #[test]
+    fn test_extract_chart_yaml_pre_target_inflation_rejected_2556() {
+        use crate::util::bounded_archive::read_metadata_from_tar_gz_limited;
+        let filler = vec![0u8; 1024 * 1024];
+        let tgz = build_multi_tgz(&[
+            ("chart/big.bin", &filler[..]),
+            ("chart/Chart.yaml", b"apiVersion: v2\nname: n\nversion: 1"),
+        ]);
+        // Tiny total budget: the 1 MiB filler entry (walked before Chart.yaml)
+        // trips the budget.
+        let out = read_metadata_from_tar_gz_limited(
+            &tgz[..],
+            |p| p.ends_with("Chart.yaml"),
+            4096,
+            10_000,
+            4 * 1024 * 1024,
+        );
+        assert!(out.is_err(), "pre-target inflation past budget must reject");
+    }
+
+    /// #2556: the real extractor rejects a many-entry chart via the entry-count
+    /// cap. Build far more than the cap would allow at test scale by asserting
+    /// the shared cap is enforced through the seam.
+    #[test]
+    fn test_extract_chart_yaml_entry_count_cap_2556() {
+        use crate::util::bounded_archive::read_metadata_from_tar_gz_limited;
+        let mut entries: Vec<(String, Vec<u8>)> = (0..40)
+            .map(|i| (format!("chart/f{i}"), vec![b'a']))
+            .collect();
+        entries.push((
+            "chart/Chart.yaml".to_string(),
+            b"apiVersion: v2\nname: n\nversion: 1".to_vec(),
+        ));
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let tgz = build_multi_tgz(&refs);
+        let out = read_metadata_from_tar_gz_limited(
+            &tgz[..],
+            |p| p.ends_with("Chart.yaml"),
+            64 * 1024 * 1024,
+            10,
+            4 * 1024 * 1024,
+        );
+        assert!(out.is_err(), "entry-count breach must reject");
+    }
+
+    /// Regression: a normal chart still parses through the hardened path.
+    #[test]
+    fn test_extract_chart_yaml_normal_after_hardening_2556() {
+        let tgz = build_multi_tgz(&[
+            ("nginx/values.yaml", b"replicaCount: 1\n"),
+            (
+                "nginx/Chart.yaml",
+                b"apiVersion: v2\nname: nginx\nversion: 9.9.9\n",
+            ),
+        ]);
+        let chart = HelmHandler::extract_chart_yaml(&tgz).unwrap();
+        assert_eq!(chart.name, "nginx");
+        assert_eq!(chart.version, "9.9.9");
+        let values = HelmHandler::extract_values_yaml(&tgz).unwrap();
+        assert!(values.is_some());
     }
 }

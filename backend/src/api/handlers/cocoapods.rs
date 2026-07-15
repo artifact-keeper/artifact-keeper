@@ -492,40 +492,19 @@ use crate::formats::cocoapods::PodSpec;
 /// Scans the archive entries for any file ending in `.podspec.json` and
 /// deserializes it into a PodSpec.
 fn extract_podspec_from_archive(data: &[u8]) -> Result<PodSpec, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    use tar::Archive;
+    // Bound the gzip/tar decompression: total-byte budget + entry-count cap +
+    // per-metadata-entry cap so a crafted pod archive cannot inflate unbounded
+    // during metadata parsing (#2556).
+    let contents = crate::util::bounded_archive::read_metadata_from_tar_gz(data, |path| {
+        path.to_string_lossy().ends_with(".podspec.json")
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "No .podspec.json found in archive".to_string())?;
 
-    let gz = GzDecoder::new(data);
-    let mut archive = Archive::new(gz);
+    let podspec: PodSpec =
+        serde_json::from_slice(&contents).map_err(|e| format!("Invalid podspec JSON: {}", e))?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read archive: {}", e))?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-
-        let path = entry
-            .path()
-            .map_err(|e| format!("Failed to read path: {}", e))?
-            .to_string_lossy()
-            .to_string();
-
-        if path.ends_with(".podspec.json") {
-            let mut contents = Vec::new();
-            entry
-                .read_to_end(&mut contents)
-                .map_err(|e| format!("Failed to read podspec: {}", e))?;
-
-            let podspec: PodSpec = serde_json::from_slice(&contents)
-                .map_err(|e| format!("Invalid podspec JSON: {}", e))?;
-
-            return Ok(podspec);
-        }
-    }
-
-    Err("No .podspec.json found in archive".to_string())
+    Ok(podspec)
 }
 
 #[cfg(test)]

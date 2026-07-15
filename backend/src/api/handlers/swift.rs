@@ -84,6 +84,17 @@ fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
         }
     };
 
+    // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
+    // bounds memory, but reject entry-count bombs before walking the archive.
+    if archive.len() as u64 > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+        tracing::debug!(
+            entries = archive.len(),
+            cap = crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+            "swift manifest extraction: too many zip entries"
+        );
+        return None;
+    }
+
     // Pass 1: top-level Package.swift wins. This is the layout produced by
     // `swift package archive-source` and most CI helpers.
     // Pass 2: any `<single-prefix>/Package.swift` (one directory deep).
