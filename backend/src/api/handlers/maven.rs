@@ -2107,12 +2107,12 @@ async fn upload(
     let storage_key = format!("maven/{}", path);
     // Guard every flat-key write before it reaches storage (#2584). On a shared
     // cloud namespace this refuses to overwrite a *different* repository's object
-    // living at this exact key (403), and claims a previously-unowned key for
-    // this repository first-writer-wins so its row-less companions (checksum
-    // sidecars, verbatim maven-metadata.xml) stay attributed and readable
-    // (#2574). All three write branches below (checksum, maven-metadata.xml, and
-    // the main artifact) store to this single `storage_key`, so one guard covers
-    // each put. Filesystem backends short-circuit (isolated key space).
+    // living at this exact key (403). It is a READ-ONLY check: it must not
+    // attribute the key here, because this runs before the bytes are written and
+    // before coordinate parsing/validation that can still reject the request --
+    // claiming here would flip ownership of a foreign *unattributed* key on any
+    // aborted write and leak the victim's bytes (V3b). The attribution claim is
+    // committed only after a successful `storage.put`, per branch below.
     crate::services::maven_flat_attribution::guard_flat_key_writable(
         &state.db,
         repo.id,
@@ -2125,24 +2125,43 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
+    // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
+    // These row-less puts create no artifact row, so attribution is committed
+    // here -- only after the object bytes are durably written (#2574, V3b).
     if parse_checksum_path(&path).is_some() {
         storage
             .put(&storage_key, body)
             .await
             .map_err(map_storage_err)?;
+        crate::services::maven_flat_attribution::claim_flat_key_on_write(
+            &state.db,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
             .unwrap());
     }
 
-    // If this is a maven-metadata.xml upload, just store it
+    // If this is a maven-metadata.xml upload, just store it. Row-less put: same
+    // claim-on-write-success rule as the checksum branch (#2574, V3b).
     if MavenHandler::is_metadata(&path) {
         storage
             .put(&storage_key, body)
             .await
             .map_err(map_storage_err)?;
+        crate::services::maven_flat_attribution::claim_flat_key_on_write(
+            &state.db,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -2272,6 +2291,19 @@ async fn upload(
         .fetch_one(&state.db)
         .await
         .map_err(map_db_err)?;
+
+    // The live artifacts row above already attributes this key (resolution
+    // layer (a)); record a durable claim as well so ownership survives a later
+    // soft-delete of the row, matching the #2504 write guard's soft-delete
+    // awareness. Committed only now, after the put + row insert both succeeded.
+    crate::services::maven_flat_attribution::claim_flat_key_on_write(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;

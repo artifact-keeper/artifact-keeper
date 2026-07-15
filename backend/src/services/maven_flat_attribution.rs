@@ -16,9 +16,12 @@
 //!
 //! * gate reads -- serve a legacy flat object only to its genuine owner
 //!   ([`flat_key_readable`]); and
-//! * gate writes -- refuse a cross-repository overwrite and claim a
-//!   previously-unowned key first-writer-wins ([`guard_flat_key_writable`]),
-//!   which closes the write-side poisoning gap (#2584).
+//! * gate writes -- refuse a cross-repository overwrite before the write
+//!   ([`guard_flat_key_writable`], a read-only check), then commit a
+//!   first-writer-wins attribution claim only after the object bytes are
+//!   successfully written ([`claim_flat_key_on_write`]). Splitting the check
+//!   from the claim keeps an aborted or coordinate-invalid write from flipping
+//!   ownership of a foreign unattributed key (#2584, V3b).
 //!
 //! Filesystem backends physically isolate each repository's key space, so every
 //! entry point short-circuits to the pre-existing behavior there and never
@@ -162,30 +165,20 @@ async fn insert_claim(db: &PgPool, repository_id: Uuid, storage_key: &str) -> Re
     Ok(())
 }
 
-/// Insert a first-writer-wins claim for a previously-unowned flat key (and its
-/// derived checksum/signature sidecars). The loser of a race reads back the
-/// winner's row on its next attribution lookup.
-async fn claim_flat_key(db: &PgPool, repository_id: Uuid, storage_key: &str) -> Result<()> {
-    insert_claim(db, repository_id, storage_key).await?;
-
-    // Claim the derived checksum/signature sidecars of a base key too, so a
-    // second tenant cannot poison a companion of a GAV this repository owns.
-    if strip_checksum_suffix(storage_key).is_none() {
-        for suffix in CHECKSUM_SUFFIXES {
-            insert_claim(db, repository_id, &format!("{storage_key}{suffix}")).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Guard a flat `maven/{path}` write by `repository_id`.
+/// Guard a flat `maven/{path}` write by `repository_id`, BEFORE the write runs.
+///
+/// This is a read-only check -- it must never mutate attribution, because it
+/// runs before the object bytes are written and before coordinate/validation
+/// steps that can still reject the request. A guard that claimed the key here
+/// would flip ownership of a foreign *unattributed* key on any aborted or
+/// coordinate-invalid write, leaking the victim's bytes on the next GET (V3b).
 ///
 /// Filesystem backends short-circuit to `Ok` (isolated key space). On shared
 /// cloud namespaces: a key owned by a *different* repository is refused with a
 /// `403 Forbidden` ([`AppError::Authorization`], the cross-repository poisoning
-/// guard, #2584); a key already owned by this repository is allowed; an unowned
-/// key is claimed first-writer-wins and allowed. A database error propagates so
-/// the caller fails the write rather than risk an unattributed overwrite.
+/// guard, #2584); a key already owned by this repository, and a currently
+/// unowned key, are both allowed to proceed. The unowned key is only *claimed*
+/// after its bytes are successfully written, via [`claim_flat_key_on_write`].
 pub async fn guard_flat_key_writable(
     db: &PgPool,
     repository_id: Uuid,
@@ -200,9 +193,34 @@ pub async fn guard_flat_key_writable(
             "storage key '{storage_key}' is owned by another repository; \
              refusing cross-repository overwrite"
         ))),
-        Some(_) => Ok(()),
-        None => claim_flat_key(db, repository_id, storage_key).await,
+        // Own key, or currently unowned: allow the write. Attribution for an
+        // unowned key is committed only on write success (claim_flat_key_on_write).
+        Some(_) | None => Ok(()),
     }
+}
+
+/// Record the first-writer-wins attribution claim for a flat key that this
+/// repository has just SUCCESSFULLY written, closing V3b: a claim row exists
+/// only for a request that actually persisted the requester's own bytes to
+/// exactly this key. Call this immediately after the `storage.put` for
+/// `storage_key` returns `Ok` (for both row-less puts and the main artifact).
+///
+/// Filesystem backends short-circuit (isolated key space, no attribution rows).
+/// On cloud the claim is idempotent (`ON CONFLICT DO NOTHING`); a concurrent
+/// legitimate first-writer race resolves to whichever `put` committed first,
+/// the same accepted first-publish race as before. Only the exact written key
+/// is claimed -- derived checksum/signature sidecars are claimed by their own
+/// successful puts, never speculatively here.
+pub async fn claim_flat_key_on_write(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
+    if storage_backend == "filesystem" {
+        return Ok(());
+    }
+    insert_claim(db, repository_id, storage_key).await
 }
 
 #[cfg(test)]
@@ -335,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_guard_writable_claims_then_blocks_second_tenant() {
+    async fn test_guard_does_not_claim_then_claim_on_write_blocks_second_tenant() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -343,21 +361,37 @@ mod tests {
         let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
         let key = format!("maven/com/acme/claim/1.0/claim-1.0-{}.pom", Uuid::new_v4());
 
-        // First writer claims the unowned key and is allowed.
+        // The pre-write guard allows an unowned key BUT must NOT attribute it
+        // (V3b): a request that aborts before writing must leave no owner row.
         guard_flat_key_writable(&pool, repo_a, "s3", &key)
             .await
-            .expect("first writer claims unowned key");
-        // The claim now attributes the key (and its checksum sidecars) to repo_a.
+            .expect("unowned key allowed to proceed");
+        assert_eq!(
+            attributed_owner(&pool, &key).await.expect("query"),
+            None,
+            "guard must not create a claim before the write succeeds"
+        );
+
+        // Only after a successful write is the claim committed -- for exactly
+        // the written key, not its derived checksum sidecars.
+        claim_flat_key_on_write(&pool, repo_a, "s3", &key)
+            .await
+            .expect("claim on write success");
         assert_eq!(
             attributed_owner(&pool, &key).await.expect("query"),
             Some(repo_a)
         );
-        assert_eq!(
-            attributed_owner(&pool, &format!("{key}.sha1"))
-                .await
-                .expect("query"),
-            Some(repo_a)
-        );
+        // No speculative claim ROW is inserted for the derived checksum key --
+        // it is claimed only by its own successful write. (It still *resolves*
+        // to the base owner via checksum-suffix inheritance, which is intended.)
+        let sidecar_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM maven_flat_object_owner WHERE storage_key = $1",
+        )
+        .bind(format!("{key}.sha1"))
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(sidecar_rows, 0, "no speculative sidecar claim row");
 
         // The owner may overwrite its own key; a second tenant is refused (403).
         guard_flat_key_writable(&pool, repo_a, "s3", &key)
@@ -368,23 +402,54 @@ mod tests {
             .expect_err("second tenant must be refused");
         assert!(matches!(err, AppError::Authorization(_)));
 
-        // Filesystem writes never consult the catalog.
+        // Filesystem writes never consult or mutate the catalog.
         let fs_key = format!("maven/com/acme/fs/1.0/fs-1.0-{}.pom", Uuid::new_v4());
         guard_flat_key_writable(&pool, repo_b, "filesystem", &fs_key)
             .await
             .expect("filesystem write always allowed");
+        claim_flat_key_on_write(&pool, repo_b, "filesystem", &fs_key)
+            .await
+            .expect("filesystem claim is a no-op");
+        assert_eq!(attributed_owner(&pool, &fs_key).await.expect("query"), None);
 
-        // Clean up the claims (FK is ON DELETE CASCADE from repositories, but
-        // these repos may be reused by the harness).
-        sqlx::query(
-            "DELETE FROM maven_flat_object_owner WHERE repository_id = $1 OR repository_id = $2",
-        )
-        .bind(repo_a)
-        .bind(repo_b)
-        .execute(&pool)
-        .await
-        .ok();
+        clear_claims(&pool, &[repo_a, repo_b]).await;
         tdh::cleanup(&pool, repo_b, Uuid::nil()).await;
         tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_aborted_write_does_not_flip_ownership_of_foreign_key() {
+        // V3b regression: an attacker's write that passes the pre-write guard
+        // (the key is unattributed) but then ABORTS -- coordinate-invalid path,
+        // validation failure, storage error -- must leave the key unattributed,
+        // so a victim's legacy bytes are never re-attributed to the attacker.
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (attacker, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/victimco/internal-{}.txt", Uuid::new_v4());
+
+        // Guard passes (unowned), but the request aborts -> claim_on_write is
+        // never reached.
+        guard_flat_key_writable(&pool, attacker, "s3", &key)
+            .await
+            .expect("guard allows unowned key to proceed");
+
+        // No owner row was created, so nobody can read the key on cloud (404).
+        assert_eq!(attributed_owner(&pool, &key).await.expect("query"), None);
+        assert!(!flat_key_readable(&pool, attacker, "s3", &key).await);
+
+        clear_claims(&pool, &[attacker]).await;
+        tdh::cleanup(&pool, attacker, Uuid::nil()).await;
+    }
+
+    async fn clear_claims(pool: &PgPool, repos: &[Uuid]) {
+        for repo in repos {
+            sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+                .bind(repo)
+                .execute(pool)
+                .await
+                .ok();
+        }
     }
 }

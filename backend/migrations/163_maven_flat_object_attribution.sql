@@ -130,7 +130,35 @@ FROM (
 WHERE dir.gav_dir LIKE 'maven/%-SNAPSHOT'
 ON CONFLICT (storage_key) DO NOTHING;
 
--- (4c) Derived checksum sidecars for the rolled-up `maven-metadata.xml` files.
+-- (4c) Group-level plugin `maven-metadata.xml` rollup: the group directory
+--      `maven/{groupPath}` -- the storage key with its last THREE segments
+--      (artifactId + version + filename) stripped -- owns
+--      `maven/{groupPath}/maven-metadata.xml` when every live row under that
+--      group prefix belongs to a single repository. This closes the group-level
+--      plugin-metadata backfill gap: without it that legacy object stays
+--      unattributed and can be claimed/overwritten/locked-out by another tenant
+--      (#2574 V3). Ambiguous (multi-owner) group prefixes stay unattributed and
+--      thus fail-closed on read.
+INSERT INTO maven_flat_object_owner (storage_key, repository_id, source)
+SELECT dir.group_dir || '/maven-metadata.xml',
+       dir.repository_id,
+       'metadata_rollup'
+FROM (
+    SELECT regexp_replace(a.storage_key, '/[^/]*/[^/]*/[^/]*$', '') AS group_dir,
+           MIN(a.repository_id::text)::uuid AS repository_id
+    FROM artifacts a
+    JOIN repositories r ON r.id = a.repository_id
+    WHERE a.storage_key LIKE 'maven/%'
+      AND a.is_deleted = false
+      AND r.storage_backend <> 'filesystem'
+    GROUP BY regexp_replace(a.storage_key, '/[^/]*/[^/]*/[^/]*$', '')
+    HAVING COUNT(DISTINCT a.repository_id) = 1
+) dir
+WHERE dir.group_dir LIKE 'maven/%'
+  AND dir.group_dir <> 'maven'
+ON CONFLICT (storage_key) DO NOTHING;
+
+-- (4d) Derived checksum sidecars for the rolled-up `maven-metadata.xml` files.
 INSERT INTO maven_flat_object_owner (storage_key, repository_id, source)
 SELECT o.storage_key || s.suffix,
        o.repository_id,
