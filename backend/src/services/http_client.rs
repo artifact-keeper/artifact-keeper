@@ -652,9 +652,18 @@ mod tests {
             socket.write_all(b"K").await.expect("write second byte");
         });
 
-        let client = large_object_client_builder(true)
-            .build()
-            .expect("build large-object client");
+        // Serialize the client build against `test_configured_proxy_host_is_
+        // exempted_from_guard`, which briefly sets a process-wide `HTTP_PROXY`
+        // while building its own client. Without this, a concurrent build here
+        // could observe that proxy and route this round-trip away from the
+        // test's own listener. The guard is dropped before any `.await`, so it
+        // never crosses an await point.
+        let client = {
+            let _proxy_env_guard = PROXY_ENV_LOCK.lock().unwrap();
+            large_object_client_builder(true)
+                .build()
+                .expect("build large-object client")
+        };
         let request = tokio::spawn(async move {
             client
                 .post(&url)
@@ -672,5 +681,118 @@ mod tests {
 
         assert_eq!(request.await.expect("request task").as_ref(), b"OK");
         server.await.expect("server task");
+    }
+
+    /// Serializes tests that mutate the process-wide `HTTP_PROXY`/`NO_PROXY`
+    /// env so a leaked value cannot perturb the loopback-block tests above.
+    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Issue #2570: the configured egress-proxy host is exempted from the
+    /// SSRF DNS guard. With `HTTP_PROXY` pointing at a loopback listener (a
+    /// hard-blocked address the guard would normally refuse), a request built
+    /// by `base_client_builder()` for an EXTERNAL http URL must be routed to —
+    /// and accepted by — that proxy listener. Before the fix the guard blocked
+    /// the proxy host's own (loopback/private) address and the connect never
+    /// happened (the 502/500 in #2570); the accepted connection is what proves
+    /// the exemption is wired in.
+    ///
+    /// The proxy host MUST be a hostname (`localhost`), not an IP literal: an IP
+    /// literal skips DNS resolution entirely, so the resolver — and therefore
+    /// the exemption — would never be exercised. `localhost` resolves (via the
+    /// SSRF resolver) to loopback, which is normally hard-blocked; the exempt
+    /// entry (parsed from the proxy env) is what lets it through. The paired
+    /// negative test [`test_unexempted_proxy_host_is_blocked_by_guard`] proves
+    /// this listener would NOT be reached without the exemption.
+    #[tokio::test]
+    async fn test_configured_proxy_host_is_exempted_from_guard() {
+        use tokio::net::TcpListener;
+
+        let _lock = PROXY_ENV_LOCK.lock().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        // Both reqwest (proxy routing) and our SSRF resolver (the proxy-host
+        // exempt-set) read the proxy env at builder-construction time. Set it,
+        // build synchronously, then remove it immediately — this keeps the
+        // process-wide env mutation to a synchronous window (no `.await` in
+        // between) so it cannot perturb a concurrently-running test that also
+        // builds a client.
+        std::env::set_var("HTTP_PROXY", format!("http://localhost:{port}"));
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+        let client = base_client_builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build client");
+        std::env::remove_var("HTTP_PROXY");
+
+        // GET an external http host so the built-in proxy applies; we only care
+        // that the connect reaches the proxy listener, not about a full response.
+        let request = tokio::spawn(async move {
+            let _ = client.get("http://example.com/").send().await;
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+
+        request.abort();
+
+        assert!(
+            accepted.is_ok(),
+            "the configured proxy host (localhost) must be exempted so the request \
+             reaches the proxy listener at 127.0.0.1:{port}; got {accepted:?}"
+        );
+    }
+
+    /// Discriminating negative for #2570: proves that (a) reqwest DOES route the
+    /// proxy HOSTNAME through our custom SSRF DNS resolver, and (b) WITHOUT the
+    /// exempt-set entry that resolver refuses the proxy's own loopback/private
+    /// address — exactly the failure the exemption fixes. The proxy is set
+    /// EXPLICITLY as a hostname (`localhost`, so DNS resolution — hence the
+    /// resolver — is actually invoked) and paired with an EMPTY-exempt resolver.
+    /// The request must be blocked before any TCP connection: the listener must
+    /// never accept and `send()` must error. If reqwest bypassed the resolver
+    /// for proxy hosts, the listener WOULD accept and this test would fail — so
+    /// a pass confirms the resolver is on the proxy path and the exemption is
+    /// load-bearing.
+    #[tokio::test]
+    async fn test_unexempted_proxy_host_is_blocked_by_guard() {
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        // Explicit proxy at a loopback-resolving HOSTNAME + a resolver with an
+        // EMPTY exempt-set (the pre-#2570 fail-closed behavior). No env mutation.
+        let empty_exempt_resolver: Arc<dyn reqwest::dns::Resolve> =
+            Arc::new(crate::services::ssrf_dns::SsrfGuardResolver::default());
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://localhost:{port}")).expect("proxy url"))
+            .dns_resolver(empty_exempt_resolver)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build client");
+
+        let request =
+            tokio::spawn(async move { client.get("http://example.com/").send().await.is_err() });
+
+        let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let send_errored = request.await.expect("request task");
+
+        assert!(
+            accepted.is_err(),
+            "an UNEXEMPTED loopback-resolving proxy host must be blocked by the \
+             resolver; the listener must never accept, but it did: {accepted:?}"
+        );
+        assert!(
+            send_errored,
+            "the request through an unexempted loopback proxy must fail at the \
+             resolver instead of connecting"
+        );
     }
 }

@@ -295,6 +295,59 @@ fn redact_url_for_diagnostics(url: &str) -> String {
     url[..end].to_string()
 }
 
+/// True when the SSRF DNS guard's "all resolved addresses blocked" marker
+/// appears anywhere in a transport error's `source()` chain. The marker
+/// string is emitted only by [`crate::services::ssrf_dns::SsrfGuardResolver`],
+/// so a match unambiguously identifies an SSRF-guard block (as opposed to a
+/// plain connection-refused / timeout).
+fn is_ssrf_block_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if e.to_string().contains("blocked by SSRF policy") {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Pure transport-error mapping (unit-testable without a real
+/// `reqwest::Error`). When an egress proxy is configured AND the failure is
+/// the SSRF DNS guard refusing to resolve a host, surface a meaningful 503 so
+/// operators see "egress proxy refused by policy" instead of an opaque
+/// `Storage` 500 or a blanket 502 (issue #2570). Every other transport
+/// failure keeps the pre-existing `Storage` mapping unchanged.
+fn map_transport_error(
+    proxy_configured: bool,
+    is_ssrf_block: bool,
+    context: &str,
+    detail: &str,
+) -> AppError {
+    if proxy_configured && is_ssrf_block {
+        AppError::ServiceUnavailable(format!(
+            "egress proxy connection refused by SSRF egress policy while {context}: {detail}"
+        ))
+    } else {
+        AppError::Storage(format!("Failed to {context}: {detail}"))
+    }
+}
+
+/// Shared classifier for a `reqwest` transport error from an upstream
+/// `send()`, reused by the buffered / streaming / token-exchange fetch paths
+/// so the mapping (and the #2570 proxy-egress diagnostic) lives in exactly
+/// one place. `context` is the operation phrase (e.g.
+/// `"fetch from upstream https://…"`) woven into both message forms.
+fn classify_send_error(err: reqwest::Error, context: &str) -> AppError {
+    let is_block = is_ssrf_block_error(&err);
+    let proxy_configured = !crate::services::ssrf_dns::configured_proxy_hosts().is_empty();
+    map_transport_error(
+        proxy_configured,
+        is_block,
+        context,
+        &err.without_url().to_string(),
+    )
+}
+
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
 /// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
@@ -1494,11 +1547,7 @@ impl UpstreamClient {
         }
 
         let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to fetch from upstream {}: {}",
-                diagnostic_url,
-                e.without_url()
-            ))
+            classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
         let status = response.status();
@@ -1660,11 +1709,7 @@ impl UpstreamClient {
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
         let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to fetch from upstream {}: {}",
-                diagnostic_url,
-                e.without_url()
-            ))
+            classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
         let status = response.status();
@@ -1762,11 +1807,13 @@ impl UpstreamClient {
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
                 let retry_response = retry_request.send().await.map_err(|e| {
-                    AppError::Storage(format!(
-                        "Failed to fetch from upstream {} after token exchange: {}",
-                        retry_diagnostic_url,
-                        e.without_url()
-                    ))
+                    classify_send_error(
+                        e,
+                        &format!(
+                            "fetch from upstream {} after token exchange",
+                            retry_diagnostic_url
+                        ),
+                    )
                 })?;
 
                 return Ok(Some(retry_response));
@@ -4867,6 +4914,95 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Transport-error classifier: egress-proxy SSRF block diagnostics (#2570)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_transport_error_proxy_block_is_service_unavailable() {
+        let err = map_transport_error(
+            true, // proxy configured
+            true, // SSRF-guard block
+            "fetch from upstream https://registry.example/x",
+            "all resolved addresses blocked by SSRF policy",
+        );
+        match err {
+            AppError::ServiceUnavailable(msg) => {
+                assert!(
+                    msg.contains("egress proxy") && msg.contains("egress policy"),
+                    "expected a meaningful proxy-egress message, got: {msg}"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_transport_error_generic_upstream_error_keeps_storage_path() {
+        // A generic transport error (proxy configured but NOT an SSRF block)
+        // must keep the pre-existing Storage mapping.
+        let err = map_transport_error(
+            true,  // proxy configured
+            false, // not an SSRF block (e.g. connection reset)
+            "fetch from upstream https://registry.example/x",
+            "connection reset by peer",
+        );
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "generic upstream error must map to Storage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn map_transport_error_ssrf_block_without_proxy_keeps_storage_path() {
+        // No proxy configured ⇒ a block is a genuine direct-target refusal,
+        // not a proxy-egress problem: keep the existing Storage mapping.
+        let err = map_transport_error(
+            false, // no proxy configured
+            true,  // SSRF-guard block
+            "fetch from upstream https://10.0.0.5/x",
+            "all resolved addresses blocked by SSRF policy",
+        );
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "SSRF block with no proxy must map to Storage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_ssrf_block_error_matches_marker_in_chain() {
+        // Direct marker.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "all resolved addresses blocked by SSRF policy",
+        );
+        assert!(is_ssrf_block_error(&io_err));
+
+        // Marker nested one level down in the source chain.
+        #[derive(Debug)]
+        struct Wrap(std::io::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error trying to connect")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let wrapped = Wrap(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "all resolved addresses blocked by SSRF policy",
+        ));
+        assert!(is_ssrf_block_error(&wrapped));
+
+        // A plain connection error must NOT match.
+        let plain =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        assert!(!is_ssrf_block_error(&plain));
+    }
 
     // -----------------------------------------------------------------------
     // Package Age Policy on the proxy sidecar (#1770 / #1771)
