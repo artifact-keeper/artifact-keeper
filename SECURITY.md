@@ -83,3 +83,48 @@ lets an attacker forge tokens if it ever leaks, so treat it like a private key:
   `JWT_SECRET` invalidates all outstanding tokens, forcing re-authentication;
   schedule rotations during a low-traffic window and roll the new value out to
   every backend replica at once.
+
+### SSO group mapping trusts the IdP group taxonomy
+
+The optional `map_groups_to_groups` setting on an OIDC or SAML provider
+reflects the group names supplied by the identity provider into Artifact
+Keeper group memberships (groups are found-or-created **by name** on first
+sight). This is convenient for centralizing group management in the IdP, but
+it has a security implication operators must understand before enabling it:
+
+**When `map_groups_to_groups` is on, the IdP effectively controls membership
+of any local group whose name collides with an IdP-supplied group name.** If a
+privileged local group (for example one used to grant elevated repository
+permissions, or a group referenced elsewhere in your authorization policy)
+shares a name with a group the IdP can emit, then anyone the IdP places in
+that group is joined into the privileged local group on login. In other words,
+enabling this setting means you are **trusting the IdP's group taxonomy** — and
+anyone who can influence group assignment in the IdP — for the membership of
+those local groups.
+
+Note that a mapped group membership persists after login: reconciliation is
+scoped to the mapping source (e.g. it only prunes memberships tagged
+`external_source = 'saml'`), so a membership added because of a name collision
+is not automatically removed and must be cleaned up by an operator.
+
+This does **not** grant the `is_admin` flag — administrator status is conferred
+only through a provider's dedicated `admin_group` setting, not through general
+group mapping. The risk is scoped to whatever any collision-shadowed local
+group is authorized to do.
+
+**Recommended mitigations:**
+
+- **Review the IdP group taxonomy before enabling** `map_groups_to_groups`,
+  and confirm no IdP-emittable group name collides with a privileged or
+  policy-referenced local group.
+- **Name privileged local groups so they can't be shadowed** by an
+  IdP-supplied name — for example reserve an operator-only naming convention
+  (such as an `ak-` / `local-` prefix) for groups that carry elevated
+  permissions, and never use those names in the IdP.
+- **Namespace / prefix mapped groups** where your IdP or mapping supports it,
+  so IdP-sourced groups land in a distinct namespace and can never coincide
+  with a locally managed privileged group.
+- **Keep group-to-permission grants least-privilege**, so that even an
+  unexpected membership has limited blast radius.
+- Restrict who can create or assign groups in the IdP, since with this setting
+  enabled that control governs Artifact Keeper group membership too.
