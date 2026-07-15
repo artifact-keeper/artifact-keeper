@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.8] - 2026-07-15
+
+Security hotfix: restores Docker migration data-fidelity and row-less Maven cloud reads, and closes an outbound-proxy SSRF bypass and a Maven cloud write-side cross-repository isolation gap.
+
+### Fixed
+
+- **Docker/OCI migrations now fetch and register referenced content** (#2457): Docker imports registered tag manifests but never fetched the config/layer blobs and per-arch child manifests they reference by digest, producing hollow, unpullable images; a referenced-content walker now fetches and registers that content, resurrects soft-deleted rows on re-import, and reconciles hollow/orphan state at startup.
+- **Row-less Maven flat-key reads restored for their owning repository on shared cloud storage** (#2574): #2504's row-anchor gate stopped serving legitimate row-less legacy objects (GAV-grouped `.pom`/`.module`/`-sources.jar` companions, verbatim `maven-metadata.xml`, checksum sidecars) on S3/GCS/Azure; a catalog-derived attribution mechanism (`services/maven_flat_attribution`, backed by the new `maven_flat_object_owner` table in migration 155) now resolves each flat key's single owning repository and serves the object only to that owner, 404ing for everyone else while ambiguous and orphan keys stay unreadable.
+
+### Security
+
+- **Outbound egress proxy host is exempted from the SSRF DNS guard** (#2570): a configured egress proxy host is now allowed through the SSRF resolver guard (host-keyed, port-agnostic) so proxied outbound requests are not misclassified as SSRF blocks.
+- **Maven flat-key writes are guarded against cross-repository poisoning on shared cloud storage** (#2584): every Maven flat-key write is now checked before it reaches storage — overwriting a key owned by a different repository is refused with `403`; the pre-write guard is read-only and the first-writer-wins attribution claim is committed only after the object bytes are durably written, so an aborted or coordinate-invalid write can never flip ownership of a foreign unattributed key. Filesystem backends are unaffected.
+
 ## [1.5.7] - 2026-07-14
 
 Security hotfix: prevents cross-repository object access on shared cloud storage backends.
