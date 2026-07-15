@@ -11,7 +11,6 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
-use std::io::Read;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -1073,21 +1072,17 @@ struct NuspecInfo {
 fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
 ) -> Result<NuspecInfo, String> {
-    let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("Invalid ZIP archive: {}", e))?;
-
-    // Find the .nuspec file inside the archive.
-    let mut nuspec_xml = String::new();
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Cannot read ZIP entry: {}", e))?;
-        if file.name().ends_with(".nuspec") {
-            file.read_to_string(&mut nuspec_xml)
-                .map_err(|e| format!("Cannot read .nuspec: {}", e))?;
-            break;
-        }
-    }
+    // Bound the decompression: entry-count cap + per-metadata-entry cap so a
+    // crafted .nupkg cannot inflate the .nuspec unbounded during metadata
+    // parsing (#2556). Zip is random-access, so unmatched entries are never
+    // inflated.
+    let nuspec_bytes = crate::util::bounded_archive::read_metadata_from_zip(reader, |name| {
+        name.ends_with(".nuspec")
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "No .nuspec file found in package".to_string())?;
+    let nuspec_xml =
+        String::from_utf8(nuspec_bytes).map_err(|e| format!("Cannot read .nuspec: {}", e))?;
 
     if nuspec_xml.is_empty() {
         return Err("No .nuspec file found in package".to_string());
@@ -1480,6 +1475,32 @@ mod tests {
         assert_eq!(nuspec.version, "1.2.3");
         assert_eq!(nuspec.description, "A test package");
         assert_eq!(nuspec.authors, "Test Author");
+    }
+
+    #[test]
+    fn test_parse_nuspec_oversized_entry_rejected_2556() {
+        // A .nuspec entry that inflates past the per-metadata-entry cap is a
+        // decompression bomb and must be rejected (bounded memory), while the
+        // compressed .nupkg stays tiny (highly repetitive deflate payload).
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("Big.nuspec", options).unwrap();
+        let oversized = vec![
+            b'A';
+            (crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES + 1024)
+                as usize
+        ];
+        std::io::Write::write_all(&mut zip, &oversized).unwrap();
+        let cursor = zip.finish().unwrap();
+        assert!(
+            cursor.get_ref().len() < 128 * 1024,
+            "compressed nupkg is tiny"
+        );
+
+        let result = parse_nuspec_from_nupkg(cursor.get_ref());
+        assert!(result.is_err(), "oversized .nuspec must be rejected");
     }
 
     #[test]

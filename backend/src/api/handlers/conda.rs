@@ -2591,8 +2591,12 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
             return Err("Invalid .conda package: missing info-*.tar.zst archive".to_string());
         }
     } else if filename.ends_with(".tar.bz2") {
-        // Validate .tar.bz2 v1 structure
-        let decoder = bzip2::read::BzDecoder::new(std::io::Cursor::new(content));
+        // Validate .tar.bz2 v1 structure. Wrap the bzip2 stream in the shared
+        // total-byte budget (#2556) so a crafted v1 package cannot inflate
+        // unbounded while we walk it looking for info/index.json.
+        let decoder = crate::util::bounded_archive::budgeted(bzip2::read::BzDecoder::new(
+            std::io::Cursor::new(content),
+        ));
         let mut archive = tar::Archive::new(decoder);
 
         let entries = archive
@@ -2736,14 +2740,19 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
     let cursor = std::io::Cursor::new(content);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
 
-    // First try metadata.json at the root of the ZIP
-    if let Ok(mut file) = archive.by_name("metadata.json") {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut file, &mut buf).ok()?;
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
-            // metadata.json may only have name/version; look for index.json in info tar
-            if val.get("depends").is_some() {
-                return Some(val);
+    // First try metadata.json at the root of the ZIP. Cap the entry read so a
+    // crafted zip entry cannot buffer unbounded (#2556).
+    if let Ok(file) = archive.by_name("metadata.json") {
+        if let Ok(buf) = crate::util::bounded_archive::read_capped(
+            file,
+            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+            "conda metadata.json",
+        ) {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                // metadata.json may only have name/version; look for index.json in info tar
+                if val.get("depends").is_some() {
+                    return Some(val);
+                }
             }
         }
     }
@@ -2755,10 +2764,18 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
 
     for (idx, name) in &file_names {
         if name.starts_with("info-") && name.ends_with(".tar.zst") {
-            let mut file = archive.by_index(*idx).ok()?;
-            let mut compressed = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut compressed).ok()?;
-            drop(file);
+            let file = archive.by_index(*idx).ok()?;
+            // Cap the read of the compressed inner archive so a crafted zip
+            // entry cannot buffer unbounded before we even reach zstd (#2556).
+            // The info tar carries only small metadata files, so the per-entry
+            // cap is generous; the actual package payload lives in pkg-*.tar.zst
+            // which we never read here.
+            let compressed = crate::util::bounded_archive::read_capped(
+                file,
+                crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+                "conda info-*.tar.zst",
+            )
+            .ok()?;
 
             // Decompress the zstd tar with size limit
             let decompressed = limited_decode_zstd(&compressed, MAX_DECOMPRESSED_METADATA_SIZE)?;
@@ -2773,9 +2790,14 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
                 let mut entry = entry.ok()?;
                 let path = entry.path().ok()?.to_string_lossy().to_string();
                 if path == "info/index.json" || path.ends_with("/index.json") {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut entry, &mut buf).ok()?;
-                    return serde_json::from_str(&buf).ok();
+                    // Cap the inner index.json read too (#2556).
+                    let buf = crate::util::bounded_archive::read_capped(
+                        &mut entry,
+                        crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+                        "conda info/index.json",
+                    )
+                    .ok()?;
+                    return serde_json::from_slice(&buf).ok();
                 }
             }
         }
@@ -2788,25 +2810,14 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
 ///
 /// The package is a bzip2-compressed tar containing `info/index.json`.
 fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
-    let decoder = bzip2::read::BzDecoder::new(std::io::Cursor::new(content));
-    let mut archive = tar::Archive::new(decoder);
-
-    let mut entries_checked = 0;
-    for entry in archive.entries().ok()? {
-        entries_checked += 1;
-        if entries_checked > MAX_TAR_ENTRIES {
-            break;
-        }
-        let mut entry = entry.ok()?;
-        let path = entry.path().ok()?.to_string_lossy().to_string();
-        if path == "info/index.json" {
-            let mut buf = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut buf).ok()?;
-            return serde_json::from_str(&buf).ok();
-        }
-    }
-
-    None
+    // Route through the shared bounded bz2/tar extractor: total-byte budget +
+    // entry-count cap + per-metadata-entry cap (#2556) close the v1 gap (which
+    // previously had only an entry-count cap and no total-byte cap).
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_bz2(content, |path| {
+        path == std::path::Path::new("info/index.json")
+    })
+    .ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -4503,6 +4514,39 @@ mod tests {
             "Valid .tar.bz2 package should pass: {:?}",
             result
         );
+    }
+
+    /// #2556: a v1 `.tar.bz2` whose `info/index.json` inflates past the
+    /// per-metadata-entry cap must not buffer unbounded during extraction; it
+    /// returns None (bounded) rather than exhausting memory. The compressed bz2
+    /// stays tiny, proving the cap bounds the decompressed size.
+    #[test]
+    fn test_extract_conda_v1_oversized_index_bounded_2556() {
+        let pad = "A".repeat(
+            (crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES + 1024) as usize,
+        );
+        let huge = serde_json::json!({
+            "name": "p", "version": "1", "build": "0", "pad": pad,
+        });
+        let package = build_test_conda_v1_package(&huge);
+        assert!(package.len() < 256 * 1024, "compressed bz2 stays tiny");
+        assert!(
+            extract_conda_v1_metadata(&package).is_none(),
+            "oversized v1 index must be bounded (None)"
+        );
+    }
+
+    /// #2556 regression: a normal v1 package still extracts its metadata after
+    /// the hardening.
+    #[test]
+    fn test_extract_conda_v1_normal_still_parses_2556() {
+        let index = serde_json::json!({
+            "name": "numpy", "version": "1.2.3", "build": "0", "depends": [],
+        });
+        let package = build_test_conda_v1_package(&index);
+        let meta = extract_conda_v1_metadata(&package).expect("normal v1 parses");
+        assert_eq!(meta.get("name").and_then(|v| v.as_str()), Some("numpy"));
+        assert_eq!(meta.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
     }
 
     /// Regression (#1782): the uploaded filename must match the embedded

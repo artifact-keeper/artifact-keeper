@@ -113,30 +113,18 @@ fn extract_npm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn extract_npm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
-    use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(reader);
-    let mut tar = tar::Archive::new(gz);
-    let entries = tar.entries().ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path().ok()?;
-        let name = path.to_string_lossy();
-        // Most npm tarballs use the `package/` prefix, but some publish
-        // tools put the actual package name first or omit the prefix
-        // entirely. Match any path ending in `/package.json` or the bare
-        // `package.json` at the root.
-        if name == "package.json" || name.ends_with("/package.json") {
-            // Drop the moved entry — re-iterate is messy with `tar`'s
-            // Read-once entries iterator, so capture the bytes here.
-            drop(name);
-            drop(path);
-            let mut buf = String::new();
-            let mut e = entry;
-            e.read_to_string(&mut buf).ok()?;
-            let pkg: serde_json::Value = serde_json::from_str(&buf).ok()?;
-            return Some(serde_json::json!({ "version_data": pkg }));
-        }
-    }
-    None
+    // Bound the gzip/tar decompression on this migration-worker reprocessing
+    // path (#2556). Most npm tarballs use the `package/` prefix, but some
+    // publish tools put the actual package name first or omit the prefix — match
+    // any path whose file name is `package.json`.
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name()
+            .map(|n| n == "package.json")
+            .unwrap_or(false)
+    })
+    .ok()??;
+    let pkg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(serde_json::json!({ "version_data": pkg }))
 }
 
 /// Extract helm chart metadata from a `.tgz` tarball.
@@ -151,39 +139,30 @@ fn extract_helm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn extract_helm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
-    use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(reader);
-    let mut tar = tar::Archive::new(gz);
-    let entries = tar.entries().ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path().ok()?;
-        let name = path.to_string_lossy();
-        if name == "Chart.yaml" || name.ends_with("/Chart.yaml") {
-            drop(name);
-            drop(path);
-            let mut buf = String::new();
-            let mut e = entry;
-            e.read_to_string(&mut buf).ok()?;
-            let chart: serde_json::Value = serde_yaml::from_str(&buf).ok()?;
-            let description = chart
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let app_version = chart
-                .get("appVersion")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let mut wrapper = serde_json::json!({ "chart": chart });
-            if let Some(d) = description {
-                wrapper["description"] = serde_json::Value::String(d);
-            }
-            if let Some(a) = app_version {
-                wrapper["appVersion"] = serde_json::Value::String(a);
-            }
-            return Some(wrapper);
-        }
+    // Bound the gzip/tar decompression on this migration-worker reprocessing
+    // path (#2556).
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name().map(|n| n == "Chart.yaml").unwrap_or(false)
+    })
+    .ok()??;
+    let buf = String::from_utf8(bytes).ok()?;
+    let chart: serde_json::Value = serde_yaml::from_str(&buf).ok()?;
+    let description = chart
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let app_version = chart
+        .get("appVersion")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let mut wrapper = serde_json::json!({ "chart": chart });
+    if let Some(d) = description {
+        wrapper["description"] = serde_json::Value::String(d);
     }
-    None
+    if let Some(a) = app_version {
+        wrapper["appVersion"] = serde_json::Value::String(a);
+    }
+    Some(wrapper)
 }
 
 fn fallback(filename: &str) -> ParsedArtifact {

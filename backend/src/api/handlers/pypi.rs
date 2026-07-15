@@ -2316,33 +2316,25 @@ async fn serve_metadata(
 }
 
 fn extract_metadata_from_wheel(content: &[u8]) -> Option<String> {
+    // Bound the zip decompression (#2556): a crafted wheel served via PEP 658
+    // `.metadata` cannot inflate the METADATA entry unbounded. On a cap breach
+    // this returns None -> a bounded "Metadata not available" response instead
+    // of an unbounded inflate.
     let cursor = std::io::Cursor::new(content);
-    let mut archive = zip::ZipArchive::new(cursor).ok()?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).ok()?;
-        if file.name().contains(".dist-info/") && file.name().ends_with("METADATA") {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut file, &mut text).ok()?;
-            return Some(text);
-        }
-    }
-    None
+    let bytes = crate::util::bounded_archive::read_metadata_from_zip(cursor, |name| {
+        name.contains(".dist-info/") && name.ends_with("METADATA")
+    })
+    .ok()??;
+    String::from_utf8(bytes).ok()
 }
 
 fn extract_metadata_from_sdist(content: &[u8]) -> Option<String> {
-    use flate2::read::GzDecoder;
-    let gz = GzDecoder::new(content);
-    let mut archive = tar::Archive::new(gz);
-    for entry in archive.entries().ok()? {
-        let mut entry = entry.ok()?;
-        let path = entry.path().ok()?.to_path_buf();
-        if path.ends_with("PKG-INFO") {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut text).ok()?;
-            return Some(text);
-        }
-    }
-    None
+    // Bound the gzip/tar decompression (#2556) for the served sdist PKG-INFO.
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_gz(content, |path| {
+        path.ends_with("PKG-INFO")
+    })
+    .ok()??;
+    String::from_utf8(bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
