@@ -30,6 +30,7 @@ pub mod image_scanner;
 pub mod incus_scanner;
 pub mod ldap_service;
 pub mod manifest_blob_refs_backfill;
+pub mod maven_flat_attribution;
 pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
