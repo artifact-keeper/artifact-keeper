@@ -156,14 +156,41 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
     // Gate 0: This helper ultimately reads a bare `maven/<path>` key that is not
-    // anchored to an artifact row scoped to the caller's repository. That is only
-    // sound on backends that physically isolate each repository's key space
-    // (filesystem, rooted at the repo's storage_path). On shared cloud namespaces
-    // (S3/GCS/Azure) the same flat key can belong to a *different* repository, so
-    // the fallback must not run there — skip straight to 404 rather than risk
-    // serving another repository's bytes.
+    // anchored to an artifact row scoped to the caller's repository. On backends
+    // that physically isolate each repository's key space (filesystem, rooted at
+    // the repo's storage_path) that is always sound, so the filesystem sibling +
+    // quarantine gates (1–3) below apply. On shared cloud namespaces
+    // (S3/GCS/Azure) the same flat key can belong to a *different* repository and
+    // a live sibling row in the *requesting* repository does NOT prove ownership
+    // of the flat key, so the sibling anchor is unsafe there. Instead serve the
+    // object only when the catalog attributes the exact key to this repository
+    // (#2504, #2574 — the same ownership rule as the write guard). A database
+    // error fails closed (404) rather than risking a foreign read.
     if !crate::storage::backend_is_repo_isolated(&location.backend) {
-        return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+        let flat_key = format!("maven/{}", artifact_path);
+        let owned = crate::services::maven_flat_attribution::attributed_owner(db, &flat_key)
+            .await
+            .ok()
+            .flatten()
+            == Some(repo_id);
+        if !owned {
+            return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+        }
+        let storage = state.storage_for_repo_or_500(location)?;
+        let stream = storage.get_stream(&flat_key).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("not found") {
+                (StatusCode::NOT_FOUND, "Artifact not found").into_response()
+            } else {
+                internal_error("Storage", e)
+            }
+        })?;
+        // Cloud flat-key legacy object: not anchored to our artifact row.
+        return Ok(StreamingFetchResult {
+            body: stream,
+            content_type: None,
+            content_length: None,
+        });
     }
 
     // Gate 1: Only secondaries and bare primaries are eligible; anything else is 404.
