@@ -1081,10 +1081,10 @@ pub(crate) async fn run_curation_sync_cycle(
                 // parse, or verification failure skips this repo (zero packages
                 // ingested) rather than trusting unauthenticated metadata. With
                 // no trusted key the batch proceeds as "unverified upstream".
-                match trusted_gpg_key
-                    .as_deref()
-                    .filter(|k| !k.trim().is_empty())
-                {
+                // `verified` gates the primary.xml checksum-chain enforcement
+                // below: a signature over repomd alone does NOT authenticate a
+                // tampered primary — repomd's <checksum> must pin it.
+                let verified = match trusted_gpg_key.as_deref().filter(|k| !k.trim().is_empty()) {
                     Some(trusted_key) => {
                         let asc_url = format!("{}/repodata/repomd.xml.asc", base);
                         let mut asc_req = client.get(&asc_url);
@@ -1109,10 +1109,13 @@ pub(crate) async fn run_curation_sync_cycle(
                             &repomd_bytes,
                             &asc,
                         ) {
-                            Ok(()) => tracing::debug!(
-                                "RPM curation sync: verified repomd.xml signature for staging repo {}",
-                                staging_id
-                            ),
+                            Ok(()) => {
+                                tracing::debug!(
+                                    "RPM curation sync: verified repomd.xml signature for staging repo {}",
+                                    staging_id
+                                );
+                                true
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "RPM curation sync: repomd.xml signature verification FAILED for staging repo {}: {}; refusing upstream (0 packages ingested)",
@@ -1123,17 +1126,24 @@ pub(crate) async fn run_curation_sync_cycle(
                             }
                         }
                     }
-                    None => tracing::info!(
-                        "RPM curation sync: no trusted GPG key configured for staging repo {}; ingesting unverified upstream metadata",
-                        staging_id
-                    ),
-                }
+                    None => {
+                        tracing::warn!(
+                            "RPM curation sync: no trusted GPG key configured for staging repo {}; ingesting UNVERIFIED upstream metadata (set trusted_gpg_key to enforce upstream signatures)",
+                            staging_id
+                        );
+                        false
+                    }
+                };
 
-                // Find primary.xml location from repomd.xml, fall back to default path.
+                // Parse the primary reference (href + repomd-pinned checksums)
+                // from repomd. When `verified`, this comes from the signed
+                // repomd, so its <checksum> can be trusted to pin primary.xml.
                 let repomd_str = String::from_utf8_lossy(&repomd_bytes);
-                let primary_path =
-                    crate::services::curation_sync::extract_primary_href(&repomd_str)
-                        .unwrap_or_else(|| "repodata/primary.xml.gz".to_string());
+                let primary_ref = crate::services::curation_sync::extract_primary_data(&repomd_str);
+                let primary_path = primary_ref
+                    .as_ref()
+                    .map(|d| d.href.clone())
+                    .unwrap_or_else(|| "repodata/primary.xml.gz".to_string());
                 let primary_url = format!("{}/{}", base, primary_path);
                 let mut primary_req = client.get(&primary_url);
                 if let Some(ref auth) = upstream_auth {
@@ -1145,6 +1155,29 @@ pub(crate) async fn run_curation_sync_cycle(
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
+
+                        // Chain-of-trust (#2357 HIGH): when the repo is
+                        // signature-verified, the FETCHED primary.xml.gz must
+                        // match the <checksum> pinned in the signed repomd.xml
+                        // BEFORE it is parsed/ingested. Fail-closed on a
+                        // missing / unsupported / mismatching checksum — this is
+                        // what binds primary.xml to the signed repomd, defeating
+                        // a tampered/replayed primary served at the signed href.
+                        // (No enforcement on the unverified path: backward-compat
+                        // for existing no-key RPM curation repos.)
+                        if verified
+                            && !crate::services::curation_sync::primary_gz_pinned_by_repomd(
+                                primary_ref.as_ref(),
+                                &bytes,
+                            )
+                        {
+                            tracing::warn!(
+                                "RPM curation sync: primary.xml.gz does NOT match the checksum pinned in the signed repomd.xml for staging repo {}; refusing upstream (0 packages ingested)",
+                                staging_id
+                            );
+                            continue;
+                        }
+
                         let xml = if primary_path.ends_with(".gz") {
                             // Bound the upstream-index decompression (#2556): a
                             // malicious/compromised upstream mirror cannot inflate
@@ -1153,6 +1186,31 @@ pub(crate) async fn run_curation_sync_cycle(
                         } else {
                             String::from_utf8_lossy(&bytes).to_string()
                         };
+
+                        // Defense-in-depth: when the signed repomd also declares
+                        // an <open-checksum> over the decompressed primary.xml,
+                        // enforce it too (only when present — the compressed
+                        // <checksum> above already binds the exact bytes).
+                        if verified {
+                            if let Some(d) = primary_ref.as_ref() {
+                                if let (Some(ot), Some(ov)) =
+                                    (d.open_checksum_type.as_deref(), d.open_checksum.as_deref())
+                                {
+                                    if !crate::services::curation_sync::repodata_checksum_matches(
+                                        ot,
+                                        ov,
+                                        xml.as_bytes(),
+                                    ) {
+                                        tracing::warn!(
+                                            "RPM curation sync: decompressed primary.xml open-checksum mismatch vs signed repomd for staging repo {}; refusing upstream",
+                                            staging_id
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         curation_sync::parse_rpm_primary_xml(&xml)
                     }
                     Ok(resp) => {
