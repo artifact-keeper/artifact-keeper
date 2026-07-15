@@ -378,6 +378,8 @@ async fn fetch_verify_store_blob(
     image: &str,
     digest: &str,
 ) -> Result<(String, i64), MigrationError> {
+    // Blobs are not size-capped here (config/layer sizes are legitimate and
+    // large); count caps + fail-closed transfer bound the walk.
     let (temp, computed, size) = stream_to_temp(
         client,
         staging_dir,
@@ -385,6 +387,7 @@ async fn fetch_verify_store_blob(
         image,
         digest,
         OciContentKind::Blob,
+        None,
     )
     .await?;
     if computed != digest {
@@ -410,21 +413,19 @@ async fn fetch_verify_store_manifest(
     image: &str,
     digest: &str,
 ) -> Result<bytes::Bytes, MigrationError> {
-    let (temp, computed, size) = stream_to_temp(
+    // The manifest cap is enforced MID-STREAM inside `stream_to_temp` (a
+    // hostile source must not spill a multi-GB body to disk behind a manifest
+    // URL), so anything returned here is already within the cap.
+    let (temp, computed, _size) = stream_to_temp(
         client,
         staging_dir,
         repo_key,
         image,
         digest,
         OciContentKind::Manifest,
+        Some(MAX_INDEX_MANIFEST_BYTES),
     )
     .await?;
-    if size as usize > MAX_INDEX_MANIFEST_BYTES {
-        return Err(MigrationError::Other(format!(
-            "referenced child manifest '{digest}' of image '{image}' exceeds the {} byte manifest cap (got {size} bytes)",
-            MAX_INDEX_MANIFEST_BYTES
-        )));
-    }
     if computed != digest {
         return Err(MigrationError::ChecksumMismatch {
             path: format!("{image}/manifests/{digest}"),
@@ -456,6 +457,7 @@ async fn stream_to_temp(
     image: &str,
     digest: &str,
     kind: OciContentKind,
+    max_bytes: Option<usize>,
 ) -> Result<(tempfile::NamedTempFile, String, i64), MigrationError> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -482,8 +484,21 @@ async fn stream_to_temp(
     let mut size: i64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(MigrationError::from)?;
+        // Enforce the size cap MID-STREAM (manifest fetches): reject before the
+        // overflowing chunk is written, so a hostile source cannot spill a
+        // multi-GB body to the staging temp file behind a manifest URL before
+        // rejection. Blob fetches pass `None` and stay uncapped here.
+        let next_size = size + chunk.len() as i64;
+        if let Some(cap) = max_bytes {
+            if next_size as usize > cap {
+                return Err(MigrationError::Other(format!(
+                    "OCI manifest '{image}/{}/{digest}' exceeds the {cap} byte cap mid-stream; aborting fetch",
+                    kind.path_segment()
+                )));
+            }
+        }
         hasher.update(&chunk);
-        size += chunk.len() as i64;
+        size = next_size;
         writer
             .write_all(&chunk)
             .await
@@ -1028,6 +1043,53 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// The manifest fetch aborts mid-stream once the body exceeds the cap,
+    /// before the whole body is spilled to the staging temp file (DoS DiD).
+    #[tokio::test]
+    async fn stream_to_temp_aborts_manifest_over_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = bytes::Bytes::from(vec![b'x'; 4096]);
+        let digest = sha256_digest(&big);
+        let mut src = DigestSource::new();
+        // Same body served on both the manifest and blob routes so the capped
+        // (manifest) and uncapped (blob) fetches exercise the identical bytes.
+        src.manifests.insert(digest.clone(), big.clone());
+        src.blobs.insert(digest.clone(), big.clone());
+        let client: Arc<dyn SourceRegistry> = Arc::new(src);
+
+        // Cap far below the body size: the fetch must error, not buffer it.
+        let capped = stream_to_temp(
+            &client,
+            tmp.path(),
+            "repo",
+            "app",
+            &digest,
+            OciContentKind::Manifest,
+            Some(64),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "manifest fetch must abort once it exceeds the cap"
+        );
+
+        // Same body with no cap (blob path) streams fine.
+        let uncapped = stream_to_temp(
+            &client,
+            tmp.path(),
+            "repo",
+            "app",
+            &digest,
+            OciContentKind::Blob,
+            None,
+        )
+        .await;
+        assert!(uncapped.is_ok(), "uncapped (blob) fetch must succeed");
+        let (_t, computed, size) = uncapped.unwrap();
+        assert_eq!(computed, digest);
+        assert_eq!(size, 4096);
     }
 
     #[test]

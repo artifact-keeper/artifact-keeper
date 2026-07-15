@@ -1469,7 +1469,7 @@ async fn stream_migration_progress(
         // Send initial connection event
         yield Ok(Event::default().event("connected").data(format!(r#"{{"job_id":"{}"}}"#, id)));
 
-        let terminal_statuses = ["completed", "failed", "cancelled"];
+        let terminal_statuses = ["completed", "completed_with_errors", "failed", "cancelled"];
 
         loop {
             // Fetch current progress
@@ -1605,7 +1605,10 @@ async fn list_migration_items(
 /// audit report is meaningful. Mirrors the terminal set used by the progress
 /// stream loop.
 fn is_terminal_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
+    matches!(
+        status,
+        "completed" | "completed_with_errors" | "failed" | "cancelled"
+    )
 }
 
 /// Fetch the persisted report row for a job, if one exists.
