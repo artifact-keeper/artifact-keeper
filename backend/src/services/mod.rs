@@ -35,6 +35,7 @@ pub mod nexus_client;
 pub mod npm_packument_cache;
 pub mod oci_manifest_refs_backfill;
 pub mod oci_migration_reindex;
+pub mod oci_referenced_content;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod opensearch_service;

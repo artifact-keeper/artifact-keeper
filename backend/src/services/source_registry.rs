@@ -17,6 +17,32 @@ use crate::services::artifactory_client::{
 /// artifact size (issue #1422).
 pub type ArtifactByteStream = BoxStream<'static, Result<Bytes, ArtifactoryError>>;
 
+/// The kind of digest-addressed OCI content to fetch from a source registry.
+///
+/// A Docker/OCI source enumerates only the *tag* manifests of a repository.
+/// The bytes those manifests reference — the image config/layer blobs and
+/// (for a multi-arch index) the per-arch child manifests — are addressed by
+/// digest and are NOT enumerated. The migration worker's referenced-content
+/// walker (#2457) fetches them explicitly by digest through
+/// [`SourceRegistry::download_oci_content_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OciContentKind {
+    /// A config or layer blob: `.../blobs/<digest>`.
+    Blob,
+    /// A child (per-arch) image manifest: `.../manifests/<digest>`.
+    Manifest,
+}
+
+impl OciContentKind {
+    /// The registry-API path segment (`blobs` or `manifests`) for this kind.
+    pub fn path_segment(self) -> &'static str {
+        match self {
+            OciContentKind::Blob => "blobs",
+            OciContentKind::Manifest => "manifests",
+        }
+    }
+}
+
 /// Trait for source registry clients used during migration.
 ///
 /// Both `ArtifactoryClient` and `NexusClient` implement this trait so the
@@ -89,6 +115,33 @@ pub trait SourceRegistry: Send + Sync {
     ) -> Result<ArtifactByteStream, ArtifactoryError> {
         let bytes = self.download_artifact(repo_key, path).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
+
+    /// Download digest-addressed OCI content (a config/layer blob or a child
+    /// image manifest) as a chunked byte stream (#2457).
+    ///
+    /// A Docker/OCI source registry enumerates only the *tag* manifests of a
+    /// repository; the config/layer blobs and per-arch child manifests those
+    /// manifests reference are addressed by digest and never appear in
+    /// `list_artifacts`. The migration worker's referenced-content walker
+    /// resolves them by digest through this method so a migrated image lands
+    /// with all of its bytes (not a hollow, unpullable tag).
+    ///
+    /// The default implementation targets the OCI Distribution v2 layout that
+    /// Nexus (and any conformant registry) serves under a repository:
+    /// `<repo>/v2/<image>/{blobs|manifests}/<digest>`. It delegates to
+    /// [`download_artifact_stream`](Self::download_artifact_stream) so the
+    /// per-source auth/transport is reused unchanged. Sources whose blob
+    /// layout differs (Artifactory) override this.
+    async fn download_oci_content_stream(
+        &self,
+        repo_key: &str,
+        image: &str,
+        digest: &str,
+        kind: OciContentKind,
+    ) -> Result<ArtifactByteStream, ArtifactoryError> {
+        let path = format!("v2/{}/{}/{}", image, kind.path_segment(), digest);
+        self.download_artifact_stream(repo_key, &path).await
     }
 
     /// Get artifact properties/metadata (optional — returns empty if unsupported)
