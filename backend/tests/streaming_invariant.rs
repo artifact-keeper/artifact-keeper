@@ -48,14 +48,26 @@ use std::path::{Path, PathBuf};
 /// `response.bytes_stream()` under a running byte ceiling instead of calling
 /// `response.bytes()`. With no gated call left, the proxy_service.rs row is
 /// removed: 32 -> 31.
+///
+/// Reconciliation (#2491): three post-Phase-4b merges drifted the source from
+/// this allowlist. Reconciled to match the current, correct source:
+///   * npm.rs 5 -> 6: the packument stale-while-revalidate cache (#2166) added a
+///     bounded `axum::body::to_bytes` read of a computed packument JSON, capped
+///     at `NPM_PACKUMENT_BUFFER_CAP`. A legitimate new metadata buffer site.
+///   * pypi.rs 1 -> removed: the shared content-addressed upload primitive
+///     (#2199) streamed the pypi upload to storage, deleting the last `.bytes()`
+///     multipart-field read. Phase progress — the row is gone.
+///   * remote_instances.rs 1 -> removed: the remote-instance proxy (#2532) now
+///     forwards `resp.bytes_stream()` instead of buffering `.bytes()`. Phase
+///     progress — the row is gone.
+///
+/// Net: 31 -> 30 (+1 npm, -1 pypi, -1 remote_instances).
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
-    ("src/api/handlers/npm.rs", 5),
+    ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
-    ("src/api/handlers/pypi.rs", 1),
-    ("src/api/handlers/remote_instances.rs", 1),
     ("src/api/handlers/repositories.rs", 2),
     ("src/api/middleware/rate_limit.rs", 1),
     ("src/main.rs", 1),
@@ -415,8 +427,9 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 31,
-        "expected 31 exempt sites after #1608 Phase 4b (proxy_service buffered \
-         metadata read capped via running-bounded bytes_stream); got {total}"
+        total, 30,
+        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+         (npm packument cache +1; pypi and remote_instances streamed to storage, \
+         -1 each); got {total}"
     );
 }
