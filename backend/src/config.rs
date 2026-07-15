@@ -331,6 +331,12 @@ pub struct Config {
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
 
+    /// Cron expression (6-field) for the deduplicated storage-stats refresher
+    /// (#2056; default: every 4 hours). The refresher recomputes the
+    /// materialized `repository_storage_stats` / `instance_storage_stats` so
+    /// the storage API reads are O(1). It also runs right after each GC pass.
+    pub storage_stats_schedule: String,
+
     /// Whether scheduled blob garbage collection is allowed to actually
     /// delete blobs (#1408). Defaults to `false`: blob deletion is the
     /// dangerous part of GC, so the scheduled pass runs in DRY-RUN mode
@@ -746,6 +752,7 @@ redacted_debug!(Config {
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
     show gc_schedule,
+    show storage_stats_schedule,
     show blob_gc_enabled,
     show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
@@ -856,6 +863,7 @@ impl Default for Config {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
+            storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
@@ -1048,6 +1056,8 @@ impl Config {
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
+            storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
+                .unwrap_or_else(|_| "0 0 */4 * * *".into()),
             // Blob deletion is the dangerous half of GC. Defaults to false
             // so the scheduled pass dry-runs unless an operator opts in.
             // Accepts "true" / "1" (case-insensitive); anything else

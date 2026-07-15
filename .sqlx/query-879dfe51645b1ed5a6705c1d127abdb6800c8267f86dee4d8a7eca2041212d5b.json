@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT unique_bytes FROM instance_storage_stats WHERE id = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unique_bytes",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "879dfe51645b1ed5a6705c1d127abdb6800c8267f86dee4d8a7eca2041212d5b"
+}

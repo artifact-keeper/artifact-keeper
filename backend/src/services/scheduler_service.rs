@@ -289,6 +289,14 @@ pub fn spawn_all(
             // Kept for the blob-GC readiness gate below; the pool itself is
             // moved into the GC service on the next line.
             let gate_db = db.clone();
+            // Post-GC storage-stats refresher (#2056): recompute the
+            // deduplicated `repository_storage_stats` right after each GC pass
+            // so the materialized numbers settle once reclaim has run. This is
+            // read-only accounting and never touches the quota path.
+            let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+                db.clone(),
+                &config_clone.storage_backend,
+            );
             // Blob deletion is opt-in (#1408). When BLOB_GC_ENABLED is unset
             // the scheduled pass runs DRY-RUN: it logs what it would reclaim
             // but deletes nothing. Bias to leaking storage over losing data.
@@ -485,6 +493,57 @@ pub fn spawn_all(
                     Err(e) => {
                         tracing::warn!("Blob GC sweep pass failed: {}", e);
                     }
+                }
+
+                // Post-GC refresh (#2056): recompute deduplicated storage stats
+                // now that this tick's reclaim has settled so the materialized
+                // table reflects the post-GC footprint. Reporting-only.
+                if let Err(e) = stats_service.recompute_all().await {
+                    tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Deduplicated storage-stats refresher (cron-based, default: every 4h).
+    // Materializes `repository_storage_stats` / `instance_storage_stats` so the
+    // storage API reads are O(1). Independent of GC so stats stay fresh even
+    // when nothing is reclaimed (#2056). Read-only: never affects quota.
+    {
+        let db = db.clone();
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(150)).await;
+            let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+                db,
+                &config_clone.storage_backend,
+            );
+
+            let normalized = normalize_cron_expression(&config_clone.storage_stats_schedule);
+            let schedule = match parse_cron_schedule(&normalized) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        "Invalid STORAGE_STATS_SCHEDULE '{}', falling back to every 4h",
+                        config_clone.storage_stats_schedule,
+                    );
+                    Schedule::from_str("0 0 */4 * * *").expect("default 4-hourly cron is valid")
+                }
+            };
+
+            loop {
+                let next = schedule
+                    .upcoming(Utc)
+                    .next()
+                    .expect("cron schedule should always have a next occurrence");
+                let delay = (next - Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::from_secs(4 * 3600));
+                tokio::time::sleep(delay).await;
+
+                tracing::debug!("Running scheduled deduplicated storage-stats refresh");
+                if let Err(e) = stats_service.recompute_all().await {
+                    tracing::warn!("Scheduled storage-stats refresh failed: {}", e);
                 }
             }
         });
