@@ -2478,7 +2478,13 @@ pub struct RepositoryStorageStatsResponse {
     /// The instance-wide globally-distinct footprint (true disk usage). On
     /// cloud backends the sum of per-repo `physical_bytes` OVER-counts shared
     /// objects, so this is the authoritative instance total.
-    pub instance_unique_bytes: i64,
+    ///
+    /// **Admin-only:** this is a whole-instance aggregate that spans every
+    /// tenant, so it is only populated for admin callers. It is omitted from the
+    /// response entirely for repo-authorized non-admins and anonymous callers,
+    /// who see only this repository's own figures (#2559 review).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_unique_bytes: Option<i64>,
     /// When these figures were last recomputed. `null` before the first refresh.
     pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -2489,6 +2495,10 @@ pub struct RepositoryStorageStatsResponse {
 /// materialized stats cache. Same visibility rules as `get_repository`:
 /// public repos and repo members pass; everyone else gets an existence-hiding
 /// 404.
+///
+/// The whole-instance aggregate `instance_unique_bytes` is admin-only and is
+/// omitted for non-admin/anonymous callers; they receive only this
+/// repository's own figures.
 #[utoipa::path(
     get,
     path = "/{key}/storage",
@@ -2525,14 +2535,25 @@ pub async fn get_repository_storage(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // The instance-total singleton (globally-distinct footprint). Absent until
-    // the first refresh; treated as 0 so the response is always well-formed.
-    let instance_unique_bytes =
-        sqlx::query_scalar!(r#"SELECT unique_bytes FROM instance_storage_stats WHERE id = true"#)
+    // The instance-total singleton (globally-distinct footprint) is a
+    // whole-instance aggregate spanning every tenant, so it is ADMIN-ONLY: only
+    // fetch it for admins, and omit it from the response for repo-authorized
+    // non-admins and anonymous callers (#2559 review). A repo-visible non-admin
+    // sees only this repository's own numbers.
+    let is_admin = matches!(&auth, Some(a) if a.is_admin);
+    let instance_unique_bytes = if is_admin {
+        Some(
+            sqlx::query_scalar!(
+                r#"SELECT unique_bytes FROM instance_storage_stats WHERE id = true"#
+            )
             .fetch_optional(&state.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
-            .unwrap_or(0);
+            .unwrap_or(0),
+        )
+    } else {
+        None
+    };
 
     let response = match row {
         Some(r) => {
@@ -7238,6 +7259,46 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // Storage stats: the whole-instance aggregate `instance_unique_bytes` is
+    // admin-only and must be OMITTED from the JSON for non-admin / anonymous
+    // callers (#2559 review), while per-repo figures are always present.
+    // -----------------------------------------------------------------------
+
+    fn sample_storage_stats(instance: Option<i64>) -> RepositoryStorageStatsResponse {
+        RepositoryStorageStatsResponse {
+            repository_key: "demo".into(),
+            logical_bytes: 54033,
+            physical_bytes: 52033,
+            unique_bytes: 52033,
+            shared_bytes: 0,
+            dedup_ratio: 1.0384,
+            blob_count: 4,
+            dedup_scope: "per_repo".into(),
+            instance_unique_bytes: instance,
+            computed_at: None,
+        }
+    }
+
+    #[test]
+    fn storage_stats_omits_instance_total_for_non_admin() {
+        // Non-admin / anon path: instance_unique_bytes is None -> absent key.
+        let json = serde_json::to_value(sample_storage_stats(None)).unwrap();
+        assert!(
+            json.get("instance_unique_bytes").is_none(),
+            "instance total must not leak to non-admin/anon callers"
+        );
+        // Per-repo figures are still present.
+        assert_eq!(json["physical_bytes"], 52033);
+        assert_eq!(json["shared_bytes"], 0);
+    }
+
+    #[test]
+    fn storage_stats_includes_instance_total_for_admin() {
+        let json = serde_json::to_value(sample_storage_stats(Some(53033))).unwrap();
+        assert_eq!(json["instance_unique_bytes"], 53033);
+    }
 
     // -----------------------------------------------------------------------
     // Content-Disposition filename derivation (#1785) — the download filename
