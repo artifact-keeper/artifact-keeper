@@ -2111,7 +2111,40 @@ pub(crate) async fn persist_tag_and_refs(
     manifest_body: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    persist_tag_and_refs_in_tx(
+        &mut tx,
+        repo_id,
+        name,
+        tag,
+        manifest_digest,
+        manifest_content_type,
+        class,
+        manifest_body,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
+/// Transaction-participating form of [`persist_tag_and_refs`]. Runs the tag
+/// upsert and reference recording against a caller-owned transaction WITHOUT
+/// committing, so the caller can bind the registration to a larger atomic
+/// unit — e.g. the migration worker registers the `artifacts` row, the tag,
+/// and every referenced blob/child manifest in ONE transaction so a migrated
+/// tag is never committed without its backing content (#2457). The pool-taking
+/// [`persist_tag_and_refs`] is a thin wrapper that begins + commits its own
+/// transaction, preserving the live push path's behaviour byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_tag_and_refs_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    name: &str,
+    tag: &str,
+    manifest_digest: &str,
+    manifest_content_type: &str,
+    class: &ManifestClass,
+    manifest_body: &[u8],
+) -> Result<(), sqlx::Error> {
     // 1. Tag upsert (identical SQL/semantics to the previous standalone form).
     sqlx::query(
         r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
@@ -2126,7 +2159,7 @@ pub(crate) async fn persist_tag_and_refs(
     .bind(tag)
     .bind(manifest_digest)
     .bind(manifest_content_type)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // 2. Reference recording, in the SAME transaction. A failure here rolls
@@ -2146,7 +2179,7 @@ pub(crate) async fn persist_tag_and_refs(
                 .bind(manifest_digest)
                 .bind(&children)
                 .bind(repo_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             }
         }
@@ -2178,7 +2211,7 @@ pub(crate) async fn persist_tag_and_refs(
                 )
                 .bind(repo_id)
                 .bind(&blob_digests)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **tx)
                 .await?;
 
                 // 2b. (#1660) Resurrect any of these blobs that blob GC has
@@ -2202,7 +2235,7 @@ pub(crate) async fn persist_tag_and_refs(
                 )
                 .bind(repo_id)
                 .bind(&blob_digests)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
 
                 sqlx::query(
@@ -2217,14 +2250,13 @@ pub(crate) async fn persist_tag_and_refs(
                 .bind(&blob_digests)
                 .bind(&kinds)
                 .bind(repo_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             }
         }
         ManifestClass::Malformed => {}
     }
 
-    tx.commit().await?;
     Ok(())
 }
 
@@ -13464,6 +13496,23 @@ mod oci_manifest_refs_tests {
         assert!(
             extract_blob_refs(body).is_empty(),
             "image index has no config/layers blobs"
+        );
+        // Companion to the pure-extractor assertion above (#2457): the
+        // referenced-content walker must NOT treat an index as an image (whose
+        // blobs `extract_blob_refs` would enumerate) — it classifies the body
+        // as an Index and recurses its `manifests[]` children instead. The
+        // classifier is the single source of truth the walker branches on.
+        assert!(
+            matches!(classify_manifest(body), ManifestClass::Index),
+            "the walker must classify this as an index and recurse children, not read blob refs"
+        );
+        assert_eq!(
+            extract_child_digests(body),
+            vec![
+                "sha256:childamd64".to_string(),
+                "sha256:childarm64".to_string()
+            ],
+            "the walker recurses exactly these child manifests"
         );
     }
 

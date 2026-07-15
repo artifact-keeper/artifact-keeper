@@ -17,6 +17,93 @@ use crate::services::artifactory_client::{
 /// artifact size (issue #1422).
 pub type ArtifactByteStream = BoxStream<'static, Result<Bytes, ArtifactoryError>>;
 
+/// The kind of digest-addressed OCI content to fetch from a source registry.
+///
+/// A Docker/OCI source enumerates only the *tag* manifests of a repository.
+/// The bytes those manifests reference — the image config/layer blobs and
+/// (for a multi-arch index) the per-arch child manifests — are addressed by
+/// digest and are NOT enumerated. The migration worker's referenced-content
+/// walker (#2457) fetches them explicitly by digest through
+/// [`SourceRegistry::download_oci_content_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OciContentKind {
+    /// A config or layer blob: `.../blobs/<digest>`.
+    Blob,
+    /// A child (per-arch) image manifest: `.../manifests/<digest>`.
+    Manifest,
+}
+
+impl OciContentKind {
+    /// The registry-API path segment (`blobs` or `manifests`) for this kind.
+    pub fn path_segment(self) -> &'static str {
+        match self {
+            OciContentKind::Blob => "blobs",
+            OciContentKind::Manifest => "manifests",
+        }
+    }
+}
+
+/// Whether `digest` is a canonical `sha256:<64-lowercase-hex>` reference.
+///
+/// The by-digest fetch path (#2457) interpolates the digest into an OUTBOUND
+/// source URL, and the digest originates from an attacker-influenced manifest
+/// body. Validate it against the strict grammar before building the URL so a
+/// crafted `../`/scheme-injecting value can never reach the request builder
+/// (defense-in-depth: the response is also digest-verified and discarded).
+pub fn is_valid_oci_digest(digest: &str) -> bool {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) => {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// Whether `image` is a valid OCI repository name (lowercase path components of
+/// `[a-z0-9]` plus `.`, `_`, `-` separators, each component starting and ending
+/// alphanumeric). Rejects empty components, leading/trailing separators, `..`
+/// traversal segments, and any character outside the grammar — so the value is
+/// safe to interpolate into an outbound `v2/<image>/...` URL.
+pub fn is_valid_oci_image_name(image: &str) -> bool {
+    if image.is_empty() || image.len() > 255 || image.contains("..") {
+        return false;
+    }
+    image.split('/').all(|component| {
+        let bytes = component.as_bytes();
+        !bytes.is_empty()
+            && bytes.iter().all(|&b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+            && bytes
+                .first()
+                .is_some_and(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && bytes
+                .last()
+                .is_some_and(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+/// Validate the `(image, digest)` pair used to build an outbound by-digest OCI
+/// fetch URL, returning a 400-class `ArtifactoryError` when either is malformed.
+pub fn validate_oci_content_ref(image: &str, digest: &str) -> Result<(), ArtifactoryError> {
+    if !is_valid_oci_image_name(image) {
+        return Err(ArtifactoryError::ApiError {
+            status: 400,
+            message: format!("refusing to fetch OCI content for invalid image name '{image}'"),
+        });
+    }
+    if !is_valid_oci_digest(digest) {
+        return Err(ArtifactoryError::ApiError {
+            status: 400,
+            message: format!("refusing to fetch OCI content for invalid digest '{digest}'"),
+        });
+    }
+    Ok(())
+}
+
 /// Trait for source registry clients used during migration.
 ///
 /// Both `ArtifactoryClient` and `NexusClient` implement this trait so the
@@ -89,6 +176,36 @@ pub trait SourceRegistry: Send + Sync {
     ) -> Result<ArtifactByteStream, ArtifactoryError> {
         let bytes = self.download_artifact(repo_key, path).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
+
+    /// Download digest-addressed OCI content (a config/layer blob or a child
+    /// image manifest) as a chunked byte stream (#2457).
+    ///
+    /// A Docker/OCI source registry enumerates only the *tag* manifests of a
+    /// repository; the config/layer blobs and per-arch child manifests those
+    /// manifests reference are addressed by digest and never appear in
+    /// `list_artifacts`. The migration worker's referenced-content walker
+    /// resolves them by digest through this method so a migrated image lands
+    /// with all of its bytes (not a hollow, unpullable tag).
+    ///
+    /// The default implementation targets the OCI Distribution v2 layout that
+    /// Nexus (and any conformant registry) serves under a repository:
+    /// `<repo>/v2/<image>/{blobs|manifests}/<digest>`. It delegates to
+    /// [`download_artifact_stream`](Self::download_artifact_stream) so the
+    /// per-source auth/transport is reused unchanged. Sources whose blob
+    /// layout differs (Artifactory) override this.
+    async fn download_oci_content_stream(
+        &self,
+        repo_key: &str,
+        image: &str,
+        digest: &str,
+        kind: OciContentKind,
+    ) -> Result<ArtifactByteStream, ArtifactoryError> {
+        // Validate the attacker-influenced components before they reach the
+        // outbound URL builder (path-traversal / injection defense-in-depth).
+        validate_oci_content_ref(image, digest)?;
+        let path = format!("v2/{}/{}/{}", image, kind.path_segment(), digest);
+        self.download_artifact_stream(repo_key, &path).await
     }
 
     /// Get artifact properties/metadata (optional — returns empty if unsupported)
@@ -289,5 +406,58 @@ mod tests {
     fn test_source_type_custom() {
         let registry = MockSourceRegistry::new("custom-registry");
         assert_eq!(registry.source_type(), "custom-registry");
+    }
+
+    #[test]
+    fn valid_oci_digest_accepts_canonical_sha256() {
+        let hex = "a".repeat(64);
+        assert!(is_valid_oci_digest(&format!("sha256:{hex}")));
+        assert!(is_valid_oci_digest(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn valid_oci_digest_rejects_malformed_and_traversal() {
+        assert!(!is_valid_oci_digest("latest"));
+        assert!(!is_valid_oci_digest("sha256:short"));
+        // wrong length
+        assert!(!is_valid_oci_digest(&format!("sha256:{}", "a".repeat(63))));
+        // uppercase hex is not canonical
+        assert!(!is_valid_oci_digest(&format!("sha256:{}", "A".repeat(64))));
+        // traversal / injection attempts must not pass the digest grammar
+        assert!(!is_valid_oci_digest("sha256:../../../../etc/passwd"));
+        assert!(!is_valid_oci_digest("sha512:aaaa"));
+        assert!(!is_valid_oci_digest(""));
+    }
+
+    #[test]
+    fn valid_oci_image_name_accepts_real_names() {
+        assert!(is_valid_oci_image_name("busybox"));
+        assert!(is_valid_oci_image_name("library/busybox"));
+        assert!(is_valid_oci_image_name("org/team/app"));
+        assert!(is_valid_oci_image_name("my-repo.name_1/sub-image"));
+    }
+
+    #[test]
+    fn valid_oci_image_name_rejects_traversal_and_injection() {
+        assert!(!is_valid_oci_image_name(""));
+        assert!(!is_valid_oci_image_name("../etc/passwd"));
+        assert!(!is_valid_oci_image_name("app/../../secret"));
+        assert!(!is_valid_oci_image_name("/leading-slash"));
+        assert!(!is_valid_oci_image_name("trailing/"));
+        assert!(!is_valid_oci_image_name("double//slash"));
+        assert!(!is_valid_oci_image_name("Upper/Case"));
+        assert!(!is_valid_oci_image_name("has space"));
+        assert!(!is_valid_oci_image_name("scheme:inject"));
+        assert!(!is_valid_oci_image_name(".leading-dot"));
+    }
+
+    #[test]
+    fn validate_oci_content_ref_gates_both_components() {
+        let hex = "b".repeat(64);
+        assert!(validate_oci_content_ref("app", &format!("sha256:{hex}")).is_ok());
+        assert!(validate_oci_content_ref("../app", &format!("sha256:{hex}")).is_err());
+        assert!(validate_oci_content_ref("app", "sha256:../bad").is_err());
     }
 }
