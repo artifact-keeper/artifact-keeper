@@ -27,6 +27,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::formats::debian::{DebianConfigPatch, DebianRepositoryConfig, DEBIAN_CONFIG_KEY};
 use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -584,6 +585,12 @@ pub struct CreateRepositoryRequest {
     /// `npm_allowed_name_patterns`. A name is allowed if its scope is allowed
     /// OR any glob matches (e.g. `@acme/*`, `internal-*`).
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// Debian remote (proxy) distribution/component/architecture filter
+    /// (#2460, epic #2458). Only valid for Debian *Remote* repositories.
+    /// Passthrough-only: allowed paths are proxied byte-for-byte; denied
+    /// paths are refused. Stored as JSON under `debian_config`. Omit or set
+    /// empty allowlists to proxy the whole upstream (default behaviour).
+    pub debian: Option<DebianRepositoryConfig>,
 }
 
 impl CreateRepositoryRequest {
@@ -682,6 +689,28 @@ pub struct UpdateRepositoryRequest {
     /// repository (#2424). When provided, replaces the stored
     /// `npm_allowed_name_patterns` list.
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// Update the Debian remote proxy filter (#2460). Three-way semantics:
+    /// omit the field to leave the stored config unchanged; send `null` to
+    /// clear it (revert to full-proxy); send an object to merge a partial
+    /// update onto the stored config. Only valid for Debian Remote repos.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<DebianConfigPatch>)]
+    pub debian: Option<Option<DebianConfigPatch>>,
+}
+
+/// Deserialize a nullable optional field into `Option<Option<T>>` so a handler
+/// can distinguish three states: the key absent (`None`), the key present and
+/// `null` (`Some(None)`), and the key present with a value (`Some(Some(v))`).
+/// Serde maps a bare `Option<T>` null to `None`, collapsing the first two —
+/// this preserves the distinction needed for partial-update-vs-clear.
+fn deserialize_double_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 impl UpdateRepositoryRequest {
@@ -756,6 +785,10 @@ pub struct RepositoryResponse {
     /// `repository_config`. Omitted for non-npm repositories or when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_allowed_name_patterns: Option<Vec<String>>,
+    /// Debian remote proxy filter (#2460), read back from `repository_config`.
+    /// Omitted for non-Debian-remote repositories or when no filter is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debian: Option<DebianRepositoryConfig>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -801,6 +834,7 @@ fn repo_to_response(
         npm_allowed_scopes: None,
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
+        debian: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -895,6 +929,63 @@ async fn with_apt_settings(
                 _ => {}
             }
         }
+    }
+    response
+}
+
+// ---------------------------------------------------------------------------
+// #2460 P2 — Debian remote proxy filter config persistence / read-back
+// ---------------------------------------------------------------------------
+
+/// True when a repository is a Debian *Remote* (proxy) repo — the only kind for
+/// which the P2 dist/component/arch filter is meaningful.
+fn is_debian_remote(repo_type: &RepositoryType, format: &RepositoryFormat) -> bool {
+    *repo_type == RepositoryType::Remote && matches!(format, RepositoryFormat::Debian)
+}
+
+/// Validate a `DebianRepositoryConfig` for the 1.6.0 passthrough-only feature
+/// set, mapping the reason string to a 422 [`AppError::UnprocessableEntity`].
+fn validate_debian_config(cfg: &DebianRepositoryConfig) -> Result<()> {
+    cfg.validate_passthrough_only()
+        .map_err(AppError::UnprocessableEntity)
+}
+
+/// Persist a resolved Debian filter config as JSON under `debian_config`.
+async fn upsert_debian_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    cfg: &DebianRepositoryConfig,
+) -> Result<()> {
+    let json = serde_json::to_string(cfg).map_err(|e| AppError::Internal(e.to_string()))?;
+    upsert_repo_config(db, repo_id, DEBIAN_CONFIG_KEY, &json).await
+}
+
+/// Read back the stored Debian filter config (if any) for a repository.
+async fn load_debian_config(db: &sqlx::PgPool, repo_id: Uuid) -> Option<DebianRepositoryConfig> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(DEBIAN_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    value
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<DebianRepositoryConfig>(v).ok())
+}
+
+/// Populate `RepositoryResponse.debian` from `repository_config` for Debian
+/// remote repositories.
+async fn with_debian_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    is_debian_remote: bool,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    if is_debian_remote {
+        response.debian = load_debian_config(db, repo_id).await;
     }
     response
 }
@@ -2144,6 +2235,21 @@ pub async fn create_repository(
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
 
+    // Debian remote proxy filter (#2460): validate up-front — before the
+    // repository row is created — so a rejected config (wrong repo type or an
+    // unsupported strategy/inconsistent filter) cannot leave an orphaned
+    // repository behind, mirroring the apt_* and npm guards above. Persistence
+    // happens after `service.create(...)`, once `repo.id` exists.
+    if let Some(ref cfg) = payload.debian {
+        if !is_debian_remote(&repo_type, &format) {
+            return Err(AppError::Validation(
+                "debian filter config is only valid for Debian remote (proxy) repositories"
+                    .to_string(),
+            ));
+        }
+        validate_debian_config(cfg)?;
+    }
+
     // Resolve storage backend: use the requested one or fall back to the default.
     let storage_backend = match &payload.storage_backend {
         None => state.config.storage_backend.clone(),
@@ -2292,6 +2398,12 @@ pub async fn create_repository(
         }
     }
 
+    // Persist the Debian remote proxy filter (#2460). Validation already ran
+    // up-front (before create), so here we only serialize + store it.
+    if let Some(ref cfg) = payload.debian {
+        upsert_debian_config(&state.db, repo.id, cfg).await?;
+    }
+
     // Add virtual repository members. Post-#1444, the validator accepts
     // `member_repos == None` (deferred-population pattern: caller will
     // POST /members later) and only rejects `Some(empty_vec)`. Treat the
@@ -2385,6 +2497,15 @@ pub async fn create_repository(
     response.apt_label = trimmed_nonempty(payload.apt_label);
     response.apt_release_version = trimmed_nonempty(payload.apt_release_version);
     response.apt_description = trimmed_nonempty(payload.apt_description);
+    // Echo the Debian remote proxy filter that was persisted (#2460) so the
+    // create response round-trips with a subsequent GET.
+    let response = with_debian_config(
+        &state.db,
+        repo_id,
+        is_debian_remote(&repo_type_out, &repo_format_out),
+        response,
+    )
+    .await;
     // Echo the npm scope policy that was persisted (#2424) so the create
     // response round-trips with a subsequent GET.
     let response = with_npm_scope_policy(
@@ -2439,6 +2560,13 @@ pub async fn get_repository(
     } else {
         response
     };
+    let response = with_debian_config(
+        &state.db,
+        repo_id,
+        is_debian_remote(&repo_type, &repo_format),
+        response,
+    )
+    .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
     Ok(Json(response))
@@ -2722,6 +2850,39 @@ pub async fn update_repository(
         }
     }
 
+    // Debian remote proxy filter (#2460). Three-way semantics:
+    //   * field omitted (`None`)      -> leave the stored config unchanged
+    //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
+    //   * field object                -> merge the partial update onto the
+    //                                    stored config, validate, persist.
+    // The gate reads the config live on every request, so no cache
+    // invalidation is required for a change to take effect.
+    match payload.debian {
+        None => {}
+        Some(None) => {
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                .bind(repo.id)
+                .bind(DEBIAN_CONFIG_KEY)
+                .execute(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        Some(Some(ref patch)) => {
+            if !is_debian_remote(&existing.repo_type, &existing.format) {
+                return Err(AppError::Validation(
+                    "debian filter config is only valid for Debian remote (proxy) repositories"
+                        .to_string(),
+                ));
+            }
+            let base = load_debian_config(&state.db, repo.id)
+                .await
+                .unwrap_or_default();
+            let merged = patch.clone().apply_to(base);
+            validate_debian_config(&merged)?;
+            upsert_debian_config(&state.db, repo.id, &merged).await?;
+        }
+    }
+
     // Invalidate the in-memory repo cache so that visibility changes take
     // effect immediately instead of waiting for the TTL to expire. Remove
     // both the old key and the new key (in case the key was renamed). This
@@ -2782,6 +2943,13 @@ pub async fn update_repository(
     } else {
         response
     };
+    let response = with_debian_config(
+        &state.db,
+        repo_id,
+        is_debian_remote(&repo_type, &repo_format),
+        response,
+    )
+    .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
     Ok(Json(response))
@@ -7026,6 +7194,10 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         SetRoutingRulesRequest,
         RoutingRulesResponse,
         RoutingRule,
+        DebianRepositoryConfig,
+        DebianConfigPatch,
+        crate::formats::debian::DebianMetadataStrategy,
+        crate::formats::debian::DebianPackageFetchStrategy,
     ))
 )]
 pub struct RepositoriesApiDoc;
@@ -8591,6 +8763,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            debian: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -9926,6 +10099,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            debian: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -15994,6 +16168,7 @@ mod tests {
             npm_allowed_scopes: None,
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
+            debian: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

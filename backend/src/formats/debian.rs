@@ -18,6 +18,253 @@ use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
 
+// ---------------------------------------------------------------------------
+// P2 (#2460) — Debian remote/mirror proxy filter configuration
+// ---------------------------------------------------------------------------
+//
+// Operator-scoped distribution/component/architecture allowlists for Debian
+// *Remote* (proxy) repositories. This is a PRE-FETCH allow/deny gate only:
+// allowed paths pass through the existing (P1-hardened) proxy path
+// byte-for-byte; denied paths are refused before any upstream fetch. There is
+// NO metadata regeneration (P3) and NO local re-signing (P4) in this release —
+// those strategies are accepted on the enum but rejected with 422 by
+// [`DebianRepositoryConfig::validate_passthrough_only`].
+//
+// Stored as a JSON string under the [`DEBIAN_CONFIG_KEY`] key in the existing
+// generic `repository_config` KV table (no schema migration), the same pattern
+// used by `apt_origin` / `index_upstream_url`.
+
+/// `repository_config` key under which the Debian proxy filter config JSON is
+/// stored for a remote repository.
+pub const DEBIAN_CONFIG_KEY: &str = "debian_config";
+
+/// How metadata (`Packages`/`Release`) is produced for a Debian remote.
+///
+/// Only [`DebianMetadataStrategy::UpstreamPassthrough`] is implemented in
+/// 1.6.0; the other variants are reserved for P3 (filtered generation) / P4
+/// (local re-signing) and are rejected with 422 until then. The enum lands now
+/// so those phases can flip it on without a schema/config-shape change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianMetadataStrategy {
+    /// Serve upstream `Release`/`InRelease`/`Release.gpg`/`Packages`
+    /// byte-for-byte (clients keep trusting the distro key). Default.
+    #[default]
+    UpstreamPassthrough,
+    /// P3 (1.7.0): regenerate a filtered, AK-authored (unsigned) index.
+    FilterAndGenerate,
+    /// P4 (1.7.0): regenerate a filtered index and re-sign it with a local key.
+    FilterGenerateAndSign,
+    /// Hosted-repo style generation (AK is the origin). Reserved.
+    HostedGenerate,
+}
+
+/// How package bodies are fetched for a Debian remote.
+///
+/// Only [`DebianPackageFetchStrategy::UpstreamPassthrough`] is implemented in
+/// 1.6.0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianPackageFetchStrategy {
+    /// Fetch `.deb` bodies lazily from upstream on demand (pull-through). Default.
+    #[default]
+    UpstreamPassthrough,
+    /// P3 (1.7.0): eagerly mirror the selected subset ahead of requests.
+    Eager,
+}
+
+/// Deserialize a `Vec<String>` where `null` (or an absent field paired with
+/// `#[serde(default)]`) yields an empty vector. Empty and `["*"]` both mean
+/// "select all" for the filter predicates.
+fn deserialize_vec_string_or_null<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+/// P2 Debian remote proxy filter config (dist/component/arch allowlists).
+///
+/// Semantics for each allowlist: an empty list OR a list containing `"*"`
+/// selects everything (today's full-proxy behaviour); otherwise only exact
+/// matches are selected. Architecture-independent (`all`) packages are always
+/// permitted regardless of the `architectures` allowlist.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DebianRepositoryConfig {
+    /// Distributions (a.k.a. suites/codenames, e.g. `bookworm`) to proxy.
+    /// Empty or `["*"]` = all.
+    #[serde(
+        default,
+        alias = "distributions",
+        deserialize_with = "deserialize_vec_string_or_null"
+    )]
+    pub distribution_paths: Vec<String>,
+    /// Components (e.g. `main`, `contrib`, `non-free`) to proxy. Empty/`["*"]` = all.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub components: Vec<String>,
+    /// Architectures (e.g. `amd64`, `arm64`) to proxy. Empty/`["*"]` = all.
+    /// `all` (arch-independent) is always permitted.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub architectures: Vec<String>,
+    /// Whether source packages (`Sources`, `.dsc`) are included. Advisory in
+    /// passthrough (upstream metadata is unchanged); honored under P3.
+    #[serde(default)]
+    pub include_source_packages: bool,
+    /// Flat (non-`dists/`) repository layout flag. Accepted but does NOT weaken
+    /// P1's flat/redirect abuse posture in passthrough.
+    #[serde(default)]
+    pub flat_repository: bool,
+    /// Whether to verify the upstream signed `Release` before serving. In P2 the
+    /// P1 integrity gate already enforces index/Release consistency; this flag
+    /// is reserved for P4 trust-anchor verification.
+    #[serde(default)]
+    pub verify_upstream_metadata: bool,
+    /// Upstream GPG key id used to verify upstream metadata (reserved for P4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_gpg_key_id: Option<String>,
+    /// Metadata production strategy. Only `upstream_passthrough` in 1.6.0.
+    #[serde(default)]
+    pub metadata_strategy: DebianMetadataStrategy,
+    /// Package-body fetch strategy. Only `upstream_passthrough` in 1.6.0.
+    #[serde(default)]
+    pub package_fetch_strategy: DebianPackageFetchStrategy,
+    /// Package-name-level queries. NOT honored in passthrough (that needs P3);
+    /// a non-empty value here with `upstream_passthrough` is rejected with 422
+    /// rather than silently advertising content the proxy would then block.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub package_queries: Vec<String>,
+}
+
+/// Partial-update patch for [`DebianRepositoryConfig`]. Fields left absent are
+/// preserved; provided fields (including an explicit empty list) replace the
+/// stored value. Applied on top of the currently stored config, or on top of
+/// the default when none exists yet.
+#[derive(Clone, Debug, Default, Deserialize, utoipa::ToSchema)]
+pub struct DebianConfigPatch {
+    #[serde(default, alias = "distributions")]
+    pub distribution_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub components: Option<Vec<String>>,
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_source_packages: Option<bool>,
+    #[serde(default)]
+    pub flat_repository: Option<bool>,
+    #[serde(default)]
+    pub verify_upstream_metadata: Option<bool>,
+    #[serde(default)]
+    pub upstream_gpg_key_id: Option<String>,
+    #[serde(default)]
+    pub metadata_strategy: Option<DebianMetadataStrategy>,
+    #[serde(default)]
+    pub package_fetch_strategy: Option<DebianPackageFetchStrategy>,
+    #[serde(default)]
+    pub package_queries: Option<Vec<String>>,
+}
+
+impl DebianConfigPatch {
+    /// Merge this patch onto `base`, returning the updated config.
+    pub fn apply_to(self, mut base: DebianRepositoryConfig) -> DebianRepositoryConfig {
+        if let Some(v) = self.distribution_paths {
+            base.distribution_paths = v;
+        }
+        if let Some(v) = self.components {
+            base.components = v;
+        }
+        if let Some(v) = self.architectures {
+            base.architectures = v;
+        }
+        if let Some(v) = self.include_source_packages {
+            base.include_source_packages = v;
+        }
+        if let Some(v) = self.flat_repository {
+            base.flat_repository = v;
+        }
+        if let Some(v) = self.verify_upstream_metadata {
+            base.verify_upstream_metadata = v;
+        }
+        if let Some(v) = self.upstream_gpg_key_id {
+            base.upstream_gpg_key_id = Some(v);
+        }
+        if let Some(v) = self.metadata_strategy {
+            base.metadata_strategy = v;
+        }
+        if let Some(v) = self.package_fetch_strategy {
+            base.package_fetch_strategy = v;
+        }
+        if let Some(v) = self.package_queries {
+            base.package_queries = v;
+        }
+        base
+    }
+}
+
+impl DebianRepositoryConfig {
+    /// True when no dimension is filtered (all allowlists empty) — behaves
+    /// exactly like the pre-#2460 full-proxy repository.
+    pub fn is_passthrough_all(&self) -> bool {
+        self.distribution_paths.is_empty()
+            && self.components.is_empty()
+            && self.architectures.is_empty()
+    }
+
+    /// Shared allowlist test: empty list or a `"*"` wildcard selects everything;
+    /// otherwise an exact match is required.
+    fn list_selects(list: &[String], value: &str) -> bool {
+        list.is_empty() || list.iter().any(|v| v == "*" || v == value)
+    }
+
+    /// Whether `distribution` is within the configured allowlist.
+    pub fn distribution_selected(&self, distribution: &str) -> bool {
+        Self::list_selects(&self.distribution_paths, distribution)
+    }
+
+    /// Whether `component` is within the configured allowlist.
+    pub fn component_selected(&self, component: &str) -> bool {
+        Self::list_selects(&self.components, component)
+    }
+
+    /// Whether `arch` is within the configured allowlist. Architecture-
+    /// independent (`all`) packages are always permitted because a
+    /// single-arch client still needs them.
+    pub fn arch_selected(&self, arch: &str) -> bool {
+        arch == "all" || Self::list_selects(&self.architectures, arch)
+    }
+
+    /// Validate that this config only asks for functionality implemented in the
+    /// 1.6.0 passthrough-only release. Returns an error message suitable for a
+    /// 422 response when it asks for metadata regeneration / re-signing, a
+    /// non-passthrough fetch strategy, or an internally inconsistent filter.
+    pub fn validate_passthrough_only(&self) -> std::result::Result<(), String> {
+        if self.metadata_strategy != DebianMetadataStrategy::UpstreamPassthrough {
+            return Err(
+                "metadata_strategy other than 'upstream_passthrough' is not yet supported in this release"
+                    .to_string(),
+            );
+        }
+        if self.package_fetch_strategy != DebianPackageFetchStrategy::UpstreamPassthrough {
+            return Err(
+                "package_fetch_strategy other than 'upstream_passthrough' is not yet supported in this release"
+                    .to_string(),
+            );
+        }
+        // Consistency reject: passthrough serves upstream metadata unchanged, so
+        // it cannot honor package-name-level filtering. Advertising blocked
+        // content would be a correctness footgun — reject rather than lie.
+        if !self.package_queries.is_empty() {
+            return Err(
+                "package_queries requires filtered metadata generation, which is not supported with upstream_passthrough"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Debian format handler
 pub struct DebianHandler;
 
@@ -1454,5 +1701,180 @@ Size: 100
     #[test]
     fn test_parse_packages_index_empty() {
         assert!(parse_packages_index("").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 (#2460) filter config predicates + (de)serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distribution_selected_empty_selects_all() {
+        let cfg = DebianRepositoryConfig::default();
+        assert!(cfg.is_passthrough_all());
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(cfg.distribution_selected("anything"));
+    }
+
+    #[test]
+    fn test_distribution_selected_wildcard_selects_all() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(cfg.distribution_selected("trixie"));
+    }
+
+    #[test]
+    fn test_distribution_selected_exact_and_case_sensitive() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(!cfg.distribution_selected("trixie"));
+        // Debian codenames are lowercase; matching is exact (case-sensitive).
+        assert!(!cfg.distribution_selected("Bookworm"));
+        assert!(!cfg.is_passthrough_all());
+    }
+
+    #[test]
+    fn test_component_selected_matrix() {
+        let cfg = DebianRepositoryConfig {
+            components: vec!["main".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.component_selected("main"));
+        assert!(!cfg.component_selected("contrib"));
+        assert!(!cfg.component_selected("non-free"));
+    }
+
+    #[test]
+    fn test_arch_selected_matrix_and_all_always_allowed() {
+        let cfg = DebianRepositoryConfig {
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.arch_selected("amd64"));
+        assert!(!cfg.arch_selected("arm64"));
+        // Architecture-independent packages are always permitted.
+        assert!(cfg.arch_selected("all"));
+        // Empty allowlist selects everything.
+        let empty = DebianRepositoryConfig::default();
+        assert!(empty.arch_selected("arm64"));
+        assert!(empty.arch_selected("amd64"));
+    }
+
+    #[test]
+    fn test_config_roundtrip_serde() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string(), "contrib".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DebianRepositoryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_config_deserialize_null_lists_and_distributions_alias() {
+        // `distributions` is an accepted alias for `distribution_paths`, and a
+        // null list deserializes to an empty (select-all) vector.
+        let json = r#"{"distributions":["trixie"],"components":null}"#;
+        let cfg: DebianRepositoryConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.distribution_paths, vec!["trixie".to_string()]);
+        assert!(cfg.components.is_empty());
+    }
+
+    #[test]
+    fn test_config_default_strategies_are_passthrough() {
+        let cfg = DebianRepositoryConfig::default();
+        assert_eq!(
+            cfg.metadata_strategy,
+            DebianMetadataStrategy::UpstreamPassthrough
+        );
+        assert_eq!(
+            cfg.package_fetch_strategy,
+            DebianPackageFetchStrategy::UpstreamPassthrough
+        );
+        assert!(cfg.validate_passthrough_only().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_generation_strategy() {
+        let cfg = DebianRepositoryConfig {
+            metadata_strategy: DebianMetadataStrategy::FilterAndGenerate,
+            ..Default::default()
+        };
+        let err = cfg.validate_passthrough_only().unwrap_err();
+        assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn test_validate_rejects_signing_strategy() {
+        let cfg = DebianRepositoryConfig {
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
+            ..Default::default()
+        };
+        assert!(cfg.validate_passthrough_only().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_passthrough_fetch_strategy() {
+        let cfg = DebianRepositoryConfig {
+            package_fetch_strategy: DebianPackageFetchStrategy::Eager,
+            ..Default::default()
+        };
+        assert!(cfg.validate_passthrough_only().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_package_queries_in_passthrough() {
+        let cfg = DebianRepositoryConfig {
+            package_queries: vec!["nginx".to_string()],
+            ..Default::default()
+        };
+        let err = cfg.validate_passthrough_only().unwrap_err();
+        assert!(err.contains("package_queries"));
+    }
+
+    #[test]
+    fn test_config_patch_merges_only_provided_fields() {
+        let base = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Patch only components; the rest is preserved.
+        let patch = DebianConfigPatch {
+            components: Some(vec!["main".to_string(), "contrib".to_string()]),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        assert_eq!(merged.distribution_paths, vec!["bookworm".to_string()]);
+        assert_eq!(
+            merged.components,
+            vec!["main".to_string(), "contrib".to_string()]
+        );
+        assert_eq!(merged.architectures, vec!["amd64".to_string()]);
+    }
+
+    #[test]
+    fn test_config_patch_explicit_empty_list_clears_dimension() {
+        let base = DebianRepositoryConfig {
+            components: vec!["main".to_string()],
+            ..Default::default()
+        };
+        let patch = DebianConfigPatch {
+            components: Some(vec![]),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        // Now select-all again for components.
+        assert!(merged.components.is_empty());
+        assert!(merged.component_selected("contrib"));
     }
 }

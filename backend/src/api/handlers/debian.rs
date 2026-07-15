@@ -40,7 +40,9 @@ use xz2::read::XzDecoder;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
-use crate::formats::debian::{DebControl, DebianHandler};
+use crate::formats::debian::{
+    DebControl, DebianHandler, DebianRepositoryConfig, DEBIAN_CONFIG_KEY,
+};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
 use crate::services::artifact_service::ArtifactService;
@@ -94,6 +96,89 @@ pub fn router() -> Router<SharedState> {
 
 async fn resolve_debian_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["debian", "apt"], "a Debian").await
+}
+
+// ---------------------------------------------------------------------------
+// P2 (#2460) — pre-fetch distribution/component/architecture filter gate
+// ---------------------------------------------------------------------------
+
+/// Load the operator-configured Debian proxy filter (dist/component/arch
+/// allowlists) for a repository. An absent or unparseable config yields the
+/// default (empty) filter, which selects everything — i.e. the pre-#2460
+/// full-proxy behaviour is preserved for repositories with no filter set.
+async fn load_debian_filter(db: &PgPool, repo_id: uuid::Uuid) -> DebianRepositoryConfig {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(DEBIAN_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    value
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<DebianRepositoryConfig>(v).ok())
+        .unwrap_or_default()
+}
+
+/// Response returned when a request is refused by the P2 filter. A filtered-out
+/// path is answered with 404 (not 403) so the proxy does not advertise which
+/// distributions/components/architectures it actually mirrors.
+fn debian_filter_denied(dimension: &str, value: &str) -> Response {
+    tracing::debug!(
+        dimension = dimension,
+        value = value,
+        "debian proxy request denied by #2460 filter allowlist"
+    );
+    (StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
+/// Pre-fetch allow/deny decision for a Debian proxy request. Each dimension is
+/// checked only when supplied (`Some`); an empty allowlist for a dimension
+/// permits everything. Returns a 404 [`Response`] as `Err` when any supplied
+/// dimension falls outside the configured allowlist. This runs BEFORE any
+/// upstream fetch, so an allowed request is left byte-identical through the P1
+/// integrity/passthrough path.
+#[allow(clippy::result_large_err)]
+fn debian_filter_decision(
+    filter: &DebianRepositoryConfig,
+    distribution: Option<&str>,
+    component: Option<&str>,
+    arch: Option<&str>,
+) -> Result<(), Response> {
+    if let Some(d) = distribution {
+        if !filter.distribution_selected(d) {
+            return Err(debian_filter_denied("distribution", d));
+        }
+    }
+    if let Some(c) = component {
+        if !filter.component_selected(c) {
+            return Err(debian_filter_denied("component", c));
+        }
+    }
+    if let Some(a) = arch {
+        if !filter.arch_selected(a) {
+            return Err(debian_filter_denied("architecture", a));
+        }
+    }
+    Ok(())
+}
+
+/// Return the component of a `dists/{dist}/*` sub-path when it is
+/// component-scoped (e.g. `main/i18n/Translation-en` -> `Some("main")`),
+/// or `None` for dist-level files that are not under a component
+/// (`Contents-amd64.gz`, `by-hash/...`, single-segment paths). Used to scope
+/// the catch-all metadata proxy to the component allowlist.
+fn catchall_component(dists_path: &str) -> Option<&str> {
+    let mut segments = dists_path.splitn(2, '/');
+    let first = segments.next()?;
+    // Not component-scoped: single-segment dist-level file, the by-hash tree,
+    // or dist-level Contents indices.
+    if segments.next().is_none() || first == "by-hash" || first.starts_with("Contents-") {
+        return None;
+    }
+    Some(first)
 }
 
 // ---------------------------------------------------------------------------
@@ -1429,6 +1514,11 @@ async fn release_file(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    // #2460 P2: deny a distribution outside the operator allowlist before any
+    // upstream fetch. An allowed distribution passes through unchanged so the
+    // P1 signed-Release integrity path stays byte-identical.
+    let filter = load_debian_filter(&state.db, repo.id).await;
+    debian_filter_decision(&filter, Some(&distribution), None, None)?;
     proxy
         .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
         .await?;
@@ -1451,6 +1541,9 @@ async fn in_release_file(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
+    let filter = load_debian_filter(&state.db, repo.id).await;
+    debian_filter_decision(&filter, Some(&distribution), None, None)?;
     proxy
         .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
         .await?;
@@ -1505,6 +1598,9 @@ async fn release_gpg(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
+    let filter = load_debian_filter(&state.db, repo.id).await;
+    debian_filter_decision(&filter, Some(&distribution), None, None)?;
     // Release.gpg is the detached signature of Release. We do not need
     // revalidation here because the matching Release fetch (called
     // by apt before Release.gpg) already drove epoch invalidation.
@@ -1754,6 +1850,18 @@ async fn dists_dispatch(
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     if let Some(req) = parse_packages_request(&dists_path) {
+        // #2460 P2: pre-fetch dist/component/arch allowlist gate for Packages
+        // indices. An empty filter (default) permits everything.
+        let repo = resolve_debian_repo(&state.0.db, &repo_key).await?;
+        let filter = load_debian_filter(&state.0.db, repo.id).await;
+        let arch = strip_binary_arch_prefix(&req.binary_arch);
+        debian_filter_decision(
+            &filter,
+            Some(&distribution),
+            Some(&req.component),
+            Some(arch),
+        )?;
+
         let path = Path((repo_key, distribution, req.component, req.binary_arch));
         return match req.ext {
             PackagesExt::Plain => packages_index(state, path).await,
@@ -1777,6 +1885,18 @@ async fn dists_proxy_catchall(
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // #2460 P2: pre-fetch allowlist gate for catch-all dists metadata
+    // (i18n/Translation, Sources, dep11, Contents, ...). Always gate the
+    // distribution; additionally gate the component when the path is
+    // component-scoped. An empty filter permits everything.
+    let filter = load_debian_filter(&state.db, repo.id).await;
+    debian_filter_decision(
+        &filter,
+        Some(&distribution),
+        catchall_component(&dists_path),
+        None,
+    )?;
 
     let upstream_path = format!("dists/{}/{}", distribution, dists_path);
 
@@ -1890,6 +2010,14 @@ async fn pool_download(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // #2460 P2: pre-fetch allowlist gate for pool downloads. The pool path
+    // carries the component; the architecture is derived from the `.deb`
+    // filename when parseable. An empty filter permits everything.
+    let filter = load_debian_filter(&state.db, repo.id).await;
+    let pool_filename = path.rsplit('/').next().unwrap_or(&path);
+    let pool_arch = parse_deb_filename(pool_filename).map(|d| d.arch);
+    debian_filter_decision(&filter, None, Some(&component), pool_arch.as_deref())?;
 
     let artifact_path = format!("pool/{}/{}", component, path);
 
@@ -2409,6 +2537,72 @@ mod tests {
             sha1: None,
             md5: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2460 P2 — pre-fetch filter gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catchall_component_scoping() {
+        // Component-scoped metadata paths return their component.
+        assert_eq!(catchall_component("main/i18n/Translation-en"), Some("main"));
+        assert_eq!(
+            catchall_component("contrib/dep11/Components-amd64.yml.gz"),
+            Some("contrib")
+        );
+        assert_eq!(catchall_component("main/Contents-amd64.gz"), Some("main"));
+        // Dist-level (non component-scoped) paths return None.
+        assert_eq!(catchall_component("Contents-amd64.gz"), None);
+        assert_eq!(catchall_component("Release"), None);
+        assert_eq!(catchall_component("by-hash/SHA256/abcdef"), None);
+    }
+
+    #[test]
+    fn test_filter_decision_empty_allows_everything() {
+        let filter = DebianRepositoryConfig::default();
+        assert!(
+            debian_filter_decision(&filter, Some("bookworm"), Some("contrib"), Some("arm64"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_filter_decision_allows_in_allowlist() {
+        let filter = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            debian_filter_decision(&filter, Some("bookworm"), Some("main"), Some("amd64")).is_ok()
+        );
+        // Arch-independent packages are always permitted.
+        assert!(
+            debian_filter_decision(&filter, Some("bookworm"), Some("main"), Some("all")).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_filter_decision_denies_out_of_allowlist_with_404() {
+        let filter = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Denied distribution.
+        let resp = debian_filter_decision(&filter, Some("trixie"), None, None).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Denied component.
+        let resp =
+            debian_filter_decision(&filter, Some("bookworm"), Some("contrib"), None).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Denied architecture.
+        let resp = debian_filter_decision(&filter, Some("bookworm"), Some("main"), Some("arm64"))
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------
