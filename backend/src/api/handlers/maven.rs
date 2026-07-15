@@ -908,15 +908,24 @@ async fn download(
         // `resolve_snapshot_artifact` reads the `artifacts` table, which never
         // has rows for Remote/Virtual repos, so it short-circuits for them.)
         // The stored-sidecar reads below fetch a bare `maven/<path>` key with no
-        // artifact row scoped to the caller's repository, so they are only sound
-        // on repo-isolated (filesystem) backends. On shared cloud namespaces
-        // (S3/GCS/Azure) that flat key can belong to a *different* repository, so
-        // skip the stored sidecar there and fall through to the row-gated
-        // computed-checksum path below (#2504).
-        let repo_isolated = crate::storage::backend_is_repo_isolated(&repo.storage_backend);
-        if checksum_compute_eligible(&repo.repo_type) && repo_isolated {
+        // artifact row scoped to the caller's repository. On repo-isolated
+        // (filesystem) backends that is always sound; on shared cloud namespaces
+        // (S3/GCS/Azure) the flat key could belong to a *different* repository,
+        // so it is served only when the catalog shows no foreign owner for the
+        // exact key (#2504, #2574 — same ownership rule as the write guard).
+        // Foreign-owned keys fall through to the row-gated computed-checksum
+        // path below.
+        let checksum_storage_key = format!("maven/{}", path);
+        if checksum_compute_eligible(&repo.repo_type)
+            && proxy_helpers::flat_key_readable(
+                &state.db,
+                repo.id,
+                &repo.storage_backend,
+                &checksum_storage_key,
+            )
+            .await
+        {
             // First try to find a stored checksum file
-            let checksum_storage_key = format!("maven/{}", path);
             if let Ok(content) = storage.get(&checksum_storage_key).await {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -929,17 +938,26 @@ async fn download(
         // If this is a SNAPSHOT path, try the stored checksum under the
         // timestamp-resolved filename before falling through to compute. Same
         // shared-namespace hazard as above: the sidecar key is unanchored, so
-        // gate it to repo-isolated backends (#2504).
-        if base_path.contains("-SNAPSHOT") && repo_isolated {
+        // it is served only when no *other* repository owns it (#2504, #2574).
+        if base_path.contains("-SNAPSHOT") {
             if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
                 let resolved_checksum_key =
                     format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
-                if let Ok(content) = storage.get(&resolved_checksum_key).await {
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/plain")
-                        .body(Body::from(content))
-                        .unwrap());
+                if proxy_helpers::flat_key_readable(
+                    &state.db,
+                    repo.id,
+                    &repo.storage_backend,
+                    &resolved_checksum_key,
+                )
+                .await
+                {
+                    if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
                 }
             }
         }
@@ -1219,15 +1237,21 @@ async fn fetch_maven_metadata_bytes(
             let mut member_docs: Vec<String> = Vec::new();
             for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
                 let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                    // Unanchored `maven/<path>` read: always sound where the
+                    // member's backend physically isolates repositories
+                    // (filesystem); on a shared cloud namespace only when no
+                    // *other* repository owns the exact key (#2504, #2574).
+                    let member_storage_key = format!("maven/{}", path);
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
-                    } else if crate::storage::backend_is_repo_isolated(&member.storage_backend) {
-                        // Unanchored `maven/<path>` read: only sound where the
-                        // member's backend physically isolates repositories
-                        // (filesystem). On a shared cloud namespace this key can
-                        // hold a non-member repository's metadata, so skip it
-                        // there (#2504).
-                        let member_storage_key = format!("maven/{}", path);
+                    } else if proxy_helpers::flat_key_readable(
+                        &state.db,
+                        member.id,
+                        &member.storage_backend,
+                        &member_storage_key,
+                    )
+                    .await
+                    {
                         match state.storage_for_repo(&member.storage_location()) {
                             Ok(member_storage) => {
                                 member_storage.get(&member_storage_key).await.ok().and_then(
@@ -1271,12 +1295,20 @@ async fn fetch_maven_metadata_bytes(
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                     } else {
-                        // Unanchored `maven/<path>` read: only sound where the
+                        // Unanchored `maven/<path>` read: always sound where the
                         // member's backend physically isolates repositories
-                        // (filesystem); on a shared cloud namespace skip it and
-                        // rely on the row-scoped snapshot entries below (#2504).
-                        if crate::storage::backend_is_repo_isolated(&member.storage_backend) {
-                            let member_storage_key = format!("maven/{}", path);
+                        // (filesystem); on a shared cloud namespace only when no
+                        // *other* repository owns the exact key (#2504, #2574).
+                        // Otherwise rely on the row-scoped snapshot entries below.
+                        let member_storage_key = format!("maven/{}", path);
+                        if proxy_helpers::flat_key_readable(
+                            &state.db,
+                            member.id,
+                            &member.storage_backend,
+                            &member_storage_key,
+                        )
+                        .await
+                        {
                             if let Ok(member_storage) =
                                 state.storage_for_repo(&member.storage_location())
                             {
@@ -1324,12 +1356,23 @@ async fn fetch_maven_metadata_bytes(
         .map_err(|e| e.into_response())?;
 
     // The stored maven-metadata.xml read fetches a bare `maven/<path>` key with
-    // no artifact row scoped to the caller's repository, so it is only sound on
-    // repo-isolated (filesystem) backends. On shared cloud namespaces the same
-    // key can hold a *different* repository's metadata, so skip the stored read
-    // there and fall through to row-gated dynamic generation below (#2504).
-    if crate::storage::backend_is_repo_isolated(&repo.storage_backend) {
-        let meta_storage_key = format!("maven/{}", path);
+    // no artifact row scoped to the caller's repository. On repo-isolated
+    // (filesystem) backends that is always sound; on shared cloud namespaces
+    // the same key could hold a *different* repository's metadata, so the
+    // stored document is served only when the catalog shows no foreign owner
+    // for the exact key (#2504, #2574). This keeps deliberately-uploaded
+    // metadata (frozen SNAPSHOT documents, hand-pinned <versions> blocks)
+    // authoritative instead of silently degrading to the dynamic generation
+    // below, which can advertise a different build than the stored file.
+    let meta_storage_key = format!("maven/{}", path);
+    if proxy_helpers::flat_key_readable(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &meta_storage_key,
+    )
+    .await
+    {
         if let Ok(content) = storage.get(&meta_storage_key).await {
             return Ok(content);
         }
@@ -1731,21 +1774,29 @@ async fn serve_artifact(
             // files while new uploads resolve through the exact `artifacts.path`.
             //
             // This fallback reads a bare `maven/{path}` key with no artifact row
-            // scoped to the caller's repository, so it is only sound on backends
-            // that physically isolate each repository's key space (filesystem,
-            // rooted at the repo's storage_path). On shared cloud namespaces
-            // (S3/GCS/Azure) the same flat key can belong to a *different*
-            // repository, so the fallback is skipped there and the request 404s
-            // rather than serving another repository's bytes.
+            // scoped to the caller's repository. On backends that physically
+            // isolate each repository's key space (filesystem, rooted at the
+            // repo's storage_path) that is always sound. On shared cloud
+            // namespaces (S3/GCS/Azure) the same flat key can belong to a
+            // *different* repository, so the fallback runs only when the
+            // catalog shows no foreign owner for the exact key (#2504, #2574 —
+            // the same ownership rule as the write guard). A foreign-owned key
+            // still 404s rather than serving another repository's bytes.
+            let legacy_storage_key = format!("maven/{}", path);
             if (repo.repo_type == RepositoryType::Local
                 || repo.repo_type == RepositoryType::Staging)
-                && crate::storage::backend_is_repo_isolated(&repo.storage_backend)
+                && proxy_helpers::flat_key_readable(
+                    &state.db,
+                    repo.id,
+                    &repo.storage_backend,
+                    &legacy_storage_key,
+                )
+                .await
             {
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
                     .map_err(|e| e.into_response())?;
-                let storage_key = format!("maven/{}", path);
-                if let Ok(stream) = storage.get_stream(&storage_key).await {
+                if let Ok(stream) = storage.get_stream(&legacy_storage_key).await {
                     let ct = content_type_for_path(path);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)

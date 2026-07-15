@@ -156,14 +156,24 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
     // Gate 0: This helper ultimately reads a bare `maven/<path>` key that is not
-    // anchored to an artifact row scoped to the caller's repository. That is only
-    // sound on backends that physically isolate each repository's key space
-    // (filesystem, rooted at the repo's storage_path). On shared cloud namespaces
-    // (S3/GCS/Azure) the same flat key can belong to a *different* repository, so
-    // the fallback must not run there — skip straight to 404 rather than risk
-    // serving another repository's bytes.
+    // anchored to an artifact row scoped to the caller's repository. On backends
+    // that physically isolate each repository's key space (filesystem, rooted at
+    // the repo's storage_path) that is always sound. On shared cloud namespaces
+    // (S3/GCS/Azure) the same flat key can belong to a *different* repository,
+    // so the fallback runs only when the catalog shows no foreign owner for the
+    // exact key — the same ownership rule as the #2504 write guard, backed by
+    // idx_artifacts_storage_key (#2574). Gate 2 below additionally anchors on a
+    // live sibling row in the *requesting* repository before any byte is served.
+    // A database error fails closed (404) rather than risking a foreign read.
     if !crate::storage::backend_is_repo_isolated(&location.backend) {
-        return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+        let flat_key = format!("maven/{}", artifact_path);
+        let readable =
+            crate::services::artifact_service::flat_key_readable_for_repo(db, repo_id, &flat_key)
+                .await
+                .unwrap_or(false);
+        if !readable {
+            return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+        }
     }
 
     // Gate 1: Only secondaries and bare primaries are eligible; anything else is 404.

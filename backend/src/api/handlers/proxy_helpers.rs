@@ -3861,6 +3861,32 @@ pub async fn guard_cross_repo_write(
     .map_err(|e| e.into_response())
 }
 
+/// Read-side twin of [`guard_cross_repo_write`] (#2574): may an unanchored
+/// flat `maven/{path}` key be served to `repository_id`?
+///
+/// Repo-isolated (filesystem) backends short-circuit to `true` — each
+/// repository physically owns its whole key space. On shared cloud namespaces
+/// the catalog decides: readable iff no *other* repository (live or
+/// soft-deleted) holds a row at the exact key — the same ownership rule as
+/// the write guard, backed by `idx_artifacts_storage_key`. This restores the
+/// legacy flat-key reads #2504 removed wholesale (row-less GAV companion
+/// files, verbatim `maven-metadata.xml`, stored checksum sidecars) while
+/// keeping the cross-tenant read hole closed. A database error fails closed
+/// (`false`): never serve a flat key we cannot prove is not foreign.
+pub async fn flat_key_readable(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> bool {
+    if crate::storage::backend_is_repo_isolated(storage_backend) {
+        return true;
+    }
+    crate::services::artifact_service::flat_key_readable_for_repo(db, repository_id, storage_key)
+        .await
+        .unwrap_or(false)
+}
+
 #[allow(clippy::result_large_err)]
 pub async fn put_artifact_bytes(
     state: &crate::api::SharedState,

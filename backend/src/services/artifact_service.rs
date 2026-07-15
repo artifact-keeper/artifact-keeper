@@ -1994,6 +1994,36 @@ pub async fn guard_foreign_storage_key(
     Ok(())
 }
 
+/// Read-side companion to [`guard_foreign_storage_key`] (#2574): is the flat
+/// `storage_key` servable to `repository_id` on a shared cloud namespace?
+///
+/// Legacy hosted data (rows created before Maven uploads indexed every
+/// physical asset — GAV-grouped uploads whose companion files have no row of
+/// their own, verbatim `maven-metadata.xml`, stored checksum sidecars) keeps
+/// bytes at flat `maven/{path}` keys. Those keys are either unowned by any
+/// row, or referenced only by the requesting repository, and serving them is
+/// exactly the pre-#2504 behavior minus the cross-tenant hole: a key with a
+/// row in a *different* repository — live or soft-deleted, since the physical
+/// object outlives a soft-delete — stays unreadable. Same ownership rule as
+/// the write guard, backed by `idx_artifacts_storage_key` (migration 154).
+pub async fn flat_key_readable_for_repo(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_key: &str,
+) -> Result<bool> {
+    let foreign: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts \
+         WHERE storage_key = $1 AND repository_id <> $2 \
+         LIMIT 1",
+    )
+    .bind(storage_key)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(foreign.is_none())
+}
+
 /// Best-effort recorder for a completed local-artifact download (#2365).
 ///
 /// Writes real attribution (validated client IP or NULL, authenticated user
@@ -2234,6 +2264,79 @@ mod tests {
         guard_foreign_storage_key(&pool, repo_a, &key)
             .await
             .expect("same-repo soft-deleted reclaim must be allowed");
+    }
+
+    // -- #2574 flat-key read ownership check --------------------------------
+
+    #[tokio::test]
+    async fn test_flat_key_readable_when_unowned() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // No row anywhere references this key — the legacy row-less companion
+        // file case (#2574). Must stay readable.
+        let key = format!("maven/com/acme/lonely/{}/lonely.pom", Uuid::new_v4());
+        assert!(flat_key_readable_for_repo(&pool, repo_a, &key)
+            .await
+            .expect("query must succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_flat_key_readable_when_owned_by_requesting_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/mine/1.0/mine-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/mine/1.0/mine-1.0.jar", &key).await;
+        assert!(flat_key_readable_for_repo(&pool, repo_a, &key)
+            .await
+            .expect("query must succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_flat_key_not_readable_when_foreign_owned() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!(
+            "maven/com/acme/theirs/1.0/theirs-1.0-{}.jar",
+            Uuid::new_v4()
+        );
+        seed_artifact(&pool, repo_b, "com/acme/theirs/1.0/theirs-1.0.jar", &key).await;
+        // The cross-tenant read hole #2504 closed: must stay closed.
+        assert!(!flat_key_readable_for_repo(&pool, repo_a, &key)
+            .await
+            .expect("query must succeed"));
+    }
+
+    #[tokio::test]
+    async fn test_flat_key_not_readable_when_foreign_soft_deleted() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/dead/1.0/dead-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_b, "com/acme/dead/1.0/dead-1.0.jar", &key).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("soft-delete");
+        // The physical object outlives the soft-delete; the tombstoned foreign
+        // row still owns the key — reads must stay blocked, mirroring the
+        // write guard's poison-on-resurrect rule.
+        assert!(!flat_key_readable_for_repo(&pool, repo_a, &key)
+            .await
+            .expect("query must succeed"));
     }
 
     // -----------------------------------------------------------------------
