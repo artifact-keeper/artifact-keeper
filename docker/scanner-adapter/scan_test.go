@@ -102,6 +102,32 @@ func TestBuildArgsOmitsOptionalFlags(t *testing.T) {
 	if strings.Contains(args, "--skip-db-update") {
 		t.Error("--skip-db-update should be absent when SkipDBUpdate=false")
 	}
+	if strings.Contains(args, "--db-repository") {
+		t.Error("--db-repository should be absent when DBRepository is empty")
+	}
+}
+
+func TestBuildArgsIncludesDBRepository(t *testing.T) {
+	cfg := &Config{Severity: "LOW", ScanTimeout: time.Minute, CacheDir: "/c",
+		DBRepository: "ghcr.io/artifact-keeper/trivy-db"}
+	args := strings.Join(NewScanner(cfg).buildArgs("ref"), " ")
+	if !strings.Contains(args, "--db-repository ghcr.io/artifact-keeper/trivy-db") {
+		t.Errorf("expected --db-repository in args; got: %s", args)
+	}
+}
+
+func TestDownloadDBArgs(t *testing.T) {
+	// Default: no --db-repository.
+	got := strings.Join(downloadDBArgs(&Config{CacheDir: "/c"}), " ")
+	want := "image --download-db-only --cache-dir /c"
+	if got != want {
+		t.Errorf("downloadDBArgs = %q, want %q", got, want)
+	}
+	// With a mirror configured.
+	got = strings.Join(downloadDBArgs(&Config{CacheDir: "/c", DBRepository: "ghcr.io/ak/trivy-db"}), " ")
+	if !strings.Contains(got, "--db-repository ghcr.io/ak/trivy-db") {
+		t.Errorf("downloadDBArgs missing --db-repository; got %q", got)
+	}
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -119,6 +145,30 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.ScanTimeout != 5*time.Minute || cfg.JobTTL != 30*time.Minute {
 		t.Errorf("unexpected duration defaults: %+v", cfg)
+	}
+	// #2167 DB-download resilience defaults.
+	if cfg.DBRepository != "" {
+		t.Errorf("DBRepository should default to empty; got %q", cfg.DBRepository)
+	}
+	if cfg.DBUpdateRetries != 3 || cfg.DBUpdateRetryDelay != 2*time.Second {
+		t.Errorf("unexpected DB retry defaults: retries=%d delay=%s", cfg.DBUpdateRetries, cfg.DBUpdateRetryDelay)
+	}
+}
+
+func TestLoadConfigDBRepositoryAndRetryOverrides(t *testing.T) {
+	t.Setenv("SCANNER_TRIVY_DB_REPOSITORY", "ghcr.io/artifact-keeper/trivy-db")
+	t.Setenv("SCANNER_TRIVY_DB_UPDATE_RETRIES", "0")
+	t.Setenv("SCANNER_TRIVY_DB_UPDATE_RETRY_DELAY", "500ms")
+	cfg := LoadConfig()
+	if cfg.DBRepository != "ghcr.io/artifact-keeper/trivy-db" {
+		t.Errorf("DBRepository override not applied: %q", cfg.DBRepository)
+	}
+	// 0 is a valid "no retries" value and must NOT fall back to the default 3.
+	if cfg.DBUpdateRetries != 0 {
+		t.Errorf("DBUpdateRetries=0 override not applied; got %d", cfg.DBUpdateRetries)
+	}
+	if cfg.DBUpdateRetryDelay != 500*time.Millisecond {
+		t.Errorf("DBUpdateRetryDelay override not applied; got %s", cfg.DBUpdateRetryDelay)
 	}
 }
 

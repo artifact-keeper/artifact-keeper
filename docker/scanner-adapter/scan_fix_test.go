@@ -7,10 +7,92 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// writeFakeTrivy writes a shell "trivy" that increments a counter file on each
+// call and exits non-zero (simulating a rate-limited DB pull) until the
+// failUntil-th call, then exits 0. Returns the binary path and counter path.
+func writeFakeTrivy(t *testing.T, failUntil int) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "count")
+	bin := filepath.Join(dir, "trivy")
+	script := "#!/bin/sh\n" +
+		"c=$(cat " + counter + " 2>/dev/null || echo 0)\n" +
+		"c=$((c+1))\n" +
+		"echo $c > " + counter + "\n" +
+		"if [ \"$c\" -lt " + itoa(failUntil) + " ]; then\n" +
+		"  echo 'TOOMANYREQUESTS: too many requests to mirror.gcr.io' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake trivy: %v", err)
+	}
+	return bin, counter
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
+}
+
+func readCount(t *testing.T, counter string) int {
+	t.Helper()
+	b, err := os.ReadFile(counter)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return n
+}
+
+// TestDownloadDBRetriesTransientFailure proves the #2167 resilience fix: a
+// transient DB-pull failure (rate-limit) is retried with backoff and eventually
+// succeeds, so the adapter becomes ready instead of hard-failing the gate.
+func TestDownloadDBRetriesTransientFailure(t *testing.T) {
+	bin, counter := writeFakeTrivy(t, 3) // fail on calls 1,2; succeed on 3
+	cfg := &Config{TrivyPath: bin, CacheDir: t.TempDir(), DBUpdateRetries: 3, DBUpdateRetryDelay: time.Millisecond}
+	if err := DownloadDB(context.Background(), cfg); err != nil {
+		t.Fatalf("DownloadDB should succeed after retries, got: %v", err)
+	}
+	if got := readCount(t, counter); got != 3 {
+		t.Errorf("expected 3 trivy invocations, got %d", got)
+	}
+}
+
+// TestDownloadDBExhaustsRetries proves DownloadDB gives up after the configured
+// attempts and surfaces a descriptive error (fail-closed at readiness).
+func TestDownloadDBExhaustsRetries(t *testing.T) {
+	bin, counter := writeFakeTrivy(t, 99) // always fails
+	cfg := &Config{TrivyPath: bin, CacheDir: t.TempDir(), DBUpdateRetries: 2, DBUpdateRetryDelay: time.Millisecond}
+	err := DownloadDB(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("DownloadDB should fail when all attempts fail")
+	}
+	if !strings.Contains(err.Error(), "after 3 attempt(s)") {
+		t.Errorf("error should report attempt count; got: %v", err)
+	}
+	if got := readCount(t, counter); got != 3 { // 1 initial + 2 retries
+		t.Errorf("expected 3 trivy invocations, got %d", got)
+	}
+}
+
+// TestDownloadDBNoRetriesWhenDisabled proves DBUpdateRetries=0 keeps the
+// single-shot behaviour (one invocation, no retry loop).
+func TestDownloadDBNoRetriesWhenDisabled(t *testing.T) {
+	bin, counter := writeFakeTrivy(t, 99)
+	cfg := &Config{TrivyPath: bin, CacheDir: t.TempDir(), DBUpdateRetries: 0, DBUpdateRetryDelay: time.Millisecond}
+	if err := DownloadDB(context.Background(), cfg); err == nil {
+		t.Fatal("expected failure")
+	}
+	if got := readCount(t, counter); got != 1 {
+		t.Errorf("expected exactly 1 invocation with retries disabled, got %d", got)
+	}
+}
 
 // TestBuildCredentialHostScopedConfig proves the target-image bearer is written
 // to a host-scoped Docker config.json (keyed by trimRegistryHost(URL)) and

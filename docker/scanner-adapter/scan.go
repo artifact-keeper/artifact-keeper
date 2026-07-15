@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,6 +72,9 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	}
 	if s.cfg.SkipDBUpdate {
 		args = append(args, "--skip-db-update")
+	}
+	if s.cfg.DBRepository != "" {
+		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
 	args = append(args, imageRef)
 	return args
@@ -195,16 +199,62 @@ func dbPresent(cacheDir string) bool {
 // never advertises ready with no DB (which trivy treats as 0 vulnerabilities).
 func DBReady(cfg *Config) bool { return dbPresent(cfg.CacheDir) }
 
-// DownloadDB triggers a trivy DB download into cfg.CacheDir. It is run at
-// startup when DB updates are enabled so the DB is present before the adapter
-// marks itself ready (rather than lazily on the first scan, which would race the
-// readiness gate). Output is captured for the log; it never carries a token.
-func DownloadDB(ctx context.Context, cfg *Config) error {
-	cmd := exec.CommandContext(ctx, cfg.TrivyPath, "image", "--download-db-only", "--cache-dir", cfg.CacheDir)
+// downloadDBArgs builds the `trivy image --download-db-only` argument list,
+// honouring cfg.DBRepository (--db-repository) so the DB can be pulled from an
+// AK-controlled mirror instead of the shared public mirror.gcr.io endpoint.
+func downloadDBArgs(cfg *Config) []string {
+	args := []string{"image", "--download-db-only", "--cache-dir", cfg.CacheDir}
+	if cfg.DBRepository != "" {
+		args = append(args, "--db-repository", cfg.DBRepository)
+	}
+	return args
+}
+
+// downloadDBOnce runs a single `trivy --download-db-only`. Output is captured
+// for the log; it never carries a token (the DB pull is anonymous / host-scoped
+// away from the target-image credential).
+func downloadDBOnce(ctx context.Context, cfg *Config) error {
+	cmd := exec.CommandContext(ctx, cfg.TrivyPath, downloadDBArgs(cfg)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("trivy --download-db-only failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// DownloadDB triggers a trivy DB download into cfg.CacheDir. It is run at
+// startup when DB updates are enabled so the DB is present before the adapter
+// marks itself ready (rather than lazily on the first scan, which would race the
+// readiness gate).
+//
+// The default trivy DB mirror (mirror.gcr.io/aquasecurity/trivy-db) is an
+// anonymous, shared, rate-limited endpoint: a single-shot download made the
+// release-gate scanner-efficacy check flaky (#2167) — a transient
+// 429/UNAUTHORIZED left the adapter not-ready and hard-failed the release for
+// the wrong reason. DownloadDB therefore retries with exponential backoff
+// (cfg.DBUpdateRetries extra attempts, base cfg.DBUpdateRetryDelay), bounded by
+// ctx. For a durable fix, point cfg.DBRepository at an AK-controlled mirror.
+func DownloadDB(ctx context.Context, cfg *Config) error {
+	attempts := cfg.DBUpdateRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			// Exponential backoff: base * 2^(i-1), interruptible by ctx.
+			delay := cfg.DBUpdateRetryDelay * time.Duration(1<<uint(i-1))
+			log.Printf("trivy DB download attempt %d/%d failed, retrying in %s: %v", i, attempts, delay, lastErr)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("trivy DB download canceled after %d attempt(s): %w (last error: %v)", i, ctx.Err(), lastErr)
+			case <-time.After(delay):
+			}
+		}
+		if lastErr = downloadDBOnce(ctx, cfg); lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("trivy DB download failed after %d attempt(s): %w", attempts, lastErr)
 }
 
 // Scan runs trivy for the given request and returns the Harbor report. Any

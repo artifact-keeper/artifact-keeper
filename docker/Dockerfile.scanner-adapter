@@ -67,6 +67,15 @@ RUN apk add --no-cache ca-certificates git rpm \
 COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
 COPY --from=build /out/scanner-adapter /usr/local/bin/scanner-adapter
 
+# DB-download resilience (#2167): the trivy vuln-DB pull defaults to the
+# anonymous, rate-limited mirror.gcr.io/aquasecurity/trivy-db endpoint, which
+# made the release-gate scanner-efficacy check flaky. The adapter now retries
+# the download with exponential backoff (SCANNER_TRIVY_DB_UPDATE_RETRIES, default
+# 3). To eliminate the public mirror entirely, set SCANNER_TRIVY_DB_REPOSITORY
+# (chart / release-gate deploy) to an AK-controlled trivy-db mirror, e.g.
+# ghcr.io/artifact-keeper/trivy-db — trivy accepts a comma-separated fallback
+# list. No default repository is baked in here so the image works out of the box
+# against the public mirror; the mirror is an infra opt-in.
 ENV SCANNER_ADAPTER_ADDR=:8080 \
     SCANNER_TRIVY_PATH=/usr/local/bin/trivy \
     SCANNER_TRIVY_CACHE_DIR=/home/scanner/.cache/trivy
