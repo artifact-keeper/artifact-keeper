@@ -2,6 +2,7 @@
 //! (loopback / link-local / private / cloud-metadata) IPs at connect time,
 //! closing the DNS-rebinding gap that URL-string validation cannot catch.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -40,30 +41,147 @@ enum ResolverMode {
 #[derive(Debug, Clone)]
 pub struct SsrfGuardResolver {
     mode: ResolverMode,
+    /// EXACT (case-insensitive, full-host) allow-set of the operator-configured
+    /// egress-proxy host(s), read once at construction from the proxy env
+    /// (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, upper and lower case). A host in
+    /// this set skips the SSRF filter entirely — the proxy's own (often
+    /// private) address must be reachable or every outbound fetch fails closed
+    /// with a 502/500 (issue #2570). The set is EMPTY when no proxy env is set,
+    /// in which case the resolver is byte-for-byte the pre-existing
+    /// fail-closed guard. Matching is exact full-host equality only; it never
+    /// relaxes any other target and never does subdomain/suffix/prefix matching.
+    exempt_proxy_hosts: HashSet<String>,
 }
 
 impl Default for SsrfGuardResolver {
     fn default() -> Self {
         Self {
             mode: ResolverMode::Upstream,
+            exempt_proxy_hosts: HashSet::new(),
         }
     }
+}
+
+impl SsrfGuardResolver {
+    /// Construct a resolver for `mode`, reading the configured egress-proxy
+    /// host(s) from the process environment so the proxy's own address is
+    /// exempt from the SSRF DNS filter for THIS resolver (issue #2570). All
+    /// production constructors funnel through here; tests build the struct
+    /// directly with an explicit `exempt_proxy_hosts` (or `..Default::default()`
+    /// for the empty, fail-closed baseline).
+    fn with_mode(mode: ResolverMode) -> Self {
+        Self {
+            mode,
+            exempt_proxy_hosts: configured_proxy_hosts(),
+        }
+    }
+
+    /// True when `host` is an exact (case-insensitive, full-host) match for a
+    /// configured egress-proxy host. Delegates to the free [`host_is_exempt`]
+    /// so the match rule is unit-testable without any DNS/network I/O.
+    fn is_exempt_proxy_host(&self, host: &str) -> bool {
+        host_is_exempt(&self.exempt_proxy_hosts, host)
+    }
+}
+
+/// Parse the bare host token out of a proxy URL value (`HTTP_PROXY` and
+/// friends): strip an optional `scheme://`, an optional `user:pass@`
+/// userinfo, any path/query, and a trailing `:port`, returning the host
+/// lowercased. `http://user:pass@proxy.corp:3128` → `proxy.corp`. Returns
+/// `None` for an empty or hostless value.
+fn proxy_host_token(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // Strip scheme (`http://`, `https://`, `socks5://`, …) if present.
+    let after_scheme = match v.find("://") {
+        Some(i) => &v[i + 3..],
+        None => v,
+    };
+    // Strip userinfo (`user:pass@`) — use the LAST '@' so a password
+    // containing '@' does not truncate the host.
+    let after_userinfo = match after_scheme.rfind('@') {
+        Some(i) => &after_scheme[i + 1..],
+        None => after_scheme,
+    };
+    // Drop any path/query/fragment.
+    let hostport = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_userinfo);
+    // Strip the port. Handle a bracketed IPv6 literal (`[::1]:port`) so the
+    // ':' inside the address is not mistaken for the port separator.
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    } else {
+        match hostport.find(':') {
+            Some(i) => &hostport[..i],
+            None => hostport,
+        }
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Read the set of configured egress-proxy host tokens from the environment,
+/// covering all six proxy vars (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in
+/// upper and lower case). Hosts are lowercased for case-insensitive exact
+/// matching. Empty when no proxy env is set (resolver stays fail-closed).
+pub(crate) fn configured_proxy_hosts() -> HashSet<String> {
+    const VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    let mut set = HashSet::new();
+    for var in VARS {
+        if let Ok(val) = std::env::var(var) {
+            if let Some(host) = proxy_host_token(&val) {
+                set.insert(host);
+            }
+        }
+    }
+    set
+}
+
+/// EXACT full-host, case-insensitive membership test against the proxy
+/// exempt-set. An empty set always returns false (no proxy configured ⇒ the
+/// resolver is fully fail-closed). No subdomain/suffix/prefix matching:
+/// `proxy.corp.attacker.com` and `10.0.0.5.attacker.com` are NOT exempted
+/// by a `proxy.corp` / `10.0.0.5` entry.
+///
+/// The match is host-keyed and PORT-AGNOSTIC (the port is stripped from the
+/// proxy value at parse time). This is safe: the exemption affects only DNS
+/// *name resolution*, which is inherently port-independent, and reqwest still
+/// dials the proxy's configured port — it grants no reach to a different
+/// service/port on that host, so port-agnosticism does not widen the guard.
+fn host_is_exempt(exempt: &HashSet<String>, host: &str) -> bool {
+    !exempt.is_empty() && exempt.contains(host.to_ascii_lowercase().as_str())
 }
 
 /// Convenience: an `Arc<dyn Resolve>` for `ClientBuilder::dns_resolver` that
 /// blocks every private/internal address (upstream / remote-proxy — the
 /// fail-closed default).
 pub fn ssrf_guard_resolver() -> Arc<dyn Resolve> {
-    Arc::new(SsrfGuardResolver::default())
+    Arc::new(SsrfGuardResolver::with_mode(ResolverMode::Upstream))
 }
 
 /// `Arc<dyn Resolve>` for trusted operator-configured internal-service
 /// clients (e.g. the scanner-adapter): permits private/CGNAT/ULA targets but
 /// retains the metadata/loopback/link-local hard-blocks (issue #2389).
 pub fn ssrf_guard_resolver_internal() -> Arc<dyn Resolve> {
-    Arc::new(SsrfGuardResolver {
-        mode: ResolverMode::TrustedInternal,
-    })
+    Arc::new(SsrfGuardResolver::with_mode(ResolverMode::TrustedInternal))
 }
 
 /// `Arc<dyn Resolve>` for webhook-delivery clients: private/CGNAT/ULA
@@ -71,9 +189,7 @@ pub fn ssrf_guard_resolver_internal() -> Arc<dyn Resolve> {
 /// `WEBHOOK_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
 /// metadata/loopback/link-local hard-blocks always apply (issue #2380).
 pub fn ssrf_guard_resolver_webhook() -> Arc<dyn Resolve> {
-    Arc::new(SsrfGuardResolver {
-        mode: ResolverMode::Webhook,
-    })
+    Arc::new(SsrfGuardResolver::with_mode(ResolverMode::Webhook))
 }
 
 /// `Arc<dyn Resolve>` for SSO/OIDC-fetch clients: private/CGNAT/ULA
@@ -81,9 +197,7 @@ pub fn ssrf_guard_resolver_webhook() -> Arc<dyn Resolve> {
 /// `SSO_ALLOW_PRIVATE_IPS` or `AK_SSRF_ALLOW_PRIVATE_CIDRS`; the
 /// metadata/loopback/link-local hard-blocks always apply (issue #2380).
 pub fn ssrf_guard_resolver_sso() -> Arc<dyn Resolve> {
-    Arc::new(SsrfGuardResolver {
-        mode: ResolverMode::SsoDiscovery,
-    })
+    Arc::new(SsrfGuardResolver::with_mode(ResolverMode::SsoDiscovery))
 }
 
 /// True when a resolved IP must be dropped for the given [`ResolverMode`].
@@ -115,12 +229,35 @@ fn filter_allowed(
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let mode = self.mode;
+        // Exempt the configured egress-proxy host (issue #2570): matched by
+        // EXACT full-host equality BEFORE the mode-specific filter. Computed
+        // here (sync, outside the future) so no reference into `self` is held.
+        let exempt = self.is_exempt_proxy_host(name.as_str());
         Box::pin(async move {
             let host = name.as_str().to_string();
             // Port 0 is a placeholder; reqwest substitutes the real port.
             let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            if exempt {
+                // Operator-configured egress proxy: return every resolved
+                // address UNFILTERED so the proxy's own (often private)
+                // address is reachable. This is keyed on the exact proxy
+                // host token only and never widens the guard for any other
+                // target.
+                let addrs: Addrs = Box::new(resolved.collect::<Vec<SocketAddr>>().into_iter());
+                return Ok(addrs);
+            }
             let allowed: Vec<SocketAddr> = filter_allowed(mode, resolved);
             if allowed.is_empty() {
+                // Previously invisible: an outbound fetch that fails closed
+                // here surfaces to the caller as an opaque connect error.
+                // Log it (security target) so operators can see WHICH host
+                // and mode tripped the guard (issue #2570 diagnostics).
+                tracing::warn!(
+                    target: "security",
+                    host = %host,
+                    mode = ?mode,
+                    "SSRF DNS guard blocked all resolved addresses for host"
+                );
                 let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "all resolved addresses blocked by SSRF policy",
@@ -263,6 +400,7 @@ mod tests {
         let name: Name = "10.0.0.5".parse().expect("valid dns name");
         let mut addrs = SsrfGuardResolver {
             mode: ResolverMode::TrustedInternal,
+            ..Default::default()
         }
         .resolve(name)
         .await
@@ -417,6 +555,7 @@ mod tests {
         let name: Name = "10.0.0.5".parse().expect("valid dns name");
         let result = SsrfGuardResolver {
             mode: ResolverMode::Webhook,
+            ..Default::default()
         }
         .resolve(name)
         .await;
@@ -436,6 +575,7 @@ mod tests {
         let name: Name = "10.0.0.5".parse().expect("valid dns name");
         let result = SsrfGuardResolver {
             mode: ResolverMode::SsoDiscovery,
+            ..Default::default()
         }
         .resolve(name)
         .await;
@@ -453,6 +593,7 @@ mod tests {
             let name: Name = host.parse().expect("valid dns name");
             let result = SsrfGuardResolver {
                 mode: ResolverMode::TrustedInternal,
+                ..Default::default()
             }
             .resolve(name)
             .await;
@@ -461,5 +602,201 @@ mod tests {
                 "internal resolver must still refuse hard-blocked host {host}"
             );
         }
+    }
+
+    // ---- Proxy-host exemption (issue #2570) ----------------------------
+
+    /// All six proxy env vars, so `with_proxy_env` can clear the full set
+    /// before applying the ones a test cares about.
+    const PROXY_VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    /// Run `f` with ONLY the given proxy env vars set (all six cleared
+    /// first), restoring the prior values afterwards. Shares [`ENV_LOCK`]
+    /// with `with_toggles` so proxy-env and private-IP-toggle tests never
+    /// race each other's process-wide env under `cargo test`.
+    fn with_proxy_env<R>(set: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev: Vec<(&str, Option<String>)> = PROXY_VARS
+            .iter()
+            .map(|v| (*v, std::env::var(v).ok()))
+            .collect();
+        for v in PROXY_VARS {
+            std::env::remove_var(v);
+        }
+        for (k, val) in set {
+            std::env::set_var(k, val);
+        }
+        let out = f();
+        for (k, val) in prev {
+            match val {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    fn exempt_set(hosts: &[&str]) -> HashSet<String> {
+        hosts.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn proxy_host_token_parses_scheme_creds_and_port() {
+        assert_eq!(
+            proxy_host_token("http://user:pass@proxy.corp:3128").as_deref(),
+            Some("proxy.corp")
+        );
+        assert_eq!(
+            proxy_host_token("https://Proxy.Corp:8080").as_deref(),
+            Some("proxy.corp"),
+            "host must be lowercased"
+        );
+        assert_eq!(
+            proxy_host_token("proxy.corp").as_deref(),
+            Some("proxy.corp")
+        );
+        assert_eq!(
+            proxy_host_token("http://10.0.0.5:3128").as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            proxy_host_token("http://user:p%40ss@10.0.0.5:3128/path?q=1").as_deref(),
+            Some("10.0.0.5"),
+            "userinfo/path/query must be stripped"
+        );
+        assert_eq!(
+            proxy_host_token("http://[fd00::1]:3128").as_deref(),
+            Some("fd00::1"),
+            "bracketed IPv6 literal keeps its inner colons"
+        );
+        assert_eq!(proxy_host_token("").as_deref(), None);
+        assert_eq!(proxy_host_token("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn configured_proxy_hosts_reads_all_six_vars() {
+        with_proxy_env(
+            &[
+                ("HTTP_PROXY", "http://a.example:3128"),
+                ("http_proxy", "http://b.example:3128"),
+                ("HTTPS_PROXY", "https://c.example:3128"),
+                ("https_proxy", "https://d.example:3128"),
+                ("ALL_PROXY", "socks5://e.example:1080"),
+                ("all_proxy", "socks5://f.example:1080"),
+            ],
+            || {
+                let hosts = configured_proxy_hosts();
+                for h in [
+                    "a.example",
+                    "b.example",
+                    "c.example",
+                    "d.example",
+                    "e.example",
+                    "f.example",
+                ] {
+                    assert!(hosts.contains(h), "expected {h} in {hosts:?}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn configured_proxy_hosts_empty_when_no_env() {
+        with_proxy_env(&[], || {
+            assert!(
+                configured_proxy_hosts().is_empty(),
+                "no proxy env ⇒ empty exempt-set (fail-closed)"
+            );
+        });
+    }
+
+    #[test]
+    fn host_is_exempt_exact_and_case_insensitive() {
+        let set = exempt_set(&["proxy.corp", "10.0.0.5"]);
+        assert!(host_is_exempt(&set, "proxy.corp"));
+        assert!(host_is_exempt(&set, "PROXY.CORP"), "case-insensitive");
+        assert!(host_is_exempt(&set, "Proxy.Corp"));
+        assert!(host_is_exempt(&set, "10.0.0.5"), "IP literal exact match");
+    }
+
+    #[test]
+    fn host_is_exempt_empty_set_always_false() {
+        let empty = HashSet::new();
+        assert!(!host_is_exempt(&empty, "proxy.corp"));
+        assert!(!host_is_exempt(&empty, "10.0.0.5"));
+    }
+
+    #[test]
+    fn host_is_exempt_rejects_subdomain_suffix_prefix() {
+        let set = exempt_set(&["proxy.corp", "10.0.0.5"]);
+        // Subdomain / suffix / prefix must NOT match — the whole point of the
+        // security invariant (rt-ssrf-peer-replication attacks these).
+        assert!(!host_is_exempt(&set, "proxy.corp.attacker.com"));
+        assert!(!host_is_exempt(&set, "evil.proxy.corp"));
+        assert!(!host_is_exempt(&set, "proxy.corpX"));
+        assert!(!host_is_exempt(&set, "Xproxy.corp"));
+        assert!(!host_is_exempt(&set, "10.0.0.5.attacker.com"));
+        assert!(!host_is_exempt(&set, "10.0.0.50"));
+    }
+
+    /// CORE: a resolver whose exempt-set contains the private literal
+    /// `10.0.0.5` (as if it were the configured proxy) must RESOLVE it even
+    /// in the fail-closed Upstream mode — the proxy address is reachable.
+    #[tokio::test]
+    async fn exempt_proxy_host_resolves_private_literal_in_upstream_mode() {
+        let name: Name = "10.0.0.5".parse().expect("valid dns name");
+        let resolver = SsrfGuardResolver {
+            mode: ResolverMode::Upstream,
+            exempt_proxy_hosts: exempt_set(&["10.0.0.5"]),
+        };
+        let mut addrs = resolver
+            .resolve(name)
+            .await
+            .expect("an exempt proxy host must resolve even at a private IP");
+        assert!(
+            addrs.next().is_some(),
+            "expected at least one (unfiltered) address for the exempt proxy host"
+        );
+    }
+
+    /// Fail-closed regression guard: with an EMPTY exempt-set the same private
+    /// literal must still be refused in Upstream mode (byte-for-byte the
+    /// pre-#2570 behavior).
+    #[tokio::test]
+    async fn empty_exempt_set_still_blocks_private_literal() {
+        let name: Name = "10.0.0.5".parse().expect("valid dns name");
+        let resolver = SsrfGuardResolver {
+            mode: ResolverMode::Upstream,
+            ..Default::default()
+        };
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "empty exempt-set must stay fail-closed for a private literal"
+        );
+    }
+
+    /// Direct-target-still-blocked: a proxy at `proxy.corp` is exempt, but a
+    /// DIFFERENT private upstream (`10.0.0.5`, e.g. a NO_PROXY direct target)
+    /// must STILL be refused even while the proxy is configured.
+    #[tokio::test]
+    async fn other_private_target_blocked_when_only_proxy_host_exempt() {
+        let name: Name = "10.0.0.5".parse().expect("valid dns name");
+        let resolver = SsrfGuardResolver {
+            mode: ResolverMode::Upstream,
+            exempt_proxy_hosts: exempt_set(&["proxy.corp"]),
+        };
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "a non-proxy private target must stay blocked when only the proxy host is exempt"
+        );
     }
 }
