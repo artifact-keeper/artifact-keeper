@@ -1096,4 +1096,69 @@ mod tests {
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
+
+    // ── #2574 Gate 0: flat-key ownership on shared cloud namespaces ─────
+
+    #[tokio::test]
+    async fn test_storage_fallback_cloud_refuses_foreign_owned_key() {
+        // SECURITY (#2504): on a shared cloud namespace a flat key owned by
+        // a *different* repository must stay unreadable under #2574 — the
+        // ownership check replaces the wholesale cloud gate, it does not
+        // reopen the cross-tenant read hole.
+        let Some((pool, state, repo_id, _repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        let (other_repo, _, _) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let path = "com/example/foreign/1.0/foreign-1.0.pom";
+        insert_primary_jar(&pool, other_repo, user_id, path, &format!("maven/{}", path)).await;
+
+        let cloud = StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let err = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &cloud, path)
+            .await
+            .expect_err("foreign-owned flat key must 404 on a shared namespace");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        db_helpers::cleanup(&pool, other_repo, user_id).await;
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_cloud_allows_unowned_key_through_gate0() {
+        // #2574: an unowned flat key (legacy row-less companion file) must
+        // pass Gate 0 on a cloud backend. With a live sibling anchoring the
+        // GAV the request reaches the storage read, which fails 500 here only
+        // because the test registry has no "s3" backend — reaching storage
+        // (instead of 404ing at a wholesale cloud gate) is what #2574 restores.
+        let Some((pool, state, repo_id, _repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        insert_primary_jar(
+            &pool,
+            repo_id,
+            user_id,
+            "com/example/unowned/1.0/unowned-1.0.jar",
+            "some-unrelated-key",
+        )
+        .await;
+
+        let cloud = StorageLocation {
+            backend: "s3".to_string(),
+            path: String::new(),
+        };
+        let err = maven_local_fetch_storage_fallback(
+            &pool,
+            &state,
+            repo_id,
+            &cloud,
+            "com/example/unowned/1.0/unowned-1.0.pom",
+        )
+        .await
+        .expect_err("fixture registry has no s3 backend, storage read must fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
 }

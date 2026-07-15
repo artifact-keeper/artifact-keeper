@@ -4528,6 +4528,55 @@ mod tests {
         assert!(!is_quarantine_block(&AppError::Storage("io".into())));
     }
 
+    // ── #2574 flat-key read ownership (read twin of guard_cross_repo_write) ──
+
+    #[tokio::test]
+    async fn test_flat_key_readable_ownership_polarity() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!(
+            "maven/com/acme/rowless/1.0/rowless-1.0-{}.pom",
+            Uuid::new_v4()
+        );
+
+        // Unowned key on a shared cloud namespace: readable — this is the
+        // legacy row-less companion-file case #2574 restores.
+        assert!(flat_key_readable(&pool, repo_a, "s3", &key).await);
+
+        // Foreign-owned key: not readable (the #2504 cross-tenant hole stays
+        // closed) — while the owning repository itself still reads it fine.
+        insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_b,
+                path: "com/acme/rowless/1.0/rowless-1.0.pom",
+                name: "rowless",
+                version: "1.0",
+                size_bytes: 1,
+                checksum_sha256: "rowless-sha",
+                content_type: "text/xml",
+                storage_key: &key,
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("seed foreign row");
+        assert!(!flat_key_readable(&pool, repo_a, "s3", &key).await);
+        assert!(flat_key_readable(&pool, repo_b, "s3", &key).await);
+
+        // Repo-isolated backends short-circuit to readable without consulting
+        // the catalog — physically separate key spaces cannot collide.
+        assert!(flat_key_readable(&pool, repo_a, "filesystem", &key).await);
+
+        tdh::cleanup(&pool, repo_b, user_id).await;
+        tdh::cleanup(&pool, repo_a, user_id).await;
+    }
+
     // ── Two-phase virtual fan-out: priority-preserving decision logic ──
     //
     // Cold negative resolution parallelizes the upstream fan-out (#2069) but
