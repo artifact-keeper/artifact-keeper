@@ -84,31 +84,35 @@ pub async fn run_repair(db: &PgPool, registry: Arc<StorageRegistry>) -> RepairSt
         ..RepairStats::default()
     };
 
-    if candidates.is_empty() {
-        return stats;
-    }
+    // Register any unregistered migrated manifests (hollow-image repair). This
+    // loop is a no-op when there are no candidates, but the orphan/hollow
+    // reconciliation below MUST still run: an orphan tag (a migrated manifest
+    // whose backing `artifacts` row was later soft-deleted) can exist with no
+    // unregistered-manifest candidate at all, so it cannot be gated behind a
+    // non-empty candidate set.
+    if !candidates.is_empty() {
+        tracing::info!(
+            candidate_count = candidates.len(),
+            "OCI migration reindex: registering migrated Docker/OCI manifests"
+        );
 
-    tracing::info!(
-        candidate_count = candidates.len(),
-        "OCI migration reindex: registering migrated Docker/OCI manifests"
-    );
-
-    for candidate in candidates {
-        match process_candidate(db, &registry, &candidate).await {
-            Ok(Some(counts)) => {
-                stats.manifests_registered += 1;
-                stats.blobs_registered += counts.blobs;
-                stats.children_registered += counts.children;
-            }
-            Ok(None) => stats.candidates_skipped += 1,
-            Err(e) => {
-                tracing::warn!(
-                    repository_id = %candidate.repository_id,
-                    path = %candidate.path,
-                    error = %e,
-                    "OCI migration reindex: skipped candidate"
-                );
-                stats.candidates_failed += 1;
+        for candidate in candidates {
+            match process_candidate(db, &registry, &candidate).await {
+                Ok(Some(counts)) => {
+                    stats.manifests_registered += 1;
+                    stats.blobs_registered += counts.blobs;
+                    stats.children_registered += counts.children;
+                }
+                Ok(None) => stats.candidates_skipped += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        repository_id = %candidate.repository_id,
+                        path = %candidate.path,
+                        error = %e,
+                        "OCI migration reindex: skipped candidate"
+                    );
+                    stats.candidates_failed += 1;
+                }
             }
         }
     }
