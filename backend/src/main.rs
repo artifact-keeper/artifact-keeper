@@ -572,24 +572,31 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     storage_registry,
                 )
                 .await;
-            if repair_stats.candidates_failed > 0 {
+            if repair_stats.candidates_failed > 0 || repair_stats.hollow_tags_flagged > 0 {
                 tracing::warn!(
                     candidates_scanned = repair_stats.candidates_scanned,
                     manifests_registered = repair_stats.manifests_registered,
                     blobs_registered = repair_stats.blobs_registered,
+                    children_registered = repair_stats.children_registered,
                     candidates_skipped = repair_stats.candidates_skipped,
                     candidates_failed = repair_stats.candidates_failed,
-                    "OCI migration reindex left {} candidate(s) unregistered; \
-                     they stay unpullable until repaired (re-run migration or \
-                     restart after fixing storage)",
-                    repair_stats.candidates_failed
+                    hollow_tags_flagged = repair_stats.hollow_tags_flagged,
+                    orphan_tags_reconciled = repair_stats.orphan_tags_reconciled,
+                    "OCI migration reindex left {} candidate(s) unregistered and \
+                     flagged {} hollow tag(s); those images stay unpullable until \
+                     re-migrated (referenced blobs/child manifests were never \
+                     transferred). See the hollow-repositories WARN above.",
+                    repair_stats.candidates_failed,
+                    repair_stats.hollow_tags_flagged
                 );
             } else {
                 tracing::info!(
                     candidates_scanned = repair_stats.candidates_scanned,
                     manifests_registered = repair_stats.manifests_registered,
                     blobs_registered = repair_stats.blobs_registered,
+                    children_registered = repair_stats.children_registered,
                     candidates_skipped = repair_stats.candidates_skipped,
+                    orphan_tags_reconciled = repair_stats.orphan_tags_reconciled,
                     "OCI migration reindex complete"
                 );
             }

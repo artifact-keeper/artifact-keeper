@@ -23,6 +23,15 @@
 #     `claim_pending_sync_tasks` concurrency tests only touch their own unique
 #     peer's rows via `WHERE peer_instance_id = $1` and hold live-TTL claims the
 #     sweep cannot match, so they stay parallel.)
+#   * `oci_migration_reindex.rs` `run_repair` (#2457) — the `test_run_repair_*`
+#     tests exercise the startup reindex, whose candidate scan, hollow-tag flag,
+#     and orphan-tag DELETE are all CLUSTER-WIDE (no repository scope) and which
+#     the tests assert on via the returned `RepairStats` (`manifests_registered`,
+#     `orphan_tags_reconciled`). Run process-per-test against the shared DB, a
+#     sibling `run_repair` call registers or drops another test's seeded
+#     manifest / orphan tag first, so the count is attributed to the wrong test
+#     (e.g. `orphan_tags_reconciled == 0`). Serializing them restores the
+#     exact-count assertions the single-process `cargo test` run provided.
 #
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
@@ -35,12 +44,12 @@
 # group so nextest never runs two of them at once, restoring the serialization
 # the in-process mutexes provide under `cargo test`. Add new tests that take
 # STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, or that call
-# `recover_expired_sync_task_claims` and assert on its global result, to the
-# matching filter below.
+# `recover_expired_sync_task_claims` or `run_repair` and assert on its global
+# result, to the matching filter below.
 
 [test-groups]
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair)'
 test-group = 'db-serial'

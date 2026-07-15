@@ -1247,6 +1247,16 @@ impl MigrationWorker {
                     .await?;
 
             if let Some((repository_id,)) = repo_id {
+                // #2457: bind the `artifacts` row, the OCI tag/ref registration,
+                // and every referenced blob/child-manifest registration into
+                // ONE transaction. A migrated Docker tag must never be committed
+                // without its backing content: if the referenced-content walk
+                // below fails to fetch a blob or child manifest, this whole
+                // transaction rolls back (no `oci_tags`, no partial `oci_blobs`)
+                // and the item is marked FAILED. For non-OCI formats the
+                // transaction just wraps the same INSERT + metadata upsert as
+                // before, a behaviour-preserving no-op.
+                let mut tx = self.db.begin().await?;
                 // Format-aware name + version. extract_name_from_path returns
                 // the filename, which is what Artifact Keeper stored prior to
                 // this fix — leaving `name` set to the full filename and
@@ -1292,11 +1302,28 @@ impl MigrationWorker {
                         "Rejected unsafe artifact path: {path_str}"
                     )));
                 }
+                // Resurrect a soft-deleted tombstone on conflict (#2457 F3).
+                // The full UNIQUE(repository_id, path) keeps a row for a
+                // deleted artifact with `is_deleted = true`
+                // (`artifact_service::delete`). A prior `DO NOTHING` left that
+                // tombstone deleted on re-import while the OCI tag was still
+                // (re)registered — an orphan tag with no live artifacts row.
+                // `DO UPDATE ... is_deleted = false` refreshes the row and
+                // clears the tombstone so the tag always has a live backing
+                // artifact, matching the live push path (artifact_service.rs).
                 sqlx::query(
                     r#"
                     INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'application/octet-stream')
-                    ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
+                    ON CONFLICT (repository_id, path) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        version = EXCLUDED.version,
+                        size_bytes = EXCLUDED.size_bytes,
+                        checksum_sha256 = EXCLUDED.checksum_sha256,
+                        checksum_sha1 = EXCLUDED.checksum_sha1,
+                        storage_key = EXCLUDED.storage_key,
+                        is_deleted = false,
+                        updated_at = NOW()
                     "#,
                 )
                 .bind(repository_id)
@@ -1307,7 +1334,7 @@ impl MigrationWorker {
                 .bind(&sha256_hex)
                 .bind(&sha1_hex)
                 .bind(&storage_key)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
 
                 // Upsert format-specific package metadata. Look up the
@@ -1323,7 +1350,7 @@ impl MigrationWorker {
                     )
                     .bind(repository_id)
                     .bind(&path_str)
-                    .fetch_optional(&self.db)
+                    .fetch_optional(&mut *tx)
                     .await?;
                     if let Some((artifact_id,)) = artifact_row {
                         sqlx::query(
@@ -1335,7 +1362,7 @@ impl MigrationWorker {
                         .bind(artifact_id)
                         .bind(package_type)
                         .bind(metadata_json)
-                        .execute(&self.db)
+                        .execute(&mut *tx)
                         .await?;
                     }
                 }
@@ -1361,7 +1388,7 @@ impl MigrationWorker {
                         .bind(digest)
                         .bind(content_size as i64)
                         .bind(&storage_key)
-                        .execute(&self.db)
+                        .execute(&mut *tx)
                         .await?;
                     }
                     OciRole::Manifest { image, reference } => {
@@ -1388,8 +1415,8 @@ impl MigrationWorker {
                                 None, body,
                             ),
                         );
-                        crate::api::handlers::oci_v2::persist_tag_and_refs(
-                            &self.db,
+                        crate::api::handlers::oci_v2::persist_tag_and_refs_in_tx(
+                            &mut tx,
                             repository_id,
                             image,
                             reference,
@@ -1404,9 +1431,49 @@ impl MigrationWorker {
                                 "Failed to register OCI manifest '{artifact_path}' in the index: {e}"
                             ))
                         })?;
+
+                        // #2457 ROOT FIX: a Docker/OCI source enumerates only
+                        // the tag manifests; the config/layer blobs and per-arch
+                        // child manifests they reference are addressed by digest
+                        // and never listed, so pre-fix a migrated image was
+                        // hollow (blobs + children 404, `docker pull` failed).
+                        // Fetch and register that referenced content by digest,
+                        // in THIS transaction, so the tag is committed only when
+                        // its content is complete. A fetch failure rolls the tag
+                        // back and fails the item (fail-closed). Content the
+                        // source enumerates as its own items (Artifactory blobs)
+                        // is deduped, so this is a no-op there.
+                        let walk = crate::services::oci_referenced_content::walk_and_register_referenced_content(
+                            &mut tx,
+                            &repo_storage,
+                            &client,
+                            &staging_dir,
+                            repository_id,
+                            repo_key,
+                            image,
+                            class,
+                            body,
+                            &crate::services::oci_referenced_content::WalkCaps::default(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            MigrationError::Other(format!(
+                                "Failed to fetch/register content referenced by OCI manifest '{artifact_path}': {e}"
+                            ))
+                        })?;
+                        tracing::debug!(
+                            image = %image,
+                            reference = %reference,
+                            blobs_registered = walk.blobs_registered,
+                            children_registered = walk.children_registered,
+                            deduped = walk.deduped,
+                            "referenced-content walk complete"
+                        );
                     }
                     OciRole::NotOci => {}
                 }
+
+                tx.commit().await?;
             }
         }
 
@@ -2041,16 +2108,21 @@ pub(crate) fn resolve_repos_for_provisioning(
 }
 
 /// Determine the final job status based on completed and failed counts.
-/// Returns Failed only when all items failed (failed > 0 and completed == 0),
-/// otherwise returns Completed.
+///
+/// - all items failed (failed > 0, completed == 0) → `Failed`
+/// - some failed, some succeeded (failed > 0, completed > 0) →
+///   `CompletedWithErrors`, so a partial/hollow migration is not surfaced as a
+///   clean success (#2457 — the OP saw "completed" over an unpullable import).
+///   The per-item counters/report carry which items failed.
+/// - nothing failed → `Completed`
 pub(crate) fn determine_final_status(
     total_failed: i32,
     total_completed: i32,
 ) -> MigrationJobStatus {
-    if total_failed > 0 && total_completed == 0 {
-        MigrationJobStatus::Failed
-    } else {
-        MigrationJobStatus::Completed
+    match (total_failed > 0, total_completed > 0) {
+        (true, false) => MigrationJobStatus::Failed,
+        (true, true) => MigrationJobStatus::CompletedWithErrors,
+        _ => MigrationJobStatus::Completed,
     }
 }
 
@@ -3405,8 +3477,10 @@ mod tests {
 
     #[test]
     fn test_determine_final_status_mixed() {
+        // Partial failure must surface as CompletedWithErrors, not a clean
+        // Completed (#2457): the OP's hollow import reported "completed".
         let status = determine_final_status(3, 7);
-        assert_eq!(status, MigrationJobStatus::Completed);
+        assert_eq!(status, MigrationJobStatus::CompletedWithErrors);
     }
 
     #[test]
@@ -3418,7 +3492,7 @@ mod tests {
     #[test]
     fn test_determine_final_status_one_failure_one_success() {
         let status = determine_final_status(1, 1);
-        assert_eq!(status, MigrationJobStatus::Completed);
+        assert_eq!(status, MigrationJobStatus::CompletedWithErrors);
     }
 
     #[test]
@@ -3439,7 +3513,7 @@ mod tests {
         );
         assert_eq!(
             determine_final_status(50_000, 50_000),
-            MigrationJobStatus::Completed
+            MigrationJobStatus::CompletedWithErrors
         );
     }
 
@@ -5157,6 +5231,277 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup repo");
+    }
+
+    /// #2457 ROOT: a real Nexus enumerates ONLY the tag manifests. Importing
+    /// just the index tag (its child manifests + all config/layer blobs are
+    /// available by digest but NOT enumerated) must leave the image fully
+    /// pullable: the walker fetches the child manifest and every blob, so
+    /// `oci_blobs` is populated and the child resolves by digest. This is the
+    /// exact shape the oracle exercises — the child/blobs are NOT pre-seeded as
+    /// their own transfer items (that masking pre-seed hid the bug).
+    #[tokio::test]
+    async fn test_docker_import_walks_referenced_content_nexus_only_tags() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-walk", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\",\"arch\":\"amd64\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"real-layer-bytes-2457-walk");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let layer_hex = sha256_hex_of(&layer_bytes);
+        let child = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"config\":{{\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[{{\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
+            config_bytes.len(),
+            config_hex,
+            layer_bytes.len(),
+            layer_hex
+        );
+        let child_bytes = bytes::Bytes::from(child);
+        let child_hex = sha256_hex_of(&child_bytes);
+        let index = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.index.v1+json\",\
+              \"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"size\":{},\"digest\":\"sha256:{}\",\
+              \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}",
+            child_bytes.len(),
+            child_hex
+        );
+        let index_bytes = bytes::Bytes::from(index);
+        let index_digest = format!("sha256:{}", sha256_hex_of(&index_bytes));
+
+        // Source contents: the index tag (enumerated) PLUS the by-digest
+        // content the walker fetches (child manifest, config, layer). Only the
+        // index tag is transferred as an item.
+        let index_path = "v2/app/manifests/latest".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(index_path.clone(), index_bytes.clone());
+        files.insert(
+            format!("v2/app/manifests/sha256:{child_hex}"),
+            child_bytes.clone(),
+        );
+        files.insert(
+            format!("v2/app/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        );
+        files.insert(
+            format!("v2/app/blobs/sha256:{layer_hex}"),
+            layer_bytes.clone(),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &index_path)
+            .await
+            .expect("index import must succeed and walk referenced content");
+
+        // Index tag registered.
+        let tag: Option<(String,)> = sqlx::query_as(
+            "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name='app' AND tag='latest'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tag.expect("index tag").0, index_digest);
+
+        // Child manifest resolved by digest + bytes present.
+        let child_row: Option<(String,)> = sqlx::query_as(
+            "SELECT manifest_digest FROM oci_tags WHERE repository_id=$1 AND manifest_digest=$2 LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(format!("sha256:{child_hex}"))
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            child_row.is_some(),
+            "child must resolve by digest after walk"
+        );
+        assert!(storage
+            .exists(&format!("oci-manifests/sha256:{child_hex}"))
+            .await
+            .unwrap());
+
+        // Both blobs registered with real bytes (the pre-fix hollow bug had
+        // oci_blobs == 0 here).
+        let blob_ct: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_ct.0, 2, "config + layer registered by the walker");
+        for hex in [&config_hex, &layer_hex] {
+            let blob: Option<(String,)> = sqlx::query_as(
+                "SELECT storage_key FROM oci_blobs WHERE repository_id=$1 AND digest=$2",
+            )
+            .bind(repo_id)
+            .bind(format!("sha256:{hex}"))
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            let (key,) = blob.expect("blob registered by walker");
+            assert!(storage.exists(&key).await.unwrap(), "blob bytes at {key}");
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Fail-closed: a source that 404s a referenced layer must FAIL the item
+    /// and commit NOTHING — no oci_tags, no partial oci_blobs, no artifacts row
+    /// for the manifest. The whole item transaction rolls back.
+    #[tokio::test]
+    async fn test_docker_import_fails_closed_on_unfetchable_layer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-fc", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-that-source-will-404");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let layer_hex = sha256_hex_of(&layer_bytes);
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+              \"config\":{{\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[{{\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
+            config_bytes.len(),
+            config_hex,
+            layer_bytes.len(),
+            layer_hex
+        );
+        let manifest_bytes = bytes::Bytes::from(manifest);
+
+        // Enumerate the image tag; provide config but NOT the layer -> the
+        // walker's layer fetch 404s.
+        let tag_path = "v2/app/manifests/latest".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(tag_path.clone(), manifest_bytes.clone());
+        files.insert(
+            format!("v2/app/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        );
+        // layer digest intentionally absent.
+
+        let res = transfer_one(&worker, &storage, &files, &repo_key, "docker", &tag_path).await;
+        assert!(res.is_err(), "unfetchable layer must fail the item");
+
+        // Nothing committed: no tag, no blobs, no manifest artifacts row.
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM oci_tags WHERE repository_id=$1), \
+                    (SELECT COUNT(*) FROM oci_blobs WHERE repository_id=$1), \
+                    (SELECT COUNT(*) FROM artifacts WHERE repository_id=$1 AND is_deleted=false)",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            counts,
+            (0, 0, 0),
+            "fail-closed: the item transaction must roll back entirely"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// F3: deleting a migrated tag then re-migrating must leave exactly one
+    /// LIVE artifacts row (the tombstone resurrected) and zero orphan oci_tags.
+    #[tokio::test]
+    async fn test_docker_reimport_resurrects_soft_deleted_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2457-f3", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+              \"config\":{{\"size\":{},\"digest\":\"sha256:{}\"}},\"layers\":[]}}",
+            config_bytes.len(),
+            config_hex
+        );
+        let manifest_bytes = bytes::Bytes::from(manifest);
+        let tag_path = "v2/app/manifests/latest".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(tag_path.clone(), manifest_bytes.clone());
+        files.insert(
+            format!("v2/app/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &tag_path)
+            .await
+            .expect("first import");
+
+        // Soft-delete the migrated manifest artifacts row (tombstone).
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path LIKE '%manifests/latest'",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-migrate (overwrite): the tombstone must be resurrected, not
+        // left dead beneath a re-registered tag.
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &tag_path)
+            .await
+            .expect("re-import");
+
+        let live_manifest_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id=$1 AND path LIKE '%manifests/latest' AND is_deleted=false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_manifest_rows.0, 1,
+            "exactly one live manifest artifact"
+        );
+
+        // No orphan oci_tags: every tag has a backing live artifacts row.
+        let orphan: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oci_tags ot WHERE ot.repository_id=$1 \
+             AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.repository_id=ot.repository_id \
+                             AND 'sha256:'||a.checksum_sha256 = ot.manifest_digest AND a.is_deleted=false)",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            orphan.0, 0,
+            "no orphan oci_tags after resurrecting re-import"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// A malformed manifest body (valid path shape, degenerate content) must

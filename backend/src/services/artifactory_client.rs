@@ -816,6 +816,27 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         self.download_artifact_stream(repo_key, path).await
     }
 
+    async fn download_oci_content_stream(
+        &self,
+        repo_key: &str,
+        image: &str,
+        digest: &str,
+        kind: crate::services::source_registry::OciContentKind,
+    ) -> Result<crate::services::source_registry::ArtifactByteStream, ArtifactoryError> {
+        // Artifactory exposes each Docker repository through its Docker
+        // Registry v2 REST API at `api/docker/<repo>/v2/<image>/{blobs|manifests}/<digest>`.
+        // `download_artifact_stream` joins `<base>/<repo>/<path>`, so pass the
+        // API prefix as the repo segment and the image-relative remainder as
+        // the path. In practice the migration enumerates Artifactory blobs and
+        // child manifests as their own items, so the referenced-content walker
+        // dedups them and never calls this — it exists for correctness if the
+        // enumeration ever misses a referenced digest.
+        crate::services::source_registry::validate_oci_content_ref(image, digest)?;
+        let api_repo = format!("api/docker/{}/v2", repo_key);
+        let path = format!("{}/{}/{}", image, kind.path_segment(), digest);
+        self.download_artifact_stream(&api_repo, &path).await
+    }
+
     async fn get_properties(
         &self,
         repo_key: &str,
