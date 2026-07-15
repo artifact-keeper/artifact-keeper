@@ -96,31 +96,23 @@ impl ComposerHandler {
     }
 
     /// Parse composer.json from a package archive to extract metadata.
+    ///
+    /// The uploaded zip's `composer.json` is read through the shared bounded
+    /// extractor (#2556): the entry-count cap + per-metadata-entry cap bound the
+    /// read so a crafted package cannot inflate the entry unbounded during
+    /// metadata parsing (previously an unbounded `read_to_string`).
     pub fn parse_composer_json(content: &[u8]) -> Result<ComposerJson> {
-        // Try to read as zip and find composer.json
-        let reader = std::io::Cursor::new(content);
-        let mut archive = zip::ZipArchive::new(reader)
-            .map_err(|e| AppError::Validation(format!("Invalid zip archive: {}", e)))?;
+        let bytes = crate::util::bounded_archive::read_metadata_from_zip(
+            std::io::Cursor::new(content),
+            |name| name.ends_with("composer.json"),
+        )?
+        .ok_or_else(|| AppError::Validation("composer.json not found in archive".to_string()))?;
 
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| AppError::Validation(format!("Invalid zip entry: {}", e)))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|e| AppError::Validation(format!("Failed to read composer.json: {}", e)))?;
 
-            if file.name().ends_with("composer.json") {
-                let mut content = String::new();
-                std::io::Read::read_to_string(&mut file, &mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read composer.json: {}", e))
-                })?;
-
-                return serde_json::from_str(&content)
-                    .map_err(|e| AppError::Validation(format!("Invalid composer.json: {}", e)));
-            }
-        }
-
-        Err(AppError::Validation(
-            "composer.json not found in archive".to_string(),
-        ))
+        serde_json::from_str(&content)
+            .map_err(|e| AppError::Validation(format!("Invalid composer.json: {}", e)))
     }
 }
 
@@ -393,6 +385,43 @@ mod tests {
     fn test_parse_composer_json_empty() {
         let result = ComposerHandler::parse_composer_json(b"");
         assert!(result.is_err());
+    }
+
+    /// Build a composer package zip carrying `composer.json` with `body`.
+    fn composer_zip(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("vendor/pkg/composer.json", opts).unwrap();
+            w.write_all(body).unwrap();
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn test_parse_composer_json_normal_2556() {
+        let zip = composer_zip(br#"{"name":"vendor/pkg","version":"1.2.3"}"#);
+        let parsed = ComposerHandler::parse_composer_json(&zip).expect("normal package parses");
+        assert_eq!(parsed.name, "vendor/pkg");
+    }
+
+    /// #2556: a `composer.json` entry that inflates past the 8 MiB per-metadata
+    /// cap is rejected (bounded memory), while the compressed zip stays tiny.
+    #[test]
+    fn test_parse_composer_json_bomb_rejected_2556() {
+        let mut body = br#"{"name":"vendor/bomb","description":""#.to_vec();
+        body.extend(std::iter::repeat(b'A').take(9 * 1024 * 1024));
+        body.extend_from_slice(br#""}"#);
+        let zip = composer_zip(&body);
+        assert!(zip.len() < 256 * 1024, "compressed composer zip stays tiny");
+        assert!(
+            ComposerHandler::parse_composer_json(&zip).is_err(),
+            "oversized composer.json must be rejected"
+        );
     }
 
     // ---- ComposerJson serde ----

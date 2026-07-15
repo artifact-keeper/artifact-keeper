@@ -150,7 +150,15 @@ fn map_archive_err(context: &str, err: &io::Error) -> AppError {
 /// the entry-count cap. A budget breach surfaces as an [`io::Error`] during the
 /// walk, which the caller maps to its own validation error.
 pub fn budgeted<R: Read>(reader: R) -> impl Read {
-    BudgetReader::new(reader, max_ingest_decompressed_bytes())
+    budgeted_to(reader, max_ingest_decompressed_bytes())
+}
+
+/// Like [`budgeted`] but with an explicit byte budget. Callers that decompress a
+/// *whole* stream (not a tar walk) — e.g. an upstream repo index — use this to
+/// pick a budget appropriate to the payload, and unit tests use it to drive a
+/// tiny budget against a tiny fixture.
+pub fn budgeted_to<R: Read>(reader: R, budget: u64) -> impl Read {
+    BudgetReader::new(reader, budget)
 }
 
 /// Read at most `cap` bytes from `reader`, rejecting input that exceeds `cap`.

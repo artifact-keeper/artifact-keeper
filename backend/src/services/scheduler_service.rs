@@ -963,11 +963,10 @@ async fn run_curation_sync_cycle(
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
                         let xml = if primary_path.ends_with(".gz") {
-                            use std::io::Read;
-                            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-                            let mut s = String::new();
-                            decoder.read_to_string(&mut s)?;
-                            s
+                            // Bound the upstream-index decompression (#2556): a
+                            // malicious/compromised upstream mirror cannot inflate
+                            // primary.xml.gz unbounded during sync.
+                            decompress_upstream_index_gz(&bytes)?
                         } else {
                             String::from_utf8_lossy(&bytes).to_string()
                         };
@@ -995,10 +994,10 @@ async fn run_curation_sync_cycle(
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
-                        use std::io::Read;
-                        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-                        let mut content = String::new();
-                        decoder.read_to_string(&mut content)?;
+                        // Bound the upstream-index decompression (#2556): a
+                        // malicious/compromised upstream mirror cannot inflate
+                        // Packages.gz unbounded during sync.
+                        let content = decompress_upstream_index_gz(&bytes)?;
                         curation_sync::parse_deb_packages_index(&content, "main")
                     }
                     _ => {
@@ -1089,6 +1088,30 @@ async fn run_curation_sync_cycle(
 }
 
 /// Extract the primary.xml href from repomd.xml content.
+/// Decompress a gzip-compressed upstream repo index (RPM `primary.xml.gz`,
+/// Debian `Packages.gz`) during proxy-sync, bounded by the shared total-byte
+/// budget (#2556) so a malicious/compromised upstream mirror cannot inflate the
+/// index unbounded. This is the egress analogue of the rubygems
+/// `parse_upstream_specs` upload-side hardening. A budget breach surfaces as an
+/// `io::Error`, which propagates up the sync path (the sync fails, bounded).
+fn decompress_upstream_index_gz(bytes: &[u8]) -> std::io::Result<String> {
+    decompress_upstream_index_gz_limited(
+        bytes,
+        crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+    )
+}
+
+/// `_limited` seam for [`decompress_upstream_index_gz`] — lets tests drive a
+/// tiny budget against a tiny gzip-bomb fixture.
+fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut decoder =
+        crate::util::bounded_archive::budgeted_to(flate2::read::GzDecoder::new(bytes), budget);
+    let mut s = String::new();
+    decoder.read_to_string(&mut s)?;
+    Ok(s)
+}
+
 fn extract_primary_href(repomd: &str) -> Option<String> {
     // Look for: <data type="primary"><location href="repodata/...-primary.xml.gz"/>
     for data_block in repomd.split("<data type=\"primary\">").skip(1) {
@@ -1106,6 +1129,38 @@ fn extract_primary_href(repomd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #2556 — bounded upstream-index decompression
+    // -----------------------------------------------------------------------
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_upstream_index_gz_normal_decompresses() {
+        let index = b"Package: nginx\nVersion: 1.24.0-1\n\nPackage: curl\nVersion: 8.0\n";
+        let gz = gzip(index);
+        let out = decompress_upstream_index_gz(&gz).expect("legit index decompresses");
+        assert_eq!(out.as_bytes(), index);
+    }
+
+    #[test]
+    fn test_upstream_index_gz_bomb_is_bounded() {
+        // A tiny gzip that inflates past a small budget → aborts mid-inflate
+        // with an io error rather than ballooning (a compromised upstream
+        // mirror serving primary.xml.gz / Packages.gz cannot exhaust memory).
+        let bomb = gzip(&vec![0u8; 4 * 1024 * 1024]);
+        assert!(bomb.len() < 64 * 1024, "gzip of zeros compresses tiny");
+        assert!(
+            decompress_upstream_index_gz_limited(&bomb, 4096).is_err(),
+            "upstream index bomb past budget must be bounded/rejected"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // compute_next_run
