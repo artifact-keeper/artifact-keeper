@@ -10,7 +10,6 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
-use tar::Archive;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -207,9 +206,17 @@ impl DebianHandler {
         ))
     }
 
-    /// Parse control.tar(.gz) to extract control file
+    /// Parse control.tar(.gz) to extract control file.
+    ///
+    /// The decompressor is selected from the ar member extension and then routed
+    /// through the shared bounded extractor (#2556): the total-byte budget on
+    /// the DECODED stream aborts a gz/xz/bz2/zstd `control.tar` bomb mid-inflate
+    /// (previously the `read_to_string` on `control` inflated unbounded and only
+    /// returned 400 *after* buffering), and the entry-count + per-entry caps
+    /// bound the walk. xz/zstd amplify hardest, so the decoded-stream budget is
+    /// the primary defence.
     fn parse_control_tar(data: &[u8], member_name: &str) -> Result<DebControl> {
-        let reader: Box<dyn Read + '_> = if member_name.ends_with(".gz") {
+        let decoder: Box<dyn Read + '_> = if member_name.ends_with(".gz") {
             Box::new(GzDecoder::new(data))
         } else if member_name.ends_with(".xz") {
             Box::new(XzDecoder::new(data))
@@ -223,32 +230,18 @@ impl DebianHandler {
             Box::new(data)
         };
 
-        let mut archive = Archive::new(reader);
+        let content =
+            crate::util::bounded_archive::read_metadata_from_decoded_tar(decoder, |path| {
+                path.ends_with("control")
+            })?
+            .ok_or_else(|| {
+                AppError::Validation("control file not found in control.tar".to_string())
+            })?;
 
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Validation(format!("Invalid control.tar: {}", e)))?
-        {
-            let mut entry =
-                entry.map_err(|e| AppError::Validation(format!("Invalid tar entry: {}", e)))?;
+        let content = String::from_utf8(content)
+            .map_err(|e| AppError::Validation(format!("Failed to read control file: {}", e)))?;
 
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Validation(format!("Invalid path: {}", e)))?;
-
-            if path.ends_with("control") {
-                let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read control file: {}", e))
-                })?;
-
-                return Self::parse_control(&content);
-            }
-        }
-
-        Err(AppError::Validation(
-            "control file not found in control.tar".to_string(),
-        ))
+        Self::parse_control(&content)
     }
 
     /// Parse Debian control file format
@@ -1191,6 +1184,68 @@ Source: full-pkg-src
         assert_eq!(control.package, "xz-pkg");
         assert_eq!(control.version, "1.0-1");
         assert_eq!(control.architecture, "amd64");
+    }
+
+    /// Build a `control.tar` whose `control` entry itself inflates past the
+    /// 8 MiB per-metadata cap (repeated bytes, so it compresses to a tiny
+    /// "bomb"). The pre-target *total-byte* budget path is covered by the fast
+    /// `bounded_archive` module tests.
+    fn control_tar_bomb(control_prefix: &str) -> Vec<u8> {
+        let mut control = control_prefix.as_bytes().to_vec();
+        // Comment lines keep it a valid-ish control file while blowing past the
+        // 8 MiB per-metadata cap.
+        control.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(control.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder
+            .append_data(&mut h, "./control", &control[..])
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// #2556: a `control.tar.xz` whose `control` inflates past the per-metadata
+    /// cap is rejected mid-inflate (previously unbounded xz `read_to_string`).
+    #[test]
+    fn test_extract_control_xz_bomb_rejected_2556() {
+        use std::io::Write;
+        let tar_bytes = control_tar_bomb("Package: p\nVersion: 1\n");
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+        encoder.write_all(&tar_bytes).unwrap();
+        let xz = encoder.finish().unwrap();
+        assert!(xz.len() < 1024 * 1024, "xz bomb compresses tiny");
+        let deb = deb_with_control_member("control.tar.xz", &xz);
+        assert!(
+            DebianHandler::extract_control(&deb).is_err(),
+            "xz control bomb must be rejected"
+        );
+    }
+
+    /// #2556: a `control.tar.zst` bomb is likewise rejected.
+    #[test]
+    fn test_extract_control_zst_bomb_rejected_2556() {
+        let tar_bytes = control_tar_bomb("Package: p\nVersion: 1\n");
+        let zst = zstd::encode_all(std::io::Cursor::new(tar_bytes), 1).unwrap();
+        assert!(zst.len() < 1024 * 1024, "zstd bomb compresses tiny");
+        let deb = deb_with_control_member("control.tar.zst", &zst);
+        assert!(
+            DebianHandler::extract_control(&deb).is_err(),
+            "zstd control bomb must be rejected"
+        );
+    }
+
+    /// #2556 regression: a normal `.deb` still parses its control after the
+    /// hardening.
+    #[test]
+    fn test_extract_control_normal_after_hardening_2556() {
+        let control = "Package: normalpkg\nVersion: 2.3.4\nArchitecture: amd64\n";
+        let deb = deb_with_control_member("control.tar", &control_tar(control));
+        let parsed = DebianHandler::extract_control(&deb).expect("normal .deb parses");
+        assert_eq!(parsed.package, "normalpkg");
+        assert_eq!(parsed.version, "2.3.4");
     }
 
     // ========================================================================

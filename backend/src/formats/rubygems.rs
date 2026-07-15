@@ -5,10 +5,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use tar::Archive;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
@@ -231,39 +228,27 @@ impl RubygemsHandler {
 
     /// Extract gemspec from .gem file
     /// .gem files are tar archives containing metadata.gz and data.tar.gz
+    ///
+    /// The outer `.gem` is a plain tar; the `metadata.gz` entry is read bounded
+    /// by the entry-count + per-entry caps, then gzip-decompressed bounded by the
+    /// per-metadata-entry cap so a gem bomb aborts mid-inflate (#2556).
+    /// Previously the `read_to_end(metadata.gz)` and the `GzDecoder`
+    /// `read_to_string` were both unbounded.
     pub fn extract_gemspec(content: &[u8]) -> Result<GemSpec> {
-        let mut archive = Archive::new(content);
+        let compressed = crate::util::bounded_archive::read_metadata_from_tar(content, |path| {
+            path.to_string_lossy() == "metadata.gz"
+        })?
+        .ok_or_else(|| AppError::Validation("metadata.gz not found in gem file".to_string()))?;
 
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Validation(format!("Invalid gem file: {}", e)))?
-        {
-            let mut entry =
-                entry.map_err(|e| AppError::Validation(format!("Invalid gem entry: {}", e)))?;
+        let yaml = crate::util::bounded_archive::decompress_gz_capped(
+            &compressed[..],
+            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+            "gem metadata",
+        )?;
+        let yaml_content = String::from_utf8(yaml)
+            .map_err(|e| AppError::Validation(format!("Failed to decompress metadata: {}", e)))?;
 
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Validation(format!("Invalid path in gem: {}", e)))?;
-
-            if path.to_string_lossy() == "metadata.gz" {
-                let mut compressed = Vec::new();
-                entry.read_to_end(&mut compressed).map_err(|e| {
-                    AppError::Validation(format!("Failed to read metadata.gz: {}", e))
-                })?;
-
-                let mut decoder = GzDecoder::new(&compressed[..]);
-                let mut yaml_content = String::new();
-                decoder.read_to_string(&mut yaml_content).map_err(|e| {
-                    AppError::Validation(format!("Failed to decompress metadata: {}", e))
-                })?;
-
-                return Self::parse_gemspec_yaml(&yaml_content);
-            }
-        }
-
-        Err(AppError::Validation(
-            "metadata.gz not found in gem file".to_string(),
-        ))
+        Self::parse_gemspec_yaml(&yaml_content)
     }
 
     /// Parse gemspec YAML content
@@ -1129,5 +1114,51 @@ summary: A summary
         assert!(!is_valid_rubygems_name(".rails"));
         assert!(!is_valid_rubygems_name("rails space"));
         assert!(!is_valid_rubygems_name("rails/slash"));
+    }
+
+    /// Build a `.gem` (plain tar) whose `metadata.gz` holds `yaml` gzip-encoded.
+    fn gem_with_metadata(yaml: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(yaml).unwrap();
+        let metadata_gz = gz.finish().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(metadata_gz.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "metadata.gz", &metadata_gz[..])
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// #2556 regression: a normal `.gem` still parses its gemspec.
+    #[test]
+    fn test_extract_gemspec_normal_2556() {
+        let gem = gem_with_metadata(
+            b"--- !ruby/object:Gem::Specification\nname: rails\nversion: 7.1.0\n",
+        );
+        let spec = RubygemsHandler::extract_gemspec(&gem).expect("normal gem parses");
+        assert_eq!(spec.name, "rails");
+    }
+
+    /// #2556: a `.gem` whose `metadata.gz` inflates past the per-metadata cap is
+    /// rejected mid-inflate (previously `read_to_end` + `read_to_string` were
+    /// both unbounded). The compressed gem stays tiny.
+    #[test]
+    fn test_extract_gemspec_bomb_rejected_2556() {
+        // ~9 MiB inflated gemspec YAML (> 8 MiB per-metadata cap), gzip of
+        // repeated bytes compresses tiny.
+        let mut yaml = b"--- !ruby/object:Gem::Specification\nname: bomb\nversion: 1\n".to_vec();
+        yaml.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        let gem = gem_with_metadata(&yaml);
+        assert!(gem.len() < 256 * 1024, "compressed gem stays tiny");
+        assert!(
+            RubygemsHandler::extract_gemspec(&gem).is_err(),
+            "gem metadata bomb must be rejected"
+        );
     }
 }

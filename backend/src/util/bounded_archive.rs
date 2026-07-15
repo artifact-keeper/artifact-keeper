@@ -246,10 +246,10 @@ pub fn read_metadata_from_tar_gz_limited<R: Read>(
     max_entries: u64,
     max_entry: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let decoder = flate2::read::GzDecoder::new(reader);
-    read_tar_entries(
-        BudgetReader::new(decoder, max_total),
+    read_metadata_from_decoded_tar_limited(
+        flate2::read::GzDecoder::new(reader),
         matches,
+        max_total,
         max_entries,
         max_entry,
     )
@@ -278,13 +278,120 @@ pub fn read_metadata_from_tar_bz2_limited<R: Read>(
     max_entries: u64,
     max_entry: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let decoder = bzip2::read::BzDecoder::new(reader);
+    read_metadata_from_decoded_tar_limited(
+        bzip2::read::BzDecoder::new(reader),
+        matches,
+        max_total,
+        max_entries,
+        max_entry,
+    )
+}
+
+/// Read the first matching metadata entry from an **xz**-compressed tar stream
+/// (debian `control.tar.xz`, incus `.tar.xz` images). xz of null/repeated bytes
+/// amplifies even harder than gzip, so the total-byte budget on the decoded
+/// stream is the primary defence.
+pub fn read_metadata_from_tar_xz<R: Read>(
+    reader: R,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    read_metadata_from_tar_xz_limited(
+        reader,
+        matches,
+        max_ingest_decompressed_bytes(),
+        MAX_INGEST_ARCHIVE_ENTRIES,
+        MAX_INGEST_METADATA_ENTRY_BYTES,
+    )
+}
+
+/// `_limited` seam for [`read_metadata_from_tar_xz`].
+pub fn read_metadata_from_tar_xz_limited<R: Read>(
+    reader: R,
+    matches: impl Fn(&Path) -> bool,
+    max_total: u64,
+    max_entries: u64,
+    max_entry: u64,
+) -> Result<Option<Vec<u8>>> {
+    read_metadata_from_decoded_tar_limited(
+        xz2::read::XzDecoder::new(reader),
+        matches,
+        max_total,
+        max_entries,
+        max_entry,
+    )
+}
+
+/// Read the first matching metadata entry from a **zstd**-compressed tar stream
+/// (debian `control.tar.zst`, incus `.tar.zst` images). Like xz, zstd bombs
+/// amplify hard, so the decoded-stream budget is the primary defence.
+pub fn read_metadata_from_tar_zst<R: Read>(
+    reader: R,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    read_metadata_from_tar_zst_limited(
+        reader,
+        matches,
+        max_ingest_decompressed_bytes(),
+        MAX_INGEST_ARCHIVE_ENTRIES,
+        MAX_INGEST_METADATA_ENTRY_BYTES,
+    )
+}
+
+/// `_limited` seam for [`read_metadata_from_tar_zst`].
+pub fn read_metadata_from_tar_zst_limited<R: Read>(
+    reader: R,
+    matches: impl Fn(&Path) -> bool,
+    max_total: u64,
+    max_entries: u64,
+    max_entry: u64,
+) -> Result<Option<Vec<u8>>> {
+    let decoder = zstd::Decoder::new(reader)
+        .map_err(|e| AppError::Validation(format!("Invalid zstd stream: {}", e)))?;
+    read_metadata_from_decoded_tar_limited(decoder, matches, max_total, max_entries, max_entry)
+}
+
+/// Read the first matching metadata entry from an **already-decoded** tar stream
+/// where the caller chose the decompressor at runtime (e.g. incus dispatches on
+/// magic bytes, debian on the ar member extension, producing a `Box<dyn Read>`).
+/// Wraps the decoded stream in the shared total-byte budget and applies the
+/// entry-count + per-entry caps. This is the single seam through which every
+/// tar-family helper flows.
+pub fn read_metadata_from_decoded_tar<R: Read>(
+    decoded: R,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    read_metadata_from_decoded_tar_limited(
+        decoded,
+        matches,
+        max_ingest_decompressed_bytes(),
+        MAX_INGEST_ARCHIVE_ENTRIES,
+        MAX_INGEST_METADATA_ENTRY_BYTES,
+    )
+}
+
+/// `_limited` seam for [`read_metadata_from_decoded_tar`]; the common core all
+/// tar-family variants delegate to.
+pub fn read_metadata_from_decoded_tar_limited<R: Read>(
+    decoded: R,
+    matches: impl Fn(&Path) -> bool,
+    max_total: u64,
+    max_entries: u64,
+    max_entry: u64,
+) -> Result<Option<Vec<u8>>> {
     read_tar_entries(
-        BudgetReader::new(decoder, max_total),
+        BudgetReader::new(decoded, max_total),
         matches,
         max_entries,
         max_entry,
     )
+}
+
+/// Decompress a standalone **gzip** stream (not a tar) to bytes, bounded by
+/// `max` so a gzip bomb aborts mid-inflate rather than buffering the whole
+/// inflated payload. Used for rubygems' `metadata.gz` inner blob. Returns `Err`
+/// when the decompressed size exceeds `max`.
+pub fn decompress_gz_capped<R: Read>(reader: R, max: u64, what: &str) -> Result<Vec<u8>> {
+    read_capped(flate2::read::GzDecoder::new(reader), max, what)
 }
 
 /// Read the first matching metadata entry from a *plain* (uncompressed) tar
@@ -313,12 +420,7 @@ pub fn read_metadata_from_tar_limited<R: Read>(
     max_entries: u64,
     max_entry: u64,
 ) -> Result<Option<Vec<u8>>> {
-    read_tar_entries(
-        BudgetReader::new(reader, max_total),
-        matches,
-        max_entries,
-        max_entry,
-    )
+    read_metadata_from_decoded_tar_limited(reader, matches, max_total, max_entries, max_entry)
 }
 
 /// Read the first matching metadata entry from a ZIP archive (`.nupkg`, `.whl`,
@@ -598,5 +700,105 @@ mod tests {
     fn read_capped_rejects_oversized() {
         assert!(read_capped(&b"abcdef"[..], 3, "x").is_err());
         assert_eq!(read_capped(&b"ab"[..], 8, "x").unwrap(), b"ab");
+    }
+
+    fn tar_xz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(xz2::write::XzEncoder::new(Vec::new(), 6));
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let raw = plain_tar(entries);
+        zstd::encode_all(std::io::Cursor::new(raw), 3).unwrap()
+    }
+
+    fn is_meta(p: &Path) -> bool {
+        p == Path::new("metadata.yaml")
+    }
+
+    #[test]
+    fn xz_normal_and_total_budget_breach() {
+        let archive = tar_xz(&[("metadata.yaml", b"name: img\nversion: 1")]);
+        let out = read_metadata_from_tar_xz_limited(
+            &archive[..],
+            is_meta,
+            1024 * 1024,
+            1000,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(out.unwrap(), b"name: img\nversion: 1");
+
+        // 2 MiB of zeros before the target entry → past a tiny budget → reject.
+        let filler = vec![0u8; 2 * 1024 * 1024];
+        let bomb = tar_xz(&[("big.bin", &filler[..]), ("metadata.yaml", b"x")]);
+        assert!(bomb.len() < 64 * 1024, "xz of zeros compresses tiny");
+        let err = read_metadata_from_tar_xz_limited(&bomb[..], is_meta, 4096, 1000, 1024 * 1024);
+        assert!(
+            err.is_err(),
+            "xz pre-target inflation past budget must reject"
+        );
+    }
+
+    #[test]
+    fn zst_normal_and_total_budget_breach() {
+        let archive = tar_zst(&[("metadata.yaml", b"name: img\nversion: 2")]);
+        let out = read_metadata_from_tar_zst_limited(
+            &archive[..],
+            is_meta,
+            1024 * 1024,
+            1000,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(out.unwrap(), b"name: img\nversion: 2");
+
+        let filler = vec![0u8; 2 * 1024 * 1024];
+        let bomb = tar_zst(&[("big.bin", &filler[..]), ("metadata.yaml", b"x")]);
+        assert!(bomb.len() < 64 * 1024, "zstd of zeros compresses tiny");
+        let err = read_metadata_from_tar_zst_limited(&bomb[..], is_meta, 4096, 1000, 1024 * 1024);
+        assert!(
+            err.is_err(),
+            "zstd pre-target inflation past budget must reject"
+        );
+    }
+
+    #[test]
+    fn decompress_gz_capped_normal_and_bomb() {
+        // Normal small blob round-trips.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"name: g\nversion: 1").unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(
+            decompress_gz_capped(&gz[..], 1024 * 1024, "x").unwrap(),
+            b"name: g\nversion: 1"
+        );
+
+        // A gzip bomb: tiny compressed, inflates past the cap → reject.
+        let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc2.write_all(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let bomb = enc2.finish().unwrap();
+        assert!(bomb.len() < 64 * 1024, "gzip of zeros compresses tiny");
+        assert!(
+            decompress_gz_capped(&bomb[..], 1024, "x").is_err(),
+            "gzip bomb past cap must reject"
+        );
+    }
+
+    #[test]
+    fn decoded_tar_generic_matches_plain() {
+        // The generic decoded-tar seam over a plain (already-"decoded") stream.
+        let archive = plain_tar(&[("metadata.yaml", b"ok")]);
+        let out =
+            read_metadata_from_decoded_tar_limited(&archive[..], is_meta, 1024 * 1024, 1000, 1024)
+                .unwrap();
+        assert_eq!(out.unwrap(), b"ok");
     }
 }
