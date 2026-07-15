@@ -422,6 +422,8 @@ pub fn router() -> Router<SharedState> {
                 .patch(update_repository)
                 .delete(delete_repository),
         )
+        // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
+        .route("/:key/storage", get(get_repository_storage))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
         // npm scope policy for Remote members of npm virtual repositories (#2327)
@@ -2441,6 +2443,154 @@ pub async fn get_repository(
     };
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
+    Ok(Json(response))
+}
+
+/// Deduplicated storage-accounting response for a single repository (#2056).
+///
+/// All figures are read from the materialized `repository_storage_stats` cache
+/// (refreshed on a schedule + post-GC), so this endpoint is an O(1) primary-key
+/// lookup and never runs the heavy cross-repo aggregation. `computed_at` is the
+/// freshness marker; it is `null` until the first refresh has run.
+///
+/// Quota is unaffected: these numbers are accounting/visibility only and do NOT
+/// change how the repository's storage quota is enforced (#2056 §7).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryStorageStatsResponse {
+    pub repository_key: String,
+    /// Sum over every reference (per-row). Now includes OCI layer bytes, which
+    /// were previously omitted from all storage accounting.
+    pub logical_bytes: i64,
+    /// Deduplicated physical footprint within the dedup scope.
+    pub physical_bytes: i64,
+    /// Physical bytes of objects referenced only by this repository.
+    pub unique_bytes: i64,
+    /// physical_bytes - unique_bytes. Always 0 on filesystem backends (a shared
+    /// digest in two repos is two files).
+    pub shared_bytes: i64,
+    /// logical_bytes / physical_bytes (1.0 when nothing is stored).
+    pub dedup_ratio: f64,
+    /// Distinct physical objects (dedup keys) this repository references.
+    pub blob_count: i64,
+    /// `per_repo` (filesystem) or `instance` (cloud) — the backend semantics at
+    /// compute time.
+    pub dedup_scope: String,
+    /// The instance-wide globally-distinct footprint (true disk usage). On
+    /// cloud backends the sum of per-repo `physical_bytes` OVER-counts shared
+    /// objects, so this is the authoritative instance total.
+    ///
+    /// **Admin-only:** this is a whole-instance aggregate that spans every
+    /// tenant, so it is only populated for admin callers. It is omitted from the
+    /// response entirely for repo-authorized non-admins and anonymous callers,
+    /// who see only this repository's own figures (#2559 review).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_unique_bytes: Option<i64>,
+    /// When these figures were last recomputed. `null` before the first refresh.
+    pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Get deduplicated storage accounting for a repository (#2056).
+///
+/// Returns the true physical footprint (with dedup savings) from the
+/// materialized stats cache. Same visibility rules as `get_repository`:
+/// public repos and repo members pass; everyone else gets an existence-hiding
+/// 404.
+///
+/// The whole-instance aggregate `instance_unique_bytes` is admin-only and is
+/// omitted for non-admin/anonymous callers; they receive only this
+/// repository's own figures.
+#[utoipa::path(
+    get,
+    path = "/{key}/storage",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Deduplicated storage stats", body = RepositoryStorageStatsResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_repository_storage(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<RepositoryStorageStatsResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &service).await?;
+
+    let row = sqlx::query!(
+        r#"
+        SELECT logical_bytes, physical_bytes, unique_bytes, shared_bytes,
+               blob_count, dedup_scope, computed_at
+          FROM repository_storage_stats
+         WHERE repository_id = $1
+        "#,
+        repo.id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // The instance-total singleton (globally-distinct footprint) is a
+    // whole-instance aggregate spanning every tenant, so it is ADMIN-ONLY: only
+    // fetch it for admins, and omit it from the response for repo-authorized
+    // non-admins and anonymous callers (#2559 review). A repo-visible non-admin
+    // sees only this repository's own numbers.
+    let is_admin = matches!(&auth, Some(a) if a.is_admin);
+    let instance_unique_bytes = if is_admin {
+        Some(
+            sqlx::query_scalar!(
+                r#"SELECT unique_bytes FROM instance_storage_stats WHERE id = true"#
+            )
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+
+    let response = match row {
+        Some(r) => {
+            let logical = r.logical_bytes;
+            let physical = r.physical_bytes;
+            RepositoryStorageStatsResponse {
+                repository_key: repo.key,
+                logical_bytes: logical,
+                physical_bytes: physical,
+                unique_bytes: r.unique_bytes,
+                shared_bytes: r.shared_bytes,
+                dedup_ratio: crate::services::storage_stats_service::dedup_ratio(logical, physical),
+                blob_count: r.blob_count,
+                dedup_scope: r.dedup_scope,
+                instance_unique_bytes,
+                computed_at: Some(r.computed_at),
+            }
+        }
+        // No materialized row yet (refresher has not run for this repo).
+        None => RepositoryStorageStatsResponse {
+            repository_key: repo.key,
+            logical_bytes: 0,
+            physical_bytes: 0,
+            unique_bytes: 0,
+            shared_bytes: 0,
+            dedup_ratio: crate::services::storage_stats_service::dedup_ratio(0, 0),
+            blob_count: 0,
+            dedup_scope: crate::services::storage_stats_service::DedupScope::from_backend(
+                &state.config.storage_backend,
+            )
+            .as_str()
+            .to_string(),
+            instance_unique_bytes,
+            computed_at: None,
+        },
+    };
+
     Ok(Json(response))
 }
 
@@ -6967,6 +7117,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         list_repositories,
         create_repository,
         get_repository,
+        get_repository_storage,
         update_repository,
         delete_repository,
         set_cache_ttl,
@@ -6999,6 +7150,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         UpdateRepositoryRequest,
         RepositoryResponse,
         RepositoryListResponse,
+        RepositoryStorageStatsResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
         SetNpmScopePolicyRequest,
@@ -7107,6 +7259,46 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // Storage stats: the whole-instance aggregate `instance_unique_bytes` is
+    // admin-only and must be OMITTED from the JSON for non-admin / anonymous
+    // callers (#2559 review), while per-repo figures are always present.
+    // -----------------------------------------------------------------------
+
+    fn sample_storage_stats(instance: Option<i64>) -> RepositoryStorageStatsResponse {
+        RepositoryStorageStatsResponse {
+            repository_key: "demo".into(),
+            logical_bytes: 54033,
+            physical_bytes: 52033,
+            unique_bytes: 52033,
+            shared_bytes: 0,
+            dedup_ratio: 1.0384,
+            blob_count: 4,
+            dedup_scope: "per_repo".into(),
+            instance_unique_bytes: instance,
+            computed_at: None,
+        }
+    }
+
+    #[test]
+    fn storage_stats_omits_instance_total_for_non_admin() {
+        // Non-admin / anon path: instance_unique_bytes is None -> absent key.
+        let json = serde_json::to_value(sample_storage_stats(None)).unwrap();
+        assert!(
+            json.get("instance_unique_bytes").is_none(),
+            "instance total must not leak to non-admin/anon callers"
+        );
+        // Per-repo figures are still present.
+        assert_eq!(json["physical_bytes"], 52033);
+        assert_eq!(json["shared_bytes"], 0);
+    }
+
+    #[test]
+    fn storage_stats_includes_instance_total_for_admin() {
+        let json = serde_json::to_value(sample_storage_stats(Some(53033))).unwrap();
+        assert_eq!(json["instance_unique_bytes"], 53033);
+    }
 
     // -----------------------------------------------------------------------
     // Content-Disposition filename derivation (#1785) — the download filename

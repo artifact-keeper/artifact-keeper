@@ -78,6 +78,7 @@ pub mod spdx_licenses;
 pub mod ssrf_dns;
 pub mod storage_gc_service;
 pub mod storage_service;
+pub mod storage_stats_service;
 pub mod sync_policy_service;
 pub mod token_service;
 pub mod transfer_service;

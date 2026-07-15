@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO instance_storage_stats (id, unique_bytes, dedup_scope, computed_at)\n            VALUES (true, $1, $2, now())\n            ON CONFLICT (id) DO UPDATE SET\n                unique_bytes = EXCLUDED.unique_bytes,\n                dedup_scope  = EXCLUDED.dedup_scope,\n                computed_at  = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "07e3c24be6f66db161ed10e0ecb0b7ec44f8a4c67022c78b67beb05d5fd9b3c4"
+}

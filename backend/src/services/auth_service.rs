@@ -3476,6 +3476,7 @@ mod tests {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
             gc_schedule: "0 0 * * * *".to_string(),
+            storage_stats_schedule: "0 0 */4 * * *".to_string(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,

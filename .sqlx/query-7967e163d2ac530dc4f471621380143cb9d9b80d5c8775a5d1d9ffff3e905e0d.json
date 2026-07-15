@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE repository_storage_stats\n               SET logical_bytes = 0, physical_bytes = 0, unique_bytes = 0,\n                   shared_bytes = 0, blob_count = 0, dedup_scope = $2,\n                   computed_at = now()\n             WHERE repository_id <> ALL($1)\n               AND (logical_bytes <> 0 OR physical_bytes <> 0 OR blob_count <> 0)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7967e163d2ac530dc4f471621380143cb9d9b80d5c8775a5d1d9ffff3e905e0d"
+}
