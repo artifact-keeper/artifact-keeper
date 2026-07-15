@@ -312,21 +312,31 @@ fn is_ssrf_block_error(err: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Pure transport-error mapping (unit-testable without a real
-/// `reqwest::Error`). When an egress proxy is configured AND the failure is
-/// the SSRF DNS guard refusing to resolve a host, surface a meaningful 503 so
-/// operators see "egress proxy refused by policy" instead of an opaque
-/// `Storage` 500 or a blanket 502 (issue #2570). Every other transport
-/// failure keeps the pre-existing `Storage` mapping unchanged.
+/// `reqwest::Error`). When the failure is the SSRF DNS guard refusing to
+/// resolve a host, surface a meaningful 503 instead of an opaque `Storage` 500
+/// or a blanket 502 (issue #2570). The wording is proxy-specific ONLY when an
+/// egress proxy is actually configured (`proxy_configured`), so a direct /
+/// `NO_PROXY` upstream that is SSRF-blocked is not mislabeled as a proxy
+/// failure — that just confuses triage since no proxy was involved. Either way
+/// it is a 503 and the redacted-URL `context` (never proxy creds/IP) is
+/// preserved. Every other (non-SSRF) transport failure keeps the pre-existing
+/// `Storage` mapping unchanged.
 fn map_transport_error(
     proxy_configured: bool,
     is_ssrf_block: bool,
     context: &str,
     detail: &str,
 ) -> AppError {
-    if proxy_configured && is_ssrf_block {
-        AppError::ServiceUnavailable(format!(
-            "egress proxy connection refused by SSRF egress policy while {context}: {detail}"
-        ))
+    if is_ssrf_block {
+        if proxy_configured {
+            AppError::ServiceUnavailable(format!(
+                "egress proxy connection refused by SSRF egress policy while {context}: {detail}"
+            ))
+        } else {
+            AppError::ServiceUnavailable(format!(
+                "connection to upstream refused by SSRF egress policy while {context}: {detail}"
+            ))
+        }
     } else {
         AppError::Storage(format!("Failed to {context}: {detail}"))
     }
@@ -4955,19 +4965,25 @@ mod tests {
     }
 
     #[test]
-    fn map_transport_error_ssrf_block_without_proxy_keeps_storage_path() {
-        // No proxy configured ⇒ a block is a genuine direct-target refusal,
-        // not a proxy-egress problem: keep the existing Storage mapping.
+    fn map_transport_error_ssrf_block_without_proxy_is_generic_503() {
+        // No proxy configured ⇒ a direct-target SSRF block is still surfaced as
+        // a meaningful 503, but the message must NOT mention a proxy (none was
+        // involved) — that keeps triage honest.
         let err = map_transport_error(
             false, // no proxy configured
             true,  // SSRF-guard block
             "fetch from upstream https://10.0.0.5/x",
             "all resolved addresses blocked by SSRF policy",
         );
-        assert!(
-            matches!(err, AppError::Storage(_)),
-            "SSRF block with no proxy must map to Storage, got {err:?}"
-        );
+        match err {
+            AppError::ServiceUnavailable(msg) => {
+                assert!(
+                    msg.contains("SSRF egress policy") && !msg.to_lowercase().contains("proxy"),
+                    "expected a generic (non-proxy) SSRF 503 message, got: {msg}"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
     }
 
     #[test]
