@@ -239,6 +239,17 @@ services:
       # subnets; keep it in sync with the actual proxy network.
       RATE_LIMIT_TRUSTED_PROXY_CIDRS: ${RATE_LIMIT_TRUSTED_PROXY_CIDRS:-172.30.0.0/24}
       TRIVY_URL: http://trivy:8090
+      # Trivy scanner-adapter URL (container-image scanning, #2471 / #2305).
+      # TRIVY_URL above only wires the legacy trivy *server* used for
+      # filesystem / incus (rootfs) scanning. To get first-class Trivy
+      # container-*image* reports, point the backend at the in-repo
+      # scanner-adapter (Harbor Pluggable Scanner API); this registers the
+      # dedicated `ImageScanner`. WITHOUT it, images are still covered by grype
+      # (registry mode), but no Trivy image report is produced and operators
+      # cannot tell why. When set it also drives fs/incus scans over HTTP
+      # (adapter >= 1.2.0), taking precedence over TRIVY_URL there. Uncomment
+      # this line and the `scanner-adapter` service block below to enable it.
+      # TRIVY_ADAPTER_URL: http://scanner-adapter:8080
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
       OPENSEARCH_URL: http://opensearch:9200
@@ -335,6 +346,29 @@ services:
       - trivy_cache:/root/.cache/trivy
       - scan_workspace:/scan-workspace:ro
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Trivy scanner-adapter (container-image scanning) — optional
+  # ---------------------------------------------------------------------------
+  # Fronts trivy with the Harbor Pluggable Scanner API so the backend can run
+  # first-class container-*image* scans (the `ImageScanner`) and, from adapter
+  # 1.2.0, filesystem/incus scans over HTTP with no trivy binary in the backend
+  # image. Uncomment this service AND set `TRIVY_ADAPTER_URL` on the backend
+  # (see the commented line in the backend `environment:` above) to enable it.
+  # Without it, container images are still scanned by grype (registry mode) but
+  # no Trivy image report is produced. See docker/scanner-adapter/README.md.
+  # scanner-adapter:
+  #   image: ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:1  # or artifactkeeper/scanner-adapter:1
+  #   container_name: artifact-keeper-scanner-adapter
+  #   environment:
+  #     SCANNER_ADAPTER_ADDR: ":8080"
+  #     # Pull image manifests/blobs from the AK registry over the compose
+  #     # network's plain HTTP. Leave true on the internal network.
+  #     SCANNER_TRIVY_INSECURE: "true"
+  #   volumes:
+  #     - trivy_cache:/home/scanner/.cache/trivy
+  #     - scan_workspace:/scan-workspace:ro
+  #   restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # OpenSCAP (compliance scanner)

@@ -206,6 +206,24 @@ flowchart LR
 - **Policies** - Configurable rules that block or quarantine artifacts
 - **Signing** - GPG/RSA signing for Debian, RPM, Alpine, and Conda packages
 
+> **Container-image scanning (`TRIVY_ADAPTER_URL`).** The base `docker-compose.yml`
+> wires `TRIVY_URL` for the legacy trivy *server* (filesystem / incus rootfs
+> scanning) only. To get first-class Trivy container-*image* reports, set
+> `TRIVY_ADAPTER_URL` (e.g. `http://scanner-adapter:8080`) so the backend
+> registers the dedicated `ImageScanner` against the in-repo
+> [`scanner-adapter`](docker/scanner-adapter/README.md) (Harbor Pluggable Scanner
+> API). Without it, images are still covered by grype (registry mode) but no
+> Trivy image report is produced. Uncomment the `TRIVY_ADAPTER_URL` line and the
+> `scanner-adapter` service in `docker-compose.yml` to enable it.
+>
+> **Not-applicable scanners.** A scanner that does not apply to an artifact's
+> format (e.g. the filesystem/incus/openscap scanners on a Docker image) records
+> a `not_applicable` result — a benign terminal state, distinct from `failed`.
+> The scan-list API folds multiple `not_applicable` results for the same
+> artifact into a single summary row (`collapsed_not_applicable_count` +
+> `collapsed_scan_types`) so they read as one muted "not applicable" indication
+> rather than N failures.
+
 ## Borg Replication
 
 Recursive peer-to-peer replication where every node is a full Artifact Keeper instance. No thin caches — each peer runs the same stack and can serve as an origin for other peers.
