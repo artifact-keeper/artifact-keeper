@@ -160,6 +160,12 @@ pub(crate) fn configured_proxy_hosts() -> HashSet<String> {
 /// resolver is fully fail-closed). No subdomain/suffix/prefix matching:
 /// `proxy.corp.attacker.com` and `10.0.0.5.attacker.com` are NOT exempted
 /// by a `proxy.corp` / `10.0.0.5` entry.
+///
+/// The match is host-keyed and PORT-AGNOSTIC (the port is stripped from the
+/// proxy value at parse time). This is safe: the exemption affects only DNS
+/// *name resolution*, which is inherently port-independent, and reqwest still
+/// dials the proxy's configured port — it grants no reach to a different
+/// service/port on that host, so port-agnosticism does not widen the guard.
 fn host_is_exempt(exempt: &HashSet<String>, host: &str) -> bool {
     !exempt.is_empty() && exempt.contains(host.to_ascii_lowercase().as_str())
 }
