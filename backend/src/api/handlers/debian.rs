@@ -250,35 +250,206 @@ fn decode_to_fixpoint(raw: &str) -> Option<String> {
     None
 }
 
-/// Reject a Debian proxy sub-path that, once the upstream URL parser
-/// percent-decodes and normalises it, would escape the gated
-/// distribution/component/architecture via path traversal. The pre-fetch
-/// allowlist gate reads the raw (axum-once-decoded) segments, but
-/// `build_upstream_url` -> `reqwest::Url::parse` decodes `%2e`/`%2E` and
-/// normalises `..`/`.` dot-segments AFTER the gate ran — so `main/%2e%2e/contrib`
-/// (or the double-encoded `main/%252e%252e/contrib`) is approved as `main` yet
-/// fetched as `contrib`. Decoding to a fixpoint and rejecting any residual
-/// dot-segment / backslash / NUL closes that gap. Legitimately percent-encoded
-/// filename bytes (e.g. an epoch colon `%3a`) decode to a non-separator and are
-/// preserved.
+/// The upstream base URL to gate against, or `None` for repositories the P2
+/// filter does not apply to (hosted/virtual, or a remote with no upstream).
+fn repo_remote_upstream(repo: &RepoInfo) -> Option<&str> {
+    if repo.repo_type == RepositoryType::Remote {
+        repo.upstream_url.as_deref()
+    } else {
+        None
+    }
+}
+
+/// Resolve the exact path reqwest will fetch for `relative`, returned relative
+/// to the upstream base. This is the structural defence against gate/fetch
+/// divergence: rather than hand-rolling normalisation, we build the URL the
+/// same way the proxy does and let the SAME WHATWG parser reqwest uses do the
+/// tab/LF/CR stripping and `.`/`..` dot-segment resolution, then gate on the
+/// result — so a request like `main/%2e%09%2e/contrib` (which axum decodes to a
+/// literal-tab segment that reqwest reforms into `..` -> contrib) is gated on
+/// the `contrib` it actually fetches.
+///
+/// A belt runs first: any C0 control byte (incl. tab/LF/CR) or space in the
+/// (already once-decoded) request path is refused outright rather than left to
+/// be silently stripped. Escapes above the base (scheme/host/port/prefix
+/// change) are refused too.
 #[allow(clippy::result_large_err)]
-fn reject_unsafe_debian_subpath(raw: &str) -> Result<(), Response> {
-    if raw.contains('\0') || raw.contains('\\') {
-        return Err(debian_filter_denied("path", raw));
+fn normalized_debian_relpath(base_url: &str, relative: &str) -> Result<String, Response> {
+    if relative.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(debian_filter_denied("path", relative));
     }
-    let decoded = match decode_to_fixpoint(raw) {
-        Some(d) => d,
-        None => return Err(debian_filter_denied("path", raw)),
-    };
-    if decoded.contains('\0') || decoded.contains('\\') {
-        return Err(debian_filter_denied("path", raw));
+    let base = reqwest::Url::parse(base_url).map_err(|_| debian_filter_denied("path", relative))?;
+    let full = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        relative.trim_start_matches('/')
+    );
+    let parsed = reqwest::Url::parse(&full).map_err(|_| debian_filter_denied("path", relative))?;
+    // The normalised URL must stay on the same origin as the base — a path that
+    // rewrites the host/scheme/port must never slip past the filter.
+    if parsed.scheme() != base.scheme()
+        || parsed.host_str() != base.host_str()
+        || parsed.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err(debian_filter_denied("path", relative));
     }
-    for seg in decoded.split('/') {
-        if seg == ".." || seg == "." || seg.is_empty() {
-            return Err(debian_filter_denied("path", raw));
+    let base_prefix = base.path().trim_end_matches('/');
+    let rel = parsed
+        .path()
+        .strip_prefix(base_prefix)
+        .map(|r| r.trim_start_matches('/'))
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| debian_filter_denied("path", relative))?;
+    Ok(rel.to_string())
+}
+
+/// Normalise a `dists/{distribution}/{raw_suffix}` request to the path reqwest
+/// will fetch, returning `(distribution, suffix)` where `suffix` is everything
+/// after `dists/{distribution}/`. Errors (404) on a control byte, over-encoding,
+/// base escape, or a normalised path no longer rooted at `dists/`.
+#[allow(clippy::result_large_err)]
+fn normalized_dists_parts(
+    base_url: &str,
+    distribution: &str,
+    raw_suffix: &str,
+) -> Result<(String, String), Response> {
+    let relative = format!("dists/{}/{}", distribution, raw_suffix);
+    let norm = normalized_debian_relpath(base_url, &relative)?;
+    let mut it = norm.splitn(3, '/');
+    match it.next() {
+        Some("dists") => {}
+        _ => return Err(debian_filter_denied("path", &norm)),
+    }
+    let dist = it.next().unwrap_or("").to_string();
+    let suffix = it.next().unwrap_or("").to_string();
+    if dist.is_empty() {
+        return Err(debian_filter_denied("path", &norm));
+    }
+    Ok((dist, suffix))
+}
+
+/// Gate a `dists/...` proxy request on the reqwest-normalised path. Extracts the
+/// effective distribution/component/architecture from the path that will
+/// actually be fetched (not the raw axum segments), so encoded/tab/dot
+/// traversal cannot split the gate from the fetch. `raw_suffix` is the part
+/// after `dists/{distribution}/` (e.g. `Release`, `main/binary-amd64/Packages`).
+#[allow(clippy::result_large_err)]
+fn gate_debian_dists(
+    filter: &DebianRepositoryConfig,
+    base_url: &str,
+    distribution: &str,
+    raw_suffix: &str,
+) -> Result<(), Response> {
+    let (dist, suffix) = normalized_dists_parts(base_url, distribution, raw_suffix)?;
+    debian_filter_decision(
+        filter,
+        Some(&dist),
+        catchall_component(&suffix),
+        catchall_arch(&suffix).as_deref(),
+    )
+}
+
+/// Gate a `pool/{component}/{path}` proxy request on the reqwest-normalised
+/// path. Gates the component, then the architecture (fail CLOSED: when an arch
+/// allowlist is set but the `.deb` filename does not yield a parseable arch,
+/// deny rather than skip).
+#[allow(clippy::result_large_err)]
+fn gate_debian_pool(
+    filter: &DebianRepositoryConfig,
+    base_url: &str,
+    component: &str,
+    path: &str,
+) -> Result<(), Response> {
+    let relative = format!("pool/{}/{}", component, path);
+    let norm = normalized_debian_relpath(base_url, &relative)?;
+    let mut it = norm.splitn(3, '/');
+    match it.next() {
+        Some("pool") => {}
+        _ => return Err(debian_filter_denied("path", &norm)),
+    }
+    let comp = it.next().unwrap_or("");
+    let rest = it.next().unwrap_or("");
+    if comp.is_empty() || rest.is_empty() {
+        return Err(debian_filter_denied("path", &norm));
+    }
+    debian_filter_decision(filter, None, Some(comp), None)?;
+    if !filter.architectures.is_empty() {
+        let filename = rest.rsplit('/').next().unwrap_or(rest);
+        let decoded = decode_to_fixpoint(filename).unwrap_or_else(|| filename.to_string());
+        match parse_deb_filename(&decoded).map(|d| d.arch) {
+            Some(arch) => debian_filter_decision(filter, None, None, Some(&arch))?,
+            None => return Err(debian_filter_denied("architecture", filename)),
         }
     }
     Ok(())
+}
+
+/// Gate the architecture of a `by-hash` metadata request, where the arch is
+/// encoded in the content HASH rather than the path (so `catchall_arch` cannot
+/// see it). Cross-references the requested SHA-256 against the arch-scoped
+/// entries in the already-verified signed `Release`: the by-hash content is
+/// served only when its hash maps to an allowed-architecture index. Unknown
+/// hashes and non-SHA-256 by-hash trees fail CLOSED under an arch allowlist.
+/// A no-op when no arch allowlist is configured or the request is not by-hash.
+#[allow(clippy::result_large_err)]
+async fn enforce_by_hash_arch(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    filter: &DebianRepositoryConfig,
+    distribution: &str,
+    raw_suffix: &str,
+) -> Result<(), Response> {
+    if filter.architectures.is_empty() {
+        return Ok(());
+    }
+    let (ndist, suffix) = normalized_dists_parts(upstream_url, distribution, raw_suffix)?;
+    if !suffix.contains("by-hash/") {
+        return Ok(());
+    }
+    // A by-hash tree under a non-SHA-256 algorithm cannot be arch-resolved from
+    // the SHA-256 Release table: refuse it under an arch filter.
+    let want_hash = match by_hash_sha256(&suffix) {
+        Some(h) => h,
+        None => return Err(debian_filter_denied("by-hash", &suffix)),
+    };
+    let table = match load_release_checksums(proxy, repo_id, repo_key, upstream_url, &ndist).await {
+        Some(t) => t,
+        None => return Err(debian_filter_denied("by-hash", want_hash)),
+    };
+    if by_hash_arch_allowed(&table, want_hash, filter) {
+        Ok(())
+    } else {
+        // Either the hash maps to a denied architecture, or the signed Release
+        // does not vouch for it at all — fail closed under an arch filter.
+        Err(debian_filter_denied("by-hash", want_hash))
+    }
+}
+
+/// Decide whether a by-hash request for `want_hash` is permitted under
+/// `filter`'s architecture allowlist, by cross-referencing the requested
+/// SHA-256 against the signed-Release checksum table (`path -> (hash, size)`).
+/// Returns `true` only when the hash is vouched for by the Release AND every
+/// index path it maps to is an allowed (or architecture-independent) arch;
+/// `false` for a denied arch or an unknown hash (fail closed).
+fn by_hash_arch_allowed(
+    table: &HashMap<String, (String, u64)>,
+    want_hash: &str,
+    filter: &DebianRepositoryConfig,
+) -> bool {
+    let mut matched = false;
+    for (path, (hash, _size)) in table {
+        if hash.eq_ignore_ascii_case(want_hash) {
+            matched = true;
+            if let Some(arch) = catchall_arch(path) {
+                if !filter.arch_selected(&arch) {
+                    return false;
+                }
+            }
+        }
+    }
+    matched
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,11 +1786,13 @@ async fn release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist before any
-    // upstream fetch. An allowed distribution passes through unchanged so the
-    // P1 signed-Release integrity path stays byte-identical.
-    reject_unsafe_debian_subpath(&distribution)?;
-    let filter = load_debian_filter(&state.db, repo.id).await;
-    debian_filter_decision(&filter, Some(&distribution), None, None)?;
+    // upstream fetch, gating on the reqwest-normalised path. An allowed
+    // distribution passes through unchanged so the P1 signed-Release integrity
+    // path stays byte-identical.
+    if let Some(base) = repo_remote_upstream(&repo) {
+        let filter = load_debian_filter(&state.db, repo.id).await;
+        gate_debian_dists(&filter, base, &distribution, "Release")?;
+    }
     proxy
         .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
         .await?;
@@ -1642,10 +1815,12 @@ async fn in_release_file(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
-    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
-    reject_unsafe_debian_subpath(&distribution)?;
-    let filter = load_debian_filter(&state.db, repo.id).await;
-    debian_filter_decision(&filter, Some(&distribution), None, None)?;
+    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
+    // gating on the reqwest-normalised path.
+    if let Some(base) = repo_remote_upstream(&repo) {
+        let filter = load_debian_filter(&state.db, repo.id).await;
+        gate_debian_dists(&filter, base, &distribution, "InRelease")?;
+    }
     proxy
         .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
         .await?;
@@ -1700,10 +1875,12 @@ async fn release_gpg(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
-    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
-    reject_unsafe_debian_subpath(&distribution)?;
-    let filter = load_debian_filter(&state.db, repo.id).await;
-    debian_filter_decision(&filter, Some(&distribution), None, None)?;
+    // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
+    // gating on the reqwest-normalised path.
+    if let Some(base) = repo_remote_upstream(&repo) {
+        let filter = load_debian_filter(&state.db, repo.id).await;
+        gate_debian_dists(&filter, base, &distribution, "Release.gpg")?;
+    }
     // Release.gpg is the detached signature of Release. We do not need
     // revalidation here because the matching Release fetch (called
     // by apt before Release.gpg) already drove epoch invalidation.
@@ -1952,24 +2129,16 @@ async fn dists_dispatch(
     state: State<SharedState>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    // #2460 hardening: refuse encoded path-traversal BEFORE the allowlist gate,
-    // so the gate sees the same segments reqwest will resolve upstream (defeats
-    // `%2e%2e` / double-encoded `%252e%252e` component/dist/arch escapes).
-    reject_unsafe_debian_subpath(&distribution)?;
-    reject_unsafe_debian_subpath(&dists_path)?;
-
     if let Some(req) = parse_packages_request(&dists_path) {
-        // #2460 P2: pre-fetch dist/component/arch allowlist gate for Packages
-        // indices. An empty filter (default) permits everything.
+        // #2460 P2: gate the Packages index on the reqwest-normalised path so a
+        // dist/component/arch escape cannot split the gate from the fetch. An
+        // empty filter (default) permits everything. Non-Packages shapes fall
+        // through to the catch-all, which applies the same normalised gate.
         let repo = resolve_debian_repo(&state.0.db, &repo_key).await?;
-        let filter = load_debian_filter(&state.0.db, repo.id).await;
-        let arch = strip_binary_arch_prefix(&req.binary_arch);
-        debian_filter_decision(
-            &filter,
-            Some(&distribution),
-            Some(&req.component),
-            Some(arch),
-        )?;
+        if let Some(base) = repo_remote_upstream(&repo) {
+            let filter = load_debian_filter(&state.0.db, repo.id).await;
+            gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+        }
 
         let path = Path((repo_key, distribution, req.component, req.binary_arch));
         return match req.ext {
@@ -1995,23 +2164,30 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // #2460 hardening: refuse encoded path-traversal before gating.
-    reject_unsafe_debian_subpath(&distribution)?;
-    reject_unsafe_debian_subpath(&dists_path)?;
-
     // #2460 P2: pre-fetch allowlist gate for catch-all dists metadata
-    // (i18n/Translation, Sources, dep11, Contents, ...). Always gate the
-    // distribution; additionally gate the component when the path is
-    // component-scoped and the architecture when the metadata is arch-scoped
-    // (Contents-<arch>, dep11 Components-<arch>, binary-<arch>). An empty
-    // filter permits everything.
-    let filter = load_debian_filter(&state.db, repo.id).await;
-    debian_filter_decision(
-        &filter,
-        Some(&distribution),
-        catchall_component(&dists_path),
-        catchall_arch(&dists_path).as_deref(),
-    )?;
+    // (i18n/Translation, Sources, dep11, Contents, ...), gating on the exact
+    // reqwest-normalised path. Gates the distribution, the component when the
+    // path is component-scoped, and the architecture when the metadata is
+    // arch-scoped (Contents-<arch>, dep11 Components-<arch>, binary-<arch>).
+    // by-hash requests carry the arch in the content hash, not the path, so a
+    // second pass cross-references the requested SHA-256 against the signed
+    // Release. An empty filter permits everything.
+    if let Some(base) = repo_remote_upstream(&repo) {
+        let filter = load_debian_filter(&state.db, repo.id).await;
+        gate_debian_dists(&filter, base, &distribution, &dists_path)?;
+        if let Some(proxy) = state.proxy_service.as_deref() {
+            enforce_by_hash_arch(
+                proxy,
+                repo.id,
+                &repo_key,
+                base,
+                &filter,
+                &distribution,
+                &dists_path,
+            )
+            .await?;
+        }
+    }
 
     let upstream_path = format!("dists/{}/{}", distribution, dists_path);
 
@@ -2126,25 +2302,13 @@ async fn pool_download(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // #2460 hardening: refuse encoded path-traversal before gating.
-    reject_unsafe_debian_subpath(&component)?;
-    reject_unsafe_debian_subpath(&path)?;
-
-    // #2460 P2: pre-fetch allowlist gate for pool downloads. The pool path
-    // carries the component; the architecture is derived from the `.deb`
-    // filename. An empty filter permits everything.
-    let filter = load_debian_filter(&state.db, repo.id).await;
-    debian_filter_decision(&filter, None, Some(&component), None)?;
-    // Architecture gate: fail CLOSED when an arch allowlist is set but the
-    // architecture cannot be determined (e.g. a percent-encoded `.deb`
-    // extension that `parse_deb_filename` rejects) — never skip the check.
-    if !filter.architectures.is_empty() {
-        let decoded_path = decode_to_fixpoint(&path).unwrap_or_else(|| path.clone());
-        let pool_filename = decoded_path.rsplit('/').next().unwrap_or(&decoded_path);
-        match parse_deb_filename(pool_filename).map(|d| d.arch) {
-            Some(arch) => debian_filter_decision(&filter, None, None, Some(&arch))?,
-            None => return Err(debian_filter_denied("architecture", pool_filename)),
-        }
+    // #2460 P2: pre-fetch allowlist gate for pool downloads, gating on the
+    // reqwest-normalised path. Gates the component and the architecture (derived
+    // from the `.deb` filename, fail-closed when unparseable). An empty filter
+    // permits everything.
+    if let Some(base) = repo_remote_upstream(&repo) {
+        let filter = load_debian_filter(&state.db, repo.id).await;
+        gate_debian_pool(&filter, base, &component, &path)?;
     }
 
     let artifact_path = format!("pool/{}/{}", component, path);
@@ -2762,23 +2926,154 @@ mod tests {
         );
     }
 
+    const TEST_BASE: &str = "http://deb.debian.org/debian";
+
     #[test]
-    fn test_reject_unsafe_debian_subpath() {
-        // Clean paths pass, including a legit epoch-encoded filename.
-        assert!(reject_unsafe_debian_subpath("main/binary-amd64/Packages.gz").is_ok());
-        assert!(reject_unsafe_debian_subpath("g/gcc-defaults/gcc_4%3a10-1_amd64.deb").is_ok());
-        // Literal, single- and double-encoded traversal all rejected with 404.
-        for bad in [
-            "main/../contrib/binary-amd64/Packages.gz",
-            "main/%2e%2e/contrib/binary-amd64/Packages.gz",
-            "main/%252e%252e/contrib/binary-amd64/Packages.gz",
-            "main/%252e%252e/%252e%252e/trixie/main/binary-amd64/Packages.gz",
-            "main/./Packages",
-            "main\\..\\contrib",
+    fn test_normalized_relpath_matches_reqwest_fetch_path() {
+        // The gate input must equal the exact path reqwest fetches. For every
+        // tricky encoding, assert normalized_debian_relpath == the path reqwest
+        // (url crate) resolves for the same joined URL — no gate/fetch drift.
+        for raw in [
+            "dists/bookworm/main/binary-amd64/Packages.gz",
+            "dists/bookworm/main/%2e%2e/contrib/binary-amd64/Packages.gz",
+            // Literal-tab dot segment (what axum yields for %2e%09%2e).
+            "dists/bookworm/main/.\t./contrib/binary-amd64/Packages.gz",
         ] {
-            let resp = reject_unsafe_debian_subpath(bad).unwrap_err();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "should reject: {bad}");
+            let full = format!("{}/{}", TEST_BASE, raw);
+            let fetched = reqwest::Url::parse(&full).unwrap();
+            let base = reqwest::Url::parse(TEST_BASE).unwrap();
+            let expected = fetched
+                .path()
+                .strip_prefix(base.path().trim_end_matches('/'))
+                .unwrap()
+                .trim_start_matches('/')
+                .to_string();
+            // A control byte is refused up front (belt); otherwise parity holds.
+            if raw.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+                assert!(normalized_debian_relpath(TEST_BASE, raw).is_err());
+            } else {
+                assert_eq!(
+                    normalized_debian_relpath(TEST_BASE, raw).unwrap(),
+                    expected,
+                    "gate input must equal reqwest fetch path for: {raw:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_gate_dists_blocks_tab_and_encoded_traversal() {
+        let filter = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Allowed request passes.
+        assert!(gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/binary-amd64/Packages.gz"
+        )
+        .is_ok());
+        // Tab-formed dot-segment (axum-decoded %2e%09%2e) -> reforms to contrib.
+        let resp = gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/.\t./contrib/binary-amd64/Packages.gz",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Distribution escape via tab dot-segments -> trixie.
+        let resp = gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/.\t./.\t./trixie/main/binary-amd64/Packages.gz",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Single-encoded %2e%2e -> contrib.
+        let resp = gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/%2e%2e/contrib/binary-amd64/Packages.gz",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_normalized_relpath_rejects_control_bytes_and_escape() {
+        // Raw control byte (tab/LF/CR/space) refused up front.
+        for bad in ["main/\t/Packages", "main/\n/Packages", "main/ /Packages"] {
+            assert!(
+                normalized_debian_relpath(TEST_BASE, bad).is_err(),
+                "should reject control/ws: {bad:?}"
+            );
+        }
+        // Escape above the base path is refused.
+        assert!(normalized_debian_relpath(TEST_BASE, "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_gate_pool_fail_closed_on_unparseable_arch() {
+        let filter = DebianRepositoryConfig {
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Allowed amd64 .deb passes.
+        assert!(
+            gate_debian_pool(&filter, TEST_BASE, "main", "0/0ad/0ad_0.0.26-3_amd64.deb").is_ok()
+        );
+        // arm64 denied.
+        let resp = gate_debian_pool(&filter, TEST_BASE, "main", "0/0ad/0ad_0.0.26-3_arm64.deb")
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Denied component.
+        let resp =
+            gate_debian_pool(&filter, TEST_BASE, "contrib", "1/1oom/1oom_1_amd64.deb").unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Unparseable arch (encoded extension) -> fail closed.
+        let resp = gate_debian_pool(
+            &filter,
+            TEST_BASE,
+            "main",
+            "0/0ad/0ad_0.0.26-3_arm64%252edeb",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_by_hash_arch_allowed_cross_reference() {
+        use std::collections::HashMap;
+        let filter = DebianRepositoryConfig {
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        let mut table: HashMap<String, (String, u64)> = HashMap::new();
+        table.insert("main/Contents-amd64.gz".into(), ("aaa".into(), 1));
+        table.insert("main/Contents-arm64.gz".into(), ("bbb".into(), 2));
+        table.insert(
+            "main/dep11/Components-arm64.yml.gz".into(),
+            ("ccc".into(), 3),
+        );
+        table.insert("main/i18n/Translation-en".into(), ("ddd".into(), 4));
+        // amd64 index hash -> allowed.
+        assert!(by_hash_arch_allowed(&table, "aaa", &filter));
+        // arm64 Contents hash -> denied.
+        assert!(!by_hash_arch_allowed(&table, "bbb", &filter));
+        // arm64 dep11 hash -> denied.
+        assert!(!by_hash_arch_allowed(&table, "ccc", &filter));
+        // arch-independent i18n hash -> allowed.
+        assert!(by_hash_arch_allowed(&table, "ddd", &filter));
+        // Unknown hash -> fail closed.
+        assert!(!by_hash_arch_allowed(&table, "zzz", &filter));
     }
 
     #[test]
