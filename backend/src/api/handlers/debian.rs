@@ -181,6 +181,106 @@ fn catchall_component(dists_path: &str) -> Option<&str> {
     Some(first)
 }
 
+/// Strip a trailing index-compression suffix (`.gz`/`.xz`/`.bz2`/`.zst`/
+/// `.zstd`/`.lz4`) from a metadata leaf name, so an embedded architecture can
+/// be recovered from e.g. `Contents-arm64.gz`.
+fn strip_index_compression_suffix(name: &str) -> &str {
+    for suffix in [".gz", ".xz", ".bz2", ".zst", ".zstd", ".lz4"] {
+        if let Some(base) = name.strip_suffix(suffix) {
+            return base;
+        }
+    }
+    name
+}
+
+/// Extract the architecture a catch-all `dists/{dist}/*` metadata path is
+/// scoped to, if any, so the allowlist can gate it. Recognises
+/// `.../binary-<arch>/...` (Packages-family), `.../Contents-[udeb-]<arch>[.comp]`
+/// (Contents index), and `.../Components-<arch>.yml[.comp]` (dep11 metadata).
+///
+/// Architecture-independent metadata (`all`/`source`, i18n/Translation,
+/// Sources, Release, by-hash, and so on) returns `None` and is never
+/// arch-gated.
+fn catchall_arch(dists_path: &str) -> Option<String> {
+    for seg in dists_path.split('/') {
+        let candidate = if let Some(rest) = seg.strip_prefix("binary-") {
+            Some(rest.to_string())
+        } else if let Some(rest) = seg.strip_prefix("Contents-") {
+            // `Contents-amd64.gz` and `Contents-udeb-amd64.gz`: the arch is the
+            // last `-`-separated token of the compression-stripped base.
+            strip_index_compression_suffix(rest)
+                .rsplit('-')
+                .next()
+                .map(|s| s.to_string())
+        } else if let Some(rest) = seg.strip_prefix("Components-") {
+            // dep11 `Components-<arch>.yml[.comp]`.
+            rest.split('.').next().map(|s| s.to_string())
+        } else {
+            None
+        };
+        if let Some(arch) = candidate {
+            if arch.is_empty() || arch == "all" || arch == "source" {
+                // Architecture-independent — not gated.
+                return None;
+            }
+            return Some(arch);
+        }
+    }
+    None
+}
+
+/// Percent-decode `raw` repeatedly until it stops changing (a fixpoint), so a
+/// single- OR multiply-encoded sequence collapses to the exact form reqwest's
+/// WHATWG URL parser will resolve when it builds the upstream request. Returns
+/// `None` on invalid UTF-8 or if more than a small number of decode layers are
+/// required (a pathological over-encoding, refused out of caution).
+fn decode_to_fixpoint(raw: &str) -> Option<String> {
+    let mut cur = raw.to_string();
+    for _ in 0..8 {
+        if !cur.contains('%') {
+            return Some(cur);
+        }
+        let decoded = urlencoding::decode(&cur).ok()?.into_owned();
+        if decoded == cur {
+            // A `%` that is not part of a valid escape — treat as a literal.
+            return Some(cur);
+        }
+        cur = decoded;
+    }
+    None
+}
+
+/// Reject a Debian proxy sub-path that, once the upstream URL parser
+/// percent-decodes and normalises it, would escape the gated
+/// distribution/component/architecture via path traversal. The pre-fetch
+/// allowlist gate reads the raw (axum-once-decoded) segments, but
+/// `build_upstream_url` -> `reqwest::Url::parse` decodes `%2e`/`%2E` and
+/// normalises `..`/`.` dot-segments AFTER the gate ran — so `main/%2e%2e/contrib`
+/// (or the double-encoded `main/%252e%252e/contrib`) is approved as `main` yet
+/// fetched as `contrib`. Decoding to a fixpoint and rejecting any residual
+/// dot-segment / backslash / NUL closes that gap. Legitimately percent-encoded
+/// filename bytes (e.g. an epoch colon `%3a`) decode to a non-separator and are
+/// preserved.
+#[allow(clippy::result_large_err)]
+fn reject_unsafe_debian_subpath(raw: &str) -> Result<(), Response> {
+    if raw.contains('\0') || raw.contains('\\') {
+        return Err(debian_filter_denied("path", raw));
+    }
+    let decoded = match decode_to_fixpoint(raw) {
+        Some(d) => d,
+        None => return Err(debian_filter_denied("path", raw)),
+    };
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return Err(debian_filter_denied("path", raw));
+    }
+    for seg in decoded.split('/') {
+        if seg == ".." || seg == "." || seg.is_empty() {
+            return Err(debian_filter_denied("path", raw));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Debian metadata from filename
 // ---------------------------------------------------------------------------
@@ -1517,6 +1617,7 @@ async fn release_file(
     // #2460 P2: deny a distribution outside the operator allowlist before any
     // upstream fetch. An allowed distribution passes through unchanged so the
     // P1 signed-Release integrity path stays byte-identical.
+    reject_unsafe_debian_subpath(&distribution)?;
     let filter = load_debian_filter(&state.db, repo.id).await;
     debian_filter_decision(&filter, Some(&distribution), None, None)?;
     proxy
@@ -1542,6 +1643,7 @@ async fn in_release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
+    reject_unsafe_debian_subpath(&distribution)?;
     let filter = load_debian_filter(&state.db, repo.id).await;
     debian_filter_decision(&filter, Some(&distribution), None, None)?;
     proxy
@@ -1599,6 +1701,7 @@ async fn release_gpg(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch).
+    reject_unsafe_debian_subpath(&distribution)?;
     let filter = load_debian_filter(&state.db, repo.id).await;
     debian_filter_decision(&filter, Some(&distribution), None, None)?;
     // Release.gpg is the detached signature of Release. We do not need
@@ -1849,6 +1952,12 @@ async fn dists_dispatch(
     state: State<SharedState>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
+    // #2460 hardening: refuse encoded path-traversal BEFORE the allowlist gate,
+    // so the gate sees the same segments reqwest will resolve upstream (defeats
+    // `%2e%2e` / double-encoded `%252e%252e` component/dist/arch escapes).
+    reject_unsafe_debian_subpath(&distribution)?;
+    reject_unsafe_debian_subpath(&dists_path)?;
+
     if let Some(req) = parse_packages_request(&dists_path) {
         // #2460 P2: pre-fetch dist/component/arch allowlist gate for Packages
         // indices. An empty filter (default) permits everything.
@@ -1886,16 +1995,22 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
+    // #2460 hardening: refuse encoded path-traversal before gating.
+    reject_unsafe_debian_subpath(&distribution)?;
+    reject_unsafe_debian_subpath(&dists_path)?;
+
     // #2460 P2: pre-fetch allowlist gate for catch-all dists metadata
     // (i18n/Translation, Sources, dep11, Contents, ...). Always gate the
     // distribution; additionally gate the component when the path is
-    // component-scoped. An empty filter permits everything.
+    // component-scoped and the architecture when the metadata is arch-scoped
+    // (Contents-<arch>, dep11 Components-<arch>, binary-<arch>). An empty
+    // filter permits everything.
     let filter = load_debian_filter(&state.db, repo.id).await;
     debian_filter_decision(
         &filter,
         Some(&distribution),
         catchall_component(&dists_path),
-        None,
+        catchall_arch(&dists_path).as_deref(),
     )?;
 
     let upstream_path = format!("dists/{}/{}", distribution, dists_path);
@@ -2011,13 +2126,26 @@ async fn pool_download(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
+    // #2460 hardening: refuse encoded path-traversal before gating.
+    reject_unsafe_debian_subpath(&component)?;
+    reject_unsafe_debian_subpath(&path)?;
+
     // #2460 P2: pre-fetch allowlist gate for pool downloads. The pool path
     // carries the component; the architecture is derived from the `.deb`
-    // filename when parseable. An empty filter permits everything.
+    // filename. An empty filter permits everything.
     let filter = load_debian_filter(&state.db, repo.id).await;
-    let pool_filename = path.rsplit('/').next().unwrap_or(&path);
-    let pool_arch = parse_deb_filename(pool_filename).map(|d| d.arch);
-    debian_filter_decision(&filter, None, Some(&component), pool_arch.as_deref())?;
+    debian_filter_decision(&filter, None, Some(&component), None)?;
+    // Architecture gate: fail CLOSED when an arch allowlist is set but the
+    // architecture cannot be determined (e.g. a percent-encoded `.deb`
+    // extension that `parse_deb_filename` rejects) — never skip the check.
+    if !filter.architectures.is_empty() {
+        let decoded_path = decode_to_fixpoint(&path).unwrap_or_else(|| path.clone());
+        let pool_filename = decoded_path.rsplit('/').next().unwrap_or(&decoded_path);
+        match parse_deb_filename(pool_filename).map(|d| d.arch) {
+            Some(arch) => debian_filter_decision(&filter, None, None, Some(&arch))?,
+            None => return Err(debian_filter_denied("architecture", pool_filename)),
+        }
+    }
 
     let artifact_path = format!("pool/{}/{}", component, path);
 
@@ -2603,6 +2731,109 @@ mod tests {
         let resp = debian_filter_decision(&filter, Some("bookworm"), Some("main"), Some("arm64"))
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2460 hardening — encoded traversal, catch-all arch, pool fail-closed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_to_fixpoint_collapses_multi_encoding() {
+        assert_eq!(decode_to_fixpoint("main").as_deref(), Some("main"));
+        // Single-encoded dot-dot.
+        assert_eq!(
+            decode_to_fixpoint("main/%2e%2e/contrib").as_deref(),
+            Some("main/../contrib")
+        );
+        // Double-encoded dot-dot.
+        assert_eq!(
+            decode_to_fixpoint("main/%252e%252e/contrib").as_deref(),
+            Some("main/../contrib")
+        );
+        // Legit epoch colon survives (not a separator).
+        assert_eq!(
+            decode_to_fixpoint("gcc_4%3a10.2.1-1_amd64.deb").as_deref(),
+            Some("gcc_4:10.2.1-1_amd64.deb")
+        );
+        // Encoded `.deb` extension.
+        assert_eq!(
+            decode_to_fixpoint("0ad_1_arm64%252edeb").as_deref(),
+            Some("0ad_1_arm64.deb")
+        );
+    }
+
+    #[test]
+    fn test_reject_unsafe_debian_subpath() {
+        // Clean paths pass, including a legit epoch-encoded filename.
+        assert!(reject_unsafe_debian_subpath("main/binary-amd64/Packages.gz").is_ok());
+        assert!(reject_unsafe_debian_subpath("g/gcc-defaults/gcc_4%3a10-1_amd64.deb").is_ok());
+        // Literal, single- and double-encoded traversal all rejected with 404.
+        for bad in [
+            "main/../contrib/binary-amd64/Packages.gz",
+            "main/%2e%2e/contrib/binary-amd64/Packages.gz",
+            "main/%252e%252e/contrib/binary-amd64/Packages.gz",
+            "main/%252e%252e/%252e%252e/trixie/main/binary-amd64/Packages.gz",
+            "main/./Packages",
+            "main\\..\\contrib",
+        ] {
+            let resp = reject_unsafe_debian_subpath(bad).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn test_catchall_arch_gates_arch_scoped_metadata() {
+        // Contents / dep11 expose the architecture in the leaf name.
+        assert_eq!(
+            catchall_arch("main/Contents-arm64.gz").as_deref(),
+            Some("arm64")
+        );
+        assert_eq!(catchall_arch("Contents-amd64.gz").as_deref(), Some("amd64"));
+        assert_eq!(
+            catchall_arch("main/dep11/Components-arm64.yml.gz").as_deref(),
+            Some("arm64")
+        );
+        assert_eq!(
+            catchall_arch("main/Contents-udeb-arm64.gz").as_deref(),
+            Some("arm64")
+        );
+        // Architecture-independent / non-arch metadata is not gated.
+        assert_eq!(catchall_arch("main/Contents-all.gz"), None);
+        assert_eq!(catchall_arch("main/Contents-source.gz"), None);
+        assert_eq!(catchall_arch("main/i18n/Translation-en.gz"), None);
+        assert_eq!(catchall_arch("main/source/Sources.gz"), None);
+        assert_eq!(catchall_arch("main/binary-all/Packages.gz"), None);
+    }
+
+    #[test]
+    fn test_catchall_arch_denies_out_of_allowlist() {
+        let filter = DebianRepositoryConfig {
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Contents-arm64 (F3a) must be denied.
+        let arch = catchall_arch("main/Contents-arm64.gz");
+        let resp = debian_filter_decision(&filter, None, None, arch.as_deref()).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Contents-amd64 stays allowed.
+        let arch = catchall_arch("main/Contents-amd64.gz");
+        assert!(debian_filter_decision(&filter, None, None, arch.as_deref()).is_ok());
+    }
+
+    #[test]
+    fn test_pool_arch_parse_fail_closed_semantics() {
+        // The pool handler denies when an arch allowlist is set but the arch
+        // cannot be parsed. Model that decision here: a percent-encoded `.deb`
+        // extension collapses to a parseable filename via decode_to_fixpoint,
+        // and a genuinely unparseable name yields None (handler -> 404).
+        let decoded = decode_to_fixpoint("0ad_0.0.26-3_arm64%252edeb").unwrap();
+        let fname = decoded.rsplit('/').next().unwrap();
+        assert_eq!(
+            parse_deb_filename(fname).map(|d| d.arch).as_deref(),
+            Some("arm64")
+        );
+        // Unparseable -> None (fail-closed at the call site).
+        assert!(parse_deb_filename("not-a-package").is_none());
     }
 
     // -----------------------------------------------------------------------
