@@ -47,6 +47,11 @@ pub enum MigrationJobStatus {
     Running,
     Paused,
     Completed,
+    /// Reached a terminal state, but at least one item failed to transfer while
+    /// others succeeded. Distinguishes a partial migration from a clean
+    /// `Completed` so a hollow/partial import is not surfaced as success
+    /// (#2457): the per-item counters and report carry the detail.
+    CompletedWithErrors,
     Failed,
     Cancelled,
 }
@@ -60,6 +65,7 @@ impl std::fmt::Display for MigrationJobStatus {
             MigrationJobStatus::Running => write!(f, "running"),
             MigrationJobStatus::Paused => write!(f, "paused"),
             MigrationJobStatus::Completed => write!(f, "completed"),
+            MigrationJobStatus::CompletedWithErrors => write!(f, "completed_with_errors"),
             MigrationJobStatus::Failed => write!(f, "failed"),
             MigrationJobStatus::Cancelled => write!(f, "cancelled"),
         }
@@ -77,6 +83,7 @@ impl std::str::FromStr for MigrationJobStatus {
             "running" => Ok(MigrationJobStatus::Running),
             "paused" => Ok(MigrationJobStatus::Paused),
             "completed" => Ok(MigrationJobStatus::Completed),
+            "completed_with_errors" => Ok(MigrationJobStatus::CompletedWithErrors),
             "failed" => Ok(MigrationJobStatus::Failed),
             "cancelled" => Ok(MigrationJobStatus::Cancelled),
             _ => Err(format!("Unknown migration job status: {}", s)),
@@ -365,6 +372,7 @@ mod tests {
             MigrationJobStatus::Running,
             MigrationJobStatus::Paused,
             MigrationJobStatus::Completed,
+            MigrationJobStatus::CompletedWithErrors,
             MigrationJobStatus::Failed,
             MigrationJobStatus::Cancelled,
         ];
@@ -373,6 +381,11 @@ mod tests {
             let parsed: MigrationJobStatus = s.parse().unwrap();
             assert_eq!(parsed, status);
         }
+        // The partial-failure status serializes to a distinct snake_case token.
+        assert_eq!(
+            MigrationJobStatus::CompletedWithErrors.to_string(),
+            "completed_with_errors"
+        );
     }
 
     // -----------------------------------------------------------------------

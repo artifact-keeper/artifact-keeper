@@ -2108,16 +2108,21 @@ pub(crate) fn resolve_repos_for_provisioning(
 }
 
 /// Determine the final job status based on completed and failed counts.
-/// Returns Failed only when all items failed (failed > 0 and completed == 0),
-/// otherwise returns Completed.
+///
+/// - all items failed (failed > 0, completed == 0) → `Failed`
+/// - some failed, some succeeded (failed > 0, completed > 0) →
+///   `CompletedWithErrors`, so a partial/hollow migration is not surfaced as a
+///   clean success (#2457 — the OP saw "completed" over an unpullable import).
+///   The per-item counters/report carry which items failed.
+/// - nothing failed → `Completed`
 pub(crate) fn determine_final_status(
     total_failed: i32,
     total_completed: i32,
 ) -> MigrationJobStatus {
-    if total_failed > 0 && total_completed == 0 {
-        MigrationJobStatus::Failed
-    } else {
-        MigrationJobStatus::Completed
+    match (total_failed > 0, total_completed > 0) {
+        (true, false) => MigrationJobStatus::Failed,
+        (true, true) => MigrationJobStatus::CompletedWithErrors,
+        _ => MigrationJobStatus::Completed,
     }
 }
 
@@ -3472,8 +3477,10 @@ mod tests {
 
     #[test]
     fn test_determine_final_status_mixed() {
+        // Partial failure must surface as CompletedWithErrors, not a clean
+        // Completed (#2457): the OP's hollow import reported "completed".
         let status = determine_final_status(3, 7);
-        assert_eq!(status, MigrationJobStatus::Completed);
+        assert_eq!(status, MigrationJobStatus::CompletedWithErrors);
     }
 
     #[test]
@@ -3485,7 +3492,7 @@ mod tests {
     #[test]
     fn test_determine_final_status_one_failure_one_success() {
         let status = determine_final_status(1, 1);
-        assert_eq!(status, MigrationJobStatus::Completed);
+        assert_eq!(status, MigrationJobStatus::CompletedWithErrors);
     }
 
     #[test]
@@ -3506,7 +3513,7 @@ mod tests {
         );
         assert_eq!(
             determine_final_status(50_000, 50_000),
-            MigrationJobStatus::Completed
+            MigrationJobStatus::CompletedWithErrors
         );
     }
 

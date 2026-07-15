@@ -831,6 +831,7 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         // child manifests as their own items, so the referenced-content walker
         // dedups them and never calls this — it exists for correctness if the
         // enumeration ever misses a referenced digest.
+        crate::services::source_registry::validate_oci_content_ref(image, digest)?;
         let api_repo = format!("api/docker/{}/v2", repo_key);
         let path = format!("{}/{}/{}", image, kind.path_segment(), digest);
         self.download_artifact_stream(&api_repo, &path).await

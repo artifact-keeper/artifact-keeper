@@ -43,6 +43,67 @@ impl OciContentKind {
     }
 }
 
+/// Whether `digest` is a canonical `sha256:<64-lowercase-hex>` reference.
+///
+/// The by-digest fetch path (#2457) interpolates the digest into an OUTBOUND
+/// source URL, and the digest originates from an attacker-influenced manifest
+/// body. Validate it against the strict grammar before building the URL so a
+/// crafted `../`/scheme-injecting value can never reach the request builder
+/// (defense-in-depth: the response is also digest-verified and discarded).
+pub fn is_valid_oci_digest(digest: &str) -> bool {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) => {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// Whether `image` is a valid OCI repository name (lowercase path components of
+/// `[a-z0-9]` plus `.`, `_`, `-` separators, each component starting and ending
+/// alphanumeric). Rejects empty components, leading/trailing separators, `..`
+/// traversal segments, and any character outside the grammar — so the value is
+/// safe to interpolate into an outbound `v2/<image>/...` URL.
+pub fn is_valid_oci_image_name(image: &str) -> bool {
+    if image.is_empty() || image.len() > 255 || image.contains("..") {
+        return false;
+    }
+    image.split('/').all(|component| {
+        let bytes = component.as_bytes();
+        !bytes.is_empty()
+            && bytes.iter().all(|&b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+            && bytes
+                .first()
+                .is_some_and(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && bytes
+                .last()
+                .is_some_and(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+/// Validate the `(image, digest)` pair used to build an outbound by-digest OCI
+/// fetch URL, returning a 400-class `ArtifactoryError` when either is malformed.
+pub fn validate_oci_content_ref(image: &str, digest: &str) -> Result<(), ArtifactoryError> {
+    if !is_valid_oci_image_name(image) {
+        return Err(ArtifactoryError::ApiError {
+            status: 400,
+            message: format!("refusing to fetch OCI content for invalid image name '{image}'"),
+        });
+    }
+    if !is_valid_oci_digest(digest) {
+        return Err(ArtifactoryError::ApiError {
+            status: 400,
+            message: format!("refusing to fetch OCI content for invalid digest '{digest}'"),
+        });
+    }
+    Ok(())
+}
+
 /// Trait for source registry clients used during migration.
 ///
 /// Both `ArtifactoryClient` and `NexusClient` implement this trait so the
@@ -140,6 +201,9 @@ pub trait SourceRegistry: Send + Sync {
         digest: &str,
         kind: OciContentKind,
     ) -> Result<ArtifactByteStream, ArtifactoryError> {
+        // Validate the attacker-influenced components before they reach the
+        // outbound URL builder (path-traversal / injection defense-in-depth).
+        validate_oci_content_ref(image, digest)?;
         let path = format!("v2/{}/{}/{}", image, kind.path_segment(), digest);
         self.download_artifact_stream(repo_key, &path).await
     }
@@ -342,5 +406,58 @@ mod tests {
     fn test_source_type_custom() {
         let registry = MockSourceRegistry::new("custom-registry");
         assert_eq!(registry.source_type(), "custom-registry");
+    }
+
+    #[test]
+    fn valid_oci_digest_accepts_canonical_sha256() {
+        let hex = "a".repeat(64);
+        assert!(is_valid_oci_digest(&format!("sha256:{hex}")));
+        assert!(is_valid_oci_digest(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn valid_oci_digest_rejects_malformed_and_traversal() {
+        assert!(!is_valid_oci_digest("latest"));
+        assert!(!is_valid_oci_digest("sha256:short"));
+        // wrong length
+        assert!(!is_valid_oci_digest(&format!("sha256:{}", "a".repeat(63))));
+        // uppercase hex is not canonical
+        assert!(!is_valid_oci_digest(&format!("sha256:{}", "A".repeat(64))));
+        // traversal / injection attempts must not pass the digest grammar
+        assert!(!is_valid_oci_digest("sha256:../../../../etc/passwd"));
+        assert!(!is_valid_oci_digest("sha512:aaaa"));
+        assert!(!is_valid_oci_digest(""));
+    }
+
+    #[test]
+    fn valid_oci_image_name_accepts_real_names() {
+        assert!(is_valid_oci_image_name("busybox"));
+        assert!(is_valid_oci_image_name("library/busybox"));
+        assert!(is_valid_oci_image_name("org/team/app"));
+        assert!(is_valid_oci_image_name("my-repo.name_1/sub-image"));
+    }
+
+    #[test]
+    fn valid_oci_image_name_rejects_traversal_and_injection() {
+        assert!(!is_valid_oci_image_name(""));
+        assert!(!is_valid_oci_image_name("../etc/passwd"));
+        assert!(!is_valid_oci_image_name("app/../../secret"));
+        assert!(!is_valid_oci_image_name("/leading-slash"));
+        assert!(!is_valid_oci_image_name("trailing/"));
+        assert!(!is_valid_oci_image_name("double//slash"));
+        assert!(!is_valid_oci_image_name("Upper/Case"));
+        assert!(!is_valid_oci_image_name("has space"));
+        assert!(!is_valid_oci_image_name("scheme:inject"));
+        assert!(!is_valid_oci_image_name(".leading-dot"));
+    }
+
+    #[test]
+    fn validate_oci_content_ref_gates_both_components() {
+        let hex = "b".repeat(64);
+        assert!(validate_oci_content_ref("app", &format!("sha256:{hex}")).is_ok());
+        assert!(validate_oci_content_ref("../app", &format!("sha256:{hex}")).is_err());
+        assert!(validate_oci_content_ref("app", "sha256:../bad").is_err());
     }
 }
