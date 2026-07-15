@@ -631,8 +631,31 @@ pub fn spawn_all(
                 ticker.tick().await;
                 tracing::debug!("Checking for curation repos due for upstream sync");
 
-                if let Err(e) = run_curation_sync_cycle(&db).await {
+                // Cluster-lease the sweep (#2357 S11): only one replica runs the
+                // scheduled curation sync per tick. Without this every replica
+                // fans out N concurrent upstream syncs. A TTL slightly above the
+                // 300s tick keeps the job pinned to its current holder; if the
+                // lease table is unreachable the replica skips the tick rather
+                // than crashing the loop.
+                let lease = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "curation_sync",
+                    360.0,
+                )
+                .await;
+                if lease.is_none() {
+                    tracing::debug!(
+                        "Curation sync: another replica holds the lease; skipping tick"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = run_curation_sync_cycle(&db, None).await {
                     tracing::warn!("Curation sync cycle failed: {}", e);
+                }
+
+                if let Some(lease) = lease {
+                    lease.release(&db).await;
                 }
             }
         });
@@ -956,24 +979,50 @@ async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// One row of the curation-sync work query: `(staging_id, format,
+/// remote_id, upstream_url, default_action, sync_interval_secs,
+/// trusted_gpg_key)`. Named to keep the `query_as` type off clippy's
+/// `type_complexity` radar (#2357 added the trusted-key column).
+type CurationSyncRow = (
+    uuid::Uuid,
+    String,
+    uuid::Uuid,
+    String,
+    String,
+    i32,
+    Option<String>,
+);
+
 /// Find all staging repos with curation enabled, fetch upstream metadata, and evaluate new packages.
-async fn run_curation_sync_cycle(
+///
+/// When `only_repo` is `Some(id)` the cycle is restricted to that single staging
+/// repository — the code path the manual `POST /curation/repos/{key}/sync`
+/// trigger (#2357) uses; when `None` it sweeps every due repo (the scheduled
+/// path). The scheduled invocation is cluster-leased by its caller so only one
+/// replica sweeps per tick.
+pub(crate) async fn run_curation_sync_cycle(
     db: &PgPool,
+    only_repo: Option<uuid::Uuid>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
 
-    // Find repos due for sync
-    let repos: Vec<(uuid::Uuid, String, uuid::Uuid, String, String, i32)> = sqlx::query_as(
+    // Find repos due for sync. `trusted_gpg_key` (#2357) is read from the remote
+    // so the RPM path can authenticate repomd.xml before ingest. The optional
+    // `only_repo` filter scopes the sweep to one repo for the manual trigger.
+    let repos: Vec<CurationSyncRow> = sqlx::query_as(
         r#"SELECT r.id, r.format::text, r.curation_source_repo_id, remote.upstream_url,
-                  r.curation_default_action, r.curation_sync_interval_secs
-           FROM repositories r
-           JOIN repositories remote ON remote.id = r.curation_source_repo_id
-           WHERE r.curation_enabled = true
-             AND r.curation_source_repo_id IS NOT NULL
-             AND r.repo_type = 'staging'
-             AND remote.upstream_url IS NOT NULL"#,
+                      r.curation_default_action, r.curation_sync_interval_secs,
+                      remote.trusted_gpg_key
+               FROM repositories r
+               JOIN repositories remote ON remote.id = r.curation_source_repo_id
+               WHERE r.curation_enabled = true
+                 AND r.curation_source_repo_id IS NOT NULL
+                 AND r.repo_type = 'staging'
+                 AND remote.upstream_url IS NOT NULL
+                 AND ($1::uuid IS NULL OR r.id = $1)"#,
     )
+    .bind(only_repo)
     .fetch_all(db)
     .await?;
 
@@ -986,31 +1035,106 @@ async fn run_curation_sync_cycle(
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
-    for (staging_id, format, remote_id, upstream_url, default_action, _interval) in &repos {
+    for (staging_id, format, remote_id, upstream_url, default_action, _interval, trusted_gpg_key) in
+        &repos
+    {
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
             .unwrap_or(None);
 
         let entries = match format.as_str() {
             "rpm" => {
-                let repomd_url =
-                    format!("{}/repodata/repomd.xml", upstream_url.trim_end_matches('/'));
-                // Try to find primary.xml location from repomd.xml, fall back to default path
+                let base = upstream_url.trim_end_matches('/');
+                let repomd_url = format!("{}/repodata/repomd.xml", base);
                 let mut repomd_req = client.get(&repomd_url);
                 if let Some(ref auth) = upstream_auth {
                     repomd_req =
                         crate::services::upstream_auth::apply_upstream_auth(repomd_req, auth);
                 }
-                let primary_path = match repomd_req.send().await {
+                // Fetch repomd.xml as raw bytes so a detached signature can be
+                // verified over the exact content before its checksums are trusted.
+                let repomd_bytes = match repomd_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        let body = resp.text().await.unwrap_or_default();
-                        extract_primary_href(&body)
-                            .unwrap_or_else(|| "repodata/primary.xml.gz".to_string())
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
+                        match resp.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!("RPM repomd.xml read error: {}", e);
+                                continue;
+                            }
+                        }
                     }
-                    _ => "repodata/primary.xml.gz".to_string(),
+                    Ok(resp) => {
+                        tracing::warn!("RPM repomd.xml fetch failed: {}", resp.status());
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("RPM repomd.xml fetch error: {}", e);
+                        continue;
+                    }
                 };
-                let primary_url =
-                    format!("{}/{}", upstream_url.trim_end_matches('/'), primary_path);
+
+                // GPG-verify-before-ingest (#2357 S4): when a trusted key is
+                // configured on the remote, fetch repomd.xml.asc and verify the
+                // detached signature over repomd.xml. Fail-closed — any fetch,
+                // parse, or verification failure skips this repo (zero packages
+                // ingested) rather than trusting unauthenticated metadata. With
+                // no trusted key the batch proceeds as "unverified upstream".
+                match trusted_gpg_key
+                    .as_deref()
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    Some(trusted_key) => {
+                        let asc_url = format!("{}/repodata/repomd.xml.asc", base);
+                        let mut asc_req = client.get(&asc_url);
+                        if let Some(ref auth) = upstream_auth {
+                            asc_req =
+                                crate::services::upstream_auth::apply_upstream_auth(asc_req, auth);
+                        }
+                        let asc = match asc_req.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                resp.text().await.unwrap_or_default()
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "RPM curation sync: trusted GPG key set but repomd.xml.asc unavailable for staging repo {}; refusing unverified upstream",
+                                    staging_id
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::services::signing_service::verify_detached(
+                            trusted_key,
+                            &repomd_bytes,
+                            &asc,
+                        ) {
+                            Ok(()) => tracing::debug!(
+                                "RPM curation sync: verified repomd.xml signature for staging repo {}",
+                                staging_id
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "RPM curation sync: repomd.xml signature verification FAILED for staging repo {}: {}; refusing upstream (0 packages ingested)",
+                                    staging_id,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    None => tracing::info!(
+                        "RPM curation sync: no trusted GPG key configured for staging repo {}; ingesting unverified upstream metadata",
+                        staging_id
+                    ),
+                }
+
+                // Find primary.xml location from repomd.xml, fall back to default path.
+                let repomd_str = String::from_utf8_lossy(&repomd_bytes);
+                let primary_path =
+                    crate::services::curation_sync::extract_primary_href(&repomd_str)
+                        .unwrap_or_else(|| "repodata/primary.xml.gz".to_string());
+                let primary_url = format!("{}/{}", base, primary_path);
                 let mut primary_req = client.get(&primary_url);
                 if let Some(ref auth) = upstream_auth {
                     primary_req =
@@ -1146,7 +1270,6 @@ async fn run_curation_sync_cycle(
     Ok(())
 }
 
-/// Extract the primary.xml href from repomd.xml content.
 /// Decompress a gzip-compressed upstream repo index (RPM `primary.xml.gz`,
 /// Debian `Packages.gz`) during proxy-sync, bounded by the shared total-byte
 /// budget (#2556) so a malicious/compromised upstream mirror cannot inflate the
@@ -1169,20 +1292,6 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
     let mut s = String::new();
     decoder.read_to_string(&mut s)?;
     Ok(s)
-}
-
-fn extract_primary_href(repomd: &str) -> Option<String> {
-    // Look for: <data type="primary"><location href="repodata/...-primary.xml.gz"/>
-    for data_block in repomd.split("<data type=\"primary\">").skip(1) {
-        if let Some(block) = data_block.split("</data>").next() {
-            let loc_start = block.find("<location href=\"")?;
-            let href_start = loc_start + "<location href=\"".len();
-            let remaining = &block[href_start..];
-            let href_end = remaining.find('"')?;
-            return Some(remaining[..href_end].to_string());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1219,6 +1328,27 @@ mod tests {
             decompress_upstream_index_gz_limited(&bomb, 4096).is_err(),
             "upstream index bomb past budget must be bounded/rejected"
         );
+    }
+
+    // #2357 regression fence: the RPM GPG-verify/lease changes edit the SHARED
+    // `run_curation_sync_cycle`, so the Debian curation path is in blast radius.
+    // Assert the Debian branch's decompress -> parse still works end to end:
+    // a gzip-encoded `Packages` index round-trips through the (now shared,
+    // bounded) `decompress_upstream_index_gz` and yields the expected packages.
+    #[test]
+    fn test_debian_packages_index_still_decompresses_and_parses() {
+        use crate::services::curation_sync;
+        let packages = "Package: nginx\nVersion: 1.24.0-1\nArchitecture: amd64\nFilename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb\nSHA256: abc123\n\nPackage: curl\nVersion: 8.5.0-1\nArchitecture: amd64\nFilename: pool/main/c/curl/curl_8.5.0-1_amd64.deb\nSHA256: def456\n";
+        let gz = gzip(packages.as_bytes());
+        let content =
+            decompress_upstream_index_gz(&gz).expect("debian Packages.gz must still decompress");
+        let entries = curation_sync::parse_deb_packages_index(&content, "main");
+        assert_eq!(entries.len(), 2, "both debian packages must parse");
+        assert!(
+            entries.iter().any(|e| e.package_name == "nginx"),
+            "nginx must be present after debian decompress+parse"
+        );
+        assert!(entries.iter().all(|e| e.format == "debian"));
     }
 
     // -----------------------------------------------------------------------

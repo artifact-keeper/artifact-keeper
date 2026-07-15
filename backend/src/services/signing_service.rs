@@ -208,6 +208,27 @@ fn generate_openpgp_key_blocking(
     Ok((public_armored, private_armored, fingerprint, key_id))
 }
 
+/// Verify a detached ASCII-armored OpenPGP signature over `data` against a
+/// trusted ASCII-armored public key.
+///
+/// Returns `Ok(())` only when the signature is valid and made by the trusted
+/// key. Used to authenticate an upstream RPM repository's `repomd.xml.asc`
+/// before its declared checksums are trusted during a curation sync (#2357):
+/// the sync is fail-closed, so any parse or verification error rejects the
+/// batch rather than ingesting unverified metadata.
+///
+/// CPU-bound (public-key verification); call from within `spawn_blocking` when
+/// on a request/async path.
+pub fn verify_detached(trusted_armored_key: &str, data: &[u8], armored_sig: &str) -> Result<()> {
+    let (public_key, _) = SignedPublicKey::from_string(trusted_armored_key)
+        .map_err(|e| AppError::Validation(format!("Invalid trusted GPG public key: {}", e)))?;
+    let (signature, _) = StandaloneSignature::from_string(armored_sig)
+        .map_err(|e| AppError::Validation(format!("Invalid detached signature: {}", e)))?;
+    signature.verify(&public_key, data).map_err(|e| {
+        AppError::Authorization(format!("Upstream signature verification failed: {}", e))
+    })
+}
+
 /// Create an ASCII-armored detached OpenPGP signature.
 ///
 /// CPU-bound. Call from within `spawn_blocking`.
@@ -1051,6 +1072,53 @@ mod tests {
             .unwrap();
         let (message, _) = CleartextSignedMessage::from_string(&cleartext).unwrap();
         message.verify(&public_key).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // #2357 — verify_detached (upstream repomd.xml.asc authentication)
+    //
+    // A valid detached signature over the exact bytes passes; a tampered body,
+    // a tampered signature, or the wrong trusted key all fail-closed. This is
+    // the primitive the RPM curation sync uses to reject unverified upstream
+    // metadata before ingest.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_verify_detached_valid_tampered_and_wrong_key() {
+        let passphrase = "detached-verify-passphrase";
+        let key = generate_test_openpgp_signing_key(passphrase).await;
+        let service = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase(passphrase),
+        };
+
+        let repomd = b"<repomd><data type=\"primary\"></data></repomd>";
+        let sig = service
+            .sign_openpgp_detached_with_key(&key, repomd)
+            .await
+            .unwrap();
+
+        // Valid signature over the exact bytes against the trusted key -> Ok.
+        verify_detached(&key.public_key_pem, repomd, &sig)
+            .expect("valid detached signature must verify against the trusted key");
+
+        // Tampered body -> rejected (checksums cannot be trusted).
+        let tampered = b"<repomd><data type=\"primary\">EVIL</data></repomd>";
+        assert!(
+            verify_detached(&key.public_key_pem, tampered, &sig).is_err(),
+            "a tampered repomd.xml must fail signature verification"
+        );
+
+        // Wrong trusted key -> rejected.
+        let other = generate_test_openpgp_signing_key(passphrase).await;
+        assert!(
+            verify_detached(&other.public_key_pem, repomd, &sig).is_err(),
+            "a signature from a different key must not verify against the trusted key"
+        );
+
+        // Malformed key / signature material -> rejected (not a panic).
+        assert!(verify_detached("not-a-key", repomd, &sig).is_err());
+        assert!(verify_detached(&key.public_key_pem, repomd, "not-a-sig").is_err());
     }
 
     // -----------------------------------------------------------------------

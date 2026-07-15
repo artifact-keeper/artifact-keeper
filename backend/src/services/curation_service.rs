@@ -291,6 +291,57 @@ impl CurationService {
             .await
     }
 
+    /// Search synced packages of one staging repo by name (#2357 WI-6).
+    ///
+    /// Filters `curation_packages` for `staging_repo_id`, optionally narrowing
+    /// by a case-insensitive substring of `package_name` (`q`), an exact
+    /// `architecture`, and a `status`. Ordered by name/version and paginated.
+    /// This is the user/dnf-facing search over synced metadata, distinct from
+    /// [`list_packages`](Self::list_packages) (a status-filtered review listing).
+    /// The name filter is served by `idx_curation_pkg_name`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_packages(
+        &self,
+        staging_repo_id: Uuid,
+        q: Option<&str>,
+        arch: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CurationPackage>, sqlx::Error> {
+        // `q` becomes a case-insensitive substring match; NULL binds disable the
+        // corresponding predicate. A single parameterized query keeps the name
+        // ILIKE index-usable and avoids per-filter SQL string assembly.
+        let name_like = q.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| {
+            format!(
+                "%{}%",
+                s.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+        let arch = arch.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let status = status.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        sqlx::query_as(
+            r#"SELECT * FROM curation_packages
+               WHERE staging_repo_id = $1
+                 AND ($2::text IS NULL OR package_name ILIKE $2)
+                 AND ($3::text IS NULL OR architecture = $3)
+                 AND ($4::text IS NULL OR status = $4)
+               ORDER BY package_name ASC, version ASC
+               LIMIT $5 OFFSET $6"#,
+        )
+        .bind(staging_repo_id)
+        .bind(name_like)
+        .bind(arch)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await
+    }
+
     pub async fn set_package_status(
         &self,
         id: Uuid,

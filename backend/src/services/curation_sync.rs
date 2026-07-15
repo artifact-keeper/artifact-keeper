@@ -173,9 +173,54 @@ fn extract_rpm_version(xml: &str) -> (String, String) {
     (ver, rel)
 }
 
+/// Extract the `primary` data file href from an RPM `repomd.xml`.
+///
+/// Returns the `<location href="...">` of the `<data type="primary">` block
+/// (typically `repodata/…-primary.xml.gz`) so the curation sync knows where to
+/// fetch the package index. Kept next to [`parse_rpm_primary_xml`] as a pure,
+/// table-testable helper so the sync path and any future consumer share one
+/// implementation (#2357 WI-1). Returns `None` when no primary block is present.
+pub fn extract_primary_href(repomd: &str) -> Option<String> {
+    // Look for: <data type="primary"><location href="repodata/...-primary.xml.gz"/>
+    for data_block in repomd.split("<data type=\"primary\">").skip(1) {
+        if let Some(block) = data_block.split("</data>").next() {
+            let loc_start = block.find("<location href=\"")?;
+            let href_start = loc_start + "<location href=\"".len();
+            let remaining = &block[href_start..];
+            let href_end = remaining.find('"')?;
+            return Some(remaining[..href_end].to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_primary_href_present() {
+        let repomd = r#"<?xml version="1.0"?>
+<repomd>
+  <data type="filelists"><location href="repodata/filelists.xml.gz"/></data>
+  <data type="primary"><location href="repodata/1234-primary.xml.gz"/></data>
+</repomd>"#;
+        assert_eq!(
+            extract_primary_href(repomd),
+            Some("repodata/1234-primary.xml.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_primary_href_absent() {
+        let repomd = r#"<repomd>
+  <data type="filelists"><location href="repodata/filelists.xml.gz"/></data>
+</repomd>"#;
+        assert_eq!(extract_primary_href(repomd), None);
+        // Empty / malformed input never panics.
+        assert_eq!(extract_primary_href(""), None);
+        assert_eq!(extract_primary_href("<data type=\"primary\">"), None);
+    }
 
     #[test]
     fn test_parse_rpm_primary_xml() {

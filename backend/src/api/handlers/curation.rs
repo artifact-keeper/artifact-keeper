@@ -14,7 +14,9 @@ use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::curation_service::CurationService;
+use crate::services::repository_service::RepositoryService;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -31,6 +33,8 @@ use crate::services::curation_service::CurationService;
         bulk_approve,
         bulk_block,
         re_evaluate,
+        trigger_sync,
+        search_packages,
         stats,
     ),
     components(schemas(
@@ -40,6 +44,8 @@ use crate::services::curation_service::CurationService;
         CurationPackageResponse,
         BulkStatusRequest,
         PackageListQuery,
+        PackageSearchQuery,
+        SyncTriggerResponse,
         ReEvaluateRequest,
         StatsResponse,
         StatusCount,
@@ -68,6 +74,9 @@ pub fn router() -> Router<SharedState> {
         .route("/packages/bulk-approve", post(bulk_approve))
         .route("/packages/bulk-block", post(bulk_block))
         .route("/packages/re-evaluate", post(re_evaluate))
+        // Per-repo manual sync trigger (#2357 WI-5) + package search (WI-6)
+        .route("/repos/:repo_key/sync", post(trigger_sync))
+        .route("/repos/:repo_key/packages/search", get(search_packages))
         // Stats
         .route("/stats", get(stats))
 }
@@ -198,6 +207,32 @@ pub struct StatusCount {
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct StatsQuery {
     pub staging_repo_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct PackageSearchQuery {
+    /// Case-insensitive substring match on the package name.
+    pub q: Option<String>,
+    /// Exact architecture filter (e.g. `x86_64`, `noarch`).
+    pub arch: Option<String>,
+    /// Curation status filter (e.g. `approved`, `pending`, `blocked`, `review`).
+    pub status: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SyncTriggerResponse {
+    /// The repository key the sync was triggered for.
+    pub repository: String,
+    /// Always true when the trigger was accepted and a sync pass ran.
+    pub triggered: bool,
+    /// Whether the sync pass completed without error. A false value with
+    /// `triggered = true` means the pass ran but an upstream fetch/verify step
+    /// failed for the repo (details are in the server logs, not this response).
+    pub succeeded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +552,165 @@ async fn re_evaluate(
         .re_evaluate_pending(req.staging_repo_id, &req.default_action)
         .await?;
     Ok(Json(count))
+}
+
+// ---------------------------------------------------------------------------
+// Manual sync trigger + package search (#2357)
+// ---------------------------------------------------------------------------
+
+/// Pure global-capability gate for the manual sync trigger (#2357 WI-5),
+/// mirroring promotion's `ensure_promotion_authorized`: authorized when the
+/// caller is an admin OR presents an API token carrying the admin-mintable
+/// `trigger:sync` scope. Split out as a pure boolean so the decision is
+/// unit-testable without a DB, and so a JWT/session user cannot acquire the
+/// capability through the scope (the call site guards on `is_api_token`).
+fn ensure_sync_authorized(is_admin: bool, has_sync_scope: bool) -> Result<(), AppError> {
+    if !is_admin && !has_sync_scope {
+        return Err(AppError::Authorization(
+            "Only admins or tokens with the 'trigger:sync' scope can trigger a sync".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pure tenant-ownership decision for the manual sync trigger, mirroring
+/// promotion's `promotion_tenant_access_allowed`: the admin capability flag does
+/// NOT blanket-bypass tenancy. A genuine super-admin passes via a NULL-scoped
+/// grant; a tenant-scoped admin is rejected for a repository in a tenant they do
+/// not own. Public repositories carry no tenant boundary, so they always pass.
+fn sync_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> bool {
+    repo_is_public || has_repo_grant
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/curation/repos/{repo_key}/sync",
+    operation_id = "trigger_curation_sync",
+    params(("repo_key" = String, Path, description = "Staging repository key")),
+    responses(
+        (status = 200, body = SyncTriggerResponse),
+        (status = 403, description = "Not authorized to trigger a sync for this repo"),
+        (status = 404, description = "Repository not found"),
+    ),
+    tag = "Curation"
+)]
+async fn trigger_sync(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(repo_key): Path<String>,
+) -> Result<Json<SyncTriggerResponse>, AppError> {
+    // Global capability (#2357 S5): admin, or an API token carrying the
+    // admin-mintable `trigger:sync` scope. `has_scope` is true for JWT sessions,
+    // so the `is_api_token` guard keeps a session user from gaining the
+    // capability they were never granted — mirroring the promotion gate.
+    let has_sync_scope = auth.is_api_token && auth.has_scope("trigger:sync");
+    ensure_sync_authorized(auth.is_admin, has_sync_scope)?;
+
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service
+        .get_by_key(&repo_key)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::NotFound("Repository not found".to_string()),
+            other => other,
+        })?;
+
+    // Tenant-ownership gate (campaign-#4 systemic authz), enforced independently
+    // of the admin flag. A repo-scoped admin cannot trigger a sync for a repo in
+    // another tenant; a genuine super-admin passes via their NULL-scoped grant.
+    // Deliberately NOT `require_repo_access` (weaker, see systemic-artifact-authz-gap).
+    let has_grant = repo_service
+        .user_can_access_repo(repo.id, auth.user_id)
+        .await?;
+    if !sync_tenant_access_allowed(repo.is_public, has_grant) {
+        return Err(AppError::Authorization(format!(
+            "You are not authorized to trigger a sync for the '{}' repository's tenant",
+            repo.key
+        )));
+    }
+
+    // Run one sync pass for this repo. The pass applies the bounded-decompress
+    // (#2556) and GPG-verify-before-ingest (#2357 S4) hardening. Upstream errors
+    // are logged and surfaced as `succeeded = false`, not propagated, so the
+    // trigger's own outcome (accepted + audited) is deterministic.
+    let sync_result =
+        crate::services::scheduler_service::run_curation_sync_cycle(&state.db, Some(repo.id)).await;
+    let succeeded = sync_result.is_ok();
+    if let Err(ref e) = sync_result {
+        tracing::warn!("Manual curation sync for repo {} failed: {}", repo.key, e);
+    }
+
+    // Audit (#2357 S7). Details carry only the repo key + outcome — never
+    // upstream credentials or response text (WI-7). Fire-and-forget: an audit
+    // write failure must not mask a completed sync trigger.
+    let _ = AuditService::new(state.db.clone())
+        .log(
+            AuditEntry::new(AuditAction::CurationSyncTriggered, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repo.id)
+                .actor_name(auth.username.clone())
+                .resource_name(repo.key.clone())
+                .details(serde_json::json!({
+                    "repo_key": repo.key,
+                    "succeeded": succeeded,
+                })),
+        )
+        .await;
+
+    Ok(Json(SyncTriggerResponse {
+        repository: repo.key,
+        triggered: true,
+        succeeded,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/curation/repos/{repo_key}/packages/search",
+    operation_id = "search_curation_packages",
+    params(
+        ("repo_key" = String, Path, description = "Staging repository key"),
+        PackageSearchQuery,
+    ),
+    responses(
+        (status = 200, body = Vec<CurationPackageResponse>),
+        (status = 404, description = "Repository not found or not visible"),
+    ),
+    tag = "Curation"
+)]
+async fn search_packages(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(repo_key): Path<String>,
+    Query(query): Query<PackageSearchQuery>,
+) -> Result<Json<Vec<CurationPackageResponse>>, AppError> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service
+        .get_by_key(&repo_key)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::NotFound("Repository not found".to_string()),
+            other => other,
+        })?;
+    // Tenant-scoped read gate (mirrors `list_packages`): a caller who cannot see
+    // the staging repo gets an existence-hiding 404 (#2443), so the repo key is
+    // not an existence oracle and cross-tenant search is refused.
+    require_repo_id_visible(&state.db, &auth, repo.id, "Repository not found").await?;
+
+    let limit = query.limit.clamp(1, 500);
+    let offset = query.offset.max(0);
+    let svc = CurationService::new(state.db.clone());
+    let packages = svc
+        .search_packages(
+            repo.id,
+            query.q.as_deref(),
+            query.arch.as_deref(),
+            query.status.as_deref(),
+            limit,
+            offset,
+        )
+        .await?;
+    Ok(Json(packages.into_iter().map(pkg_to_response).collect()))
 }
 
 #[utoipa::path(
@@ -1059,5 +1253,235 @@ mod tests {
         }
 
         tdh::cleanup_user(&pool, user).await;
+    }
+
+    // ----------------------------------------------------------------------
+    // #2357 — manual sync trigger authz (pure) + search / trigger (DB).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_sync_authorized_pure() {
+        // admin passes; scoped token passes; neither is rejected.
+        assert!(super::ensure_sync_authorized(true, false).is_ok());
+        assert!(super::ensure_sync_authorized(false, true).is_ok());
+        let denied = super::ensure_sync_authorized(false, false);
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "no admin + no scope must be rejected: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn test_sync_tenant_access_allowed_pure() {
+        // Admin flag does NOT bypass: only a grant or a public repo allows.
+        assert!(super::sync_tenant_access_allowed(false, true));
+        assert!(super::sync_tenant_access_allowed(true, false)); // public repo
+        assert!(!super::sync_tenant_access_allowed(false, false));
+    }
+
+    /// An API-token principal carrying the admin-mintable `trigger:sync` scope.
+    fn sync_scope_token(user_id: Uuid, username: &str) -> AuthExtension {
+        AuthExtension {
+            user_id,
+            username: username.to_string(),
+            email: format!("{username}@test.local"),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["trigger:sync".to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    // POST /repos/{key}/sync: anon-ish non-admin (no scope) -> 403;
+    // authorized admin -> 200 and exactly one CURATION_SYNC_TRIGGERED audit row.
+    #[tokio::test]
+    async fn test_trigger_sync_authz_and_audit_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // A curation staging repo whose remote points at an unreachable upstream,
+        // so the sync pass runs and safely no-ops (no network) — the trigger's
+        // authz + audit behavior is what we assert.
+        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_source_repo_id = $2 WHERE id = $1",
+        )
+        .bind(staging)
+        .bind(remote)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Point the remote at an address that refuses instantly so the sync pass
+        // fails fast (connection refused) instead of waiting on a DNS/HTTP
+        // timeout — the trigger's authz + audit behavior is what this asserts.
+        sqlx::query("UPDATE repositories SET upstream_url = 'http://127.0.0.1:1' WHERE id = $1")
+            .bind(remote)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (user, uname) = tdh::create_user(&pool).await;
+        let (admin, aname) = tdh::create_user(&pool).await;
+        // The admin genuinely owns this tenant: grant a repo-scoped assignment so
+        // the (admin-flag-independent) tenant gate passes. This models a real
+        // super-admin/tenant owner, not a foreign-tenant admin (which the
+        // cross-tenant test asserts is refused).
+        tdh::grant_repo_access(&pool, staging, admin).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Non-admin, no scope -> 403 (no sync, no audit).
+        let denied = super::trigger_sync(
+            State(state.clone()),
+            Extension(tdh::make_auth(user, &uname)),
+            Path(skey.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "non-admin without trigger:sync must be 403: {denied:?}"
+        );
+
+        // Authorized admin -> 200, triggered, and one audit row for the repo.
+        let ok = super::trigger_sync(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(skey.clone()),
+        )
+        .await;
+        assert!(ok.is_ok(), "admin trigger must succeed: {ok:?}");
+        assert!(ok.unwrap().triggered);
+
+        let audits = tdh::audit_count(&pool, staging, "CURATION_SYNC_TRIGGERED").await;
+        assert_eq!(
+            audits, 1,
+            "an authorized sync trigger must write exactly one audit_log row"
+        );
+
+        // A scoped API token also passes the global gate (tenant check applies).
+        let scoped = super::trigger_sync(
+            State(state),
+            Extension(sync_scope_token(admin, &aname)),
+            Path(skey),
+        )
+        .await;
+        assert!(
+            scoped.is_ok(),
+            "trigger:sync-scoped token passes the global gate: {scoped:?}"
+        );
+
+        tdh::cleanup(&pool, staging, user).await;
+        tdh::cleanup(&pool, remote, admin).await;
+    }
+
+    // Wrong-tenant admin-capable principal (repo-scoped admin, no grant on a
+    // PRIVATE repo) must be refused by the tenant gate even though is_admin.
+    #[tokio::test]
+    async fn test_trigger_sync_cross_tenant_admin_rejected_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (other_user, ouname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // A tenant-scoped admin (is_admin=true) with NO grant on this private
+        // repo. `admin_auth` uses AccessScope::Admin, but the tenant gate keys
+        // off `user_can_access_repo`, which this user does not have.
+        let denied = super::trigger_sync(
+            State(state),
+            Extension(tdh::admin_auth(other_user, &ouname)),
+            Path(skey),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "admin-capable principal without a tenant grant must be 403: {denied:?}"
+        );
+
+        tdh::cleanup(&pool, staging, other_user).await;
+    }
+
+    // GET /repos/{key}/packages/search: non-member -> existence-hiding 404;
+    // member -> 200 with the NEVRA rows filtered by the name query.
+    #[tokio::test]
+    async fn test_search_packages_tenant_and_filter_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, skey, _sd) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        // Seed two RPM packages so the name filter is exercised.
+        for (name, arch) in [("bash", "x86_64"), ("curl", "x86_64")] {
+            sqlx::query(
+                "INSERT INTO curation_packages \
+                 (staging_repo_id, remote_repo_id, format, package_name, version, release, architecture, upstream_path, status) \
+                 VALUES ($1, $2, 'rpm', $3, '5.1.8', '1.el9', $4, $5, 'approved')",
+            )
+            .bind(staging)
+            .bind(remote)
+            .bind(name)
+            .bind(arch)
+            .bind(format!("Packages/{name}.rpm"))
+            .execute(&pool)
+            .await
+            .expect("seed curation package");
+        }
+
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, member).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Non-member -> 404 (existence-hiding).
+        let denied = super::search_packages(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(skey.clone()),
+            Query(PackageSearchQuery {
+                q: Some("bash".to_string()),
+                arch: None,
+                status: None,
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member search must 404: {denied:?}"
+        );
+
+        // Member -> 200, name filter returns only bash.
+        let seen = super::search_packages(
+            State(state),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(skey),
+            Query(PackageSearchQuery {
+                q: Some("bash".to_string()),
+                arch: Some("x86_64".to_string()),
+                status: Some("approved".to_string()),
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .expect("member search must succeed");
+        let rows = seen.0;
+        assert_eq!(
+            rows.len(),
+            1,
+            "name filter must return only the bash package"
+        );
+        assert_eq!(rows[0].package_name, "bash");
+        assert_eq!(rows[0].architecture.as_deref(), Some("x86_64"));
+
+        tdh::cleanup(&pool, staging, member).await;
+        tdh::cleanup(&pool, remote, outsider).await;
     }
 }
