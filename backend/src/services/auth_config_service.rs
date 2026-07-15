@@ -48,6 +48,14 @@ pub struct OidcConfigRow {
     /// When true, the OIDC `groups` claim values are reflected as
     /// Artifact Keeper group memberships (auto-creating groups on first
     /// sight). Otherwise legacy role mapping is used.
+    ///
+    /// SECURITY: groups are found-or-created by NAME, so enabling this
+    /// trusts the IdP's group taxonomy — an IdP-supplied group name that
+    /// collides with a privileged local group joins the user into that
+    /// local group. Ensure privileged local group names can't be shadowed
+    /// by IdP-emittable names (see SECURITY.md "SSO group mapping trusts
+    /// the IdP group taxonomy"). Does not grant `is_admin` (that is only
+    /// via `admin_group`).
     pub map_groups_to_groups: bool,
     /// Opt-in compatibility flag (migration 144): when true, ID tokens
     /// signed with RSA keys shorter than 2048 bits are accepted via a
@@ -117,6 +125,16 @@ pub struct SamlConfigRow {
     /// `external_source = 'saml'`, reconciled per login). Mirrors the OIDC
     /// flag from #1094; defaults to false so existing providers keep the
     /// admin-role-only group behavior (migration 157, #2333).
+    ///
+    /// SECURITY: groups are found-or-created by NAME, so enabling this
+    /// trusts the IdP's group taxonomy — a signed group claim whose name
+    /// collides with a privileged local group joins the user into that
+    /// local group, and (because prune is scoped to
+    /// `external_source = 'saml'`) that membership persists until an
+    /// operator removes it. Ensure privileged local group names can't be
+    /// shadowed by IdP-emittable names (see SECURITY.md "SSO group mapping
+    /// trusts the IdP group taxonomy"). Does not grant `is_admin` (that is
+    /// only via `admin_group`).
     pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
