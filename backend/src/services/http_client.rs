@@ -740,8 +740,6 @@ mod tests {
     async fn test_configured_proxy_host_is_exempted_from_guard() {
         use tokio::net::TcpListener;
 
-        let _lock = PROXY_ENV_LOCK.lock().unwrap();
-
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind proxy listener");
@@ -752,15 +750,21 @@ mod tests {
         // build synchronously, then remove it immediately — this keeps the
         // process-wide env mutation to a synchronous window (no `.await` in
         // between) so it cannot perturb a concurrently-running test that also
-        // builds a client.
-        std::env::set_var("HTTP_PROXY", format!("http://localhost:{port}"));
-        std::env::remove_var("NO_PROXY");
-        std::env::remove_var("no_proxy");
-        let client = base_client_builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .expect("build client");
-        std::env::remove_var("HTTP_PROXY");
+        // builds a client. The `PROXY_ENV_LOCK` guard serializes that window
+        // and is dropped before the request `.await` below, so it never
+        // crosses an await point.
+        let client = {
+            let _proxy_env_guard = PROXY_ENV_LOCK.lock().unwrap();
+            std::env::set_var("HTTP_PROXY", format!("http://localhost:{port}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            let client = base_client_builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("build client");
+            std::env::remove_var("HTTP_PROXY");
+            client
+        };
 
         // GET an external http host so the built-in proxy applies; we only care
         // that the connect reaches the proxy listener, not about a full response.
