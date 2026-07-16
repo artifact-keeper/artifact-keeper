@@ -337,10 +337,195 @@ fn yaml_scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+/// Is `rest` (which begins with a `|` or `>`) a YAML block-scalar header, i.e.
+/// `|`/`>` optionally followed by indentation/chomping indicators and then only
+/// whitespace or a comment? Used to skip literal block-scalar bodies (e.g. a
+/// multi-line `description:` with markdown `*` bullets) during the anchor scan.
+/// A value like `>= 1.0` is deliberately *not* a header.
+fn is_block_scalar_header(rest: &[u8]) -> bool {
+    let mut j = 1;
+    while j < rest.len() && (rest[j].is_ascii_digit() || rest[j] == b'+' || rest[j] == b'-') {
+        j += 1;
+    }
+    while j < rest.len() {
+        match rest[j] {
+            b' ' | b'\t' => j += 1,
+            b'#' => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Cheaply detect whether YAML `content` uses anchors (`&name`), aliases
+/// (`*name`), or merge keys (`<<`) as *structural* indicators.
+///
+/// serde_yaml 0.9 is libyaml-backed and expands aliases with no bound, so an
+/// anchor/alias "billion laughs" bomb only a few KB in size (well under the
+/// 8 MiB `MAX_INGEST_METADATA_ENTRY_BYTES` cap) can expand to gigabytes of nodes
+/// during parse — even through fields we deserialize as ignored, since aliases
+/// are resolved before a value is discarded — pinning a tokio worker's CPU and
+/// memory synchronously on the async push path. A machine-generated `gem build`
+/// `metadata.gz` for a `Gem::Specification` never uses anchors/aliases/merge
+/// keys, so rejecting any input that does costs nothing legitimate and is a
+/// guaranteed stop: with no aliases, parse cost is linear in the (capped) input.
+///
+/// The scan tracks single/double-quote state and block-scalar bodies so a
+/// literal `&`/`*`/`<<` inside a scalar *value* is not a false positive. Per the
+/// YAML spec a *plain* scalar can never begin with `&` or `*`, so an anchor or
+/// alias indicator is exactly a `&`/`*` at a node-start position outside quotes.
+fn yaml_uses_anchors_or_aliases(content: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::None;
+    // `Some(indent)` while inside a `|`/`>` block scalar whose parent key sits at
+    // column `indent`; more-indented lines are literal text, not structure.
+    let mut block_scalar_parent: Option<usize> = None;
+
+    for line in content.lines() {
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+
+        // Finish a quoted scalar that opened on a previous physical line (YAML
+        // wraps long double-quoted scalars). Nothing here can be an indicator.
+        if quote != Quote::None {
+            while i < bytes.len() {
+                let c = bytes[i];
+                match quote {
+                    Quote::Single => {
+                        if c == b'\'' {
+                            if bytes.get(i + 1) == Some(&b'\'') {
+                                i += 2;
+                                continue;
+                            }
+                            quote = Quote::None;
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Quote::Double => {
+                        if c == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if c == b'"' {
+                            quote = Quote::None;
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Quote::None => break,
+                }
+                i += 1;
+            }
+            if quote != Quote::None {
+                continue; // scalar still open; whole line is literal text
+            }
+        }
+
+        // Skip block-scalar body lines (only meaningful at a fresh line start).
+        if i == 0 {
+            if let Some(parent) = block_scalar_parent {
+                let indent = line.len() - line.trim_start().len();
+                if line.trim().is_empty() || indent > parent {
+                    continue;
+                }
+                block_scalar_parent = None;
+            }
+        }
+
+        // Resuming mid-value (after a closed multi-line quote) is not node start.
+        let mut at_node_start = i == 0;
+
+        while i < bytes.len() {
+            let c = bytes[i];
+            match c {
+                b' ' | b'\t' => i += 1,
+                b'#' => break, // comment to end of line
+                b'\'' => {
+                    at_node_start = false;
+                    i += 1;
+                    loop {
+                        if i >= bytes.len() {
+                            quote = Quote::Single;
+                            break;
+                        }
+                        if bytes[i] == b'\'' {
+                            if bytes.get(i + 1) == Some(&b'\'') {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    at_node_start = false;
+                    i += 1;
+                    loop {
+                        if i >= bytes.len() {
+                            quote = Quote::Double;
+                            break;
+                        }
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'&' | b'*' if at_node_start => return true,
+                b'<' if at_node_start && bytes.get(i + 1) == Some(&b'<') => return true,
+                b'|' | b'>' if at_node_start && is_block_scalar_header(&bytes[i..]) => {
+                    let indent = line.len() - line.trim_start().len();
+                    block_scalar_parent = Some(indent);
+                    break;
+                }
+                b'-' if at_node_start && (i + 1 >= bytes.len() || bytes[i + 1] == b' ') => {
+                    // block sequence entry "- "; the entry's value begins a node
+                    i += 1;
+                }
+                b':' if i + 1 >= bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t' => {
+                    at_node_start = true;
+                    i += 1;
+                }
+                b',' | b'[' | b'{' => {
+                    at_node_start = true;
+                    i += 1;
+                }
+                _ => {
+                    at_node_start = false;
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Extract dependencies from a gem's `metadata.gz` YAML into
 /// `[name, requirement-string, type]` triples. Returns `None` if the content is
 /// not parseable as a gemspec document.
 fn parse_gemspec_dependencies(content: &str) -> Option<Vec<GemDependency>> {
+    // Fail closed on anchor/alias/merge-key YAML before handing it to
+    // serde_yaml: it has no alias-expansion bound, so a tiny "billion laughs"
+    // bomb would otherwise pin a tokio worker on the async push path. Real
+    // `gem build` metadata never uses these, so this drops no legitimate deps.
+    if yaml_uses_anchors_or_aliases(content) {
+        return None;
+    }
+
     #[derive(serde::Deserialize, Default)]
     struct YReq {
         #[serde(default)]
@@ -1117,6 +1302,93 @@ dependencies:
         assert_eq!(deps[1].name, "rake");
         assert_eq!(deps[1].requirements, ">= 12.0");
         assert_eq!(deps[1].dep_type, "development");
+    }
+
+    #[test]
+    fn test_parse_gemspec_dependencies_alias_bomb_bounded() {
+        // A YAML anchor/alias "billion laughs": ~0.5 KB of source that libyaml
+        // would expand to ~9^7 (~4.7M) nodes if parsed. The pre-scan must reject
+        // it before serde_yaml runs, so dependencies are simply left unset
+        // (fail-closed, the push still succeeds) and it returns near-instantly.
+        let bomb = r#"--- !ruby/object:Gem::Specification
+name: evil
+a: &a ["lol","lol","lol","lol","lol","lol","lol","lol","lol"]
+b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]
+c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]
+d: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]
+e: &e [*d,*d,*d,*d,*d,*d,*d,*d,*d]
+f: &f [*e,*e,*e,*e,*e,*e,*e,*e,*e]
+g: &g [*f,*f,*f,*f,*f,*f,*f,*f,*f]
+dependencies: [*g,*g,*g,*g,*g,*g,*g,*g,*g]
+"#;
+        let start = std::time::Instant::now();
+        let deps = parse_gemspec_dependencies(bomb);
+        let elapsed = start.elapsed();
+        assert!(deps.is_none(), "alias-bomb must be rejected (deps unset)");
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "alias-bomb handling must stay bounded, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_yaml_anchor_scan_detects_indicators() {
+        // Structural anchors, aliases and merge keys are all rejected.
+        assert!(yaml_uses_anchors_or_aliases("a: &anchor 1\n"));
+        assert!(yaml_uses_anchors_or_aliases("a: *alias\n"));
+        assert!(yaml_uses_anchors_or_aliases("deps: [*a, *b]\n"));
+        assert!(yaml_uses_anchors_or_aliases("foo:\n  <<: bar\n"));
+        assert!(yaml_uses_anchors_or_aliases("- &x 1\n"));
+    }
+
+    #[test]
+    fn test_yaml_anchor_scan_no_false_positive_in_scalars() {
+        // `&`/`*`/`<<` inside scalar *values* are literal text, not indicators.
+        assert!(!yaml_uses_anchors_or_aliases(
+            "name: dtf\nsummary: Fast & simple; uses *globs* and a << b\n"
+        ));
+        assert!(!yaml_uses_anchors_or_aliases(
+            "desc: \"has & and * and << inside\"\n"
+        ));
+        assert!(!yaml_uses_anchors_or_aliases(
+            "desc: 'has & and * inside'\n"
+        ));
+        // A multi-line block scalar whose body has markdown `*` bullets is fine.
+        assert!(!yaml_uses_anchors_or_aliases(
+            "description: |\n  Features:\n  * fast\n  * simple\nname: foo\n"
+        ));
+        // A physically wrapped double-quoted scalar spanning two lines is fine.
+        assert!(!yaml_uses_anchors_or_aliases(
+            "description: \"long line that\n  wraps & keeps *going\"\nname: foo\n"
+        ));
+        // `>=` requirement values must not be mistaken for a block scalar header.
+        assert!(!yaml_uses_anchors_or_aliases("requirement: >= 1.0\n"));
+    }
+
+    #[test]
+    fn test_parse_gemspec_dependencies_scalar_specials_still_parse() {
+        // Real deps must still parse even when other fields carry literal
+        // `&`/`*` in their values (guards against an over-eager pre-scan).
+        let yaml = r#"--- !ruby/object:Gem::Specification
+name: dtf-app
+summary: Fast & simple; uses *globs*
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: dtf-dep
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - '='
+      - !ruby/object:Gem::Version
+        version: 1.0.0
+  type: :runtime
+  prerelease: false
+"#;
+        let deps = parse_gemspec_dependencies(yaml).expect("real deps still parse");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "dtf-dep");
+        assert_eq!(deps[0].requirements, "= 1.0.0");
+        assert_eq!(deps[0].dep_type, "runtime");
     }
 
     #[test]
