@@ -221,19 +221,19 @@ impl CurationService {
         checksum_sha256: Option<&str>,
         upstream_path: &str,
         metadata: &serde_json::Value,
-        primary_xml_snippet: Option<&str>,
+        primary_metadata: Option<&serde_json::Value>,
     ) -> Result<CurationPackage, sqlx::Error> {
         sqlx::query_as(
             r#"INSERT INTO curation_packages
                (staging_repo_id, remote_repo_id, format, package_name, version, release,
-                architecture, checksum_sha256, upstream_path, metadata, primary_xml_snippet)
+                architecture, checksum_sha256, upstream_path, metadata, primary_metadata)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                ON CONFLICT (staging_repo_id, format, package_name, version,
                            COALESCE(release, ''), COALESCE(architecture, ''))
                DO UPDATE SET checksum_sha256 = EXCLUDED.checksum_sha256,
                             upstream_path = EXCLUDED.upstream_path,
                             metadata = EXCLUDED.metadata,
-                            primary_xml_snippet = EXCLUDED.primary_xml_snippet,
+                            primary_metadata = EXCLUDED.primary_metadata,
                             upstream_updated_at = now()
                RETURNING *"#,
         )
@@ -247,7 +247,7 @@ impl CurationService {
         .bind(checksum_sha256)
         .bind(upstream_path)
         .bind(metadata)
-        .bind(primary_xml_snippet)
+        .bind(primary_metadata)
         .fetch_one(&self.db)
         .await
     }

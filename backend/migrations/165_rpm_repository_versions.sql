@@ -9,13 +9,16 @@
 --   ALTER TABLE repositories DROP COLUMN IF EXISTS active_publication_id;
 --   DROP TABLE IF EXISTS repository_version_packages;
 --   DROP TABLE IF EXISTS repository_versions;
---   ALTER TABLE curation_packages DROP COLUMN IF EXISTS primary_xml_snippet;
+--   ALTER TABLE curation_packages DROP COLUMN IF EXISTS primary_metadata;
 
--- 1. Retain the verbatim upstream `<package>` block on each synced package so a
---    publish can re-emit an upstream-faithful primary.xml. Rows synced before
---    this column existed stay NULL and must be re-synced before a publish can
---    include them (the publish path fails closed on a missing snippet).
-ALTER TABLE curation_packages ADD COLUMN IF NOT EXISTS primary_xml_snippet TEXT;
+-- 1. Retain the STRUCTURED, validated upstream primary.xml metadata on each
+--    synced package (#2358 A-hardened). Captured as typed JSONB so a publish
+--    re-serializes it canonically under AK's escaping and AK-derived
+--    `<location>` -- attacker-influenced upstream markup is never signed
+--    verbatim. Rows synced before this column existed stay NULL and must be
+--    re-synced before a publish can include them (the publish path fails closed
+--    on missing metadata).
+ALTER TABLE curation_packages ADD COLUMN IF NOT EXISTS primary_metadata JSONB;
 
 -- 2. A frozen, monotonic snapshot of an approved curation set. The publication
 --    columns (published_at + storage keys) are folded in here; they stay NULL

@@ -1288,7 +1288,7 @@ pub(crate) async fn run_curation_sync_cycle(
                     entry.checksum_sha256.as_deref(),
                     &entry.upstream_path,
                     &entry.metadata,
-                    entry.primary_xml_snippet.as_deref(),
+                    entry.primary_metadata.as_ref(),
                 )
                 .await
             {

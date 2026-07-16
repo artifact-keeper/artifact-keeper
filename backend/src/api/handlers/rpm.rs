@@ -320,6 +320,161 @@ fn build_rpm_package_response(
         .unwrap()
 }
 
+/// Is `p` a safe RELATIVE upstream path to append to a curation-config
+/// upstream base?
+///
+/// The stored `upstream_path` comes from the upstream `<location href>`, which
+/// is attacker-influenced. `ProxyService::build_upstream_url` concatenates
+/// (`{base}/{path}`), so an absolute href cannot currently override the host —
+/// but this guard makes that safety explicit and local rather than an implicit
+/// dependency on a helper elsewhere: an absolute URL, an absolute path, a
+/// traversal, or a backslash is rejected so the `@N` fetch can only ever target
+/// a path UNDER the configured curation upstream (defense in depth, #2358).
+fn is_safe_upstream_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.contains("://")
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.split('/').any(|seg| seg == "..")
+}
+
+/// Stream an already-verified, frozen `@N` package from the immutable store
+/// (cache hit). Chunked (no `Content-Length`) so the whole `.rpm` is never
+/// buffered in memory when re-serving.
+fn stream_rpm_response(body: Body, filename: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-rpm")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(body)
+        .unwrap()
+}
+
+/// Checksum-verified serving of a package under a published, immutable `@N`
+/// (#2358 A-hardened).
+///
+/// The package BYTES are resolved and served fail-closed:
+///   1. Cache hit — a previously verified+stored copy in the version's frozen
+///      store streams straight back (immutable `@N`; never re-fetched).
+///   2. Otherwise resolve the member within version N, fetch its bytes from the
+///      CURATION-CONFIG upstream (the curation source repo's `upstream_url` plus
+///      the stored `upstream_path`) — NEVER from `repo.upstream_url` and NEVER
+///      from any metadata blob — VERIFY `sha256 == checksum_sha256`, and only on
+///      a match cache the bytes into the frozen store and stream them. A missing
+///      member, missing upstream/checksum, or a checksum MISMATCH fails closed
+///      (404 / 502): a tampered upstream body is never served.
+async fn serve_version_package(
+    state: &SharedState,
+    repo: &RepoInfo,
+    version_prefix: &str,
+    version_number: i64,
+    filename: &str,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let cache_key = format!("{version_prefix}/packages/{filename}");
+
+    // 1. Cache-first: stream the frozen, already-verified copy.
+    if let Ok(stream) = storage.get_stream(&cache_key).await {
+        return Ok(stream_rpm_response(Body::from_stream(stream), filename));
+    }
+
+    // 2. Resolve the member within this PUBLISHED version plus its
+    //    curation-config upstream (source repo `upstream_url`), stored
+    //    `upstream_path`, and the frozen expected checksum. The member filename
+    //    is the canonical AK NEVRA filename the publish emitted as `<location>`.
+    let member = sqlx::query_as::<_, (Option<String>, String, Option<String>, uuid::Uuid, String)>(
+        "SELECT cp.checksum_sha256, cp.upstream_path, r.upstream_url, r.id, r.key \
+         FROM repository_version_packages rvp \
+         JOIN repository_versions rv ON rv.id = rvp.version_id \
+         JOIN curation_packages cp ON cp.id = rvp.curation_package_id \
+         JOIN repositories r ON r.id = cp.remote_repo_id \
+         WHERE rv.repository_id = $1 AND rv.version_number = $2 \
+           AND rv.published_at IS NOT NULL \
+           AND (cp.package_name || '-' || cp.version || '-' \
+                || COALESCE(NULLIF(cp.release, ''), '1') || '.' \
+                || COALESCE(NULLIF(cp.architecture, ''), 'noarch') || '.rpm') = $3",
+    )
+    .bind(repo.id)
+    .bind(version_number)
+    .bind(filename)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(super::db_err)?;
+
+    let (expected, upstream_path, upstream_url, remote_id, remote_key) = match member {
+        Some((Some(ck), up, Some(url), rid, rkey)) if !ck.trim().is_empty() => {
+            (ck, up, url, rid, rkey)
+        }
+        // No such member, or nothing to verify/fetch against -> fail closed.
+        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+    };
+
+    // The stored href is attacker-influenced: refuse to fetch anything that is
+    // not a plain relative path under the curation upstream.
+    if !is_safe_upstream_rel_path(&upstream_path) {
+        tracing::warn!(
+            "@{} package {} has an unsafe upstream path {:?}; refusing to fetch",
+            version_number,
+            filename,
+            upstream_path
+        );
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Upstream proxy unavailable").into_response())?;
+
+    // Fetch UNCACHED from the curation-config upstream so an unverified body is
+    // never persisted to the shared proxy cache.
+    let (bytes, _ct, _url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        remote_id,
+        &remote_key,
+        &upstream_url,
+        &upstream_path,
+    )
+    .await?;
+
+    // VERIFY sha256 == the frozen checksum. FAIL CLOSED on mismatch.
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(expected.trim()) {
+        tracing::warn!(
+            "@{} package {} failed checksum verification against the frozen curation set; \
+             refusing to serve",
+            version_number,
+            filename
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Upstream package failed checksum verification",
+        )
+            .into_response());
+    }
+
+    // Cache into the immutable frozen store, then stream the verified bytes.
+    let size = bytes.len() as i64;
+    storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()
+    })?;
+
+    Ok(build_rpm_package_response(
+        Body::from(bytes),
+        filename,
+        size,
+        expected.trim(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // RPM filename parsing
 // ---------------------------------------------------------------------------
@@ -820,10 +975,16 @@ async fn repodata_proxy(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     // #2358: an active publication serves its frozen repodata blobs (dnf also
-    // fetches the checksum-prefixed payloads through this catch-all).
+    // fetches the checksum-prefixed payloads through this catch-all). Route the
+    // catch-all subpath through the same traversal guard `upstream_proxy` uses
+    // before it is joined onto a storage prefix, so this path can never
+    // `storage.get` outside the publication prefix. On a reject we skip the
+    // frozen-blob serve and fall through to the unchanged proxy path.
     let active_sub = format!("repodata/{}", path);
-    if let Some(resp) = try_serve_active_publication(&state, &repo, &active_sub).await? {
-        return Ok(resp);
+    if let Ok(safe_sub) = sanitize_publication_subpath(&active_sub) {
+        if let Some(resp) = try_serve_active_publication(&state, &repo, &safe_sub).await? {
+            return Ok(resp);
+        }
     }
 
     let upstream_path = format!("repodata/{}", path);
@@ -863,35 +1024,37 @@ async fn upstream_proxy(
 
     // #2358: a leading `@<digits>` segment selects a published, immutable
     // snapshot. Serve the frozen, AK-signed metadata blob for the sub-path from
-    // storage (never proxying upstream, and without requiring a Remote repo).
-    // A non-metadata sub-path (e.g. a package href) is not a stored blob, so we
-    // fall through to the normal package path on the `@`-stripped sub-path —
-    // package BYTES are best-effort until P4.
-    let (upstream_path, publication_fallthrough) = if let Some((version_number, sub)) =
-        split_publication_prefix(&upstream_path)
-    {
+    // storage; a `packages/{nevra}.rpm` sub-path is served CHECKSUM-VERIFIED
+    // from the curation-config upstream. Nothing else is resolvable under an
+    // immutable `@N`, and upstream is NEVER proxied verbatim from here.
+    if let Some((version_number, sub)) = split_publication_prefix(&upstream_path) {
         let prefix = fetch_published_version_prefix(&state.db, repo.id, version_number)
             .await?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
         let sub_path = sanitize_publication_subpath(&sub)?;
+
+        // Frozen, AK-signed repodata blob?
         if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
         {
             return Ok(resp);
         }
-        // Non-metadata sub-path under a published @N: fall through to the local
-        // cache / upstream-proxy on the `@`-stripped path so an approved
-        // package's bytes are still resolvable (best-effort until P4). The
-        // `packages/` bytes may be local (promoted/uploaded) on a staging
-        // curation repo, so we do NOT gate this on the Remote type.
-        (sub_path, true)
-    } else {
-        (upstream_path, false)
-    };
 
-    // A normal (non-`@N`) request only serves from Remote repos; the `@N`
-    // fall-through additionally serves local bytes from a hosted/staging repo
-    // (and 404s below if there is neither a local hit nor an upstream to proxy).
-    if !publication_fallthrough && repo.repo_type != RepositoryType::Remote {
+        // A `packages/{filename}.rpm` request under a published @N: resolve the
+        // member, fetch from the curation-config upstream, VERIFY sha256 against
+        // the frozen checksum, and stream — fail-closed on any mismatch.
+        if let Some(filename) = sub_path.strip_prefix("packages/") {
+            if !filename.is_empty() && !filename.contains('/') {
+                return serve_version_package(&state, &repo, &prefix, version_number, filename)
+                    .await;
+            }
+        }
+
+        // Nothing else is served from an immutable @N.
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    // A normal (non-`@N`) request only serves from Remote repos.
+    if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
@@ -1440,7 +1603,7 @@ pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish failed")
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1460,6 +1623,31 @@ mod tests {
     use axum::http::HeaderValue;
 
     // -- #2358 @N publication-serving pure helpers ---------------------------
+
+    // The stored upstream href is attacker-influenced. Only a plain relative
+    // path under the curation upstream may ever be fetched.
+    #[test]
+    fn test_is_safe_upstream_rel_path_rejects_hostile_hrefs() {
+        // Legit relative upstream paths.
+        assert!(is_safe_upstream_rel_path(
+            "Packages/nginx-1.24.0-1.el9.x86_64.rpm"
+        ));
+        assert!(is_safe_upstream_rel_path("nginx.rpm"));
+        assert!(is_safe_upstream_rel_path("el/9/x86_64/n/nginx.rpm"));
+
+        // The injection vectors: absolute attacker URL, absolute path,
+        // traversal, backslash, empty.
+        assert!(!is_safe_upstream_rel_path(
+            "https://evil.example.com/backdoor.rpm"
+        ));
+        assert!(!is_safe_upstream_rel_path("http://evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("//evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("/etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages/../../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages\\evil.rpm"));
+        assert!(!is_safe_upstream_rel_path(""));
+    }
 
     #[test]
     fn test_split_publication_prefix() {

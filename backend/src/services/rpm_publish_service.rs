@@ -10,10 +10,13 @@
 //!      single serializable transaction so the number is monotonic under
 //!      concurrency) plus its `repository_version_packages` membership. It fails
 //!      closed on an empty approved set and on any approved package missing its
-//!      retained upstream `primary_xml_snippet` (which means it must be re-synced).
-//!   2. [`publish`] re-emits an upstream-faithful `primary.xml` from the retained
-//!      member snippets, generates pkgid-consistent stub `filelists.xml`/
-//!      `other.xml` via the existing hosted RPM generators, builds and SIGNS a
+//!      structured `primary_metadata` (which means it must be re-synced).
+//!   2. [`publish`] CANONICALLY re-serializes `primary.xml` from each member's
+//!      validated `primary_metadata` struct — every text node and attribute is
+//!      escaped and every `<location>` is rebuilt from validated NEVRA, so
+//!      attacker-influenced upstream content can never be signed verbatim. It
+//!      then generates pkgid-consistent stub `filelists.xml`/`other.xml` via the
+//!      existing hosted RPM generators, builds and SIGNS a
 //!      `repomd.xml`, and stores every blob (including the detached signature and
 //!      the public key *as they were at publish time*) beneath the version's
 //!      `storage_prefix`. Serving `@N` then reads these frozen blobs, so a later
@@ -24,12 +27,22 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::handlers::rpm::{
-    generate_filelists_xml, generate_other_xml, gzip_bytes, sha256_hex, RpmArtifact,
+    generate_filelists_xml, generate_other_xml, gzip_bytes, sha256_hex, xml_escape, RpmArtifact,
 };
 use crate::error::AppError;
 use crate::formats::rpm::{generate_repomd, RepoMdChecksum, RepoMdData, RepoMdLocation};
+use crate::services::curation_sync::{RpmEntry, RpmPackageMetadata};
 use crate::services::signing_service::SigningService;
 use crate::storage::StorageBackend;
+
+/// Hard ceiling on the number of packages a single publication may serialize
+/// (#2358 A-hardened): bounds the work + output of one publish so a hostile or
+/// huge approved set cannot exhaust memory.
+const MAX_PUBLICATION_PACKAGES: usize = 100_000;
+
+/// Hard ceiling on the serialized `primary.xml` buffer (#2358 A-hardened):
+/// canonical serialization fails closed rather than growing an unbounded String.
+const MAX_PRIMARY_XML_BYTES: usize = 512 * 1024 * 1024;
 
 /// A created (not-yet-published) or published curated snapshot.
 #[derive(Debug, Clone)]
@@ -51,12 +64,12 @@ pub struct PublishSummary {
 /// One member of a snapshot, loaded for publication.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct MemberPackage {
-    primary_xml_snippet: Option<String>,
-    checksum_sha256: Option<String>,
+    /// The STRUCTURED, validated primary.xml metadata (JSONB). `NULL`/absent
+    /// means the row predates structured capture (or was dropped fail-closed at
+    /// sync) and must be re-synced before a publish can include it.
+    primary_metadata: Option<serde_json::Value>,
     package_name: String,
     version: String,
-    release: Option<String>,
-    architecture: Option<String>,
 }
 
 /// Snapshot the *approved* curation set of `repo_id` into a new monotonic
@@ -77,8 +90,8 @@ pub async fn create_version(
         .execute(&mut *tx)
         .await?;
 
-    let approved: Vec<(Uuid, Option<String>, String, String)> = sqlx::query_as(
-        r#"SELECT id, primary_xml_snippet, package_name, version
+    let approved: Vec<(Uuid, Option<serde_json::Value>, String, String)> = sqlx::query_as(
+        r#"SELECT id, primary_metadata, package_name, version
            FROM curation_packages
            WHERE staging_repo_id = $1 AND status = 'approved'
            ORDER BY package_name ASC, version ASC"#,
@@ -93,18 +106,18 @@ pub async fn create_version(
         ));
     }
 
-    // Fail closed on any approved package whose upstream snippet was never
-    // retained (synced before snippet retention existed). List them so the
-    // operator knows exactly what to re-sync.
+    // Fail closed on any approved package whose structured metadata was never
+    // captured (synced before structured capture, or dropped fail-closed at
+    // sync). List them so the operator knows exactly what to re-sync.
     let needs_resync: Vec<String> = approved
         .iter()
-        .filter(|(_, snippet, _, _)| snippet.as_deref().map(str::trim).unwrap_or("").is_empty())
+        .filter(|(_, meta, _, _)| meta.as_ref().map(|v| v.is_null()).unwrap_or(true))
         .map(|(_, _, name, version)| format!("{name}-{version}"))
         .collect();
     if !needs_resync.is_empty() {
         return Err(AppError::Validation(format!(
-            "Cannot create a version: {} approved package(s) are missing their upstream \
-             metadata snippet and must be re-synced first: {}",
+            "Cannot create a version: {} approved package(s) are missing their structured \
+             upstream metadata and must be re-synced first: {}",
             needs_resync.len(),
             needs_resync.join(", ")
         )));
@@ -179,8 +192,7 @@ pub async fn publish(
     }
 
     let members: Vec<MemberPackage> = sqlx::query_as(
-        r#"SELECT cp.primary_xml_snippet, cp.checksum_sha256, cp.package_name,
-                  cp.version, cp.release, cp.architecture
+        r#"SELECT cp.primary_metadata, cp.package_name, cp.version
            FROM repository_version_packages rvp
            JOIN curation_packages cp ON cp.id = rvp.curation_package_id
            WHERE rvp.version_id = $1
@@ -196,32 +208,53 @@ pub async fn publish(
         ));
     }
 
-    // Fail closed: never emit a package without its retained upstream snippet.
-    for m in &members {
-        if m.primary_xml_snippet
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        {
-            return Err(AppError::Validation(format!(
-                "Cannot publish: package {}-{} is missing its upstream metadata snippet; re-sync it first",
-                m.package_name, m.version
-            )));
-        }
+    // Cap: bound the per-publication package count so a hostile/huge approved
+    // set cannot exhaust memory during serialization.
+    if members.len() > MAX_PUBLICATION_PACKAGES {
+        return Err(AppError::Validation(format!(
+            "Cannot publish: {} packages exceeds the per-publication limit of {}",
+            members.len(),
+            MAX_PUBLICATION_PACKAGES
+        )));
     }
 
-    // 1. primary.xml — re-emit the upstream-faithful blocks verbatim.
-    let snippets: Vec<&str> = members
-        .iter()
-        .map(|m| m.primary_xml_snippet.as_deref().unwrap_or_default())
-        .collect();
-    let primary_xml = assemble_primary_xml(&snippets);
+    // Fail closed: deserialize each member's STRUCTURED metadata. A package
+    // whose metadata is missing or does not parse cleanly is never published.
+    let mut metas: Vec<RpmPackageMetadata> = Vec::with_capacity(members.len());
+    for m in &members {
+        let raw = m
+            .primary_metadata
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Cannot publish: package {}-{} is missing its structured upstream \
+                     metadata; re-sync it first",
+                    m.package_name, m.version
+                ))
+            })?;
+        let meta: RpmPackageMetadata = serde_json::from_value(raw.clone()).map_err(|_| {
+            AppError::Validation(format!(
+                "Cannot publish: package {}-{} has unreadable structured metadata; \
+                 re-sync it first",
+                m.package_name, m.version
+            ))
+        })?;
+        metas.push(meta);
+    }
+
+    // 1. primary.xml — CANONICALLY re-serialized from the validated structs.
+    //    Every text node + attribute is escaped and every `<location>` is
+    //    rebuilt from validated NEVRA, so attacker-influenced upstream content
+    //    can never break out of the wrapper or inject markup into the signed
+    //    document.
+    let primary_xml = assemble_primary_xml(&metas)?;
 
     // 2. pkgid-consistent stub filelists.xml / other.xml via the hosted RPM
-    //    generators. Each stub carries `pkgid="{checksum_sha256}"`, the SAME
-    //    pkgid the primary snippet declares, so dnf accepts the metadata set.
-    let stub_artifacts: Vec<RpmArtifact> = members.iter().map(member_to_stub_artifact).collect();
+    //    generators. Each stub carries the SAME AK-derived pkgid the primary
+    //    declares (from the structured, byte-verified checksum), so dnf accepts
+    //    the metadata set.
+    let stub_artifacts: Vec<RpmArtifact> = metas.iter().map(meta_to_stub_artifact).collect();
     let filelists_xml = generate_filelists_xml(&stub_artifacts);
     let other_xml = generate_other_xml(&stub_artifacts);
 
@@ -315,42 +348,202 @@ struct Repodata {
     repomd_xml: String,
 }
 
-/// Wrap the retained per-package `<package type="rpm">…</package>` snippets in a
-/// single `<metadata …>` document. The snippets are concatenated VERBATIM — the
-/// signature is computed over the resulting repomd, and the snippet content is
-/// never interpreted as markup by AK, so a snippet cannot break out of the
-/// wrapper into repomd/signing structures.
-fn assemble_primary_xml(snippets: &[&str]) -> String {
+/// Build the AK `<location href>` for a member purely from validated NEVRA.
+///
+/// The result is always a RELATIVE `packages/{name}-{version}-{release}.{arch}.rpm`
+/// path that resolves under `/rpm/{key}/@N/`. It is NEVER sourced from the
+/// upstream `<location>`, so an attacker cannot smuggle an absolute URL
+/// (`https://evil/…`) or a traversal (`..`) into the signed document — those are
+/// impossible by construction.
+fn member_location(meta: &RpmPackageMetadata) -> String {
+    format!(
+        "packages/{}-{}-{}.{}.rpm",
+        meta.name, meta.version, meta.release, meta.arch
+    )
+}
+
+/// Canonically re-serialize the validated member structs into a single
+/// `<metadata …>` document (#2358 A-hardened).
+///
+/// Every text node and attribute value is passed through [`xml_escape`], and
+/// every `<location>` is rebuilt from validated NEVRA via [`member_location`].
+/// Structurally there is therefore exactly one `<metadata>`/`</metadata>` pair,
+/// no attacker markup survives un-escaped, and the pkgid is AK-derived from the
+/// structured (byte-verified) checksum. Fails closed if the buffer would exceed
+/// [`MAX_PRIMARY_XML_BYTES`].
+fn assemble_primary_xml(metas: &[RpmPackageMetadata]) -> Result<String, AppError> {
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata \
          xmlns=\"http://linux.duke.edu/metadata/common\" \
          xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\" packages=\"{}\">\n",
-        snippets.len()
+        metas.len()
     );
-    for snippet in snippets {
-        xml.push_str(snippet.trim());
-        xml.push('\n');
+
+    for meta in metas {
+        push_package_xml(&mut xml, meta);
+        if xml.len() > MAX_PRIMARY_XML_BYTES {
+            return Err(AppError::Validation(
+                "Cannot publish: primary.xml exceeds the maximum serialized size".to_string(),
+            ));
+        }
     }
     xml.push_str("</metadata>\n");
-    xml
+    Ok(xml)
 }
 
-/// Build the minimal `RpmArtifact` the hosted stub generators consume. Only the
-/// checksum (→ pkgid) and NEVRA metadata matter for the filelists/other stubs.
-fn member_to_stub_artifact(m: &MemberPackage) -> RpmArtifact {
+/// Serialize one `<package type="rpm">` element from a validated struct, with
+/// every text node and attribute value escaped.
+fn push_package_xml(xml: &mut String, meta: &RpmPackageMetadata) {
+    xml.push_str("  <package type=\"rpm\">\n");
+    xml.push_str(&format!("    <name>{}</name>\n", xml_escape(&meta.name)));
+    xml.push_str(&format!("    <arch>{}</arch>\n", xml_escape(&meta.arch)));
+    xml.push_str(&format!(
+        "    <version epoch=\"{}\" ver=\"{}\" rel=\"{}\"/>\n",
+        xml_escape(&meta.epoch),
+        xml_escape(&meta.version),
+        xml_escape(&meta.release),
+    ));
+    // pkgid is AK-derived from the structured, byte-verified checksum.
+    xml.push_str(&format!(
+        "    <checksum type=\"{}\" pkgid=\"{}\">{}</checksum>\n",
+        xml_escape(&meta.checksum.checksum_type),
+        if meta.checksum.pkgid { "YES" } else { "NO" },
+        xml_escape(&meta.checksum.value),
+    ));
+    xml.push_str(&format!(
+        "    <summary>{}</summary>\n",
+        xml_escape(&meta.summary)
+    ));
+    xml.push_str(&format!(
+        "    <description>{}</description>\n",
+        xml_escape(&meta.description)
+    ));
+    if let Some(v) = &meta.packager {
+        xml.push_str(&format!("    <packager>{}</packager>\n", xml_escape(v)));
+    }
+    if let Some(v) = &meta.url {
+        xml.push_str(&format!("    <url>{}</url>\n", xml_escape(v)));
+    }
+    xml.push_str(&format!(
+        "    <time file=\"{}\" build=\"{}\"/>\n",
+        meta.time.file, meta.time.build
+    ));
+    xml.push_str(&format!(
+        "    <size package=\"{}\" installed=\"{}\" archive=\"{}\"/>\n",
+        meta.size.package, meta.size.installed, meta.size.archive
+    ));
+    // The location is rebuilt from validated NEVRA — never from upstream.
+    xml.push_str(&format!(
+        "    <location href=\"{}\"/>\n",
+        xml_escape(&member_location(meta))
+    ));
+    push_format_xml(xml, meta);
+    xml.push_str("  </package>\n");
+}
+
+fn push_format_xml(xml: &mut String, meta: &RpmPackageMetadata) {
+    let f = &meta.format;
+    xml.push_str("    <format>\n");
+    if let Some(v) = &f.license {
+        xml.push_str(&format!(
+            "      <rpm:license>{}</rpm:license>\n",
+            xml_escape(v)
+        ));
+    }
+    if let Some(v) = &f.vendor {
+        xml.push_str(&format!(
+            "      <rpm:vendor>{}</rpm:vendor>\n",
+            xml_escape(v)
+        ));
+    }
+    if let Some(v) = &f.group {
+        xml.push_str(&format!("      <rpm:group>{}</rpm:group>\n", xml_escape(v)));
+    }
+    if let Some(v) = &f.buildhost {
+        xml.push_str(&format!(
+            "      <rpm:buildhost>{}</rpm:buildhost>\n",
+            xml_escape(v)
+        ));
+    }
+    if let Some(v) = &f.sourcerpm {
+        xml.push_str(&format!(
+            "      <rpm:sourcerpm>{}</rpm:sourcerpm>\n",
+            xml_escape(v)
+        ));
+    }
+    if let Some((start, end)) = f.header_range {
+        xml.push_str(&format!(
+            "      <rpm:header-range start=\"{start}\" end=\"{end}\"/>\n"
+        ));
+    }
+    push_entry_list(xml, "rpm:provides", &f.provides);
+    push_entry_list(xml, "rpm:requires", &f.requires);
+    push_entry_list(xml, "rpm:conflicts", &f.conflicts);
+    push_entry_list(xml, "rpm:obsoletes", &f.obsoletes);
+    push_entry_list(xml, "rpm:recommends", &f.recommends);
+    push_entry_list(xml, "rpm:suggests", &f.suggests);
+    push_entry_list(xml, "rpm:supplements", &f.supplements);
+    push_entry_list(xml, "rpm:enhances", &f.enhances);
+    for file in &f.files {
+        match &file.kind {
+            Some(k) => xml.push_str(&format!(
+                "      <file type=\"{}\">{}</file>\n",
+                xml_escape(k),
+                xml_escape(&file.path)
+            )),
+            None => xml.push_str(&format!("      <file>{}</file>\n", xml_escape(&file.path))),
+        }
+    }
+    xml.push_str("    </format>\n");
+}
+
+fn push_entry_list(xml: &mut String, tag: &str, entries: &[RpmEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    xml.push_str(&format!("      <{tag}>\n"));
+    for e in entries {
+        xml.push_str(&format!(
+            "        <rpm:entry name=\"{}\"",
+            xml_escape(&e.name)
+        ));
+        if let Some(v) = &e.flags {
+            xml.push_str(&format!(" flags=\"{}\"", xml_escape(v)));
+        }
+        if let Some(v) = &e.epoch {
+            xml.push_str(&format!(" epoch=\"{}\"", xml_escape(v)));
+        }
+        if let Some(v) = &e.ver {
+            xml.push_str(&format!(" ver=\"{}\"", xml_escape(v)));
+        }
+        if let Some(v) = &e.rel {
+            xml.push_str(&format!(" rel=\"{}\"", xml_escape(v)));
+        }
+        if let Some(v) = &e.pre {
+            xml.push_str(&format!(" pre=\"{}\"", xml_escape(v)));
+        }
+        xml.push_str("/>\n");
+    }
+    xml.push_str(&format!("      </{tag}>\n"));
+}
+
+/// Build the minimal `RpmArtifact` the hosted stub generators consume. The pkgid
+/// is sourced from the structured, byte-verified checksum so it is consistent
+/// with the primary.xml the same publish emits.
+fn meta_to_stub_artifact(meta: &RpmPackageMetadata) -> RpmArtifact {
     RpmArtifact {
         id: Uuid::nil(),
         path: String::new(),
-        name: m.package_name.clone(),
-        version: Some(m.version.clone()),
+        name: meta.name.clone(),
+        version: Some(meta.version.clone()),
         size_bytes: 0,
-        checksum_sha256: m.checksum_sha256.clone().unwrap_or_default(),
+        checksum_sha256: meta.checksum.value.clone(),
         storage_key: String::new(),
         metadata: Some(serde_json::json!({
-            "name": m.package_name,
-            "version": m.version,
-            "release": m.release.clone().unwrap_or_else(|| "1".to_string()),
-            "arch": m.architecture.clone().unwrap_or_else(|| "noarch".to_string()),
+            "name": meta.name,
+            "version": meta.version,
+            "release": meta.release,
+            "arch": meta.arch,
         })),
     }
 }
@@ -447,46 +640,140 @@ async fn put_blob(storage: &dyn StorageBackend, key: &str, bytes: Vec<u8>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::curation_sync::{RpmChecksum, RpmFormat, RpmSize, RpmTime};
 
+    fn meta(name: &str, checksum: &str) -> RpmPackageMetadata {
+        RpmPackageMetadata {
+            name: name.to_string(),
+            arch: "x86_64".to_string(),
+            epoch: "0".to_string(),
+            version: "1.0".to_string(),
+            release: "1.el9".to_string(),
+            summary: String::new(),
+            description: String::new(),
+            packager: None,
+            url: None,
+            checksum: RpmChecksum {
+                checksum_type: "sha256".to_string(),
+                pkgid: true,
+                value: checksum.to_string(),
+            },
+            size: RpmSize::default(),
+            time: RpmTime::default(),
+            format: RpmFormat::default(),
+        }
+    }
+
+    // The canonical serializer over structs carrying attacker strings in
+    // name/summary/provides must emit EXACTLY ONE metadata pair, NONE of the raw
+    // attacker markup, and every `<location>` a relative AK `packages/…` path.
     #[test]
-    fn test_assemble_primary_xml_wraps_and_preserves_snippets() {
-        let s1 = "<package type=\"rpm\">\n  <name>nginx</name>\n  <format><rpm:provides><rpm:entry name=\"webserver\"/></rpm:provides></format>\n</package>";
-        let s2 = "<package type=\"rpm\"><name>curl</name></package>";
-        let xml = assemble_primary_xml(&[s1, s2]);
+    fn test_assemble_primary_xml_is_canonical_and_escapes_attacker_markup() {
+        let mut evil = meta("nginx", "abc123");
+        // Attacker strings smuggled into structured fields.
+        evil.name = "nginx</metadata><package type=\"rpm\">".to_string();
+        evil.summary = "pwn </metadata> & <script>".to_string();
+        evil.format.provides = vec![RpmEntry {
+            name: "systemd".to_string(),
+            flags: Some("EQ".to_string()),
+            epoch: Some("99".to_string()),
+            ver: Some("999\"/></rpm:provides></metadata>".to_string()),
+            rel: None,
+            pre: None,
+        }];
+        let clean = meta("curl", "def456");
+
+        let xml = assemble_primary_xml(&[evil, clean]).expect("serialize");
 
         assert!(xml.contains("packages=\"2\""));
         assert!(xml.starts_with("<?xml version=\"1.0\""));
-        assert!(xml.contains("xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\""));
-        // Both verbatim blocks (incl. provides) survive inside the wrapper.
-        assert!(xml.contains("<rpm:provides><rpm:entry name=\"webserver\"/>"));
-        assert!(xml.contains("<name>curl</name>"));
-        assert!(xml.trim_end().ends_with("</metadata>"));
-        // Exactly one opening + one closing metadata tag (no breakout).
+        // Structurally exactly one metadata pair — the breakout is neutralized.
         assert_eq!(xml.matches("<metadata").count(), 1);
         assert_eq!(xml.matches("</metadata>").count(), 1);
+        // The RAW attacker markup never appears un-escaped.
+        assert!(!xml.contains("nginx</metadata>"));
+        assert!(!xml.contains("<script>"));
+        assert!(!xml.contains("</rpm:provides></metadata>"));
+        // It survives only as ESCAPED text.
+        assert!(xml.contains("&lt;/metadata&gt;"));
+        // Every location is a relative AK packages/ path built from NEVRA.
+        let locations: Vec<&str> = xml.lines().filter(|l| l.contains("<location")).collect();
+        assert_eq!(locations.len(), 2);
+        for line in locations {
+            assert!(
+                line.contains("href=\"packages/"),
+                "location must be a relative AK packages/ path: {line}"
+            );
+            assert!(!line.contains("://"), "no absolute URL in location: {line}");
+        }
     }
 
-    // The stub filelists/other MUST carry the SAME pkgid the primary snippet
-    // declares, or dnf rejects the metadata set. Here the member's
-    // checksum_sha256 is the pkgid, and it must appear verbatim in both stubs.
+    // The stub filelists/other MUST carry the SAME AK-derived pkgid the primary
+    // declares (the structured, byte-verified checksum), or dnf rejects the set.
     #[test]
     fn test_stub_generators_are_pkgid_consistent() {
-        let member = MemberPackage {
-            primary_xml_snippet: Some("<package type=\"rpm\"></package>".to_string()),
-            checksum_sha256: Some("deadbeefcafef00d".to_string()),
-            package_name: "bash".to_string(),
-            version: "5.1.8".to_string(),
-            release: Some("1.el9".to_string()),
-            architecture: Some("x86_64".to_string()),
-        };
-        let stub = member_to_stub_artifact(&member);
+        let m = meta("bash", "deadbeefcafef00d");
+        let stub = meta_to_stub_artifact(&m);
         let filelists = generate_filelists_xml(std::slice::from_ref(&stub));
         let other = generate_other_xml(std::slice::from_ref(&stub));
 
+        assert_eq!(stub.checksum_sha256, "deadbeefcafef00d");
         assert!(filelists.contains("pkgid=\"deadbeefcafef00d\""));
         assert!(filelists.contains("name=\"bash\""));
         assert!(filelists.contains("arch=\"x86_64\""));
         assert!(other.contains("pkgid=\"deadbeefcafef00d\""));
+    }
+
+    // The location for a member is built PURELY from validated NEVRA.
+    #[test]
+    fn test_member_location_is_nevra_relative() {
+        assert_eq!(
+            member_location(&meta("nginx", "abc")),
+            "packages/nginx-1.0-1.el9.x86_64.rpm"
+        );
+    }
+
+    // A full realistic member round-trips provides/requires/size/format/files
+    // through the canonical serializer, so dnf can still depsolve + install.
+    #[test]
+    fn test_assemble_primary_xml_round_trips_depsolve_fields() {
+        let mut m = meta("nginx", "abc123");
+        m.summary = "web server".to_string();
+        m.size = RpmSize {
+            package: 573440,
+            installed: 1048576,
+            archive: 1050624,
+        };
+        m.format.license = Some("BSD".to_string());
+        m.format.header_range = Some((4504, 98765));
+        m.format.provides = vec![RpmEntry {
+            name: "webserver".to_string(),
+            ..Default::default()
+        }];
+        m.format.requires = vec![RpmEntry {
+            name: "openssl-libs".to_string(),
+            flags: Some("GE".to_string()),
+            epoch: Some("0".to_string()),
+            ver: Some("3.0".to_string()),
+            ..Default::default()
+        }];
+        m.format.files = vec![crate::services::curation_sync::RpmFileEntry {
+            path: "/usr/sbin/nginx".to_string(),
+            kind: None,
+        }];
+
+        let xml = assemble_primary_xml(std::slice::from_ref(&m)).expect("serialize");
+        assert!(
+            xml.contains("<size package=\"573440\" installed=\"1048576\" archive=\"1050624\"/>")
+        );
+        assert!(xml.contains("<rpm:license>BSD</rpm:license>"));
+        assert!(xml.contains("<rpm:header-range start=\"4504\" end=\"98765\"/>"));
+        assert!(xml.contains("<rpm:entry name=\"webserver\"/>"));
+        assert!(
+            xml.contains("<rpm:entry name=\"openssl-libs\" flags=\"GE\" epoch=\"0\" ver=\"3.0\"/>")
+        );
+        assert!(xml.contains("<file>/usr/sbin/nginx</file>"));
+        assert!(xml.contains("<version epoch=\"0\" ver=\"1.0\" rel=\"1.el9\"/>"));
     }
 
     #[test]
@@ -520,24 +807,30 @@ mod tests {
 
     // -- create_version DB paths (skip silently when DATABASE_URL is unset) ----
 
+    /// A realistic structured metadata JSON for `name`, matching what the
+    /// A-hardened sync captures.
+    fn sample_meta_json(name: &str) -> serde_json::Value {
+        serde_json::to_value(meta(name, "abc123")).unwrap()
+    }
+
     async fn seed_approved_pkg(
         pool: &PgPool,
         staging: Uuid,
         remote: Uuid,
         name: &str,
-        snippet: Option<&str>,
+        primary_metadata: Option<serde_json::Value>,
     ) {
         sqlx::query(
             "INSERT INTO curation_packages \
              (staging_repo_id, remote_repo_id, format, package_name, version, release, \
-              architecture, checksum_sha256, upstream_path, status, primary_xml_snippet) \
+              architecture, checksum_sha256, upstream_path, status, primary_metadata) \
              VALUES ($1, $2, 'rpm', $3, '1.0', '1.el9', 'x86_64', 'abc123', $4, 'approved', $5)",
         )
         .bind(staging)
         .bind(remote)
         .bind(name)
         .bind(format!("Packages/{name}.rpm"))
-        .bind(snippet)
+        .bind(primary_metadata)
         .execute(pool)
         .await
         .expect("seed approved package");
@@ -560,9 +853,9 @@ mod tests {
         tdh::cleanup(&pool, staging, actor).await;
     }
 
-    // A NULL/blank snippet on an approved package fails closed (must re-sync).
+    // NULL structured metadata on an approved package fails closed (must re-sync).
     #[tokio::test]
-    async fn test_create_version_null_snippet_fails_closed_db() {
+    async fn test_create_version_null_metadata_fails_closed_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -599,7 +892,7 @@ mod tests {
             staging,
             remote,
             "bash",
-            Some("<package type=\"rpm\"><name>bash</name></package>"),
+            Some(sample_meta_json("bash")),
         )
         .await;
 
@@ -628,9 +921,14 @@ mod tests {
         let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
         let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
         let (actor, _n) = tdh::create_user(&pool).await;
-        let snippet = "<package type=\"rpm\"><name>bash</name>\
-            <checksum type=\"sha256\" pkgid=\"YES\">deadbeef</checksum></package>";
-        seed_approved_pkg(&pool, staging, remote, "bash", Some(snippet)).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
 
         // A signing key + metadata-signing config so sign_data() returns a sig.
         let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
@@ -696,7 +994,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("missing published blob {name}: {e}"));
             assert!(!blob.is_empty(), "{name} must be non-empty");
         }
-        // The stored primary.xml.gz re-emits the retained upstream snippet verbatim.
+        // The stored primary.xml.gz is the canonical AK re-serialization.
         let primary_gz = storage
             .get(&format!(
                 "{}/repodata/primary.xml.gz",
@@ -707,11 +1005,20 @@ mod tests {
         let mut gz = flate2::read::GzDecoder::new(&primary_gz[..]);
         let mut primary = String::new();
         std::io::Read::read_to_string(&mut gz, &mut primary).unwrap();
-        assert!(primary.contains("<name>bash</name>"), "snippet re-emitted");
+        // Canonical re-serialization: the package is emitted from the struct.
+        assert!(primary.contains("<name>bash</name>"), "package re-emitted");
+        // pkgid is AK-derived from the structured (byte-verified) checksum.
         assert!(
-            primary.contains("pkgid=\"YES\">deadbeef"),
-            "pkgid preserved"
+            primary.contains("pkgid=\"YES\">abc123"),
+            "AK-derived pkgid present"
         );
+        // The location is a relative AK packages/ path built from NEVRA.
+        assert!(
+            primary.contains("href=\"packages/bash-1.0-1.el9.x86_64.rpm\""),
+            "canonical AK location: {primary}"
+        );
+        // Exactly one metadata pair.
+        assert_eq!(primary.matches("</metadata>").count(), 1);
 
         // The version is marked published and is the repo's active publication.
         let (published, active): (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) =
