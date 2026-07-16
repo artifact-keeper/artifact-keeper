@@ -647,22 +647,19 @@ async fn upload_package(
 
     // Extract pubspec.yaml from the staged archive on disk, decoding the gzip
     // stream incrementally so we never hold the whole archive in memory.
-    let pubspec = {
-        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
-        // saturation); the permit is held across the blocking decode and
-        // released as this block ends, before storage.
-        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
-            .map_err(|e| e.into_response())?;
+    // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
+    let pubspec = crate::util::bounded_archive::with_ingest_extraction_async(|| {
         extract_pubspec_from_staged(staged.path())
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid Pub package: {}", e),
-                )
-                    .into_response()
-            })?
-    };
+    })
+    .await
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid Pub package: {}", e),
+        )
+            .into_response()
+    })?;
 
     let pkg_name = &pubspec.name;
     let pkg_version = &pubspec.version;

@@ -1024,11 +1024,11 @@ async fn run_curation_sync_cycle(
                         let xml = if primary_path.ends_with(".gz") {
                             // Bound the upstream-index decompression (#2556): a
                             // malicious/compromised upstream mirror cannot inflate
-                            // primary.xml.gz unbounded during sync.
-                            // #2561: also cap CONCURRENT index decompressions.
-                            let _ingest_permit =
-                                crate::util::bounded_archive::acquire_ingest_extraction()?;
-                            decompress_upstream_index_gz(&bytes)?
+                            // primary.xml.gz unbounded during sync. #2561: the
+                            // permit-scoped decode also caps CONCURRENT decodes.
+                            crate::util::bounded_archive::with_ingest_extraction(|| {
+                                decompress_upstream_index_gz(&bytes)
+                            })??
                         } else {
                             String::from_utf8_lossy(&bytes).to_string()
                         };
@@ -1058,11 +1058,12 @@ async fn run_curation_sync_cycle(
                         let bytes = resp.bytes().await?;
                         // Bound the upstream-index decompression (#2556): a
                         // malicious/compromised upstream mirror cannot inflate
-                        // Packages.gz unbounded during sync.
-                        // #2561: also cap CONCURRENT index decompressions.
-                        let _ingest_permit =
-                            crate::util::bounded_archive::acquire_ingest_extraction()?;
-                        let content = decompress_upstream_index_gz(&bytes)?;
+                        // Packages.gz unbounded during sync. #2561: the
+                        // permit-scoped decode also caps CONCURRENT decodes.
+                        let content =
+                            crate::util::bounded_archive::with_ingest_extraction(|| {
+                                decompress_upstream_index_gz(&bytes)
+                            })??;
                         curation_sync::parse_deb_packages_index(&content, "main")
                     }
                     _ => {

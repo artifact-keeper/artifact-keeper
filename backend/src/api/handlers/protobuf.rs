@@ -1358,14 +1358,13 @@ async fn download(
                         )
                         .await?;
 
-                        let files = {
-                            // #2561: cap concurrent ingestion decompressions
-                            // (fast-fail 503 on saturation).
-                            let _ingest_permit =
-                                crate::util::bounded_archive::acquire_ingest_extraction()
-                                    .map_err(|e| e.into_response())?;
-                            extract_files_from_bundle(&bundle_data)?
-                        };
+                        // #2561: permit-scoped decode, fast-fail 503 on saturation.
+                        #[allow(clippy::result_large_err)]
+                        // Response-as-error matches this module's handler convention.
+                        let files = crate::util::bounded_archive::with_ingest_extraction(|| {
+                            extract_files_from_bundle(&bundle_data)
+                        })
+                        .map_err(|e| e.into_response())??;
                         let commit = CommitInfo {
                             id: digest.to_string(),
                             create_time: chrono::Utc::now().to_rfc3339(),
@@ -1409,14 +1408,13 @@ async fn download(
 
                     let bundle_data = result.collect().await.map_err(|e| e.into_response())?;
 
-                    let files = {
-                        // #2561: cap concurrent ingestion decompressions
-                        // (fast-fail 503 on saturation).
-                        let _ingest_permit =
-                            crate::util::bounded_archive::acquire_ingest_extraction()
-                                .map_err(|e| e.into_response())?;
-                        extract_files_from_bundle(&bundle_data)?
-                    };
+                    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+                    #[allow(clippy::result_large_err)]
+                    // Response-as-error matches this module's handler convention.
+                    let files = crate::util::bounded_archive::with_ingest_extraction(|| {
+                        extract_files_from_bundle(&bundle_data)
+                    })
+                    .map_err(|e| e.into_response())??;
                     let commit = CommitInfo {
                         id: digest.clone(),
                         create_time: chrono::Utc::now().to_rfc3339(),
@@ -1461,12 +1459,13 @@ async fn download(
             )
         })?;
 
-        let files = {
-            // #2561: cap concurrent ingestion decompressions (fast-fail 503).
-            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
-                .map_err(|e| e.into_response())?;
-            extract_files_from_bundle(&bundle_data)?
-        };
+        // #2561: permit-scoped decode, fast-fail 503 on saturation.
+        #[allow(clippy::result_large_err)]
+        // Response-as-error matches this module's handler convention.
+        let files = crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_files_from_bundle(&bundle_data)
+        })
+        .map_err(|e| e.into_response())??;
         let commit = build_commit_info_from_row(&artifact_row);
 
         // Record download

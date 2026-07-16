@@ -2297,17 +2297,18 @@ async fn serve_metadata(
         .await
         .map_err(map_storage_err)?;
 
-    // #2561: cap concurrent ingestion decompressions on the serve path
-    // (fast-fail 503 on saturation); the permit is released before the response
-    // is built. Only taken for the branches that actually decode an archive.
+    // #2561: permit-scoped decode on the serve path, fast-fail 503 on
+    // saturation. Only taken for the branches that actually decode an archive.
     let metadata_text = if filename.ends_with(".whl") {
-        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
-            .map_err(|e| e.into_response())?;
-        extract_metadata_from_wheel(&content)
+        crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_metadata_from_wheel(&content)
+        })
+        .map_err(|e| e.into_response())?
     } else if filename.ends_with(".tar.gz") {
-        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
-            .map_err(|e| e.into_response())?;
-        extract_metadata_from_sdist(&content)
+        crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_metadata_from_sdist(&content)
+        })
+        .map_err(|e| e.into_response())?
     } else {
         None
     };

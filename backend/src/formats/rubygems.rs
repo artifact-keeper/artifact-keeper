@@ -403,12 +403,12 @@ impl FormatHandler for RubygemsHandler {
 
         // Extract gemspec if this is a gem file
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
-            // #2561: cap concurrent ingestion decompressions; on saturation skip
-            // this best-effort metadata enrichment rather than blocking/queueing.
-            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
-                if let Ok(gemspec) = Self::extract_gemspec(content) {
-                    metadata["gemspec"] = serde_json::to_value(&gemspec)?;
-                }
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Ok(gemspec)) = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_gemspec(content)
+            }) {
+                metadata["gemspec"] = serde_json::to_value(&gemspec)?;
             }
         }
 
@@ -420,10 +420,10 @@ impl FormatHandler for RubygemsHandler {
 
         // Validate gem packages
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
-            // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
-            // saturation); permit released at the end of this validation scope.
-            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()?;
-            let gemspec = Self::extract_gemspec(content)?;
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            let gemspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_gemspec(content)
+            })??;
 
             // Verify name matches
             if let Some(path_name) = &info.name {
@@ -1150,6 +1150,25 @@ summary: A summary
         );
         let spec = RubygemsHandler::extract_gemspec(&gem).expect("normal gem parses");
         assert_eq!(spec.name, "rails");
+    }
+
+    /// #2561: `validate` and `parse_metadata` on a gem path still decode the
+    /// gemspec through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_validate_and_parse_metadata_gem_2561() {
+        let gem = gem_with_metadata(
+            b"--- !ruby/object:Gem::Specification\nname: rails\nversion: 7.0.8\n",
+        );
+        let handler = RubygemsHandler::new();
+        handler
+            .validate("gems/rails-7.0.8.gem", &Bytes::from(gem.clone()))
+            .await
+            .expect("matching gem validates");
+        let meta = handler
+            .parse_metadata("gems/rails-7.0.8.gem", &Bytes::from(gem))
+            .await
+            .expect("parse_metadata succeeds");
+        assert_eq!(meta["gemspec"]["name"], "rails");
     }
 
     /// #2556: a `.gem` whose `metadata.gz` inflates past the per-metadata cap is

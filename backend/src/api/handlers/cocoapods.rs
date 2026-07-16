@@ -284,19 +284,18 @@ async fn push_pod(
 
     // Try to extract podspec from the archive body.
     // The body should contain a tar.gz with a podspec.json inside.
-    let podspec = {
-        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
-        // saturation); the permit is released as this block ends, before storage.
-        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
-            .map_err(|e| e.into_response())?;
-        extract_podspec_from_archive(&body).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid pod archive: {}", e),
-            )
-                .into_response()
-        })?
-    };
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let podspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_podspec_from_archive(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid pod archive: {}", e),
+        )
+            .into_response()
+    })?;
 
     let pod_name = &podspec.name;
     let pod_version = &podspec.version;
@@ -970,6 +969,49 @@ mod tests {
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #2561: an authenticated pod push decodes the podspec through the
+    /// permit-scoped decode (uncontended) and stores the pod.
+    #[tokio::test]
+    async fn test_cocoapods_push_pod_succeeds_2561() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let podspec_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": "PushPod",
+            "version": "1.0.0",
+            "summary": "coverage pod",
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("PushPod.podspec.json").unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        let targz = gz.finish().unwrap();
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(targz))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+        fx.teardown().await;
+    }
 
     // Exercises the DB-query happy paths so the sweep's db_err/db_status
     // call-site lines are covered by cargo llvm-cov --lib (#2083).

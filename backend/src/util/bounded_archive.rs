@@ -180,15 +180,47 @@ fn acquire_ingest_extraction_from(sem: &Arc<Semaphore>) -> Result<IngestExtracti
 
 /// Reserve one process-wide ingestion-decompression slot, FAST-FAIL to a 503 on
 /// saturation. Call this in the async handler immediately before invoking the
-/// (synchronous) archive extractor and hold the returned guard across that call:
-///
-/// ```ignore
-/// let _ingest = acquire_ingest_extraction()?; // 503 if the server is saturated
-/// let meta = read_metadata_from_tar_gz(reader, matches)?; // bounded decode
-/// // `_ingest` drops here, releasing the slot before any DB/storage work
-/// ```
+/// (synchronous) archive extractor and hold the returned guard across that call.
+/// Most call sites should prefer [`with_ingest_extraction`] /
+/// [`with_ingest_extraction_async`], which scope the permit for you.
 pub fn acquire_ingest_extraction() -> Result<IngestExtractionGuard> {
     acquire_ingest_extraction_from(ingest_extraction_semaphore())
+}
+
+/// Run `decode` (a synchronous archive decompression) while holding one
+/// process-wide ingestion-decompression slot. FAST-FAILS with the 503
+/// [`AppError::ServiceUnavailable`] on saturation *without* invoking `decode`;
+/// otherwise the permit is held exactly for the duration of `decode` and
+/// released as it returns (before any DB/storage work in the caller). `decode`'s
+/// own return value — `Result`, `Option`, plain value — passes through inside
+/// the `Ok`, so callers layer their existing error mapping on top:
+///
+/// ```ignore
+/// let spec = with_ingest_extraction(|| extract_gemspec(&body))
+///     .map_err(|e| e.into_response())?   // 503 shed
+///     .map_err(|e| bad_request(e))?;     // decode's own error
+/// ```
+pub fn with_ingest_extraction<T>(decode: impl FnOnce() -> T) -> Result<T> {
+    with_ingest_extraction_from(ingest_extraction_semaphore(), decode)
+}
+
+/// `_from` seam for [`with_ingest_extraction`] — lets unit tests drive a local
+/// cap without touching the process singleton.
+fn with_ingest_extraction_from<T>(sem: &Arc<Semaphore>, decode: impl FnOnce() -> T) -> Result<T> {
+    let _permit = acquire_ingest_extraction_from(sem)?;
+    Ok(decode())
+}
+
+/// Like [`with_ingest_extraction`] but holds the slot across an `.await` — for
+/// decodes that hop to a blocking thread (`spawn_blocking`) so the permit must
+/// span the join. Same fast-fail-503 semantics; the future is never constructed
+/// when the server is saturated.
+pub async fn with_ingest_extraction_async<T, F>(decode: impl FnOnce() -> F) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let _permit = acquire_ingest_extraction_from(ingest_extraction_semaphore())?;
+    Ok(decode().await)
 }
 
 /// A `Read` wrapper enforcing a hard cumulative-byte budget on a *decoded*
@@ -1020,6 +1052,53 @@ mod tests {
         drop(first);
         let _third = acquire_ingest_extraction_from(&sem)
             .expect("slot must be reusable after the guard drops");
+    }
+
+    #[test]
+    fn global_wrappers_uncontended_happy_path() {
+        // The process-wide entry points (which the handlers call) work
+        // uncontended: acquire + release, then a scoped decode passes through.
+        let guard = acquire_ingest_extraction().expect("global acquire uncontended");
+        drop(guard);
+        let out = with_ingest_extraction(|| 5).expect("global scoped decode uncontended");
+        assert_eq!(out, 5);
+    }
+
+    #[test]
+    fn with_ingest_extraction_runs_decode_and_releases() {
+        let sem = Arc::new(Semaphore::new(1));
+
+        // Under cap: the decode runs and its value passes through.
+        let out = with_ingest_extraction_from(&sem, || 41 + 1).expect("under-cap decode runs");
+        assert_eq!(out, 42);
+
+        // The permit was released when the closure returned: the slot is free
+        // again immediately (no leak), so a second scoped decode also runs.
+        let out2 = with_ingest_extraction_from(&sem, || "ok").expect("slot released after decode");
+        assert_eq!(out2, "ok");
+
+        // Saturated: the decode is NEVER invoked and the caller gets the 503.
+        let held = acquire_ingest_extraction_from(&sem).expect("hold the only slot");
+        let mut ran = false;
+        let err = with_ingest_extraction_from(&sem, || ran = true)
+            .expect_err("saturated helper must shed");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "saturation must map to a 503 ServiceUnavailable, got {:?}",
+            err
+        );
+        assert!(!ran, "decode must not run when the acquire sheds");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn with_ingest_extraction_async_holds_across_await() {
+        // Happy path on the process-wide semaphore (uncontended in tests):
+        // the future runs to completion and its value passes through.
+        let out = with_ingest_extraction_async(|| async { 7 * 6 })
+            .await
+            .expect("uncontended async decode runs");
+        assert_eq!(out, 42);
     }
 
     #[test]

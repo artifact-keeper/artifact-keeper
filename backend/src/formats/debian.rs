@@ -617,12 +617,12 @@ impl FormatHandler for DebianHandler {
 
         // Extract control if this is a package
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            // #2561: cap concurrent ingestion decompressions; on saturation skip
-            // this best-effort metadata enrichment rather than blocking/queueing.
-            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
-                if let Ok(control) = Self::extract_control(content) {
-                    metadata["control"] = serde_json::to_value(&control)?;
-                }
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Ok(control)) = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_control(content)
+            }) {
+                metadata["control"] = serde_json::to_value(&control)?;
             }
         }
 
@@ -634,10 +634,10 @@ impl FormatHandler for DebianHandler {
 
         // Validate .deb packages
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
-            // saturation); permit released at the end of this validation scope.
-            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()?;
-            let control = Self::extract_control(content)?;
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            let control = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_control(content)
+            })??;
 
             // Verify package name matches
             if let Some(path_package) = &info.package {
@@ -1438,6 +1438,31 @@ Source: full-pkg-src
         assert_eq!(control.package, "xz-pkg");
         assert_eq!(control.version, "1.0-1");
         assert_eq!(control.architecture, "amd64");
+    }
+
+    /// #2561: `validate` and `parse_metadata` on a package path still decode
+    /// the control tar through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_validate_and_parse_metadata_deb_2561() {
+        use std::io::Write;
+
+        let control = "Package: xzpkg\nVersion: 1.0-1\nArchitecture: amd64\n";
+        let tar_bytes = control_tar(control);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar_bytes).expect("write xz");
+        let deb = deb_with_control_member("control.tar.xz", &encoder.finish().expect("finish xz"));
+
+        let handler = DebianHandler::new();
+        let path = "pool/main/x/xzpkg/xzpkg_1.0-1_amd64.deb";
+        handler
+            .validate(path, &Bytes::from(deb.clone()))
+            .await
+            .expect("matching .deb validates");
+        let meta = handler
+            .parse_metadata(path, &Bytes::from(deb))
+            .await
+            .expect("parse_metadata succeeds");
+        assert_eq!(meta["control"]["package"], "xzpkg");
     }
 
     /// Build a `control.tar` whose `control` entry itself inflates past the

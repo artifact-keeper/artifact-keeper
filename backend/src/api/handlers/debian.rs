@@ -1453,16 +1453,14 @@ async fn resolve_pool_expected_checksum(
         else {
             continue;
         };
-        // #2561: cap concurrent ingestion decompressions on this serve path
-        // (each cached index inflates up to the 128 MiB budget). Fast-fail 503
-        // on saturation; the permit is scoped to the decode only, so it is
-        // released before the next cache read.
-        let text = {
-            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()?;
-            match decompress_packages_index(&cache_path, &bytes) {
-                Some(text) => text,
-                None => continue,
-            }
+        // #2561: permit-scoped decode on this serve path (each cached index
+        // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
+        // permit is released before the next cache read.
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+            decompress_packages_index(&cache_path, &bytes)
+        })?
+        else {
+            continue;
         };
         let map = crate::formats::debian::parse_packages_index(&text);
         if let Some(sha) = resolve_pool_deb_checksum(&map, artifact_path) {
