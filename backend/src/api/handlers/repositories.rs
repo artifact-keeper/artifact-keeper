@@ -562,6 +562,14 @@ pub struct CreateRepositoryRequest {
     /// project (permissions with `target_type = 'project'`) are inherited by
     /// the repository. Omit to leave the repository unassigned.
     pub project_id: Option<Uuid>,
+    /// ASCII-armored OpenPGP *public* key trusted to sign this RPM curation
+    /// remote's `repodata/repomd.xml` (#2568, RPM curation Phase 3). When set,
+    /// the curation sync fetches `repomd.xml.asc` and verifies the detached
+    /// signature before ingesting upstream metadata (#2567 reads this column).
+    /// Must be a PUBLIC key block; a private-key block is rejected. Write-only:
+    /// the response exposes only the boolean `has_trusted_gpg_key`, never the
+    /// key material.
+    pub trusted_gpg_key: Option<String>,
     /// Custom Origin field for Debian/APT Release files.
     /// Stored in `repository_config` under `apt_origin`.
     pub apt_origin: Option<String>,
@@ -665,6 +673,15 @@ pub struct UpdateRepositoryRequest {
     /// the field leaves the assignment unchanged (unassignment ships with the
     /// project-admin surface in P2).
     pub project_id: Option<Uuid>,
+    /// Update the trusted upstream OpenPGP public key for RPM curation (#2568).
+    /// Three-way semantics via `Option<Option<String>>`: omit the field to
+    /// leave the stored key unchanged; send `null` to clear it (revert to
+    /// "unverified upstream"); send an ASCII-armored PUBLIC key block to set
+    /// it. A private-key block or malformed armor is rejected (400). The
+    /// response never echoes the key — only `has_trusted_gpg_key`.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<String>)]
+    pub trusted_gpg_key: Option<Option<String>>,
     /// Custom Origin field for Debian/APT Release files. Pass an empty string
     /// to reset to the default ("artifact-keeper").
     /// Stored in `repository_config` under `apt_origin`.
@@ -745,6 +762,13 @@ pub struct RepositoryResponse {
     pub quota_bytes: Option<i64>,
     /// Project this repository is assigned to (#2472), if any.
     pub project_id: Option<Uuid>,
+    /// Whether a trusted upstream OpenPGP public key is configured for RPM
+    /// curation signature verification (#2568). The key material itself is
+    /// never returned; this boolean is the only exposure. `false` for repos
+    /// with no key set. Populated by the single-repo handlers (create / get /
+    /// update) and the listing; `repo_to_response` alone defaults it to `false`
+    /// (it is db-less and cannot read the column).
+    pub has_trusted_gpg_key: bool,
     pub upstream_url: Option<String>,
     pub upstream_auth_type: Option<String>,
     pub upstream_auth_configured: bool,
@@ -820,6 +844,9 @@ fn repo_to_response(
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
+        // db-less: single-repo handlers overwrite this via `with_trusted_gpg_key`
+        // and the listing sets it from a batch presence query (#2568).
+        has_trusted_gpg_key: false,
         upstream_url: repo.upstream_url,
         upstream_auth_type: None,
         upstream_auth_configured: false,
@@ -1043,6 +1070,71 @@ fn validate_custom_user_agent(ua: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Upper bound on an accepted `trusted_gpg_key` payload (#2568). A real
+/// ASCII-armored OpenPGP public key is a few KiB; 1 MiB is a generous cap that
+/// still fails closed on an attempt to store an unbounded blob in the column.
+const MAX_TRUSTED_GPG_KEY_BYTES: usize = 1024 * 1024;
+
+/// Validate a caller-supplied `trusted_gpg_key` (#2568, RPM curation Phase 3).
+///
+/// Fail-closed: the value must be a single ASCII-armored OpenPGP *public* key
+/// block that the same parser used by the curation sync
+/// ([`signing_service::verify_detached`], `pgp::SignedPublicKey::from_string`)
+/// can load. Garbage, an oversized blob, or a *private*-key block are all
+/// rejected with a 400 so a key accepted here is guaranteed usable at sync time
+/// and no secret key is ever persisted.
+fn validate_trusted_gpg_key(key: &str) -> Result<()> {
+    use pgp::composed::{Deserializable, SignedPublicKey};
+
+    // Size cap first, before any parsing, so an oversized blob is cheap to
+    // reject and never reaches the armor parser.
+    if key.len() > MAX_TRUSTED_GPG_KEY_BYTES {
+        return Err(AppError::Validation(format!(
+            "trusted_gpg_key must be {MAX_TRUSTED_GPG_KEY_BYTES} bytes or fewer"
+        )));
+    }
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "trusted_gpg_key must not be empty".to_string(),
+        ));
+    }
+    // Reject a private-key block explicitly and deterministically. Operators
+    // must supply a PUBLIC key; a private key must never be stored server-side.
+    if trimmed.contains("PGP PRIVATE KEY BLOCK") {
+        return Err(AppError::Validation(
+            "trusted_gpg_key must be an ASCII-armored OpenPGP PUBLIC key block, not a private key"
+                .to_string(),
+        ));
+    }
+    // Parse with the same routine the curation sync verifies against.
+    SignedPublicKey::from_string(trimmed).map_err(|_| {
+        AppError::Validation(
+            "trusted_gpg_key must be a valid ASCII-armored OpenPGP public key block".to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Populate `RepositoryResponse.has_trusted_gpg_key` from the repositories row
+/// (#2568). Split out like `with_custom_user_agent` so only handlers with a DB
+/// handle read the column back; the key material is never returned.
+async fn with_trusted_gpg_key(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    mut response: RepositoryResponse,
+) -> RepositoryResponse {
+    let present: std::result::Result<Option<bool>, _> =
+        sqlx::query_scalar("SELECT trusted_gpg_key IS NOT NULL FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(db)
+            .await;
+    if let Ok(Some(has_key)) = present {
+        response.has_trusted_gpg_key = has_key;
+    }
+    response
 }
 
 /// Returns `true` when `s` contains any line-ending character
@@ -2099,11 +2191,31 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
+    // Batch fetch which repos have a trusted GPG key configured (#2568) so the
+    // listing reports `has_trusted_gpg_key` accurately without an N+1. The key
+    // material is never selected — only its presence.
+    let gpg_key_ids: std::collections::HashSet<Uuid> = if !repo_ids.is_empty() {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM repositories WHERE id = ANY($1) AND trusted_gpg_key IS NOT NULL",
+        )
+        .bind(&repo_ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
             let storage = storage_map.get(&r.id).copied().unwrap_or(0);
-            repo_to_response(r, storage)
+            let has_gpg = gpg_key_ids.contains(&r.id);
+            let mut resp = repo_to_response(r, storage);
+            resp.has_trusted_gpg_key = has_gpg;
+            resp
         })
         .collect();
 
@@ -2191,6 +2303,13 @@ pub async fn create_repository(
             ));
         }
         validate_custom_user_agent(ua)?;
+    }
+
+    // Validate the trusted upstream GPG key up-front (#2568) — before the row
+    // is created — so a malformed or private key cannot leave an orphaned
+    // repository behind, mirroring the `custom_user_agent` guard above.
+    if let Some(ref gpg_key) = payload.trusted_gpg_key {
+        validate_trusted_gpg_key(gpg_key)?;
     }
 
     // apt_* Release metadata (#2489): validate up-front — before the repository
@@ -2332,6 +2451,9 @@ pub async fn create_repository(
             // `plugin_format_key` carries the canonical handler name.
             format_key: plugin_format_key.or(payload.format_key),
             project_id: payload.project_id,
+            // Trusted upstream GPG key for RPM curation (#2568). Already
+            // validated up-front; the service persists it in the create tx.
+            trusted_gpg_key: payload.trusted_gpg_key,
             // Owner auto-grant: record the creator and grant them per-repo
             // access so they retain access under per-repo authorization.
             created_by: Some(auth.user_id),
@@ -2518,6 +2640,9 @@ pub async fn create_repository(
         response,
     )
     .await;
+    // Reflect the trusted GPG key state (#2568) so the create response
+    // round-trips with a subsequent GET. Only the boolean is exposed.
+    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -2571,6 +2696,7 @@ pub async fn get_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
+    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -2828,6 +2954,13 @@ pub async fn update_repository(
         }
     }
 
+    // Validate the trusted upstream GPG key when it is being SET (#2568).
+    // `Some(Some(key))` sets it (must validate); `Some(None)` clears it (no
+    // validation); `None` leaves it unchanged.
+    if let Some(Some(ref gpg_key)) = payload.trusted_gpg_key {
+        validate_trusted_gpg_key(gpg_key)?;
+    }
+
     let service = state.create_repository_service();
 
     // Get existing repo by key and check repo access
@@ -2876,6 +3009,9 @@ pub async fn update_repository(
                 // P1 set-only (#2472): a present field maps to Some(Some(id));
                 // an omitted field leaves the assignment unchanged.
                 project_id: payload.project_id.map(Some),
+                // Trusted upstream GPG key (#2568). Three-way: omit = unchanged,
+                // Some(None) = clear, Some(Some(key)) = set (already validated).
+                trusted_gpg_key: payload.trusted_gpg_key,
             },
         )
         .await?;
@@ -3166,6 +3302,7 @@ pub async fn update_repository(
     .await;
     let response =
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
+    let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
 
@@ -8761,6 +8898,114 @@ mod tests {
         assert!(validate_custom_user_agent("MyClient/1.0\t(tab ok)").is_ok());
     }
 
+    /// A minimal valid ASCII-armored OpenPGP public key (ed25519), #2568.
+    const TEST_TRUSTED_PUB_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmDMEalhDshYJKwYBBAHaRw8BAQdACzr46aD+QjHsSShzXFU7UyTBcfkr3V0B5QbC\nuHNwPaG0LEFLIFRlc3QgQ3VyYXRpb24gPGN1cmF0aW9uLXRlc3RAZXhhbXBsZS5j\nb20+iJMEExYKADsWIQR0avJEHEsDJgM2tIhMkudvlQGn6AUCalhDsgIbIwULCQgH\nAgIiAgYVCgkICwIEFgIDAQIeBwIXgAAKCRBMkudvlQGn6NbIAQD8FUordTijk/cv\nJXJF2Z4uU6pGzePlVjV66sMDeCrKeAD/buTRceKb+lc9GJaZTG0Nn0OpXuXFSzYY\njK6gqQU8eAO4OARqWEOyEgorBgEEAZdVAQUBAQdAR27xDvtQLrO+SDzbLNgOSuvF\nob14dCYHAudLwThyCBIDAQgHiHgEGBYKACAWIQR0avJEHEsDJgM2tIhMkudvlQGn\n6AUCalhDsgIbDAAKCRBMkudvlQGn6POzAP9NNEWgre36i/Ig+fphD4cwlcsvW6+v\ny54TTJUA3J4JyQEAgkLBwMrNA4LkzW2pYv8Cc/jK8GpSa1IAOPdsgPCcmQ0=\n=NyW4\n-----END PGP PUBLIC KEY BLOCK-----\n";
+
+    #[test]
+    fn test_validate_trusted_gpg_key_accepts_valid_public_key() {
+        // #2568: a real ASCII-armored public key parses cleanly.
+        assert!(validate_trusted_gpg_key(TEST_TRUSTED_PUB_KEY).is_ok());
+        // Surrounding whitespace is tolerated (trimmed before parsing).
+        let padded = format!("\n\n  {TEST_TRUSTED_PUB_KEY}  \n");
+        assert!(validate_trusted_gpg_key(&padded).is_ok());
+    }
+
+    #[test]
+    fn test_validate_trusted_gpg_key_rejects_garbage() {
+        for bad in [
+            "",
+            "   ",
+            "not a key",
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\nnope\n-----END PGP PUBLIC KEY BLOCK-----",
+        ] {
+            let err = validate_trusted_gpg_key(bad).unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "expected Validation error for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_trusted_gpg_key_rejects_oversize() {
+        // A blob past the 1 MiB cap is rejected before any parsing.
+        let oversize = "A".repeat(MAX_TRUSTED_GPG_KEY_BYTES + 1);
+        let err = validate_trusted_gpg_key(&oversize).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("byte")),
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_trusted_gpg_key_rejects_private_key() {
+        // Fail-closed: a private-key block must never be accepted/stored (#2568).
+        let private_block = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlAc+dGVzdA==\n=abcd\n-----END PGP PRIVATE KEY BLOCK-----\n";
+        let err = validate_trusted_gpg_key(private_block).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("private") || msg.contains("PUBLIC"),
+                "message should call out the public-key requirement, got: {msg}"
+            ),
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// Minimal `Repository` model for response-shaping unit tests (#2568).
+    fn sample_repo() -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository};
+        let now = chrono::Utc::now();
+        Repository {
+            versioning_enabled: false,
+            id: Uuid::new_v4(),
+            key: "rpm-curation".to_string(),
+            name: "RPM Curation".to_string(),
+            description: None,
+            format: RepositoryFormat::Rpm,
+            repo_type: RepositoryType::Staging,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/rpm-curation".to_string(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: true,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "review".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_repository_response_redacts_key_exposes_only_boolean() {
+        // #2568: the response serializes a `has_trusted_gpg_key` boolean and
+        // never any key material / a `trusted_gpg_key` field.
+        let mut resp = repo_to_response(sample_repo(), 0);
+        resp.has_trusted_gpg_key = true;
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"has_trusted_gpg_key\":true"),
+            "response must expose the boolean: {json}"
+        );
+        assert!(
+            !json.contains("trusted_gpg_key\":\"") && !json.contains("PGP PUBLIC KEY"),
+            "response must never echo the key material: {json}"
+        );
+        // And false serializes as the boolean too (no omission).
+        let mut resp2 = repo_to_response(sample_repo(), 0);
+        resp2.has_trusted_gpg_key = false;
+        let json2 = serde_json::to_string(&resp2).unwrap();
+        assert!(json2.contains("\"has_trusted_gpg_key\":false"), "{json2}");
+    }
+
     #[test]
     fn test_create_request_deserializes_custom_user_agent() {
         let json = r#"{"key":"npm-proxy","name":"NPM Proxy","format":"npm","repo_type":"remote","custom_user_agent":"MyClient/2.0"}"#;
@@ -9086,6 +9331,7 @@ mod tests {
     fn test_repository_response_serialization() {
         let resp = RepositoryResponse {
             versioning_enabled: false,
+            has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
             name: "My Repo".to_string(),
@@ -10422,6 +10668,7 @@ mod tests {
         // `repository_config`, they appear in the serialized detail response.
         let resp = RepositoryResponse {
             versioning_enabled: false,
+            has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
             name: "npm-age".to_string(),
@@ -16491,6 +16738,7 @@ mod tests {
     fn test_repository_response_serializes_custom_user_agent() {
         let mut resp = RepositoryResponse {
             id: Uuid::new_v4(),
+            has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),
             name: "ua-serde".to_string(),
             description: None,
