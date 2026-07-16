@@ -120,7 +120,8 @@ impl AuditAction {
             | AuditAction::TotpDisabled
             | AuditAction::SessionsInvalidated
             | AuditAction::AgeGateQueued
-            | AuditAction::AgeGateApproved => Outcome::Success,
+            | AuditAction::AgeGateApproved
+            | AuditAction::CurationSyncTriggered => Outcome::Success,
         }
     }
 }

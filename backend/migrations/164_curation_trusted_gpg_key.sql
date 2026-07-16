@@ -1,0 +1,11 @@
+-- #2357 (RPM curation Phase 2): trusted upstream GPG key.
+--
+-- Optional ASCII-armored OpenPGP public key trusted to sign a remote/source
+-- repository's `repodata/repomd.xml`. When set on the remote a curation sync
+-- fetches `repomd.xml.asc` and verifies the detached signature over
+-- `repomd.xml` BEFORE trusting its declared checksums / ingesting any packages
+-- (fail-closed). When NULL the prior behavior is preserved: the sync proceeds
+-- but the batch is treated as "unverified upstream".
+--
+-- Reversible: DROP COLUMN restores the pre-#2357 shape.
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS trusted_gpg_key TEXT;

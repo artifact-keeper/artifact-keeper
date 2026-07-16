@@ -95,6 +95,13 @@ pub enum AuditAction {
     // enum to keep the additive change conflict-free with in-flight taxonomy
     // work.
     PermissionDenied,
+
+    // Curation/RPM manual sync trigger (#2357). Recorded when an authorized
+    // principal manually triggers an upstream metadata sync for a repository
+    // via `POST /curation/repos/{key}/sync`, capturing who initiated an
+    // outbound sync and when. Appended at the END of the enum to keep the
+    // additive change conflict-free with in-flight taxonomy work.
+    CurationSyncTriggered,
 }
 
 impl AuditAction {
@@ -147,6 +154,7 @@ impl AuditAction {
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
+            AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
         }
     }
 }

@@ -98,6 +98,7 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     "delete:repositories",
     "read:users",
     "write:users",
+    "trigger:sync",
     "admin",
     "*",
 ];
@@ -134,6 +135,10 @@ pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(),
 ///     mint a token that carries it (the holder still passes the tenant
 ///     and approval gates at promote time).
 ///   * `write:users` — user-management write capability.
+///   * `trigger:sync` — triggers an upstream curation/RPM metadata sync for a
+///     repository (#2357); privileged because it drives outbound fetches and
+///     mutates the synced catalog, so only an admin may mint a token that
+///     carries it (the holder still passes the per-repo tenant gate).
 ///
 /// `write:artifacts` and `write:repositories` are deliberately NOT on
 /// this list: artifact publishing is a routine non-admin action and
@@ -146,6 +151,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "delete:artifacts",
     "delete:repositories",
     "promote:artifacts",
+    "trigger:sync",
     "write:users",
 ];
 
