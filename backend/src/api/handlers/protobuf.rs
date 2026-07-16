@@ -1358,7 +1358,14 @@ async fn download(
                         )
                         .await?;
 
-                        let files = extract_files_from_bundle(&bundle_data)?;
+                        let files = {
+                            // #2561: cap concurrent ingestion decompressions
+                            // (fast-fail 503 on saturation).
+                            let _ingest_permit =
+                                crate::util::bounded_archive::acquire_ingest_extraction()
+                                    .map_err(|e| e.into_response())?;
+                            extract_files_from_bundle(&bundle_data)?
+                        };
                         let commit = CommitInfo {
                             id: digest.to_string(),
                             create_time: chrono::Utc::now().to_rfc3339(),
@@ -1402,7 +1409,14 @@ async fn download(
 
                     let bundle_data = result.collect().await.map_err(|e| e.into_response())?;
 
-                    let files = extract_files_from_bundle(&bundle_data)?;
+                    let files = {
+                        // #2561: cap concurrent ingestion decompressions
+                        // (fast-fail 503 on saturation).
+                        let _ingest_permit =
+                            crate::util::bounded_archive::acquire_ingest_extraction()
+                                .map_err(|e| e.into_response())?;
+                        extract_files_from_bundle(&bundle_data)?
+                    };
                     let commit = CommitInfo {
                         id: digest.clone(),
                         create_time: chrono::Utc::now().to_rfc3339(),
@@ -1447,7 +1461,12 @@ async fn download(
             )
         })?;
 
-        let files = extract_files_from_bundle(&bundle_data)?;
+        let files = {
+            // #2561: cap concurrent ingestion decompressions (fast-fail 503).
+            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+                .map_err(|e| e.into_response())?;
+            extract_files_from_bundle(&bundle_data)?
+        };
         let commit = build_commit_info_from_row(&artifact_row);
 
         // Record download

@@ -42,6 +42,9 @@
 
 use std::io::{self, Read, Seek};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{AppError, Result};
 
@@ -86,6 +89,93 @@ pub fn max_ingest_decompressed_bytes() -> u64 {
         MAX_INGEST_DECOMPRESSED_BYTES_ENV,
         DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency cap (#2561)
+// ---------------------------------------------------------------------------
+//
+// The three per-archive caps above bound a *single* extraction's memory/CPU,
+// but place no bound on the NUMBER of extractions running at once. Every
+// ingestion/serve metadata extractor decodes on the request path, so N parallel
+// uploads decode N archives concurrently — N × up-to-`max_ingest_decompressed_bytes()`
+// decode buffers plus N × decompressor CPU at the same time. This mirrors the
+// scanner's own concurrent-extraction gap (`scanner_service.rs` #2540), which
+// caps in-flight scan-workspace extractions with a process-wide semaphore.
+//
+// This module adds the ingestion analogue: a process-wide semaphore whose
+// permits bound the number of concurrent ingestion decodes. Unlike the
+// scanner's FIFO *blocking* acquire (detached background scans have no client
+// latency SLA and must complete), ingestion decode happens on the request path,
+// so the guard is acquired FAST-FAIL: on saturation it sheds the request with a
+// 503 ([`AppError::ServiceUnavailable`]) instead of queueing more decode work.
+// It is a *separate* semaphore from the scanner's, so ingestion and scan
+// extractions do not double-count against one shared budget.
+
+/// Default cap on how many ingestion/serve archive decompressions may run at
+/// once, across ALL format extractors. Bounds worst-case concurrent decode
+/// memory/CPU to roughly `cap × per-archive-cap`. A small default keeps the
+/// out-of-the-box worst case modest while still allowing parallel uploads.
+pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS: usize = 8;
+
+/// Env var overriding [`DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS`]. A blank,
+/// non-numeric, or zero value falls back to the default (a zero cap would wedge
+/// every upload, so it is treated as "unset").
+pub const MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_INGEST_EXTRACTIONS";
+
+/// Effective concurrent-ingest-extraction cap, honouring
+/// [`MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV`] over the default.
+fn max_concurrent_ingest_extractions() -> usize {
+    positive_env_or(
+        MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV,
+        DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS as u64,
+    ) as usize
+}
+
+/// Process-wide semaphore bounding concurrent ingestion decompressions. Seeded
+/// once from [`max_concurrent_ingest_extractions`]; each in-flight extraction
+/// holds one permit (via [`IngestExtractionGuard`]) only for the duration of the
+/// decode. Never `close()`d — it lives for the process lifetime.
+fn ingest_extraction_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_ingest_extractions())))
+}
+
+/// RAII guard representing one in-flight ingestion decompression. Hold it across
+/// the (synchronous) decode call and drop it promptly afterwards — dropping it
+/// releases the permit so a slow downstream (DB/storage) never keeps a decode
+/// slot occupied. Acquire it with [`acquire_ingest_extraction`].
+#[must_use = "hold the guard across the decode; dropping it immediately releases the permit"]
+#[derive(Debug)]
+pub struct IngestExtractionGuard {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Try to reserve one ingestion-decompression slot on `sem`, FAST-FAIL: on
+/// saturation return an [`AppError::ServiceUnavailable`] (HTTP 503) rather than
+/// blocking, so an overloaded server sheds excess decode work instead of piling
+/// up memory/CPU. The `_from` seam takes the semaphore explicitly so tests can
+/// drive a local cap without touching the process singleton.
+fn acquire_ingest_extraction_from(sem: &Arc<Semaphore>) -> Result<IngestExtractionGuard> {
+    match sem.clone().try_acquire_owned() {
+        Ok(permit) => Ok(IngestExtractionGuard { _permit: permit }),
+        Err(_) => Err(AppError::ServiceUnavailable(
+            "Server is busy decompressing other uploads; please retry shortly".to_string(),
+        )),
+    }
+}
+
+/// Reserve one process-wide ingestion-decompression slot, FAST-FAIL to a 503 on
+/// saturation. Call this in the async handler immediately before invoking the
+/// (synchronous) archive extractor and hold the returned guard across that call:
+///
+/// ```ignore
+/// let _ingest = acquire_ingest_extraction()?; // 503 if the server is saturated
+/// let meta = read_metadata_from_tar_gz(reader, matches)?; // bounded decode
+/// // `_ingest` drops here, releasing the slot before any DB/storage work
+/// ```
+pub fn acquire_ingest_extraction() -> Result<IngestExtractionGuard> {
+    acquire_ingest_extraction_from(ingest_extraction_semaphore())
 }
 
 /// A `Read` wrapper enforcing a hard cumulative-byte budget on a *decoded*
@@ -808,5 +898,86 @@ mod tests {
             read_metadata_from_decoded_tar_limited(&archive[..], is_meta, 1024 * 1024, 1000, 1024)
                 .unwrap();
         assert_eq!(out.unwrap(), b"ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2561 — concurrent-ingest-extraction cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_concurrent_ingest_extractions_env_override() {
+        // Default when unset; a valid override wins; blank / non-numeric / zero
+        // fall back to the default (a zero cap would wedge every upload).
+        let key = MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV;
+        let saved = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(
+            max_concurrent_ingest_extractions(),
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS
+        );
+
+        std::env::set_var(key, "3");
+        assert_eq!(max_concurrent_ingest_extractions(), 3);
+
+        std::env::set_var(key, "64");
+        assert_eq!(max_concurrent_ingest_extractions(), 64);
+
+        for bad in ["0", "", "   ", "abc", "-1"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                max_concurrent_ingest_extractions(),
+                DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS,
+                "value {:?} should fall back to default",
+                bad
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn acquire_ingest_extraction_fast_fails_when_saturated() {
+        // A *local* cap-1 semaphore (not the process singleton) so this test is
+        // deterministic regardless of test-thread count.
+        let sem = Arc::new(Semaphore::new(1));
+
+        // Under cap: the first acquire succeeds.
+        let first = acquire_ingest_extraction_from(&sem).expect("first acquire is under cap");
+
+        // Saturated: the next acquire FAST-FAILS to a 503 (ServiceUnavailable),
+        // it does NOT block.
+        let err = acquire_ingest_extraction_from(&sem)
+            .expect_err("acquire past the cap must fail fast, not block");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "saturation must map to a 503 ServiceUnavailable, got {:?}",
+            err
+        );
+
+        // Releasing the guard frees the slot promptly (no permit leak): a
+        // subsequent acquire succeeds again.
+        drop(first);
+        let _third = acquire_ingest_extraction_from(&sem)
+            .expect("slot must be reusable after the guard drops");
+    }
+
+    #[test]
+    fn under_cap_ingest_extractions_all_proceed() {
+        // With headroom every concurrent extraction proceeds unchanged.
+        let sem = Arc::new(Semaphore::new(4));
+        let g1 = acquire_ingest_extraction_from(&sem).expect("1/4");
+        let g2 = acquire_ingest_extraction_from(&sem).expect("2/4");
+        let g3 = acquire_ingest_extraction_from(&sem).expect("3/4");
+        // Fourth still fits; fifth would shed.
+        let g4 = acquire_ingest_extraction_from(&sem).expect("4/4");
+        assert!(
+            acquire_ingest_extraction_from(&sem).is_err(),
+            "the 5th concurrent extraction past a cap of 4 must shed"
+        );
+        drop((g1, g2, g3, g4));
     }
 }

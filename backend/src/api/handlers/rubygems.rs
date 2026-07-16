@@ -291,9 +291,15 @@ async fn push_gem(
     }
 
     // Extract gemspec from the .gem file
-    let gemspec = RubygemsHandler::extract_gemspec(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
-    })?;
+    let gemspec = {
+        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+        // saturation); permit released as this block ends, before storage.
+        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+            .map_err(|e| e.into_response())?;
+        RubygemsHandler::extract_gemspec(&body).map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
+        })?
+    };
 
     let gem_name = &gemspec.name;
     let gem_version = &gemspec.version;
@@ -458,7 +464,12 @@ async fn collect_remote_specs(
         state.proxy_service.as_deref(),
         virtual_repo_id,
         upstream_path,
-        |bytes, _member_key| async move { parse_upstream_specs(&bytes) },
+        |bytes, _member_key| async move {
+            // #2561: cap concurrent proxy-index decompressions (fast-fail 503).
+            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+                .map_err(|e| e.into_response())?;
+            parse_upstream_specs(&bytes)
+        },
     )
     .await?;
 

@@ -156,8 +156,12 @@ impl FormatHandler for ComposerHandler {
 
         // Extract composer.json from archive packages
         if matches!(info.kind, ComposerPathKind::Archive) && !content.is_empty() {
-            if let Ok(composer_json) = Self::parse_composer_json(content) {
-                metadata["composer"] = serde_json::to_value(&composer_json)?;
+            // #2561: cap concurrent ingestion decompressions; on saturation skip
+            // this best-effort metadata enrichment rather than blocking/queueing.
+            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
+                if let Ok(composer_json) = Self::parse_composer_json(content) {
+                    metadata["composer"] = serde_json::to_value(&composer_json)?;
+                }
             }
         }
 

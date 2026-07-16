@@ -379,13 +379,19 @@ async fn publish_package(
     //   - metadata.config (Erlang term format)
     //   - contents.tar.gz (the actual package files)
     //   - CHECKSUM (SHA-256 of the above)
-    let (pkg_name, pkg_version) = extract_name_version_from_tarball(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid hex tarball: {}", e),
-        )
-            .into_response()
-    })?;
+    let (pkg_name, pkg_version) = {
+        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+        // saturation); permit released as this block ends, before storage.
+        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+            .map_err(|e| e.into_response())?;
+        extract_name_version_from_tarball(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid hex tarball: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
         return Err((

@@ -925,6 +925,11 @@ async fn push_package(
     // Parse .nuspec from the SEEKABLE staged file (the ZIP reader needs
     // Read + Seek); run the blocking archive read off the async runtime.
     let nuspec = {
+        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+        // saturation); the permit is held across the blocking decode and
+        // released as this block ends, before storage.
+        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+            .map_err(|e| e.into_response())?;
         let staged_path = staged.path().to_path_buf();
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&staged_path)

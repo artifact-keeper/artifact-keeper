@@ -284,13 +284,19 @@ async fn push_pod(
 
     // Try to extract podspec from the archive body.
     // The body should contain a tar.gz with a podspec.json inside.
-    let podspec = extract_podspec_from_archive(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid pod archive: {}", e),
-        )
-            .into_response()
-    })?;
+    let podspec = {
+        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+        // saturation); the permit is released as this block ends, before storage.
+        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+            .map_err(|e| e.into_response())?;
+        extract_podspec_from_archive(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid pod archive: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     let pod_name = &podspec.name;
     let pod_version = &podspec.version;

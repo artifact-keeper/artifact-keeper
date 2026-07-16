@@ -247,9 +247,13 @@ impl FormatHandler for IncusHandler {
 
         // Try extracting metadata.yaml from tarballs
         if !content.is_empty() && info.file_type.is_tarball() {
-            if let Some(image_meta) = Self::extract_metadata(content) {
-                metadata["image_metadata"] =
-                    serde_json::to_value(&image_meta).unwrap_or(serde_json::Value::Null);
+            // #2561: cap concurrent ingestion decompressions; on saturation skip
+            // this best-effort metadata enrichment rather than blocking/queueing.
+            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
+                if let Some(image_meta) = Self::extract_metadata(content) {
+                    metadata["image_metadata"] =
+                        serde_json::to_value(&image_meta).unwrap_or(serde_json::Value::Null);
+                }
             }
         }
 

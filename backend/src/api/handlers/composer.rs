@@ -1348,13 +1348,19 @@ async fn upload(
     }
 
     // Parse composer.json from the archive to extract metadata
-    let composer_json = ComposerHandler::parse_composer_json(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to parse composer.json from archive: {}", e),
-        )
-            .into_response()
-    })?;
+    let composer_json = {
+        // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+        // saturation); permit released as this block ends, before storage.
+        let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()
+            .map_err(|e| e.into_response())?;
+        ComposerHandler::parse_composer_json(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to parse composer.json from archive: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     // Validate package name has vendor/package format
     let full_name = &composer_json.name;

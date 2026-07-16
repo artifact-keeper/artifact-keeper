@@ -403,8 +403,12 @@ impl FormatHandler for RubygemsHandler {
 
         // Extract gemspec if this is a gem file
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
-            if let Ok(gemspec) = Self::extract_gemspec(content) {
-                metadata["gemspec"] = serde_json::to_value(&gemspec)?;
+            // #2561: cap concurrent ingestion decompressions; on saturation skip
+            // this best-effort metadata enrichment rather than blocking/queueing.
+            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
+                if let Ok(gemspec) = Self::extract_gemspec(content) {
+                    metadata["gemspec"] = serde_json::to_value(&gemspec)?;
+                }
             }
         }
 
@@ -416,6 +420,9 @@ impl FormatHandler for RubygemsHandler {
 
         // Validate gem packages
         if !content.is_empty() && matches!(info.operation, RubygemsOperation::Gem) {
+            // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+            // saturation); permit released at the end of this validation scope.
+            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()?;
             let gemspec = Self::extract_gemspec(content)?;
 
             // Verify name matches

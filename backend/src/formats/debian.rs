@@ -617,8 +617,12 @@ impl FormatHandler for DebianHandler {
 
         // Extract control if this is a package
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            if let Ok(control) = Self::extract_control(content) {
-                metadata["control"] = serde_json::to_value(&control)?;
+            // #2561: cap concurrent ingestion decompressions; on saturation skip
+            // this best-effort metadata enrichment rather than blocking/queueing.
+            if let Ok(_ingest_permit) = crate::util::bounded_archive::acquire_ingest_extraction() {
+                if let Ok(control) = Self::extract_control(content) {
+                    metadata["control"] = serde_json::to_value(&control)?;
+                }
             }
         }
 
@@ -630,6 +634,9 @@ impl FormatHandler for DebianHandler {
 
         // Validate .deb packages
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
+            // #2561: cap concurrent ingestion decompressions (fast-fail 503 on
+            // saturation); permit released at the end of this validation scope.
+            let _ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction()?;
             let control = Self::extract_control(content)?;
 
             // Verify package name matches
