@@ -1033,6 +1033,17 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             )
         };
 
+        // The hosted RPM route serves packages under `packages/<file>` (see the
+        // `/rpm/{repo}/{path}` handler). Artifacts uploaded through the native
+        // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
+        // the generic upload flow are stored at their bare path. Emit a location
+        // that always matches the download route so both upload paths resolve.
+        let location = if artifact.path.starts_with("packages/") {
+            artifact.path.clone()
+        } else {
+            format!("packages/{filename}")
+        };
+
         xml.push_str(&format!(
             r#"  <package type="rpm">
     <name>{name}</name>
@@ -1051,7 +1062,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             checksum = artifact.checksum_sha256,
             summary = xml_escape(&summary),
             size = artifact.size_bytes,
-            location = xml_escape(&artifact.path),
+            location = xml_escape(&location),
         ));
     }
 
@@ -1787,6 +1798,91 @@ mod tests {
         }];
         let xml = generate_primary_xml(&artifacts);
         assert!(xml.contains("test&lt;pkg&gt;"));
+    }
+
+    // The <location href> must match the hosted download route (`packages/<file>`)
+    // regardless of how the artifact was stored (native PUT vs. generic upload).
+    #[test]
+    fn test_generate_primary_xml_bare_path_location_prefixed() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "bare-path RPM must emit a packages/-prefixed href: {xml}"
+        );
+    }
+
+    #[test]
+    fn test_generate_primary_xml_nested_non_packages_path_uses_basename() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "some/nested/dir/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "nested non-packages path must map to packages/<basename>: {xml}"
+        );
+    }
+
+    // Regression pin: a native `packages/`-prefixed path must be emitted
+    // byte-for-byte identically (no double-prefixing, no rewrite).
+    #[test]
+    fn test_generate_primary_xml_native_packages_path_location_identical() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "native packages/ path must be emitted verbatim: {xml}"
+        );
+        assert!(
+            !xml.contains("packages/packages/"),
+            "native packages/ path must not be double-prefixed: {xml}"
+        );
+    }
+
+    // xml_escape must still apply to the computed location.
+    #[test]
+    fn test_generate_primary_xml_location_is_xml_escaped() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "weird&name-1.0-1.x86_64.rpm".to_string(),
+            name: "weird".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/weird.rpm".to_string(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/weird&amp;name-1.0-1.x86_64.rpm"/>"#),
+            "location must be xml-escaped: {xml}"
+        );
     }
 
     #[test]
