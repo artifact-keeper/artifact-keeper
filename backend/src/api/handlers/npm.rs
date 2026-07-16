@@ -791,11 +791,18 @@ fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<
 ///   re-serialised verbatim and leaked out-of-scope package existence against
 ///   upstreams that still honour the endpoints (older verdaccio/Nexus/CouchDB).
 ///
-/// Only entries whose value is an object (a package document) or an array (a
-/// package-name list) are scope-checked by key; scalar-valued keys carry
-/// structural metadata (e.g. `/-/all`'s `_updated`, `/-/whoami`'s
+/// Entries whose value is an object (a package document) or an array (a
+/// package-name list) are scope-checked by key. Scalar-valued keys usually
+/// carry structural metadata (e.g. `/-/all`'s `_updated`, `/-/whoami`'s
 /// `{"username":"..."}`, `/-/ping`'s `{}`) — no package listing — and are
-/// preserved unchanged.
+/// preserved unchanged, except where the key itself is an unambiguous
+/// `@scope/name` package name (#2594), which is scope-checked so a
+/// name->scalar map cannot leak out-of-scope package existence via its keys.
+///
+/// A kept key vouches only for itself: `/-/by-user/:user` keys on the
+/// *username*, so its array value is separately scope-filtered per package
+/// name (#2594), as are name-bearing arrays sitting beside `objects` in a
+/// search envelope.
 ///
 /// A top-level JSON array (some registries answer `/-/all` and similar
 /// endpoints with a bare `["pkg-a","@scope/pkg-b",...]` listing) is treated as
@@ -829,6 +836,13 @@ impl MetaFilterOutcome {
 }
 
 fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> MetaFilterOutcome {
+    // An inactive policy restricts nothing, so there is nothing to filter and
+    // no shape to fail closed on: hand back the upstream bytes verbatim
+    // (#2594). `proxy_npm_meta_get` already gates on `is_active()`, so this is
+    // an invariant for direct callers rather than a change to the proxy path.
+    if !policy.is_active() {
+        return MetaFilterOutcome::Filtered(Bytes::copy_from_slice(bytes));
+    }
     let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(_) => return MetaFilterOutcome::Unrecognized,
@@ -845,19 +859,46 @@ fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> MetaFilterOutc
             });
             let total = objects.len();
             obj.insert("total".to_string(), serde_json::json!(total));
+            // Sibling name-bearing lists (#2594): some registries decorate the
+            // search envelope with extra package-name arrays (e.g. spelling
+            // suggestions) alongside `objects`. Scrub those to the same scope
+            // as the hits themselves; scalar siblings (`total`, `time`) carry
+            // no package listing and stay untouched.
+            for (key, val) in obj.iter_mut() {
+                if key == "objects" {
+                    continue;
+                }
+                if let Some(list) = val.as_array_mut() {
+                    list.retain(|entry| meta_array_entry_allowed(entry, policy));
+                }
+            }
         } else {
             // Legacy map shapes (#2542): key is a package name, value is a
             // package document (`/-/all`) or a package-name list
             // (`/-/by-user`). Drop out-of-scope keys; keep scalar-valued
             // structural metadata (e.g. `_updated`, whoami's `username`)
             // untouched so those endpoints stay correct.
-            obj.retain(|key, val| {
-                if val.is_object() || val.is_array() {
-                    policy.allows(key)
-                } else {
-                    true
-                }
+            obj.retain(|key, val| match val {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => policy.allows(key),
+                // Scalar-valued keys (#2594): a key in unambiguous
+                // `@scope/name` form is a package name (e.g. the non-standard
+                // `{"@scope/pkg":"1.2.3"}` name->version map), so scope-check
+                // it — keeping it would leak out-of-scope package existence
+                // through the key alone. A bare unscoped key is
+                // indistinguishable from structural metadata (`_updated`,
+                // whoami's `username`, `ok`), so it is still preserved.
+                _ => !matches!(npm_name_shape(key), NpmNameShape::Scoped(_)) || policy.allows(key),
             });
+            // Package-name lists under a kept key (#2594): `/-/by-user/:user`
+            // keys on the *username*, so an allowed key says nothing about the
+            // package names it lists — scope-filter the list itself. Object
+            // values are package documents (`/-/all`) already vouched for by
+            // their in-scope key and are left intact.
+            for val in obj.values_mut() {
+                if let Some(list) = val.as_array_mut() {
+                    list.retain(|entry| meta_array_entry_allowed(entry, policy));
+                }
+            }
         }
     } else if let Some(arr) = value.as_array_mut() {
         // Top-level package-name array (#2551): retain only in-scope entries.
@@ -3955,6 +3996,145 @@ mod tests {
             .map(|n| n.as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["lodash", "express", "@evil/secret"]);
+    }
+
+    #[test]
+    fn meta_response_by_user_list_is_scope_filtered_under_allowed_key() {
+        // `/-/by-user/:user` keys on the *username*, not a package name (#2594).
+        // An allowed username (here matched by the `lodash*` name glob) must not
+        // hand back the out-of-scope package names it lists.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"lodash-maint":["@corp/tool","@evil/secret","express","lodash.merge"]}"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v["lodash-maint"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        // In-scope names still listed for the allowed user.
+        assert!(names.contains(&"@corp/tool"));
+        assert!(names.contains(&"lodash.merge"));
+        // Out-of-scope package existence removed from the list.
+        assert!(!names.contains(&"@evil/secret"));
+        assert!(!names.contains(&"express"));
+    }
+
+    #[test]
+    fn meta_response_scalar_map_drops_out_of_scope_package_name_keys() {
+        // Non-standard package-name -> scalar maps (e.g. name->version) leak the
+        // key name itself; an unambiguous `@scope/name` key is scope-checked
+        // (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"@corp/tool":"1.0.0","@evil/secret":"9.9.9","_updated":1}"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        // In-scope scalar key kept, with its value.
+        assert_eq!(obj["@corp/tool"], "1.0.0");
+        // Out-of-scope scalar key dropped.
+        assert!(!obj.contains_key("@evil/secret"));
+        // Structural metadata still preserved.
+        assert_eq!(obj["_updated"], 1);
+    }
+
+    #[test]
+    fn meta_response_scalar_structural_keys_survive_active_policy() {
+        // Bare unscoped scalar keys are indistinguishable from structural
+        // metadata, so whoami/ping-style documents stay intact under an active
+        // policy (#2594 must not over-block them).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let whoami = filter_meta_response(br#"{"username":"alice"}"#, &p).expect_filtered();
+        let vw: serde_json::Value = serde_json::from_slice(&whoami).unwrap();
+        assert_eq!(vw["username"], "alice");
+        let ping = filter_meta_response(b"{}", &p).expect_filtered();
+        let vp: serde_json::Value = serde_json::from_slice(&ping).unwrap();
+        assert!(vp.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_search_response_scrubs_name_bearing_siblings() {
+        // Only `objects` used to be scrubbed: a sibling package-name array rode
+        // along untouched (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"objects":[
+            {"package":{"name":"lodash","version":"4.17.21"}},
+            {"package":{"name":"express","version":"4.18.0"}}
+        ],"total":2,"time":"now","typosOf":["@evil/secret","lodash"]}"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // `objects` filtering and `total` correction unchanged.
+        let objs = v["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0]["package"]["name"], "lodash");
+        assert_eq!(v["total"], 1);
+        // The sibling list is scrubbed to the same scope.
+        let typos: Vec<&str> = v["typosOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(typos, vec!["lodash"]);
+        // Scalar siblings carry no package listing and are left alone.
+        assert_eq!(v["time"], "now");
+    }
+
+    #[test]
+    fn meta_response_in_scope_only_body_is_preserved_intact() {
+        // The hardening must not cost legitimate content: a response with only
+        // in-scope names survives whole (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"_updated":7,"lodash":{"name":"lodash","dist-tags":{"latest":"4.17.21"}},"lodash-maint":["@corp/tool","lodash.merge"]}"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["_updated"], 7);
+        // The `/-/all` package document keeps its internal fields.
+        assert_eq!(v["lodash"]["name"], "lodash");
+        assert_eq!(v["lodash"]["dist-tags"]["latest"], "4.17.21");
+        // The in-scope name list under an allowed key is untouched.
+        assert_eq!(
+            v["lodash-maint"],
+            serde_json::json!(["@corp/tool", "lodash.merge"])
+        );
+    }
+
+    #[test]
+    fn meta_response_unrecognized_shape_still_fails_closed() {
+        // Regression pin for #2551: the added value-level filtering must not
+        // reopen the fail-open on unrecognised shapes.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        assert!(matches!(
+            filter_meta_response(b"not json at all { [", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"\"@evil/secret\"", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"1234", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn meta_response_inactive_policy_is_byte_identical_passthrough() {
+        // Inactive policy restricts nothing: every shape the new filtering
+        // touches comes back byte-for-byte (#2594).
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        for body in [
+            br#"{"lodash-maint":["@corp/tool","@evil/secret","express"]}"#.as_slice(),
+            br#"{"@evil/secret":"9.9.9","_updated":1}"#.as_slice(),
+            br#"{"objects":[{"package":{"name":"express"}}],"total":1,"typosOf":["@evil/secret"]}"#
+                .as_slice(),
+            br#"{"username":"alice"}"#.as_slice(),
+        ] {
+            let out = filter_meta_response(body, &p).expect_filtered();
+            assert_eq!(&out[..], body);
+        }
     }
 
     #[test]
