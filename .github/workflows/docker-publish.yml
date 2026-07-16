@@ -42,8 +42,40 @@ env:
   DOCKERHUB_SCANNER_ADAPTER: artifactkeeper/scanner-adapter
 
 jobs:
+  publish-preflight:
+    name: Publish identity preflight
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject moved or deleted version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG_CREATED: ${{ github.event.created }}
+          TAG_DELETED: ${{ github.event.deleted }}
+          TAG_FORCED: ${{ github.event.forced }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG_CREATED" != "true" || "$TAG_DELETED" == "true" || "$TAG_FORCED" == "true" ]]; then
+            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved, recreated, or deleted. Refusing to replace published container tags."
+            exit 1
+          fi
+
+      # Manual builds are useful for candidate/dev labels, but must not be a
+      # back door around the immutable release path.
+      - name: Reject stable manual tags
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_TAG" == "latest" || "$REQUESTED_TAG" =~ ^v?[0-9]+([.][0-9]+){0,2}([+-].*)?$ ]]; then
+            echo "::error title=Stable manual tag refused::${REQUESTED_TAG} is release-like. Stable tags must come from the guarded release path; use an explicit candidate/dev label."
+            exit 1
+          fi
+
   build-backend:
     name: Backend (${{ matrix.platform }})
+    needs: [publish-preflight]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -136,6 +168,7 @@ jobs:
 
   build-openscap:
     name: OpenSCAP (${{ matrix.platform }})
+    needs: [publish-preflight]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -215,6 +248,7 @@ jobs:
 
   build-scanner-adapter:
     name: Scanner Adapter (${{ matrix.platform }})
+    needs: [publish-preflight]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -295,6 +329,7 @@ jobs:
 
   build-backend-alpine:
     name: Backend Alpine (${{ matrix.platform }})
+    needs: [publish-preflight]
     # Alpine builds suspended. UBI is the default backend image and the
     # only one we currently publish. Re-enable when the Alpine variant is
     # needed again (smaller footprint, distroless-style use cases).
@@ -872,12 +907,13 @@ jobs:
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "minor=${V%.*}" >> "$GITHUB_OUTPUT"
           echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
-          # Publish the version/major.minor/major/latest tags on main-branch
-          # builds and clean (non-prerelease) v-tag builds only.
-          if [[ "$GH_REF" == "refs/heads/main" || ( "$GH_REF" == refs/tags/v* && "$GH_REF" != *-* ) ]]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+          # Stable adapter tags are considered only for clean release-tag
+          # builds. Main publishes dev + sha tags and must never move the
+          # adapter's exact semver tag without a VERSION bump.
+          if [[ "$GH_REF" == refs/tags/v* && "$GH_REF" != *-* ]]; then
+            echo "stable_requested=true" >> "$GITHUB_OUTPUT"
           else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "stable_requested=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download digests
@@ -906,19 +942,80 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Decide stable adapter publication
+        id: adapter_publish
+        env:
+          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
+          STABLE_REQUESTED: ${{ steps.adapter_version.outputs.stable_requested }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$STABLE_REQUESTED" != "true" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Branch/pr/manual build: publishing scanner-adapter dev/sha tags only."
+            exit 0
+          fi
+
+          EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
+          set +e
+          INSPECT_RESULT=$(docker buildx imagetools inspect "$EXACT_REF" 2>&1)
+          INSPECT_RC=$?
+          set -e
+          if [[ "$INSPECT_RC" -ne 0 ]] && grep -Eqi 'manifest unknown|not found' <<< "$INSPECT_RESULT"; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Scanner-adapter ${ADAPTER_VERSION} is new; stable tags will be created."
+            exit 0
+          fi
+          if [[ "$INSPECT_RC" -ne 0 ]]; then
+            echo "::error title=Adapter registry lookup failed::Unable to prove whether ${EXACT_REF} exists; failing closed."
+            printf '%s\n' "$INSPECT_RESULT"
+            exit 1
+          fi
+
+          # An existing exact semver is immutable. Reuse it only when scanner
+          # sources are unchanged since the revision recorded on that image.
+          # If sources changed, VERSION must be bumped before a stable release.
+          MANIFEST_JSON=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$EXACT_REF")
+          EXISTING_REV=$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$MANIFEST_JSON")
+          if [[ ! "$EXISTING_REV" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation; refusing to move an exact semver tag."
+            exit 1
+          fi
+
+          if ! git cat-file -e "${EXISTING_REV}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$EXISTING_REV"
+          fi
+
+          EXISTING_VERSION=$(git show "${EXISTING_REV}:docker/scanner-adapter/VERSION")
+          if [[ "$EXISTING_VERSION" != "$ADAPTER_VERSION" ]]; then
+            echo "::error title=Adapter version collision::${EXACT_REF} records VERSION=${EXISTING_VERSION}, expected ${ADAPTER_VERSION}."
+            exit 1
+          fi
+
+          if ! git diff --quiet "$EXISTING_REV" "$GITHUB_SHA" -- \
+            docker/scanner-adapter docker/Dockerfile.scanner-adapter; then
+            echo "::error title=Scanner adapter VERSION bump required::${EXACT_REF} already exists at ${EXISTING_REV}, but scanner-adapter sources changed. Bump docker/scanner-adapter/VERSION; exact semver tags are immutable."
+            exit 1
+          fi
+
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "Scanner-adapter ${ADAPTER_VERSION} already exists and sources are unchanged; retaining its existing stable digest."
+
       - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           # Tags come from the adapter's own VERSION file, NOT the AK git-tag
-          # semver used by backend/web/openscap. dev + sha-<sha> are kept on
-          # main builds for traceability.
+          # semver used by backend/web/openscap. Exact semver and floating
+          # stable tags are created once per adapter VERSION. Main builds keep
+          # only dev + sha-<sha> for traceability.
           tags: |
-            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
@@ -932,10 +1029,10 @@ jobs:
           # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
           # AK git-tag semver. Same tags published to both registries.
           tags: |
-            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_version.outputs.publish == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_version.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
@@ -944,9 +1041,13 @@ jobs:
       - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.version=${ADAPTER_VERSION}" \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@sha256:%s ' *)
         env:
+          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
 
       - name: Inspect image

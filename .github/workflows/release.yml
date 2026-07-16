@@ -18,12 +18,61 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release version is immutable. In particular, reject a second push that
+  # moves an existing v-tag: v1.5.8 demonstrated that a moved tag plus release
+  # asset overwrite can silently replace every public binary.
+  release-preflight:
+    name: Release identity preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Reject moved or deleted version tags
+        if: github.event_name == 'push'
+        env:
+          TAG_CREATED: ${{ github.event.created }}
+          TAG_DELETED: ${{ github.event.deleted }}
+          TAG_FORCED: ${{ github.event.forced }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG_CREATED" != "true" || "$TAG_DELETED" == "true" || "$TAG_FORCED" == "true" ]]; then
+            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved, recreated, or deleted. Released version tags are immutable; create a new version instead."
+            exit 1
+          fi
+
+      - name: Refuse an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="v${DISPATCH_VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          set +e
+          LOOKUP=$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)
+          LOOKUP_RC=$?
+          set -e
+          if [[ "$LOOKUP_RC" -eq 0 ]]; then
+            echo "::error title=Release already exists::${TAG} already has a GitHub Release. Refusing to modify its metadata or assets; create a new version."
+            exit 1
+          fi
+          if ! grep -q 'HTTP 404' <<< "$LOOKUP"; then
+            echo "::error title=Release lookup failed::Unable to prove ${TAG} is unused; failing closed."
+            printf '%s\n' "$LOOKUP"
+            exit 1
+          fi
+
   # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
 
   e2e-gate:
     name: 🚦 E2E Gate
+    needs: [release-preflight]
     uses: ./.github/workflows/e2e.yml
     with:
       profile: smoke
@@ -32,6 +81,7 @@ jobs:
 
   mesh-e2e-gate:
     name: Mesh Replication E2E (optional)
+    needs: [release-preflight]
     uses: ./.github/workflows/mesh-e2e.yml
     with:
       image_tag: dev
@@ -39,6 +89,7 @@ jobs:
 
   release-gate:
     name: Release Gate (Full Suite)
+    needs: [release-preflight]
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: dev
@@ -56,7 +107,7 @@ jobs:
     if: |
       always() &&
       needs.e2e-gate.result == 'success' &&
-      (needs.release-gate.result == 'success' || needs.release-gate.result == 'failure')
+      needs.release-gate.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -168,8 +219,7 @@ jobs:
   # references at the release version tag, and fails if any is missing
   # after the docker-publish workflows have had time to complete.
   #
-  # When this gate fails, the GitHub Release stays a draft (see Check
-  # gate status step in the release job below).
+  # When this gate fails, the GitHub Release job does not run.
   #
   # Tracks Hardening Core issue
   # https://github.com/artifact-keeper/artifact-keeper/issues/882
@@ -332,7 +382,7 @@ jobs:
 
           if [ "${#missing[@]}" -gt 0 ]; then
             echo ""
-            echo "::error::One or more required images are missing on ghcr.io and/or docker.io after the deadline. The GitHub Release will be marked DRAFT and will not promote to stable until every required image is published on both registries."
+            echo "::error::One or more required images are missing on ghcr.io and/or docker.io after the deadline. GitHub Release creation is blocked until every required image is published on both registries."
             printf '  - %s\n' "${missing[@]}"
             exit 1
           fi
@@ -347,7 +397,11 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [build-binaries, release-gate, mesh-e2e-gate, verify-images-published]
-    if: always() && needs.build-binaries.result == 'success'
+    if: |
+      always() &&
+      needs.build-binaries.result == 'success' &&
+      needs.release-gate.result == 'success' &&
+      needs.verify-images-published.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -369,22 +423,27 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Check gate status
-        id: gates
+      # Repeat the existence check immediately before publication to close the
+      # race between the early preflight and this job. A rerun must never find
+      # a public/draft release and replace its files.
+      - name: Refuse release creation race or rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          RELEASE_GATE="${{ needs.release-gate.result }}"
-          MESH_GATE="${{ needs.mesh-e2e-gate.result }}"
-          IMAGES_GATE="${{ needs.verify-images-published.result }}"
-          echo "release_gate=${RELEASE_GATE}" >> $GITHUB_OUTPUT
-          echo "mesh_gate=${MESH_GATE}" >> $GITHUB_OUTPUT
-          echo "images_gate=${IMAGES_GATE}" >> $GITHUB_OUTPUT
-
-          if [[ "$RELEASE_GATE" == "success" && "$IMAGES_GATE" == "success" ]]; then
-            echo "all_passed=true" >> $GITHUB_OUTPUT
-            echo "Gates passed: release=$RELEASE_GATE images=$IMAGES_GATE mesh=$MESH_GATE (mesh is optional)"
-          else
-            echo "all_passed=false" >> $GITHUB_OUTPUT
-            echo "::warning::A required gate is not green: release=$RELEASE_GATE images=$IMAGES_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
+          set -euo pipefail
+          set +e
+          LOOKUP=$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)
+          LOOKUP_RC=$?
+          set -e
+          if [[ "$LOOKUP_RC" -eq 0 ]]; then
+            echo "::error title=Release already exists::${TAG} appeared after preflight. Refusing to update or replace its assets."
+            exit 1
+          fi
+          if ! grep -q 'HTTP 404' <<< "$LOOKUP"; then
+            echo "::error title=Release lookup failed::Unable to prove ${TAG} is unused; failing closed."
+            printf '%s\n' "$LOOKUP"
+            exit 1
           fi
 
       - name: Collect release assets
@@ -400,13 +459,13 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
+          draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*
           fail_on_unmatched_files: true
+          overwrite_files: false
 
       - name: Notify Windows MSI build
-        if: steps.gates.outputs.all_passed == 'true'
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           token: ${{ secrets.WINDOWS_REPO_PAT }}
