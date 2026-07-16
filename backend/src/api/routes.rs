@@ -894,6 +894,8 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             )),
         )
         // Remote instance management & proxy routes with auth middleware.
+        // Instances are user-owned integration records; handlers scope every
+        // operation to the authenticated user's id.
         // The global body limit is disabled above, so apply a route-scoped
         // request-body limit here (default 32 MiB, env-tunable via
         // REMOTE_PROXY_BODY_LIMIT_BYTES) to bound the proxy request path. The
@@ -918,12 +920,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Migration routes with auth middleware
+        // Migration connections and jobs are system-wide administrative state.
+        // Gate the whole nest so authz runs before UUID lookup or JSON parsing.
         .nest(
             "/migrations",
             handlers::migration::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
-                auth_middleware,
+                admin_middleware,
             )),
         )
         // Chunked/resumable upload routes with auth middleware
@@ -1059,6 +1062,22 @@ mod tests {
         assert!(
             ROUTES_RS_SRC.contains("\"/dependency-track\","),
             "/dependency-track nest registration missing"
+        );
+    }
+
+    #[test]
+    fn migrations_nest_requires_admin() {
+        let nest = ROUTES_RS_SRC
+            .split("handlers::migration::router()")
+            .nth(1)
+            .expect("migration::router() must be nested under /migrations");
+        let next_middleware = nest
+            .split("from_fn_with_state")
+            .nth(1)
+            .expect("/migrations nest must attach middleware");
+        assert!(
+            next_middleware.contains("admin_middleware"),
+            "/migrations must reject non-admins before validation or lookup"
         );
     }
 }

@@ -465,9 +465,9 @@ fn oci_forbidden_scope(required: &str) -> Response {
 }
 
 /// Build a 403 Forbidden response when a caller is authenticated but lacks
-/// write/delete access to the target repository (private-repo members-only
-/// gate). Uses the OCI `DENIED` error code, the registry-standard code for an
-/// authorization failure on an authenticated request.
+/// write/delete access to the target repository. Uses the OCI `DENIED` error
+/// code, the registry-standard code for an authorization failure on an
+/// authenticated request.
 fn oci_denied_repo_access() -> Response {
     oci_error(
         StatusCode::FORBIDDEN,
@@ -522,46 +522,34 @@ fn enforce_token_repo_scope(
     }
 }
 
-/// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
+/// OCI v2 write/delete authorization — parity with the REST artifact gates.
 ///
-/// The REST artifact path enforces a private-repository members-only gate
-/// (`require_repo_write_access` in `handlers/repositories.rs`, the #1764
-/// lineage): admins bypass, public repositories are writable by any
-/// authenticated caller, and every other caller must hold a role assignment
-/// scoped to the repository (direct or global) — exactly
-/// `RepositoryService::user_can_access_repo`. The /v2 write/delete handlers
-/// authenticate the caller and check the OCI token scope, but never consulted
-/// this per-repo membership gate, so a non-admin non-member could push to /
-/// delete from a PRIVATE repository that the REST path denies with 403. Apply
-/// the same decision here.
-///
-/// This is intentionally the per-repo membership check, NOT the fine-grained
-/// permission-rule check (`check_permission`/`has_any_rules_for_target`): the
-/// latter defaults to "no rules => allow", which would leave a freshly-created
-/// private repo with no rules wide open — the gap that the REST gate closes.
+/// Public visibility is read-only. Pushes and deletes require the requested
+/// repository action (or `admin`) once fine-grained rules exist, with legacy
+/// role assignments as the fallback for repositories without rules.
 ///
 /// Public-pull / anonymous-read paths never reach this helper (it is only
 /// invoked on write/delete handlers after authentication). Proxy/mirror flows
 /// are unaffected: remote/virtual repos reject pushes earlier, and replication
 /// identities hold a repo-scoped or global grant. Fails closed (503) if the
 /// membership lookup errors, mirroring the REST middleware.
-async fn require_oci_repo_write_access(
+async fn require_oci_repo_action_access(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
-    repo_is_public: bool,
+    action: &str,
 ) -> Result<(), Response> {
     // An API-token-scoped bearer may only touch repositories in its declared
     // allow-list — a ceiling that applies even to admins (#2290). This mirrors
     // the REST #504 gate, which runs `can_access_repo` before the admin
     // fine-grained bypass. No-op for unscoped tokens / JWT-login sessions.
     enforce_token_repo_scope(claims, repo_id)?;
-    if claims.is_admin || repo_is_public {
+    if claims.is_admin {
         return Ok(());
     }
     match state
         .create_repository_service()
-        .user_can_access_repo(repo_id, claims.sub)
+        .user_can_perform_repo_action(repo_id, claims.sub, action)
         .await
     {
         Ok(true) => Ok(()),
@@ -574,61 +562,6 @@ async fn require_oci_repo_write_access(
                 "repository authorization temporarily unavailable",
             ))
         }
-    }
-}
-
-/// Fine-grained per-action OCI gate, applied AFTER `require_oci_repo_write_access`
-/// (the tenant-membership gate) on the destructive manifest-delete path.
-///
-/// `require_oci_repo_write_access` admits any member (incl. a read/write-only
-/// grantee) and any authed caller on a public repo, collapsing write/delete —
-/// the OCI half of #2321 (G2). When the repo has fine-grained permission rules,
-/// require the requested `action` (or `admin`, which implies all actions), the
-/// same `has_rules -> check_permission` block the REST path enforces. Admins
-/// bypass; a repo with no rules falls through unchanged. Fails closed (503) if
-/// the rule lookup errors, mirroring `require_oci_repo_write_access`.
-#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
-async fn require_oci_repo_fine_grained_action(
-    state: &SharedState,
-    claims: &crate::services::auth_service::Claims,
-    repo_id: Uuid,
-    action: &str,
-) -> Result<(), Response> {
-    if claims.is_admin {
-        return Ok(());
-    }
-    let has_rules = match state
-        .permission_service
-        .has_any_rules_for_target("repository", repo_id)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("OCI permission-rule lookup failed: {}", e);
-            return Err(oci_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "DENIED",
-                "repository authorization temporarily unavailable",
-            ));
-        }
-    };
-    if !has_rules {
-        return Ok(());
-    }
-    let has_action = state
-        .permission_service
-        .check_permission(claims.sub, "repository", repo_id, action, false)
-        .await
-        .unwrap_or(false);
-    let has_admin = state
-        .permission_service
-        .check_permission(claims.sub, "repository", repo_id, "admin", false)
-        .await
-        .unwrap_or(false);
-    if has_action || has_admin {
-        Ok(())
-    } else {
-        Err(oci_denied_repo_access())
     }
 }
 
@@ -4607,11 +4540,8 @@ async fn handle_start_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write authorization (private-repo members-only gate, parity
-    // with the REST artifact-write path). Without this a non-admin non-member
-    // could open a blob upload against a PRIVATE repo it has no grant on.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
+    // Repository write authorization, including rule-less public repositories.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "write").await {
         return resp;
     }
     // #1776: only repositories that store their own manifests (Local/Staging)
@@ -4947,9 +4877,8 @@ async fn handle_patch_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write authorization (private-repo members-only gate).
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
+    // Repository write authorization.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "write").await {
         return resp;
     }
 
@@ -5193,9 +5122,8 @@ async fn handle_cancel_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write authorization (private-repo members-only gate).
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
+    // Repository write authorization.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "write").await {
         return resp;
     }
     let storage = match state.storage_for_repo(&repo.location) {
@@ -5435,9 +5363,8 @@ async fn handle_complete_upload(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write authorization (private-repo members-only gate).
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
+    // Repository write authorization.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "write").await {
         return resp;
     }
 
@@ -6985,9 +6912,8 @@ async fn handle_put_manifest(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write authorization (private-repo members-only gate).
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
+    // Repository write authorization.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "write").await {
         return resp;
     }
     // #1776: only repositories that store their own manifests (Local/Staging)
@@ -8031,17 +7957,8 @@ async fn handle_delete_manifest(
         Ok(r) => r,
         Err(e) => return e,
     };
-    // Repository write/delete authorization (private-repo members-only gate).
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, repo.is_public).await
-    {
-        return resp;
-    }
-    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
-    // member regardless of action, collapsing read/write/delete. Require the
-    // `delete` action when the repo has permission rules, matching the REST
-    // `delete_artifact` path.
-    if let Err(resp) = require_oci_repo_fine_grained_action(state, &claims, repo.id, "delete").await
-    {
+    // Repository delete authorization.
+    if let Err(resp) = require_oci_repo_action_access(state, &claims, repo.id, "delete").await {
         return resp;
     }
 
@@ -14196,6 +14113,9 @@ mod manifest_digest_db_tests {
         assert_eq!(st, StatusCode::NOT_FOUND, "absent digest still 404s");
 
         // 5. DELETE by digest removes the object; the digest then 404s.
+        // This fixture's legacy developer role grants write, not delete. Give
+        // the actor the explicit actions needed by the remainder of the test.
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "delete"]).await;
         let (st, _, _) = send(
             router().with_state(fx.state.clone()),
             req(
@@ -14442,6 +14362,7 @@ mod manifest_digest_db_tests {
         .await
         .expect("create failure trigger");
 
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["delete"]).await;
         let (status, _, _) = send(
             router().with_state(fx.state.clone()),
             req(
@@ -14809,6 +14730,10 @@ mod oci_blob_upload_streaming_tests {
             }
         };
 
+        // Keep this test focused on the promotion-only gate: the actor is
+        // otherwise authorized to delete from the repository.
+        tdh::grant_repo_actions(&f.inner.pool, f.inner.repo_id, f.inner.user_id, &["delete"]).await;
+
         // (a) promotion_only=true, non-admin (default fixture token, is_admin=false):
         //     DELETE must be rejected 403 DENIED and leave the tag intact.
         f.inner.set_promotion_only(true).await;
@@ -15058,6 +14983,7 @@ mod oci_blob_upload_streaming_tests {
         .await
         .expect("seed refs");
 
+        tdh::grant_repo_actions(&f.inner.pool, f.inner.repo_id, f.inner.user_id, &["delete"]).await;
         let (status, _h, _b) = send(
             f.app(),
             request(
@@ -15106,6 +15032,7 @@ mod oci_blob_upload_streaming_tests {
         .await
         .expect("seed child refs");
 
+        tdh::grant_repo_actions(&f.inner.pool, f.inner.repo_id, f.inner.user_id, &["delete"]).await;
         let (status, _h, _b) = send(
             f.app(),
             request(
@@ -22240,11 +22167,9 @@ mod cross_repo_session_regression_tests {
 // ===========================================================================
 // OCI v2 write authorization + body-size cap.
 //
-// Authorization: the /v2 blob-upload and manifest write/delete paths must
-// enforce the SAME private-repo members-only gate the REST artifact path
-// enforces (`require_repo_write_access` -> `user_can_access_repo`, the #1764
-// lineage). A non-admin non-member is denied on a PRIVATE repo; admins and
-// granted members are allowed; public repos and anonymous reads are unaffected.
+// Authorization: the /v2 blob-upload and manifest write/delete paths enforce
+// the same action-aware repository gate as REST. Public visibility is read-only;
+// mutations require the matching repository action or global admin.
 //
 // Size cap: an over-limit body must yield 413 Payload Too Large (declared
 // Content-Length / Content-Range rejection, or the streaming cumulative cap),
@@ -22408,6 +22333,32 @@ mod oci_write_authz_and_size_tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, member).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn start_upload_denied_for_ungranted_user_on_public_repo() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = create_private_docker_repo(&pool).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make OCI repository public");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let outsider = create_oci_user(&pool, false).await;
+        let bearer = bearer_for(&state, outsider).await;
+
+        let status = start_upload_status(&state, &repo_key, &bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "public pull visibility must not authorize an OCI push"
+        );
+
+        tdh::cleanup(&pool, repo_id, outsider).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 

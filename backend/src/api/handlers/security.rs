@@ -661,13 +661,16 @@ async fn get_all_scores(
     tag = "security",
     responses(
         (status = 200, description = "List of scan configurations", body = Vec<ScanConfigResponse>),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_scan_configs(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<ScanConfigResponse>>> {
+    auth.require_admin()?;
+
     let svc = ScanConfigService::new(state.db.clone());
     let configs = svc.list_configs().await?;
     let response: Vec<ScanConfigResponse> =
@@ -1475,6 +1478,10 @@ mod tests {
                 writer
             );
         }
+        assert!(
+            body_of("list_scan_configs").contains("require_admin("),
+            "global scan configuration inventory must require admin"
+        );
     }
 
     // -----------------------------------------------------------------------

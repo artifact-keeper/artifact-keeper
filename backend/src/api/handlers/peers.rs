@@ -236,14 +236,18 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
     params(ListPeersQuery),
     responses(
         (status = 200, description = "List of peer instances", body = PeerInstanceListResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_peers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<PeerInstanceListResponse>> {
+    auth.require_admin()?;
+
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -367,6 +371,7 @@ pub async fn register_peer(
     ),
     responses(
         (status = 200, description = "Peer instance details", body = PeerInstanceResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -374,8 +379,11 @@ pub async fn register_peer(
 )]
 pub async fn get_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PeerInstanceResponse>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let instance = service.get_by_id(id).await?;
 
@@ -501,6 +509,7 @@ pub async fn trigger_sync(
     ),
     responses(
         (status = 200, description = "List of pending sync tasks", body = Vec<SyncTaskResponse>),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -508,9 +517,12 @@ pub async fn trigger_sync(
 )]
 pub async fn get_sync_tasks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<SyncTaskResponse>>> {
+    auth.require_admin()?;
+
     let limit = query.per_page.unwrap_or(50) as i64;
     let service = PeerInstanceService::new(state.db.clone());
     let tasks = service.get_pending_sync_tasks(id, limit).await?;
@@ -544,6 +556,7 @@ pub async fn get_sync_tasks(
     ),
     responses(
         (status = 200, description = "List of assigned repository IDs", body = Vec<Uuid>),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -551,8 +564,11 @@ pub async fn get_sync_tasks(
 )]
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Uuid>>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let repos = service.get_assigned_repositories(id).await?;
     Ok(Json(repos))
@@ -628,6 +644,7 @@ pub async fn assign_repo(
     ),
     responses(
         (status = 200, description = "Subscription details", body = SubscriptionResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Subscription not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -635,8 +652,11 @@ pub async fn assign_repo(
 )]
 pub async fn get_subscription(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((id, repo_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<SubscriptionResponse>> {
+    auth.require_admin()?;
+
     let service = PeerInstanceService::new(state.db.clone());
     let sub = service.get_subscription(id, repo_id).await?;
     Ok(Json(SubscriptionResponse {
@@ -1627,10 +1647,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Admin gate: the mutating peer handlers (register / unregister /
-    // trigger_sync / assign / unassign / run-now) now call
-    // auth.require_admin()? before touching the service, matching the
-    // in-file pattern already used by heartbeat / announce / identity.
+    // Admin gate: peer management mutations and sensitive inventory reads call
+    // auth.require_admin()? before touching the service.
     // -----------------------------------------------------------------------
 
     /// Build an [`AuthExtension`] for a non-admin caller.
@@ -1672,5 +1690,28 @@ mod tests {
     #[test]
     fn test_peer_write_guard_allows_admin() {
         assert!(admin_auth().require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_peer_inventory_handlers_require_admin() {
+        let source = include_str!("peers.rs");
+        for handler in [
+            "list_peers",
+            "get_peer",
+            "get_sync_tasks",
+            "get_assigned_repos",
+            "get_subscription",
+        ] {
+            let marker = format!("pub async fn {handler}(");
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler {handler} not found"));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("auth.require_admin()?"),
+                "peer inventory handler {handler} must require global admin"
+            );
+        }
     }
 }
