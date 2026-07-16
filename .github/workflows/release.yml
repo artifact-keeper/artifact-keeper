@@ -1,70 +1,76 @@
 name: Release
 
+# A tag push is the only way to cut a release. There was also a
+# `workflow_dispatch` trigger taking a free-text `version` input, which has been
+# removed: it let the version being released drift away from the ref being
+# tested. The gates read `github.ref` (CHANGELOG, image probes) while the
+# release action read `inputs.version`, so a dispatch could validate one version
+# and publish a different one from whatever the default branch happened to be at
+# the time. It had no user -- releases are cut by pushing a tag, per RELEASING.md
+# -- so the coherent fix is to delete it rather than to reconcile it.
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version (e.g., 1.0.0)'
-        required: true
 
 permissions:
   contents: write
   packages: write
   actions: write
 
+# One release run per tag, and never cancel one. Two runs for the same tag would
+# both pass the preflight and then race to publish, and the winner decides which
+# commit the public release contains.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # A release version is immutable. In particular, reject a second push that
-  # moves an existing v-tag: v1.5.8 demonstrated that a moved tag plus release
-  # asset overwrite can silently replace every public binary.
   release-preflight:
     name: Release identity preflight
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Reject moved or deleted version tags
-        if: github.event_name == 'push'
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/scripts
+
+      # Scope, stated honestly: `created` is false only when a push updates an
+      # existing ref, so this catches a force-push over a live tag -- the
+      # v1.5.8 failure mode, where one version named two commits. It does NOT
+      # catch delete-then-recreate: GitHub reports the recreating push as a
+      # brand-new ref (created=true, forced=false), indistinguishable from a
+      # first-time tag. `deleted` is not checked because Actions does not run
+      # `push` workflows on ref deletion at all.
+      #
+      # Real tag immutability comes from a repository ruleset restricting
+      # updates AND deletions on refs/tags/v* -- a repository setting an
+      # administrator applies, which no workflow can substitute for. This job
+      # narrows the window; it does not close it.
+      - name: Reject moved version tags
         env:
           TAG_CREATED: ${{ github.event.created }}
-          TAG_DELETED: ${{ github.event.deleted }}
           TAG_FORCED: ${{ github.event.forced }}
         run: |
           set -euo pipefail
-          if [[ "$TAG_CREATED" != "true" || "$TAG_DELETED" == "true" || "$TAG_FORCED" == "true" ]]; then
-            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved, recreated, or deleted. Released version tags are immutable; create a new version instead."
+          if [[ "$TAG_CREATED" != "true" || "$TAG_FORCED" == "true" ]]; then
+            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved or force-pushed. Released version tags are immutable; create a new version instead."
             exit 1
           fi
 
+      # Catches a published release early, before an hour of gates. It cannot
+      # see drafts -- see the script, and the repeat of this check in the
+      # release job, which holds the token that can.
       - name: Refuse an existing GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          DISPATCH_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            TAG="v${DISPATCH_VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-
-          set +e
-          LOOKUP=$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)
-          LOOKUP_RC=$?
-          set -e
-          if [[ "$LOOKUP_RC" -eq 0 ]]; then
-            echo "::error title=Release already exists::${TAG} already has a GitHub Release. Refusing to modify its metadata or assets; create a new version."
-            exit 1
-          fi
-          if ! grep -q 'HTTP 404' <<< "$LOOKUP"; then
-            echo "::error title=Release lookup failed::Unable to prove ${TAG} is unused; failing closed."
-            printf '%s\n' "$LOOKUP"
-            exit 1
-          fi
+          .github/scripts/assert-release-absent.sh "${GITHUB_REF_NAME}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds
@@ -103,11 +109,10 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Both gates must be green. That is the default `success()` behaviour for
+    # `needs`, so no `if:` is needed -- and an `always()` here would only be a
+    # way to lose it again.
     needs: [e2e-gate, release-gate]
-    if: |
-      always() &&
-      needs.e2e-gate.result == 'success' &&
-      needs.release-gate.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -230,11 +235,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: read
+    # Runs on a green build-binaries by default. The old `startsWith(github.ref,
+    # 'refs/tags/v')` guard existed for the removed workflow_dispatch trigger,
+    # where it quietly skipped this job -- and a skipped required gate then
+    # skipped the release itself after an hour of work, with nothing red to
+    # explain why. The workflow only triggers on v-tags now.
     needs: [build-binaries]
-    if: |
-      always() &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      needs.build-binaries.result == 'success'
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -397,8 +403,12 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: [build-binaries, release-gate, mesh-e2e-gate, verify-images-published]
+    # `mesh-e2e-gate` is advisory, so this cannot fall back to the default
+    # `success()` -- it has to name the gates it requires. `!cancelled()` rather
+    # than `always()`: with `always()`, cancelling the run does not stop the
+    # publication, because the gates it names have already reported success.
     if: |
-      always() &&
+      !cancelled() &&
       needs.build-binaries.result == 'success' &&
       needs.release-gate.result == 'success' &&
       needs.verify-images-published.result == 'success'
@@ -412,39 +422,26 @@ jobs:
           path: artifacts
           pattern: artifact-keeper-*
 
+      # The tag that triggered the run is the single source of the version. It
+      # is the same ref the gates validated, which is the point.
       - name: Determine version
         id: version
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       # Repeat the existence check immediately before publication to close the
-      # race between the early preflight and this job. A rerun must never find
-      # a public/draft release and replace its files.
+      # race between the early preflight and this job. Unlike the preflight,
+      # this job's token carries `contents: write`, so this is also the check
+      # that can see a draft release left over from an earlier attempt.
       - name: Refuse release creation race or rerun
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
-          set +e
-          LOOKUP=$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)
-          LOOKUP_RC=$?
-          set -e
-          if [[ "$LOOKUP_RC" -eq 0 ]]; then
-            echo "::error title=Release already exists::${TAG} appeared after preflight. Refusing to update or replace its assets."
-            exit 1
-          fi
-          if ! grep -q 'HTTP 404' <<< "$LOOKUP"; then
-            echo "::error title=Release lookup failed::Unable to prove ${TAG} is unused; failing closed."
-            printf '%s\n' "$LOOKUP"
-            exit 1
-          fi
+          .github/scripts/assert-release-absent.sh "$TAG"
 
       - name: Collect release assets
         run: |
@@ -457,6 +454,12 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          # Pin the release to the commit this run tested. The tag already
+          # exists (it is what triggered the run), so GitHub resolves the
+          # release from it and this is belt-and-braces -- but it states the
+          # intent, and it is the field that would otherwise silently default to
+          # the head of the default branch.
+          target_commitish: ${{ github.sha }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
           generate_release_notes: true
           draft: false

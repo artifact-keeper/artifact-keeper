@@ -20,6 +20,26 @@ big-bang release workflow.
 
 ## Phase 0 — Contain and establish ownership
 
+### Task 0.0: Apply the version-tag ruleset (blocking prerequisite)
+
+**Repository:** `artifact-keeper` — repository settings, not a pull request.
+
+Every later phase in this plan treats a version tag as a stable name for one
+commit. Nothing in this plan establishes that; a workflow cannot. A tag push is
+reported to Actions only after the ref has moved, and a delete-then-recreate
+arrives as `created=true, forced=false` — identical to a first-time tag. The
+workflow guards contain the damage (they refuse to overwrite a published release
+or image tag); they do not make the tag immutable.
+
+- [ ] Add a repository ruleset restricting **updates** and **deletions** on
+      `refs/tags/v*`.
+- [ ] Enforce it for administrators; record any bypass actors explicitly.
+- [ ] Verify by attempting a force-push and a delete against a scratch `v*` tag.
+
+**Exit criteria:** A released version tag cannot be moved or deleted by any
+non-bypass actor. Until then, treat "released versions are immutable" as an
+intent, not a control.
+
 ### Task 0.1: Resolve the current release incident
 
 **Repositories:** both

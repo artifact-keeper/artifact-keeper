@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g., v1.0.0, latest)'
+        description: 'Candidate image tag (e.g., rc-1.5.9, pr-123, 1.1-dev). Release-managed labels such as latest/dev/stable and version numbers are refused.'
         required: true
-        default: 'latest'
+        default: 'rc-candidate'
 
 permissions: {}
 
@@ -45,33 +45,56 @@ jobs:
   publish-preflight:
     name: Publish identity preflight
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
+    outputs:
+      # The validated, normalized manual tag. Downstream metadata steps use
+      # THIS value rather than the raw input, so the string that was checked is
+      # the string that gets published. Empty for non-dispatch events, where
+      # the manual tag line is disabled anyway.
+      dispatch_tag: ${{ steps.manual_tag.outputs.tag }}
     steps:
-      - name: Reject moved or deleted version tags
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/scripts
+
+      # Scope, stated honestly: `created` is false only when a push updates an
+      # existing ref, so this catches a force-push over a live tag -- the
+      # v1.5.8 failure mode. It does NOT catch delete-then-recreate: GitHub
+      # reports the recreating push as a brand-new ref (created=true,
+      # forced=false), indistinguishable from a first-time tag. `deleted` is
+      # not checked because Actions does not run `push` workflows on ref
+      # deletion at all, so the branch would be dead code.
+      #
+      # Genuine tag immutability is a repository ruleset (restrict updates AND
+      # deletions on refs/tags/v*), not a workflow control. This job narrows
+      # the window; it does not close it.
+      - name: Reject moved version tags
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           TAG_CREATED: ${{ github.event.created }}
-          TAG_DELETED: ${{ github.event.deleted }}
           TAG_FORCED: ${{ github.event.forced }}
         run: |
           set -euo pipefail
-          if [[ "$TAG_CREATED" != "true" || "$TAG_DELETED" == "true" || "$TAG_FORCED" == "true" ]]; then
-            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved, recreated, or deleted. Refusing to replace published container tags."
+          if [[ "$TAG_CREATED" != "true" || "$TAG_FORCED" == "true" ]]; then
+            echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved or force-pushed. Refusing to replace published container tags; create a new version instead."
             exit 1
           fi
 
       # Manual builds are useful for candidate/dev labels, but must not be a
-      # back door around the immutable release path.
-      - name: Reject stable manual tags
+      # back door around the guarded release path. See the script for why the
+      # normalized value is what gets validated and published.
+      - name: Validate manual tag
+        id: manual_tag
         if: github.event_name == 'workflow_dispatch'
         env:
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "$REQUESTED_TAG" == "latest" || "$REQUESTED_TAG" =~ ^v?[0-9]+([.][0-9]+){0,2}([+-].*)?$ ]]; then
-            echo "::error title=Stable manual tag refused::${REQUESTED_TAG} is release-like. Stable tags must come from the guarded release path; use an explicit candidate/dev label."
-            exit 1
-          fi
+          TAG=$(.github/scripts/validate-dispatch-tag.sh "$REQUESTED_TAG")
+          echo "Manual tag accepted: ${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
   build-backend:
     name: Backend (${{ matrix.platform }})
@@ -641,7 +664,13 @@ jobs:
           echo "## Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Trivy CVE Scan" >> $GITHUB_STEP_SUMMARY
-          echo "- **Policy**: Fail on CRITICAL or HIGH severity CVEs" >> $GITHUB_STEP_SUMMARY
+          # These scans run with `exit-code: 0`: they report, they do not gate.
+          # Findings land in code scanning and in the uploaded SARIF. Saying
+          # otherwise here would be the same kind of unearned claim this
+          # workflow's other guards exist to remove. Making the policy real is
+          # tracked separately.
+          echo "- **Scope**: CRITICAL and HIGH severity, fixed CVEs only (\`.trivyignore\` documents accepted exceptions)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Policy**: reporting only — findings are uploaded to code scanning and do NOT block publication" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **Scanner Adapter**: $([ -f scanner-adapter-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
@@ -658,7 +687,7 @@ jobs:
   merge-backend:
     name: Backend Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [build-backend]
+    needs: [publish-preflight, build-backend]
     permissions:
       contents: read
       packages: write
@@ -666,6 +695,13 @@ jobs:
       attestations: write
 
     steps:
+      - name: Checkout (scripts and VEX files)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: |
+            .github/scripts
+            .vex
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -692,6 +728,26 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The exact version tag is the identity the Helm chart pins, so it is
+      # published once and never re-pointed -- not by a rerun, and not by a
+      # delete-and-recreate of the git tag, which the preflight cannot detect
+      # (only a repository ruleset can). Both registries are checked because
+      # this run writes to both, and a tag that survives on one is not evidence
+      # about the other. The floating tags (latest, X.Y) are expected to move
+      # and are not checked here.
+      - name: Refuse to overwrite a published backend version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          .github/scripts/assert-stable-tag-free.sh "$VERSION" \
+            "ghcr.io|${BACKEND_IMAGE}" \
+            "docker.io|${DOCKERHUB_BACKEND}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
@@ -706,7 +762,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
@@ -722,7 +778,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
@@ -759,11 +815,7 @@ jobs:
           push-to-registry: true
         continue-on-error: true
 
-      - name: Checkout (for VEX files)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          sparse-checkout: .vex
-
+      # .vex was fetched by the checkout at the top of this job.
       - name: Attach VEX attestations
         run: |
           for vex in .vex/*.vex.json; do
@@ -779,7 +831,7 @@ jobs:
   merge-openscap:
     name: OpenSCAP Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [build-openscap]
+    needs: [publish-preflight, build-openscap]
     permissions:
       contents: read
       packages: write
@@ -787,6 +839,11 @@ jobs:
       attestations: write
 
     steps:
+      - name: Checkout (scripts)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/scripts
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -813,6 +870,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Same rule as the backend: the exact version tag is published once, on
+      # both registries, and is never re-pointed. See merge-backend.
+      - name: Refuse to overwrite a published openscap version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          .github/scripts/assert-stable-tag-free.sh "$VERSION" \
+            "ghcr.io|${OPENSCAP_IMAGE}" \
+            "docker.io|${DOCKERHUB_OPENSCAP}"
+
       - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
@@ -827,7 +899,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
@@ -843,7 +915,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
@@ -883,7 +955,7 @@ jobs:
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [build-scanner-adapter]
+    needs: [publish-preflight, build-scanner-adapter]
     permissions:
       contents: read
       packages: write
@@ -903,7 +975,8 @@ jobs:
         env:
           GH_REF: ${{ github.ref }}
         run: |
-          V=$(cat docker/scanner-adapter/VERSION)
+          set -euo pipefail
+          V=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "minor=${V%.*}" >> "$GITHUB_OUTPUT"
           echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
@@ -942,44 +1015,79 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Two different tags with two different jobs:
+      #
+      #   exact (1.2.1)          identity. Published once, never re-pointed.
+      #   floating (1.2, 1, latest)  "the newest build of that line". May move.
+      #
+      # The distinction matters because this image is rebuilt deliberately:
+      # build-scanner-adapter sets `no-cache-filters: runtime` so `apk` re-runs
+      # against current Alpine errata on every publish (#2391). A rule that
+      # froze every stable tag once the version existed would leave the
+      # chart-pinned floating tags on the old, unpatched digest with no way to
+      # deliver an Alpine CVE fix short of a version bump for someone else's
+      # security update. So an unchanged-source rebuild re-points the floating
+      # tags and leaves the exact tag alone; a changed-source build still
+      # demands a VERSION bump.
       - name: Decide stable adapter publication
         id: adapter_publish
         env:
           ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
           STABLE_REQUESTED: ${{ steps.adapter_version.outputs.stable_requested }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
+          publish_exact=false
+          publish_floating=false
+          finish() {
+            echo "publish_exact=${publish_exact}" >> "$GITHUB_OUTPUT"
+            echo "publish_floating=${publish_floating}" >> "$GITHUB_OUTPUT"
+          }
+
           if [[ "$STABLE_REQUESTED" != "true" ]]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Branch/pr/manual build: publishing scanner-adapter dev/sha tags only."
+            finish
             exit 0
           fi
 
-          EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
-          set +e
-          INSPECT_RESULT=$(docker buildx imagetools inspect "$EXACT_REF" 2>&1)
-          INSPECT_RC=$?
-          set -e
-          if [[ "$INSPECT_RC" -ne 0 ]] && grep -Eqi 'manifest unknown|not found' <<< "$INSPECT_RESULT"; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "Scanner-adapter ${ADAPTER_VERSION} is new; stable tags will be created."
-            exit 0
-          fi
-          if [[ "$INSPECT_RC" -ne 0 ]]; then
-            echo "::error title=Adapter registry lookup failed::Unable to prove whether ${EXACT_REF} exists; failing closed."
-            printf '%s\n' "$INSPECT_RESULT"
+          # Ask both registries, because this job writes to both. ghcr.io
+          # answering "absent" says nothing about docker.io -- and deleting a
+          # ghcr package version is a routine admin action, which must not
+          # become permission to overwrite a published Docker Hub tag.
+          PROBE=.github/scripts/registry-tag-state.sh
+          GHCR_STATE=$("$PROBE" ghcr.io "${SCANNER_ADAPTER_IMAGE}" "$ADAPTER_VERSION" || true)
+          HUB_STATE=$("$PROBE" docker.io "${DOCKERHUB_SCANNER_ADAPTER}" "$ADAPTER_VERSION" || true)
+          echo "Adapter ${ADAPTER_VERSION}: ghcr.io=${GHCR_STATE}, docker.io=${HUB_STATE}"
+
+          if [[ "$GHCR_STATE" == "indeterminate" || "$HUB_STATE" == "indeterminate" ]]; then
+            echo "::error title=Adapter registry lookup inconclusive::Unable to prove whether ${ADAPTER_VERSION} is already published (ghcr.io=${GHCR_STATE}, docker.io=${HUB_STATE}); failing closed rather than risk replacing a published tag."
             exit 1
           fi
 
-          # An existing exact semver is immutable. Reuse it only when scanner
-          # sources are unchanged since the revision recorded on that image.
-          # If sources changed, VERSION must be bumped before a stable release.
+          if [[ "$GHCR_STATE" == "absent" && "$HUB_STATE" == "absent" ]]; then
+            publish_exact=true
+            publish_floating=true
+            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; exact and floating tags will be created."
+            finish
+            exit 0
+          fi
+
+          if [[ "$GHCR_STATE" != "$HUB_STATE" ]]; then
+            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io. Reconcile the two registries before publishing; this job will not resolve the split by overwriting either one."
+            exit 1
+          fi
+
+          # Present on both. The exact tag stays where it is; decide whether the
+          # floating tags may follow this rebuild.
+          EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
           MANIFEST_JSON=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$EXACT_REF")
           EXISTING_REV=$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$MANIFEST_JSON")
           if [[ ! "$EXISTING_REV" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation; refusing to move an exact semver tag."
+            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation, so this build cannot prove the floating tags would advance the same sources. Bump docker/scanner-adapter/VERSION."
             exit 1
           fi
 
@@ -987,7 +1095,9 @@ jobs:
             git fetch --no-tags --depth=1 origin "$EXISTING_REV"
           fi
 
-          EXISTING_VERSION=$(git show "${EXISTING_REV}:docker/scanner-adapter/VERSION")
+          # Tolerate a trailing newline or CRLF in the recorded VERSION file
+          # rather than reporting a version collision over whitespace.
+          EXISTING_VERSION=$(git show "${EXISTING_REV}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')
           if [[ "$EXISTING_VERSION" != "$ADAPTER_VERSION" ]]; then
             echo "::error title=Adapter version collision::${EXACT_REF} records VERSION=${EXISTING_VERSION}, expected ${ADAPTER_VERSION}."
             exit 1
@@ -995,12 +1105,14 @@ jobs:
 
           if ! git diff --quiet "$EXISTING_REV" "$GITHUB_SHA" -- \
             docker/scanner-adapter docker/Dockerfile.scanner-adapter; then
-            echo "::error title=Scanner adapter VERSION bump required::${EXACT_REF} already exists at ${EXISTING_REV}, but scanner-adapter sources changed. Bump docker/scanner-adapter/VERSION; exact semver tags are immutable."
+            echo "::error title=Scanner adapter VERSION bump required::${EXACT_REF} already exists at ${EXISTING_REV}, but scanner-adapter sources changed. Bump docker/scanner-adapter/VERSION; exact version tags are never republished."
             exit 1
           fi
 
-          echo "publish=false" >> "$GITHUB_OUTPUT"
-          echo "Scanner-adapter ${ADAPTER_VERSION} already exists and sources are unchanged; retaining its existing stable digest."
+          publish_floating=true
+          echo "Scanner-adapter ${ADAPTER_VERSION} already exists and sources are unchanged."
+          echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; moving the floating tags to this rebuild so base-image errata reach the chart-pinned tags."
+          finish
 
       - name: Extract metadata (ghcr.io)
         id: meta
@@ -1008,18 +1120,19 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           # Tags come from the adapter's own VERSION file, NOT the AK git-tag
-          # semver used by backend/web/openscap. Exact semver and floating
-          # stable tags are created once per adapter VERSION. Main builds keep
-          # only dev + sha-<sha> for traceability.
+          # semver used by backend/web/openscap. The exact version tag is
+          # created once per adapter VERSION; the floating tags may also follow
+          # an unchanged-source rebuild. Main builds keep only dev + sha-<sha>
+          # for traceability.
           tags: |
-            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
@@ -1029,14 +1142,14 @@ jobs:
           # Mirror of the ghcr.io tag set above: adapter's own VERSION, not the
           # AK git-tag semver. Same tags published to both registries.
           tags: |
-            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
-            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.minor }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
+            type=raw,value=${{ steps.adapter_version.outputs.major }},enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
+            type=raw,value=latest,enable=${{ steps.adapter_publish.outputs.publish_floating == 'true' }}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
@@ -1058,10 +1171,19 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
+      # Carry the same annotations the ghcr.io index gets. The source-revision
+      # annotation is what the publication decision above reads back to tell an
+      # unchanged-source rebuild from a version collision, so a Docker Hub index
+      # without it would have no provenance anchor at all.
       - name: Copy to Docker Hub
+        env:
+          ADAPTER_VERSION: ${{ steps.adapter_version.outputs.version }}
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta-dockerhub.outputs.json }}
         run: |
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.version=${ADAPTER_VERSION}" \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Sign image with cosign (keyless)
@@ -1082,7 +1204,7 @@ jobs:
     # Alpine builds suspended; the multi-arch manifest job follows them.
     if: false
     runs-on: ubuntu-latest
-    needs: [build-backend-alpine]
+    needs: [publish-preflight, build-backend-alpine]
     permissions:
       contents: read
       packages: write
@@ -1132,7 +1254,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
@@ -1150,7 +1272,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.publish-preflight.outputs.dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && needs.publish-preflight.outputs.dispatch_tag != '' }}
 
       - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests

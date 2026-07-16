@@ -116,17 +116,43 @@ identity.
 
 ## Containment actions
 
+### Outstanding prerequisite: a tag ruleset
+
+**No workflow control in this list makes a version tag immutable, and none can.**
+A workflow only sees a tag push after the ref has already changed, and GitHub
+reports a delete-then-recreate as a brand-new ref (`created=true`,
+`forced=false`) — indistinguishable from a first-time tag. The workflow guards
+below reject a *force-push* over a live tag and refuse to overwrite already
+published releases and image tags, which contains the observed failure and
+removes its blast radius. They do not prevent one version from naming two
+commits.
+
+Closing that requires a repository **ruleset** restricting **updates and
+deletions** on `refs/tags/v*` — a repository setting an administrator applies.
+Until it exists, every guarantee below is "the pipeline refuses to act on a
+changed tag", not "the tag cannot change".
+
+- [ ] **Protect version tags from update and deletion with a repository
+      ruleset.** Prerequisite for the immutability claims in this document.
+
+### Applied in the publication workflows
+
 - [x] Require exact release-gate success before building release binaries.
 - [x] Require exact required-gate success before invoking the release action.
 - [x] Refuse to create or update a release when its tag already has a release
       object.
 - [x] Disable release-asset overwrite.
-- [x] Reject forced/moved tag events in both publication workflows. Repository
-      tag-rule enforcement remains outstanding.
-- [ ] Protect version tags from update or deletion with a repository ruleset.
+- [x] Reject moved/force-pushed tag events in both publication workflows.
+      Delete-and-recreate is not detectable here; see the ruleset prerequisite
+      above.
+- [x] Refuse to publish an exact version tag that either registry already
+      serves (backend, openscap, scanner-adapter), so a recreated tag cannot
+      replace a published image even though the tag event itself looks new.
 - [x] Stop publishing scanner-adapter semver/stable tags from `main`.
 - [x] Refuse to move an existing scanner-adapter exact semver tag to a new
-      digest; require a VERSION bump.
+      digest; require a VERSION bump. Floating tags (`1.2`, `1`, `latest`) still
+      follow an unchanged-source rebuild so Alpine errata reach the
+      chart-pinned tags (#2391).
 - [x] Bump scanner-adapter to `1.2.1` because `1.2.0` moved and its current
       manifest lacks immutable source-revision metadata.
 - [ ] Add a visible v1.5.8 integrity notice and supersede it with a new version
