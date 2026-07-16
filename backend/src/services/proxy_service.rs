@@ -7245,7 +7245,7 @@ mod tests {
         let service = build_proxy_service_with_storage(mock.clone());
 
         let err = service
-            .cache_quarantine_gate("npm-proxy", "lodash")
+            .cache_quarantine_gate("npm-proxy-quarantine-active", "lodash")
             .await
             .expect_err("an active hold must block the redirect fast path");
         match err {
@@ -7265,7 +7265,7 @@ mod tests {
 
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate("npm-proxy-quarantine-elapsed", "lodash")
                 .await
                 .is_ok(),
             "an elapsed hold must not block the redirect"
@@ -7282,7 +7282,7 @@ mod tests {
 
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate("npm-proxy-quarantine-none", "lodash")
                 .await
                 .is_ok(),
             "a sidecar with no hold must not block the redirect"
@@ -7296,7 +7296,7 @@ mod tests {
 
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate("npm-proxy-quarantine-missing", "lodash")
                 .await
                 .is_ok(),
             "a missing sidecar means no hold known -> allow"
@@ -7316,7 +7316,7 @@ mod tests {
 
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate("npm-proxy-quarantine-read-error", "lodash")
                 .await
                 .is_ok(),
             "a sidecar read/parse error must be treated as no hold known"

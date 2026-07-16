@@ -96,14 +96,17 @@ pub struct SigningConfigResponse {
     responses(
         (status = 200, description = "List of signing keys", body = KeyListResponse),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_keys(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListKeysQuery>,
 ) -> Result<Json<KeyListResponse>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let keys = svc.list_keys(query.repository_id).await?;
     let total = keys.len();
@@ -204,15 +207,18 @@ fn resolve_key_type_and_algorithm(
     responses(
         (status = 200, description = "Signing key details", body = SigningKeyPublic),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_key(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
+
     let svc = signing_service(&state);
     let key = svc.get_key(key_id).await?;
     Ok(Json(key))
@@ -772,6 +778,16 @@ mod tests {
             signing_handler_body("sign_artifact").contains("require_signing_admin"),
             "sign_artifact MUST call require_signing_admin (admin gate) — #2535 bypass guard"
         );
+    }
+
+    #[test]
+    fn test_global_signing_key_inventory_requires_admin() {
+        for name in ["list_keys", "get_key"] {
+            assert!(
+                signing_handler_body(name).contains("require_signing_admin"),
+                "{name} must require global admin before returning key metadata"
+            );
+        }
     }
 
     #[test]

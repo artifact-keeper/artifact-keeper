@@ -29,6 +29,7 @@ use crate::models::access_scope::AccessScope;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::permission_service::PermissionService;
+use crate::services::repository_service::RepositoryService;
 
 /// Custom header name for API key
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
@@ -1248,12 +1249,32 @@ pub struct RepoVisibilityState {
 
 /// Extract the repository key from a format handler request path.
 ///
-/// Format routes are nested as `/{format}/{repo_key}/...`, so the repo key
-/// is the second path segment (e.g. `/pypi/my-repo/simple/` -> `"my-repo"`).
+/// Format routes are nested as `/{format}/{repo_key}/...`, but middleware can
+/// observe either the nest-stripped form or the full `/api/v1/...` URI. In both
+/// cases the repo key is the segment immediately after the format prefix.
 pub(crate) fn extract_repo_key(path: &str) -> &str {
-    let trimmed = path.trim_start_matches('/');
-    let mut segments = trimmed.split('/');
-    segments.next(); // skip format prefix (pypi, npm, maven, etc.)
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let first = match segments.next() {
+        Some(segment) => segment,
+        None => return "",
+    };
+
+    let format = if first == "api" {
+        let Some(version) = segments.next() else {
+            return "";
+        };
+        if !version.starts_with('v') {
+            return "";
+        }
+        segments.next()
+    } else {
+        Some(first)
+    };
+
+    if format.is_none() {
+        return "";
+    }
+
     segments.next().unwrap_or("")
 }
 
@@ -1655,36 +1676,24 @@ pub async fn repo_visibility_middleware(
                         return forbidden_permission_response();
                     }
                 }
-            } else if !is_public {
-                // A private repo with NO fine-grained permission rules must
-                // still not be readable by every authenticated user. Mirror
-                // the REST `require_visible` model: a non-admin needs a role
-                // assignment scoped to this repo (or a global assignment).
+            } else if is_write || !is_public {
+                // Repositories with no fine-grained rules fall back to legacy
+                // role assignments. Private repositories require that grant
+                // for reads and writes; public repositories require it for
+                // writes because public visibility is read-only.
                 //
-                // Without this branch the native-protocol path default-ALLOWED
-                // rule-less private repos to any authenticated principal, while
-                // the REST download path denied the same caller (404) — a
-                // cross-tenant private-artifact leak (red-team round 2).
-                //
-                // Uses sqlx::query_scalar (not the macro) so no new entry in
-                // the sqlx offline-query cache is required, matching the rest
-                // of this middleware. Same predicate as
-                // RepositoryService::user_can_access_repo.
-                let granted = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM role_assignments ra \
-                         WHERE ra.user_id = $1 \
-                           AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-                     )",
-                )
-                .bind(ext.user_id)
-                .bind(repo.id)
-                .fetch_one(&vis_state.db)
-                .await;
+                // This mirrors RepositoryService::user_can_perform_repo_action
+                // and keeps the legacy SQL in one service implementation.
+                let action = action_for_method(request.method());
+                let granted = RepositoryService::new(vis_state.db.clone())
+                    .user_can_perform_legacy_repo_action(repo.id, ext.user_id, action)
+                    .await;
 
                 match granted {
                     Ok(true) => {}
-                    // Existence-hiding 404, matching REST `require_visible`.
+                    Ok(false) if is_write => return forbidden_permission_response(),
+                    // Existence-hiding 404 for unauthorized private reads,
+                    // matching the REST `require_visible` behavior.
                     Ok(false) => return not_found_response(),
                     Err(_) => {
                         // DB error on access check: fail closed.
@@ -2420,6 +2429,20 @@ mod tests {
     #[test]
     fn test_extract_repo_key_no_leading_slash() {
         assert_eq!(extract_repo_key("pypi/my-repo/simple"), "my-repo");
+    }
+
+    #[test]
+    fn test_extract_repo_key_full_api_path() {
+        assert_eq!(extract_repo_key("/api/v1/pypi/my-repo/simple/"), "my-repo");
+        assert_eq!(
+            extract_repo_key("/api/v1/maven/my-repo/com/example/artifact"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_key_full_api_path_without_repo() {
+        assert_eq!(extract_repo_key("/api/v1/pypi"), "");
     }
 
     // -----------------------------------------------------------------------
@@ -4624,6 +4647,7 @@ mod tests {
             repo_key: &str,
             repo_id: Uuid,
             storage_path: String,
+            is_public: bool,
         ) -> RepoVisibilityState {
             let cache: RepoCache =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -4634,7 +4658,7 @@ mod tests {
                 upstream_url: None,
                 storage_path,
                 storage_backend: "filesystem".to_string(),
-                is_public: false,
+                is_public,
                 index_upstream_url: None,
             };
             cache
@@ -4657,6 +4681,14 @@ mod tests {
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
+        let write_req = || {
+            axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/pypi/{}/", repo_key))
+                .header("Authorization", &bearer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
         let storage = storage_dir.to_string_lossy().into_owned();
 
         // 1) No role assignment -> existence-hiding 404 (the fix). Without the
@@ -4667,6 +4699,7 @@ mod tests {
             &repo_key,
             repo_id,
             storage.clone(),
+            false,
         )
         .await;
         let resp = run_through_visibility(state, req()).await;
@@ -4674,17 +4707,51 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "authenticated non-admin without a role assignment must NOT read a \
-             rule-less private repo via the native path"
+            rule-less private repo via the native path"
         );
 
-        // 2) Grant a role assignment -> access restored (parity with REST).
+        // 2) Public visibility remains read-only. A full /api/v1 native-format
+        //    path must resolve the real repo key and deny an ungranted write.
+        let state = mk_state(
+            &pool,
+            auth_service.clone(),
+            &repo_key,
+            repo_id,
+            storage.clone(),
+            true,
+        )
+        .await;
+        let resp = run_through_visibility(state, write_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "public visibility must not authorize native-format writes"
+        );
+
+        // 3) Grant a role assignment -> private read access restored (parity
+        //    with REST), and the legacy developer role remains a write grant.
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
-        let state = mk_state(&pool, auth_service, &repo_key, repo_id, storage).await;
+        let state = mk_state(
+            &pool,
+            auth_service.clone(),
+            &repo_key,
+            repo_id,
+            storage.clone(),
+            false,
+        )
+        .await;
         let resp = run_through_visibility(state, req()).await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
             "a role assignment must restore native-path access to the private repo"
+        );
+        let state = mk_state(&pool, auth_service, &repo_key, repo_id, storage, true).await;
+        let resp = run_through_visibility(state, write_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "legacy developer membership must retain native-format write access"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;

@@ -93,12 +93,11 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
     }
 }
 
-/// Authorize a write/delete operation against a repository.
+/// Authorize a mutating or administrative operation against a repository.
 ///
-/// Enforces both the token-scope check (`require_repo_access`) and, for private
-/// repositories, per-repo authorization: admins bypass; every other caller must
-/// hold a role assignment scoped to the repo (direct or global). Public repos
-/// keep their existing behavior (token-scope only).
+/// Enforces both token scope and action-specific repository authorization.
+/// Public visibility is deliberately read-only and never grants write, delete,
+/// or repository-admin access by itself.
 ///
 /// Exposed as `pub(crate)` so the repository sub-resource handlers that live in
 /// sibling modules (labels, security, email subscriptions) and the chunked
@@ -106,99 +105,50 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
 /// rather than re-deriving (or forgetting) it. The `/api/v1/repositories` nest
 /// runs under `optional_auth_middleware` only, NOT `repo_visibility_middleware`,
 /// so each sub-handler must enforce this itself.
-pub(crate) async fn require_repo_write_access(
+async fn require_repo_action_access(
     auth: &AuthExtension,
     repo: &crate::models::repository::Repository,
     repo_service: &RepositoryService,
+    action: &str,
 ) -> Result<()> {
     require_repo_access(auth, repo.id)?;
-    if repo.is_public || auth.is_admin {
-        return Ok(());
-    }
-    if repo_service
-        .user_can_access_repo(repo.id, auth.user_id)
-        .await?
-    {
-        Ok(())
-    } else {
-        Err(AppError::Authorization(
-            "You do not have access to this repository".to_string(),
-        ))
-    }
-}
-
-/// Pure fine-grained per-action decision, mirroring `upload_write_decision`
-/// (#817) in the chunked-upload path. Admins always pass; a repository with no
-/// permission rules falls through to the default access model; otherwise the
-/// caller must hold the requested action or `admin` (which implies all actions).
-///
-/// Factored out so both branches are unit-testable without a database.
-fn repo_fine_grained_action_allowed(
-    is_admin: bool,
-    has_rules: bool,
-    has_action: bool,
-    has_admin: bool,
-) -> bool {
-    if is_admin {
-        return true;
-    }
-    if !has_rules {
-        return true;
-    }
-    has_action || has_admin
-}
-
-/// Fine-grained per-action authorization, applied AFTER `require_repo_write_access`
-/// (the outer tenant gate) on the generic REST artifact write/delete handlers.
-///
-/// `require_repo_write_access` is only a tenant-membership gate: it treats a
-/// public repository or ANY role-assignment grantee (including a read-only one)
-/// as authorized, collapsing read/write/delete into a single "has access"
-/// predicate. That is the gap #2321 (G2) reports: on a rules-bearing repo a
-/// read-only grantee could still PUT/DELETE, and on a public repo any authed
-/// caller could write. This adds the SAME `has_rules -> check_permission(action)`
-/// block the chunked upload-session path (`upload.rs::create_session`, #817)
-/// already enforces, so the action actually maps to the granted permission.
-///
-/// `action` is `"write"` for uploads and `"delete"` for deletes. Admins bypass;
-/// a repository with no permission rules falls through unchanged (the rules-less
-/// public-repo case is a separate global default-access decision, out of scope
-/// here). A permission-rule lookup error fails closed (503), mirroring
-/// `repo_visibility_middleware` and `create_session`.
-async fn require_repo_fine_grained_action(
-    auth: &AuthExtension,
-    repo_id: Uuid,
-    action: &str,
-    permission_service: &crate::services::permission_service::PermissionService,
-) -> Result<()> {
     if auth.is_admin {
         return Ok(());
     }
-    let has_rules = permission_service
-        .has_any_rules_for_target("repository", repo_id)
-        .await
-        .map_err(|_| {
-            tracing::error!("permission check failed: database unreachable");
-            AppError::ServiceUnavailable("permission service temporarily unavailable".to_string())
-        })?;
-    if !has_rules {
-        return Ok(());
-    }
-    let has_action = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, action, false)
-        .await
-        .unwrap_or(false);
-    let has_admin = permission_service
-        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
-        .await
-        .unwrap_or(false);
-    if repo_fine_grained_action_allowed(auth.is_admin, has_rules, has_action, has_admin) {
+    if repo_service
+        .user_can_perform_repo_action(repo.id, auth.user_id, action)
+        .await?
+    {
         Ok(())
     } else {
         Err(AppError::Authorization(
             "You do not have permission to perform this action on this repository".to_string(),
         ))
     }
+}
+
+pub(crate) async fn require_repo_write_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    require_repo_action_access(auth, repo, repo_service, "write").await
+}
+
+pub(crate) async fn require_repo_delete_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    require_repo_action_access(auth, repo, repo_service, "delete").await
+}
+
+pub(crate) async fn require_repo_admin_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    require_repo_action_access(auth, repo, repo_service, "admin").await
 }
 
 /// Ensure a repository is visible to the current user.
@@ -1935,15 +1885,17 @@ pub async fn put_pypi_track(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, project)): Path<(String, String)>,
-    Json(payload): Json<PypiTrackRequest>,
+    body: Bytes,
 ) -> Result<Json<PypiTrackResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &service).await?;
+    require_repo_admin_access(&auth, &repo, &service).await?;
     require_pypi_tracks_repo(&repo)?;
 
+    let payload: PypiTrackRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid JSON: {}", e)))?;
     let tracks_url = payload.tracks_url.trim().to_string();
     if !(tracks_url.starts_with("http://") || tracks_url.starts_with("https://")) {
         return Err(AppError::Validation(
@@ -2003,7 +1955,7 @@ pub async fn delete_pypi_track(
     auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &service).await?;
+    require_repo_admin_access(&auth, &repo, &service).await?;
 
     let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
     sqlx::query(
@@ -5536,23 +5488,17 @@ pub async fn upload_artifact(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
 
-    // Validate the composed artifact path against traversal, null bytes,
-    // backslashes, percent-encoded traversal, absolute paths, etc. This
-    // protects all upload entry points (URL-path variant, multipart with
-    // path in URL, and multipart with `path` form field added in #1237).
-    // Filesystem storage's `key_to_path` would strip `..` segments, but S3
-    // and other object backends would happily accept `../etc/passwd`.
-    upload_service::validate_artifact_path(&path)
-        .map_err(|e| AppError::Validation(e.to_string()))?;
-
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    // Fine-grained write gate (#2321 G2): the tenant gate above admits any
-    // grantee (incl. a read-only one) and any authed caller on a public repo,
-    // collapsing read/write. Require the `write` action when rules exist, the
-    // same block `upload.rs::create_session` applies to the chunked path.
-    require_repo_fine_grained_action(&auth, repo.id, "write", &state.permission_service).await?;
+
+    // Validate only after repository authorization so an ungranted caller
+    // cannot use path-validation responses as an oracle. Filesystem storage's
+    // `key_to_path` would strip `..` segments, while object backends would
+    // accept them, so every authorized upload still passes this gate before
+    // any storage operation.
+    upload_service::validate_artifact_path(&path)
+        .map_err(|e| AppError::Validation(e.to_string()))?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
@@ -6613,12 +6559,7 @@ pub async fn delete_artifact(
     auth.require_scope("delete")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
-    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
-    // grantee (incl. a write-only or read-only one), collapsing write/delete.
-    // Require the `delete` action when rules exist so a write-scoped grantee
-    // cannot destroy artifacts. Mirrors the upload path's `write` gate.
-    require_repo_fine_grained_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    require_repo_delete_access(&auth, &repo, &repo_service).await?;
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
@@ -7191,13 +7132,20 @@ pub async fn set_upstream_auth(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<UpstreamAuthRequest>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
-    let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = repo_service.get_by_key(&key).await?;
+    require_repo_admin_access(&auth, &repo, &repo_service).await?;
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "This operation is only valid for remote repositories".to_string(),
+        ));
+    }
+    let payload: UpstreamAuthRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid JSON: {}", e)))?;
 
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
@@ -7378,10 +7326,17 @@ pub async fn set_routing_rules(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<SetRoutingRulesRequest>,
+    body: Bytes,
 ) -> Result<Json<RoutingRulesResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_admin_access(&auth, &repo, &service).await?;
+
+    let payload: SetRoutingRulesRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid JSON: {}", e)))?;
 
     // Validate every rule before persisting
     for (i, rule) in payload.rules.iter().enumerate() {
@@ -7392,10 +7347,6 @@ pub async fn set_routing_rules(
             )));
         }
     }
-
-    let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &service).await?;
 
     let value = serde_json::to_string(&payload.rules)
         .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
@@ -7446,7 +7397,7 @@ pub async fn delete_routing_rules(
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &service).await?;
+    require_repo_admin_access(&auth, &repo, &service).await?;
 
     sqlx::query(
         r#"
@@ -11045,44 +10996,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #2321 G2: pure fine-grained per-action decision (write/delete) applied
-    // after the tenant gate on the generic REST + OCI artifact paths. Mirrors
-    // `upload.rs::upload_write_decision`.
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_repo_fine_grained_action_admin_always_allowed() {
-        // Admins bypass regardless of rules/actions state.
-        assert!(repo_fine_grained_action_allowed(true, false, false, false));
-        assert!(repo_fine_grained_action_allowed(true, true, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_no_rules_falls_through() {
-        // A repo with no permission rules keeps the default access model.
-        assert!(repo_fine_grained_action_allowed(false, false, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_require_matching_action() {
-        // Rules exist but the caller holds neither the action nor admin -> deny.
-        // This is the read-only-grantee-cannot-write / write-only-cannot-delete
-        // collapse that #2321 G2 closes.
-        assert!(!repo_fine_grained_action_allowed(false, true, false, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_with_action_allowed() {
-        // Holding the requested action (write or delete) passes.
-        assert!(repo_fine_grained_action_allowed(false, true, true, false));
-    }
-
-    #[test]
-    fn test_repo_fine_grained_action_rules_with_admin_action_allowed() {
-        // `admin` implies all actions, so it passes any per-action gate.
-        assert!(repo_fine_grained_action_allowed(false, true, false, true));
-    }
-
-    // -----------------------------------------------------------------------
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
@@ -11106,14 +11019,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_require_repo_write_access_public_allowed_no_db() {
-        let repo = make_repo(true); // is_public = true
-        let res =
-            require_repo_write_access(&make_auth_ext(None), &repo, &no_db_repo_service()).await;
+    async fn test_require_repo_write_access_public_requires_grant_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let mut repo = make_repo_with_id(repo_id, &key);
+        repo.is_public = true;
+        let ext = tdh::make_auth(user_id, &username);
+        let svc = RepositoryService::new(pool.clone());
+
+        let denied = require_repo_write_access(&ext, &repo, &svc).await;
         assert!(
-            res.is_ok(),
-            "a public repo is writable past the gate, no DB: {res:?}"
+            matches!(denied, Err(AppError::Authorization(_))),
+            "public visibility must not grant write without an explicit repository grant: {denied:?}"
         );
+
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let allowed = require_repo_write_access(&ext, &repo, &svc).await;
+        assert!(
+            allowed.is_ok(),
+            "legacy repository membership remains a write grant when no fine-grained rules exist: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
     #[tokio::test]
@@ -11239,6 +11170,11 @@ mod tests {
         .await;
         assert!(up.is_ok(), "initial publish must succeed: {up:?}");
 
+        // The legacy developer role grants writes but no destructive action.
+        // Explicitly authorize both operations exercised below so the test
+        // reaches the release-immutability backstop.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["write", "delete"]).await;
+
         // 2) DELETE (soft-delete -> tombstone). Generic classifies mutable, so
         // the delete guard permits this even for a non-admin.
         let del = delete_artifact(
@@ -11330,6 +11266,10 @@ mod tests {
         )
         .await
         .expect("initial publish must succeed");
+
+        // From this point the actor must be able to reach both the promotion
+        // guard and the normal-repository delete path under test.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["write", "delete"]).await;
 
         // (1) promotion_only=true, non-admin -> 403 FORBIDDEN, artifact intact.
         set_promotion_only(true).await;
@@ -12102,6 +12042,39 @@ mod tests {
             .execute(&pool)
             .await
             .expect("make repo public");
+
+        let no_rules_public = upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                pub_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path((pub_key.clone(), "pub/no-rules.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(no_rules_public, Err(AppError::Authorization(_))),
+            "public visibility must not grant write when no permission rules exist: {no_rules_public:?}"
+        );
+
+        let invalid_path_denied = upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                pub_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path((pub_key.clone(), "../invalid.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(invalid_path_denied, Err(AppError::Authorization(_))),
+            "repository authorization must precede artifact-path validation: {invalid_path_denied:?}"
+        );
+
         let (other_id, _other_name) = tdh::create_user(&pool).await;
         tdh::grant_repo_actions(&pool, pub_repo_id, other_id, &["read", "write"]).await;
         let nonmember_pub = upload_artifact(
@@ -12198,21 +12171,141 @@ mod tests {
             "delete grant must delete, got: {allowed:?}"
         );
 
+        // Public visibility with no rules must not grant delete, even when the
+        // target artifact exists. Seed it as an admin, then attempt deletion as
+        // an unrelated authenticated user.
+        let (public_id, public_key, public_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(public_id)
+            .execute(&pool)
+            .await
+            .expect("make delete probe repository public");
+        let public_path = "public/existing-delete-probe.bin".to_string();
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                public_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(admin)),
+            Path((public_key.clone(), public_path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"PUBLIC"),
+        )
+        .await
+        .expect("admin must seed public delete probe");
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let public_denied = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                public_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(tdh::make_auth(outsider_id, &outsider_name))),
+            Path((public_key, public_path)),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(public_denied, Err(AppError::Authorization(_))),
+            "public visibility must not grant delete without a repository grant: {public_denied:?}"
+        );
+
+        tdh::cleanup(&pool, public_id, outsider_id).await;
+        let _ = std::fs::remove_dir_all(&public_dir);
+
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #2321 G2 binding test: the generic artifact write/delete handlers must
-    /// keep routing through `require_repo_fine_grained_action` after the tenant
-    /// gate. A handler that dropped the call would silently re-collapse
-    /// read/write/delete, so pin it structurally (the DB tests above cannot run
-    /// without a Postgres).
+    #[tokio::test]
+    async fn repo_admin_subresources_deny_public_non_admin_before_parsing_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (remote_id, remote_key, remote_dir) =
+            tdh::create_repo(&pool, "remote", "generic").await;
+        let (pypi_id, pypi_key, pypi_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![remote_id, pypi_id])
+            .execute(&pool)
+            .await
+            .expect("make admin probe repositories public");
+
+        let state = tdh::build_state(pool.clone(), remote_dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        let upstream_denied = set_upstream_auth(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(remote_key.clone()),
+            Bytes::from_static(br#"{"auth_type":"none"}"#),
+        )
+        .await;
+        assert!(
+            matches!(upstream_denied, Err(AppError::Authorization(_))),
+            "public visibility must not authorize upstream credentials: {upstream_denied:?}"
+        );
+
+        let routing_denied = set_routing_rules(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(remote_key),
+            Bytes::from_static(br#"{"rules":[]}"#),
+        )
+        .await;
+        assert!(
+            matches!(routing_denied, Err(AppError::Authorization(_))),
+            "public visibility must not authorize routing rules: {routing_denied:?}"
+        );
+
+        let pypi_denied = put_pypi_track(
+            State(state),
+            Extension(auth),
+            Path((pypi_key, "ak-security-probe".to_string())),
+            Bytes::from_static(br#"{"tracks":["ak-security-probe"]}"#),
+        )
+        .await;
+        assert!(
+            matches!(pypi_denied, Err(AppError::Authorization(_))),
+            "repository-admin authorization must precede PyPI body validation: {pypi_denied:?}"
+        );
+
+        let config_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repository_config WHERE repository_id = $1 \
+             AND key IN ('upstream_auth_type', 'upstream_auth_credentials', 'routing_rules')",
+        )
+        .bind(remote_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count denied repository configuration writes");
+        assert_eq!(config_rows, 0, "denied requests must not mutate config");
+        let track_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pypi_project_tracks WHERE repository_id = $1")
+                .bind(pypi_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count denied PyPI track writes");
+        assert_eq!(track_rows, 0, "denied request must not create a track");
+
+        tdh::cleanup(&pool, pypi_id, user_id).await;
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&pypi_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// Binding test: generic artifact mutations must use the helper matching
+    /// their action so write and delete cannot collapse into one broad gate.
     #[test]
-    fn test_generic_artifact_handlers_call_fine_grained_gate() {
+    fn test_generic_artifact_handlers_call_action_gate() {
         let source = include_str!("repositories.rs");
-        for (handler, action) in [
-            ("upload_artifact", "\"write\""),
-            ("delete_artifact", "\"delete\""),
+        for (handler, helper) in [
+            ("upload_artifact", "require_repo_write_access("),
+            ("delete_artifact", "require_repo_delete_access("),
         ] {
             let marker = format!("pub async fn {}(", handler);
             let start = source
@@ -12222,10 +12315,10 @@ mod tests {
             let end = rest.find("\npub async fn ").unwrap_or(rest.len());
             let body = &rest[..end];
             assert!(
-                body.contains("require_repo_fine_grained_action(") && body.contains(action),
-                "handler `{}` must call require_repo_fine_grained_action with {} (#2321 G2)",
+                body.contains(helper),
+                "handler `{}` must call `{}`",
                 handler,
-                action
+                helper
             );
         }
     }
@@ -12348,29 +12441,25 @@ mod tests {
         );
     }
 
-    /// Cross-tenant write authz (xtenant-write-authz-systemic):
+    /// Cross-tenant mutation authz (xtenant-write-authz-systemic):
     ///
     /// The `/api/v1/repositories` REST nest runs under `optional_auth_middleware`
     /// only, NOT `repo_visibility_middleware`, so each sub-resource mutation
-    /// handler must enforce the tenant write gate itself. Assert every such
-    /// handler references `require_repo_write_access` (the canonical
-    /// `is_public + role_assignments` gate) so a future handler cannot silently
-    /// fall open to a non-member, non-admin caller on a private repo. String-grep
-    /// because the handlers need a full `SharedState` to run.
+    /// handler must enforce the action-specific repository gate itself.
     #[test]
-    fn test_repo_mutation_handlers_call_write_gate() {
+    fn test_repo_mutation_handlers_call_action_gate() {
         let source = include_str!("repositories.rs");
 
-        for handler in [
-            "set_cache_ttl",
-            "invalidate_cache",
-            "put_pypi_track",
-            "delete_pypi_track",
-            "set_routing_rules",
-            "delete_routing_rules",
-            "set_upstream_auth",
-            "upload_artifact",
-            "delete_artifact",
+        for (handler, helper) in [
+            ("set_cache_ttl", "require_repo_write_access("),
+            ("invalidate_cache", "require_repo_write_access("),
+            ("put_pypi_track", "require_repo_admin_access("),
+            ("delete_pypi_track", "require_repo_admin_access("),
+            ("set_routing_rules", "require_repo_admin_access("),
+            ("delete_routing_rules", "require_repo_admin_access("),
+            ("set_upstream_auth", "require_repo_admin_access("),
+            ("upload_artifact", "require_repo_write_access("),
+            ("delete_artifact", "require_repo_delete_access("),
         ] {
             let marker = format!("pub async fn {}(", handler);
             let start = source
@@ -12384,14 +12473,31 @@ mod tests {
             let body = &rest[..end];
 
             assert!(
-                body.contains("require_repo_write_access("),
-                "handler `{}` does not call `require_repo_write_access` \
-                 (xtenant-write-authz-systemic). The /repositories nest is not \
-                 covered by repo_visibility_middleware, so each mutation handler \
-                 must enforce the tenant write gate itself. If you intentionally \
-                 restructured the authz model, update this test to match.",
-                handler
+                body.contains(helper),
+                "handler `{}` does not call `{}` (xtenant-write-authz-systemic)",
+                handler,
+                helper
             );
+
+            if matches!(
+                handler,
+                "put_pypi_track" | "set_routing_rules" | "set_upstream_auth"
+            ) {
+                let gate_pos = body
+                    .find("require_repo_admin_access(")
+                    .unwrap_or_else(|| panic!("{handler} must authorize repository admin"));
+                let parse_pos = body
+                    .find("serde_json::from_slice")
+                    .unwrap_or_else(|| panic!("{handler} must parse JSON explicitly"));
+                assert!(
+                    body.contains("body: Bytes"),
+                    "{handler} must accept raw bytes so authz precedes schema validation"
+                );
+                assert!(
+                    gate_pos < parse_pos,
+                    "{handler} must authorize before parsing the request body"
+                );
+            }
         }
     }
 
@@ -12507,22 +12613,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // require_repo_write_access (authz-private-repo-membership)
     //
-    // Write/delete authorization on a repository. The public-repo and admin
-    // arms short-circuit before the grant lookup, so they are DB-free. The
-    // private + non-admin grant lookup is covered by
-    // `repository_service::tests::test_user_can_access_repo_private_grant_enforced`.
+    // Action-specific authorization on a repository. Only admins and
+    // out-of-token-scope denials short-circuit before the database lookup.
+    // Public visibility deliberately does not short-circuit mutation authz.
     // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_require_repo_write_access_public_ok() {
-        let repo = make_repo(true);
-        let auth = make_auth_ext(None);
-        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
-        assert!(
-            require_repo_write_access(&auth, &repo, &svc).await.is_ok(),
-            "any authenticated caller may write to a public repo"
-        );
-    }
 
     #[tokio::test]
     async fn test_require_repo_write_access_admin_ok() {
@@ -17564,6 +17658,11 @@ mod tests {
             matches!(dl_bogus, Err(AppError::NotFound(_))),
             "an unknown npm tarball must still 404 (resolver leaves a miss path unchanged)"
         );
+
+        // The fixture's developer role is intentionally write-only. Grant the
+        // destructive action so the remaining assertions exercise npm path
+        // canonicalization rather than repository authorization.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["delete"]).await;
 
         // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
         // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`

@@ -1,7 +1,7 @@
 //! Repository-scoped access token management.
 //!
-//! Allows repository administrators (users with write scope or global admins)
-//! to create, list, and revoke API tokens scoped to a specific repository.
+//! Allows repository administrators to create, list, and revoke API tokens
+//! scoped to a specific repository.
 //! Tokens created through these endpoints are automatically restricted to the
 //! repository they were created on via the `api_token_repositories` join table.
 
@@ -12,6 +12,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -116,7 +117,8 @@ fn caller_owns_token(auth: &AuthExtension, created_by_user_id: Option<Uuid>) -> 
 }
 
 /// Require that the caller is authenticated and has write scope on repos
-/// (or is a global admin).
+/// (or is a global admin). Repository-admin authorization is checked after the
+/// target repository is resolved.
 fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
@@ -130,11 +132,10 @@ fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 /// Authorize the caller for a repo-tokens endpoint and resolve the target
 /// repository. Returns the validated `(auth, repo)` pair on success.
 ///
-/// This collapses the three-step pre-amble shared by every handler in this
-/// module: `require_repo_write`, `RepositoryService::get_by_key`, and the
-/// per-caller `can_access_repo` visibility check. The `NotFound` (rather
-/// than `Forbidden`) response on visibility failure is intentional: it
-/// prevents an unauthorized caller from probing repository existence.
+/// Repository-scoped tokens delegate repository access, so every operation on
+/// them requires repository `admin` (or global admin). This helper centralizes
+/// authentication, token repository scope, and repository-admin authorization
+/// before token lookup and request parsing.
 async fn authorize_repo_for_tokens(
     state: &SharedState,
     auth: Option<AuthExtension>,
@@ -152,23 +153,18 @@ async fn authorize_repo_for_tokens(
         )));
     }
 
-    // Per-repo authorization (mirrors `require_visible` in the repositories
-    // handler). The `can_access_repo` check above only enforces the *token's*
-    // repo scope — a broad `write:repositories` token (`allowed_repo_ids =
-    // None`) passes it for ANY repo. Without this DB-level check, any
-    // authenticated user with the write scope could mint repo-scoped tokens on
-    // a PRIVATE repository they cannot see (#1783). A private repo is visible
-    // only to an admin or a user with a role assignment scoped to it.
-    if !repo.is_public
-        && !auth.is_admin
-        && !repo_service
-            .user_can_access_repo(repo.id, auth.user_id)
-            .await?
-    {
-        return Err(AppError::NotFound(format!(
-            "Repository '{}' not found",
-            key
-        )));
+    // Repository-scoped tokens are delegation credentials. Visibility or write
+    // access is not enough: public repositories must not let every authenticated
+    // principal mint a token, and writers must not escalate into token issuance.
+    if !auth.is_admin {
+        let allowed = repo_service
+            .user_can_perform_repo_action(repo.id, auth.user_id, "admin")
+            .await?;
+        if !allowed {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage repository tokens".to_string(),
+            ));
+        }
     }
 
     Ok((auth, repo))
@@ -298,9 +294,11 @@ pub async fn create_repo_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<CreateRepoTokenRequest>,
+    body: Bytes,
 ) -> Result<Json<CreateRepoTokenResponse>> {
     let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
+    let payload: CreateRepoTokenRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid JSON: {}", e)))?;
 
     // Validate inputs
     validate_scopes_pure(&payload.scopes).map_err(AppError::Validation)?;
@@ -914,16 +912,16 @@ mod admin_scope_policy_tests {
     async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String, String)> {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
-        let (_repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
-        // These tests assert the admin-scope 403 gate, not repo visibility. The
-        // #1783 private-repo check returns 404 before that gate for a private,
-        // rule-less repo, so make the setup repo public to reach the scope gate.
-        // The dedicated private-repo test flips this back to private itself.
+        let (repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        // These tests target delegated-scope policy after repository
+        // authorization, so grant repository admin to the fixture caller. The
+        // dedicated no-role test removes this grant before issuing its request.
         sqlx::query("UPDATE repositories SET is_public = true WHERE key = $1")
             .bind(&repo_key)
             .execute(&pool)
             .await
             .expect("make setup repo public");
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
         let state = tdh::build_state(pool.clone(), "/tmp");
         Some((pool, state, user_id, username, repo_key))
     }
@@ -998,11 +996,60 @@ mod admin_scope_policy_tests {
         cleanup(&pool, user_id, &repo_key).await;
     }
 
+    #[tokio::test]
+    async fn non_admin_without_repo_admin_cannot_mint_token_on_public_repo() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'repository' \
+             AND target_id = (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .expect("remove repository-admin grant");
+
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+
+        let req = post_repo_token_request(&repo_key, "public-probe", &["read:artifacts"]);
+        let (status, _) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "public visibility must not authorize repository token delegation"
+        );
+
+        let malformed = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{}/tokens", repo_key))
+            .header("content-type", "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state, auth), malformed).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "repository-admin authorization must precede token body parsing"
+        );
+
+        let created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count denied token creations");
+        assert_eq!(created, 0, "denied requests must not create API tokens");
+
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
     /// #1783: a non-admin holding only the broad `write:repositories` scope
     /// (token `allowed_repo_ids = None`, so `can_access_repo` passes for ANY
     /// repo) must NOT be able to mint a repo token on a PRIVATE repository it
-    /// has no role on. Before the fix the endpoint returned 200/created; it
-    /// must now 404 (existence-hiding), exactly like `require_visible`.
+    /// has no repository-admin grant. Before the fix the endpoint returned
+    /// 200/created; delegated token issuance must now return 403.
     #[tokio::test]
     async fn non_admin_without_role_cannot_mint_token_on_private_repo() {
         let Some((pool, state, user_id, username, repo_key)) = setup().await else {
@@ -1014,6 +1061,14 @@ mod admin_scope_policy_tests {
             .execute(&pool)
             .await
             .expect("set repo private");
+        sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'repository' \
+             AND target_id = (SELECT id FROM repositories WHERE key = $1)",
+        )
+        .bind(&repo_key)
+        .execute(&pool)
+        .await
+        .expect("remove repository-admin grant");
 
         // Non-admin API token with the delegatable write scope but no repo
         // restriction, requesting a SAFE (non-admin) scope so it clears the
@@ -1028,8 +1083,8 @@ mod admin_scope_policy_tests {
 
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "non-admin without a role must not mint tokens on a private repo (existence-hiding); got {} body: {}",
+            StatusCode::FORBIDDEN,
+            "non-admin without repository-admin must not mint tokens; got {} body: {}",
             status,
             String::from_utf8_lossy(&body_bytes),
         );
@@ -1095,11 +1150,10 @@ mod admin_scope_policy_tests {
 // ---------------------------------------------------------------------------
 // Per-token ownership gate tests (CWE-639 / BOLA)
 //
-// Repository-scoped token GET/DELETE and list-detail were authorized only via
-// `authorize_repo_for_tokens` (repo-level access), which every same-tenant
-// member with `write:repositories` passes. These tests prove the per-token
-// ownership gate: a peer cannot read, enumerate, or revoke another member's
-// repo token; the creator and global admins still can.
+// Repository-scoped token GET/DELETE and list-detail first require repository
+// admin. These tests prove the additional per-token ownership gate: one
+// repository admin cannot read, enumerate, or revoke another repository
+// admin's token; the creator and global admins still can.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1179,10 +1233,8 @@ mod ownership_gate_tests {
         row.0
     }
 
-    /// Full public-repo setup with two members (victor=creator, sam=peer) and a
-    /// token seeded on the repo by victor. The repo is public so the #1783
-    /// private-repo gate is satisfied and the gate under test is purely
-    /// per-token, not visibility.
+    /// Full public-repo setup with two users (victor=repository admin/creator,
+    /// sam=peer) and a token seeded on the repo by victor.
     struct Fixture {
         pool: sqlx::PgPool,
         state: SharedState,
@@ -1203,6 +1255,7 @@ mod ownership_gate_tests {
             .expect("make repo public");
         let (victor, victor_name) = tdh::create_user(&pool).await;
         let (sam, _sam_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_admin(&pool, repo_id, victor).await;
         let state = tdh::build_state(pool.clone(), "/tmp");
         let token_id = create_token_as(&state, member_auth(victor, &victor_name), &repo_key).await;
         Some(Fixture {
@@ -1237,23 +1290,23 @@ mod ownership_gate_tests {
         }
     }
 
-    /// (1) A peer GET of another member's token returns 404 (was 200).
+    /// (1) A peer without repository admin is rejected before token lookup.
     #[tokio::test]
-    async fn peer_get_token_is_404() {
+    async fn peer_get_token_is_403() {
         let Some(f) = fixture().await else { return };
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, _) = tdh::send(app, get_token_req(&f.repo_key, f.token_id)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "peer GET must 404");
+        assert_eq!(status, StatusCode::FORBIDDEN, "peer GET must 403");
         teardown(&f).await;
     }
 
-    /// (2) A peer DELETE returns 404 and the token is NOT revoked.
+    /// (2) A peer DELETE returns 403 and the token is not revoked.
     #[tokio::test]
-    async fn peer_delete_token_is_404_and_not_revoked() {
+    async fn peer_delete_token_is_403_and_not_revoked() {
         let Some(f) = fixture().await else { return };
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, _) = tdh::send(app, delete_token_req(&f.repo_key, f.token_id)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "peer DELETE must 404");
+        assert_eq!(status, StatusCode::FORBIDDEN, "peer DELETE must 403");
         assert!(
             revoked_at(&f.pool, f.token_id).await.is_none(),
             "peer DELETE must NOT revoke the token"
@@ -1316,25 +1369,20 @@ mod ownership_gate_tests {
         teardown(&f).await;
     }
 
-    /// (6) The list omits a peer's token for a non-admin, but an admin sees all.
+    /// (6) Repository admins see their tokens; peers cannot list the repository
+    /// token inventory; global admins see all.
     #[tokio::test]
     async fn list_scopes_to_owner_for_non_admin_and_all_for_admin() {
         let Some(f) = fixture().await else { return };
 
-        // Peer sees no items (victor's token is filtered out).
+        // Peer cannot list repository-scoped tokens without repository admin.
         let app = app_as(f.state.clone(), member_auth(f.sam, "sam"));
         let (status, bytes) = tdh::send(app, list_tokens_req(&f.repo_key)).await;
-        assert_eq!(status, StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let peer_ids: Vec<&str> = v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["id"].as_str().unwrap())
-            .collect();
         assert!(
-            !peer_ids.contains(&f.token_id.to_string().as_str()),
-            "peer list must not contain victor's token"
+            status == StatusCode::FORBIDDEN,
+            "peer list must 403, got {} body: {}",
+            status,
+            String::from_utf8_lossy(&bytes)
         );
 
         // Creator sees their own token.

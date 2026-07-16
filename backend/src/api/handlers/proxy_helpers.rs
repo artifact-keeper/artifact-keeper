@@ -9313,7 +9313,7 @@ mod tests {
             &proxy,
             &state,
             Uuid::nil(),
-            "npm-proxy",
+            "npm-proxy-held-entry-2075",
             "https://upstream.example.test",
             "lodash",
         )
@@ -9348,7 +9348,7 @@ mod tests {
             &proxy,
             &state,
             Uuid::nil(),
-            "npm-proxy",
+            "npm-proxy-unheld-entry-2075",
             "https://upstream.example.test",
             "lodash",
         )

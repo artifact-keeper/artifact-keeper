@@ -874,6 +874,103 @@ impl RepositoryService {
         Ok(granted)
     }
 
+    /// Check whether a user may perform a specific action on a repository.
+    ///
+    /// Fine-grained repository or inherited project permissions are
+    /// authoritative once any applicable rules exist: callers need the
+    /// requested action or `admin`. Repositories without rules fall back to
+    /// legacy role assignments so existing installations retain their
+    /// configured read/write behavior.
+    pub async fn user_can_perform_repo_action(
+        &self,
+        repo_id: Uuid,
+        user_id: Uuid,
+        action: &str,
+    ) -> Result<bool> {
+        let has_rules: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM permissions \
+                 WHERE (target_type = 'repository' AND target_id = $1) \
+                    OR (target_type = 'project' AND target_id = ( \
+                        SELECT project_id FROM repositories WHERE id = $1 \
+                    )) \
+             )",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if !has_rules {
+            return self
+                .user_can_perform_legacy_repo_action(repo_id, user_id, action)
+                .await;
+        }
+
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM permissions p \
+                 WHERE ( \
+                       (p.target_type = 'repository' AND p.target_id = $2) \
+                       OR (p.target_type = 'project' AND p.target_id = ( \
+                           SELECT project_id FROM repositories WHERE id = $2 \
+                       )) \
+                   ) \
+                   AND ($3 = ANY(p.actions) OR 'admin' = ANY(p.actions)) \
+                   AND ( \
+                       (p.principal_type IN ('user', 'service_account') \
+                           AND p.principal_id = $1) \
+                       OR (p.principal_type = 'group' AND p.principal_id IN ( \
+                           SELECT group_id FROM user_group_members WHERE user_id = $1 \
+                       )) \
+                   ) \
+             )",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(action)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(allowed)
+    }
+
+    /// Evaluate the legacy role-assignment model for a repository action.
+    ///
+    /// Callers must first establish that no applicable fine-grained repository
+    /// or project rules exist; those rules are authoritative when present.
+    pub(crate) async fn user_can_perform_legacy_repo_action(
+        &self,
+        repo_id: Uuid,
+        user_id: Uuid,
+        action: &str,
+    ) -> Result<bool> {
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM role_assignments ra \
+                 INNER JOIN roles r ON r.id = ra.role_id \
+                 WHERE ra.user_id = $1 \
+                   AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                   AND ( \
+                       r.name = 'admin' \
+                       OR $3 = ANY(r.permissions) \
+                       OR 'admin' = ANY(r.permissions) \
+                       OR ($3 = 'read') \
+                       OR ($3 = 'write' AND r.name = 'developer') \
+                   ) \
+             )",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(action)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(allowed)
+    }
+
     /// Get a repository by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Repository> {
         let repo = sqlx::query_as!(
@@ -3286,6 +3383,199 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             for uid in [owner_id, other_id] {
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(uid)
+                    .execute(&pool)
+                    .await;
+            }
+        }
+
+        /// Action-specific RBAC must not turn visibility/read grants into
+        /// write or delete, while repository `admin` implies every action.
+        #[tokio::test]
+        async fn test_user_can_perform_repo_action_honors_specific_actions() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (grantee_id, _) = tdh::create_user(&pool).await;
+
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut req = make_create_req(&suffix, RepositoryFormat::Generic);
+            req.created_by = Some(owner_id);
+            let repo = service.create(req).await.expect("create private repo");
+
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(grantee_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("insert read permission");
+
+            assert!(
+                !service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "write")
+                    .await
+                    .expect("write check"),
+                "read permission must not grant write"
+            );
+            assert!(
+                !service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "delete")
+                    .await
+                    .expect("delete check"),
+                "read permission must not grant delete"
+            );
+
+            sqlx::query(
+                "UPDATE permissions SET actions = ARRAY['write'] \
+                 WHERE principal_type = 'user' AND principal_id = $1 \
+                   AND target_type = 'repository' AND target_id = $2",
+            )
+            .bind(grantee_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("update to write permission");
+
+            assert!(
+                service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "write")
+                    .await
+                    .expect("write check"),
+                "write permission must grant write"
+            );
+            assert!(
+                !service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "delete")
+                    .await
+                    .expect("delete check"),
+                "write permission must not grant delete"
+            );
+
+            sqlx::query(
+                "UPDATE permissions SET actions = ARRAY['admin'] \
+                 WHERE principal_type = 'user' AND principal_id = $1 \
+                   AND target_type = 'repository' AND target_id = $2",
+            )
+            .bind(grantee_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("update to admin permission");
+
+            assert!(
+                service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "delete")
+                    .await
+                    .expect("delete check"),
+                "admin permission must grant delete"
+            );
+            assert!(
+                service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "admin")
+                    .await
+                    .expect("admin check"),
+                "admin permission must grant admin"
+            );
+
+            let (service_account_id, _) = tdh::create_user(&pool).await;
+            sqlx::query("UPDATE users SET is_service_account = true WHERE id = $1")
+                .bind(service_account_id)
+                .execute(&pool)
+                .await
+                .expect("mark service-account principal");
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('service_account', $1, 'repository', $2, ARRAY['write'])",
+            )
+            .bind(service_account_id)
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("insert service-account write permission");
+            assert!(
+                service
+                    .user_can_perform_repo_action(repo.id, service_account_id, "write")
+                    .await
+                    .expect("service-account write check"),
+                "service-account repository grants must be honored"
+            );
+
+            // Project grants are inherited by their repositories and become
+            // authoritative just like direct repository rules. In particular,
+            // the owner's legacy developer assignment must not bypass a
+            // project rule granted to somebody else.
+            sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("remove direct repository rules");
+            let project_id: Uuid =
+                sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+                    .bind(format!("action-test-{}", Uuid::new_v4()))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create action-test project");
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(repo.id)
+                .bind(project_id)
+                .execute(&pool)
+                .await
+                .expect("assign repository to project");
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'project', $2, ARRAY['write'])",
+            )
+            .bind(grantee_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("insert inherited project write permission");
+            assert!(
+                service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "write")
+                    .await
+                    .expect("inherited project write check"),
+                "project write permission must apply to an assigned repository"
+            );
+            assert!(
+                !service
+                    .user_can_perform_repo_action(repo.id, grantee_id, "delete")
+                    .await
+                    .expect("inherited project delete check"),
+                "project write permission must not grant repository delete"
+            );
+            assert!(
+                !service
+                    .user_can_perform_repo_action(repo.id, owner_id, "write")
+                    .await
+                    .expect("legacy fallback check with project rules"),
+                "applicable project rules must prevent legacy-role fallback"
+            );
+
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'project' AND target_id = $1",
+            )
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+            cleanup_repo(&pool, repo.id).await;
+            let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+                .bind(project_id)
+                .execute(&pool)
+                .await;
+            for uid in [owner_id, grantee_id, service_account_id] {
                 let _ = sqlx::query("DELETE FROM users WHERE id = $1")
                     .bind(uid)
                     .execute(&pool)
