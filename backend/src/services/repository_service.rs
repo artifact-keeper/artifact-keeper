@@ -39,6 +39,10 @@ pub struct CreateRepositoryRequest {
     /// Optional project to assign the repository to at creation (#2472).
     /// `None` leaves the repository unassigned (legacy behavior).
     pub project_id: Option<Uuid>,
+    /// Trusted upstream OpenPGP public key for RPM curation signature
+    /// verification (#2568). `None` leaves the column NULL ("unverified
+    /// upstream"). Validated by the handler before it reaches the service.
+    pub trusted_gpg_key: Option<String>,
     /// User who is creating this repository. When set, the repository records
     /// this user as `created_by` and the creator is auto-granted the
     /// `developer` role scoped to the new repository (owner auto-grant), so the
@@ -65,6 +69,12 @@ pub struct UpdateRepositoryRequest {
     /// is the "field present" marker and the inner value is what is stored
     /// (P1 exposes set-only, so handlers pass `Some(Some(id))`).
     pub project_id: Option<Option<Uuid>>,
+    /// When `Some`, updates the trusted upstream GPG key (#2568): the outer
+    /// `Option` is the "field present" marker and the inner value is stored
+    /// (`Some(None)` clears the column, `Some(Some(key))` sets it). `None`
+    /// leaves the stored key unchanged. Validated by the handler before it
+    /// reaches the service.
+    pub trusted_gpg_key: Option<Option<String>>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -749,6 +759,20 @@ impl RepositoryService {
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
                 }
+                // Trusted upstream GPG key for RPM curation (#2568). Persisted
+                // inside the same tx as the INSERT so it is atomic with create.
+                // The column is not on the `Repository` model (the sync reads it
+                // via a targeted query, #2567); the handler exposes only a
+                // boolean, never the key, so a separate write keeps it off the
+                // model and out of any serialized `Repository`.
+                if let Some(ref gpg_key) = req.trusted_gpg_key {
+                    sqlx::query("UPDATE repositories SET trusted_gpg_key = $1 WHERE id = $2")
+                        .bind(gpg_key)
+                        .bind(repo.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                }
                 // Owner auto-grant: record the creator and grant them the
                 // `developer` role scoped to this repository, so the creator
                 // retains access under per-repo authorization. Runs inside the
@@ -1074,6 +1098,23 @@ impl RepositoryService {
             }
         })?
         .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+
+        // Trusted upstream GPG key (#2568). Applied as a targeted write after
+        // the main COALESCE update because COALESCE cannot express "clear to
+        // NULL": `Some(None)` must be able to null the column. The column is
+        // deliberately off the `Repository` model (the sync reads it via its
+        // own query, #2567) and the handler exposes only a boolean, never the
+        // key. `None` leaves the stored value unchanged.
+        if let Some(ref gpg_key) = req.trusted_gpg_key {
+            sqlx::query(
+                "UPDATE repositories SET trusted_gpg_key = $1, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(gpg_key.as_deref())
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
 
         // Index updated repository in search engine (non-blocking)
         if let Some(ref search) = self.search_service {
@@ -1729,6 +1770,7 @@ mod tests {
             promotion_only: false,
             format_key: None,
             project_id: None,
+            trusted_gpg_key: None,
             created_by: None,
         };
         assert_eq!(req.key, "my-repo");
@@ -1755,6 +1797,7 @@ mod tests {
             promotion_only: false,
             format_key: None,
             project_id: None,
+            trusted_gpg_key: None,
             created_by: None,
         };
         assert_eq!(
@@ -1780,6 +1823,7 @@ mod tests {
             upstream_url: None,
             promotion_only: None,
             project_id: None,
+            trusted_gpg_key: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -1801,6 +1845,7 @@ mod tests {
             upstream_url: None,
             promotion_only: None,
             project_id: None,
+            trusted_gpg_key: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -1820,6 +1865,7 @@ mod tests {
             upstream_url: None,
             promotion_only: None,
             project_id: None,
+            trusted_gpg_key: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -2978,6 +3024,7 @@ mod tests {
                 promotion_only: false,
                 format_key: None,
                 project_id: None,
+                trusted_gpg_key: None,
                 created_by: None,
             }
         }
@@ -3034,6 +3081,105 @@ mod tests {
                     .await
                     .expect("fetch format_key");
             assert_eq!(stored.as_deref(), Some("wasm:custom-handler"));
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// A minimal valid ASCII-armored OpenPGP public key (ed25519), used to
+        /// exercise the `trusted_gpg_key` create/update write path (#2568).
+        const TEST_TRUSTED_PUB_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmDMEalhDshYJKwYBBAHaRw8BAQdACzr46aD+QjHsSShzXFU7UyTBcfkr3V0B5QbC\nuHNwPaG0LEFLIFRlc3QgQ3VyYXRpb24gPGN1cmF0aW9uLXRlc3RAZXhhbXBsZS5j\nb20+iJMEExYKADsWIQR0avJEHEsDJgM2tIhMkudvlQGn6AUCalhDsgIbIwULCQgH\nAgIiAgYVCgkICwIEFgIDAQIeBwIXgAAKCRBMkudvlQGn6NbIAQD8FUordTijk/cv\nJXJF2Z4uU6pGzePlVjV66sMDeCrKeAD/buTRceKb+lc9GJaZTG0Nn0OpXuXFSzYY\njK6gqQU8eAO4OARqWEOyEgorBgEEAZdVAQUBAQdAR27xDvtQLrO+SDzbLNgOSuvF\nob14dCYHAudLwThyCBIDAQgHiHgEGBYKACAWIQR0avJEHEsDJgM2tIhMkudvlQGn\n6AUCalhDsgIbDAAKCRBMkudvlQGn6POzAP9NNEWgre36i/Ig+fphD4cwlcsvW6+v\ny54TTJUA3J4JyQEAgkLBwMrNA4LkzW2pYv8Cc/jK8GpSa1IAOPdsgPCcmQ0=\n=NyW4\n-----END PGP PUBLIC KEY BLOCK-----\n";
+
+        /// #2568: `trusted_gpg_key` round-trips through create -> update-set ->
+        /// update-clear. Create with no key leaves the column NULL; an update
+        /// that supplies a key sets it; an update that clears it (`Some(None)`)
+        /// nulls it again. The column is read directly (it is intentionally off
+        /// the `Repository` model).
+        #[tokio::test]
+        async fn test_trusted_gpg_key_create_update_clear_roundtrip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+
+            let read_key = |pool: PgPool, id: Uuid| async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT trusted_gpg_key FROM repositories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read trusted_gpg_key")
+            };
+
+            // Create WITH a key -> persisted in the create tx.
+            let mut req = make_create_req(&suffix, RepositoryFormat::Rpm);
+            req.trusted_gpg_key = Some(TEST_TRUSTED_PUB_KEY.to_string());
+            let repo = service.create(req).await.expect("create with gpg key");
+            assert_eq!(
+                read_key(pool.clone(), repo.id).await.as_deref(),
+                Some(TEST_TRUSTED_PUB_KEY),
+                "create should persist the trusted key"
+            );
+
+            // update-clear (Some(None)) -> column nulled.
+            let clear_req = UpdateRepositoryRequest {
+                key: None,
+                name: None,
+                description: None,
+                is_public: None,
+                quota_bytes: None,
+                upstream_url: None,
+                promotion_only: None,
+                versioning_enabled: None,
+                project_id: None,
+                trusted_gpg_key: Some(None),
+            };
+            service.update(repo.id, clear_req).await.expect("clear gpg");
+            assert!(
+                read_key(pool.clone(), repo.id).await.is_none(),
+                "Some(None) update should clear the key"
+            );
+
+            // update-set (Some(Some(key))) -> column set again.
+            let set_req = UpdateRepositoryRequest {
+                key: None,
+                name: None,
+                description: None,
+                is_public: None,
+                quota_bytes: None,
+                upstream_url: None,
+                promotion_only: None,
+                versioning_enabled: None,
+                project_id: None,
+                trusted_gpg_key: Some(Some(TEST_TRUSTED_PUB_KEY.to_string())),
+            };
+            service.update(repo.id, set_req).await.expect("set gpg");
+            assert_eq!(
+                read_key(pool.clone(), repo.id).await.as_deref(),
+                Some(TEST_TRUSTED_PUB_KEY),
+                "Some(Some(key)) update should set the key"
+            );
+
+            // update with trusted_gpg_key: None -> column left unchanged.
+            let noop_req = UpdateRepositoryRequest {
+                key: None,
+                name: Some("renamed".to_string()),
+                description: None,
+                is_public: None,
+                quota_bytes: None,
+                upstream_url: None,
+                promotion_only: None,
+                versioning_enabled: None,
+                project_id: None,
+                trusted_gpg_key: None,
+            };
+            service.update(repo.id, noop_req).await.expect("noop gpg");
+            assert_eq!(
+                read_key(pool.clone(), repo.id).await.as_deref(),
+                Some(TEST_TRUSTED_PUB_KEY),
+                "omitted field must leave the stored key unchanged"
+            );
 
             cleanup_repo(&pool, repo.id).await;
         }
