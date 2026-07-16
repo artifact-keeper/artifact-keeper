@@ -795,37 +795,115 @@ fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<
 /// package-name list) are scope-checked by key; scalar-valued keys carry
 /// structural metadata (e.g. `/-/all`'s `_updated`, `/-/whoami`'s
 /// `{"username":"..."}`, `/-/ping`'s `{}`) — no package listing — and are
-/// preserved unchanged. `None` on parse failure so the caller serves the
-/// upstream body verbatim.
-fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<Bytes> {
-    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let obj = value.as_object_mut()?;
-    if let Some(objects) = obj.get_mut("objects").and_then(|v| v.as_array_mut()) {
-        objects.retain(|entry| {
-            entry
-                .get("package")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|name| policy.allows(name))
-                .unwrap_or(false)
-        });
-        let total = objects.len();
-        obj.insert("total".to_string(), serde_json::json!(total));
-    } else {
-        // Legacy map shapes (#2542): key is a package name, value is a package
-        // document (`/-/all`) or a package-name list (`/-/by-user`). Drop
-        // out-of-scope keys; keep scalar-valued structural metadata (e.g.
-        // `_updated`, whoami's `username`) untouched so those endpoints stay
-        // correct.
-        obj.retain(|key, val| {
-            if val.is_object() || val.is_array() {
-                policy.allows(key)
-            } else {
-                true
-            }
-        });
+/// preserved unchanged.
+///
+/// A top-level JSON array (some registries answer `/-/all` and similar
+/// endpoints with a bare `["pkg-a","@scope/pkg-b",...]` listing) is treated as
+/// a package-name list: only entries whose name `policy.allows` survive.
+///
+/// The outcome is explicit (#2551): [`MetaFilterOutcome::Filtered`] carries the
+/// scope-filtered bytes; [`MetaFilterOutcome::Unrecognized`] means the body did
+/// not parse or its top-level shape was neither a recognised object nor array.
+/// The caller MUST fail closed on `Unrecognized` under an active policy (serve
+/// an empty scoped body) rather than echo the upstream bytes verbatim — the
+/// previous `None`-means-passthrough behaviour leaked out-of-scope package
+/// existence whenever an upstream returned an unmodelled shape.
+enum MetaFilterOutcome {
+    /// Recognised shape (search object, legacy package-name-keyed map, or a
+    /// top-level package-name array), scope-filtered. Serve these bytes.
+    Filtered(Bytes),
+    /// Unparseable body or an unrecognised top-level shape. Fail closed under
+    /// an active policy.
+    Unrecognized,
+}
+
+#[cfg(test)]
+impl MetaFilterOutcome {
+    /// Unwrap to the filtered bytes, panicking on `Unrecognized`.
+    fn expect_filtered(self) -> Bytes {
+        match self {
+            MetaFilterOutcome::Filtered(bytes) => bytes,
+            MetaFilterOutcome::Unrecognized => panic!("expected a filtered outcome"),
+        }
     }
-    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+fn filter_meta_response(bytes: &[u8], policy: &NpmScopePolicy) -> MetaFilterOutcome {
+    let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return MetaFilterOutcome::Unrecognized,
+    };
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(objects) = obj.get_mut("objects").and_then(|v| v.as_array_mut()) {
+            objects.retain(|entry| {
+                entry
+                    .get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|name| policy.allows(name))
+                    .unwrap_or(false)
+            });
+            let total = objects.len();
+            obj.insert("total".to_string(), serde_json::json!(total));
+        } else {
+            // Legacy map shapes (#2542): key is a package name, value is a
+            // package document (`/-/all`) or a package-name list
+            // (`/-/by-user`). Drop out-of-scope keys; keep scalar-valued
+            // structural metadata (e.g. `_updated`, whoami's `username`)
+            // untouched so those endpoints stay correct.
+            obj.retain(|key, val| {
+                if val.is_object() || val.is_array() {
+                    policy.allows(key)
+                } else {
+                    true
+                }
+            });
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        // Top-level package-name array (#2551): retain only in-scope entries.
+        arr.retain(|entry| meta_array_entry_allowed(entry, policy));
+    } else {
+        // Scalar or other unmodelled top-level shape — cannot be scope-checked.
+        return MetaFilterOutcome::Unrecognized;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(v) => MetaFilterOutcome::Filtered(Bytes::from(v)),
+        Err(_) => MetaFilterOutcome::Unrecognized,
+    }
+}
+
+/// Whether a single entry of a top-level meta array is in scope (#2551).
+///
+/// Entries are either bare package-name strings (the common
+/// `["pkg-a","@scope/pkg-b",...]` listing some registries return) or objects
+/// carrying a `name` / `package.name` field. An entry with no extractable
+/// package name is dropped (fail-closed) rather than leaked.
+fn meta_array_entry_allowed(entry: &serde_json::Value, policy: &NpmScopePolicy) -> bool {
+    let name = match entry {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Object(_) => entry
+            .get("name")
+            .or_else(|| entry.get("package").and_then(|p| p.get("name")))
+            .and_then(|n| n.as_str()),
+        _ => None,
+    };
+    match name {
+        Some(name) => policy.allows(name),
+        None => false,
+    }
+}
+
+/// Safe, empty, in-scope meta body to serve when the upstream response shape is
+/// unrecognised/unparseable under an active scope policy (#2551). Fails closed:
+/// never echoes upstream bytes. Search endpoints get the well-formed empty
+/// search envelope so clients parse it cleanly; everything else gets an empty
+/// object.
+fn empty_scoped_meta_body(meta_path: &str) -> Bytes {
+    if meta_path.contains("search") {
+        Bytes::from_static(br#"{"objects":[],"total":0}"#)
+    } else {
+        Bytes::from_static(b"{}")
+    }
 }
 
 /// Forward an npm audit POST request to the configured upstream registry.
@@ -1003,8 +1081,15 @@ async fn proxy_npm_meta_get(
     let (status, content_type, bytes) =
         npm_meta_upstream_bytes(upstream_url, meta_path, query).await?;
     let bytes = if policy.is_active() {
-        filter_meta_response(&bytes, policy).unwrap_or(bytes)
+        // Fail closed (#2551): an unrecognised/unparseable upstream shape must
+        // NOT be echoed verbatim under an active scope policy — that leaks
+        // out-of-scope package existence. Serve an empty scoped body instead.
+        match filter_meta_response(&bytes, policy) {
+            MetaFilterOutcome::Filtered(filtered) => filtered,
+            MetaFilterOutcome::Unrecognized => empty_scoped_meta_body(meta_path),
+        }
     } else {
+        // Inactive policy: byte-identical passthrough, unchanged behaviour.
         bytes
     };
     Some(
@@ -3681,7 +3766,7 @@ mod tests {
             {"package":{"name":"express","version":"4.18.0"}},
             {"package":{"name":"lodash.merge","version":"4.6.2"}}
         ],"total":3,"time":"now"}"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let objs = v["objects"].as_array().unwrap();
         assert_eq!(objs.len(), 2);
@@ -3701,7 +3786,7 @@ mod tests {
         // re-serialised JSON with the same logical content.
         let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
         let body = br#"{"ok":true}"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["ok"], true);
     }
@@ -3720,7 +3805,7 @@ mod tests {
             "express": {"name":"express","dist-tags":{"latest":"4.18.0"}},
             "@evil/secret": {"name":"@evil/secret","dist-tags":{"latest":"9.9.9"}}
         }"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let obj = v.as_object().unwrap();
         // In-scope kept.
@@ -3744,7 +3829,7 @@ mod tests {
             "@corp/tool": ["read","write"],
             "express": ["read","write"]
         }"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let obj = v.as_object().unwrap();
         assert!(obj.contains_key("lodash"));
@@ -3763,7 +3848,7 @@ mod tests {
             "lodash": {"name":"lodash"},
             "express": {"name":"express"}
         }"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let obj = v.as_object().unwrap();
         assert!(obj.contains_key("lodash"));
@@ -3778,9 +3863,98 @@ mod tests {
         // syntactically valid unscoped package name the policy would deny.
         let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
         let body = br#"{"username":"alice"}"#;
-        let out = filter_meta_response(body, &p).expect("parses");
+        let out = filter_meta_response(body, &p).expect_filtered();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["username"], "alice");
+    }
+
+    #[test]
+    fn meta_response_top_level_array_retains_only_in_scope_names() {
+        // Some registries answer `/-/all` (and similar) with a bare
+        // package-name array. Only in-scope names may survive (#2551); the
+        // array must be filtered, never echoed whole.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"["lodash","express","@corp/tool","@evil/secret","lodash.merge"]"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"lodash.merge"));
+        assert!(names.contains(&"@corp/tool"));
+        // Out-of-scope package existence removed.
+        assert!(!names.contains(&"express"));
+        assert!(!names.contains(&"@evil/secret"));
+    }
+
+    #[test]
+    fn meta_response_unparseable_bytes_under_active_policy_is_unrecognized() {
+        // A body that does not parse as JSON must NOT be served verbatim under
+        // an active policy: the outcome is `Unrecognized` so the caller fails
+        // closed with an empty scoped body (#2551).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = b"this is not json { [ oops";
+        assert!(matches!(
+            filter_meta_response(body, &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        // And the caller's fail-closed body is empty + well-formed, never the
+        // raw upstream bytes.
+        let search = empty_scoped_meta_body("v1/search");
+        assert_eq!(&search[..], br#"{"objects":[],"total":0}"#);
+        let other = empty_scoped_meta_body("all");
+        assert_eq!(&other[..], b"{}");
+    }
+
+    #[test]
+    fn meta_response_scalar_top_level_under_active_policy_is_unrecognized() {
+        // A bare scalar top-level document (not an object or array) carries no
+        // scope-checkable package listing and cannot be safely echoed; it is
+        // `Unrecognized` so the active-policy caller fails closed (#2551).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        assert!(matches!(
+            filter_meta_response(b"true", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"\"pong\"", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn meta_response_structural_docs_preserved_under_active_policy() {
+        // whoami / ping structural documents remain intact (recognised object
+        // shapes), never routed through the fail-closed path.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let whoami = filter_meta_response(br#"{"username":"alice"}"#, &p).expect_filtered();
+        let vw: serde_json::Value = serde_json::from_slice(&whoami).unwrap();
+        assert_eq!(vw["username"], "alice");
+        let ping = filter_meta_response(b"{}", &p).expect_filtered();
+        let vp: serde_json::Value = serde_json::from_slice(&ping).unwrap();
+        assert!(vp.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_response_inactive_policy_top_level_array_is_verbatim() {
+        // Inactive policy = allow-all: a top-level array is retained whole,
+        // preserving the default-behaviour-unchanged guarantee (#2551).
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        let body = br#"["lodash","express","@evil/secret"]"#;
+        let out = filter_meta_response(body, &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["lodash", "express", "@evil/secret"]);
     }
 
     #[test]
