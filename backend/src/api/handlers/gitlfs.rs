@@ -765,34 +765,7 @@ async fn create_lock(
         ));
     }
 
-    // Check for existing lock on this path
-    let existing_lock = sqlx::query!(
-        r#"
-        SELECT id FROM artifact_metadata
-        WHERE format = 'gitlfs_lock'
-          AND artifact_id = $1
-          AND metadata->>'path' = $2
-        "#,
-        repo.id,
-        request.path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
-        )
-    })?;
-
-    if existing_lock.is_some() {
-        return Err(lfs_error_response(
-            StatusCode::CONFLICT,
-            "Lock already exists for this path",
-        ));
-    }
-
-    // Look up username
+    // Look up username for the lock owner record.
     let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
         .fetch_one(&state.db)
         .await
@@ -803,27 +776,26 @@ async fn create_lock(
             )
         })?;
 
-    let lock_id = uuid::Uuid::new_v4();
-    let locked_at = chrono::Utc::now();
+    let ref_name = request.lock_ref.as_ref().map(|r| r.name.clone());
 
-    let lock_metadata = serde_json::json!({
-        "lock_id": lock_id.to_string(),
-        "path": request.path,
-        "locked_at": locked_at.to_rfc3339(),
-        "owner": username,
-        "ref": request.lock_ref,
-    });
-
-    // Store lock as metadata entry (using repo.id as artifact_id for grouping)
-    sqlx::query!(
+    // Insert the lock, relying on the (repository_id, path) UNIQUE constraint to
+    // enforce single-ownership of a path. `ON CONFLICT DO NOTHING` returns no
+    // row when the path is already locked, which we surface as the Git LFS 409
+    // "already created" response (including the existing lock, per the spec).
+    let inserted = sqlx::query!(
         r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'gitlfs_lock', $2)
+        INSERT INTO lfs_locks (repository_id, path, ref_name, owner_id, owner_name)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (repository_id, path) DO NOTHING
+        RETURNING id, locked_at
         "#,
         repo.id,
-        lock_metadata,
+        request.path,
+        ref_name,
+        user_id,
+        username,
     )
-    .execute(&state.db)
+    .fetch_optional(&state.db)
     .await
     .map_err(|e| {
         lfs_error_response(
@@ -832,16 +804,57 @@ async fn create_lock(
         )
     })?;
 
+    let Some(row) = inserted else {
+        // Path already locked — return 409 with the existing lock so the client
+        // can report who holds it (Git LFS locking spec, "lock already exists").
+        let existing = sqlx::query!(
+            r#"
+            SELECT id, path, locked_at, owner_name
+            FROM lfs_locks
+            WHERE repository_id = $1 AND path = $2
+            "#,
+            repo.id,
+            request.path,
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                crate::api::handlers::db_status(&e),
+                &format!("Database error: {}", e),
+            )
+        })?;
+
+        let lock = existing.map(|r| LockInfo {
+            id: r.id.to_string(),
+            path: r.path,
+            locked_at: r.locked_at.to_rfc3339(),
+            owner: LockOwner { name: r.owner_name },
+        });
+        return Err(lock_conflict_response(lock));
+    };
+
     let response = LockResponse {
         lock: LockInfo {
-            id: lock_id.to_string(),
+            id: row.id.to_string(),
             path: request.path,
-            locked_at: locked_at.to_rfc3339(),
+            locked_at: row.locked_at.to_rfc3339(),
             owner: LockOwner { name: username },
         },
     };
 
     Ok(lfs_json_response(StatusCode::CREATED, &response))
+}
+
+/// Build the Git LFS 409 "lock already exists" response. The locking spec's
+/// create endpoint returns `{ "lock": {...}, "message": "..." }` so the client
+/// can surface the current holder.
+fn lock_conflict_response(existing: Option<LockInfo>) -> Response {
+    let body = serde_json::json!({
+        "lock": existing,
+        "message": "Lock already exists for this path",
+    });
+    lfs_json_response(StatusCode::CONFLICT, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -863,11 +876,10 @@ async fn list_locks(
 
     let rows = sqlx::query!(
         r#"
-        SELECT metadata
-        FROM artifact_metadata
-        WHERE format = 'gitlfs_lock'
-          AND artifact_id = $1
-        ORDER BY metadata->>'locked_at' DESC
+        SELECT id, path, locked_at, owner_name
+        FROM lfs_locks
+        WHERE repository_id = $1
+        ORDER BY locked_at DESC
         "#,
         repo.id
     )
@@ -881,17 +893,14 @@ async fn list_locks(
     })?;
 
     let locks: Vec<LockInfo> = rows
-        .iter()
-        .filter_map(|row| {
-            let m = &row.metadata;
-            Some(LockInfo {
-                id: m.get("lock_id")?.as_str()?.to_string(),
-                path: m.get("path")?.as_str()?.to_string(),
-                locked_at: m.get("locked_at")?.as_str()?.to_string(),
-                owner: LockOwner {
-                    name: m.get("owner")?.as_str()?.to_string(),
-                },
-            })
+        .into_iter()
+        .map(|row| LockInfo {
+            id: row.id.to_string(),
+            path: row.path,
+            locked_at: row.locked_at.to_rfc3339(),
+            owner: LockOwner {
+                name: row.owner_name,
+            },
         })
         .collect();
 
@@ -938,11 +947,10 @@ async fn verify_locks(
 
     let rows = sqlx::query!(
         r#"
-        SELECT metadata
-        FROM artifact_metadata
-        WHERE format = 'gitlfs_lock'
-          AND artifact_id = $1
-        ORDER BY metadata->>'locked_at' DESC
+        SELECT id, path, locked_at, owner_name
+        FROM lfs_locks
+        WHERE repository_id = $1
+        ORDER BY locked_at DESC
         "#,
         repo.id
     )
@@ -958,23 +966,14 @@ async fn verify_locks(
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
 
-    for row in &rows {
-        let m = &row.metadata;
-        let lock_info = match (
-            m.get("lock_id").and_then(|v| v.as_str()),
-            m.get("path").and_then(|v| v.as_str()),
-            m.get("locked_at").and_then(|v| v.as_str()),
-            m.get("owner").and_then(|v| v.as_str()),
-        ) {
-            (Some(id), Some(path), Some(locked_at), Some(owner)) => LockInfo {
-                id: id.to_string(),
-                path: path.to_string(),
-                locked_at: locked_at.to_string(),
-                owner: LockOwner {
-                    name: owner.to_string(),
-                },
+    for row in rows {
+        let lock_info = LockInfo {
+            id: row.id.to_string(),
+            path: row.path,
+            locked_at: row.locked_at.to_rfc3339(),
+            owner: LockOwner {
+                name: row.owner_name,
             },
-            _ => continue,
         };
 
         if lock_info.owner.name == username {
@@ -1026,17 +1025,21 @@ async fn delete_lock(
             )
         })?;
 
-    // Find the lock
+    // The lock id is the `lfs_locks.id` UUID handed out by create_lock. An
+    // unparseable id simply cannot match any row -> 404 (never a 500).
+    let lock_uuid = uuid::Uuid::parse_str(&lock_id)
+        .map_err(|_| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
+
+    // Find the lock (scoped to this repository).
     let row = sqlx::query!(
         r#"
-        SELECT id as "row_id!", metadata
-        FROM artifact_metadata
-        WHERE format = 'gitlfs_lock'
-          AND artifact_id = $1
-          AND metadata->>'lock_id' = $2
+        SELECT id, path, locked_at, owner_name
+        FROM lfs_locks
+        WHERE repository_id = $1
+          AND id = $2
         "#,
         repo.id,
-        lock_id
+        lock_uuid
     )
     .fetch_optional(&state.db)
     .await
@@ -1048,11 +1051,8 @@ async fn delete_lock(
     })?
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
 
-    let m = &row.metadata;
-    let lock_owner = m.get("owner").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Only the lock owner or force can unlock
-    if lock_owner != username && !force {
+    // Only the lock owner or a forced unlock can release it.
+    if row.owner_name != username && !force {
         return Err(lfs_error_response(
             StatusCode::FORBIDDEN,
             "You do not own this lock",
@@ -1061,23 +1061,15 @@ async fn delete_lock(
 
     let lock_info = LockInfo {
         id: lock_id.clone(),
-        path: m
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        locked_at: m
-            .get("locked_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        path: row.path,
+        locked_at: row.locked_at.to_rfc3339(),
         owner: LockOwner {
-            name: lock_owner.to_string(),
+            name: row.owner_name,
         },
     };
 
     // Delete the lock
-    sqlx::query!("DELETE FROM artifact_metadata WHERE id = $1", row.row_id)
+    sqlx::query!("DELETE FROM lfs_locks WHERE id = $1", lock_uuid)
         .execute(&state.db)
         .await
         .map_err(|e| {

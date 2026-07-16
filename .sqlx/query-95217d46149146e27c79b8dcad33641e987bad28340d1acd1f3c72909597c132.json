@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM artifact_metadata WHERE id = $1",
+  "query": "DELETE FROM lfs_locks WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "68eacb53cce72ba95f2f73bbb52692ae38dca39d875a48c965c25864865ea6ff"
+  "hash": "95217d46149146e27c79b8dcad33641e987bad28340d1acd1f3c72909597c132"
 }
