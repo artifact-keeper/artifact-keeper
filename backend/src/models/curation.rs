@@ -43,4 +43,11 @@ pub struct CurationPackage {
     pub metadata: serde_json::Value,
     pub first_seen_at: DateTime<Utc>,
     pub upstream_updated_at: Option<DateTime<Utc>>,
+    /// The verbatim `<package type="rpm">…</package>` block this package was
+    /// synced from (#2358 RPM Phase-3). Retained so a curated snapshot publish
+    /// can re-emit an upstream-faithful `primary.xml`. `NULL` for rows synced
+    /// before this column existed (they must be re-synced before a publish can
+    /// include them — the publish path fails closed on a missing snippet) and
+    /// for non-RPM formats.
+    pub primary_xml_snippet: Option<String>,
 }

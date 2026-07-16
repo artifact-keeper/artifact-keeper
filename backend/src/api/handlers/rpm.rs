@@ -83,6 +83,146 @@ async fn resolve_rpm_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo,
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["rpm", "yum"], "an RPM").await
 }
 
+// ---------------------------------------------------------------------------
+// Curated snapshot (`@N`) publication serving (#2358 — RPM Phase-3)
+// ---------------------------------------------------------------------------
+
+/// If `path` begins with a `@<digits>` segment, split it into
+/// `(version_number, remaining_sub_path)`.
+///   `@3/repodata/repomd.xml` -> `Some((3, "repodata/repomd.xml"))`
+///   `@3`                     -> `Some((3, ""))`
+/// Returns `None` when there is no leading `@N` segment (or the digits do not
+/// parse), so the normal proxy path is used.
+fn split_publication_prefix(path: &str) -> Option<(i64, String)> {
+    let rest = path.strip_prefix('@')?;
+    let (num_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let version_number: i64 = num_str.parse().ok()?;
+    Some((version_number, sub.to_string()))
+}
+
+/// Validate a `@N` sub-path before it is joined onto a storage prefix.
+///
+/// Rejects path traversal (`..`), absolute paths, empty/dot segments, `//` and
+/// backslashes so a crafted `@N/../../foo` (or `@N//etc/passwd`) can never
+/// escape the per-publication storage prefix. Returns the verified sub-path
+/// unchanged, or a `404` response.
+#[allow(clippy::result_large_err)]
+fn sanitize_publication_subpath(sub: &str) -> Result<String, Response> {
+    let rejected = sub.is_empty()
+        || sub.starts_with('/')
+        || sub.contains('\\')
+        || sub.contains("//")
+        || sub
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    if rejected {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    Ok(sub.to_string())
+}
+
+/// Content type for a stored publication blob, keyed off its extension.
+fn publication_content_type(path: &str) -> &'static str {
+    if path.ends_with(".gz") {
+        "application/gzip"
+    } else if path.ends_with(".asc") {
+        "application/pgp-signature"
+    } else if path.ends_with(".key") {
+        "application/pgp-keys"
+    } else if path.ends_with(".xml") {
+        "application/xml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// The `storage_prefix` of a specific PUBLISHED version, or `None` when the
+/// version is absent or not yet published (both surface to the client as 404).
+async fn fetch_published_version_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    version_number: i64,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT storage_prefix FROM repository_versions \
+         WHERE repository_id = $1 AND version_number = $2 AND published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .bind(version_number)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// The `storage_prefix` of the repo's ACTIVE publication, or `None` when the
+/// repo has no active publication (keeps today's live-generation path).
+async fn fetch_active_publication_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT rv.storage_prefix FROM repositories r \
+         JOIN repository_versions rv ON rv.id = r.active_publication_id \
+         WHERE r.id = $1 AND rv.published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// Serve `{prefix}/{sub_path}` from the repo's storage. `Ok(Some)` on a hit,
+/// `Ok(None)` when the blob is absent (caller falls through / keeps its live
+/// path), `Err` on a real storage failure. Metadata blobs are frozen at publish
+/// time, so this never proxies upstream.
+async fn serve_stored_publication_blob(
+    state: &SharedState,
+    repo: &RepoInfo,
+    prefix: &str,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let key = format!("{prefix}/{sub_path}");
+    match storage.get(&key).await {
+        Ok(bytes) => Ok(Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, publication_content_type(sub_path))
+                .header(CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap(),
+        )),
+        Err(crate::error::AppError::NotFound(_)) => Ok(None),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()),
+    }
+}
+
+/// Active-publication passthrough for the no-`@N` repodata routes: if the repo
+/// has an active publication, serve the frozen blob for `sub_path`; otherwise
+/// (`Ok(None)`) the caller keeps its unchanged live-generation / proxy path.
+async fn try_serve_active_publication(
+    state: &SharedState,
+    repo: &RepoInfo,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let prefix = match fetch_active_publication_prefix(&state.db, repo.id).await? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    serve_stored_publication_blob(state, repo, &prefix, sub_path).await
+}
+
 /// Reject RPM uploads to non-hosted (Remote/Virtual) repositories.
 ///
 /// `dnf`/`yum` only ever PUT/POST RPMs into hosted repos. Both Remote (proxy)
@@ -219,15 +359,15 @@ fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-struct RpmArtifact {
-    id: uuid::Uuid,
-    path: String,
-    name: String,
-    version: Option<String>,
-    size_bytes: i64,
-    checksum_sha256: String,
-    storage_key: String,
-    metadata: Option<serde_json::Value>,
+pub(crate) struct RpmArtifact {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) version: Option<String>,
+    pub(crate) size_bytes: i64,
+    pub(crate) checksum_sha256: String,
+    pub(crate) storage_key: String,
+    pub(crate) metadata: Option<serde_json::Value>,
 }
 
 async fn list_rpm_artifacts(
@@ -394,6 +534,12 @@ async fn repomd_xml(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: if this repo has an active curated publication, serve its frozen,
+    // signed repomd.xml instead of live-generating / proxying.
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/repomd.xml").await? {
+        return Ok(resp);
+    }
+
     // #1447: for Remote repos proxy the upstream repomd.xml instead of
     // synthesizing an empty index from local artifacts.
     if let Some(resp) =
@@ -421,6 +567,14 @@ async fn repomd_xml_asc(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: an active publication's detached signature is the one that matches
+    // its frozen repomd.xml — serve the stored .asc, not a freshly-signed one.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.asc").await?
+    {
+        return Ok(resp);
+    }
 
     // #1447: proxy the upstream detached signature for Remote repos.
     if let Some(resp) = try_proxy_repodata(
@@ -480,6 +634,14 @@ async fn repomd_xml_key(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: serve the active publication's frozen public key so a later signing
+    // key rotation never invalidates an already-published @N.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.key").await?
+    {
+        return Ok(resp);
+    }
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let public_key = signing_svc
@@ -544,6 +706,12 @@ async fn primary_xml_gz(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/primary.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
+    if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/primary.xml.gz", "application/gzip").await?
     {
         return Ok(resp);
@@ -571,6 +739,12 @@ async fn filelists_xml_gz(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/filelists.xml.gz").await?
+    {
+        return Ok(resp);
+    }
 
     if let Some(resp) = try_proxy_repodata(
         &state,
@@ -606,6 +780,11 @@ async fn other_xml_gz(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/other.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
     if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/other.xml.gz", "application/gzip").await?
     {
@@ -639,6 +818,13 @@ async fn repodata_proxy(
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: an active publication serves its frozen repodata blobs (dnf also
+    // fetches the checksum-prefixed payloads through this catch-all).
+    let active_sub = format!("repodata/{}", path);
+    if let Some(resp) = try_serve_active_publication(&state, &repo, &active_sub).await? {
+        return Ok(resp);
+    }
 
     let upstream_path = format!("repodata/{}", path);
     let default_ct = if path.ends_with(".gz") {
@@ -675,7 +861,37 @@ async fn upstream_proxy(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
-    if repo.repo_type != RepositoryType::Remote {
+    // #2358: a leading `@<digits>` segment selects a published, immutable
+    // snapshot. Serve the frozen, AK-signed metadata blob for the sub-path from
+    // storage (never proxying upstream, and without requiring a Remote repo).
+    // A non-metadata sub-path (e.g. a package href) is not a stored blob, so we
+    // fall through to the normal package path on the `@`-stripped sub-path —
+    // package BYTES are best-effort until P4.
+    let (upstream_path, publication_fallthrough) = if let Some((version_number, sub)) =
+        split_publication_prefix(&upstream_path)
+    {
+        let prefix = fetch_published_version_prefix(&state.db, repo.id, version_number)
+            .await?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
+        let sub_path = sanitize_publication_subpath(&sub)?;
+        if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
+        {
+            return Ok(resp);
+        }
+        // Non-metadata sub-path under a published @N: fall through to the local
+        // cache / upstream-proxy on the `@`-stripped path so an approved
+        // package's bytes are still resolvable (best-effort until P4). The
+        // `packages/` bytes may be local (promoted/uploaded) on a staging
+        // curation repo, so we do NOT gate this on the Remote type.
+        (sub_path, true)
+    } else {
+        (upstream_path, false)
+    };
+
+    // A normal (non-`@N`) request only serves from Remote repos; the `@N`
+    // fall-through additionally serves local bytes from a hosted/staging repo
+    // (and 404s below if there is neither a local hit nor an upstream to proxy).
+    if !publication_fallthrough && repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
@@ -1070,7 +1286,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="{}">
@@ -1134,7 +1350,7 @@ fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <otherdata xmlns="http://linux.duke.edu/metadata/other" packages="{}">
@@ -1212,13 +1428,13 @@ fn generate_updateinfo_xml() -> String {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
 }
 
-fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("gzip write failed");
     encoder.finish().expect("gzip finish failed")
@@ -1242,6 +1458,71 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    // -- #2358 @N publication-serving pure helpers ---------------------------
+
+    #[test]
+    fn test_split_publication_prefix() {
+        assert_eq!(
+            split_publication_prefix("@3/repodata/repomd.xml"),
+            Some((3, "repodata/repomd.xml".to_string()))
+        );
+        assert_eq!(split_publication_prefix("@42"), Some((42, String::new())));
+        // No leading @N -> None (normal proxy path).
+        assert_eq!(split_publication_prefix("repodata/repomd.xml"), None);
+        assert_eq!(split_publication_prefix("Packages/foo.rpm"), None);
+        // `@` not followed by digits -> None.
+        assert_eq!(split_publication_prefix("@latest/x"), None);
+        assert_eq!(split_publication_prefix("@/x"), None);
+        // An email-like package name is not mistaken for a version.
+        assert_eq!(split_publication_prefix("@1.2/x"), None);
+    }
+
+    #[test]
+    fn test_sanitize_publication_subpath_rejects_traversal() {
+        assert!(sanitize_publication_subpath("repodata/repomd.xml").is_ok());
+        assert!(sanitize_publication_subpath("Packages/tree.rpm").is_ok());
+        // Traversal / absolute / empty / dot / backslash / double-slash all 404.
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "repodata/../../etc/passwd",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "..",
+        ] {
+            assert!(
+                sanitize_publication_subpath(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_publication_content_type() {
+        assert_eq!(
+            publication_content_type("repodata/primary.xml.gz"),
+            "application/gzip"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.asc"),
+            "application/pgp-signature"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.key"),
+            "application/pgp-keys"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml"),
+            "application/xml"
+        );
+        assert_eq!(
+            publication_content_type("Packages/tree.rpm"),
+            "application/octet-stream"
+        );
+    }
 
     /// Wrap a base64-encoded signature in PGP armor format.
     fn pgp_armor_signature(b64: &str) -> String {

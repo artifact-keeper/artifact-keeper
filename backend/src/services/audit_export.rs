@@ -121,7 +121,9 @@ impl AuditAction {
             | AuditAction::SessionsInvalidated
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
-            | AuditAction::CurationSyncTriggered => Outcome::Success,
+            | AuditAction::CurationSyncTriggered
+            | AuditAction::CurationVersionCreated
+            | AuditAction::CurationVersionPublished => Outcome::Success,
         }
     }
 }
