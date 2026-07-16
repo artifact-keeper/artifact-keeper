@@ -331,7 +331,11 @@ impl DebianHandler {
         }
 
         // Pool package
-        if path.starts_with("pool/") || path.ends_with(".deb") || path.ends_with(".udeb") {
+        if path.starts_with("pool/")
+            || path.ends_with(".deb")
+            || path.ends_with(".udeb")
+            || path.ends_with(".ddeb")
+        {
             let filename = path.rsplit('/').next().unwrap_or(path);
             let info = Self::parse_deb_filename(filename)?;
 
@@ -365,6 +369,7 @@ impl DebianHandler {
         let name = filename
             .strip_suffix(".deb")
             .or_else(|| filename.strip_suffix(".udeb"))
+            .or_else(|| filename.strip_suffix(".ddeb"))
             .ok_or_else(|| {
                 AppError::Validation(format!("Invalid Debian package filename: {}", filename))
             })?;
@@ -965,6 +970,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_deb_filename_ddeb() {
+        let (pkg, ver, arch) =
+            DebianHandler::parse_deb_filename("systemd-dbgsym_256_amd64.ddeb").unwrap();
+        assert_eq!(pkg, "systemd-dbgsym");
+        assert_eq!(ver, "256");
+        assert_eq!(arch, "amd64");
+    }
+
+    #[test]
     fn test_parse_deb_filename_epoch_in_version() {
         // Debian allows epoch: "1:1.0-1" but _ separates fields
         let (pkg, ver, arch) =
@@ -1063,6 +1077,13 @@ mod tests {
     #[test]
     fn test_parse_path_direct_udeb_file() {
         let info = DebianHandler::parse_path("base_1.0_amd64.udeb").unwrap();
+        assert!(matches!(info.operation, DebianOperation::Package));
+        assert_eq!(info.package, Some("base".to_string()));
+    }
+
+    #[test]
+    fn test_parse_path_direct_ddeb_file() {
+        let info = DebianHandler::parse_path("base_1.0_amd64.ddeb").unwrap();
         assert!(matches!(info.operation, DebianOperation::Package));
         assert_eq!(info.package, Some("base".to_string()));
     }
