@@ -2590,14 +2590,34 @@ pub struct RepositoryStorageStatsResponse {
     /// were previously omitted from all storage accounting.
     pub logical_bytes: i64,
     /// Deduplicated physical footprint within the dedup scope.
-    pub physical_bytes: i64,
+    ///
+    /// **Restricted on cloud (instance-scope) backends:** on a shared-storage
+    /// backend `physical_bytes`, `unique_bytes`, `shared_bytes` and
+    /// `dedup_ratio` are all cross-tenant-derivable — `shared_bytes =
+    /// physical_bytes - unique_bytes` reveals whether this repo's blobs are also
+    /// stored by another tenant (a per-blob cross-tenant existence oracle,
+    /// #2560). The whole derivable set is therefore populated only for admins on
+    /// instance-scope backends, and omitted for repo-authorized non-admins /
+    /// anonymous callers. On `per_repo` (filesystem) backends there is no
+    /// cross-tenant sharing (`shared_bytes == 0` by construction), so all
+    /// figures are always present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_bytes: Option<i64>,
     /// Physical bytes of objects referenced only by this repository.
-    pub unique_bytes: i64,
+    /// Restricted on cloud backends — see [`physical_bytes`].
+    ///
+    /// [`physical_bytes`]: Self::physical_bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_bytes: Option<i64>,
     /// physical_bytes - unique_bytes. Always 0 on filesystem backends (a shared
-    /// digest in two repos is two files).
-    pub shared_bytes: i64,
-    /// logical_bytes / physical_bytes (1.0 when nothing is stored).
-    pub dedup_ratio: f64,
+    /// digest in two repos is two files). Restricted on cloud backends — see
+    /// [`physical_bytes`](Self::physical_bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_bytes: Option<i64>,
+    /// logical_bytes / physical_bytes (1.0 when nothing is stored). Restricted
+    /// on cloud backends — see [`physical_bytes`](Self::physical_bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup_ratio: Option<f64>,
     /// Distinct physical objects (dedup keys) this repository references.
     pub blob_count: i64,
     /// `per_repo` (filesystem) or `instance` (cloud) — the backend semantics at
@@ -2617,6 +2637,49 @@ pub struct RepositoryStorageStatsResponse {
     pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl RepositoryStorageStatsResponse {
+    /// Assemble the response, restricting the cross-tenant-derivable dedup
+    /// figures (`physical_bytes`, `unique_bytes`, `shared_bytes`, `dedup_ratio`)
+    /// to admins on instance-scope (cloud) backends.
+    ///
+    /// On a shared-storage backend `shared_bytes = physical_bytes -
+    /// unique_bytes` is a per-blob cross-tenant existence oracle (#2560), so the
+    /// whole derivable set is gated together — hiding only the named
+    /// `shared_bytes` is useless while `physical_bytes` and `unique_bytes`
+    /// remain. `per_repo` (filesystem) scope has no cross-tenant sharing and is
+    /// left fully populated.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        repository_key: String,
+        logical_bytes: i64,
+        physical_bytes: i64,
+        unique_bytes: i64,
+        shared_bytes: i64,
+        blob_count: i64,
+        dedup_scope: String,
+        is_admin: bool,
+        instance_unique_bytes: Option<i64>,
+        computed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        use crate::services::storage_stats_service::{dedup_ratio, DedupScope};
+        // Cloud (instance) scope + non-admin caller => omit the whole set.
+        let restrict = dedup_scope == DedupScope::Instance.as_str() && !is_admin;
+        let expose = !restrict;
+        Self {
+            repository_key,
+            logical_bytes,
+            physical_bytes: expose.then_some(physical_bytes),
+            unique_bytes: expose.then_some(unique_bytes),
+            shared_bytes: expose.then_some(shared_bytes),
+            dedup_ratio: expose.then(|| dedup_ratio(logical_bytes, physical_bytes)),
+            blob_count,
+            dedup_scope,
+            instance_unique_bytes,
+            computed_at,
+        }
+    }
+}
+
 /// Get deduplicated storage accounting for a repository (#2056).
 ///
 /// Returns the true physical footprint (with dedup savings) from the
@@ -2627,6 +2690,11 @@ pub struct RepositoryStorageStatsResponse {
 /// The whole-instance aggregate `instance_unique_bytes` is admin-only and is
 /// omitted for non-admin/anonymous callers; they receive only this
 /// repository's own figures.
+///
+/// On cloud (instance-scope) backends the dedup breakdown (`physical_bytes`,
+/// `unique_bytes`, `shared_bytes`, `dedup_ratio`) is cross-tenant-derivable and
+/// is likewise restricted to admins (#2560); non-admins/anon see only their
+/// repository's `logical_bytes`, `blob_count`, `dedup_scope` and `computed_at`.
 #[utoipa::path(
     get,
     path = "/{key}/storage",
@@ -2684,39 +2752,35 @@ pub async fn get_repository_storage(
     };
 
     let response = match row {
-        Some(r) => {
-            let logical = r.logical_bytes;
-            let physical = r.physical_bytes;
-            RepositoryStorageStatsResponse {
-                repository_key: repo.key,
-                logical_bytes: logical,
-                physical_bytes: physical,
-                unique_bytes: r.unique_bytes,
-                shared_bytes: r.shared_bytes,
-                dedup_ratio: crate::services::storage_stats_service::dedup_ratio(logical, physical),
-                blob_count: r.blob_count,
-                dedup_scope: r.dedup_scope,
-                instance_unique_bytes,
-                computed_at: Some(r.computed_at),
-            }
-        }
+        Some(r) => RepositoryStorageStatsResponse::assemble(
+            repo.key,
+            r.logical_bytes,
+            r.physical_bytes,
+            r.unique_bytes,
+            r.shared_bytes,
+            r.blob_count,
+            r.dedup_scope,
+            is_admin,
+            instance_unique_bytes,
+            Some(r.computed_at),
+        ),
         // No materialized row yet (refresher has not run for this repo).
-        None => RepositoryStorageStatsResponse {
-            repository_key: repo.key,
-            logical_bytes: 0,
-            physical_bytes: 0,
-            unique_bytes: 0,
-            shared_bytes: 0,
-            dedup_ratio: crate::services::storage_stats_service::dedup_ratio(0, 0),
-            blob_count: 0,
-            dedup_scope: crate::services::storage_stats_service::DedupScope::from_backend(
+        None => RepositoryStorageStatsResponse::assemble(
+            repo.key,
+            0,
+            0,
+            0,
+            0,
+            0,
+            crate::services::storage_stats_service::DedupScope::from_backend(
                 &state.config.storage_backend,
             )
             .as_str()
             .to_string(),
+            is_admin,
             instance_unique_bytes,
-            computed_at: None,
-        },
+            None,
+        ),
     };
 
     Ok(Json(response))
@@ -7439,18 +7503,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn sample_storage_stats(instance: Option<i64>) -> RepositoryStorageStatsResponse {
-        RepositoryStorageStatsResponse {
-            repository_key: "demo".into(),
-            logical_bytes: 54033,
-            physical_bytes: 52033,
-            unique_bytes: 52033,
-            shared_bytes: 0,
-            dedup_ratio: 1.0384,
-            blob_count: 4,
-            dedup_scope: "per_repo".into(),
-            instance_unique_bytes: instance,
-            computed_at: None,
-        }
+        // A filesystem (per_repo) repo seen by an admin: every figure present.
+        RepositoryStorageStatsResponse::assemble(
+            "demo".into(),
+            54033, // logical
+            52033, // physical
+            52033, // unique
+            0,     // shared
+            4,     // blob_count
+            "per_repo".into(),
+            true, // is_admin
+            instance,
+            None,
+        )
     }
 
     #[test]
@@ -7470,6 +7535,97 @@ mod tests {
     fn storage_stats_includes_instance_total_for_admin() {
         let json = serde_json::to_value(sample_storage_stats(Some(53033))).unwrap();
         assert_eq!(json["instance_unique_bytes"], 53033);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-tenant dedup oracle (#2560): on cloud (instance-scope) backends,
+    // `shared_bytes = physical_bytes - unique_bytes` reveals whether a blob in
+    // this repo is also stored by another tenant. The WHOLE derivable set
+    // (physical/unique/shared/dedup_ratio) must be omitted for non-admins there,
+    // while admins and all `per_repo` (filesystem) callers keep it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_stats_omits_xtenant_figures_for_non_admin_on_cloud() {
+        let resp = RepositoryStorageStatsResponse::assemble(
+            "demo".into(),
+            54033, // logical
+            52033, // physical
+            40000, // unique
+            12033, // shared (physical - unique) -> the oracle delta
+            4,     // blob_count
+            "instance".into(),
+            false, // non-admin
+            None,
+            None,
+        );
+        // The struct itself carries None for the whole derivable set.
+        assert_eq!(resp.physical_bytes, None);
+        assert_eq!(resp.unique_bytes, None);
+        assert_eq!(resp.shared_bytes, None);
+        assert_eq!(resp.dedup_ratio, None);
+
+        // ...and serde drops the keys entirely (no `null` leak either).
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("physical_bytes").is_none());
+        assert!(json.get("unique_bytes").is_none());
+        assert!(json.get("shared_bytes").is_none());
+        assert!(json.get("dedup_ratio").is_none());
+        // The non-cross-tenant figures the caller is entitled to remain.
+        assert_eq!(json["logical_bytes"], 54033);
+        assert_eq!(json["blob_count"], 4);
+        assert_eq!(json["dedup_scope"], "instance");
+    }
+
+    #[test]
+    fn storage_stats_includes_xtenant_figures_for_admin_on_cloud() {
+        let resp = RepositoryStorageStatsResponse::assemble(
+            "demo".into(),
+            54033,
+            52033,
+            40000,
+            12033,
+            4,
+            "instance".into(),
+            true, // admin
+            Some(60000),
+            None,
+        );
+        assert_eq!(resp.physical_bytes, Some(52033));
+        assert_eq!(resp.unique_bytes, Some(40000));
+        assert_eq!(resp.shared_bytes, Some(12033));
+        assert!(resp.dedup_ratio.is_some());
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["physical_bytes"], 52033);
+        assert_eq!(json["shared_bytes"], 12033);
+        assert_eq!(json["instance_unique_bytes"], 60000);
+    }
+
+    #[test]
+    fn storage_stats_keeps_figures_for_non_admin_on_filesystem() {
+        // per_repo (filesystem) scope has no cross-tenant sharing (shared == 0
+        // by construction), so a non-admin still gets the full breakdown.
+        let resp = RepositoryStorageStatsResponse::assemble(
+            "demo".into(),
+            54033,
+            52033,
+            52033,
+            0,
+            4,
+            "per_repo".into(),
+            false, // non-admin
+            None,
+            None,
+        );
+        assert_eq!(resp.physical_bytes, Some(52033));
+        assert_eq!(resp.unique_bytes, Some(52033));
+        assert_eq!(resp.shared_bytes, Some(0));
+        assert!(resp.dedup_ratio.is_some());
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["physical_bytes"], 52033);
+        assert_eq!(json["shared_bytes"], 0);
     }
 
     // -----------------------------------------------------------------------
