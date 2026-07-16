@@ -65,6 +65,7 @@ pub mod repo_selector_service;
 pub mod repository_label_service;
 pub mod repository_service;
 pub mod routing_rules;
+pub mod rpm_publish_service;
 pub mod rpm_repodata_cache;
 pub mod saml_service;
 pub mod sbom_service;

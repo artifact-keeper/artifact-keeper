@@ -122,7 +122,9 @@ impl AuditAction {
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
-            | AuditAction::CurationSyncTriggered => Outcome::Success,
+            | AuditAction::CurationSyncTriggered
+            | AuditAction::CurationVersionCreated
+            | AuditAction::CurationVersionPublished => Outcome::Success,
         }
     }
 }

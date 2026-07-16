@@ -14,6 +14,13 @@ pub struct CurationPackageEntry {
     pub checksum_sha256: Option<String>,
     pub upstream_path: String,
     pub metadata: serde_json::Value,
+    /// The VERBATIM `<package type="rpm">…</package>` block this entry was
+    /// parsed from, retained so a curated snapshot publish (#2358 RPM Phase-3)
+    /// can re-emit an upstream-faithful `primary.xml` — the NEVRA-only fields
+    /// above drop the `<rpm:provides>`/`<rpm:requires>`/`<size>` that dnf needs
+    /// to resolve dependencies. `None` for formats that do not carry a reusable
+    /// XML block (e.g. Debian `Packages` index entries).
+    pub primary_xml_snippet: Option<String>,
 }
 
 /// Parse RPM primary.xml content into package entries.
@@ -38,6 +45,11 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
         if name.is_empty() || ver.is_empty() {
             continue;
         }
+
+        // Retain the verbatim `<package type="rpm">…</package>` wrapper so a
+        // curated snapshot publish can re-emit an upstream-faithful primary.xml
+        // (preserves provides/requires/size the NEVRA extraction above drops).
+        let primary_xml_snippet = Some(format!("<package type=\"rpm\">{pkg_block}</package>"));
 
         entries.push(CurationPackageEntry {
             format: "rpm".to_string(),
@@ -66,6 +78,7 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
                 "arch": arch,
                 "description": description,
             }),
+            primary_xml_snippet,
         });
     }
 
@@ -133,6 +146,8 @@ pub fn parse_deb_packages_index(content: &str, component: &str) -> Vec<CurationP
                 "component": component,
                 "description": description,
             }),
+            // Debian entries carry no reusable RPM XML block.
+            primary_xml_snippet: None,
         });
     }
 
@@ -479,6 +494,64 @@ mod tests {
 
         assert_eq!(entries[1].package_name, "curl");
         assert_eq!(entries[1].version, "8.5.0");
+    }
+
+    // #2358 RPM Phase-3: the verbatim `<package type="rpm">…</package>` block —
+    // including the `<rpm:provides>`/`<rpm:requires>`/`<size>` the NEVRA-only
+    // fields drop — must round-trip into `primary_xml_snippet` so a curated
+    // snapshot publish can re-emit an upstream-faithful primary.xml.
+    #[test]
+    fn test_parse_rpm_primary_xml_retains_verbatim_snippet() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="1">
+<package type="rpm">
+  <name>nginx</name>
+  <arch>x86_64</arch>
+  <version epoch="0" ver="1.24.0" rel="1.el9"/>
+  <checksum type="sha256" pkgid="YES">abc123def456</checksum>
+  <size package="573440" installed="1048576" archive="1050624"/>
+  <location href="Packages/nginx-1.24.0-1.el9.x86_64.rpm"/>
+  <format>
+    <rpm:provides>
+      <rpm:entry name="nginx" flags="EQ" epoch="0" ver="1.24.0" rel="1.el9"/>
+      <rpm:entry name="webserver"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="libc.so.6()(64bit)"/>
+      <rpm:entry name="openssl-libs" flags="GE" epoch="0" ver="3.0"/>
+    </rpm:requires>
+  </format>
+</package>
+</metadata>"#;
+
+        let entries = parse_rpm_primary_xml(xml);
+        assert_eq!(entries.len(), 1);
+
+        let snippet = entries[0]
+            .primary_xml_snippet
+            .as_deref()
+            .expect("rpm entry must retain a primary_xml_snippet");
+
+        // The snippet is wrapped by the verbatim `<package type="rpm">` … tags.
+        assert!(snippet.starts_with("<package type=\"rpm\">"));
+        assert!(snippet.ends_with("</package>"));
+        // The provides/requires/size the NEVRA fields drop survive in the snippet.
+        assert!(snippet.contains("<rpm:provides>"));
+        assert!(snippet.contains("name=\"webserver\""));
+        assert!(snippet.contains("<rpm:requires>"));
+        assert!(snippet.contains("name=\"openssl-libs\""));
+        assert!(snippet.contains("<size package=\"573440\""));
+        // The pkgid checksum (used as dnf's pkgid) is preserved verbatim.
+        assert!(snippet.contains("pkgid=\"YES\">abc123def456</checksum>"));
+    }
+
+    // The Debian parser carries no reusable RPM block.
+    #[test]
+    fn test_parse_deb_packages_index_has_no_snippet() {
+        let content = "Package: nginx\nVersion: 1.24.0-1\nArchitecture: amd64\nFilename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb\n";
+        let entries = parse_deb_packages_index(content, "main");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].primary_xml_snippet.is_none());
     }
 
     #[test]
