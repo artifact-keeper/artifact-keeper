@@ -1462,4 +1462,735 @@ mod tests {
             "require_auth_basic(None, ...) must return Err to deny unauthenticated callers"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed Git LFS file-locking tests (#2627).
+    //
+    // These drive the four lock handlers this fix rewrote onto the dedicated
+    // `lfs_locks` table (migration 165). Each handler is called directly with
+    // hand-built extractors against a live database, so `cargo llvm-cov --lib`
+    // — which is exactly what the CI coverage job runs — instruments them.
+    //
+    // The sibling HTTP-level suite in `backend/tests/gitlfs_locks_tests.rs` is
+    // an integration (`--test`) target: it is a useful end-to-end guard over
+    // the real router, but `--lib` never builds it, so it contributes no
+    // coverage. These tests cover the handler bodies; that suite covers the
+    // wiring.
+    //
+    // Runtime-skips when `DATABASE_URL` is unset (NOT `#[ignore]`, so the
+    // coverage instrument sees these paths in CI, which stands up Postgres and
+    // applies migrations before the coverage run). Mirrors the in-`src`
+    // DB-test pattern used by the approval/migration handler suites.
+    // -----------------------------------------------------------------------
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test module exempt — buffering a small JSON lock
+    // response body in an assertion is not an artifact path (#1608).
+    mod locks_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// A live `gitlfs` repository, its owner, and a second principal used by
+        /// the ownership / force-unlock paths.
+        struct Fx {
+            pool: PgPool,
+            state: SharedState,
+            repo_id: Uuid,
+            repo_key: String,
+            user_id: Uuid,
+            username: String,
+            other_id: Uuid,
+            other_name: String,
+        }
+
+        impl Fx {
+            /// Session-shaped auth for the lock owner. `scopes: None` grants
+            /// every scope, so the scope-reject tests opt in via [`token_auth`].
+            fn auth(&self) -> AuthExtension {
+                tdh::make_auth(self.user_id, &self.username)
+            }
+
+            /// The owner presented as an API token carrying exactly `scopes` —
+            /// the shape `require_auth_basic_scope` gates on.
+            fn token_auth(&self, scopes: &[&str]) -> AuthExtension {
+                let mut ext = self.auth();
+                ext.is_api_token = true;
+                ext.scopes = Some(scopes.iter().map(|s| s.to_string()).collect());
+                ext
+            }
+
+            /// Insert a lock row directly, bypassing `create_lock`.
+            async fn seed_lock(&self, path: &str, owner_id: Uuid, owner_name: &str) -> Uuid {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO lfs_locks (repository_id, path, owner_id, owner_name) \
+                     VALUES ($1, $2, $3, $4) RETURNING id",
+                )
+                .bind(self.repo_id)
+                .bind(path)
+                .bind(owner_id)
+                .bind(owner_name)
+                .fetch_one(&self.pool)
+                .await
+                .expect("seed lfs_locks row")
+            }
+
+            async fn lock_count(&self, path: &str) -> i64 {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM lfs_locks WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(self.repo_id)
+                .bind(path)
+                .fetch_one(&self.pool)
+                .await
+                .expect("count lfs_locks rows")
+            }
+
+            async fn cleanup(&self) {
+                // `lfs_locks` cascades from both `repositories` and `users`.
+                tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(self.other_id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        /// Build the fixture, or `None` when no database is reachable.
+        async fn fx() -> Option<Fx> {
+            let pool = tdh::try_pool().await?;
+            let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "gitlfs").await;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (other_id, other_name) = tdh::create_user(&pool).await;
+            let state = tdh::build_state(pool.clone(), storage_dir.to_string_lossy().as_ref());
+            Some(Fx {
+                pool,
+                state,
+                repo_id,
+                repo_key,
+                user_id,
+                username,
+                other_id,
+                other_name,
+            })
+        }
+
+        /// Collapse a handler's `Result<Response, Response>` into the status and
+        /// body bytes both arms carry.
+        async fn parts(out: Result<Response, Response>) -> (StatusCode, Bytes) {
+            let response = match out {
+                Ok(r) => r,
+                Err(r) => r,
+            };
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            (status, body)
+        }
+
+        fn as_json(body: &Bytes) -> serde_json::Value {
+            serde_json::from_slice(body).expect("response body must be JSON")
+        }
+
+        /// `path` field of every lock in a response array, in response order.
+        fn paths_of(value: &serde_json::Value) -> Vec<String> {
+            value
+                .as_array()
+                .map(|locks| {
+                    locks
+                        .iter()
+                        .map(|l| l["path"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        // -------------------------------------------------------------------
+        // create_lock
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn create_lock_rejects_token_without_write_scope() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.token_auth(&["git-lfs:read"]))),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(br#"{"path":"a/b.bin"}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(
+                String::from_utf8_lossy(&body).contains("required scope: write"),
+                "expected a scope-denial body, got {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                fx.lock_count("a/b.bin").await,
+                0,
+                "a scope-denied create must not take the lock"
+            );
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn create_lock_unknown_repository_is_404() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path("lfs-no-such-repo-2627".to_string()),
+                    Bytes::from_static(br#"{"path":"a.bin"}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(as_json(&body)["message"], "Repository not found");
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn create_lock_invalid_json_is_400() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(b"{not json"),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = as_json(&body)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.starts_with("Invalid JSON"),
+                "expected an Invalid JSON message, got {message:?}"
+            );
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn create_lock_empty_path_is_400() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(br#"{"path":""}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(as_json(&body)["message"], "Lock path is required");
+            fx.cleanup().await;
+        }
+
+        /// The happy path: a lock is persisted to `lfs_locks` (the table
+        /// migration 165 added) and reported in the LFS response shape.
+        #[tokio::test]
+        async fn create_lock_persists_the_lock_and_returns_201() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let response = create_lock(
+                State(fx.state.clone()),
+                Extension(Some(fx.auth())),
+                Path(fx.repo_key.clone()),
+                Bytes::from_static(
+                    br#"{"path":"data/model.bin","ref":{"name":"refs/heads/main"}}"#,
+                ),
+            )
+            .await
+            .expect("create_lock must succeed for an unlocked path");
+
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(LFS_CONTENT_TYPE),
+                "LFS clients require the git-lfs media type"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+
+            let json = as_json(&body);
+            let lock = &json["lock"];
+            assert_eq!(lock["path"], "data/model.bin");
+            assert_eq!(lock["owner"]["name"], fx.username.as_str());
+            assert!(
+                Uuid::parse_str(lock["id"].as_str().unwrap_or_default()).is_ok(),
+                "the lock id must be the lfs_locks UUID, got {:?}",
+                lock["id"]
+            );
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(
+                    lock["locked_at"].as_str().unwrap_or_default()
+                )
+                .is_ok(),
+                "locked_at must be RFC3339, got {:?}",
+                lock["locked_at"]
+            );
+
+            // The row lands in the dedicated table with the ref and owner
+            // recorded — the storage this fix introduced.
+            let (ref_name, owner_id): (Option<String>, Uuid) = sqlx::query_as(
+                "SELECT ref_name, owner_id FROM lfs_locks WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind("data/model.bin")
+            .fetch_one(&fx.pool)
+            .await
+            .expect("the lock row must exist");
+            assert_eq!(ref_name.as_deref(), Some("refs/heads/main"));
+            assert_eq!(owner_id, fx.user_id);
+
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn create_lock_on_a_locked_path_is_409_naming_the_holder() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            fx.seed_lock("shared/asset.psd", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(br#"{"path":"shared/asset.psd"}"#),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT);
+            let json = as_json(&body);
+            assert_eq!(json["message"], "Lock already exists for this path");
+            // Per the LFS locking spec the 409 carries the CURRENT holder so the
+            // client can report who to ask.
+            assert_eq!(json["lock"]["path"], "shared/asset.psd");
+            assert_eq!(json["lock"]["owner"]["name"], fx.other_name.as_str());
+            assert_eq!(
+                fx.lock_count("shared/asset.psd").await,
+                1,
+                "the (repository_id, path) unique constraint must keep a single holder"
+            );
+            fx.cleanup().await;
+        }
+
+        /// The `existing == None` arm of the 409 builder. `create_lock` reaches
+        /// it when the conflicting row is deleted between the
+        /// `INSERT ... ON CONFLICT DO NOTHING` and the follow-up SELECT (a
+        /// concurrent unlock). The response must still be a well-formed 409
+        /// carrying a null lock rather than a 500. Needs no database.
+        #[tokio::test]
+        async fn lock_conflict_response_tolerates_a_vanished_holder() {
+            let response = lock_conflict_response(None);
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let json = as_json(&body);
+            assert!(
+                json["lock"].is_null(),
+                "a holder that vanished mid-request must serialize as null"
+            );
+            assert_eq!(json["message"], "Lock already exists for this path");
+        }
+
+        // -------------------------------------------------------------------
+        // list_locks
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn list_locks_requires_authentication() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                list_locks(
+                    State(fx.state.clone()),
+                    Extension(None),
+                    Path(fx.repo_key.clone()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "anonymous callers must not enumerate lock paths and holders"
+            );
+            assert_eq!(String::from_utf8_lossy(&body), "Authentication required");
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn list_locks_returns_the_repository_locks() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            fx.seed_lock("mine.bin", fx.user_id, &fx.username).await;
+            fx.seed_lock("theirs.bin", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, body) = parts(
+                list_locks(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            let json = as_json(&body);
+            let mut paths = paths_of(&json["locks"]);
+            paths.sort();
+            assert_eq!(paths, vec!["mine.bin", "theirs.bin"]);
+            // `next_cursor` is None -> omitted; a present cursor tells an LFS
+            // client there is another page to fetch.
+            assert!(
+                json.get("next_cursor").is_none(),
+                "next_cursor must be omitted when there is no next page"
+            );
+            fx.cleanup().await;
+        }
+
+        // -------------------------------------------------------------------
+        // verify_locks
+        // -------------------------------------------------------------------
+
+        /// git-lfs sends no body when it has no ref to report, and the handler
+        /// must treat that as "no ref filter" rather than a parse error.
+        #[tokio::test]
+        async fn verify_locks_accepts_an_empty_body_and_partitions_ours_from_theirs() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            fx.seed_lock("mine.bin", fx.user_id, &fx.username).await;
+            fx.seed_lock("theirs.bin", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, body) = parts(
+                verify_locks(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            let json = as_json(&body);
+            assert_eq!(paths_of(&json["ours"]), vec!["mine.bin"]);
+            assert_eq!(paths_of(&json["theirs"]), vec!["theirs.bin"]);
+            assert!(json.get("next_cursor").is_none());
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn verify_locks_accepts_a_ref_body() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            fx.seed_lock("mine.bin", fx.user_id, &fx.username).await;
+
+            let (status, body) = parts(
+                verify_locks(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(br#"{"ref":{"name":"refs/heads/main"}}"#),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            let json = as_json(&body);
+            assert_eq!(paths_of(&json["ours"]), vec!["mine.bin"]);
+            assert!(paths_of(&json["theirs"]).is_empty());
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn verify_locks_invalid_json_is_400() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                verify_locks(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(b"{\"ref\":"),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = as_json(&body)["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.starts_with("Invalid JSON"),
+                "expected an Invalid JSON message, got {message:?}"
+            );
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn verify_locks_rejects_token_without_write_scope() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, _) = parts(
+                verify_locks(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.token_auth(&["git-lfs:read"]))),
+                    Path(fx.repo_key.clone()),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            fx.cleanup().await;
+        }
+
+        // -------------------------------------------------------------------
+        // delete_lock
+        // -------------------------------------------------------------------
+
+        /// The headline #2627 fix: the lock id is a `lfs_locks.id` UUID, and a
+        /// client that sends anything else cannot match a row. That must be a
+        /// 404, never a 500 from a failed UUID bind.
+        #[tokio::test]
+        async fn delete_lock_unparseable_id_is_404_not_500() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), "not-a-uuid".to_string())),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(as_json(&body)["message"], "Lock not found");
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn delete_lock_unknown_id_is_404() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), Uuid::new_v4().to_string())),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(as_json(&body)["message"], "Lock not found");
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn delete_lock_owner_releases_the_lock() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let id = fx.seed_lock("mine.bin", fx.user_id, &fx.username).await;
+
+            let (status, body) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), id.to_string())),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            let lock = &as_json(&body)["lock"];
+            assert_eq!(lock["id"], id.to_string());
+            assert_eq!(lock["path"], "mine.bin");
+            assert_eq!(lock["owner"]["name"], fx.username.as_str());
+            assert_eq!(
+                fx.lock_count("mine.bin").await,
+                0,
+                "the lock row must be deleted"
+            );
+            fx.cleanup().await;
+        }
+
+        /// An empty unlock body means `force` defaults to false, so the
+        /// ownership check still applies.
+        #[tokio::test]
+        async fn delete_lock_empty_body_does_not_force() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let id = fx
+                .seed_lock("theirs.bin", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, body) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), id.to_string())),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(as_json(&body)["message"], "You do not own this lock");
+            assert_eq!(
+                fx.lock_count("theirs.bin").await,
+                1,
+                "a refused unlock must leave the lock in place"
+            );
+            fx.cleanup().await;
+        }
+
+        /// A malformed unlock body must not be read as `force = true` — that
+        /// would let any caller steal another user's lock. `unwrap_or(false)`
+        /// keeps the ownership check in force.
+        #[tokio::test]
+        async fn delete_lock_malformed_body_is_not_a_force_unlock() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let id = fx
+                .seed_lock("theirs.bin", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, _) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), id.to_string())),
+                    Bytes::from_static(br#"{"force":"yes-please"}"#),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                fx.lock_count("theirs.bin").await,
+                1,
+                "an unparseable force flag must not release someone else's lock"
+            );
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn delete_lock_force_releases_another_users_lock() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let id = fx
+                .seed_lock("theirs.bin", fx.other_id, &fx.other_name)
+                .await;
+
+            let (status, body) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path((fx.repo_key.clone(), id.to_string())),
+                    Bytes::from_static(br#"{"force":true}"#),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            // The response reports the ORIGINAL holder, not the forcing caller.
+            assert_eq!(
+                as_json(&body)["lock"]["owner"]["name"],
+                fx.other_name.as_str()
+            );
+            assert_eq!(fx.lock_count("theirs.bin").await, 0);
+            fx.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn delete_lock_rejects_token_without_delete_scope() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let id = fx.seed_lock("mine.bin", fx.user_id, &fx.username).await;
+
+            let (status, _) = parts(
+                delete_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.token_auth(&["git-lfs:write"]))),
+                    Path((fx.repo_key.clone(), id.to_string())),
+                    Bytes::new(),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a write-scoped token must not be able to unlock"
+            );
+            assert_eq!(
+                fx.lock_count("mine.bin").await,
+                1,
+                "a scope-denied unlock must not delete the row"
+            );
+            fx.cleanup().await;
+        }
+    }
 }
