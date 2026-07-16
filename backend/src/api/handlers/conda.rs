@@ -783,53 +783,62 @@ pub fn router() -> Router<SharedState> {
 ///     - https://host/conda/t/<TOKEN>/my-channel
 pub fn token_router() -> Router<SharedState> {
     Router::new()
-        .route("/:token/:repo_key/channeldata.json", get(channeldata_json))
-        .route("/:token/:repo_key/notices.json", get(notices_json))
-        .route("/:token/:repo_key/keys/repo.pub", get(repo_public_key))
+        .route(
+            "/:token/:repo_key/channeldata.json",
+            get(channeldata_json_with_token),
+        )
+        .route(
+            "/:token/:repo_key/notices.json",
+            get(notices_json_with_token),
+        )
+        .route(
+            "/:token/:repo_key/keys/repo.pub",
+            get(repo_public_key_with_token),
+        )
         .route("/:token/:repo_key/upload", post(upload_post_with_token))
         .route(
             "/:token/:repo_key/:subdir/repodata.json",
-            get(repodata_json),
+            get(repodata_json_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata.json.bz2",
-            get(repodata_json_bz2),
+            get(repodata_json_bz2_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata.json.sig",
-            get(repodata_json_sig),
+            get(repodata_json_sig_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata.json.zst",
-            get(repodata_json_zst),
+            get(repodata_json_zst_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata.json.jlap",
-            get(repodata_json_jlap),
+            get(repodata_json_jlap_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/current_repodata.json",
-            get(current_repodata_json),
+            get(current_repodata_json_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/run_exports.json",
-            get(run_exports_json),
+            get(run_exports_json_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/patch_instructions.json",
-            get(patch_instructions_json),
+            get(patch_instructions_json_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata_shards.msgpack.zst",
-            get(sharded_repodata_index),
+            get(sharded_repodata_index_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/shards/:shard_hash",
-            get(sharded_repodata_shard),
+            get(sharded_repodata_shard_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/:filename",
-            get(download_package).put(upload_package_put_with_token),
+            get(download_package_with_token).put(upload_package_put_with_token),
         )
         .route(
             "/:token/:repo_key/:subdir/:filename/attestation",
@@ -845,6 +854,136 @@ pub fn token_router() -> Router<SharedState> {
                 response
             },
         ))
+}
+
+// ---------------------------------------------------------------------------
+// Token-authenticated GET handlers (for /conda/t/<TOKEN>/ URL paths).
+//
+// The conda token router nests every read route under a leading `/:token`
+// segment. These handlers exist solely to bind that extra segment and delegate
+// to the shared non-token handler with a correctly-aligned `Path` tuple.
+//
+// Credential resolution for the URL token happens upstream in
+// `repo_visibility_middleware` (`extract_conda_url_token`), which validates the
+// token and injects the resulting `Option<AuthExtension>` before these handlers
+// run; the token segment itself is discarded here. Without these dedicated
+// handlers the non-token handlers bind `Path<(repo_key, subdir, ...)>`
+// positionally against the token-prefixed path, so every parameter shifts by
+// one (`repo_key` receives the token) and resolution never reaches a valid
+// channel -- a valid token-channel read then 401s.
+// ---------------------------------------------------------------------------
+
+async fn channeldata_json_with_token(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((_token, repo_key)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    channeldata_json(state, auth, headers, Path(repo_key)).await
+}
+
+async fn notices_json_with_token(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    Path((_token, repo_key)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    notices_json(state, headers, Path(repo_key)).await
+}
+
+async fn repo_public_key_with_token(
+    state: State<SharedState>,
+    Path((_token, repo_key)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    repo_public_key(state, Path(repo_key)).await
+}
+
+async fn repodata_json_with_token(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    repodata_json(state, auth, headers, Path((repo_key, subdir))).await
+}
+
+async fn repodata_json_bz2_with_token(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    repodata_json_bz2(state, auth, headers, Path((repo_key, subdir))).await
+}
+
+async fn repodata_json_sig_with_token(
+    state: State<SharedState>,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    repodata_json_sig(state, Path((repo_key, subdir))).await
+}
+
+async fn repodata_json_zst_with_token(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    repodata_json_zst(state, auth, headers, Path((repo_key, subdir))).await
+}
+
+async fn repodata_json_jlap_with_token(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    repodata_json_jlap(state, headers, Path((repo_key, subdir))).await
+}
+
+async fn current_repodata_json_with_token(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    current_repodata_json(state, headers, Path((repo_key, subdir))).await
+}
+
+async fn run_exports_json_with_token(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    run_exports_json(state, headers, Path((repo_key, subdir))).await
+}
+
+async fn patch_instructions_json_with_token(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    patch_instructions_json(state, headers, Path((repo_key, subdir))).await
+}
+
+async fn sharded_repodata_index_with_token(
+    state: State<SharedState>,
+    Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    sharded_repodata_index(state, Path((repo_key, subdir))).await
+}
+
+async fn sharded_repodata_shard_with_token(
+    state: State<SharedState>,
+    Path((_token, repo_key, subdir, shard_hash)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    sharded_repodata_shard(state, Path((repo_key, subdir, shard_hash))).await
+}
+
+async fn download_package_with_token(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    Path((_token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    download_package(state, auth, Path((repo_key, subdir, filename)), ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -8552,5 +8691,141 @@ mod tests {
             verifying_key.verify(&json_bytes, &signature).is_ok(),
             "Signature should verify against the public key"
         );
+    }
+
+    // =======================================================================
+    // Token-channel GET routing (regression: token-router GET param shift)
+    // =======================================================================
+
+    /// The conda token router nests every read route under a leading
+    /// `/:token` segment. Before the fix, those routes pointed at the
+    /// non-token handlers whose `Path` extractors bound only
+    /// `(repo_key, subdir[, filename])`, so the leading token shifted every
+    /// parameter by one (`repo_key` received the token) and a valid
+    /// token-channel read 401/404'd because resolution ran against a bogus
+    /// repo key.
+    ///
+    /// This test mounts `token_router()` directly (credential injection is the
+    /// visibility middleware's job and is covered in `middleware::auth`
+    /// tests) and proves the token-aware handlers now bind the SECOND path
+    /// segment as the repo key: a valid key resolves (200) while a bogus key
+    /// 404s, and the package download binds the final segment as the
+    /// filename.
+    #[tokio::test]
+    async fn test_token_channel_get_routes_bind_repo_key_not_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "pkg-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        let storage_key = format!("conda/{}/{}", fx.repo_id, path);
+        let content = Bytes::from_static(b"fake-conda-package-bytes");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            &path,
+            "pkg",
+            "1.0",
+            "application/x-tar",
+            content.clone(),
+            fx.user_id,
+        )
+        .await;
+
+        // Any opaque string in the token slot; the handler discards it and the
+        // middleware (not mounted here) is what validates it.
+        let tok = "ak_url_token_placeholder";
+        let key = fx.repo_key.clone();
+
+        let assertions = async {
+            // repodata.json resolves the real repo key (segment 2) and lists
+            // the seeded package -> the token segment was correctly discarded.
+            let app = fx.router_with_auth(token_router());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{tok}/{key}/noarch/repodata.json"))).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "token-channel repodata must resolve the real repo key"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["packages"]
+                    .as_object()
+                    .is_some_and(|m| m.contains_key(filename)),
+                "repodata must list the seeded package, got: {json}"
+            );
+
+            // A bogus repo key in segment 2 must 404 -> confirms segment 2 (not
+            // segment 1, the token) is treated as the repo key.
+            let app = fx.router_with_auth(token_router());
+            let (status, _b) = tdh::send(
+                app,
+                tdh::get(format!("/{tok}/no-such-repo-xyz/noarch/repodata.json")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "an unknown repo key in the token URL must 404"
+            );
+
+            // Compressed + metadata read routes resolve the repo key too.
+            for suffix in [
+                "noarch/repodata.json.bz2",
+                "noarch/repodata.json.zst",
+                "noarch/current_repodata.json",
+                "noarch/run_exports.json",
+                "noarch/patch_instructions.json",
+                "noarch/repodata.json.jlap",
+                "channeldata.json",
+                "notices.json",
+            ] {
+                let app = fx.router_with_auth(token_router());
+                let (status, _b) = tdh::send(app, tdh::get(format!("/{tok}/{key}/{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "token-channel read `{suffix}` must resolve the repo key"
+                );
+            }
+
+            // The package download binds the FINAL segment as the filename
+            // (4-tuple) and streams the stored bytes.
+            let app = fx.router_with_auth(token_router());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{tok}/{key}/noarch/{filename}"))).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "token-channel package download must resolve the filename"
+            );
+            assert_eq!(
+                &body[..],
+                &content[..],
+                "download must stream the stored package bytes"
+            );
+
+            // Signing-key routes have no key configured for the fixture repo,
+            // so they 404 -- but the handler is reached (repo key bound),
+            // exercising the token-aware wrappers.
+            for suffix in ["keys/repo.pub", "noarch/repodata.json.sig"] {
+                let app = fx.router_with_auth(token_router());
+                let (status, _b) = tdh::send(app, tdh::get(format!("/{tok}/{key}/{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "signing route `{suffix}` reaches the handler and 404s (no key)"
+                );
+            }
+        };
+
+        assertions.await;
+        fx.teardown().await;
     }
 }
