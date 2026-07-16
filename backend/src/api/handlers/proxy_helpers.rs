@@ -2637,20 +2637,10 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<StreamingFetchResult, Response> {
-    let reversed_pattern = reverse_suffix_for_like(path_suffix);
-    let path: String = sqlx::query_scalar(
-        "SELECT path FROM artifacts \
-         WHERE repository_id = $1 \
-           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
-           AND is_deleted = false \
-         LIMIT 1",
-    )
-    .bind(repo_id)
-    .bind(&reversed_pattern)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+    let path = resolve_local_artifact_by_suffix(db, repo_id, path_suffix)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?
+        .path;
 
     local_fetch_by_path(db, state, repo_id, location, &path).await
 }
@@ -2672,20 +2662,10 @@ pub async fn local_fetch_or_redirect_by_suffix(
     path_suffix: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let reversed_pattern = reverse_suffix_for_like(path_suffix);
-    let path: String = sqlx::query_scalar(
-        "SELECT path FROM artifacts \
-         WHERE repository_id = $1 \
-           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
-           AND is_deleted = false \
-         LIMIT 1",
-    )
-    .bind(repo_id)
-    .bind(&reversed_pattern)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+    let path = resolve_local_artifact_by_suffix(db, repo_id, path_suffix)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?
+        .path;
 
     local_fetch_or_redirect(db, state, repo_id, location, &path, ctx).await
 }
@@ -2710,6 +2690,70 @@ fn reverse_suffix_for_like(path_suffix: &str) -> String {
     with_slash.push_str(path_suffix);
     let reversed: String = with_slash.chars().rev().collect();
     super::escape_like_literal(&reversed)
+}
+
+/// Row resolved by [`resolve_local_artifact_by_suffix`].
+struct ResolvedLocalArtifact {
+    id: Uuid,
+    path: String,
+    storage_key: String,
+}
+
+/// Resolve a single local artifact by trailing path-suffix, with an
+/// exact-path fallback for artifacts stored at their bare (root) path.
+///
+/// The primary lookup is the indexed reverse-suffix LIKE, which matches
+/// `path` values ending in `/<suffix>` — i.e. every artifact stored under a
+/// directory. Artifacts uploaded through the generic flow are stored at their
+/// bare filename (no leading directory), so the `'/'`-anchored suffix pattern
+/// never matches them. On a suffix MISS we retry with an exact `path = $suffix`
+/// match to resolve those root-stored artifacts.
+///
+/// The fallback fires ONLY on a suffix miss, so any lookup that already
+/// succeeded returns the identical row and every currently-passing caller is
+/// unaffected. The exact match also can't produce a substring false positive
+/// (a request for `b.rpm` will not resolve a root-stored `ab.rpm`).
+async fn resolve_local_artifact_by_suffix(
+    db: &PgPool,
+    repository_id: Uuid,
+    path_suffix: &str,
+) -> Result<Option<ResolvedLocalArtifact>, Response> {
+    use sqlx::Row;
+    let reversed_pattern = reverse_suffix_for_like(path_suffix);
+    let row = sqlx::query(
+        "SELECT id, path, storage_key FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(&reversed_pattern)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    let row = match row {
+        Some(r) => Some(r),
+        None => sqlx::query(
+            "SELECT id, path, storage_key FROM artifacts \
+             WHERE repository_id = $1 \
+               AND is_deleted = false \
+               AND path = $2 \
+             LIMIT 1",
+        )
+        .bind(repository_id)
+        .bind(path_suffix)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| internal_error("Database", e))?,
+    };
+
+    Ok(row.map(|r| ResolvedLocalArtifact {
+        id: r.try_get("id").unwrap_or_default(),
+        path: r.try_get("path").unwrap_or_default(),
+        storage_key: r.try_get("storage_key").unwrap_or_default(),
+    }))
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the
@@ -3740,25 +3784,14 @@ pub async fn find_local_by_filename_suffix(
     repository_id: Uuid,
     path_suffix: &str,
 ) -> Result<Option<LocalArtifactHit>, Response> {
-    use sqlx::Row;
-    let reversed_pattern = reverse_suffix_for_like(path_suffix);
-    let row = sqlx::query(
-        "SELECT id, storage_key FROM artifacts \
-         WHERE repository_id = $1 \
-           AND is_deleted = false \
-           AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
-         LIMIT 1",
+    Ok(
+        resolve_local_artifact_by_suffix(db, repository_id, path_suffix)
+            .await?
+            .map(|r| LocalArtifactHit {
+                id: r.id,
+                storage_key: r.storage_key,
+            }),
     )
-    .bind(repository_id)
-    .bind(&reversed_pattern)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| internal_error("Database", e))?;
-
-    Ok(row.map(|r| LocalArtifactHit {
-        id: r.try_get("id").unwrap_or_default(),
-        storage_key: r.try_get("storage_key").unwrap_or_default(),
-    }))
 }
 
 /// Parse a two-field multipart upload (`file` + a named JSON metadata field).
@@ -7584,6 +7617,121 @@ mod tests {
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 
+    #[tokio::test]
+    async fn test_find_local_by_filename_suffix_root_stored_exact_fallback() {
+        // #2580: an artifact stored at its bare (root) path — as produced by the
+        // generic upload flow — is not matched by the '/'-anchored suffix LIKE.
+        // The exact-path fallback resolves it by filename.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "rpm").await;
+
+        let id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "hello-1.0-1.x86_64.rpm",
+                name: "hello",
+                version: "1.0-1",
+                size_bytes: 5,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/hello/hello-1.0-1.x86_64.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let hit = find_local_by_filename_suffix(&pool, repo_id, "hello-1.0-1.x86_64.rpm")
+            .await
+            .expect("find")
+            .expect("root-stored artifact must resolve via exact fallback");
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.storage_key, "rpm/hello/hello-1.0-1.x86_64.rpm");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_local_by_filename_suffix_hit_wins_over_fallback() {
+        // When the suffix LIKE hits, the exact-path fallback must NOT fire: the
+        // directory-stored row is returned, identical to pre-fix behaviour.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "rpm").await;
+
+        let dir_id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "packages/hello-1.0-1.x86_64.rpm",
+                name: "hello",
+                version: "1.0-1",
+                size_bytes: 5,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/hello/packages.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert dir");
+
+        let hit = find_local_by_filename_suffix(&pool, repo_id, "hello-1.0-1.x86_64.rpm")
+            .await
+            .expect("find")
+            .expect("some");
+        assert_eq!(
+            hit.id, dir_id,
+            "suffix hit must return the directory-stored row, not fire the fallback"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_local_by_filename_suffix_no_substring_false_positive() {
+        // The exact fallback must not substring-match: a request for `b.rpm`
+        // must NOT resolve a root-stored `ab.rpm`.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "rpm").await;
+
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "ab.rpm",
+                name: "ab",
+                version: "1",
+                size_bytes: 1,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/ab/ab.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let miss = find_local_by_filename_suffix(&pool, repo_id, "b.rpm")
+            .await
+            .expect("ok");
+        assert!(
+            miss.is_none(),
+            "`b.rpm` must not substring-match root-stored `ab.rpm`"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
     // ── ensure_unique_artifact_path ──────────────────────────────────────
 
     #[tokio::test]
@@ -8131,6 +8279,126 @@ mod tests {
             .expect("fetch suffix");
         let content2 = result2.collect().await.unwrap();
         assert_eq!(&content2[..], b"abc123");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_fetch_by_path_suffix_root_stored_and_false_positive() {
+        // #2580: a root-stored artifact (generic upload) resolves by filename
+        // through the exact-path fallback; a substring must NOT false-positive.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "rpm").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+            format: "rpm".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+        };
+        let bytes = Bytes::from_static(b"rpmbytes");
+        put_artifact_bytes(&state, &repo, "rpm/ab.rpm", bytes.clone())
+            .await
+            .expect("put");
+
+        // Root-stored bare path (no leading directory).
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "ab.rpm",
+                name: "ab",
+                version: "1",
+                size_bytes: bytes.len() as i64,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/ab.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let location = repo.storage_location();
+
+        // Exact fallback resolves the root-stored artifact by its full filename.
+        let ok = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "ab.rpm")
+            .await
+            .expect("root-stored artifact must resolve");
+        let content = ok.collect().await.unwrap();
+        assert_eq!(&content[..], b"rpmbytes");
+
+        // Substring must NOT match: `b.rpm` != root-stored `ab.rpm`.
+        let miss = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "b.rpm").await;
+        assert!(
+            miss.is_err(),
+            "`b.rpm` must not substring-match root-stored `ab.rpm`"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_fetch_by_path_suffix_hit_wins_over_fallback() {
+        // A directory-stored artifact still resolves via the suffix LIKE; the
+        // exact-path fallback does not shadow it.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "rpm").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+            format: "rpm".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+        };
+        let bytes = Bytes::from_static(b"dirbytes");
+        put_artifact_bytes(&state, &repo, "rpm/packages/hello.rpm", bytes.clone())
+            .await
+            .expect("put");
+
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "packages/hello.rpm",
+                name: "hello",
+                version: "1",
+                size_bytes: bytes.len() as i64,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/packages/hello.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let location = repo.storage_location();
+        let ok = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "hello.rpm")
+            .await
+            .expect("directory-stored artifact must resolve via suffix");
+        let content = ok.collect().await.unwrap();
+        assert_eq!(&content[..], b"dirbytes");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
