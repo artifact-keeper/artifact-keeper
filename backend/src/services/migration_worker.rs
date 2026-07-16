@@ -1174,11 +1174,16 @@ impl MigrationWorker {
         // and is bounded for npm/helm because those tarballs are small.
         // Returns None for unknown formats; the artifact INSERT proceeds
         // either way and only the metadata row is skipped.
-        let extracted_metadata =
+        // #2561: permit-scoped decode; on saturation skip the best-effort
+        // extraction (only the metadata row is skipped).
+        let extracted_metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
             crate::services::artifact_metadata::extract_artifact_metadata_from_path(
                 package_type,
                 &temp_path,
-            );
+            )
+        })
+        .ok()
+        .flatten();
 
         // Get metadata if requested
         let metadata = if include_metadata {

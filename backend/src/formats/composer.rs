@@ -156,7 +156,13 @@ impl FormatHandler for ComposerHandler {
 
         // Extract composer.json from archive packages
         if matches!(info.kind, ComposerPathKind::Archive) && !content.is_empty() {
-            if let Ok(composer_json) = Self::parse_composer_json(content) {
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Ok(composer_json)) =
+                crate::util::bounded_archive::with_ingest_extraction(|| {
+                    Self::parse_composer_json(content)
+                })
+            {
                 metadata["composer"] = serde_json::to_value(&composer_json)?;
             }
         }
@@ -411,6 +417,19 @@ mod tests {
 
     /// #2556: a `composer.json` entry that inflates past the 8 MiB per-metadata
     /// cap is rejected (bounded memory), while the compressed zip stays tiny.
+    /// #2561: the archive branch of `parse_metadata` still enriches the
+    /// metadata through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_parse_metadata_archive_enriches_composer_2561() {
+        let handler = ComposerHandler::new();
+        let zip = composer_zip(br#"{"name":"vendor/pkg","version":"1.2.3"}"#);
+        let meta = handler
+            .parse_metadata("dist/vendor/pkg/1.2.3/abc123.zip", &Bytes::from(zip))
+            .await
+            .expect("archive parse_metadata succeeds");
+        assert_eq!(meta["composer"]["name"], "vendor/pkg");
+    }
+
     #[test]
     fn test_parse_composer_json_bomb_rejected_2556() {
         let mut body = br#"{"name":"vendor/bomb","description":""#.to_vec();

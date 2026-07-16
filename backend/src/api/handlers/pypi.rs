@@ -2297,10 +2297,18 @@ async fn serve_metadata(
         .await
         .map_err(map_storage_err)?;
 
+    // #2561: permit-scoped decode on the serve path, fast-fail 503 on
+    // saturation. Only taken for the branches that actually decode an archive.
     let metadata_text = if filename.ends_with(".whl") {
-        extract_metadata_from_wheel(&content)
+        crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_metadata_from_wheel(&content)
+        })
+        .map_err(|e| e.into_response())?
     } else if filename.ends_with(".tar.gz") {
-        extract_metadata_from_sdist(&content)
+        crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_metadata_from_sdist(&content)
+        })
+        .map_err(|e| e.into_response())?
     } else {
         None
     };

@@ -379,7 +379,12 @@ async fn publish_package(
     //   - metadata.config (Erlang term format)
     //   - contents.tar.gz (the actual package files)
     //   - CHECKSUM (SHA-256 of the above)
-    let (pkg_name, pkg_version) = extract_name_version_from_tarball(&body).map_err(|e| {
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let (pkg_name, pkg_version) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_name_version_from_tarball(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("Invalid hex tarball: {}", e),
@@ -1928,6 +1933,41 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #2561: an authenticated hex publish decodes the outer tarball through
+    /// the permit-scoped decode (uncontended) and stores the package.
+    #[tokio::test]
+    async fn test_hex_publish_succeeds_2561() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let metadata = r#"{<<"name">>, <<"pushpkg">>}.
+{<<"version">>, <<"1.2.3">>}.
+"#;
+        let data = metadata.as_bytes();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.config").unwrap();
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, data).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "hex publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+        f.teardown().await;
+    }
 
     #[tokio::test]
     async fn test_hex_tarball_download_404_when_missing() {

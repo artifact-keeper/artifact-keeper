@@ -878,9 +878,15 @@ async fn upload_image(
     let mut staged = StagedTempFile::new(temp_path.clone());
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
-    // Extract metadata from the file on disk
-    let metadata = IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path)
-        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+    // Extract metadata from the file on disk. #2561: permit-scoped decode; the
+    // artifact is already staged, so a saturated server skips this best-effort
+    // extraction rather than shedding the upload.
+    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
 
     // Record an upload session in `finalizing` state, then push to the
     // StorageBackend on a background task and return 202. Doing the
@@ -1236,9 +1242,15 @@ async fn complete_chunked_upload(
         }
     }
 
-    // Extract metadata from the file on disk
-    let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
-        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+    // Extract metadata from the file on disk. #2561: permit-scoped decode; the
+    // artifact is already staged, so a saturated server skips this best-effort
+    // extraction rather than shedding the upload.
+    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
 
     // Finalize asynchronously: mark the session `finalizing`, push to the
     // StorageBackend on a background task, and return 202. The assembled

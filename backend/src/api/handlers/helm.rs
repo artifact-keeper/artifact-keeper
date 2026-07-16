@@ -474,15 +474,19 @@ async fn upload_chart(
 
     // Extract and validate Chart.yaml from the staged archive on disk, reading
     // only the Chart.yaml entry (bounded memory) rather than the whole package.
-    let chart_yaml = extract_chart_yaml_from_staged(staged.path())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid chart package: {}", e),
-            )
-                .into_response()
-        })?;
+    // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
+    let chart_yaml = crate::util::bounded_archive::with_ingest_extraction_async(|| {
+        extract_chart_yaml_from_staged(staged.path())
+    })
+    .await
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid chart package: {}", e),
+        )
+            .into_response()
+    })?;
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;

@@ -247,7 +247,13 @@ impl FormatHandler for IncusHandler {
 
         // Try extracting metadata.yaml from tarballs
         if !content.is_empty() && info.file_type.is_tarball() {
-            if let Some(image_meta) = Self::extract_metadata(content) {
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Some(image_meta)) =
+                crate::util::bounded_archive::with_ingest_extraction(|| {
+                    Self::extract_metadata(content)
+                })
+            {
                 metadata["image_metadata"] =
                     serde_json::to_value(&image_meta).unwrap_or(serde_json::Value::Null);
             }
@@ -611,6 +617,26 @@ properties:
             IncusHandler::extract_metadata(&zst).unwrap().os,
             Some("Ubuntu".to_string())
         );
+    }
+
+    /// #2561: the tarball branch of `parse_metadata` still enriches the
+    /// metadata through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_parse_metadata_tarball_enriches_2561() {
+        use std::io::Write;
+
+        let yaml = b"architecture: x86_64\nproperties:\n  os: Ubuntu\n  release: noble\n";
+        let raw = image_tar(yaml, 0);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        let gz = gz.finish().unwrap();
+
+        let handler = IncusHandler::new();
+        let meta = handler
+            .parse_metadata("ubuntu-noble/20240215/incus.tar.gz", &Bytes::from(gz))
+            .await
+            .expect("tarball parse_metadata succeeds");
+        assert_eq!(meta["image_metadata"]["os"], "Ubuntu");
     }
 
     #[tokio::test]

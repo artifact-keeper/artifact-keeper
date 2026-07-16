@@ -1348,7 +1348,12 @@ async fn upload(
     }
 
     // Parse composer.json from the archive to extract metadata
-    let composer_json = ComposerHandler::parse_composer_json(&body).map_err(|e| {
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let composer_json = crate::util::bounded_archive::with_ingest_extraction(|| {
+        ComposerHandler::parse_composer_json(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("Failed to parse composer.json from archive: {}", e),

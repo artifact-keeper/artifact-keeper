@@ -1428,16 +1428,23 @@ fn read_index_capped<R: Read>(reader: R) -> Option<String> {
 
 /// Tier B resolver: find the SHA-256 the cached Packages index records for a
 /// pool artifact, so the streamed `.deb` download can gate its cache commit on
-/// it. Best-effort: `None` when no cached Packages index covers the file
+/// it. Best-effort: `Ok(None)` when no cached Packages index covers the file
 /// (which leaves the download's cache behaviour unchanged from before #2459).
+/// `Err` only when the server is saturated with concurrent ingestion decodes
+/// (#2561), which sheds the request with a retryable 503 before any upstream
+/// fetch or cache write — the resolve fails cleanly, no partial state.
 async fn resolve_pool_expected_checksum(
     proxy: &ProxyService,
     repo_key: &str,
     component: &str,
     artifact_path: &str,
-) -> Option<String> {
-    let filename = artifact_path.rsplit('/').next()?;
-    let (_, _, arch) = DebianHandler::parse_deb_filename(filename).ok()?;
+) -> crate::error::Result<Option<String>> {
+    let Some(filename) = artifact_path.rsplit('/').next() else {
+        return Ok(None);
+    };
+    let Ok((_, _, arch)) = DebianHandler::parse_deb_filename(filename) else {
+        return Ok(None);
+    };
     for cache_path in proxy.list_cached_paths(repo_key).await {
         if !is_matching_packages_index(&cache_path, component, &arch) {
             continue;
@@ -1448,15 +1455,21 @@ async fn resolve_pool_expected_checksum(
         else {
             continue;
         };
-        let Some(text) = decompress_packages_index(&cache_path, &bytes) else {
+        // #2561: permit-scoped decode on this serve path (each cached index
+        // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
+        // permit is released before the next cache read.
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+            decompress_packages_index(&cache_path, &bytes)
+        })?
+        else {
             continue;
         };
         let map = crate::formats::debian::parse_packages_index(&text);
         if let Some(sha) = resolve_pool_deb_checksum(&map, artifact_path) {
-            return Some(sha);
+            return Ok(Some(sha));
         }
     }
-    None
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,7 +2373,8 @@ async fn pool_download(
                         &component,
                         &artifact_path,
                     )
-                    .await;
+                    .await
+                    .map_err(|e| e.into_response())?;
                     let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         repo.id,

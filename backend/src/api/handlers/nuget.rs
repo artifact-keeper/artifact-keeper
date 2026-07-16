@@ -924,29 +924,31 @@ async fn push_package(
 
     // Parse .nuspec from the SEEKABLE staged file (the ZIP reader needs
     // Read + Seek); run the blocking archive read off the async runtime.
-    let nuspec = {
-        let staged_path = staged.path().to_path_buf();
+    // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
+    let staged_path = staged.path().to_path_buf();
+    let nuspec = crate::util::bounded_archive::with_ingest_extraction_async(|| {
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&staged_path)
                 .map_err(|e| format!("Cannot open staged package: {e}"))?;
             parse_nuspec_from_reader(file)
         })
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("nuspec parse task failed: {e}"),
-            )
-                .into_response()
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read .nuspec from package: {e}"),
-            )
-                .into_response()
-        })?
-    };
+    })
+    .await
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("nuspec parse task failed: {e}"),
+        )
+            .into_response()
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read .nuspec from package: {e}"),
+        )
+            .into_response()
+    })?;
 
     let package_id = nuspec.id.to_lowercase();
     let version = nuspec.version.clone();

@@ -291,9 +291,12 @@ async fn push_gem(
     }
 
     // Extract gemspec from the .gem file
-    let gemspec = RubygemsHandler::extract_gemspec(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
-    })?;
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let gemspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+        RubygemsHandler::extract_gemspec(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response())?;
 
     let gem_name = &gemspec.name;
     let gem_version = &gemspec.version;
@@ -458,7 +461,15 @@ async fn collect_remote_specs(
         state.proxy_service.as_deref(),
         virtual_repo_id,
         upstream_path,
-        |bytes, _member_key| async move { parse_upstream_specs(&bytes) },
+        |bytes, _member_key| async move {
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            #[allow(clippy::result_large_err)]
+            // Response-as-error matches this module's handler convention.
+            let specs = crate::util::bounded_archive::with_ingest_extraction(|| {
+                parse_upstream_specs(&bytes)
+            });
+            specs.map_err(|e| e.into_response())?
+        },
     )
     .await?;
 
@@ -993,6 +1004,42 @@ mod tests {
             .unwrap();
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    /// #2561: an authenticated gem push decodes the gemspec through the
+    /// permit-scoped decode (uncontended) and stores the gem.
+    #[tokio::test]
+    async fn test_rubygems_push_gem_succeeds_2561() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        // A .gem is a plain tar carrying a gzip'd gemspec-YAML `metadata.gz`.
+        let yaml = b"--- !ruby/object:Gem::Specification\nname: pushgem\nversion: 1.0.0\n";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, yaml).unwrap();
+        let metadata_gz = gz.finish().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.gz").unwrap();
+        header.set_size(metadata_gz.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &metadata_gz[..]).unwrap();
+        let gem = builder.into_inner().unwrap();
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(gem))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
         f.teardown().await;
     }
 }

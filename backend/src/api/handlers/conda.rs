@@ -3059,9 +3059,13 @@ async fn store_conda_package(
         },
     )?;
 
-    // Validate package structure before storing
-    validate_conda_package(&content, filename)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+    // Validate package structure before storing.
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    crate::util::bounded_archive::with_ingest_extraction(|| {
+        validate_conda_package(&content, filename)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
 
     // Compute SHA256 and MD5
     let mut sha256_hasher = Sha256::new();
@@ -3154,8 +3158,14 @@ async fn store_conda_package(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
-    // Extract metadata from package contents
-    let extracted = extract_conda_metadata(&content, filename);
+    // Extract metadata from package contents. #2561: permit-scoped decode; the
+    // artifact row is already committed, so a saturated server skips this
+    // best-effort enrichment rather than failing the stored upload.
+    let extracted = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_conda_metadata(&content, filename)
+    })
+    .ok()
+    .flatten();
 
     let build_number = extracted
         .as_ref()

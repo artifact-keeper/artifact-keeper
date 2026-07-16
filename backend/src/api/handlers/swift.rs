@@ -752,7 +752,12 @@ async fn fetch_manifest(
                     &format!("Storage error: {}", e),
                 )
             })?;
-            extract_manifest_from_zip(&zip_bytes).ok_or_else(|| {
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            crate::util::bounded_archive::with_ingest_extraction(|| {
+                extract_manifest_from_zip(&zip_bytes)
+            })
+            .map_err(|e| e.into_response())?
+            .ok_or_else(|| {
                 swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
             })?
         }
@@ -871,11 +876,19 @@ async fn publish_release(
     // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
     // because the manifest endpoint returns 404 even though the archive is
     // perfectly valid (issue #1100).
-    let manifest = headers
+    let manifest = match headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .or_else(|| extract_manifest_from_zip(&body));
+    {
+        Some(m) => Some(m),
+        // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
+        // when the header fallback actually needs to decode the uploaded zip.
+        None => crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_manifest_from_zip(&body)
+        })
+        .map_err(|e| e.into_response())?,
+    };
 
     let swift_metadata = serde_json::json!({
         "scope": scope,
