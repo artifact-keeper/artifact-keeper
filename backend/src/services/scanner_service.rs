@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
@@ -22,7 +22,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -1080,6 +1080,170 @@ fn max_concurrent_scan_extractions() -> usize {
 fn scan_extraction_semaphore() -> &'static Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_scan_extractions())))
+}
+
+/// Env var pinning the per-tenant fair-share floor used by the #2555 fairness
+/// layer. A blank, non-numeric, or zero value falls back to the computed
+/// `ceil(N/2)` default (see [`scan_extraction_per_tenant_fair_share`]).
+const MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV: &str =
+    "MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT";
+
+/// Per-tenant fair-share floor for scan-workspace extraction (#2555).
+///
+/// The global [`scan_extraction_semaphore`] bounds *total* in-flight
+/// extractions but is a single process-wide FIFO: one tenant firing many scans
+/// (repo-wide rescan / bulk-upload auto-scan) can fill the queue and starve
+/// other tenants. This value is the number of a single tenant's scans that may
+/// contend for the global pool at once — a *soft* ceiling, not a hard cap:
+///
+/// * When a tenant is alone, the opportunistic path in
+///   [`acquire_scan_extraction_permit_from`] lets it burst to the full global
+///   `N` (no throttle without contention).
+/// * When multiple tenants contend, each tenant only ever crowds up to
+///   `fair_share` requests into the global FIFO, so the remaining backlog waits
+///   on the tenant's *own* semaphore instead of blocking peers. Under sustained
+///   contention every tenant converges toward its fair slice of the pool.
+///
+/// Defaults to `ceil(N/2)` and is clamped to `[1, N]` (a floor above the global
+/// cap would just behave like `N`). An operator may pin it via
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV`].
+fn scan_extraction_per_tenant_fair_share() -> usize {
+    let global = max_concurrent_scan_extractions().max(1);
+    let default_fair = global.div_ceil(2).max(1);
+    let fair = positive_env_or(
+        MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV,
+        default_fair as u64,
+    ) as usize;
+    fair.clamp(1, global)
+}
+
+/// One tenant's fair-share semaphore plus a refcount of its in-flight (or
+/// queued) scans, so idle entries are pruned from the registry on drop and the
+/// map stays bounded even with many short-lived tenants.
+struct TenantExtractionEntry {
+    sem: Arc<Semaphore>,
+    refs: usize,
+}
+
+/// Per-tenant fair-share registry, keyed by `repository_id`, layered in FRONT of
+/// the global extraction semaphore (#2555). Held behind a `std::sync::Mutex`:
+/// every critical section is a few map operations with no `.await` inside, so a
+/// blocking mutex is correct and avoids a new async dependency (mirrors the
+/// existing `email_rate_limiter` choice of `Mutex<HashMap>` over a `DashMap`).
+type TenantExtractionRegistry = Arc<Mutex<HashMap<Uuid, TenantExtractionEntry>>>;
+
+/// Process-wide per-tenant registry. Lives for the process lifetime; entries are
+/// created lazily on first scan for a tenant and pruned once that tenant has no
+/// scan in flight.
+fn scan_extraction_tenant_registry() -> TenantExtractionRegistry {
+    static REG: OnceLock<TenantExtractionRegistry> = OnceLock::new();
+    REG.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+/// RAII guard bundling the permits a single `scan_artifact_inner` invocation
+/// holds: always the global extraction permit, and — except on the opportunistic
+/// over-share burst path — the tenant's fair-share permit. Dropping it releases
+/// both permits and decrements the tenant's refcount, pruning the registry entry
+/// once the tenant has no scan left.
+struct ScanExtractionPermit {
+    repository_id: Uuid,
+    registry: TenantExtractionRegistry,
+    // Held for the whole scan; `None` only in the impossible closed-semaphore
+    // case (we fall through rather than shed a legitimate scan, matching the
+    // prior `.ok()` behaviour).
+    _global: Option<OwnedSemaphorePermit>,
+    // Held only when the scan acquired within (or blocked for) its fair share;
+    // the opportunistic over-share path holds a global permit but no tenant one.
+    _tenant: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ScanExtractionPermit {
+    fn drop(&mut self) {
+        // Release the tenant permit first so a same-tenant waiter can wake, then
+        // update the registry against the still-live entry.
+        self._tenant.take();
+        if let Ok(mut reg) = self.registry.lock() {
+            if let Some(entry) = reg.get_mut(&self.repository_id) {
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs == 0 {
+                    reg.remove(&self.repository_id);
+                }
+            }
+        }
+        // `_global` releases when the field drops after this method returns.
+    }
+}
+
+/// Acquire the layered per-tenant + global scan-extraction permit for
+/// `repository_id` (#2555). Ordering is ALWAYS per-tenant-then-global so the two
+/// semaphores can never deadlock. Factored to take its collaborators explicitly
+/// (the `_from` seam) so unit tests can drive it with local semaphores/registry
+/// instead of the process statics — mirroring
+/// `test_scan_extraction_semaphore_bounds_peak_concurrency`.
+async fn acquire_scan_extraction_permit_from(
+    repository_id: Uuid,
+    global: Arc<Semaphore>,
+    registry: TenantExtractionRegistry,
+    fair_share: usize,
+) -> ScanExtractionPermit {
+    // Register this scan against its tenant and fetch the tenant's semaphore.
+    let tenant_sem = {
+        let mut reg = registry.lock().expect("tenant registry mutex poisoned");
+        let entry = reg
+            .entry(repository_id)
+            .or_insert_with(|| TenantExtractionEntry {
+                sem: Arc::new(Semaphore::new(fair_share.max(1))),
+                refs: 0,
+            });
+        entry.refs += 1;
+        entry.sem.clone()
+    };
+
+    // Per-tenant FIRST, then global (consistent ordering => no deadlock).
+    let (tenant_permit, global_permit) = match tenant_sem.clone().try_acquire_owned() {
+        // Within the tenant's fair share: reserve the tenant slot, then block for
+        // a global slot (a legit scan must complete, only serialized, never shed).
+        Ok(tp) => {
+            let gp = global.acquire_owned().await.ok();
+            (Some(tp), gp)
+        }
+        // Over the fair share. Only proceed beyond the floor if the global pool
+        // has a permit free RIGHT NOW — this is the contention-aware burst that
+        // lets a LONE tenant reach the full global `N` without a hard throttle.
+        Err(_) => match global.clone().try_acquire_owned() {
+            Ok(gp) => (None, Some(gp)),
+            // Global is contended too, so do NOT jump the FIFO ahead of other
+            // tenants: wait for this tenant's OWN fair-share slot first, then the
+            // global slot. This bounds a busy tenant to `fair_share` requests in
+            // the global queue, leaving room for peers.
+            Err(_) => {
+                let tp = tenant_sem.acquire_owned().await.ok();
+                let gp = global.acquire_owned().await.ok();
+                (tp, gp)
+            }
+        },
+    };
+
+    ScanExtractionPermit {
+        repository_id,
+        registry,
+        _global: global_permit,
+        _tenant: tenant_permit,
+    }
+}
+
+/// Process-wired entry point for [`acquire_scan_extraction_permit_from`], using
+/// the global semaphore, the process tenant registry, and the effective
+/// per-tenant fair share.
+async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPermit {
+    acquire_scan_extraction_permit_from(
+        repository_id,
+        scan_extraction_semaphore().clone(),
+        scan_extraction_tenant_registry(),
+        scan_extraction_per_tenant_fair_share(),
+    )
+    .await
 }
 
 /// Copy a single archive entry into `writer`, enforcing the shared cumulative
@@ -3388,16 +3552,19 @@ impl ScannerService {
         // artifact scan holds one permit for the rest of this method; the
         // scanner loop below runs sequentially, so worst-case concurrent
         // extracted trees are capped at
-        // `max_concurrent_scan_extractions() * per-archive-cap`. FIFO blocking
-        // acquire — detached background scans have no client latency SLA, so a
-        // legit scan must *complete* (just serialized), never be shed. The
-        // semaphore is never close()d in this binary; on the impossible closed
-        // error we fall through (`.ok()`) rather than drop a legitimate scan.
-        let _extraction_permit = scan_extraction_semaphore()
-            .clone()
-            .acquire_owned()
-            .await
-            .ok();
+        // `max_concurrent_scan_extractions() * per-archive-cap`. Detached
+        // background scans have no client latency SLA, so a legit scan must
+        // *complete* (just serialized), never be shed.
+        //
+        // #2555: the raw global semaphore is a single FIFO, so one tenant firing
+        // many scans (repo-wide rescan / bulk-upload auto-scan) can fill the
+        // queue and starve other tenants. `acquire_scan_extraction_permit`
+        // layers a per-tenant (repository_id) fair-share semaphore in FRONT of
+        // the global one: a lone tenant still bursts to the full global N, while
+        // under contention a busy tenant is held to its fair share so peers keep
+        // making progress. The guard holds both permits for the rest of this
+        // method and prunes idle tenant entries on drop.
+        let _extraction_permit = acquire_scan_extraction_permit(artifact.repository_id).await;
 
         // Load content from storage (we need the storage key)
         // NOTE: The orchestrator is called with content already available in
@@ -10037,6 +10204,207 @@ mod tests {
             done.load(Ordering::SeqCst),
             TASKS,
             "every queued scan must complete (FIFO queue, never shed)"
+        );
+    }
+
+    // ===================================================================
+    // #2555 -- per-tenant fairness on the scan-extraction semaphore
+    // ===================================================================
+
+    /// The env override for the per-tenant fair-share floor parses through the
+    /// shared `positive_env_or` idiom: default is `ceil(N/2)`, a valid override
+    /// wins, blank/non-numeric/zero fall back, and a floor above the global cap
+    /// is clamped to `N`.
+    #[test]
+    fn test_scan_extraction_per_tenant_fair_share_env_override() {
+        let key = MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV;
+        let global_key = MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV;
+        let saved = std::env::var(key).ok();
+        let saved_global = std::env::var(global_key).ok();
+
+        // Pin the global cap so the ceil(N/2) default is deterministic.
+        std::env::set_var(global_key, "4");
+
+        std::env::remove_var(key);
+        assert_eq!(
+            scan_extraction_per_tenant_fair_share(),
+            2,
+            "default fair share is ceil(N/2)"
+        );
+
+        std::env::set_var(key, "1");
+        assert_eq!(scan_extraction_per_tenant_fair_share(), 1);
+
+        std::env::set_var(key, "3");
+        assert_eq!(scan_extraction_per_tenant_fair_share(), 3);
+
+        // A floor above the global cap collapses to the global cap.
+        std::env::set_var(key, "99");
+        assert_eq!(
+            scan_extraction_per_tenant_fair_share(),
+            4,
+            "fair share is clamped to the global N"
+        );
+
+        for bad in ["0", "", "   ", "abc", "-1"] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                scan_extraction_per_tenant_fair_share(),
+                2,
+                "value {:?} should fall back to ceil(N/2)",
+                bad
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match saved_global {
+            Some(v) => std::env::set_var(global_key, v),
+            None => std::env::remove_var(global_key),
+        }
+    }
+
+    /// No throttle without contention: a LONE tenant reaches the full global `N`.
+    /// The `N+1`th scan is bounded by the GLOBAL cap (not a per-tenant one), so
+    /// it blocks — proving the per-tenant layer never shrinks a lone tenant below
+    /// the global ceiling.
+    #[tokio::test]
+    async fn test_scan_extraction_lone_tenant_reaches_full_global() {
+        let global = Arc::new(Semaphore::new(4));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let fair = 2; // ceil(4/2)
+        let tenant = Uuid::new_v4();
+
+        let mut held = Vec::new();
+        for i in 0..4 {
+            let permit = tokio::time::timeout(
+                Duration::from_millis(500),
+                acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("lone tenant throttled at permit {} of N=4", i));
+            held.push(permit);
+        }
+        assert_eq!(
+            global.available_permits(),
+            0,
+            "a lone tenant should hold all N global permits"
+        );
+
+        // The 5th scan is correctly bounded by the GLOBAL cap, not per-tenant.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(150),
+            acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the N+1th scan must wait on the global cap"
+        );
+
+        drop(held);
+    }
+
+    /// Under contention a busy tenant cannot monopolize the FIFO: a second
+    /// tenant's single scan acquires a global permit ahead of the first tenant's
+    /// backlog, because that backlog waits on tenant 1's OWN semaphore rather
+    /// than crowding the global queue.
+    #[tokio::test]
+    async fn test_scan_extraction_second_tenant_not_starved_by_backlog() {
+        let global = Arc::new(Semaphore::new(2));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let fair = 1; // ceil(2/2)
+        let tenant1 = Uuid::new_v4();
+        let tenant2 = Uuid::new_v4();
+
+        // Tenant 1 saturates the global pool alone: one fair-share permit plus
+        // one opportunistic burst permit.
+        let p1_fair =
+            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
+                .await;
+        let p1_burst =
+            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
+                .await;
+        assert_eq!(
+            global.available_permits(),
+            0,
+            "tenant 1 alone reaches the full global N"
+        );
+
+        // Tenant 1 keeps piling on scans; these park on tenant 1's own semaphore.
+        let backlog = {
+            let g = global.clone();
+            let r = registry.clone();
+            tokio::spawn(
+                async move { acquire_scan_extraction_permit_from(tenant1, g, r, fair).await },
+            )
+        };
+
+        // Tenant 2 arrives and queues on the global semaphore.
+        let t2 = {
+            let g = global.clone();
+            let r = registry.clone();
+            tokio::spawn(
+                async move { acquire_scan_extraction_permit_from(tenant2, g, r, fair).await },
+            )
+        };
+
+        // Let both queued tasks register their waiters.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Tenant 1's first scan finishes, freeing exactly one global permit.
+        drop(p1_fair);
+
+        // The freed permit must go to tenant 2 (ahead of tenant 1's backlog).
+        let p2 = tokio::time::timeout(Duration::from_millis(1000), t2)
+            .await
+            .expect("tenant 2 starved behind tenant 1's backlog")
+            .expect("tenant 2 task panicked");
+
+        drop(p1_burst);
+        drop(p2);
+        let _ = tokio::time::timeout(Duration::from_millis(1000), backlog).await;
+    }
+
+    /// Stress the layered acquire across many tenants and scans: the strict
+    /// per-tenant-then-global ordering must never deadlock, every scan must
+    /// complete, all permits must be returned, and idle tenant entries must be
+    /// pruned from the registry on drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_extraction_no_deadlock_and_prunes_idle_tenants() {
+        let global = Arc::new(Semaphore::new(4));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let fair = 2;
+        let tenants: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+
+        let mut handles = Vec::new();
+        for i in 0..60 {
+            let tenant = tenants[i % tenants.len()];
+            let g = global.clone();
+            let r = registry.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = acquire_scan_extraction_permit_from(tenant, g, r, fair).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }));
+        }
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_millis(5000), h)
+                .await
+                .expect("scan-extraction acquire deadlocked")
+                .expect("scan task panicked");
+        }
+
+        assert_eq!(
+            global.available_permits(),
+            4,
+            "every global permit must be released"
+        );
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "idle per-tenant entries must be pruned on drop"
         );
     }
 
