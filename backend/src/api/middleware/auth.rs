@@ -1253,8 +1253,58 @@ pub struct RepoVisibilityState {
 pub(crate) fn extract_repo_key(path: &str) -> &str {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
-    segments.next(); // skip format prefix (pypi, npm, maven, etc.)
+    // Format prefix (pypi, npm, maven, ...).
+    let format = segments.next().unwrap_or("");
+    // Conda token channels embed the credential in the URL path:
+    //   /conda/t/<TOKEN>/<repo_key>/<subdir>/...
+    // The generic "skip one prefix segment" rule would return "t" as the repo
+    // key (the conda token router is mounted at /conda/t), so the visibility
+    // middleware would resolve a nonexistent repo and 401 an otherwise valid
+    // token-channel read. Skip the `t/<TOKEN>` pair for conda token URLs so the
+    // actual repository key is returned.
+    if format == "conda" && segments.clone().next() == Some("t") {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     segments.next().unwrap_or("")
+}
+
+/// Extract the credential from a conda token-channel URL path.
+///
+/// Conda clients embed the token directly in the path as
+/// `/conda/t/<TOKEN>/<repo_key>/...` (configured in `.condarc`). This
+/// credential is invisible to [`extract_token`], which only inspects headers
+/// and cookies, so without this helper the visibility middleware treats an
+/// authenticated token-channel request as anonymous and rejects reads of
+/// private channels. Returns `None` for any non-conda-token path or an empty
+/// token segment.
+pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    if segments.next()? != "conda" {
+        return None;
+    }
+    if segments.next()? != "t" {
+        return None;
+    }
+    match segments.next() {
+        Some(token) if !token.is_empty() => Some(token),
+        _ => None,
+    }
+}
+
+/// Resolve the request credential for the visibility middleware, falling back
+/// to the conda token-channel URL credential when no header/cookie credential
+/// is present. Header credentials always take precedence.
+fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> {
+    let extracted = extract_token(request);
+    if !matches!(extracted, ExtractedToken::None) {
+        return extracted;
+    }
+    match extract_conda_url_token(request.uri().path()) {
+        Some(token) => ExtractedToken::ApiKey(token),
+        None => ExtractedToken::None,
+    }
 }
 
 /// Decide whether a request to a repository should be allowed.
@@ -1485,7 +1535,7 @@ pub async fn repo_visibility_middleware(
     // info-disclosure question (#-TBD); for now we mirror
     // `optional_auth_middleware` and prioritise honouring the deactivation.
     let Some(repo) = repo else {
-        let extracted = extract_token(&request);
+        let extracted = extract_visibility_token(&request);
         let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
         // Transient bcrypt-capacity shed -> retryable 503 (see
         // `AuthOutcome::Overloaded`), never a 401.
@@ -1525,8 +1575,10 @@ pub async fn repo_visibility_middleware(
     let is_public = repo.is_public;
     let is_write = is_write_method(request.method());
 
-    // Perform optional auth (shared with optional_auth_middleware).
-    let extracted = extract_token(&request);
+    // Perform optional auth (shared with optional_auth_middleware). Conda
+    // token channels carry the credential in the URL path, so fall back to it
+    // when no header/cookie credential is present.
+    let extracted = extract_visibility_token(&request);
     let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
@@ -1775,6 +1827,40 @@ mod tests {
             .unwrap();
         let result = extract_token(&request);
         assert!(matches!(result, ExtractedToken::ApiKey("token-xyz")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_uses_conda_url_token() {
+        // No header credential: the conda token-channel URL supplies the token.
+        let request = Request::builder()
+            .uri("/conda/t/url-token-123/my-channel/noarch/repodata.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::ApiKey("url-token-123")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_header_takes_priority() {
+        // A header credential always wins over the URL token.
+        let request = Request::builder()
+            .uri("/conda/t/url-token-123/my-channel/noarch/repodata.json")
+            .header(AUTHORIZATION, "Bearer header-jwt")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::Bearer("header-jwt")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_none_for_plain_path() {
+        // A non-token path with no header credential yields no token.
+        let request = Request::builder()
+            .uri("/conda/my-channel/noarch/repodata.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::None));
     }
 
     #[test]
@@ -2420,6 +2506,50 @@ mod tests {
     #[test]
     fn test_extract_repo_key_no_leading_slash() {
         assert_eq!(extract_repo_key("pypi/my-repo/simple"), "my-repo");
+    }
+
+    #[test]
+    fn test_extract_repo_key_conda_token_channel() {
+        // /conda/t/<TOKEN>/<repo_key>/... must resolve to the real repo key,
+        // not the literal "t" segment that the generic rule would return.
+        assert_eq!(
+            extract_repo_key("/conda/t/abc123token/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        assert_eq!(
+            extract_repo_key("/conda/t/abc123token/my-channel/channeldata.json"),
+            "my-channel"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_key_conda_non_token_unchanged() {
+        // A plain conda channel (no /t/ prefix) is unaffected.
+        assert_eq!(
+            extract_repo_key("/conda/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        // A conda channel that merely happens to be named "t" (no token
+        // segment shape) still resolves to that key when addressed plainly.
+        assert_eq!(extract_repo_key("/conda/t"), "");
+    }
+
+    #[test]
+    fn test_extract_conda_url_token() {
+        assert_eq!(
+            extract_conda_url_token("/conda/t/abc123token/my-channel/noarch/repodata.json"),
+            Some("abc123token")
+        );
+        // Non-conda paths carry no URL token.
+        assert_eq!(extract_conda_url_token("/pypi/t/abc/my-repo/simple"), None);
+        // Plain conda channel (no /t/) carries no URL token.
+        assert_eq!(
+            extract_conda_url_token("/conda/my-channel/noarch/repodata.json"),
+            None
+        );
+        // Empty token segment is not a credential.
+        assert_eq!(extract_conda_url_token("/conda/t//my-channel"), None);
+        assert_eq!(extract_conda_url_token("/conda/t"), None);
     }
 
     // -----------------------------------------------------------------------
