@@ -123,13 +123,26 @@ pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS: usize = 8;
 /// every upload, so it is treated as "unset").
 pub const MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_INGEST_EXTRACTIONS";
 
+/// Clamp a parsed permit count into the range tokio's `Semaphore` accepts.
+/// `Semaphore::new` panics above [`Semaphore::MAX_PERMITS`] (2^61 - 1), and a
+/// panic inside the `OnceLock` initializer would re-panic on EVERY subsequent
+/// decode (the init is retried), wedging all ingestion — so an absurd override
+/// is clamped rather than trusted. The floor of 1 keeps the semaphore usable
+/// even if a caller ever bypasses `positive_env_or`'s zero filter.
+fn clamp_ingest_permits(v: u64) -> usize {
+    usize::try_from(v)
+        .unwrap_or(usize::MAX)
+        .clamp(1, Semaphore::MAX_PERMITS)
+}
+
 /// Effective concurrent-ingest-extraction cap, honouring
-/// [`MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV`] over the default.
+/// [`MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV`] over the default, clamped to what
+/// `Semaphore::new` accepts (see [`clamp_ingest_permits`]).
 fn max_concurrent_ingest_extractions() -> usize {
-    positive_env_or(
+    clamp_ingest_permits(positive_env_or(
         MAX_CONCURRENT_INGEST_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS as u64,
-    ) as usize
+    ))
 }
 
 /// Process-wide semaphore bounding concurrent ingestion decompressions. Seeded
@@ -933,10 +946,54 @@ mod tests {
             );
         }
 
+        // A parseable-but-absurd value above tokio's `Semaphore::MAX_PERMITS`
+        // (2^61 - 1) must be CLAMPED, not passed through: `Semaphore::new`
+        // panics above that bound, and a panicking `OnceLock` initializer
+        // re-panics on every subsequent decode, wedging all ingestion. Kept in
+        // this test fn (not a sibling) so no two tests race on the env var.
+        std::env::set_var(key, "9999999999999999999");
+        assert_eq!(
+            max_concurrent_ingest_extractions(),
+            Semaphore::MAX_PERMITS,
+            "huge override must clamp to Semaphore::MAX_PERMITS, not panic"
+        );
+
         match saved {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    #[test]
+    fn clamp_ingest_permits_bounds_and_floor() {
+        // In-range values pass through untouched.
+        assert_eq!(clamp_ingest_permits(1), 1);
+        assert_eq!(
+            clamp_ingest_permits(DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS as u64),
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS
+        );
+
+        // The exact bound is accepted; anything above clamps to it.
+        assert_eq!(
+            clamp_ingest_permits(Semaphore::MAX_PERMITS as u64),
+            Semaphore::MAX_PERMITS
+        );
+        assert_eq!(
+            clamp_ingest_permits(Semaphore::MAX_PERMITS as u64 + 1),
+            Semaphore::MAX_PERMITS
+        );
+        assert_eq!(
+            clamp_ingest_permits(9_999_999_999_999_999_999),
+            Semaphore::MAX_PERMITS
+        );
+        assert_eq!(clamp_ingest_permits(u64::MAX), Semaphore::MAX_PERMITS);
+
+        // Floor: a zero (only reachable if positive_env_or's filter is ever
+        // bypassed) still yields a usable semaphore.
+        assert_eq!(clamp_ingest_permits(0), 1);
+
+        // The clamped ceiling actually constructs without panicking.
+        let _sem = Semaphore::new(clamp_ingest_permits(u64::MAX));
     }
 
     #[test]
