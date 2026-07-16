@@ -611,13 +611,16 @@ impl PromotionPolicyService {
             return Ok(false);
         }
 
-        // Check if the artifact has been signed (has a signing audit entry)
+        // Check if the artifact has been signed (has a signing audit entry).
+        // #2535: require the signing key to still be active so a signature from
+        // a revoked or rotated-away key does not satisfy the gate.
         let signed: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS(
                 SELECT 1 FROM signing_key_audit ska
                 JOIN signing_keys sk ON sk.id = ska.signing_key_id
                 WHERE sk.repository_id = $2
+                  AND sk.is_active = true
                   AND ska.action = 'used_for_signing'
                   AND ska.details->>'artifact_id' = $1::TEXT
             )
@@ -2123,5 +2126,139 @@ mod tests {
             require_signature: false,
         };
         assert!(cfg.block_unscanned);
+    }
+
+    // =======================================================================
+    // check_artifact_signature: revocation re-gate (#2535)
+    //
+    // DB-backed: requires a live Postgres via DATABASE_URL (a throwaway,
+    // migrated instance — NOT the rig DB). Each test scopes its rows to a
+    // freshly-created repository so it is safe against a shared test database.
+    // =======================================================================
+
+    async fn sig_test_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    async fn seed_repo(pool: &PgPool) -> Uuid {
+        let key = format!("sig-gate-test-{}", Uuid::new_v4().as_simple());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'rpm', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository")
+    }
+
+    async fn seed_artifact(pool: &PgPool, repo: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+                (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, repeat('a', 64), 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(format!("pkg-{}.rpm", Uuid::new_v4().as_simple()))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    /// Insert a minimal signing_keys row (no real key material is needed: the
+    /// gate never decrypts the key, it only reads `is_active`).
+    async fn seed_key(pool: &PgPool, repo: Uuid, is_active: bool) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO signing_keys \
+                (repository_id, name, key_type, public_key_pem, private_key_enc, is_active) \
+             VALUES ($1, 'gate-test-key', 'rsa', 'pub', '\\x00', $2) RETURNING id",
+        )
+        .bind(repo)
+        .bind(is_active)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test signing key")
+    }
+
+    async fn seed_signing_config(pool: &PgPool, repo: Uuid, key_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO repository_signing_config (repository_id, signing_key_id, sign_metadata) \
+             VALUES ($1, $2, true)",
+        )
+        .bind(repo)
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .expect("failed to create signing config");
+    }
+
+    async fn seed_used_for_signing(pool: &PgPool, key_id: Uuid, artifact_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO signing_key_audit (signing_key_id, action, details) \
+             VALUES ($1, 'used_for_signing', jsonb_build_object('artifact_id', $2::text))",
+        )
+        .bind(key_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .expect("failed to insert used_for_signing audit row");
+    }
+
+    // The gate is satisfied only by a `used_for_signing` row whose key is still
+    // active. The repository keeps an active signing config throughout (so the
+    // gate's signing-config precondition holds), which isolates the revocation
+    // re-gate to the per-artifact signature query itself:
+    //   (a) signed by the active key            -> gate true
+    //   (b) only signed by a revoked/rotated key -> gate false (revocation)
+    //   (c) unsigned                             -> gate false
+    #[tokio::test]
+    async fn check_artifact_signature_requires_active_key() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_repo(&pool).await;
+
+        // Active key backs the repo's signing config; a second key is revoked
+        // (models a rotated-away / compromised key that once signed an artifact).
+        let active_key = seed_key(&pool, repo, true).await;
+        let revoked_key = seed_key(&pool, repo, false).await;
+        seed_signing_config(&pool, repo, active_key).await;
+
+        // (c) unsigned artifact: no audit row -> gate false.
+        let unsigned = seed_artifact(&pool, repo).await;
+        assert!(
+            !svc.check_artifact_signature(unsigned, repo)
+                .await
+                .expect("gate query failed"),
+            "unsigned artifact must not satisfy the signature gate"
+        );
+
+        // (a) artifact signed by the ACTIVE key -> gate true.
+        let signed = seed_artifact(&pool, repo).await;
+        seed_used_for_signing(&pool, active_key, signed).await;
+        assert!(
+            svc.check_artifact_signature(signed, repo)
+                .await
+                .expect("gate query failed"),
+            "artifact signed by an active key must satisfy the gate"
+        );
+
+        // (b) artifact whose only signature is from the REVOKED key -> gate false.
+        let stale = seed_artifact(&pool, repo).await;
+        seed_used_for_signing(&pool, revoked_key, stale).await;
+        assert!(
+            !svc.check_artifact_signature(stale, repo)
+                .await
+                .expect("gate query failed"),
+            "a signature from a revoked key must not satisfy the gate"
+        );
     }
 }

@@ -296,6 +296,15 @@ pub struct SigningService {
     encryption: CredentialEncryption,
 }
 
+/// Result of a deliberate per-artifact signing action (#2535). The signature
+/// blob itself is not persisted (marker-only attestation); the returned digest
+/// lets the caller surface what was produced.
+pub struct ArtifactSignature {
+    pub key_id: Uuid,
+    pub algorithm: String,
+    pub signature_sha256: String,
+}
+
 /// Request to create a new signing key.
 pub struct CreateKeyRequest {
     pub repository_id: Option<Uuid>,
@@ -590,6 +599,101 @@ impl SigningService {
         .await?;
 
         Ok(Some(signature))
+    }
+
+    /// Produce a deliberate, authorized signature over an artifact's content
+    /// with the repository's **active** signing key, and record the
+    /// `used_for_signing` marker the promotion `require_signature` gate reads
+    /// (#2535).
+    ///
+    /// This is the **sole** writer of the per-artifact marker: it is only
+    /// reachable from the admin-gated `POST /signing/artifacts/:id/sign`
+    /// endpoint, so an artifact can satisfy `require_signature` only through an
+    /// explicit, authenticated signing action over its bytes — never as a side
+    /// effect of an anonymous metadata read.
+    ///
+    /// Returns `Ok(None)` when the repository has no active signing key /
+    /// signing config (the caller maps this to a 409), so a repo that cannot
+    /// sign stays fail-closed. Format-agnostic: signs raw content bytes, so it
+    /// works for maven/npm/pypi/etc., not only the metadata-signing formats.
+    pub async fn sign_artifact_content(
+        &self,
+        repo_id: Uuid,
+        artifact_id: Uuid,
+        content: &[u8],
+        performed_by: Option<Uuid>,
+    ) -> Result<Option<ArtifactSignature>> {
+        let key = match self.get_active_key_for_repo(repo_id).await? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // Produce a real content signature with whichever key material the
+        // repo's active key holds.
+        let (signature, algorithm) = if key.key_type == "gpg" {
+            let armored = self.sign_openpgp_detached_with_key(&key, content).await?;
+            (armored.into_bytes(), format!("openpgp:{}", key.algorithm))
+        } else {
+            let sig = self.sign_with_key(&key, content)?;
+            (sig, format!("rsa-pkcs1v15-sha256:{}", key.algorithm))
+        };
+
+        let signature_sha256 = hex::encode(Sha256::digest(&signature));
+
+        self.record_artifact_signature(
+            key.id,
+            artifact_id,
+            performed_by,
+            &algorithm,
+            &signature_sha256,
+        )
+        .await?;
+        self.mark_key_used(key.id).await?;
+
+        Ok(Some(ArtifactSignature {
+            key_id: key.id,
+            algorithm,
+            signature_sha256,
+        }))
+    }
+
+    /// Insert the single `used_for_signing` audit row that attests `artifact_id`
+    /// under `key_id` (#2535). Idempotent on `(key_id, artifact_id)`: re-signing
+    /// the same artifact with the same active key does not accumulate duplicate
+    /// markers.
+    async fn record_artifact_signature(
+        &self,
+        key_id: Uuid,
+        artifact_id: Uuid,
+        performed_by: Option<Uuid>,
+        algorithm: &str,
+        signature_sha256: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO signing_key_audit (signing_key_id, action, performed_by, details)
+            SELECT $1, 'used_for_signing', $2,
+                   jsonb_build_object(
+                       'artifact_id', $3::text,
+                       'algorithm', $4::text,
+                       'signature_sha256', $5::text
+                   )
+            WHERE NOT EXISTS (
+                SELECT 1 FROM signing_key_audit ska
+                WHERE ska.signing_key_id = $1
+                  AND ska.action = 'used_for_signing'
+                  AND ska.details->>'artifact_id' = $3::text
+            )
+            "#,
+        )
+        .bind(key_id)
+        .bind(performed_by)
+        .bind(artifact_id)
+        .bind(algorithm)
+        .bind(signature_sha256)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     /// Sign data with a specific key.
@@ -2421,5 +2525,154 @@ mod tests {
 
             current = next.id;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2535: the per-artifact `used_for_signing` marker (read by the promotion
+    // `require_signature` gate) is written ONLY by the deliberate, authorized
+    // `sign_artifact_content` path — never by metadata signing (`sign_data`).
+    // -----------------------------------------------------------------------
+
+    async fn seed_artifact(pool: &sqlx::PgPool, repo: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+                (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, repeat('a', 64), 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(format!("pkg-{}.deb", Uuid::new_v4().as_simple()))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    /// Count `used_for_signing` rows for a (key, artifact) pair.
+    async fn used_for_signing_count(pool: &sqlx::PgPool, key_id: Uuid, artifact_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit \
+             WHERE signing_key_id = $1 AND action = 'used_for_signing' \
+               AND details->>'artifact_id' = $2::text",
+        )
+        .bind(key_id)
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("audit count query failed")
+    }
+
+    // A deliberate per-artifact signing action writes exactly one marker for the
+    // artifact under the repo's active key, and is idempotent on repeat.
+    #[tokio::test]
+    async fn sign_artifact_content_writes_single_idempotent_marker() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_id = seed_active_key(&service, repo).await;
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        // No marker before the artifact is deliberately signed.
+        assert_eq!(used_for_signing_count(&pool, key_id, artifact_id).await, 0);
+
+        // `performed_by` is left None here (the rotation harness seeds no users
+        // row and the column is FK-constrained + nullable); the handler passes
+        // the authenticated admin's id in production.
+        let out = service
+            .sign_artifact_content(repo, artifact_id, b"artifact-bytes", None)
+            .await
+            .expect("sign_artifact_content failed")
+            .expect("an active key must produce a signature");
+        assert_eq!(out.key_id, key_id);
+        assert!(!out.signature_sha256.is_empty());
+        assert_eq!(
+            used_for_signing_count(&pool, key_id, artifact_id).await,
+            1,
+            "signing an artifact must record exactly one marker"
+        );
+
+        // Re-signing the same artifact with the same active key is idempotent.
+        service
+            .sign_artifact_content(repo, artifact_id, b"artifact-bytes-again", None)
+            .await
+            .expect("sign_artifact_content failed")
+            .expect("still signable");
+        assert_eq!(
+            used_for_signing_count(&pool, key_id, artifact_id).await,
+            1,
+            "repeated signing must not duplicate the marker"
+        );
+    }
+
+    // A repository with no active signing key / config cannot sign -> Ok(None)
+    // (the handler maps this to a 409 and the artifact stays fail-closed).
+    #[tokio::test]
+    async fn sign_artifact_content_without_active_key_returns_none() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        let out = service
+            .sign_artifact_content(repo, artifact_id, b"bytes", None)
+            .await
+            .expect("sign_artifact_content failed");
+        assert!(out.is_none(), "no active key -> None (fail-closed)");
+
+        // No marker exists for the artifact under ANY key.
+        let markers: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit \
+             WHERE action = 'used_for_signing' AND details->>'artifact_id' = $1::text",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count failed");
+        assert_eq!(markers, 0, "an unsignable repo must attest nothing");
+    }
+
+    // Regression guard against PR #2553 Part B: metadata signing (`sign_data`)
+    // must NEVER write a per-artifact `used_for_signing` marker. An anonymous
+    // metadata read must not be able to attest artifacts.
+    #[tokio::test]
+    async fn sign_data_writes_no_used_for_signing_marker() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_id = seed_active_key(&service, repo).await;
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        let sig = service
+            .sign_data(repo, b"repomd.xml")
+            .await
+            .expect("sign_data failed");
+        assert!(
+            sig.is_some(),
+            "metadata signing must still produce a signature"
+        );
+
+        // But it must attest NO artifact.
+        assert_eq!(
+            used_for_signing_count(&pool, key_id, artifact_id).await,
+            0,
+            "sign_data must not write a used_for_signing marker (anon-read attestation bypass)"
+        );
+        let total: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM signing_key_audit \
+             WHERE signing_key_id = $1 AND action = 'used_for_signing'",
+        )
+        .bind(key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count failed");
+        assert_eq!(total, 0, "metadata signing must attest zero artifacts");
     }
 }

@@ -35,6 +35,10 @@ pub fn router() -> Router<SharedState> {
             "/repositories/:repo_id/public-key",
             get(get_repo_public_key),
         )
+        // Deliberate per-artifact attestation (#2535). Admin-only, and the SOLE
+        // writer of the `used_for_signing` marker the promotion require_signature
+        // gate reads.
+        .route("/artifacts/:artifact_id/sign", post(sign_artifact))
 }
 
 // --- Request/Response DTOs ---
@@ -440,6 +444,94 @@ fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
 }
 
+/// Response from a deliberate per-artifact signing action (#2535).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SignArtifactResponse {
+    pub artifact_id: Uuid,
+    /// The active signing key that produced the attestation.
+    pub key_id: Uuid,
+    pub algorithm: String,
+    /// SHA-256 of the produced signature blob (the blob itself is not persisted).
+    pub signature_sha256: String,
+}
+
+/// `POST /api/v1/signing/artifacts/{artifact_id}/sign` — produce an authorized
+/// signature over the artifact's content with the repository's active signing
+/// key and record the attestation the promotion `require_signature` gate reads
+/// (#2535).
+///
+/// This is the ONLY writer of the per-artifact `used_for_signing` marker, and
+/// it is admin-gated: an artifact can satisfy `require_signature` only through a
+/// deliberate, authenticated signing action over its bytes — never as a side
+/// effect of an (anonymous) repository-metadata read. Format-agnostic: signs
+/// content bytes, so it works for every hosted format, not just the
+/// metadata-signing ones. Proxy-cached remote artifacts (no `artifacts` row)
+/// cannot be signed and therefore stay fail-closed under `require_signature`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/signing/artifacts/{artifact_id}/sign",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "Artifact signed; attestation recorded", body = SignArtifactResponse),
+        (status = 403, description = "Admin privilege required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Artifact not found or not eligible for signing", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Repository has no active signing key/config", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn sign_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+) -> Result<Json<SignArtifactResponse>> {
+    // Admin-only: writing the attestation the require_signature gate trusts is a
+    // trust-model mutation, same gate as the other signing routes.
+    require_signing_admin(&auth)?;
+
+    // Resolve the artifact and its storage location. Proxy-cached remote objects
+    // are listed with synthetic ids and have no `artifacts` row, so they cannot
+    // be signed -> 404 (fail-closed), consistent with SBOM/scan eligibility.
+    let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT a.repository_id, a.storage_key, r.storage_backend, r.storage_path
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id
+         WHERE a.id = $1 AND a.is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let (repository_id, storage_key, backend, path) = row.ok_or_else(|| {
+        AppError::NotFound(crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.to_string())
+    })?;
+
+    // Fetch the artifact bytes and sign the content.
+    let location = crate::storage::StorageLocation { backend, path };
+    let storage = state.storage_for_repo(&location)?;
+    let content = storage.get(&storage_key).await.map_err(|e| {
+        AppError::NotFound(format!("Artifact content unavailable for signing: {e}"))
+    })?;
+
+    let signed = signing_service(&state)
+        .sign_artifact_content(repository_id, artifact_id, &content, Some(auth.user_id))
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "Repository has no active signing key or signing config; configure one before signing artifacts"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(Json(SignArtifactResponse {
+        artifact_id,
+        key_id: signed.key_id,
+        algorithm: signed.algorithm,
+        signature_sha256: signed.signature_sha256,
+    }))
+}
+
 /// Admin gate shared by the signing-key/repo-config mutation handlers.
 ///
 /// Minting, deleting, revoking, rotating a repository signing key, or writing
@@ -479,6 +571,7 @@ fn signing_config_fields(
         get_repo_signing_config,
         update_repo_signing_config,
         get_repo_public_key,
+        sign_artifact,
     ),
     components(schemas(
         ListKeysQuery,
@@ -486,6 +579,7 @@ fn signing_config_fields(
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
+        SignArtifactResponse,
     ))
 )]
 pub struct SigningApiDoc;
@@ -653,12 +747,31 @@ mod tests {
             "revoke_key",
             "rotate_key",
             "update_repo_signing_config",
+            "sign_artifact",
         ] {
             assert!(
                 signing_handler_body(name).contains("require_signing_admin"),
                 "{name} MUST call require_signing_admin (admin gate) — CWE-862 regression guard"
             );
         }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_signing_artifact() {
+        // #2535: POST /signing/artifacts/{id}/sign is the SOLE writer of the
+        // used_for_signing marker the promotion require_signature gate reads.
+        // It must be admin-only, or an unprivileged caller could attest an
+        // artifact and bypass the gate.
+        // (1) the gate rejects a non-admin.
+        match require_signing_admin(&non_admin_jwt()) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization for non-admin sign, got {other:?}"),
+        }
+        // (2) load-bearing: pin that sign_artifact ITSELF calls the gate.
+        assert!(
+            signing_handler_body("sign_artifact").contains("require_signing_admin"),
+            "sign_artifact MUST call require_signing_admin (admin gate) — #2535 bypass guard"
+        );
     }
 
     #[test]
