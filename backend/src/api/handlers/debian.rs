@@ -769,10 +769,15 @@ fn format_deb822_description(desc: &str) -> String {
 /// `apt_release_version` and `apt_description` are returned as
 /// `Option<String>` — `None` when unset or empty, meaning the caller
 /// omits those lines from the Release file.
+///
+/// Errors propagate for the same reason they do in `release_publish_timestamp`:
+/// these values are rendered into the signed document, so falling back to the
+/// defaults on a transient DB fault would flip `Origin:`/`Label:` between the
+/// `Release` and `Release.gpg` renders and break the detached signature.
 async fn fetch_apt_release_metadata(
     db: &PgPool,
     repo_id: uuid::Uuid,
-) -> (String, String, Option<String>, Option<String>) {
+) -> Result<(String, String, Option<String>, Option<String>), Response> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT key, value FROM repository_config \
          WHERE repository_id = $1 \
@@ -781,7 +786,7 @@ async fn fetch_apt_release_metadata(
     .bind(repo_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut origin: Option<String> = None;
     let mut label: Option<String> = None;
@@ -825,12 +830,12 @@ async fn fetch_apt_release_metadata(
         }
     }
 
-    (
+    Ok((
         origin.unwrap_or_else(|| DEFAULT_APT_ORIGIN.to_string()),
         label.unwrap_or_else(|| DEFAULT_APT_LABEL.to_string()),
         release_version,
         description,
-    )
+    ))
 }
 
 /// Return the first line of `s` (up to but not including the first
@@ -844,6 +849,180 @@ fn take_first_line(s: &str) -> String {
         .unwrap_or(&normalized)
         .trim()
         .to_string()
+}
+
+/// Resolve the `Date:` stamped into a generated `Release`.
+///
+/// This MUST be a pure function of repository state and MUST NOT read the wall
+/// clock. `Release` and `Release.gpg` are rendered by two *independent*
+/// requests, and the detached signature only verifies if both renders produce
+/// byte-identical documents. A `Utc::now()` here made the document depend on
+/// the second in which each request happened to land, so an untampered repo
+/// served a `Release` whose bytes differed from the bytes `Release.gpg` had
+/// signed whenever the two fetches straddled a second boundary — `apt-secure`
+/// then reports `BAD signature` on an honest repo.
+///
+/// The publish timestamp is the newest mutation of the repository's artifacts
+/// (`created_at`/`updated_at`, deleted rows included), falling back to the
+/// repository's own `created_at` for an empty repo. It is identical for every
+/// reader of a given repository state, including separate backend replicas.
+///
+/// Counting deleted rows is deliberate: it keeps the stamp monotonic. Filtering
+/// them out would move `Date:` *backward* when the newest artifact is removed —
+/// and apt clients holding a newer cached `Date:` do not reject a backward
+/// step, they silently keep the cached metadata and `apt-get update` exits 0
+/// with no diagnostics (see `release_date_floor` for the measured mechanism),
+/// so the repo would freeze for existing clients with nothing alerting anyone.
+/// It does not follow that every content
+/// change moves the stamp forward — only writers that stamp `updated_at` do.
+/// `ArtifactService::delete_artifact` does; the retention/lifecycle sweeps in
+/// `lifecycle_service` and the Conan overwrite-supersede path do not, so those
+/// deletions change the index without advancing `Date:`. That is a fidelity gap
+/// in what `Date:` reports, not a signature hazard: both renders of a given
+/// state still agree, which is the invariant this function exists to hold.
+///
+/// The state stamp is floored at [`release_date_floor`] (the binary's build
+/// timestamp). Without the floor, deploying the state-derived `Date:` would
+/// step it *backward* exactly once on every pre-existing repo — from the last
+/// `Utc::now()` a pre-fix build served to the last repo mutation — and every
+/// apt client that had already cached the newer value would silently pin to
+/// its pre-deploy metadata (see [`release_date_floor`]).
+///
+/// Errors propagate. A failed read here must fail the request, not fall back to
+/// a default: `Release` and `Release.gpg` are separate requests, so a transient
+/// DB fault on one of them would otherwise stamp a different `Date:` than the
+/// other and produce a detached signature over bytes the client never received
+/// — reintroducing the `BAD signature` this function exists to prevent, and
+/// doing so under load, exactly when the inter-request gap is widest.
+async fn release_publish_timestamp(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<chrono::DateTime<chrono::Utc>, Response> {
+    let stamp: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+        r#"
+        SELECT GREATEST(
+                 (SELECT MAX(GREATEST(a.created_at, a.updated_at))
+                    FROM artifacts a
+                   WHERE a.repository_id = $1),
+                 (SELECT r.created_at FROM repositories r WHERE r.id = $1)
+               )
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    // `repositories.created_at` is NOT NULL and the row was resolved earlier in
+    // this request, so a NULL here means the repository was deleted mid-render.
+    // Fail rather than stamp a placeholder: a placeholder would differ from the
+    // sibling request that still saw the repo.
+    stamp
+        .and_then(|(t,)| t)
+        .map(|t| t.max(release_date_floor()))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Repository no longer exists".to_string(),
+            )
+                .into_response()
+        })
+}
+
+/// Monotonic floor for the `Release` `Date:` field: the moment this binary was
+/// built (`RELEASE_DATE_FLOOR_EPOCH`, baked by `build.rs`; honors
+/// `SOURCE_DATE_EPOCH` so reproducible builds stay reproducible).
+///
+/// Why a floor exists: [`release_publish_timestamp`] replaced a `Utc::now()`
+/// stamp with a state-derived one, so at deploy every pre-existing repo steps
+/// `Date:` backward exactly once — from "the last time a client fetched
+/// `Release`" to "the last time anything changed", potentially months on a
+/// quiescent repo. apt does not reject a backward `Date:` and does not warn:
+/// `pkgAcqMetaBase::VerifyVendor` (apt-pkg/acquire-item.cc; verified identical
+/// in apt 2.2.4, 2.6.1 and 2.8.3, detached `Release`+`Release.gpg` and
+/// `InRelease` alike) converts it into a fake If-Modified-Since hit, discards
+/// the downloaded metadata, keeps the client's cached set, and `apt-get
+/// update` exits 0 with zero diagnostics. No configuration option controls
+/// that path (`Acquire::Check-Date=false` does not unlock it — that option
+/// governs the separate *future*-Date check). Every existing client would
+/// therefore silently freeze on pre-deploy metadata until `Date:` climbs past
+/// its cached value — indefinitely on a quiescent repo. Flooring the stamp at
+/// the build timestamp keeps the first post-deploy render at least as new as
+/// any wall-clock `Date:` the previous build served before this build existed.
+///
+/// Why the *build* timestamp specifically: the floor must be (a) at least the
+/// last `Utc::now()` a pre-fix build served, (b) identical across replicas —
+/// every replica runs the same image, so a compile-time constant is — and
+/// (c) stable across process restarts. A process-start time fails (b) and (c):
+/// replicas start at different moments, so the same repository state would
+/// render different bytes on different replicas and the detached-signature
+/// invariant this file exists to hold would break again.
+fn release_date_floor() -> chrono::DateTime<chrono::Utc> {
+    // Compile-time constant; build.rs validates it parses, but degrade to
+    // "no floor" (epoch 0) rather than panic inside a request handler.
+    env!("RELEASE_DATE_FLOOR_EPOCH")
+        .parse::<i64>()
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+}
+
+/// Render the `Date:` field value. Split out so the exact wire format is
+/// pinned by a unit test.
+fn format_release_date(published_at: chrono::DateTime<chrono::Utc>) -> String {
+    published_at.format("%a, %d %b %Y %H:%M:%S UTC").to_string()
+}
+
+/// Everything the `Release` document is rendered from. Constructing this is the
+/// only place repository state is read; `render_release_document` is then a
+/// pure function of it, so the same repository state always renders the same
+/// bytes no matter which request (or which replica) does the rendering.
+struct ReleaseRenderInput<'a> {
+    origin: &'a str,
+    label: &'a str,
+    distribution: &'a str,
+    version: Option<&'a str>,
+    description: Option<&'a str>,
+    published_at: chrono::DateTime<chrono::Utc>,
+    architectures: &'a str,
+    components: &'a str,
+    /// `(path, bytes)` for every index file the hash sections cover.
+    files: &'a [(String, Vec<u8>)],
+}
+
+/// Render the Debian `Release` document. Pure: identical input renders
+/// byte-identical output, which is what makes the detached `Release.gpg`
+/// signature verify against the separately-rendered `Release`.
+fn render_release_document(input: &ReleaseRenderInput<'_>) -> String {
+    let mut release = String::new();
+    release.push_str(&format!("Origin: {}\n", input.origin));
+    release.push_str(&format!("Label: {}\n", input.label));
+    release.push_str(&format!("Suite: {}\n", input.distribution));
+    release.push_str(&format!("Codename: {}\n", input.distribution));
+    if let Some(ver) = input.version {
+        release.push_str(&format!("Version: {}\n", ver));
+    }
+    if let Some(desc) = input.description {
+        release.push_str("Description: ");
+        release.push_str(&format_deb822_description(desc));
+        release.push('\n');
+    }
+    release.push_str(&format!(
+        "Date: {}\n",
+        format_release_date(input.published_at)
+    ));
+    release.push_str(&format!("Architectures: {}\n", input.architectures));
+    release.push_str(&format!("Components: {}\n", input.components));
+    push_release_hash_section(&mut release, "MD5Sum", input.files, |bytes| {
+        ArtifactService::calculate_md5(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA1", input.files, |bytes| {
+        ArtifactService::calculate_sha1(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA256", input.files, |bytes| {
+        ArtifactService::calculate_sha256(bytes)
+    });
+    release
 }
 
 async fn generate_release_content(
@@ -890,39 +1069,26 @@ async fn generate_release_content(
         }
     }
 
-    let now = chrono::Utc::now();
-    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
+    // Derived from repository state, never from the wall clock: see
+    // `release_publish_timestamp`. Both reads propagate their errors so a
+    // transient DB fault fails this request instead of silently rendering a
+    // document that differs from the sibling `Release`/`Release.gpg` render.
+    let published_at = release_publish_timestamp(&state.db, repo_id).await?;
 
     let (origin, label, version, description) =
-        fetch_apt_release_metadata(&state.db, repo_id).await;
+        fetch_apt_release_metadata(&state.db, repo_id).await?;
 
-    let mut release = String::new();
-    release.push_str(&format!("Origin: {}\n", origin));
-    release.push_str(&format!("Label: {}\n", label));
-    release.push_str(&format!("Suite: {}\n", distribution));
-    release.push_str(&format!("Codename: {}\n", distribution));
-    if let Some(ref ver) = version {
-        release.push_str(&format!("Version: {}\n", ver));
-    }
-    if let Some(ref desc) = description {
-        release.push_str("Description: ");
-        release.push_str(&format_deb822_description(desc));
-        release.push('\n');
-    }
-    release.push_str(&format!("Date: {}\n", date_str));
-    release.push_str(&format!("Architectures: {}\n", arch_str));
-    release.push_str(&format!("Components: {}\n", component_str));
-    push_release_hash_section(&mut release, "MD5Sum", &release_files, |bytes| {
-        ArtifactService::calculate_md5(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA1", &release_files, |bytes| {
-        ArtifactService::calculate_sha1(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA256", &release_files, |bytes| {
-        ArtifactService::calculate_sha256(bytes)
-    });
-
-    Ok(release)
+    Ok(render_release_document(&ReleaseRenderInput {
+        origin: &origin,
+        label: &label,
+        distribution,
+        version: version.as_deref(),
+        description: description.as_deref(),
+        published_at,
+        architectures: &arch_str,
+        components: &component_str,
+        files: &release_files,
+    }))
 }
 
 async fn discover_release_layout(
@@ -5052,8 +5218,9 @@ mod apt_release_metadata_db_tests {
         };
         let (repo_id, dir) = insert_hosted_debian(&pool).await;
 
-        let (origin, label, version, description) =
-            fetch_apt_release_metadata(&pool, repo_id).await;
+        let (origin, label, version, description) = fetch_apt_release_metadata(&pool, repo_id)
+            .await
+            .expect("read apt release metadata");
         assert_eq!(
             origin, "artifact-keeper",
             "default Origin must be preserved"
@@ -5077,8 +5244,9 @@ mod apt_release_metadata_db_tests {
         set_cfg(&pool, repo_id, "apt_release_version", "2026.07").await;
         set_cfg(&pool, repo_id, "apt_description", "Internal mirror").await;
 
-        let (origin, label, version, description) =
-            fetch_apt_release_metadata(&pool, repo_id).await;
+        let (origin, label, version, description) = fetch_apt_release_metadata(&pool, repo_id)
+            .await
+            .expect("read apt release metadata");
         assert_eq!(origin, "Acme Corp");
         assert_eq!(label, "Acme Staging");
         assert_eq!(version.as_deref(), Some("2026.07"));
@@ -5111,7 +5279,9 @@ mod apt_release_metadata_db_tests {
         )
         .await;
 
-        let (origin, label, version, _desc) = fetch_apt_release_metadata(&pool, repo_id).await;
+        let (origin, label, version, _desc) = fetch_apt_release_metadata(&pool, repo_id)
+            .await
+            .expect("read apt release metadata");
         assert_eq!(origin, "evil", "Origin must be reduced to its first line");
         assert!(!origin.contains('\n') && !origin.contains('\r'));
         assert_eq!(label, "l1", "Label must be reduced to its first line");
@@ -5147,7 +5317,9 @@ mod apt_release_metadata_db_tests {
         )
         .await;
 
-        let (_o, _l, _v, description) = fetch_apt_release_metadata(&pool, repo_id).await;
+        let (_o, _l, _v, description) = fetch_apt_release_metadata(&pool, repo_id)
+            .await
+            .expect("read apt release metadata");
         let desc = description.expect("description present");
         let rendered = format!("Description: {}\n", format_deb822_description(&desc));
         // The second line must be a space-prefixed continuation, never a field.
@@ -5158,6 +5330,257 @@ mod apt_release_metadata_db_tests {
         assert!(
             !rendered.contains("\nForged-Field:"),
             "must not emit a bare (column-0) forged field: {rendered:?}"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Release document determinism.
+    //
+    // `Release` and `Release.gpg` are rendered by two independent requests, so
+    // the detached signature only verifies if the two renders are byte-
+    // identical. These pin that invariant: the render must depend on
+    // repository state ONLY, never on when the request arrived.
+    // -----------------------------------------------------------------------
+
+    fn render_input_fixture(
+        published_at: chrono::DateTime<chrono::Utc>,
+        files: &[(String, Vec<u8>)],
+    ) -> ReleaseRenderInput<'_> {
+        ReleaseRenderInput {
+            origin: "artifact-keeper",
+            label: "artifact-keeper",
+            distribution: "stable",
+            version: None,
+            description: None,
+            published_at,
+            architectures: "amd64",
+            components: "main",
+            files,
+        }
+    }
+
+    /// The `Date:` field must come from the supplied publish timestamp, not
+    /// from the clock. Rendering with a timestamp far in the past must emit
+    /// that past date — a `now()` read would emit today instead.
+    #[test]
+    fn release_date_comes_from_publish_timestamp_not_the_wall_clock() {
+        let published_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::days(1);
+        let doc = render_release_document(&render_input_fixture(published_at, &[]));
+
+        assert!(
+            doc.contains("Date: Fri, 02 Jan 1970 00:00:00 UTC\n"),
+            "Date: must render the publish timestamp verbatim, got:\n{doc}"
+        );
+        let this_year = chrono::Utc::now().format("%Y").to_string();
+        assert!(
+            !doc.contains(&format!("Date: {this_year}"))
+                && !doc.contains(&format!(" {this_year} ")),
+            "Date: must not be stamped from the wall clock, got:\n{doc}"
+        );
+    }
+
+    /// Pin the exact `Date:` wire format apt parses (RFC-1123-ish, UTC).
+    #[test]
+    fn format_release_date_matches_the_apt_wire_format() {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-07-17T01:24:11Z")
+            .expect("parse fixture")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(format_release_date(t), "Fri, 17 Jul 2026 01:24:11 UTC");
+    }
+
+    /// Same repository state must render identically regardless of how many
+    /// times (or in which order) it is rendered — the property that lets the
+    /// content-addressed signature cache hand back a signature that still
+    /// matches a freshly-rendered `Release`.
+    #[test]
+    fn release_render_is_stable_across_repeated_calls() {
+        let files = vec![(
+            "main/binary-amd64/Packages".to_string(),
+            b"Package: a\n".to_vec(),
+        )];
+        let published_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::days(2);
+        let first = render_release_document(&render_input_fixture(published_at, &files));
+        for _ in 0..5 {
+            assert_eq!(
+                first,
+                render_release_document(&render_input_fixture(published_at, &files)),
+                "repeated renders of unchanged state must be byte-identical"
+            );
+        }
+    }
+
+    /// THE regression guard for the `Release`/`Release.gpg` BAD-signature bug.
+    ///
+    /// End-to-end against the DB: `generate_release_content` — the single
+    /// function behind `Release`, `InRelease` and `Release.gpg` — must return
+    /// identical bytes when called twice across a wall-clock second boundary
+    /// for an unchanged repository. This is the served-vs-signed invariant at
+    /// the exact call site both endpoints use, so it fails against any clock
+    /// read reintroduced anywhere beneath it (not just in the renderer).
+    ///
+    /// Against the pre-fix `Utc::now()` stamp this fails on exactly one byte —
+    /// the seconds digit of `Date:` — which is what made `gpg --verify` report
+    /// `BAD signature` on an untampered repo.
+    #[tokio::test]
+    async fn generate_release_content_is_stable_across_a_second_boundary() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let served = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+        // Cross a real second boundary between the served and signed renders.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let signed = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+
+        assert_eq!(
+            served, signed,
+            "Release render changed across a second boundary: the bytes served by \
+             GET Release would differ from the bytes signed by GET Release.gpg, so \
+             apt-secure would report BAD signature on an untampered repo"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// The publish timestamp must be repository *state*, not the clock: for a
+    /// repo with no artifacts it must equal that repo's own `created_at` read
+    /// back from the DB. A `Utc::now()` implementation fails this — the repo
+    /// was created a moment before, so the two differ.
+    #[tokio::test]
+    async fn release_publish_timestamp_is_the_repository_created_at() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        let (created_at,): (chrono::DateTime<chrono::Utc>,) =
+            sqlx::query_as("SELECT created_at FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read repo created_at");
+
+        let stamp = release_publish_timestamp(&pool, repo_id)
+            .await
+            .map_err(|_| "release_publish_timestamp failed")
+            .expect("publish timestamp");
+
+        assert_eq!(
+            stamp, created_at,
+            "publish timestamp must be the repository's stored created_at, not a \
+             wall-clock read"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// A failed publish-timestamp read must fail the request, never degrade to
+    /// a default stamp.
+    ///
+    /// `.ok()` on this read would swallow a pool timeout / connection reset and
+    /// render `Date: Thu, 01 Jan 1970`. `Release` and `Release.gpg` are separate
+    /// requests: if only one of them hit the blip, the signature would cover
+    /// bytes the client never received — the same BAD-signature bug with a new
+    /// trigger, and one that fires under load, precisely when the gap between
+    /// the two requests is widest.
+    ///
+    /// Needs no live Postgres: an unreachable lazy pool fails on connect.
+    #[tokio::test]
+    async fn release_publish_timestamp_errors_when_the_database_is_unreachable() {
+        let dead = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool");
+
+        let result = release_publish_timestamp(&dead, Uuid::new_v4()).await;
+
+        assert!(
+            result.is_err(),
+            "a failed publish-timestamp read must propagate an error; falling back \
+             to a default stamp would let Release and Release.gpg disagree and \
+             produce a signature over bytes never served"
+        );
+    }
+
+    /// Deploy-time monotonic floor: repository state older than the binary's
+    /// build timestamp must render `Date:` == the floor, never the older
+    /// state stamp.
+    ///
+    /// Why: swapping `Utc::now()` for a state-derived stamp steps `Date:`
+    /// backward once at deploy on every pre-existing repo. apt does not
+    /// reject a backward `Date:` — it silently fakes an IMS hit
+    /// (`pkgAcqMetaBase::VerifyVendor`, measured identical on apt
+    /// 2.2.4/2.6.1/2.8.3, no option controls it), keeps its cached
+    /// pre-deploy metadata, and `apt-get update` exits 0. Without the floor
+    /// every existing client freezes on stale metadata — indefinitely on a
+    /// quiescent repo — with nothing alerting anyone.
+    #[tokio::test]
+    async fn release_publish_timestamp_is_floored_at_the_build_timestamp() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        // Deploy-shape state: a quiescent repo whose newest mutation is far
+        // older than this binary. No artifacts, so the repo's own created_at
+        // is the raw state stamp.
+        sqlx::query("UPDATE repositories SET created_at = '2001-02-03T04:05:06Z' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("backdate repository");
+
+        let floor = release_date_floor();
+        assert!(
+            floor
+                > chrono::DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+                    .expect("parse fixture")
+                    .with_timezone(&chrono::Utc),
+            "build-time floor must postdate the backdated fixture"
+        );
+
+        let stamp = release_publish_timestamp(&pool, repo_id)
+            .await
+            .map_err(|_| "release_publish_timestamp failed")
+            .expect("publish timestamp");
+        assert_eq!(
+            stamp, floor,
+            "state older than the build-time floor must be floored: apt clients \
+             that cached a pre-deploy wall-clock Date silently pin to stale \
+             metadata (fake IMS hit, exit 0, no diagnostics) whenever Date: \
+             steps backward"
+        );
+
+        // The floored render must stay deterministic: the floor is a
+        // compile-time constant, not a clock read, so two renders across a
+        // second boundary are still byte-identical and stamp the floor.
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let served = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let signed = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+        assert_eq!(
+            served, signed,
+            "floored renders must be byte-identical across a second boundary"
+        );
+        assert!(
+            served.contains(&format!("Date: {}\n", format_release_date(floor))),
+            "rendered Date: must be the floor, got:\n{served}"
         );
 
         cleanup(&pool, repo_id, &dir).await;
