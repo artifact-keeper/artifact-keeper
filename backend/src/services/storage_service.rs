@@ -478,6 +478,21 @@ pub struct StorageService {
     backend: Arc<dyn StorageBackend>,
 }
 
+/// Whether the given `STORAGE_BACKEND` value can back the proxy-cache
+/// [`StorageService`] facade used for remote/proxy repositories.
+///
+/// `filesystem`, `s3`, and `gcs` each have an arm in
+/// [`StorageService::from_config`]. Azure deliberately does not (#1555):
+/// `main.rs` builds an Azure *primary* backend for hosted repositories, but the
+/// proxy facade has no `AzureBackendWrapper`, so remote/proxy repositories
+/// cannot be served on Azure. Callers use this to make the gap loud at startup
+/// (fail closed / log at error level) instead of booting green and silently
+/// black-holing every proxy request (handlers skip the upstream fetch when the
+/// proxy service is absent). Kept in lockstep with the arms in `from_config`.
+pub fn backend_supports_proxy_cache(storage_backend: &str) -> bool {
+    matches!(storage_backend, "filesystem" | "s3" | "gcs")
+}
+
 impl StorageService {
     /// Create storage service from config
     pub async fn from_config(config: &Config) -> Result<Self> {
@@ -1042,6 +1057,36 @@ mod tests {
             err_msg.contains("bogus"),
             "Error should mention the unknown backend name, got: {}",
             err_msg
+        );
+    }
+
+    // -- Azure proxy-cache gap (#2670) ---------------------------------------
+
+    #[test]
+    fn backend_supports_proxy_cache_matches_from_config_arms() {
+        // The backends that have an arm in from_config can back the proxy facade.
+        assert!(backend_supports_proxy_cache("filesystem"));
+        assert!(backend_supports_proxy_cache("s3"));
+        assert!(backend_supports_proxy_cache("gcs"));
+        // Azure has no arm (#1555): remote/proxy repositories cannot be served,
+        // so this must report false. Booting with azure + proxy repos must be
+        // made loud/fatal by the caller rather than silently disabled.
+        assert!(!backend_supports_proxy_cache("azure"));
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_azure_is_unsupported() {
+        // Regression for #2670: with STORAGE_BACKEND=azure the proxy StorageService
+        // cannot be built (no azure arm, #1555), so from_config returns Err. The
+        // boot path must treat this as an explicit, loud failure rather than a
+        // silent warn-and-continue that black-holes proxy traffic — and
+        // backend_supports_proxy_cache is the decision function it keys off.
+        assert!(!backend_supports_proxy_cache("azure"));
+        let config = minimal_config("azure");
+        let result = StorageService::from_config(&config).await;
+        assert!(
+            result.is_err(),
+            "from_config must fail for azure until #1555 wires an Azure proxy arm"
         );
     }
 

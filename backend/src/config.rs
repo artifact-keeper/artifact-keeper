@@ -151,7 +151,9 @@ pub struct Config {
     /// Deployment environment name (e.g. "development", "staging", "production")
     pub environment: String,
 
-    /// Storage backend: "filesystem" or "s3"
+    /// Storage backend: one of `filesystem`, `s3`, `gcs`, or `azure`.
+    /// Validated at startup by [`Config::validate_storage_backend`]; an
+    /// unrecognized value is rejected rather than silently defaulted.
     pub storage_backend: String,
 
     /// Filesystem storage path (when storage_backend = "filesystem")
@@ -1266,6 +1268,7 @@ impl Config {
         };
 
         config.validate_jwt_secret()?;
+        config.validate_storage_backend()?;
         config.validate_storage_paths()?;
 
         Ok(config)
@@ -1286,6 +1289,28 @@ impl Config {
                 "JWT_SECRET is unsuitable: {reason} \
                  Generate a secure random secret (e.g. `openssl rand -base64 48`)."
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate that `STORAGE_BACKEND` names a recognized backend.
+    ///
+    /// An unrecognized value (a typo such as `gcs-prod`, or `s3 ` with a stray
+    /// trailing space) must never reach runtime. `main.rs` selects the primary
+    /// backend with a `match` whose catch-all arm silently falls back to the
+    /// filesystem backend, so a typo boots green while the deployment believes
+    /// it is running a cloud object store. Worse, [`backend_is_repo_isolated`]
+    /// keys the #2504 cross-tenant isolation guards off this exact string, so a
+    /// silent mismatch runs the wrong store with the wrong isolation semantics.
+    /// Reject the misconfiguration at startup instead. This is a
+    /// `from_env`-only check (like [`Config::validate_jwt_secret`]);
+    /// constructing `Config` directly skips it. Detection lives in the pure,
+    /// unit-testable [`storage_backend_error`] helper.
+    ///
+    /// [`backend_is_repo_isolated`]: crate::storage::backend_is_repo_isolated
+    fn validate_storage_backend(&self) -> Result<()> {
+        if let Some(message) = storage_backend_error(&self.storage_backend) {
+            return Err(AppError::Config(message));
         }
         Ok(())
     }
@@ -1416,6 +1441,38 @@ pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
 /// startup `from_env` check so callers get a single, ready-to-surface message.
 pub(crate) fn jwt_secret_strength_error(secret: &str) -> Option<&'static str> {
     jwt_secret_warnings(secret).first().map(|w| w.message())
+}
+
+/// Storage backends recognized by `STORAGE_BACKEND`.
+///
+/// `filesystem` gives each repository a physically isolated key space;
+/// `s3`, `gcs`, and `azure` are shared cloud object stores. These are exactly
+/// the values `main.rs` builds a primary backend for — any other value is an
+/// operator misconfiguration. Kept as a single source of truth so the validator
+/// and its error message never drift from the set of backends the binary can
+/// actually construct.
+pub(crate) const SUPPORTED_STORAGE_BACKENDS: [&str; 4] = ["filesystem", "s3", "gcs", "azure"];
+
+/// Pure validator for `STORAGE_BACKEND`. Returns `Some(message)` naming the
+/// offending value and listing [`SUPPORTED_STORAGE_BACKENDS`] when the value is
+/// not recognized, or `None` when it is one of the supported backends.
+///
+/// Used by the startup `from_env` check so an unrecognized value fails fast
+/// instead of silently falling back to the filesystem backend (see
+/// [`Config::validate_storage_backend`] for why that silent fallback is unsafe).
+pub(crate) fn storage_backend_error(storage_backend: &str) -> Option<String> {
+    if SUPPORTED_STORAGE_BACKENDS.contains(&storage_backend) {
+        return None;
+    }
+    Some(format!(
+        "STORAGE_BACKEND=`{storage_backend}` is not a recognized storage backend. \
+         Supported values are: {}. An unrecognized value silently falls back to the \
+         `filesystem` backend at startup, so the service would run the wrong store \
+         while looking healthy and the #2504 cross-tenant isolation guards \
+         (keyed off the backend name) would apply the wrong semantics; set \
+         STORAGE_BACKEND to one of the supported values.",
+        SUPPORTED_STORAGE_BACKENDS.join(", ")
+    ))
 }
 
 /// Pure filesystem-storage path gate. Returns `Some(message)` describing the
@@ -3754,6 +3811,49 @@ mod tests {
         assert!(storage_path_error("s3", "artifact-keeper", "").is_none());
         assert!(storage_path_error("s3", "", "").is_none());
         assert!(storage_path_error("gcs", "some/prefix", "").is_none());
+    }
+
+    // -- storage_backend_error (#2669) ---------------------------------------
+
+    #[test]
+    fn storage_backend_error_accepts_every_supported_backend() {
+        // Each recognized backend must validate cleanly (no error).
+        for backend in SUPPORTED_STORAGE_BACKENDS {
+            assert!(
+                storage_backend_error(backend).is_none(),
+                "supported backend `{backend}` should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_backend_error_rejects_typo_and_names_value_and_supported_set() {
+        // Regression for #2669: an unrecognized value (here a typo) must be an
+        // error rather than silently defaulting to filesystem. Before the fix
+        // this string was accepted verbatim and main.rs's catch-all arm ran the
+        // filesystem backend under the wrong isolation semantics.
+        let message = storage_backend_error("gcs-prod").expect("a typo backend must be rejected");
+        assert!(
+            message.contains("gcs-prod"),
+            "message should name the offending value: {message}"
+        );
+        // The message must list the supported set so the operator can fix it.
+        for backend in SUPPORTED_STORAGE_BACKENDS {
+            assert!(
+                message.contains(backend),
+                "message should list supported backend `{backend}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_backend_error_rejects_whitespace_padded_value() {
+        // `s3 ` (trailing space) is the classic env-var typo: it is NOT `s3`,
+        // so it must be rejected rather than silently falling back.
+        assert!(storage_backend_error("s3 ").is_some());
+        assert!(storage_backend_error(" s3").is_some());
+        assert!(storage_backend_error("S3").is_some());
+        assert!(storage_backend_error("").is_some());
     }
 
     /// Extract the text of a top-level `services.<name>` block (a 2-space
