@@ -1,0 +1,21 @@
+// Hex registry `/names` resource.
+//
+// Mirrors hex_core's `mix_hex_pb_names` schema (verified against hex 2.5.1).
+syntax = "proto2";
+
+package hexpb.names;
+
+message Names {
+  repeated Package packages = 1;
+  required string repository = 2;
+}
+
+message Package {
+  required string name = 1;
+  optional Timestamp updated_at = 3;
+}
+
+message Timestamp {
+  required int64 seconds = 1;
+  required int32 nanos = 2;
+}

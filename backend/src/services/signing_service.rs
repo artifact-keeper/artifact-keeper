@@ -19,10 +19,21 @@ use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// `signing_keys.name` of the dedicated key that signs a hosted hex
+/// repository's registry resources. Also the discriminator for the partial
+/// unique index that keeps provisioning idempotent (migration 166).
+pub const HEX_REGISTRY_KEY_NAME: &str = "hex-registry";
+
+/// Key strength for hex registry keys. Hex fixes the signature algorithm
+/// (RSA + SHA-512) but not the modulus size; 2048 matches what `mix
+/// hex.registry build` produces via `openssl genrsa` and keeps first-touch
+/// provisioning fast.
+pub const HEX_REGISTRY_KEY_ALGORITHM: &str = "rsa2048";
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -721,6 +732,114 @@ impl SigningService {
         let signature = signing_key.sign(data);
 
         Ok(signature.to_bytes().to_vec())
+    }
+
+    /// Sign hex registry bytes with `key`: RSA PKCS#1 v1.5, **SHA-512** digest.
+    ///
+    /// The hex protocol fixes both the padding and the digest — the real client
+    /// verifies with `public_key:verify(Payload, sha512, Signature, RSAPublicKey)`
+    /// (hex 2.5.1, `mix_hex_registry:verify/3`). That is why this cannot reuse
+    /// [`SigningService::sign_with_key`], which signs with SHA-256 for the
+    /// Debian/Conda metadata paths: a SHA-256 signature is well-formed but the
+    /// hex client rejects it.
+    ///
+    /// Mirrors `sign_with_key`'s handling of the decrypted private key: the PEM
+    /// plaintext lives in a `Zeroizing` buffer and the parsed key self-cleans on
+    /// drop (#1328).
+    pub fn sign_hex_registry(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
+        let private_pem: Zeroizing<Vec<u8>> =
+            Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
+                AppError::Internal(format!("Failed to decrypt private key: {}", e))
+            })?);
+
+        let private_key = RsaPrivateKey::from_pkcs8_pem(
+            std::str::from_utf8(&private_pem)
+                .map_err(|e| AppError::Internal(format!("Invalid UTF-8 in key: {}", e)))?,
+        )
+        .map_err(|e| AppError::Internal(format!("Failed to parse private key: {}", e)))?;
+
+        let signing_key = RsaSigningKey::<Sha512>::new(private_key);
+        Ok(signing_key.sign(data).to_bytes().to_vec())
+    }
+
+    /// Look up a repository's dedicated hex registry key, if it has one.
+    async fn find_hex_registry_key(&self, repo_id: Uuid) -> Result<Option<SigningKey>> {
+        let key = sqlx::query_as!(
+            SigningKey,
+            r#"
+            SELECT * FROM signing_keys
+            WHERE repository_id = $1 AND name = $2 AND is_active = true
+            LIMIT 1
+            "#,
+            repo_id,
+            HEX_REGISTRY_KEY_NAME,
+        )
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(key)
+    }
+
+    /// Get (or provision on first use) the RSA key that signs a hosted hex
+    /// repository's registry resources.
+    ///
+    /// Hex differs from the other signed formats in that signing is not
+    /// optional: a registry with no signature is unusable, so there is no
+    /// "unsigned but working" mode to fall back to and a repo with no key would
+    /// simply be broken. Rather than require an out-of-band setup step, the key
+    /// is created on first touch and stored like every other signing key
+    /// (`signing_keys`, private half encrypted at rest).
+    ///
+    /// Deliberately does **not** write `repository_signing_config`: that table
+    /// drives the Debian/Conda `sign_metadata` behaviour and the promotion
+    /// `require_signature` gate, and a hex repo publishing its own registry key
+    /// must not imply anything about those.
+    ///
+    /// Keygen is CPU-bound, so it runs on the blocking pool (via
+    /// `generate_key_material`) and happens at most once per repository — the
+    /// partial unique index from migration 166 collapses concurrent first
+    /// touches onto a single row.
+    pub async fn get_or_create_hex_registry_key(&self, repo_id: Uuid) -> Result<SigningKey> {
+        if let Some(key) = self.find_hex_registry_key(repo_id).await? {
+            return Ok(key);
+        }
+
+        let req = CreateKeyRequest {
+            repository_id: Some(repo_id),
+            name: HEX_REGISTRY_KEY_NAME.to_string(),
+            key_type: "rsa".to_string(),
+            algorithm: HEX_REGISTRY_KEY_ALGORITHM.to_string(),
+            uid_name: None,
+            uid_email: None,
+            created_by: None,
+        };
+        let material = self.generate_key_material(&req).await?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,
+                public_key_pem, private_key_enc, algorithm, is_active, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10)
+            ON CONFLICT DO NOTHING
+            "#,
+            Uuid::new_v4(),
+            repo_id,
+            HEX_REGISTRY_KEY_NAME,
+            material.key_type,
+            material.fingerprint,
+            material.key_id,
+            material.public_key_pem,
+            material.private_key_enc,
+            HEX_REGISTRY_KEY_ALGORITHM,
+            Utc::now(),
+        )
+        .execute(&self.db)
+        .await?;
+
+        // Re-select rather than trusting the INSERT: on a concurrent first
+        // touch the conflicting writer's row is the one that must be used.
+        self.find_hex_registry_key(repo_id).await?.ok_or_else(|| {
+            AppError::Internal("Failed to provision hex registry signing key".to_string())
+        })
     }
 
     /// Create an ASCII-armored detached OpenPGP signature for repository metadata.

@@ -121,6 +121,7 @@ tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.12"
+prost-build = "0.13"
 
 # URL parsing and resolution
 url = "2.5"

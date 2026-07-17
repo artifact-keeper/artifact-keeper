@@ -28,7 +28,9 @@ use crate::api::SharedState;
 use crate::formats::hex::{
     is_valid_hex_package_name, package_name_from_tarball_filename, HexHandler,
 };
+use crate::formats::hex_registry;
 use crate::models::repository::{Repository, RepositoryType};
+use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -46,6 +48,9 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/versions", get(list_versions))
         // Download tarball - use a wildcard to capture name-version.tar
         .route("/:repo_key/tarballs/*tarball_file", get(download_tarball))
+        // Registry public key (hosted repos) - clients pin this via
+        // `mix hex.repo add <name> <url> --public-key=<file>`
+        .route("/:repo_key/public_key", get(public_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +59,185 @@ pub fn router() -> Router<SharedState> {
 
 async fn resolve_hex_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["hex"], "a Hex").await
+}
+
+// ---------------------------------------------------------------------------
+// Hosted registry resources (signed protobuf)
+// ---------------------------------------------------------------------------
+
+/// True when `repo_type` is a repository whose contents this instance owns and
+/// must therefore describe with its own signed registry (as opposed to a
+/// Remote proxy, which passes upstream's already-signed bytes through).
+fn is_hosted(repo_type: &str) -> bool {
+    repo_type == RepositoryType::Local || repo_type == RepositoryType::Staging
+}
+
+/// Sign `payload` with the repository's hex registry key and wrap it in the
+/// gzipped `Signed` envelope the client expects.
+async fn signed_registry_response(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    payload: Vec<u8>,
+) -> Result<Response, Response> {
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let key = signing_svc
+        .get_or_create_hex_registry_key(repo_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load hex registry signing key: {}", e),
+            )
+                .into_response()
+        })?;
+    let signature = signing_svc.sign_hex_registry(&key, &payload).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to sign hex registry resource: {}", e),
+        )
+            .into_response()
+    })?;
+    let body = hex_registry::signed_gzip(payload, signature).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to encode hex registry resource: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, hex_registry::REGISTRY_CONTENT_TYPE)
+        .body(Body::from(body))
+        .unwrap())
+}
+
+/// Read a release's `inner_checksum` and dependencies out of the artifact's
+/// recorded hex metadata.
+///
+/// Returns `None` when the row predates registry-fact capture at publish, in
+/// which case the caller re-derives them from the stored tarball.
+fn release_facts_from_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> Option<(Vec<u8>, Vec<hex_registry::HexDependency>)> {
+    let metadata = metadata?;
+    let inner_hex = metadata.get("inner_checksum")?.as_str()?;
+    let inner = hex_registry::decode_inner_checksum(inner_hex).ok()?;
+    let dependencies = match metadata.get("requirements") {
+        Some(v) => serde_json::from_value(v.clone()).ok()?,
+        None => Vec::new(),
+    };
+    Some((inner, dependencies))
+}
+
+/// Resolve the `inner_checksum` + dependencies a release must advertise.
+///
+/// Fast path: the facts recorded at publish. Fallback: re-read the stored
+/// tarball, which is what artifacts published before those facts were captured
+/// need. `inner_checksum` is a required field the client copies into
+/// `mix.lock`, so there is no correct way to omit it — a release we cannot
+/// describe is an error rather than a silently incomplete registry.
+async fn resolve_release_facts(
+    state: &SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    metadata: Option<&serde_json::Value>,
+) -> Result<(Vec<u8>, Vec<hex_registry::HexDependency>), Response> {
+    if let Some(facts) = release_facts_from_metadata(metadata) {
+        return Ok(facts);
+    }
+
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open storage: {}", e),
+            )
+                .into_response()
+        })?;
+    let bytes = storage.get(storage_key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read package tarball: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_registry_facts_from_tarball(&bytes)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to parse stored hex tarball: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let inner_hex = facts.inner_checksum_hex.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored hex tarball has no CHECKSUM member; cannot build registry entry",
+        )
+            .into_response()
+    })?;
+    let inner = hex_registry::decode_inner_checksum(&inner_hex).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Stored hex tarball has an unusable CHECKSUM: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok((inner, facts.dependencies))
+}
+
+// ---------------------------------------------------------------------------
+// GET /hex/{repo_key}/public_key -- Registry public key (hosted repos)
+// ---------------------------------------------------------------------------
+
+/// Serve the PEM public key that verifies this repository's registry
+/// signatures.
+///
+/// `mix` has no auto-discovery for this: the operator pins it explicitly with
+/// `mix hex.repo add <name> <url> --public-key=<file>`, and a repo added
+/// without one fails inside `:mix_hex_registry.key/1`. The key is served in
+/// SubjectPublicKeyInfo PEM (`BEGIN PUBLIC KEY`), which the client's
+/// `public_key:pem_entry_decode/1` accepts just as it does the PKCS#1 form
+/// `mix hex.registry build` writes.
+async fn public_key(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_hex_repo(&state.db, &repo_key).await?;
+
+    if !is_hosted(&repo.repo_type) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Only hosted hex repositories publish a registry public key",
+        )
+            .into_response());
+    }
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let key = signing_svc
+        .get_or_create_hex_registry_key(repo.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load hex registry signing key: {}", e),
+            )
+                .into_response()
+        })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-pem-file")
+        .body(Body::from(key.public_key_pem))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +253,7 @@ async fn package_info(
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.storage_key,
                am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
@@ -159,6 +344,41 @@ async fn package_info(
         }
 
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    }
+
+    // Hosted: emit the real registry resource — gzipped, signed protobuf.
+    // See `list_names` for why plain JSON is not consumable by `mix`.
+    if is_hosted(&repo.repo_type) {
+        let mut releases = Vec::with_capacity(artifacts.len());
+        // Advertise oldest-first, matching `mix hex.registry build`.
+        for a in artifacts.iter().rev() {
+            let version = a.version.clone().unwrap_or_default();
+            let outer_checksum =
+                hex_registry::decode_outer_checksum(&a.checksum_sha256).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "Stored checksum for {} {} is unusable: {}",
+                            a.name, version, e
+                        ),
+                    )
+                        .into_response()
+                })?;
+            let (inner_checksum, dependencies) =
+                resolve_release_facts(&state, &repo, &a.storage_key, a.metadata.as_ref()).await?;
+            releases.push(hex_registry::HexRelease {
+                version,
+                inner_checksum,
+                outer_checksum,
+                dependencies,
+            });
+        }
+        let canonical_name = artifacts
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| name.clone());
+        let payload = hex_registry::encode_package_payload(&repo_key, &canonical_name, &releases);
+        return signed_registry_response(&state, repo.id, payload).await;
     }
 
     let releases: Vec<serde_json::Value> = artifacts
@@ -437,12 +657,45 @@ async fn publish_package(
     let storage_key = format!("hex/{}/{}/{}", pkg_name, pkg_version, filename);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
-    let hex_metadata = serde_json::json!({
+    // Record the facts the signed registry has to advertise for this release:
+    // the tarball's inner checksum and its declared requirements. Both are
+    // derivable from the bytes we already hold, so capturing them here keeps
+    // the read path from re-opening the tarball on every registry fetch.
+    // Best-effort: a tarball that parsed well enough to publish but carries no
+    // CHECKSUM member still publishes, and the registry falls back to reading
+    // the stored bytes.
+    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_registry_facts_from_tarball(&body)
+    })
+    .map_err(|e| e.into_response())?;
+
+    let mut hex_metadata = serde_json::json!({
         "format": "hex",
         "name": pkg_name,
         "version": pkg_version,
         "filename": filename,
     });
+    match registry_facts {
+        Ok(facts) => {
+            if let Some(obj) = hex_metadata.as_object_mut() {
+                if let Some(inner) = facts.inner_checksum_hex {
+                    obj.insert("inner_checksum".to_string(), serde_json::json!(inner));
+                }
+                obj.insert(
+                    "requirements".to_string(),
+                    serde_json::json!(facts.dependencies),
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Hex publish: could not derive registry facts for {} {}: {}",
+                pkg_name,
+                pkg_version,
+                e
+            );
+        }
+    }
 
     let size_bytes = body.len() as i64;
 
@@ -495,12 +748,13 @@ async fn list_names(
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
 
-    let names = sqlx::query_scalar!(
+    let name_rows = sqlx::query!(
         r#"
-        SELECT DISTINCT name
+        SELECT name, MAX(created_at) AS "updated_at!"
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
+        GROUP BY name
         ORDER BY name
         "#,
         repo.id
@@ -508,6 +762,23 @@ async fn list_names(
     .fetch_all(&state.db)
     .await
     .map_err(super::db_err)?;
+    let names: Vec<String> = name_rows.iter().map(|r| r.name.clone()).collect();
+
+    // Hosted: emit the real registry resource — gzipped, signed protobuf.
+    // A `mix` client gunzips the body before anything else, so the plain JSON
+    // this used to return failed at `:zlib.gunzip/1` with `:data_error` and
+    // made hosted hex repos unusable by the real client.
+    if is_hosted(&repo.repo_type) {
+        let packages: Vec<hex_registry::HexPackageName> = name_rows
+            .iter()
+            .map(|r| hex_registry::HexPackageName {
+                name: r.name.clone(),
+                updated_at_secs: Some(r.updated_at.timestamp()),
+            })
+            .collect();
+        let payload = hex_registry::encode_names_payload(&repo_key, &packages);
+        return signed_registry_response(&state, repo.id, payload).await;
+    }
 
     // Remote with no local artifacts: proxy the names list from upstream.
     // hex.pm's /names endpoint returns a signed protobuf payload; pass it through as-is.
@@ -598,6 +869,23 @@ async fn list_versions(
         let name = artifact.name.clone();
         let version = artifact.version.clone().unwrap_or_default();
         packages.entry(name).or_default().push(version);
+    }
+
+    // Hosted: emit the real registry resource — gzipped, signed protobuf.
+    // See `list_names` for why plain JSON is not consumable by `mix`.
+    if is_hosted(&repo.repo_type) {
+        let pkgs: Vec<(String, Vec<String>)> = packages
+            .iter()
+            .map(|(name, versions)| {
+                // The query returns newest-first; registries advertise oldest
+                // first (`mix hex.registry build` sorts ascending).
+                let mut versions = versions.clone();
+                versions.reverse();
+                (name.clone(), versions)
+            })
+            .collect();
+        let payload = hex_registry::encode_versions_payload(&repo_key, &pkgs);
+        return signed_registry_response(&state, repo.id, payload).await;
     }
 
     // Remote with no local artifacts: proxy the versions list from upstream.
@@ -981,6 +1269,48 @@ fn extract_name_version_from_tarball(data: &[u8]) -> Result<(String, String), St
     Ok((name, version))
 }
 
+/// Registry-relevant facts carried inside a hex tarball, beyond the name and
+/// version the publish path already needs.
+struct HexRegistryFacts {
+    /// ASCII-hex contents of the tarball's `CHECKSUM` member, when present.
+    inner_checksum_hex: Option<String>,
+    dependencies: Vec<hex_registry::HexDependency>,
+}
+
+/// Read the `CHECKSUM` member and the declared requirements out of a hex
+/// tarball. Both feed the signed `/packages/{name}` resource.
+fn extract_registry_facts_from_tarball(data: &[u8]) -> Result<HexRegistryFacts, String> {
+    let checksum = crate::util::bounded_archive::read_metadata_from_tar(data, |path| {
+        path == std::path::Path::new("CHECKSUM")
+    })
+    .map_err(|e| e.to_string())?;
+
+    let inner_checksum_hex = match checksum {
+        Some(bytes) => {
+            let text =
+                String::from_utf8(bytes).map_err(|e| format!("Failed to read CHECKSUM: {}", e))?;
+            // Validate now so a malformed digest is caught at publish rather
+            // than surfacing as an unusable registry later.
+            hex_registry::decode_inner_checksum(&text)?;
+            Some(text.trim().to_string())
+        }
+        None => None,
+    };
+
+    let metadata = crate::util::bounded_archive::read_metadata_from_tar(data, |path| {
+        path == std::path::Path::new("metadata.config")
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "metadata.config not found in tarball".to_string())?;
+    let metadata = String::from_utf8(metadata)
+        .map_err(|e| format!("Failed to read metadata.config: {}", e))?;
+
+    Ok(HexRegistryFacts {
+        inner_checksum_hex,
+        dependencies: hex_registry::parse_requirements(&metadata)?,
+    })
+}
+
 /// Extract a string value from Erlang term format metadata.
 ///
 /// Hex metadata.config uses Erlang term format like:
@@ -1013,6 +1343,147 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // is_hosted — decides which repos get their own signed registry (#2641)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_hosted_covers_local_and_staging() {
+        assert!(is_hosted("local"));
+        assert!(is_hosted("staging"));
+    }
+
+    #[test]
+    fn test_is_hosted_excludes_remote_so_upstream_bytes_pass_through() {
+        // A Remote repo proxies hex.pm's already-signed protobuf; re-signing it
+        // with our key would break the client's pinned upstream key.
+        assert!(!is_hosted("remote"));
+    }
+
+    #[test]
+    fn test_is_hosted_excludes_virtual() {
+        assert!(!is_hosted("virtual"));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_registry_facts_from_tarball (#2641)
+    // -----------------------------------------------------------------------
+
+    /// Build a tar carrying the given members, mirroring a hex tarball layout.
+    fn build_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, data) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    // The literal CHECKSUM member of the real `dtf_marker-1.0.0.tar` produced
+    // by `mix hex.build` (elixir:1.17 / hex 2.5.1).
+    const REAL_CHECKSUM: &str = "4157D617FA279E00440545FBDB0BB74B8E0A96A776DAACCE33C690721F09A9C1";
+
+    #[test]
+    fn test_extract_registry_facts_reads_checksum_and_requirements() {
+        let metadata = br#"{<<"name">>,<<"dep_pkg">>}.
+{<<"version">>,<<"2.1.0">>}.
+{<<"requirements">>,[[{<<"name">>,<<"jason">>},{<<"app">>,<<"jason">>},{<<"optional">>,false},{<<"requirement">>,<<"~> 1.4">>},{<<"repository">>,<<"hexpm">>}]]}.
+"#;
+        let tar = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata),
+        ]);
+
+        let facts = extract_registry_facts_from_tarball(&tar).unwrap();
+        assert_eq!(facts.inner_checksum_hex.as_deref(), Some(REAL_CHECKSUM));
+        assert_eq!(facts.dependencies.len(), 1);
+        assert_eq!(facts.dependencies[0].package, "jason");
+        assert_eq!(facts.dependencies[0].requirement, "~> 1.4");
+    }
+
+    #[test]
+    fn test_extract_registry_facts_without_checksum_member_is_not_fatal() {
+        // Publish must still succeed; the registry re-derives from the bytes.
+        let metadata = br#"{<<"name">>,<<"a">>}.
+{<<"version">>,<<"1.0.0">>}.
+{<<"requirements">>,[]}.
+"#;
+        let tar = build_tar(&[("metadata.config", metadata)]);
+        let facts = extract_registry_facts_from_tarball(&tar).unwrap();
+        assert!(facts.inner_checksum_hex.is_none());
+        assert!(facts.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_extract_registry_facts_rejects_malformed_checksum_at_publish() {
+        let metadata = br#"{<<"name">>,<<"a">>}.
+{<<"version">>,<<"1.0.0">>}.
+"#;
+        let tar = build_tar(&[
+            ("CHECKSUM", b"not-a-valid-digest"),
+            ("metadata.config", metadata),
+        ]);
+        assert!(extract_registry_facts_from_tarball(&tar).is_err());
+    }
+
+    #[test]
+    fn test_extract_registry_facts_requires_metadata_config() {
+        let tar = build_tar(&[("CHECKSUM", REAL_CHECKSUM.as_bytes())]);
+        assert!(extract_registry_facts_from_tarball(&tar).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // release_facts_from_metadata (#2641)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_facts_from_metadata_reads_publish_recorded_facts() {
+        let meta = serde_json::json!({
+            "format": "hex",
+            "inner_checksum": REAL_CHECKSUM,
+            "requirements": [{
+                "package": "jason",
+                "requirement": "~> 1.4",
+                "optional": false,
+                "app": "jason",
+                "repository": "hexpm"
+            }],
+        });
+        let (inner, deps) = release_facts_from_metadata(Some(&meta)).unwrap();
+        assert_eq!(inner.len(), 32);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].package, "jason");
+    }
+
+    #[test]
+    fn test_release_facts_from_metadata_without_requirements_yields_no_deps() {
+        let meta = serde_json::json!({ "inner_checksum": REAL_CHECKSUM });
+        let (_, deps) = release_facts_from_metadata(Some(&meta)).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_release_facts_from_metadata_falls_back_when_checksum_absent() {
+        // Rows published before registry facts were captured: the caller must
+        // re-derive from storage rather than emit a wrong checksum.
+        let meta = serde_json::json!({ "format": "hex", "name": "a" });
+        assert!(release_facts_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_release_facts_from_metadata_falls_back_when_checksum_malformed() {
+        let meta = serde_json::json!({ "inner_checksum": "zzzz" });
+        assert!(release_facts_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_release_facts_from_metadata_none_metadata_falls_back() {
+        assert!(release_facts_from_metadata(None).is_none());
+    }
 
     // -----------------------------------------------------------------------
     // order_members_local_first (#973 supply-chain-shadowing rule)

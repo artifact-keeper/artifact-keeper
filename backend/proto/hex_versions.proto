@@ -1,0 +1,18 @@
+// Hex registry `/versions` resource.
+//
+// Mirrors hex_core's `mix_hex_pb_versions` schema (verified against hex 2.5.1).
+syntax = "proto2";
+
+package hexpb.versions;
+
+message Versions {
+  repeated Package packages = 1;
+  required string repository = 2;
+}
+
+message Package {
+  required string name = 1;
+  repeated string versions = 2;
+  repeated int32 retired = 3 [packed = true];
+  repeated int32 with_advisories = 5 [packed = true];
+}

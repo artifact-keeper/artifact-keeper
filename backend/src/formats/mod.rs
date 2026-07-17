@@ -16,6 +16,7 @@ pub mod gitlfs;
 pub mod go;
 pub mod helm;
 pub mod hex;
+pub mod hex_registry;
 pub mod huggingface;
 pub mod incus;
 pub mod jetbrains_plugins;
