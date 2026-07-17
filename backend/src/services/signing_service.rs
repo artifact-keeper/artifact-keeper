@@ -35,11 +35,14 @@ pub const HEX_REGISTRY_KEY_NAME: &str = "hex-registry";
 /// fast.
 pub const HEX_REGISTRY_KEY_ALGORITHM: &str = "rsa2048";
 
-/// Namespace (first key) for the two-key `pg_advisory_xact_lock(int4, int4)`
-/// that serializes hex registry key provisioning per repository. The second key
-/// is `hashtext(repository_id)`. Namespacing keeps this lock space disjoint
-/// from the other two-key advisory-lock users in the codebase.
-const HEX_REGISTRY_KEY_LOCK_NAMESPACE: i32 = 0x4845_5801; // "HEX\x01"
+/// Second key (lock *class*) for the two-key `pg_advisory_xact_lock(int4,
+/// int4)` that serializes hex registry key provisioning per repository. The
+/// first key is the entity — `hashtext(repository_id)` — matching the
+/// key-order convention of the other two-key advisory-lock users
+/// (`sync_worker`'s per-peer claim lock, `scan_result_service`'s
+/// per-artifact preparer lock). The class keeps this lock space disjoint
+/// from theirs.
+const HEX_REGISTRY_KEY_LOCK_CLASS: i32 = 0x4845_5801; // "HEX\x01"
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -836,12 +839,13 @@ impl SigningService {
 
         let mut tx = self.db.begin().await?;
 
-        // Serialize provisioning per repository. Two-key advisory lock space,
-        // namespaced to keep it distinct from other advisory-lock users
+        // Serialize provisioning per repository. Two-key advisory lock —
+        // entity (repository) first, lock class second, like the other
+        // two-key users — with the class keeping it distinct from them
         // (`cluster_lock`, `repository_service`, the admin-password init).
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-            .bind(HEX_REGISTRY_KEY_LOCK_NAMESPACE)
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), $2)")
             .bind(repo_id.to_string())
+            .bind(HEX_REGISTRY_KEY_LOCK_CLASS)
             .execute(&mut *tx)
             .await?;
 

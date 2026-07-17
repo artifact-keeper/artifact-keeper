@@ -2486,7 +2486,19 @@ pub async fn create_repository(
     // do not run this hook), and after a key is revoked.
     if is_hex_hosted {
         let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-        signing_svc.provision_hex_registry_key(repo.id).await?;
+        // Warn-and-continue on failure: the repository is already created and
+        // committed at this point, so failing the request would hand the
+        // operator an error for an operation whose primary effect succeeded —
+        // and a retry would then hit "already exists". A keyless repo is
+        // covered by the read path's `get_or_create` self-heal.
+        if let Err(e) = signing_svc.provision_hex_registry_key(repo.id).await {
+            tracing::warn!(
+                repo_id = %repo.id,
+                error = %e,
+                "Failed to eagerly provision the hex registry signing key; \
+                 the first registry read will self-heal it"
+            );
+        }
     }
 
     if let Some(ref index_url) = payload.index_upstream_url {
