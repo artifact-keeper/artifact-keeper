@@ -81,7 +81,10 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
         .nest("/swift", handlers::swift::router())
-        .nest("/terraform", handlers::terraform::router())
+        .nest(
+            handlers::terraform::MOUNT_PREFIX,
+            handlers::terraform::router(),
+        )
         .nest("/cocoapods", handlers::cocoapods::router())
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())

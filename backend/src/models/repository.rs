@@ -100,6 +100,25 @@ impl RepositoryType {
         }
     }
 
+    /// Parse the lowercase database representation back into a variant, the
+    /// inverse of [`RepositoryType::as_str`].
+    ///
+    /// Returns `None` for anything that is not a known repository type so a
+    /// caller reading a raw `repo_type` string can fail closed. Callers that
+    /// branch on the type with an `else` arm cannot distinguish "unknown" from
+    /// a real variant on their own: `resolve_repo_by_key` yields an empty
+    /// string when the column read fails, and a variant added later is unknown
+    /// to every existing match.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "local" => Some(Self::Local),
+            "remote" => Some(Self::Remote),
+            "virtual" => Some(Self::Virtual),
+            "staging" => Some(Self::Staging),
+            _ => None,
+        }
+    }
+
     /// Check if this is a staging repository (requires promotion to release)
     pub fn is_staging(&self) -> bool {
         matches!(self, RepositoryType::Staging)
@@ -233,6 +252,50 @@ mod tests {
         assert_eq!(RepositoryType::Remote.as_str(), "remote");
         assert_eq!(RepositoryType::Virtual.as_str(), "virtual");
         assert_eq!(RepositoryType::Staging.as_str(), "staging");
+    }
+
+    #[test]
+    fn test_repository_type_from_db_str() {
+        assert_eq!(
+            RepositoryType::from_db_str("local"),
+            Some(RepositoryType::Local)
+        );
+        assert_eq!(
+            RepositoryType::from_db_str("remote"),
+            Some(RepositoryType::Remote)
+        );
+        assert_eq!(
+            RepositoryType::from_db_str("virtual"),
+            Some(RepositoryType::Virtual)
+        );
+        assert_eq!(
+            RepositoryType::from_db_str("staging"),
+            Some(RepositoryType::Staging)
+        );
+    }
+
+    /// Anything that is not a known type is `None` so callers fail closed
+    /// rather than silently treating it as a default variant.
+    #[test]
+    fn test_repository_type_from_db_str_unknown_is_none() {
+        assert_eq!(RepositoryType::from_db_str(""), None);
+        assert_eq!(RepositoryType::from_db_str("federated"), None);
+        // The DB enum is lowercase.
+        assert_eq!(RepositoryType::from_db_str("Local"), None);
+    }
+
+    /// `from_db_str` is the exact inverse of `as_str` for every variant, so the
+    /// two cannot drift as variants are added.
+    #[test]
+    fn test_repository_type_db_str_round_trip() {
+        for t in [
+            RepositoryType::Local,
+            RepositoryType::Remote,
+            RepositoryType::Virtual,
+            RepositoryType::Staging,
+        ] {
+            assert_eq!(RepositoryType::from_db_str(t.as_str()), Some(t.clone()));
+        }
     }
 
     #[test]
