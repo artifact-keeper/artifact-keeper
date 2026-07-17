@@ -116,6 +116,15 @@ fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// repodata handlers always read from the local artifact table even
 /// when the repo was a proxy, so dnf saw an empty repository and
 /// silently did nothing.
+/// Buffered-metadata byte ceiling for the RPM repodata proxy.
+///
+/// RPM `primary`/`filelists` documents are legitimately large (an OL8
+/// `filelists` is tens of MiB), so #2623 raised this from the 8 MiB DEFAULT to
+/// the 128 MiB LARGE tier. It is the single source the handler reads, and a
+/// regression test (`rpm_proxy_metadata_cap_is_large_tier`, #2664) pins it to
+/// the LARGE value so a silent revert to DEFAULT is caught in CI.
+const RPM_PROXY_METADATA_MAX_BYTES: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
+
 async fn try_proxy_repodata(
     state: &SharedState,
     repo: &RepoInfo,
@@ -130,25 +139,77 @@ async fn try_proxy_repodata(
         _ => return Ok(None),
     };
 
+    // #2665: reserve against the process-wide byte budget BEFORE buffering the
+    // upstream/cached document. Without this, N concurrent anonymous,
+    // un-rate-limited requests each buffered up to the per-request cap, so
+    // resident memory scaled with concurrency (~512× the cap in the issue) —
+    // and because a cache hit returns before the single-flight coordinator,
+    // even cached responses each re-buffered. The reservation is held for the
+    // buffered body's whole lifetime (it rides the response stream below) and
+    // released only after the bytes leave the server, so the SUM of concurrent
+    // buffering is capped regardless of request count.
+    let permit = proxy_helpers::proxy_metadata_budget()
+        .reserve(RPM_PROXY_METADATA_MAX_BYTES)
+        .await;
+
     let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RPM_PROXY_METADATA_MAX_BYTES,
     )
     .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    Ok(Some(buffered_metadata_response(
+        content,
+        content_type,
+        permit,
+    )))
+}
+
+/// Build the 200 response for a buffered proxy-metadata document, tying its
+/// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
+///
+/// The `permit` rides the body stream (see [`metadata_body_stream`]) and is
+/// released only after the buffered chunk has been handed to the response
+/// writer, so the global byte budget accounts for the resident body until it
+/// leaves the server rather than releasing at handler return.
+fn buffered_metadata_response(
+    content: Bytes,
+    content_type: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let content_length = content.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, content_length.to_string())
+        .body(Body::from_stream(metadata_body_stream(content, permit)))
+        .unwrap()
+}
+
+/// One-shot body stream over an already-buffered metadata document that also
+/// owns its budget reservation (#2665). The permit is carried in the stream
+/// state and dropped only after the buffered chunk has been yielded to the
+/// response writer, so the budget stays debited for the body's whole lifetime.
+fn metadata_body_stream(
+    content: Bytes,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    enum State {
+        Data(Bytes, tokio::sync::OwnedSemaphorePermit),
+        Done(tokio::sync::OwnedSemaphorePermit),
+    }
+    futures::stream::unfold(State::Data(content, permit), |state| async move {
+        match state {
+            State::Data(bytes, permit) => Some((Ok(bytes), State::Done(permit))),
+            // Permit dropped here, after the chunk reached the response writer.
+            State::Done(_permit) => None,
+        }
+    })
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.
@@ -1305,6 +1366,61 @@ mod tests {
     use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 
     use crate::services::signing_service::{verify_detached, CreateKeyRequest};
+
+    // -----------------------------------------------------------------------
+    // RPM proxy metadata cap + memory bound (#2664 / #2665)
+    // -----------------------------------------------------------------------
+
+    /// #2664: pin the RPM repodata proxy buffered cap to the LARGE tier.
+    ///
+    /// #2623 raised it DEFAULT (8 MiB) → LARGE (128 MiB) because real
+    /// `filelists`/`primary` documents exceed 8 MiB and would otherwise 502.
+    /// If someone silently reverts the handler to the DEFAULT tier, this fails.
+    #[test]
+    fn rpm_proxy_metadata_cap_is_large_tier() {
+        assert_eq!(
+            RPM_PROXY_METADATA_MAX_BYTES,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "RPM proxy metadata cap must be the LARGE tier (#2623/#2664)"
+        );
+        assert_ne!(
+            RPM_PROXY_METADATA_MAX_BYTES,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "RPM proxy metadata cap must not be the DEFAULT tier"
+        );
+    }
+
+    /// #2665: the RPM repodata proxy response must keep its budget reservation
+    /// debited for the whole lifetime of the buffered body — releasing it only
+    /// once the response (and thus the body) is dropped. This is what makes the
+    /// total-memory bound hold under sustained concurrency: a request cannot
+    /// release its slice of the budget the instant it returns and let the next
+    /// request pile another buffer on top.
+    #[tokio::test]
+    async fn buffered_metadata_response_holds_budget_until_body_dropped() {
+        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
+        let permit = budget.reserve(1000).await;
+        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+
+        let resp = buffered_metadata_response(
+            Bytes::from_static(b"repodata-bytes"),
+            "application/gzip".to_string(),
+            permit,
+        );
+        // Still debited while the response (its body owns the permit) is alive.
+        assert_eq!(
+            budget.available_bytes(),
+            3096,
+            "budget stays debited while the response body is alive"
+        );
+
+        drop(resp);
+        assert_eq!(
+            budget.available_bytes(),
+            4096,
+            "budget is released once the response body is dropped"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
