@@ -4227,7 +4227,47 @@ pub struct NewArtifact<'a> {
 /// "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
-    let id: Uuid = sqlx::query_scalar(
+    let repository_id = art.repository_id;
+
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| internal_error("Database", e))?;
+    let id = insert_artifact_row(&mut conn, art).await?;
+    drop(conn);
+
+    // Apply the upload-time quarantine hold at the shared chokepoint used by the
+    // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
+    // rpm, huggingface). Scoped to hosted repositories so proxy/remote cache
+    // inserts — which carry their own sidecar quarantine state — are not
+    // double-held. Best-effort: never fails the insert.
+    crate::services::quarantine_service::apply_upload_hold_hosted(db, repository_id, id).await;
+
+    Ok(id)
+}
+
+/// Insert a row into `artifacts` on a caller-supplied connection or
+/// transaction, returning the new id.
+///
+/// This is the body of [`insert_artifact`] without the quarantine hold. Use it
+/// when several artifact rows must commit **together** — pass `&mut *tx` from a
+/// `db.begin()` transaction so a failure on a later row rolls the earlier ones
+/// back. Object storage cannot join the transaction, but the rows can, which is
+/// what keeps a half-written upload retryable instead of wedging the coordinate
+/// behind a 409 (#2635).
+///
+/// The caller owns two follow-ups that deliberately do **not** belong inside the
+/// transaction:
+///   * `quarantine_service::apply_upload_hold_hosted` — it reads the artifact
+///     row through the pool, so it must run *after* the commit makes the row
+///     visible.
+///   * `record_artifact_metadata` — already best-effort/post-commit by contract.
+#[allow(clippy::result_large_err)]
+pub async fn insert_artifact_row(
+    conn: &mut sqlx::PgConnection,
+    art: NewArtifact<'_>,
+) -> Result<Uuid, Response> {
+    sqlx::query_scalar(
         "INSERT INTO artifacts ( \
              repository_id, path, name, version, size_bytes, \
              checksum_sha256, content_type, storage_key, uploaded_by \
@@ -4243,18 +4283,9 @@ pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, 
     .bind(art.content_type)
     .bind(art.storage_key)
     .bind(art.uploaded_by)
-    .fetch_one(db)
+    .fetch_one(conn)
     .await
-    .map_err(|e| internal_error("Database", e))?;
-
-    // Apply the upload-time quarantine hold at the shared chokepoint used by the
-    // helper-based format handlers (helm, hex, cran, ansible, puppet, rubygems,
-    // rpm, huggingface). Scoped to hosted repositories so proxy/remote cache
-    // inserts — which carry their own sidecar quarantine state — are not
-    // double-held. Best-effort: never fails the insert.
-    crate::services::quarantine_service::apply_upload_hold_hosted(db, art.repository_id, id).await;
-
-    Ok(id)
+    .map_err(|e| internal_error("Database", e))
 }
 
 /// Reject if `(repository_id, path)` already exists, otherwise sweep any

@@ -38,6 +38,7 @@ use crate::api::SharedState;
 use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler, HelmIndex};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::proxy_service::ProxyService;
+use crate::services::quarantine_service;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -639,6 +640,23 @@ async fn upload_chart(
         .await?;
     }
 
+    // A chart and its provenance are one publish, so they must land as one
+    // unit (#2635). Ordering below is load-bearing:
+    //
+    //   1. BOTH objects go to storage first. Object storage cannot join a DB
+    //      transaction, so every fallible storage write happens while the
+    //      repository still has no row pointing at this coordinate.
+    //   2. BOTH rows are inserted inside ONE transaction. A fault on the prov
+    //      row rolls the chart row back with it.
+    //
+    // The property that matters is that a failure is *retryable*: nothing
+    // commits a chart row until the prov is safely stored, so the publisher's
+    // retry cannot collide with a half-finished predecessor in
+    // `ensure_unique_artifact_path` and get a 409 it can never clear. An
+    // orphaned object left in storage by an interrupted upload is overwritten
+    // by that retry -- the storage key is fully determined by chart name and
+    // version.
+
     // Stream the staged archive into the repo's StorageBackend via `put_stream`,
     // which computes the SHA-256 incrementally as it copies (no re-hash pass).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
@@ -647,9 +665,28 @@ async fn upload_chart(
 
     let size_bytes = put.bytes_written as i64;
 
-    // Insert artifact record
-    let artifact_id = proxy_helpers::insert_artifact(
-        &state.db,
+    // #2635: persist the provenance BEFORE the chart row is committed. Any
+    // failure here is propagated with `?` -- the handler must never fall
+    // through to a `{"saved":true}` reply while the prov is on the floor, and
+    // must never leave behind a chart that advertises provenance it cannot
+    // serve.
+    let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
+    let prov_put = match staged_prov {
+        Some(prov) => {
+            Some(proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?)
+        }
+        None => None,
+    };
+
+    // Both objects are in storage. Commit both rows together or neither.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| proxy_helpers::internal_error("Database", e))?;
+
+    let artifact_id = proxy_helpers::insert_artifact_row(
+        &mut tx,
         proxy_helpers::NewArtifact {
             repository_id: repo.id,
             path: &artifact_path,
@@ -663,6 +700,37 @@ async fn upload_chart(
         },
     )
     .await?;
+
+    let prov_artifact_id = match prov_put.as_ref() {
+        Some(prov_put) => Some(
+            proxy_helpers::insert_artifact_row(
+                &mut tx,
+                proxy_helpers::NewArtifact {
+                    repository_id: repo.id,
+                    path: &prov_artifact_path,
+                    name: chart_name,
+                    version: chart_version,
+                    size_bytes: prov_put.bytes_written as i64,
+                    checksum_sha256: &prov_put.checksum_sha256,
+                    content_type: PROV_CONTENT_TYPE,
+                    storage_key: &prov_storage_key,
+                    uploaded_by: user_id,
+                },
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
+    // Until this returns, a fault has left the repository exactly as it was.
+    tx.commit()
+        .await
+        .map_err(|e| proxy_helpers::internal_error("Database", e))?;
+
+    // Post-commit follow-ups. The quarantine hold reads the artifact row back
+    // through the pool, so it can only run once the rows are visible; metadata
+    // recording is best-effort by contract.
+    quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id).await;
 
     // Build metadata JSON including the full Chart.yaml data
     let helm_metadata = serde_json::json!({
@@ -680,30 +748,8 @@ async fn upload_chart(
     )
     .await;
 
-    // #2635: persist the provenance alongside its chart. Any failure here is
-    // propagated with `?` -- the handler must never fall through to a
-    // `{"saved":true}` reply while the prov is on the floor.
-    let mut prov_stored = false;
-    if let Some(prov) = staged_prov {
-        let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
-        let prov_put =
-            proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?;
-
-        let prov_artifact_id = proxy_helpers::insert_artifact(
-            &state.db,
-            proxy_helpers::NewArtifact {
-                repository_id: repo.id,
-                path: &prov_artifact_path,
-                name: chart_name,
-                version: chart_version,
-                size_bytes: prov_put.bytes_written as i64,
-                checksum_sha256: &prov_put.checksum_sha256,
-                content_type: PROV_CONTENT_TYPE,
-                storage_key: &prov_storage_key,
-                uploaded_by: user_id,
-            },
-        )
-        .await?;
+    if let Some(prov_artifact_id) = prov_artifact_id {
+        quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, prov_artifact_id).await;
 
         proxy_helpers::record_artifact_metadata(
             &state.db,
@@ -718,9 +764,9 @@ async fn upload_chart(
             }),
         )
         .await;
-
-        prov_stored = true;
     }
+
+    let prov_stored = prov_artifact_id.is_some();
 
     info!(
         "Helm upload: {} {} to repo {} (provenance: {})",
@@ -1476,6 +1522,148 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        f.teardown().await;
+    }
+
+    /// ATOMICITY (#2635), storage half: a fault while storing the provenance
+    /// must not leave a committed chart row behind.
+    ///
+    /// The chart used to be `put` **and its row committed** before the prov was
+    /// stored, so a storage fault on the prov returned 5xx over a repository
+    /// that now held a chart with no provenance -- and the publisher's retry hit
+    /// `ensure_unique_artifact_path` and got a permanent `409 Chart already
+    /// exists`. Unretryable, and the exact "signed chart that cannot be
+    /// verified" state this issue exists to eliminate.
+    #[tokio::test]
+    async fn test_helm_prov_storage_fault_leaves_no_chart_row_blocking_reupload() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let parts: &[(&str, &str, &[u8])] = &[
+            ("chart", "provchart-0.1.0.tgz", &tgz),
+            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+        ];
+
+        // A real storage fault, scoped to the PROV object only: a directory
+        // squatting on the prov's destination makes the filesystem backend's
+        // final rename fail with EISDIR, while the chart's own put succeeds.
+        // This is the residual class the armor pre-validation cannot catch --
+        // the prov is perfectly well-formed, the storage write is what breaks.
+        let prov_object = f
+            .storage_dir
+            .join("helm/provchart/0.1.0/provchart-0.1.0.tgz.prov");
+        std::fs::create_dir_all(&prov_object).expect("inject prov storage fault");
+
+        let (status, _) = upload_parts(&f, parts).await;
+        assert!(
+            status.is_server_error(),
+            "a prov that cannot be stored must fail the upload, got {status}"
+        );
+
+        // THE POINT: nothing is committed. Not the chart, not the prov.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("count artifacts");
+        assert_eq!(
+            rows, 0,
+            "a failed publish must leave no artifact row -- a committed chart \
+             with no prov wedges the coordinate behind an unclearable 409"
+        );
+
+        // Clear the fault and retry exactly as the publisher would.
+        std::fs::remove_dir_all(&prov_object).expect("clear prov storage fault");
+        let (status, body) = upload_parts(&f, parts).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the retry after a transient storage fault must succeed, not 409"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["prov"], serde_json::json!(true));
+
+        // And the retry really did publish a verifiable chart.
+        let app = f.router_anon(super::router());
+        let (status, got) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/provchart-0.1.0.tgz.prov", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&got[..], REAL_PROV);
+
+        f.teardown().await;
+    }
+
+    /// ATOMICITY (#2635), database half: the chart row and its prov row are
+    /// inserted in ONE transaction, so a fault on the prov row takes the chart
+    /// row with it instead of stranding a chart nobody can re-upload.
+    ///
+    /// Object storage cannot join the transaction, but the rows can -- and that
+    /// alone is what turns an unretryable 409 into a retryable failure. The
+    /// fault injected here is a `UNIQUE(repository_id, path)` violation, the
+    /// shape a publisher racing between `ensure_unique_artifact_path` and the
+    /// insert produces.
+    #[tokio::test]
+    async fn test_helm_chart_and_prov_rows_roll_back_together() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let chart_path = "provchart/0.1.0/provchart-0.1.0.tgz";
+        let prov_path = "provchart/0.1.0/provchart-0.1.0.tgz.prov";
+
+        let checksum = "a".repeat(64);
+        let new_row = |path: &'static str, content_type: &'static str| proxy_helpers::NewArtifact {
+            repository_id: f.repo_id,
+            path,
+            name: "provchart",
+            version: "0.1.0",
+            size_bytes: 1,
+            checksum_sha256: &checksum,
+            content_type,
+            storage_key: path,
+            uploaded_by: f.user_id,
+        };
+
+        // Somebody already occupies the prov coordinate.
+        let mut conn = f.pool.acquire().await.expect("acquire");
+        proxy_helpers::insert_artifact_row(&mut conn, new_row(prov_path, PROV_CONTENT_TYPE))
+            .await
+            .expect("seed the conflicting prov row");
+        drop(conn);
+
+        // The publish transaction: chart row inserts, prov row collides.
+        let mut tx = f.pool.begin().await.expect("begin");
+        proxy_helpers::insert_artifact_row(&mut tx, new_row(chart_path, "application/gzip"))
+            .await
+            .expect("the chart row itself inserts fine");
+        let prov_result =
+            proxy_helpers::insert_artifact_row(&mut tx, new_row(prov_path, PROV_CONTENT_TYPE))
+                .await;
+        assert!(
+            prov_result.is_err(),
+            "the conflicting prov row must fail the insert"
+        );
+        // Exactly what the handler's `?` does: drop the transaction unfinished.
+        drop(tx);
+
+        // The chart row must have gone with it, leaving the coordinate free.
+        let chart_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(chart_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count chart rows");
+        assert_eq!(
+            chart_rows, 0,
+            "a rolled-back publish must not leave the chart row committed"
+        );
 
         f.teardown().await;
     }
