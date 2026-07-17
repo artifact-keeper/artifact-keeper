@@ -189,6 +189,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
         artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
             .await?;
+        artifact_keeper_backend::migration_repair::repair_release_1_5_x_divergence(&db_pool)
+            .await?;
         // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
