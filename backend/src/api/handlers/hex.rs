@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -469,12 +470,9 @@ async fn package_info(
         // microsecond precision, so it picks a different winner than the
         // fold whenever two case variants land within the same second. See
         // `fold_spelling_winner`.
-        let canonical_name = canonical_hex_spelling(
-            artifacts
-                .iter()
-                .map(|a| (a.name.as_str(), a.created_at.timestamp())),
-        )
-        .unwrap_or_else(|| name.clone());
+        let canonical_name =
+            canonical_hex_spelling(artifacts.iter().map(|a| (a.name.as_str(), a.created_at)))
+                .unwrap_or_else(|| name.clone());
         let payload = hex_registry::encode_package_payload(&repo_key, &canonical_name, &releases);
         return signed_registry_response(&state, repo.id, payload).await;
     }
@@ -840,9 +838,9 @@ async fn publish_package(
 // GET /hex/{repo_key}/names -- List all package names
 // ---------------------------------------------------------------------------
 
-/// Fold one `(spelling, created_at_secs)` artifact row into the running
-/// winner for its case-folded package group: the newer row's spelling wins,
-/// and a whole-second timestamp tie goes to the byte-wise greater name.
+/// Fold one `(spelling, created_at)` artifact row into the running winner
+/// for its case-folded package group: the newer row's spelling wins, and a
+/// whole-second timestamp tie goes to the byte-wise greater name.
 ///
 /// This is the single implementation of the registry's winner rule. `/names`
 /// ([`canonical_hex_names`]), `/versions` ([`canonical_hex_versions`]) and
@@ -856,26 +854,40 @@ async fn publish_package(
 /// different winner than a whole-second fold that ties. Do not reimplement
 /// this rule anywhere else (in SQL or in Rust).
 ///
-/// Losing rows never carry a timestamp greater than the winner's (a strictly
-/// newer timestamp always wins), so `winner.1` is also the group's max —
-/// callers that advertise a group-level `updated_at` can read it directly.
-fn fold_spelling_winner(winner: &mut (String, i64), name: &str, created_at_secs: i64) {
-    if (created_at_secs, name) > (winner.1, winner.0.as_str()) {
-        *winner = (name.to_string(), created_at_secs);
+/// The fold takes the row's full-precision [`DateTime<Utc>`] and truncates to
+/// whole seconds HERE — the one and only precision drop in the module. It
+/// used to take a bare `i64` and trust every call site to pass
+/// `.timestamp()`; a caller reaching for `.timestamp_millis()` instead would
+/// have compiled fine and silently re-opened the same-second divergence.
+/// With the `DateTime` parameter no call site can choose a precision at all.
+///
+/// `winner` starts as `None` (no rows seen); the first row always seeds it,
+/// through the same truncation. Losing rows never carry a timestamp greater
+/// than the winner's (a strictly newer timestamp always wins), so the
+/// winner's seconds are also the group's max — callers that advertise a
+/// group-level `updated_at` can read it directly.
+fn fold_spelling_winner(winner: &mut Option<(String, i64)>, name: &str, created_at: DateTime<Utc>) {
+    let created_at_secs = created_at.timestamp();
+    let beats = match winner {
+        Some((w_name, w_secs)) => (created_at_secs, name) > (*w_secs, w_name.as_str()),
+        None => true,
+    };
+    if beats {
+        *winner = Some((name.to_string(), created_at_secs));
     }
 }
 
 /// Pick the one spelling `/packages/{name}` may echo for a set of case-variant
 /// artifact rows, through the same fold — and the same whole-second timestamp
 /// precision — as [`canonical_hex_names`]. Returns `None` for no rows.
-fn canonical_hex_spelling<'a>(rows: impl IntoIterator<Item = (&'a str, i64)>) -> Option<String> {
-    let mut rows = rows.into_iter();
-    let (name, created_at_secs) = rows.next()?;
-    let mut winner = (name.to_string(), created_at_secs);
-    for (name, created_at_secs) in rows {
-        fold_spelling_winner(&mut winner, name, created_at_secs);
+fn canonical_hex_spelling<'a>(
+    rows: impl IntoIterator<Item = (&'a str, DateTime<Utc>)>,
+) -> Option<String> {
+    let mut winner = None;
+    for (name, created_at) in rows {
+        fold_spelling_winner(&mut winner, name, created_at);
     }
-    Some(winner.0)
+    winner.map(|(name, _)| name)
 }
 
 /// Fold case-variant spellings of a package name down to the single name the
@@ -894,20 +906,19 @@ fn canonical_hex_spelling<'a>(rows: impl IntoIterator<Item = (&'a str, i64)>) ->
 /// group's `updated_at` is the newest across all variants, since they are all
 /// the same package (the fold maintains that: a losing row's timestamp is
 /// never greater than the winner's).
-fn canonical_hex_names(rows: &[(String, i64)]) -> Vec<hex_registry::HexPackageName> {
-    let mut folded: std::collections::BTreeMap<String, (String, i64)> =
+fn canonical_hex_names(rows: &[(String, DateTime<Utc>)]) -> Vec<hex_registry::HexPackageName> {
+    let mut folded: std::collections::BTreeMap<String, Option<(String, i64)>> =
         std::collections::BTreeMap::new();
 
-    for (name, updated_at_secs) in rows {
+    for (name, updated_at) in rows {
         let key = name.to_lowercase();
-        folded
-            .entry(key)
-            .and_modify(|winner| fold_spelling_winner(winner, name, *updated_at_secs))
-            .or_insert_with(|| (name.clone(), *updated_at_secs));
+        fold_spelling_winner(folded.entry(key).or_default(), name, *updated_at);
     }
 
     let mut out: Vec<hex_registry::HexPackageName> = folded
         .into_values()
+        // Every entry was folded at least once, so the winner is always Some.
+        .flatten()
         .map(|(name, updated_at_secs)| hex_registry::HexPackageName {
             name,
             updated_at_secs: Some(updated_at_secs),
@@ -949,9 +960,9 @@ async fn list_names(
         // can echo back verbatim. The JSON arm below is left as-is: it is the
         // remote/virtual path and is not consumed by the `mix` client, so it
         // does not carry the name-matching constraint.
-        let rows: Vec<(String, i64)> = name_rows
+        let rows: Vec<(String, DateTime<Utc>)> = name_rows
             .iter()
-            .map(|r| (r.name.clone(), r.updated_at.timestamp()))
+            .map(|r| (r.name.clone(), r.updated_at))
             .collect();
         let packages = canonical_hex_names(&rows);
         let payload = hex_registry::encode_names_payload(&repo_key, &packages);
@@ -1031,20 +1042,20 @@ async fn list_names(
 /// hex.registry build`. Ordering by `created_at` instead only coincides with
 /// that while releases are published in version order — a backported 0.9.0
 /// published after 1.0.0 would be advertised last.
-fn canonical_hex_versions(rows: &[(String, String, i64)]) -> Vec<(String, Vec<String>)> {
+fn canonical_hex_versions(rows: &[(String, String, DateTime<Utc>)]) -> Vec<(String, Vec<String>)> {
     struct Group {
-        winner: (String, i64),
+        winner: Option<(String, i64)>,
         versions: Vec<String>,
     }
     let mut folded: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
 
-    for (name, version, created_at_secs) in rows {
+    for (name, version, created_at) in rows {
         let key = name.to_lowercase();
         let group = folded.entry(key).or_insert_with(|| Group {
-            winner: (name.clone(), *created_at_secs),
+            winner: None,
             versions: Vec::new(),
         });
-        fold_spelling_winner(&mut group.winner, name, *created_at_secs);
+        fold_spelling_winner(&mut group.winner, name, *created_at);
         if !group.versions.contains(version) {
             group.versions.push(version.clone());
         }
@@ -1052,9 +1063,10 @@ fn canonical_hex_versions(rows: &[(String, String, i64)]) -> Vec<(String, Vec<St
 
     let mut out: Vec<(String, Vec<String>)> = folded
         .into_values()
-        .map(|mut g| {
+        // Every group was folded at least once, so the winner is always Some.
+        .filter_map(|mut g| {
             g.versions.sort_by(|a, b| version_compare(a, b).cmp(&0));
-            (g.winner.0, g.versions)
+            g.winner.map(|(name, _)| (name, g.versions))
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1094,13 +1106,13 @@ async fn list_versions(
     // Hosted: emit the real registry resource — gzipped, signed protobuf.
     // See `list_names` for why plain JSON is not consumable by `mix`.
     if is_hosted(&repo.repo_type) {
-        let rows: Vec<(String, String, i64)> = artifacts
+        let rows: Vec<(String, String, DateTime<Utc>)> = artifacts
             .iter()
             .map(|a| {
                 (
                     a.name.clone(),
                     a.version.clone().unwrap_or_default(),
-                    a.created_at.timestamp(),
+                    a.created_at,
                 )
             })
             .collect();
@@ -1581,13 +1593,24 @@ mod tests {
     // release ordering (#2641 review)
     // -----------------------------------------------------------------------
 
+    /// Whole-second UTC stamp for fold tests.
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).expect("valid test timestamp")
+    }
+
+    /// UTC stamp with a sub-second component, as real `created_at` rows have.
+    fn ts_micros(secs: i64, micros: u32) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, micros * 1_000).expect("valid test timestamp")
+    }
+
     #[test]
     fn test_canonical_hex_names_folds_case_variants_to_one_name() {
         // `/packages/{name}` matches case-insensitively and echoes the newest
         // artifact's spelling. If `/names` advertised both spellings, a client
         // asking for the older one would get a payload naming the other and
         // reject it as `bad_repo_name`.
-        let out = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 200)]);
+        let out =
+            canonical_hex_names(&[("Foo".to_string(), ts(100)), ("foo".to_string(), ts(200))]);
         assert_eq!(out.len(), 1, "case variants must collapse to one name");
         assert_eq!(out[0].name, "foo", "the newest spelling wins");
         assert_eq!(
@@ -1600,8 +1623,8 @@ mod tests {
     #[test]
     fn test_canonical_hex_names_newest_spelling_wins_regardless_of_row_order() {
         // Same data, opposite input order — the winner must not depend on it.
-        let a = canonical_hex_names(&[("foo".to_string(), 200), ("Foo".to_string(), 100)]);
-        let b = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 200)]);
+        let a = canonical_hex_names(&[("foo".to_string(), ts(200)), ("Foo".to_string(), ts(100))]);
+        let b = canonical_hex_names(&[("Foo".to_string(), ts(100)), ("foo".to_string(), ts(200))]);
         assert_eq!(a[0].name, "foo");
         assert_eq!(b[0].name, "foo");
     }
@@ -1610,8 +1633,8 @@ mod tests {
     fn test_canonical_hex_names_ties_break_deterministically() {
         // Equal timestamps must still yield a stable, order-independent winner
         // (the byte-wise greater name — see `fold_spelling_winner`).
-        let a = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 100)]);
-        let b = canonical_hex_names(&[("foo".to_string(), 100), ("Foo".to_string(), 100)]);
+        let a = canonical_hex_names(&[("Foo".to_string(), ts(100)), ("foo".to_string(), ts(100))]);
+        let b = canonical_hex_names(&[("foo".to_string(), ts(100)), ("Foo".to_string(), ts(100))]);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].name, "foo", "greater name wins a timestamp tie");
         assert_eq!(
@@ -1623,9 +1646,9 @@ mod tests {
     #[test]
     fn test_canonical_hex_names_distinct_names_are_untouched_and_sorted() {
         let out = canonical_hex_names(&[
-            ("zeta".to_string(), 100),
-            ("alpha".to_string(), 200),
-            ("mid".to_string(), 150),
+            ("zeta".to_string(), ts(100)),
+            ("alpha".to_string(), ts(200)),
+            ("mid".to_string(), ts(150)),
         ]);
         let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
@@ -1642,9 +1665,9 @@ mod tests {
         // VERSION. Ordering by publish time diverges the moment a backport is
         // published after a newer release — here 0.9.0 published last.
         let out = canonical_hex_versions(&[
-            ("p".to_string(), "1.0.0".to_string(), 100),
-            ("p".to_string(), "0.9.0".to_string(), 300),
-            ("p".to_string(), "1.1.0".to_string(), 200),
+            ("p".to_string(), "1.0.0".to_string(), ts(100)),
+            ("p".to_string(), "0.9.0".to_string(), ts(300)),
+            ("p".to_string(), "1.1.0".to_string(), ts(200)),
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(
@@ -1658,9 +1681,9 @@ mod tests {
     fn test_canonical_hex_versions_sorts_numerically_not_lexically() {
         // Lexical ordering would put 10.0.0 before 9.0.0.
         let out = canonical_hex_versions(&[
-            ("p".to_string(), "10.0.0".to_string(), 100),
-            ("p".to_string(), "9.0.0".to_string(), 200),
-            ("p".to_string(), "2.0.0".to_string(), 300),
+            ("p".to_string(), "10.0.0".to_string(), ts(100)),
+            ("p".to_string(), "9.0.0".to_string(), ts(200)),
+            ("p".to_string(), "2.0.0".to_string(), ts(300)),
         ]);
         assert_eq!(out[0].1, vec!["2.0.0", "9.0.0", "10.0.0"]);
     }
@@ -1668,8 +1691,8 @@ mod tests {
     #[test]
     fn test_canonical_hex_versions_folds_case_variants() {
         let out = canonical_hex_versions(&[
-            ("Foo".to_string(), "1.0.0".to_string(), 100),
-            ("foo".to_string(), "2.0.0".to_string(), 200),
+            ("Foo".to_string(), "1.0.0".to_string(), ts(100)),
+            ("foo".to_string(), "2.0.0".to_string(), ts(200)),
         ]);
         assert_eq!(out.len(), 1, "case variants are one package");
         assert_eq!(out[0].0, "foo", "newest spelling wins, as in /names");
@@ -1686,22 +1709,25 @@ mod tests {
         // `/versions` keys the package under, or a client looks up a package it
         // was just told exists and misses.
         let rows = [
-            ("Foo".to_string(), "1.0.0".to_string(), 100),
-            ("foo".to_string(), "2.0.0".to_string(), 200),
-            ("BAR".to_string(), "1.0.0".to_string(), 500),
-            ("bar".to_string(), "0.1.0".to_string(), 50),
+            ("Foo".to_string(), "1.0.0".to_string(), ts(100)),
+            ("foo".to_string(), "2.0.0".to_string(), ts(200)),
+            ("BAR".to_string(), "1.0.0".to_string(), ts(500)),
+            ("bar".to_string(), "0.1.0".to_string(), ts(50)),
         ];
-        let name_rows: Vec<(String, i64)> =
-            rows.iter()
-                .map(|(n, _, t)| (n.clone(), *t))
-                .fold(Vec::new(), |mut acc, (n, t)| {
-                    // Mimic `/names`' GROUP BY name → MAX(created_at) per spelling.
-                    match acc.iter_mut().find(|(an, _): &&mut (String, i64)| *an == n) {
-                        Some(entry) => entry.1 = entry.1.max(t),
-                        None => acc.push((n, t)),
-                    }
-                    acc
-                });
+        let name_rows: Vec<(String, DateTime<Utc>)> = rows
+            .iter()
+            .map(|(n, _, t)| (n.clone(), *t))
+            .fold(Vec::new(), |mut acc, (n, t)| {
+                // Mimic `/names`' GROUP BY name → MAX(created_at) per spelling.
+                match acc
+                    .iter_mut()
+                    .find(|(an, _): &&mut (String, DateTime<Utc>)| *an == n)
+                {
+                    Some(entry) => entry.1 = entry.1.max(t),
+                    None => acc.push((n, t)),
+                }
+                acc
+            });
 
         let advertised: Vec<String> = canonical_hex_names(&name_rows)
             .into_iter()
@@ -1730,18 +1756,30 @@ mod tests {
         // microsecond precision, sees no tie, and puts "Foo" first. The
         // spelling `/packages/{name}` echoes must be one `/names`
         // advertises, or the client rejects the payload (`bad_repo_name`).
-        let t = 1_000_000_000i64; // whole-second stamp both rows share
+        //
+        // NOTE: this test pins the tie-break DIRECTION through the shared
+        // fold. The guard that `package_info` actually ROUTES through the
+        // fold is the DB-backed
+        // `test_package_info_echo_matches_names_for_same_second_case_variants_db`,
+        // which drives the handler end-to-end and fails if the handler goes
+        // back to trusting the SQL row order.
+        let t = 1_000_000_000i64; // whole second both rows share
 
         // Rows as SQL hands them to `package_info`: newest first at
-        // microsecond precision ("Foo" @ .500 sorts before "foo" @ .100 —
-        // no tie at that precision). Sub-second parts vanish in
-        // `.timestamp()`, exactly as they do on the handler's rows. The
+        // microsecond precision ("Foo" @ .000500 sorts before "foo" @
+        // .000100 — no tie at that precision). The fold truncates the
+        // sub-second parts internally, sees the tie, and picks "foo". The
         // pre-fix code took the first row ("Foo") and desynchronized from
         // `/names`.
-        let echoed = canonical_hex_spelling([("Foo", t), ("foo", t)]).unwrap();
+        let echoed =
+            canonical_hex_spelling([("Foo", ts_micros(t, 500)), ("foo", ts_micros(t, 100))])
+                .unwrap();
 
-        // `/names` input: GROUP BY name -> MAX(created_at).timestamp().
-        let advertised = canonical_hex_names(&[("Foo".to_string(), t), ("foo".to_string(), t)]);
+        // `/names` input: GROUP BY name -> MAX(created_at).
+        let advertised = canonical_hex_names(&[
+            ("Foo".to_string(), ts_micros(t, 500)),
+            ("foo".to_string(), ts_micros(t, 100)),
+        ]);
         assert_eq!(advertised.len(), 1);
         assert_eq!(
             echoed, advertised[0].name,
@@ -1757,8 +1795,8 @@ mod tests {
     fn test_canonical_hex_spelling_newest_wins_and_ignores_row_order() {
         // `package_info` feeds rows in SQL order (newest first); the winner
         // must not depend on that.
-        let a = canonical_hex_spelling([("Foo", 200), ("foo", 100)]);
-        let b = canonical_hex_spelling([("foo", 100), ("Foo", 200)]);
+        let a = canonical_hex_spelling([("Foo", ts(200)), ("foo", ts(100))]);
+        let b = canonical_hex_spelling([("foo", ts(100)), ("Foo", ts(200))]);
         assert_eq!(a.as_deref(), Some("Foo"), "the newest spelling wins");
         assert_eq!(a, b, "the winner must be order-independent");
     }
@@ -1766,7 +1804,7 @@ mod tests {
     #[test]
     fn test_canonical_hex_spelling_empty_rows() {
         assert_eq!(
-            canonical_hex_spelling(std::iter::empty::<(&str, i64)>()),
+            canonical_hex_spelling(std::iter::empty::<(&str, DateTime<Utc>)>()),
             None
         );
     }
@@ -1775,11 +1813,12 @@ mod tests {
     fn test_canonical_hex_spelling_agrees_with_names_and_versions_winner() {
         // The three endpoints share one fold; pin that they agree on a
         // non-tied group too.
-        let echoed = canonical_hex_spelling([("foo", 200), ("Foo", 100)]).unwrap();
-        let advertised = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 200)]);
+        let echoed = canonical_hex_spelling([("foo", ts(200)), ("Foo", ts(100))]).unwrap();
+        let advertised =
+            canonical_hex_names(&[("Foo".to_string(), ts(100)), ("foo".to_string(), ts(200))]);
         let keyed = canonical_hex_versions(&[
-            ("Foo".to_string(), "1.0.0".to_string(), 100),
-            ("foo".to_string(), "2.0.0".to_string(), 200),
+            ("Foo".to_string(), "1.0.0".to_string(), ts(100)),
+            ("foo".to_string(), "2.0.0".to_string(), ts(200)),
         ]);
         assert_eq!(echoed, advertised[0].name);
         assert_eq!(echoed, keyed[0].0);
@@ -1788,8 +1827,8 @@ mod tests {
     #[test]
     fn test_canonical_hex_versions_dedupes_identical_versions_across_case_variants() {
         let out = canonical_hex_versions(&[
-            ("Foo".to_string(), "1.0.0".to_string(), 100),
-            ("foo".to_string(), "1.0.0".to_string(), 200),
+            ("Foo".to_string(), "1.0.0".to_string(), ts(100)),
+            ("foo".to_string(), "1.0.0".to_string(), ts(200)),
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1, vec!["1.0.0"], "a version must be advertised once");
@@ -3211,6 +3250,95 @@ mod tests {
         );
 
         drop(held);
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Same-second case-variant echo (#2641 review MUST-FIX)
+    // -----------------------------------------------------------------------
+
+    /// Drive `package_info` END-TO-END through the router against real rows
+    /// and assert the name the signed payload echoes is the one `/names`
+    /// advertises.
+    ///
+    /// This is the guard the pure-fold unit test above cannot be: that test
+    /// derives both sides through `fold_spelling_winner`, so it holds by
+    /// construction no matter what the handler does. This one seeds the exact
+    /// divergence — two case variants inside the same whole second, with the
+    /// fold's LOSING spelling ("Foo") the microsecond-newer row — so the
+    /// handler's SQL (`ORDER BY created_at DESC` at microsecond precision)
+    /// puts "Foo" first while the whole-second fold ties and picks "foo".
+    /// Reverting the handler to trust the SQL first row (`artifacts.first()`)
+    /// makes this test FAIL; routing through the shared fold makes it pass.
+    #[tokio::test]
+    async fn test_package_info_echo_matches_names_for_same_second_case_variants_db() {
+        use prost::Message as _;
+        use std::io::Read as _;
+
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        seed_pre_change_release(&f, "foo", "1.0.0").await;
+        seed_pre_change_release(&f, "Foo", "2.0.0").await;
+
+        // Same whole second; "Foo" is newer by 400µs. Postgres timestamptz
+        // keeps microseconds, so the handler's ORDER BY sees "Foo" first.
+        let same_second = 1_750_000_000i64;
+        for (spelling, micros) in [("foo", 100u32), ("Foo", 500u32)] {
+            let stamp = chrono::DateTime::from_timestamp(same_second, micros * 1_000)
+                .expect("valid seed timestamp");
+            sqlx::query(
+                "UPDATE artifacts SET created_at = $1 WHERE repository_id = $2 AND name = $3",
+            )
+            .bind(stamp)
+            .bind(f.repo_id)
+            .bind(spelling)
+            .execute(&f.pool)
+            .await
+            .expect("pin created_at");
+        }
+
+        /// Gunzip a registry response body and return the `Signed` payload.
+        fn signed_payload(body: &[u8]) -> Vec<u8> {
+            let mut gz = flate2::read::GzDecoder::new(body);
+            let mut raw = Vec::new();
+            gz.read_to_end(&mut raw).expect("gunzip registry body");
+            hex_registry::pb::signed::Signed::decode(raw.as_slice())
+                .expect("decode Signed envelope")
+                .payload
+        }
+
+        // What `/names` advertises for this group.
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/names", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "/names must serve");
+        let names = hex_registry::pb::names::Names::decode(signed_payload(&body).as_slice())
+            .expect("decode Names payload");
+        let advertised: Vec<&str> = names
+            .packages
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|n| n.eq_ignore_ascii_case("foo"))
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["foo"],
+            "/names must fold the same-second case variants to the byte-wise greater spelling"
+        );
+
+        // What `/packages/foo` echoes for the same group.
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/packages/foo", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "/packages/foo must serve");
+        let pkg = hex_registry::pb::pkg::Package::decode(signed_payload(&body).as_slice())
+            .expect("decode Package payload");
+        assert_eq!(
+            pkg.name, "foo",
+            "/packages/{{name}} must echo the /names winner, not the SQL first row \
+             (microsecond-newer \"Foo\") — the client rejects a mismatch as bad_repo_name"
+        );
+
         f.teardown().await;
     }
 }
