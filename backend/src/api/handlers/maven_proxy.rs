@@ -168,10 +168,14 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // error fails closed (404) rather than risking a foreign read.
     if !crate::storage::backend_is_repo_isolated(&location.backend) {
         let flat_key = format!("maven/{}", artifact_path);
-        let owned = crate::services::maven_flat_attribution::attributed_owner(db, &flat_key)
-            .await
-            .ok()
-            .flatten()
+        let owned = crate::services::maven_flat_attribution::attributed_owner(
+            db,
+            &location.backend,
+            &flat_key,
+        )
+        .await
+        .ok()
+        .flatten()
             == Some(repo_id);
         if !owned {
             return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());

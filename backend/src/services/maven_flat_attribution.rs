@@ -11,8 +11,8 @@
 //!
 //! This module resolves the single owning repository of a flat key from the
 //! catalog (live artifact rows, parent-artifact metadata `files[]`, and the
-//! `maven_flat_object_owner` attribution table backfilled by migration 163),
-//! and uses that to:
+//! `maven_flat_object_owner` attribution table backfilled by migration 163 and
+//! qualified by storage backend in migration 168), and uses that to:
 //!
 //! * gate reads -- serve a legacy flat object only to its genuine owner
 //!   ([`flat_key_readable`]); and
@@ -42,19 +42,31 @@ fn strip_checksum_suffix(storage_key: &str) -> Option<&str> {
         .find_map(|suffix| storage_key.strip_suffix(suffix))
 }
 
-/// Distinct owning repositories of a live `artifacts` row at exactly this key
-/// (LIMIT 2 -- one row is a clean owner, two rows means the key is ambiguous).
-const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT repository_id FROM artifacts \
-     WHERE storage_key = $1 AND is_deleted = false \
+// Every owner lookup is parameterized by `$1` = storage_key and `$2` =
+// storage_backend. The backend qualifier is what closes #2671: on a MIXED
+// backend deployment the same flat storage-key string names two physically
+// distinct objects (one per cloud), so owner resolution must only consider rows
+// whose repository lives on the *same* backend as the caller. Without it, two
+// repositories on different backends collide on one key and both fail closed.
+
+/// Distinct owning repositories of a live `artifacts` row at exactly this key,
+/// restricted to repositories on `$2` (LIMIT 2 -- one row is a clean owner, two
+/// rows means the key is ambiguous on that backend).
+const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM artifacts a \
+     JOIN repositories r ON r.id = a.repository_id \
+     WHERE a.storage_key = $1 AND a.is_deleted = false AND r.storage_backend = $2 \
      LIMIT 2";
 
 /// Distinct owning repositories of a live parent artifact whose metadata
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
-/// files have no row of their own). LIMIT 2 for the same ambiguity test.
+/// files have no row of their own), restricted to repositories on `$2`. LIMIT 2
+/// for the same ambiguity test.
 const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      FROM artifact_metadata am \
      JOIN artifacts a ON a.id = am.artifact_id \
+     JOIN repositories r ON r.id = a.repository_id \
      WHERE a.is_deleted = false \
+       AND r.storage_backend = $2 \
        AND jsonb_typeof(am.metadata->'files') = 'array' \
        AND EXISTS ( \
          SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
@@ -62,9 +74,10 @@ const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      LIMIT 2";
 
 /// The attribution table (backfilled legacy keys + write-time claims). The
-/// `storage_key` primary key means this yields at most one owner.
-const OWNER_BY_ATTRIBUTION_TABLE_SQL: &str =
-    "SELECT repository_id FROM maven_flat_object_owner WHERE storage_key = $1 LIMIT 2";
+/// `(storage_backend, storage_key)` primary key means this yields at most one
+/// owner per backend.
+const OWNER_BY_ATTRIBUTION_TABLE_SQL: &str = "SELECT repository_id FROM maven_flat_object_owner \
+     WHERE storage_key = $1 AND storage_backend = $2 LIMIT 2";
 
 /// Outcome of a single attribution-layer lookup.
 enum LayerResult {
@@ -76,10 +89,17 @@ enum LayerResult {
     Ambiguous,
 }
 
-/// Run one `storage_key`-parameterized owner lookup and classify the result.
-async fn query_layer(db: &PgPool, sql: &str, storage_key: &str) -> Result<LayerResult> {
+/// Run one owner lookup (parameterized by storage_key + storage_backend) and
+/// classify the result.
+async fn query_layer(
+    db: &PgPool,
+    sql: &str,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<LayerResult> {
     let owners: Vec<Uuid> = sqlx::query_scalar(sql)
         .bind(storage_key)
+        .bind(storage_backend)
         .fetch_all(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -90,18 +110,23 @@ async fn query_layer(db: &PgPool, sql: &str, storage_key: &str) -> Result<LayerR
     })
 }
 
-/// Resolve the owner of a flat key directly (without checksum-suffix stripping):
-/// (a) a live `artifacts` row, then (b) a live parent artifact whose metadata
-/// `files[]` references the key, then (c) the `maven_flat_object_owner` table.
-/// A layer that names two or more repositories is ambiguous and resolves to
+/// Resolve the owner of a flat key on `storage_backend` directly (without
+/// checksum-suffix stripping): (a) a live `artifacts` row, then (b) a live
+/// parent artifact whose metadata `files[]` references the key, then (c) the
+/// `maven_flat_object_owner` table -- each restricted to the same backend. A
+/// layer that names two or more repositories is ambiguous and resolves to
 /// `None` (no tenant may read it) rather than arbitrarily picking one owner.
-async fn resolve_direct(db: &PgPool, storage_key: &str) -> Result<Option<Uuid>> {
+async fn resolve_direct(
+    db: &PgPool,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<Option<Uuid>> {
     for sql in [
         OWNER_BY_ARTIFACT_ROW_SQL,
         OWNER_BY_METADATA_FILES_SQL,
         OWNER_BY_ATTRIBUTION_TABLE_SQL,
     ] {
-        match query_layer(db, sql, storage_key).await? {
+        match query_layer(db, sql, storage_backend, storage_key).await? {
             LayerResult::Absent => continue,
             LayerResult::Owner(owner) => return Ok(Some(owner)),
             LayerResult::Ambiguous => return Ok(None),
@@ -110,19 +135,26 @@ async fn resolve_direct(db: &PgPool, storage_key: &str) -> Result<Option<Uuid>> 
     Ok(None)
 }
 
-/// Resolve the single repository that owns the physical object at `storage_key`,
-/// or `None` when the key is unattributed (unowned, or ambiguous across
-/// repositories). Resolution order: (a) live `artifacts` row, (b) live parent
-/// artifact metadata `files[]`, (c) `maven_flat_object_owner` table, and if the
-/// key is a checksum/signature sidecar, (d) strip the suffix and resolve the
-/// base key the same way.
-pub async fn attributed_owner(db: &PgPool, storage_key: &str) -> Result<Option<Uuid>> {
-    if let Some(owner) = resolve_direct(db, storage_key).await? {
+/// Resolve the single repository that owns the physical object at
+/// (`storage_backend`, `storage_key`), or `None` when the key is unattributed
+/// (unowned, or ambiguous across repositories on that backend). The backend is
+/// part of the object's physical identity: the same flat key on two different
+/// backends names two distinct objects with independent owners (#2671).
+/// Resolution order: (a) live `artifacts` row, (b) live parent artifact metadata
+/// `files[]`, (c) `maven_flat_object_owner` table, and if the key is a
+/// checksum/signature sidecar, (d) strip the suffix and resolve the base key the
+/// same way.
+pub async fn attributed_owner(
+    db: &PgPool,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<Option<Uuid>> {
+    if let Some(owner) = resolve_direct(db, storage_backend, storage_key).await? {
         return Ok(Some(owner));
     }
     // (d) Checksum/signature sidecar: inherit the base object's owner.
     if let Some(base) = strip_checksum_suffix(storage_key) {
-        if let Some(owner) = resolve_direct(db, base).await? {
+        if let Some(owner) = resolve_direct(db, storage_backend, base).await? {
             return Ok(Some(owner));
         }
     }
@@ -146,17 +178,26 @@ pub async fn flat_key_readable(
     if storage_backend == "filesystem" {
         return true;
     }
-    matches!(attributed_owner(db, storage_key).await, Ok(Some(owner)) if owner == repository_id)
+    matches!(
+        attributed_owner(db, storage_backend, storage_key).await,
+        Ok(Some(owner)) if owner == repository_id
+    )
 }
 
 /// Insert a single first-writer-wins claim row (racing claims resolved by the
-/// primary-key `ON CONFLICT DO NOTHING`).
-async fn insert_claim(db: &PgPool, repository_id: Uuid, storage_key: &str) -> Result<()> {
+/// `(storage_backend, storage_key)` primary-key `ON CONFLICT DO NOTHING`).
+async fn insert_claim(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO maven_flat_object_owner (storage_key, repository_id, source) \
-         VALUES ($1, $2, 'write_claim') \
-         ON CONFLICT (storage_key) DO NOTHING",
+        "INSERT INTO maven_flat_object_owner (storage_backend, storage_key, repository_id, source) \
+         VALUES ($1, $2, $3, 'write_claim') \
+         ON CONFLICT (storage_backend, storage_key) DO NOTHING",
     )
+    .bind(storage_backend)
     .bind(storage_key)
     .bind(repository_id)
     .execute(db)
@@ -188,7 +229,7 @@ pub async fn guard_flat_key_writable(
     if storage_backend == "filesystem" {
         return Ok(());
     }
-    match attributed_owner(db, storage_key).await? {
+    match attributed_owner(db, storage_backend, storage_key).await? {
         Some(owner) if owner != repository_id => Err(AppError::Authorization(format!(
             "storage key '{storage_key}' is owned by another repository; \
              refusing cross-repository overwrite"
@@ -220,7 +261,7 @@ pub async fn claim_flat_key_on_write(
     if storage_backend == "filesystem" {
         return Ok(());
     }
-    insert_claim(db, repository_id, storage_key).await
+    insert_claim(db, repository_id, storage_backend, storage_key).await
 }
 
 #[cfg(test)]
@@ -271,10 +312,11 @@ mod tests {
             return;
         };
         let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
         let key = format!("maven/com/acme/live/1.0/live-1.0-{}.jar", Uuid::new_v4());
         seed_artifact(&pool, repo_a, "com/acme/live/1.0/live-1.0.jar", &key).await;
         assert_eq!(
-            attributed_owner(&pool, &key).await.expect("query"),
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
             Some(repo_a)
         );
         tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
@@ -286,12 +328,15 @@ mod tests {
             return;
         };
         let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
         let base = format!("maven/com/acme/cs/1.0/cs-1.0-{}.jar", Uuid::new_v4());
         seed_artifact(&pool, repo_a, "com/acme/cs/1.0/cs-1.0.jar", &base).await;
         // The .sha1 sidecar has no row of its own but inherits the base owner.
         let checksum = format!("{base}.sha1");
         assert_eq!(
-            attributed_owner(&pool, &checksum).await.expect("query"),
+            attributed_owner(&pool, "s3", &checksum)
+                .await
+                .expect("query"),
             Some(repo_a)
         );
         tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
@@ -303,7 +348,10 @@ mod tests {
             return;
         };
         let key = format!("maven/com/acme/orphan/{}/orphan.pom", Uuid::new_v4());
-        assert_eq!(attributed_owner(&pool, &key).await.expect("query"), None);
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -313,13 +361,19 @@ mod tests {
         };
         let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
         let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
-        // Two repositories hold a live row at the SAME flat key (legacy
-        // pre-#2504 multi-owner state). The key is ambiguous, so it is
-        // attributed to neither -- 404 for both tenants, not an arbitrary pick.
+        // Two repositories on the SAME backend hold a live row at the SAME flat
+        // key (legacy pre-#2504 multi-owner state on one shared namespace). The
+        // key is ambiguous, so it is attributed to neither -- 404 for both
+        // tenants, not an arbitrary pick.
+        set_repo_backend(&pool, repo_a, "s3").await;
+        set_repo_backend(&pool, repo_b, "s3").await;
         let key = format!("maven/com/acme/amb/1.0/amb-1.0-{}.jar", Uuid::new_v4());
         seed_artifact(&pool, repo_a, "com/acme/amb/1.0/amb-1.0.jar", &key).await;
         seed_artifact(&pool, repo_b, "com/acme/amb/1.0/amb-1.0.jar", &key).await;
-        assert_eq!(attributed_owner(&pool, &key).await.expect("query"), None);
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            None
+        );
         assert!(!flat_key_readable(&pool, repo_a, "s3", &key).await);
         assert!(!flat_key_readable(&pool, repo_b, "s3", &key).await);
         tdh::cleanup(&pool, repo_b, Uuid::nil()).await;
@@ -333,6 +387,8 @@ mod tests {
         };
         let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
         let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
+        set_repo_backend(&pool, repo_b, "s3").await;
         let key = format!("maven/com/acme/pol/1.0/pol-1.0-{}.jar", Uuid::new_v4());
         seed_artifact(&pool, repo_b, "com/acme/pol/1.0/pol-1.0.jar", &key).await;
 
@@ -367,7 +423,7 @@ mod tests {
             .await
             .expect("unowned key allowed to proceed");
         assert_eq!(
-            attributed_owner(&pool, &key).await.expect("query"),
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
             None,
             "guard must not create a claim before the write succeeds"
         );
@@ -378,7 +434,7 @@ mod tests {
             .await
             .expect("claim on write success");
         assert_eq!(
-            attributed_owner(&pool, &key).await.expect("query"),
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
             Some(repo_a)
         );
         // No speculative claim ROW is inserted for the derived checksum key --
@@ -410,7 +466,12 @@ mod tests {
         claim_flat_key_on_write(&pool, repo_b, "filesystem", &fs_key)
             .await
             .expect("filesystem claim is a no-op");
-        assert_eq!(attributed_owner(&pool, &fs_key).await.expect("query"), None);
+        assert_eq!(
+            attributed_owner(&pool, "filesystem", &fs_key)
+                .await
+                .expect("query"),
+            None
+        );
 
         clear_claims(&pool, &[repo_a, repo_b]).await;
         tdh::cleanup(&pool, repo_b, Uuid::nil()).await;
@@ -436,11 +497,108 @@ mod tests {
             .expect("guard allows unowned key to proceed");
 
         // No owner row was created, so nobody can read the key on cloud (404).
-        assert_eq!(attributed_owner(&pool, &key).await.expect("query"), None);
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            None
+        );
         assert!(!flat_key_readable(&pool, attacker, "s3", &key).await);
 
         clear_claims(&pool, &[attacker]).await;
         tdh::cleanup(&pool, attacker, Uuid::nil()).await;
+    }
+
+    async fn set_repo_backend(pool: &PgPool, repo_id: Uuid, backend: &str) {
+        sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+            .bind(backend)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set repo backend");
+    }
+
+    /// #2671 regression: on a MIXED-backend deployment the same flat storage
+    /// key names two physically distinct objects (one per cloud). Attribution
+    /// must be qualified by backend so each tenant resolves to ITSELF as the
+    /// single owner of its own object, instead of both collapsing onto one
+    /// `storage_key`-only PK row that reads as ambiguous and fails closed
+    /// (404 read / 403 write) for BOTH tenants.
+    ///
+    /// This test FAILS on the pre-fix code (`attributed_owner` ignored the
+    /// backend, so the two live rows collided into an ambiguous result and
+    /// `flat_key_readable` returned false for both) and PASSES after the fix
+    /// (migration 168 + backend-scoped resolution).
+    #[tokio::test]
+    async fn test_mixed_backend_same_key_no_collision_2671() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_s3, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_gcs, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // The two repositories live on two DIFFERENT cloud backends.
+        set_repo_backend(&pool, repo_s3, "s3").await;
+        set_repo_backend(&pool, repo_gcs, "gcs").await;
+
+        // The SAME flat storage key -- the same Maven GAV maps to the same key
+        // string, but the two objects are physically distinct (one in S3, one
+        // in GCS).
+        let key = format!("maven/com/acme/mix/1.0/mix-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_s3, "com/acme/mix/1.0/mix-1.0.jar", &key).await;
+        seed_artifact(&pool, repo_gcs, "com/acme/mix/1.0/mix-1.0.jar", &key).await;
+
+        // Each backend's object resolves to its OWN single owner -- no collision.
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            Some(repo_s3),
+            "the s3 object must attribute to the s3 repository"
+        );
+        assert_eq!(
+            attributed_owner(&pool, "gcs", &key).await.expect("query"),
+            Some(repo_gcs),
+            "the gcs object must attribute to the gcs repository"
+        );
+
+        // Each tenant can read its OWN object on its OWN backend (the bug made
+        // both 404).
+        assert!(
+            flat_key_readable(&pool, repo_s3, "s3", &key).await,
+            "s3 tenant must read its own object"
+        );
+        assert!(
+            flat_key_readable(&pool, repo_gcs, "gcs", &key).await,
+            "gcs tenant must read its own object"
+        );
+
+        // Cross-backend isolation still holds: neither owns the other's object.
+        assert!(!flat_key_readable(&pool, repo_s3, "gcs", &key).await);
+        assert!(!flat_key_readable(&pool, repo_gcs, "s3", &key).await);
+
+        // And write attribution is likewise per-backend: each may claim/own its
+        // own object without the other's claim blocking it (#2671, write side).
+        let wkey = format!("maven/com/acme/mix/1.0/mix-1.0-{}.pom", Uuid::new_v4());
+        claim_flat_key_on_write(&pool, repo_s3, "s3", &wkey)
+            .await
+            .expect("s3 claim");
+        claim_flat_key_on_write(&pool, repo_gcs, "gcs", &wkey)
+            .await
+            .expect("gcs claim must not collide with the s3 claim");
+        guard_flat_key_writable(&pool, repo_s3, "s3", &wkey)
+            .await
+            .expect("s3 owner re-write allowed");
+        guard_flat_key_writable(&pool, repo_gcs, "gcs", &wkey)
+            .await
+            .expect("gcs owner re-write allowed");
+        assert_eq!(
+            attributed_owner(&pool, "s3", &wkey).await.expect("query"),
+            Some(repo_s3)
+        );
+        assert_eq!(
+            attributed_owner(&pool, "gcs", &wkey).await.expect("query"),
+            Some(repo_gcs)
+        );
+
+        clear_claims(&pool, &[repo_s3, repo_gcs]).await;
+        tdh::cleanup(&pool, repo_gcs, Uuid::nil()).await;
+        tdh::cleanup(&pool, repo_s3, Uuid::nil()).await;
     }
 
     async fn clear_claims(pool: &PgPool, repos: &[Uuid]) {
