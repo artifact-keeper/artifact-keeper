@@ -183,10 +183,13 @@ pub struct OciBlobRepoFootprint {
     pub repository_id: Uuid,
     /// Number of `oci_blobs` rows attributed to this repository.
     pub blob_rows: i64,
-    /// Sum of `oci_blobs.size_bytes` for this repository's rows. Because OCI
-    /// blob storage is content-addressed and deduplicated across repos, the
+    /// Sum of `oci_blobs.size_bytes` for this repository's rows. On shared
+    /// backends (anything other than `filesystem`) blobs are deduplicated
+    /// across repos — one physical object per digest per backend — so the
     /// same physical bytes can be counted under more than one repository
-    /// here; see [`OciBlobFootprintReport::physical_bytes`] for the
+    /// here. On `filesystem` each repository stores its own independent
+    /// copy under its `storage_path`, so its rows are that repo's real
+    /// bytes. See [`OciBlobFootprintReport::physical_bytes`] for the
     /// dedup-aware total.
     pub logical_bytes: i64,
 }
@@ -199,20 +202,23 @@ pub struct OciBlobRepoFootprint {
 /// layers before any garbage-collection mechanism is enabled.
 ///
 /// It deliberately does NOT attempt to classify which blobs are
-/// "reclaimable orphans": that requires a manifest -> blob reference table
-/// that does not yet exist in the schema, and any per-`(repository_id,
-/// digest)` orphan heuristic would mis-handle the cross-repo dedup case
-/// (multiple `oci_blobs` rows, one physical object) and report in-use
-/// blobs as reclaimable. The numbers here are exact aggregates only.
+/// "reclaimable orphans": that is the blob GC's job (mark-and-sweep over
+/// `manifest_blob_refs`, per [`BLOB_PROTECTED_BY_REFS_SQL`]). A naive
+/// per-`(repository_id, digest)` orphan heuristic would mis-handle shared
+/// backends (anything other than `filesystem`), where all referencing
+/// repos share ONE physical object per digest per backend, and report
+/// in-use blobs as reclaimable; on `filesystem` each repository keeps an
+/// independent copy under its own `storage_path`. The numbers here are
+/// exact aggregates only.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct OciBlobFootprintReport {
     /// Total number of `oci_blobs` rows across all repositories.
     pub total_blob_rows: i64,
     /// Number of distinct blob digests (content-addressed identities). When
     /// this is smaller than `total_blob_rows`, the difference is cross-repo
-    /// sharing of a content identity (one physical object per sharing repo
-    /// on shared backends; an independent copy per repository on
-    /// `filesystem`).
+    /// sharing of a content identity (one physical object shared by all
+    /// referencing repos on shared backends; an independent copy per
+    /// repository on `filesystem`).
     pub distinct_digests: i64,
     /// Sum of `size_bytes` over every `oci_blobs` row. Double-counts
     /// deduplicated blobs once per referencing repository.
@@ -1063,7 +1069,16 @@ impl StorageGcService {
         // `size_bytes` is MAX within a group (rows for the same digest
         // share a size) and `first_seen` is the group's oldest row.
         // `distinct_digests` stays digest-level (content identities),
-        // independent of how many physical copies exist.
+        // independent of how many physical copies exist; counting it over
+        // `per_object` equals counting over `oci_blobs` directly (the NOT
+        // NULL `repository_id` FK means the join drops no rows) and saves
+        // a fourth scan of the table.
+        //
+        // DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
+        // mark-and-sweep marker, migration 141) are INCLUDED in every
+        // figure — marked-but-not-yet-swept bytes are still physically on
+        // disk, and this is a footprint view. Do not "fix" by excluding
+        // them.
         //
         // `grace_hours` binds as int8, but `make_interval` only defines int4
         // named parameters, so the SQL must cast `$1::int` or Postgres
@@ -1088,7 +1103,7 @@ impl StorageGcService {
                 (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
                 (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
                    FROM oci_blobs)                                     AS logical_bytes,
-                (SELECT COUNT(DISTINCT digest) FROM oci_blobs)         AS distinct_digests,
+                COUNT(DISTINCT digest)                                 AS distinct_digests,
                 COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
                 COUNT(DISTINCT digest) FILTER (
                     WHERE first_seen < NOW() - make_interval(hours => $1::int)
