@@ -25,7 +25,117 @@ pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METAD
 use crate::storage::StorageLocation;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+// ---------------------------------------------------------------------------
+// Global buffered-proxy-metadata byte budget (#2665)
+// ---------------------------------------------------------------------------
+
+/// Default ceiling on the TOTAL bytes the buffered proxy-metadata path may hold
+/// resident across ALL in-flight requests (#2665). 1 GiB — eight worst-case
+/// [`LARGE_METADATA_MAX_BYTES`] (128 MiB) buffers, or many more realistically
+/// sized ones — chosen so a legitimate concurrent `dnf` refresh does not block
+/// while a hostile fan-out cannot drive resident memory unbounded.
+pub const DEFAULT_PROXY_METADATA_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Env override for [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]. A blank,
+/// non-numeric, or zero value falls back to the default.
+pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTES";
+
+/// A process-wide byte budget bounding the TOTAL memory the *buffered*
+/// proxy-metadata path may hold resident at once, independent of request
+/// concurrency (#2665).
+///
+/// The buffered metadata fetch ([`proxy_fetch_capped`], used by the RPM repodata
+/// proxy) reads the whole upstream/cached document into a [`Bytes`] before
+/// responding. A per-request cap ([`LARGE_METADATA_MAX_BYTES`]) bounds ONE
+/// request, but nothing bounded the *sum* over concurrent requests: N anonymous,
+/// un-rate-limited requests each buffering up to the cap put ~N×cap resident (a
+/// realistic ~15 GiB from a cached ~30 MiB `filelists`). Cache hits made this
+/// worse — they return before the single-flight coordinator, so even cached
+/// responses each buffered independently.
+///
+/// This budget caps that sum: each buffered fetch reserves permits (one per
+/// byte, up to the cap) BEFORE it buffers and releases them once the buffered
+/// body has been handed to the response writer, so total concurrent buffering
+/// can never exceed `total_bytes`. Once the budget is exhausted, further
+/// requests await a reservation (bounded queueing) instead of admitting
+/// unbounded buffers. Mirrors the byte-bounded `scan_extraction_semaphore`
+/// pattern (`permits × per-item-cap` resident ceiling) already used by the
+/// scanner.
+pub struct ProxyMetadataBudget {
+    sem: Arc<Semaphore>,
+    total: usize,
+}
+
+impl ProxyMetadataBudget {
+    /// Build a budget of `total_bytes`, clamped to `[1, u32::MAX]` (and to
+    /// [`Semaphore::MAX_PERMITS`]). A single reservation is always `<=` the
+    /// per-request cap, far below `u32::MAX`, so it stays inside the acquirable
+    /// range.
+    pub fn new(total_bytes: usize) -> Self {
+        let ceiling = (u32::MAX as usize).min(Semaphore::MAX_PERMITS);
+        let total = total_bytes.clamp(1, ceiling);
+        Self {
+            sem: Arc::new(Semaphore::new(total)),
+            total,
+        }
+    }
+
+    /// Total budget in bytes.
+    pub fn total_bytes(&self) -> usize {
+        self.total
+    }
+
+    /// Currently unreserved bytes (observability / test helper).
+    pub fn available_bytes(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    fn permits_for(&self, bytes: usize) -> u32 {
+        // A single request can reserve at most the whole budget, so an oversized
+        // request degrades to "hold the whole budget" rather than deadlocking on
+        // a permit count the semaphore can never satisfy.
+        bytes.clamp(1, self.total) as u32
+    }
+
+    /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
+    /// returned permit releases the reservation on drop — hold it for as long
+    /// as the buffered bytes are resident.
+    pub async fn reserve(&self, bytes: usize) -> OwnedSemaphorePermit {
+        // `acquire_many_owned` only errors when the semaphore is closed; this
+        // one lives for the process lifetime and is never closed.
+        Arc::clone(&self.sem)
+            .acquire_many_owned(self.permits_for(bytes))
+            .await
+            .expect("proxy metadata budget semaphore is never closed")
+    }
+
+    /// Non-blocking reservation: `None` when the budget cannot currently satisfy
+    /// `bytes`. Used to prove the bound rejects once exhausted.
+    pub fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.sem)
+            .try_acquire_many_owned(self.permits_for(bytes))
+            .ok()
+    }
+}
+
+/// Process-wide buffered-proxy-metadata byte budget (#2665). Sized once from
+/// [`PROXY_METADATA_BUDGET_BYTES_ENV`] (default
+/// [`DEFAULT_PROXY_METADATA_BUDGET_BYTES`]); lives for the process lifetime.
+pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
+    static BUDGET: OnceLock<ProxyMetadataBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let total = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_PROXY_METADATA_BUDGET_BYTES);
+        ProxyMetadataBudget::new(total)
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -4544,6 +4654,98 @@ pub(crate) fn build_remote_repo_with_format(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── Global buffered-metadata byte budget (#2665) ─────────────────
+    //
+    // Before this fix the buffered proxy-metadata path (RPM repodata) had a
+    // per-request cap but NO bound on total concurrent buffering: N requests
+    // each buffered up to the cap, so resident memory scaled with concurrency
+    // (~512× the cap in the issue). These pin the primitive that bounds the
+    // SUM, so total resident buffered bytes can never exceed the budget.
+
+    #[test]
+    fn proxy_metadata_budget_bounds_total_concurrent_reservation() {
+        // A budget of 3× the per-request cap admits exactly three cap-sized
+        // reservations, then REJECTS the fourth until one releases — this is
+        // the total-memory bound that was absent (unbounded per-request
+        // buffering) before #2665.
+        let cap = LARGE_METADATA_MAX_BYTES;
+        let budget = ProxyMetadataBudget::new(cap * 3);
+
+        let p1 = budget.try_reserve(cap).expect("1st reservation fits");
+        let p2 = budget.try_reserve(cap).expect("2nd reservation fits");
+        let _p3 = budget.try_reserve(cap).expect("3rd reservation fits");
+        assert_eq!(budget.available_bytes(), 0, "budget fully reserved");
+
+        // A fourth concurrent buffer would exceed the total budget: rejected.
+        assert!(
+            budget.try_reserve(cap).is_none(),
+            "budget must reject a reservation beyond the total budget"
+        );
+
+        // Releasing one reservation frees exactly its bytes for the next.
+        drop(p2);
+        assert_eq!(budget.available_bytes(), cap);
+        let _p4 = budget
+            .try_reserve(cap)
+            .expect("reservation fits again after a release");
+        drop((p1, _p3, _p4));
+        assert_eq!(budget.available_bytes(), cap * 3, "all bytes returned");
+    }
+
+    #[test]
+    fn proxy_metadata_budget_clamps_oversized_reservation_to_total() {
+        // A single request larger than the whole budget must not deadlock: it
+        // degrades to holding the entire budget, never requests an
+        // unsatisfiable permit count.
+        let budget = ProxyMetadataBudget::new(1024);
+        let p = budget.try_reserve(usize::MAX).expect("clamped to total");
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(1).is_none());
+        drop(p);
+        assert_eq!(budget.available_bytes(), 1024);
+    }
+
+    #[tokio::test]
+    async fn proxy_metadata_budget_queues_until_release() {
+        // The async reserve() path QUEUES when the budget is exhausted and
+        // unblocks on release — requests wait (bounded) rather than admitting
+        // unbounded concurrent buffers.
+        let budget = Arc::new(ProxyMetadataBudget::new(LARGE_METADATA_MAX_BYTES));
+        let held = budget.reserve(LARGE_METADATA_MAX_BYTES).await;
+        assert_eq!(budget.available_bytes(), 0);
+
+        let waiter_budget = Arc::clone(&budget);
+        let waiter =
+            tokio::spawn(async move { waiter_budget.reserve(LARGE_METADATA_MAX_BYTES).await });
+        // Let the waiter park on the exhausted budget.
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a second full reservation must queue while the budget is exhausted"
+        );
+
+        drop(held);
+        let _got = waiter
+            .await
+            .expect("waiter joins once the budget is released");
+        assert_eq!(
+            budget.available_bytes(),
+            0,
+            "the released budget is handed straight to the queued waiter"
+        );
+    }
+
+    #[test]
+    fn proxy_metadata_budget_defaults_admit_a_full_metadata_buffer() {
+        // The process-wide budget must admit at least one full LARGE metadata
+        // buffer, so a legitimate lone request never blocks.
+        let budget = proxy_metadata_budget();
+        assert!(
+            budget.total_bytes() >= LARGE_METADATA_MAX_BYTES,
+            "shared budget must fit at least one full RPM metadata buffer"
+        );
+    }
 
     // ── Package Age Policy quarantine surfacing (#1770) ──────────────
 
