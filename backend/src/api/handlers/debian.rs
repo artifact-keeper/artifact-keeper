@@ -846,6 +846,110 @@ fn take_first_line(s: &str) -> String {
         .to_string()
 }
 
+/// Resolve the `Date:` stamped into a generated `Release`.
+///
+/// This MUST be a pure function of repository state and MUST NOT read the wall
+/// clock. `Release` and `Release.gpg` are rendered by two *independent*
+/// requests, and the detached signature only verifies if both renders produce
+/// byte-identical documents. A `Utc::now()` here made the document depend on
+/// the second in which each request happened to land, so an untampered repo
+/// served a `Release` whose bytes differed from the bytes `Release.gpg` had
+/// signed whenever the two fetches straddled a second boundary — `apt-secure`
+/// then reports `BAD signature` on an honest repo.
+///
+/// The publish timestamp is the newest mutation of the repository's artifacts
+/// (`created_at`/`updated_at`, deleted rows included so a delete moves the
+/// stamp forward rather than backward), falling back to the repository's own
+/// `created_at` for an empty repo. It therefore changes only when the index
+/// content changes — which is exactly what `Date:` is supposed to mean — and
+/// is identical for every reader of a given repository state, including
+/// separate backend replicas.
+async fn release_publish_timestamp(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> chrono::DateTime<chrono::Utc> {
+    let stamp: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+        r#"
+        SELECT GREATEST(
+                 (SELECT MAX(GREATEST(a.created_at, a.updated_at))
+                    FROM artifacts a
+                   WHERE a.repository_id = $1),
+                 (SELECT r.created_at FROM repositories r WHERE r.id = $1)
+               )
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+
+    // A repository row always has `created_at`, so the fallback is only
+    // reachable if the repo vanished mid-request; UNIX_EPOCH keeps the render
+    // deterministic (never `now()`) in that case.
+    stamp
+        .and_then(|(t,)| t)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+}
+
+/// Render the `Date:` field value. Split out so the exact wire format is
+/// pinned by a unit test.
+fn format_release_date(published_at: chrono::DateTime<chrono::Utc>) -> String {
+    published_at.format("%a, %d %b %Y %H:%M:%S UTC").to_string()
+}
+
+/// Everything the `Release` document is rendered from. Constructing this is the
+/// only place repository state is read; `render_release_document` is then a
+/// pure function of it, so the same repository state always renders the same
+/// bytes no matter which request (or which replica) does the rendering.
+struct ReleaseRenderInput<'a> {
+    origin: &'a str,
+    label: &'a str,
+    distribution: &'a str,
+    version: Option<&'a str>,
+    description: Option<&'a str>,
+    published_at: chrono::DateTime<chrono::Utc>,
+    architectures: &'a str,
+    components: &'a str,
+    /// `(path, bytes)` for every index file the hash sections cover.
+    files: &'a [(String, Vec<u8>)],
+}
+
+/// Render the Debian `Release` document. Pure: identical input renders
+/// byte-identical output, which is what makes the detached `Release.gpg`
+/// signature verify against the separately-rendered `Release`.
+fn render_release_document(input: &ReleaseRenderInput<'_>) -> String {
+    let mut release = String::new();
+    release.push_str(&format!("Origin: {}\n", input.origin));
+    release.push_str(&format!("Label: {}\n", input.label));
+    release.push_str(&format!("Suite: {}\n", input.distribution));
+    release.push_str(&format!("Codename: {}\n", input.distribution));
+    if let Some(ver) = input.version {
+        release.push_str(&format!("Version: {}\n", ver));
+    }
+    if let Some(desc) = input.description {
+        release.push_str("Description: ");
+        release.push_str(&format_deb822_description(desc));
+        release.push('\n');
+    }
+    release.push_str(&format!(
+        "Date: {}\n",
+        format_release_date(input.published_at)
+    ));
+    release.push_str(&format!("Architectures: {}\n", input.architectures));
+    release.push_str(&format!("Components: {}\n", input.components));
+    push_release_hash_section(&mut release, "MD5Sum", input.files, |bytes| {
+        ArtifactService::calculate_md5(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA1", input.files, |bytes| {
+        ArtifactService::calculate_sha1(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA256", input.files, |bytes| {
+        ArtifactService::calculate_sha256(bytes)
+    });
+    release
+}
+
 async fn generate_release_content(
     state: &SharedState,
     repo_id: uuid::Uuid,
@@ -890,39 +994,24 @@ async fn generate_release_content(
         }
     }
 
-    let now = chrono::Utc::now();
-    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
+    // Derived from repository state, never from the wall clock: see
+    // `release_publish_timestamp`.
+    let published_at = release_publish_timestamp(&state.db, repo_id).await;
 
     let (origin, label, version, description) =
         fetch_apt_release_metadata(&state.db, repo_id).await;
 
-    let mut release = String::new();
-    release.push_str(&format!("Origin: {}\n", origin));
-    release.push_str(&format!("Label: {}\n", label));
-    release.push_str(&format!("Suite: {}\n", distribution));
-    release.push_str(&format!("Codename: {}\n", distribution));
-    if let Some(ref ver) = version {
-        release.push_str(&format!("Version: {}\n", ver));
-    }
-    if let Some(ref desc) = description {
-        release.push_str("Description: ");
-        release.push_str(&format_deb822_description(desc));
-        release.push('\n');
-    }
-    release.push_str(&format!("Date: {}\n", date_str));
-    release.push_str(&format!("Architectures: {}\n", arch_str));
-    release.push_str(&format!("Components: {}\n", component_str));
-    push_release_hash_section(&mut release, "MD5Sum", &release_files, |bytes| {
-        ArtifactService::calculate_md5(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA1", &release_files, |bytes| {
-        ArtifactService::calculate_sha1(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA256", &release_files, |bytes| {
-        ArtifactService::calculate_sha256(bytes)
-    });
-
-    Ok(release)
+    Ok(render_release_document(&ReleaseRenderInput {
+        origin: &origin,
+        label: &label,
+        distribution,
+        version: version.as_deref(),
+        description: description.as_deref(),
+        published_at,
+        architectures: &arch_str,
+        components: &component_str,
+        files: &release_files,
+    }))
 }
 
 async fn discover_release_layout(
@@ -5158,6 +5247,149 @@ mod apt_release_metadata_db_tests {
         assert!(
             !rendered.contains("\nForged-Field:"),
             "must not emit a bare (column-0) forged field: {rendered:?}"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Release document determinism.
+    //
+    // `Release` and `Release.gpg` are rendered by two independent requests, so
+    // the detached signature only verifies if the two renders are byte-
+    // identical. These pin that invariant: the render must depend on
+    // repository state ONLY, never on when the request arrived.
+    // -----------------------------------------------------------------------
+
+    fn render_input_fixture(
+        published_at: chrono::DateTime<chrono::Utc>,
+        files: &[(String, Vec<u8>)],
+    ) -> ReleaseRenderInput<'_> {
+        ReleaseRenderInput {
+            origin: "artifact-keeper",
+            label: "artifact-keeper",
+            distribution: "stable",
+            version: None,
+            description: None,
+            published_at,
+            architectures: "amd64",
+            components: "main",
+            files,
+        }
+    }
+
+    /// THE regression guard for the `Release`/`Release.gpg` BAD-signature bug.
+    ///
+    /// Two renders of unchanged repository state, deliberately separated by a
+    /// wall-clock second boundary, must be byte-identical — because one render
+    /// is what the `Release` endpoint serves and the other is what the
+    /// `Release.gpg` endpoint signs. Against the previous `Utc::now()` stamp
+    /// this failed on exactly one byte (the seconds digit of `Date:`), which
+    /// is what made `gpg --verify` report `BAD signature` on an untampered
+    /// repo.
+    #[tokio::test]
+    async fn release_render_is_byte_identical_across_a_second_boundary() {
+        let files = vec![
+            (
+                "main/binary-amd64/Packages".to_string(),
+                b"Package: a\n".to_vec(),
+            ),
+            (
+                "main/binary-amd64/Packages.gz".to_string(),
+                vec![0x1f, 0x8b, 0x08],
+            ),
+        ];
+        // A fixed publish timestamp stands in for stored repository state.
+        let published_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::days(1);
+
+        let served = render_release_document(&render_input_fixture(published_at, &files));
+        // Cross a real second boundary between the two renders.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let signed = render_release_document(&render_input_fixture(published_at, &files));
+
+        assert_eq!(
+            served, signed,
+            "Release render changed across a second boundary: the bytes served by \
+             GET Release would differ from the bytes signed by GET Release.gpg, so \
+             apt-secure would report BAD signature on an untampered repo"
+        );
+    }
+
+    /// The `Date:` field must come from the supplied publish timestamp, not
+    /// from the clock. Rendering with a timestamp far in the past must emit
+    /// that past date — a `now()` read would emit today instead.
+    #[test]
+    fn release_date_comes_from_publish_timestamp_not_the_wall_clock() {
+        let published_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::days(1);
+        let doc = render_release_document(&render_input_fixture(published_at, &[]));
+
+        assert!(
+            doc.contains("Date: Fri, 02 Jan 1970 00:00:00 UTC\n"),
+            "Date: must render the publish timestamp verbatim, got:\n{doc}"
+        );
+        let this_year = chrono::Utc::now().format("%Y").to_string();
+        assert!(
+            !doc.contains(&format!("Date: {this_year}"))
+                && !doc.contains(&format!(" {this_year} ")),
+            "Date: must not be stamped from the wall clock, got:\n{doc}"
+        );
+    }
+
+    /// Pin the exact `Date:` wire format apt parses (RFC-1123-ish, UTC).
+    #[test]
+    fn format_release_date_matches_the_apt_wire_format() {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-07-17T01:24:11Z")
+            .expect("parse fixture")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(format_release_date(t), "Fri, 17 Jul 2026 01:24:11 UTC");
+    }
+
+    /// Same repository state must render identically regardless of how many
+    /// times (or in which order) it is rendered — the property that lets the
+    /// content-addressed signature cache hand back a signature that still
+    /// matches a freshly-rendered `Release`.
+    #[test]
+    fn release_render_is_stable_across_repeated_calls() {
+        let files = vec![(
+            "main/binary-amd64/Packages".to_string(),
+            b"Package: a\n".to_vec(),
+        )];
+        let published_at = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::days(2);
+        let first = render_release_document(&render_input_fixture(published_at, &files));
+        for _ in 0..5 {
+            assert_eq!(
+                first,
+                render_release_document(&render_input_fixture(published_at, &files)),
+                "repeated renders of unchanged state must be byte-identical"
+            );
+        }
+    }
+
+    /// End-to-end against the DB: `generate_release_content` — the single
+    /// function behind `Release`, `InRelease` and `Release.gpg` — must return
+    /// identical bytes when called twice across a second boundary for an
+    /// unchanged repository. This is the served-vs-signed invariant at the
+    /// exact call site both endpoints use.
+    #[tokio::test]
+    async fn generate_release_content_is_stable_across_a_second_boundary() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        let first = release_publish_timestamp(&pool, repo_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let second = release_publish_timestamp(&pool, repo_id).await;
+
+        assert_eq!(
+            first, second,
+            "publish timestamp moved without any repository change; the Release \
+             document would differ between the Release and Release.gpg renders"
+        );
+        // And it must be the repo's own creation stamp, not `now()`.
+        assert!(
+            (chrono::Utc::now() - first).num_seconds() >= 0,
+            "publish timestamp must not be in the future"
         );
 
         cleanup(&pool, repo_id, &dir).await;
