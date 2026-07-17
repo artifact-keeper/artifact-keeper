@@ -13,6 +13,7 @@ use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryFormat;
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
@@ -131,17 +132,6 @@ async fn create_key(
 ) -> Result<Json<SigningKeyPublic>> {
     require_signing_admin(&auth)?;
 
-    // Validate a repository-scoped key names an existing repository before
-    // handing off to the signing service. Without this, a nonexistent
-    // repository_id hits the FK constraint at INSERT and surfaces as an opaque
-    // 500 DATABASE_ERROR; `get_by_id` returns a clean NotFound (404) instead.
-    // Global keys (repository_id = None) carry no FK and skip the lookup.
-    if let Some(repo_id) = payload.repository_id {
-        RepositoryService::new(state.db.clone())
-            .get_by_id(repo_id)
-            .await?;
-    }
-
     // Normalize the key family / algorithm pair before handing off to the
     // signing service. Clients commonly send the algorithm variant
     // ("rsa2048"/"rsa4096") as the key_type; without normalization that value
@@ -150,6 +140,25 @@ async fn create_key(
     // returns a clean Validation (400) instead.
     let (key_type, algorithm) =
         resolve_key_type_and_algorithm(payload.key_type, payload.algorithm)?;
+
+    // Validate a repository-scoped key names an existing repository before
+    // handing off to the signing service. Without this, a nonexistent
+    // repository_id hits the FK constraint at INSERT and surfaces as an opaque
+    // 500 DATABASE_ERROR; `get_by_id` returns a clean NotFound (404) instead.
+    // Global keys (repository_id = None) carry no FK and skip the lookup.
+    if let Some(repo_id) = payload.repository_id {
+        let repo = RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+
+        // Fail fast on an impossible signing config (#2651): a repository whose
+        // metadata is OpenPGP-signed (Debian InRelease/Release.gpg, RPM
+        // repomd.xml.asc) can only ever be served with a key_type='gpg' key.
+        // Accepting an rsa/ed25519 key here lets the repo boot green and then
+        // fail every anonymous `apt`/`dnf` metadata poll at request time.
+        // Reject the combination at config time with an actionable error.
+        validate_key_type_for_repo_format(&repo.format, &key_type).map_err(AppError::Validation)?;
+    }
 
     let svc = signing_service(&state);
     let key = svc
@@ -190,6 +199,38 @@ fn resolve_key_type_and_algorithm(
         }
     });
     Ok((family, algorithm))
+}
+
+/// Reject a signing `key_type` that can never satisfy `format`'s metadata
+/// signing, at key-creation (config) time rather than at anonymous request time
+/// (#2651).
+///
+/// Debian (`InRelease`/`Release.gpg`) and RPM (`repomd.xml.asc`) metadata is
+/// signed with OpenPGP (`SigningService::sign_openpgp_*`), which can only load a
+/// `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
+/// the OpenPGP path can never parse, so such a key lets the repository boot
+/// green and then fail every `apt`/`dnf` metadata poll — a fail-open config
+/// trap. This turns that latent request-time failure into an actionable 400 at
+/// the point an operator configures the key.
+///
+/// Formats that sign metadata with raw RSA (Conda, Alpine, via
+/// `SigningService::sign_data`) and content-signing formats never need OpenPGP,
+/// so they still accept `rsa`/`ed25519` keys — the guard is scoped to the
+/// OpenPGP metadata formats only.
+fn validate_key_type_for_repo_format(
+    format: &RepositoryFormat,
+    key_type: &str,
+) -> std::result::Result<(), String> {
+    let requires_openpgp = matches!(format, RepositoryFormat::Debian | RepositoryFormat::Rpm);
+    if requires_openpgp && key_type != "gpg" {
+        return Err(format!(
+            "key_type='{key_type}' cannot sign {format:?} repository metadata. \
+             Debian/RPM metadata (InRelease, Release.gpg, repomd.xml.asc) is OpenPGP-signed \
+             and requires a signing key with key_type='gpg'. Supported key_type for this \
+             repository format: gpg."
+        ));
+    }
+    Ok(())
 }
 
 /// Get a signing key by ID.
@@ -609,6 +650,58 @@ mod tests {
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2651: reject an impossible signing config (rsa/ed25519 key on a repo
+    // whose metadata can only be OpenPGP-signed) at key-creation time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_debian_rejects_rsa_key_type() {
+        // An rsa key holds PKCS#8 RSA material and can never produce the OpenPGP
+        // InRelease/Release.gpg signatures a Debian repo serves, so it must be
+        // rejected at config time rather than failing every anonymous apt poll.
+        let err = validate_key_type_for_repo_format(&RepositoryFormat::Debian, "rsa")
+            .expect_err("rsa must be rejected for Debian metadata signing");
+        assert!(
+            err.contains("rsa"),
+            "error must name the offending key_type: {err}"
+        );
+        assert!(
+            err.contains("gpg"),
+            "error must name the supported key_type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rpm_rejects_rsa_key_type() {
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Rpm, "rsa").is_err());
+    }
+
+    #[test]
+    fn test_debian_rejects_ed25519_key_type() {
+        // ed25519 is not an OpenPGP key either (and is not even generated as a
+        // real ed25519 key — it falls through to RSA keygen), so it also cannot
+        // satisfy the Debian/RPM OpenPGP metadata path.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "ed25519").is_err());
+    }
+
+    #[test]
+    fn test_debian_accepts_gpg_key_type() {
+        // gpg is the only key_type the OpenPGP metadata path can load.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "gpg").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Rpm, "gpg").is_ok());
+    }
+
+    #[test]
+    fn test_non_openpgp_format_accepts_rsa_key_type() {
+        // Conda/Alpine sign metadata with raw RSA (sign_data), and content-signing
+        // formats never need OpenPGP, so rsa/ed25519 keys stay valid there — the
+        // guard is scoped to the OpenPGP metadata formats only.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Conda, "rsa").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Alpine, "rsa").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Maven, "ed25519").is_ok());
     }
 
     fn admin_jwt() -> AuthExtension {
