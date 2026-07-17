@@ -1045,6 +1045,13 @@ impl StorageGcService {
         // so a single physical object is counted once even though it has one
         // row per referencing repository (rows for the same digest share a
         // size, so MAX == the per-object size).
+        //
+        // `grace_hours` binds as int8, but `make_interval` only defines int4
+        // named parameters, so the SQL must cast `$1::int` or Postgres
+        // rejects the call outright (#2626). Safe: clamp_grace_hours caps
+        // the value at 8760. The SUM(...) columns need `::BIGINT` for the
+        // same class of reason: SUM over bigint yields NUMERIC, which the
+        // i64 try_gets below cannot decode — they'd silently fall back to 0.
         let totals_sql = r#"
             WITH per_digest AS (
                 SELECT digest,
@@ -1055,15 +1062,16 @@ impl StorageGcService {
             )
             SELECT
                 (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
-                (SELECT COALESCE(SUM(size_bytes), 0) FROM oci_blobs)   AS logical_bytes,
+                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+                   FROM oci_blobs)                                     AS logical_bytes,
                 COUNT(*)                                               AS distinct_digests,
-                COALESCE(SUM(size_bytes), 0)                           AS physical_bytes,
+                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
                 COUNT(*) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1)
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
                 )                                                      AS aged_distinct_digests,
                 COALESCE(SUM(size_bytes) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1)
-                ), 0)                                                  AS aged_physical_bytes
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                ), 0)::BIGINT                                          AS aged_physical_bytes
             FROM per_digest
         "#;
 
@@ -1077,7 +1085,7 @@ impl StorageGcService {
         let per_repo_sql = r#"
             SELECT repository_id,
                    COUNT(*) AS blob_rows,
-                   COALESCE(SUM(size_bytes), 0) AS logical_bytes
+                   COALESCE(SUM(size_bytes), 0)::BIGINT AS logical_bytes
             FROM oci_blobs
             GROUP BY repository_id
             ORDER BY logical_bytes DESC, repository_id ASC
