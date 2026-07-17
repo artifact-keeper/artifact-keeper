@@ -22,9 +22,13 @@
 //! which means it runs **before** the inner `auth_middleware` /
 //! `optional_auth_middleware` / `repo_visibility_middleware` layers populate
 //! request extensions. To make the gating decision we therefore resolve auth
-//! directly (the same path the optional and visibility middlewares use) and
-//! short-circuit if the path is not allowlisted. Inner middlewares run again on
-//! requests that pass the guard and populate the extensions used by handlers.
+//! directly and short-circuit if the path is not allowlisted. We resolve via
+//! [`extract_visibility_token`] — the same channel-aware extractor the
+//! repo-visibility middleware uses — so the guard honours every credential
+//! channel the handlers accept, including the conda URL-embedded token and the
+//! NuGet push `X-NuGet-ApiKey` header (not just the standard `Authorization` /
+//! `X-API-Key` headers). Inner middlewares run again on requests that pass the
+//! guard and populate the extensions used by handlers.
 //!
 //! We resolve via [`try_resolve_auth_outcome`] and match on the full
 //! [`AuthOutcome`] rather than a boolean "is there a principal?" check, so a
@@ -47,7 +51,7 @@ use axum::{
 use serde_json::json;
 
 use crate::api::middleware::auth::{
-    extract_token, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+    extract_visibility_token, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
 };
 use crate::services::auth_service::AuthService;
 
@@ -157,12 +161,18 @@ pub async fn guest_access_guard(
         return next.run(request).await;
     }
 
-    // Resolve auth from the request headers via `try_resolve_auth_outcome` and
+    // Resolve auth via `extract_visibility_token` (NOT the header-only
+    // `extract_token`) so the guard recognises the SAME credential channels the
+    // repo-visibility middleware and format handlers accept — including the
+    // conda URL-embedded token (`/conda/t/<TOKEN>/...`) and the NuGet push
+    // `X-NuGet-ApiKey` header. Using the narrower `extract_token` here treated a
+    // legitimately-authenticated conda/nuget client as a guest and 401'd it when
+    // guest access was disabled, rendering issues #2631 / #2644 inert. We then
     // match the full outcome so a transient `AuthOutcome::Overloaded` shed
     // becomes a retryable 503 rather than a spurious 401 — see module docs.
     // Inner middlewares re-resolve and populate request extensions for handlers
     // on requests that pass the guard.
-    let extracted = extract_token(&request);
+    let extracted = extract_visibility_token(&request);
     let outcome = try_resolve_auth_outcome(&state.auth_service, extracted).await;
     match guard_short_circuit(&outcome) {
         Some(response) => response,
@@ -524,34 +534,11 @@ mod tests {
         let cfg = Arc::new(config);
         let auth_service = Arc::new(AuthService::new(pool.clone(), cfg.clone()));
 
-        // Insert a real user so the DB watermark check has a row to consult.
-        // Backdate ALL credential-bearing columns so the token's `iat` is
-        // strictly after them and the async validator accepts. This must
-        // include `privileges_changed_at` (migration 131, DEFAULT NOW()): it
-        // is folded into the credential-change watermark GREATEST(...), so
-        // omitting it pins the watermark to insert time and the token minted
-        // microseconds later intermittently 401s under parallel test load.
-        // Runtime `sqlx::query` (not `query!`) keeps SQLX_OFFLINE builds
-        // working without regenerating .sqlx metadata for a test-only insert.
-        let user_id = uuid::Uuid::new_v4();
-        let username = format!("guest_jwt_{}", &user_id.to_string()[..8]);
-        sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
-                                is_active, is_admin, password_changed_at, \
-                                privileges_changed_at, failed_login_attempts, \
-                                created_at, updated_at) \
-             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
-                     NOW() - INTERVAL '60 seconds', \
-                     NOW() - INTERVAL '60 seconds', 0, \
-                     NOW() - INTERVAL '60 seconds', \
-                     NOW() - INTERVAL '60 seconds')",
-        )
-        .bind(user_id)
-        .bind(&username)
-        .bind(format!("{username}@test.com"))
-        .execute(&pool)
-        .await
-        .expect("insert test user");
+        // Insert a real user so the DB watermark check has a row to consult;
+        // `insert_backdated_user` backdates the credential-bearing columns so the
+        // freshly-minted token's `iat` clears the credential-change watermark.
+        let username = format!("guest_jwt_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_backdated_user(&pool, &username).await;
 
         let now = chrono::Utc::now();
         let user = crate::models::user::User {
@@ -653,5 +640,216 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -- issue #2655: guard must honour format-specific credential channels --
+    //
+    // When `GUEST_ACCESS_ENABLED=false` the guard previously resolved auth via
+    // the header-only `extract_token`, so credentials carried on format-specific
+    // channels were invisible to it: the conda URL-embedded token
+    // (`/conda/t/<TOKEN>/...`, added by #2631) and the NuGet `X-NuGet-ApiKey`
+    // push header (added by #2644). A legitimately-authenticated conda/nuget
+    // client was therefore treated as a guest and 401'd, rendering those two
+    // shipped fixes inert. The guard now resolves via `extract_visibility_token`
+    // — the same channel-aware extractor the repo-visibility middleware and the
+    // handlers use — so it honours every credential channel the handlers accept.
+    //
+    // Both channels resolve as `ExtractedToken::ApiKey`, so a single real API
+    // token exercises both. Tests (a)/(b) FAIL on the pre-fix code (channel
+    // credential unseen -> 401) and PASS after; (c)/(d) confirm the guard is not
+    // weakened for genuinely anonymous or invalid-credential requests.
+
+    use axum::http::Method;
+
+    // --- shared arrange/act helpers (keep each test a one-liner so jscpd sees
+    //     no duplicated ~10-line setup/act blocks) ---
+
+    /// Build a guard state with guest access disabled, backed by `pool`.
+    fn disabled_state(pool: sqlx::PgPool) -> GuestAccessState {
+        let mut config = Config::test_config();
+        config.guest_access_enabled = false;
+        GuestAccessState {
+            guest_access_enabled: false,
+            auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
+        }
+    }
+
+    /// Insert a test user with every credential-bearing timestamp backdated 60s
+    /// so a token minted immediately afterwards is strictly newer than the
+    /// credential-change watermark and the async validator accepts it. Must
+    /// include `privileges_changed_at` (migration 131, DEFAULT NOW()): it is
+    /// folded into the watermark `GREATEST(...)`, so omitting it pins the
+    /// watermark to insert time and a token minted microseconds later
+    /// intermittently 401s under parallel test load. Runtime `sqlx::query` (not
+    /// `query!`) keeps `SQLX_OFFLINE` builds working without regenerated `.sqlx`
+    /// metadata for a test-only insert. Returns the new user id.
+    async fn insert_backdated_user(pool: &sqlx::PgPool, username: &str) -> uuid::Uuid {
+        let user_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                                is_active, is_admin, password_changed_at, \
+                                privileges_changed_at, failed_login_attempts, \
+                                created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', 0, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(format!("{username}@test.com"))
+        .execute(pool)
+        .await
+        .expect("insert test user");
+        user_id
+    }
+
+    /// Insert a fresh user and mint a real API token it owns. Returns the guard
+    /// state (guest access disabled), the raw token, and the user id for cleanup.
+    async fn setup_api_token(pool: &sqlx::PgPool) -> (GuestAccessState, String, uuid::Uuid) {
+        let state = disabled_state(pool.clone());
+        let username = format!("guest_chan_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_backdated_user(pool, &username).await;
+
+        let (token, _token_id) = state
+            .auth_service
+            .generate_api_token(user_id, "chan-test-2655", vec![], None)
+            .await
+            .expect("mint api token");
+
+        (state, token, user_id)
+    }
+
+    async fn cleanup_user(pool: &sqlx::PgPool, user_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// A conda token-channel read request carrying `token` in the URL path.
+    fn conda_token_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/conda/t/{token}/my-repo/noarch/repodata.json"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A NuGet package-push request, optionally carrying `X-NuGet-ApiKey`.
+    fn nuget_push_request(api_key: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::PUT)
+            .uri("/nuget/my-repo/api/v2/package");
+        if let Some(key) = api_key {
+            builder = builder.header("X-NuGet-ApiKey", key);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// Run `request` through the guard (guest access disabled) and return the
+    /// resulting status. The fallback router returns 200 for anything the guard
+    /// lets through, so `OK` == "guard accepted" and `401` == "guard denied".
+    /// (The conda / nuget paths are not otherwise registered here; the fallback
+    /// stands in for the real format handlers, which enforce their own authz.)
+    async fn guard_status(state: GuestAccessState, request: Request<Body>) -> StatusCode {
+        Router::new()
+            .fallback(|| async { "ok" })
+            .layer(from_fn_with_state(state, guest_access_guard))
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // (a) valid conda URL-embedded token is recognised by the guard.
+    #[tokio::test]
+    async fn guard_allows_valid_conda_url_token_when_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, token, user_id) = setup_api_token(&pool).await;
+        let status = guard_status(state, conda_token_request(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a valid conda URL-token must pass the guest-access guard (#2655)"
+        );
+        cleanup_user(&pool, user_id).await;
+    }
+
+    // (b) valid NuGet `X-NuGet-ApiKey` push credential is recognised.
+    #[tokio::test]
+    async fn guard_allows_valid_nuget_api_key_when_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, token, user_id) = setup_api_token(&pool).await;
+        let status = guard_status(state, nuget_push_request(Some(&token))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a valid X-NuGet-ApiKey push credential must pass the guard (#2655)"
+        );
+        cleanup_user(&pool, user_id).await;
+    }
+
+    // (c) a genuinely anonymous request on a conda path is still denied.
+    // No credential on any channel resolves before any DB call, so the DB-free
+    // `make_state(false)` (lazy pool) suffices.
+    #[tokio::test]
+    async fn guard_denies_anonymous_conda_path_when_disabled() {
+        // Not a token-channel URL (no `/t/<TOKEN>`), and no headers.
+        let req = Request::builder()
+            .uri("/conda/my-repo/noarch/repodata.json")
+            .body(Body::empty())
+            .unwrap();
+        let status = guard_status(make_state(false), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // (c') an anonymous NuGet push (no `X-NuGet-ApiKey`, no auth) is still denied.
+    #[tokio::test]
+    async fn guard_denies_anonymous_nuget_push_when_disabled() {
+        let status = guard_status(make_state(false), nuget_push_request(None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // (d) an INVALID conda URL-token is still denied. Validating an unknown API
+    // token requires a DB lookup to distinguish `InvalidCredential` (401) from a
+    // pool-timeout `Overloaded` (503), so this needs a live database.
+    #[tokio::test]
+    async fn guard_denies_invalid_conda_url_token_when_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let status = guard_status(
+            disabled_state(pool),
+            conda_token_request("not-a-real-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // (d') an INVALID `X-NuGet-ApiKey` push credential is still denied.
+    #[tokio::test]
+    async fn guard_denies_invalid_nuget_api_key_when_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let status = guard_status(
+            disabled_state(pool),
+            nuget_push_request(Some("not-a-real-token")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

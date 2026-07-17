@@ -1364,7 +1364,7 @@ fn extract_nuget_push_api_key(request: &Request) -> Option<&str> {
 /// present: the conda token-channel URL, and the NuGet push `X-NuGet-ApiKey`
 /// header. Header credentials always take precedence, and an unparseable or
 /// invalid fallback credential still fails closed downstream.
-fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> {
+pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> {
     let extracted = extract_token(request);
     if !matches!(extracted, ExtractedToken::None) {
         return extracted;
