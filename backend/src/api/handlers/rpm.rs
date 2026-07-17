@@ -136,7 +136,7 @@ async fn try_proxy_repodata(
         &repo.key,
         upstream_url,
         upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await?;
 
