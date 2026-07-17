@@ -546,11 +546,9 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     (status, body)
 }
 
-/// Grant `user_id` the `developer` role scoped to `repo_id`, mirroring the
-/// owner auto-grant that `RepositoryService::create` performs for real
-/// callers. Handler smoke tests authenticate as the fixture user, so without
-/// this grant the per-repo authorization check in `require_visible` /
-/// `require_repo_write_access` would reject them on private repositories.
+/// Grant `user_id` the `developer` role scoped to `repo_id`. Handler smoke
+/// tests use this for an ordinary read/write repository member; owner-specific
+/// tests should grant the `repository-owner` role explicitly.
 pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
@@ -1018,10 +1016,9 @@ impl Fixture {
         let pool = try_pool().await?;
         let (user_id, username) = create_user(&pool).await;
         let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
-        // Owner auto-grant: the fixture user is the de-facto owner of the
-        // fixture repo, so grant them per-repo access. This keeps the
+        // Make the fixture user an ordinary repository member. This keeps the
         // authenticated-router smoke tests valid under per-repo authorization
-        // (private repos now require a role assignment, not just a token).
+        // without silently giving every fixture durable owner capability.
         grant_repo_access(&pool, repo_id, user_id).await;
         let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
         Some(Self {

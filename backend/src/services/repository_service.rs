@@ -73,9 +73,9 @@ pub struct CreateRepositoryRequest {
     /// legacy unverified-ingest behavior. Persisted in the create tx.
     pub curation_allow_unverified: Option<bool>,
     /// User who is creating this repository. When set, the repository records
-    /// this user as `created_by` and the creator is auto-granted the
-    /// `developer` role scoped to the new repository (owner auto-grant), so the
-    /// creator retains access under per-repo authorization.
+    /// this user as `created_by` and the creator is auto-granted the durable
+    /// `repository-owner` role scoped to the new repository. The legacy
+    /// `developer` grant is retained during the staged authorization rollout.
     pub created_by: Option<Uuid>,
 }
 
@@ -821,10 +821,9 @@ impl RepositoryService {
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
                 }
-                // Owner auto-grant: record the creator and grant them the
-                // `developer` role scoped to this repository, so the creator
-                // retains access under per-repo authorization. Runs inside the
-                // same tx as the INSERT so creator-grant is atomic with create.
+                // Owner auto-grant: dual-write the durable repository-owner
+                // and legacy developer roles during the staged rollout. Both
+                // grants land in the same transaction as the repository.
                 if let Some(creator_id) = req.created_by {
                     sqlx::query("UPDATE repositories SET created_by = $1 WHERE id = $2")
                         .bind(creator_id)
@@ -834,7 +833,8 @@ impl RepositoryService {
                         .map_err(|e| AppError::Database(e.to_string()))?;
                     sqlx::query(
                         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-                         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                         SELECT $1, r.id, $2 FROM roles r \
+                         WHERE r.name IN ('repository-owner', 'developer') \
                          ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
                     )
                     .bind(creator_id)
@@ -3646,7 +3646,25 @@ mod tests {
             req.created_by = Some(owner_id);
             let repo = service.create(req).await.expect("create private repo");
 
-            // Owner (auto-granted developer role scoped to the repo) -> allowed.
+            let creator_roles: Vec<String> = sqlx::query_scalar(
+                "SELECT r.name::text FROM role_assignments ra \
+                 JOIN roles r ON r.id = ra.role_id \
+                 WHERE ra.user_id = $1 AND ra.repository_id = $2 \
+                   AND r.name IN ('developer', 'repository-owner') \
+                 ORDER BY r.name",
+            )
+            .bind(owner_id)
+            .bind(repo.id)
+            .fetch_all(&pool)
+            .await
+            .expect("creator role lookup");
+            assert_eq!(
+                creator_roles,
+                vec!["developer", "repository-owner"],
+                "creator must receive owner and retain developer during staged rollout"
+            );
+
+            // Owner (auto-granted repository-owner role) -> allowed.
             assert!(
                 service
                     .user_can_access_repo(repo.id, owner_id)
