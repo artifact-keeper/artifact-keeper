@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 /// `signing_keys.name` of the dedicated key that signs a hosted hex
 /// repository's registry resources. Also the discriminator for the partial
-/// unique index that keeps provisioning idempotent (migration 166).
+/// unique index that keeps provisioning idempotent (migration 167).
 pub const HEX_REGISTRY_KEY_NAME: &str = "hex-registry";
 
 /// Key strength for hex registry keys. Hex fixes the signature algorithm
@@ -771,7 +771,7 @@ impl SigningService {
     /// Look up a repository's dedicated hex registry key, if it has one.
     ///
     /// The predicate here is mirrored exactly by the partial unique index in
-    /// migration 166. Changing one without the other lets provisioning conflict
+    /// migration 167. Changing one without the other lets provisioning conflict
     /// against a row this lookup cannot see (see that migration's note).
     async fn find_hex_registry_key_exec<'e, E>(exec: E, repo_id: Uuid) -> Result<Option<SigningKey>>
     where
