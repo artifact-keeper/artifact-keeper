@@ -676,6 +676,29 @@ fn create_apkindex_tar_gz(
 // GET /alpine/{repo_key}/{branch}/{repository}/{arch}/APKINDEX.tar.gz
 // ---------------------------------------------------------------------------
 
+/// Turn the outcome of signing the APKINDEX into either the signature to embed
+/// or an error response.
+///
+/// The three outcomes are distinct and must stay distinct:
+///   * `Ok(None)`    — the repository has no active signing key, so serving the
+///                     index unsigned is the intended, configured behaviour.
+///   * `Ok(Some(_))` — a signature was produced; embed it.
+///   * `Err(_)`      — signing was configured but failed. This must surface as a
+///                     hard 500, never be collapsed into "serve unsigned": apk
+///                     clients that require signatures would otherwise be handed
+///                     an unsigned index under a 200 (#2660).
+fn resolve_apkindex_signature(
+    result: crate::error::Result<Option<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>, Response> {
+    result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to sign APKINDEX: {e}"),
+        )
+            .into_response()
+    })
+}
+
 async fn apk_index(
     State(state): State<SharedState>,
     Path((repo_key, branch, repository, arch)): Path<(String, String, String, String)>,
@@ -773,12 +796,13 @@ async fn apk_index(
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
 
-    // Sign the APKINDEX content if signing is configured for this repository
+    // Sign the APKINDEX content if signing is configured for this repository.
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, apkindex_text.as_bytes())
-        .await
-        .unwrap_or(None);
+    let signature = resolve_apkindex_signature(
+        signing_svc
+            .sign_data(repo.id, apkindex_text.as_bytes())
+            .await,
+    )?;
 
     let tar_gz = create_apkindex_tar_gz(&apkindex_text, signature.as_deref())?;
 
@@ -1665,6 +1689,52 @@ mod tests {
 
     fn marker_apk_info() -> ApkPackageInfo {
         parse_apk_package(MARKER_APK).expect("marker .apk should parse")
+    }
+
+    // -----------------------------------------------------------------------
+    // APKINDEX signing must fail closed (#2660)
+    //
+    // When signing is configured but the signing operation fails, the index
+    // request must become a hard 500 — it must never fall back to serving an
+    // unsigned index under a 200, which would silently defeat apk clients that
+    // require signatures.
+    // -----------------------------------------------------------------------
+
+    /// A signing failure must surface as a 500 error response, not be swallowed
+    /// into `Ok(None)` (which would serve an unsigned index with a 200).
+    #[test]
+    fn signing_failure_is_not_swallowed_into_an_unsigned_index() {
+        let failure: crate::error::Result<Option<Vec<u8>>> = Err(crate::error::AppError::Internal(
+            "signing key unavailable".into(),
+        ));
+
+        let resolved = resolve_apkindex_signature(failure);
+
+        let resp = resolved.expect_err(
+            "a signing failure must surface as an error response, not an unsigned index",
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A repository with no active signing key legitimately serves an unsigned
+    /// index: `Ok(None)` passes through without error.
+    #[test]
+    fn absent_signing_key_serves_unsigned_index() {
+        let unconfigured: crate::error::Result<Option<Vec<u8>>> = Ok(None);
+
+        let signature = resolve_apkindex_signature(unconfigured)
+            .expect("an unconfigured signing key must not produce an error");
+        assert!(signature.is_none());
+    }
+
+    /// A produced signature passes straight through to be embedded.
+    #[test]
+    fn produced_signature_passes_through() {
+        let signed: crate::error::Result<Option<Vec<u8>>> = Ok(Some(vec![1, 2, 3, 4]));
+
+        let signature = resolve_apkindex_signature(signed)
+            .expect("a successful signature must not produce an error");
+        assert_eq!(signature, Some(vec![1, 2, 3, 4]));
     }
 
     // -----------------------------------------------------------------------
