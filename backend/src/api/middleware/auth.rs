@@ -7,6 +7,7 @@
 //! - `Authorization: Bearer <api_token>` - API tokens via Bearer scheme
 //! - `Authorization: ApiKey <api_token>` - API tokens via ApiKey scheme
 //! - `X-API-Key: <api_token>` - API tokens via custom header
+//! - `X-NuGet-ApiKey: <api_token>` - API tokens on the NuGet push route only
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,13 @@ use crate::services::permission_service::PermissionService;
 
 /// Custom header name for API key
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// Header the NuGet client sends the push credential in.
+///
+/// `dotnet nuget push --api-key <key>` puts the credential here rather than in
+/// `Authorization` when the configured source carries no credentials. Only the
+/// NuGet push route honours it (see [`extract_nuget_push_api_key`]).
+static X_NUGET_API_KEY: HeaderName = HeaderName::from_static("x-nuget-apikey");
 
 /// Extension that holds authenticated user information
 ///
@@ -1293,18 +1301,81 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     }
 }
 
+/// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
+///
+/// Matched exactly — with or without the trailing slash that `dotnet nuget
+/// push` appends to the `PackagePublish/2.0.0` URL it discovers from the v3
+/// service index (both spellings are registered in `nuget::router`). Every
+/// other NuGet route (service index, search, registration, flat container) and
+/// every other format returns `false`, which is what keeps the
+/// `X-NuGet-ApiKey` credential fallback from widening the accepted credential
+/// surface anywhere else.
+fn is_nuget_push_path(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    if segments.next() != Some("nuget") {
+        return false;
+    }
+    // Repository key.
+    match segments.next() {
+        Some(key) if !key.is_empty() => {}
+        _ => return false,
+    }
+    if segments.next() != Some("api") || segments.next() != Some("v2") {
+        return false;
+    }
+    if segments.next() != Some("package") {
+        return false;
+    }
+    // Nothing may follow except the optional trailing slash.
+    match segments.next() {
+        None => true,
+        Some("") => segments.next().is_none(),
+        Some(_) => false,
+    }
+}
+
+/// Extract the credential from the NuGet `X-NuGet-ApiKey` push header.
+///
+/// `dotnet nuget push --api-key <key>` against a source with no configured
+/// credentials sends the key in `X-NuGet-ApiKey` and nothing in
+/// `Authorization`. That header is invisible to [`extract_token`], so the
+/// visibility middleware treated such a push as anonymous and rejected it with
+/// 401 (writes always require auth) *before* `push_package` — which has its own
+/// `X-NuGet-ApiKey` fallback — could ever run.
+///
+/// Scoped to `PUT` on the push route alone: this header is a NuGet client
+/// convention, so it must not become a general-purpose credential channel on
+/// read routes or on other formats. Returns `None` for any other method, path,
+/// or an empty header value.
+fn extract_nuget_push_api_key(request: &Request) -> Option<&str> {
+    if request.method() != Method::PUT || !is_nuget_push_path(request.uri().path()) {
+        return None;
+    }
+    request
+        .headers()
+        .get(&X_NUGET_API_KEY)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+}
+
 /// Resolve the request credential for the visibility middleware, falling back
-/// to the conda token-channel URL credential when no header/cookie credential
-/// is present. Header credentials always take precedence.
+/// to format-specific credential channels when no header/cookie credential is
+/// present: the conda token-channel URL, and the NuGet push `X-NuGet-ApiKey`
+/// header. Header credentials always take precedence, and an unparseable or
+/// invalid fallback credential still fails closed downstream.
 fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> {
     let extracted = extract_token(request);
     if !matches!(extracted, ExtractedToken::None) {
         return extracted;
     }
-    match extract_conda_url_token(request.uri().path()) {
-        Some(token) => ExtractedToken::ApiKey(token),
-        None => ExtractedToken::None,
+    if let Some(token) = extract_conda_url_token(request.uri().path()) {
+        return ExtractedToken::ApiKey(token);
     }
+    if let Some(token) = extract_nuget_push_api_key(request) {
+        return ExtractedToken::ApiKey(token);
+    }
+    ExtractedToken::None
 }
 
 /// Decide whether a request to a repository should be allowed.
@@ -1861,6 +1932,134 @@ mod tests {
             .unwrap();
         let result = extract_visibility_token(&request);
         assert!(matches!(result, ExtractedToken::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // NuGet push X-NuGet-ApiKey fallback
+    // -----------------------------------------------------------------------
+
+    fn nuget_push_request(uri: &str, api_key: Option<&str>) -> Request {
+        let mut builder = Request::builder().method(Method::PUT).uri(uri);
+        if let Some(key) = api_key {
+            builder = builder.header("x-nuget-apikey", key);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn test_extract_visibility_token_uses_nuget_push_api_key() {
+        // `dotnet nuget push --api-key <key>` against a credential-less source
+        // sends the key ONLY in X-NuGet-ApiKey. Without this fallback the
+        // visibility middleware saw an anonymous write and 401'd before the
+        // push handler (which has its own X-NuGet-ApiKey fallback) could run.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("nuget-key-123")
+        ));
+
+        // `dotnet nuget push` appends a trailing slash to the discovered
+        // PackagePublish URL; both spellings are registered routes.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package/", Some("nuget-key-123"));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("nuget-key-123")
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_header_credential_takes_priority() {
+        // An explicit Authorization credential always wins over X-NuGet-ApiKey.
+        let mut request =
+            nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer header-jwt"),
+        );
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::Bearer("header-jwt")
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_empty_nuget_api_key_is_none() {
+        // An empty header value is not a credential: fall through to anonymous
+        // so the write gate fails closed with 401.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package", Some(""));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::None
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_off_push_path() {
+        // The fallback must not widen the credential surface beyond the push
+        // route: NuGet read routes ignore the header entirely.
+        for uri in [
+            "/nuget/my-feed/v3/index.json",
+            "/nuget/my-feed/v3/search",
+            "/nuget/my-feed/v3/flatcontainer/pkg/1.0.0/pkg.nupkg",
+            "/nuget/my-feed/api/v2/package/extra",
+            "/nuget/my-feed/api/v2/symbolpackage",
+            "/nuget/api/v2/package",
+        ] {
+            let request = nuget_push_request(uri, Some("nuget-key-123"));
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored on {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_for_other_formats() {
+        // No cross-format blast radius: an identically-shaped path under any
+        // other format prefix never honours the header.
+        for uri in [
+            "/pypi/my-feed/api/v2/package",
+            "/npm/my-feed/api/v2/package",
+            "/conda/my-feed/api/v2/package",
+        ] {
+            let request = nuget_push_request(uri, Some("nuget-key-123"));
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_on_read_methods() {
+        // Scoped to the PUT push. A GET carrying the header stays anonymous,
+        // so it can never unlock a private-repo read.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/nuget/my-feed/api/v2/package")
+            .header("x-nuget-apikey", "nuget-key-123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::None
+        ));
+    }
+
+    #[test]
+    fn test_is_nuget_push_path() {
+        assert!(is_nuget_push_path("/nuget/my-feed/api/v2/package"));
+        assert!(is_nuget_push_path("/nuget/my-feed/api/v2/package/"));
+        // Repo keys are single segments; nothing may follow `package`.
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2/package//"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2/package/x"));
+        assert!(!is_nuget_push_path("/nuget//api/v2/package"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v3/package"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2"));
+        assert!(!is_nuget_push_path("/nuget"));
+        assert!(!is_nuget_push_path(""));
+        // Other formats never match, whatever the tail looks like.
+        assert!(!is_nuget_push_path("/pypi/my-feed/api/v2/package"));
     }
 
     #[test]
