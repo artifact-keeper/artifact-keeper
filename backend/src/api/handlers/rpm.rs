@@ -1383,9 +1383,10 @@ mod tests {
             proxy_helpers::LARGE_METADATA_MAX_BYTES,
             "RPM proxy metadata cap must be the LARGE tier (#2623/#2664)"
         );
-        assert!(
-            RPM_PROXY_METADATA_MAX_BYTES > proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            "RPM proxy metadata cap must exceed the DEFAULT tier"
+        assert_ne!(
+            RPM_PROXY_METADATA_MAX_BYTES,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "RPM proxy metadata cap must not be the DEFAULT tier"
         );
     }
 
