@@ -192,9 +192,10 @@ const APK_MAX_SEGMENT_INFLATED_BYTES: usize = 4 * 1024 * 1024;
 /// by `MAX_UPLOAD_SIZE` (10 GB by default), not by anything this handler
 /// controls.
 ///
-/// A package whose control segment does not fit in the window is treated as
-/// unreadable *at this parser version* — see [`APK_PARSER_VERSION`], which is
-/// what makes widening the window a safe, retrying change.
+/// A package whose control segment does not fit in the window is recorded as
+/// [`APK_PARSE_TRUNCATED_FIELD`] rather than as unreadable: the reader stopped
+/// early, which says nothing about the bytes it never saw. Widening this window
+/// retries those artifacts automatically.
 const APK_BACKFILL_HEAD_BYTES: usize = 1024 * 1024;
 
 /// Maximum number of artifacts whose bytes a single index request will read.
@@ -218,7 +219,25 @@ const APK_PARSER_VERSION: i64 = 1;
 /// marker suppresses re-reads only for the parser that already saw those exact
 /// bytes. Also makes the skipped population queryable:
 /// `SELECT ... WHERE metadata ? 'apk_parse_failed'`.
+///
+/// Only written when the parser read the object to its end — see
+/// [`APK_PARSE_TRUNCATED_FIELD`] for the case where it did not.
 const APK_PARSE_FAILED_FIELD: &str = "apk_parse_failed";
+
+/// Metadata field recording that the head window filled before the parser found
+/// the control segment.
+///
+/// Distinct from [`APK_PARSE_FAILED_FIELD`] because it is not a verdict on the
+/// bytes: the reader stopped at [`APK_BACKFILL_HEAD_BYTES`] and the package may
+/// well be a good one that simply carries its control segment further in. It
+/// still has to be recorded, or the artifact is re-fetched on every index
+/// request — the anonymous, unmetered re-read this backfill is bounded to avoid.
+///
+/// Holds the window that proved too small rather than a bare boolean, so
+/// widening [`APK_BACKFILL_HEAD_BYTES`] retries these artifacts on its own, the
+/// way bumping [`APK_PARSER_VERSION`] retries a parse failure. Queryable the same
+/// way: `SELECT ... WHERE metadata ? 'apk_parse_truncated'`.
+const APK_PARSE_TRUNCATED_FIELD: &str = "apk_parse_truncated";
 
 /// Number of leading gzip segments searched for `.PKGINFO`. An apk v2 package is
 /// `[signature segment] control segment data segment`, so the control segment is
@@ -795,25 +814,52 @@ fn apk_parse_already_failed(artifact: &AlpineArtifact) -> bool {
         .is_some_and(|version| version >= APK_PARSER_VERSION)
 }
 
+/// Whether a reader with a head window no larger than this one already stopped
+/// short on these bytes.
+///
+/// `>=` rather than `==` so the marker only suppresses a re-read while the
+/// window is still too small to have changed the answer: widen
+/// [`APK_BACKFILL_HEAD_BYTES`] and every artifact recorded at a narrower window
+/// is retried.
+fn apk_head_was_truncated(artifact: &AlpineArtifact) -> bool {
+    let window = i64::try_from(APK_BACKFILL_HEAD_BYTES).unwrap_or(i64::MAX);
+    artifact
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(APK_PARSE_TRUNCATED_FIELD))
+        .and_then(|v| v.as_i64())
+        .is_some_and(|recorded| recorded >= window)
+}
+
 /// Whether the index backfill should read this artifact's bytes.
 ///
-/// Both terms matter. Without the checksum test a package would be re-read once
-/// it is already indexed; without the failure-marker test an artifact this parser
-/// cannot read would be fetched and re-parsed on *every* index request forever,
-/// which is unmetered work for an endpoint that is anonymous on public
-/// repositories.
+/// Every term matters. Without the checksum test a package would be re-read once
+/// it is already indexed; without the marker tests an artifact this reader cannot
+/// index would be fetched and re-parsed on *every* index request forever, which
+/// is unmetered work for an endpoint that is anonymous on public repositories.
+/// The two markers are separate because they expire on different things: a parse
+/// failure is a verdict on the bytes that only a better parser can overturn, a
+/// truncated read is a limit of the window that a wider one lifts.
 fn needs_apk_backfill(artifact: &AlpineArtifact) -> bool {
-    !has_apk_checksum(artifact) && !apk_parse_already_failed(artifact)
+    !has_apk_checksum(artifact)
+        && !apk_parse_already_failed(artifact)
+        && !apk_head_was_truncated(artifact)
 }
 
 /// What reading a stored package told us about it.
 enum ApkBackfillOutcome {
     /// The package was read and parsed; its index metadata is available.
     Parsed(Box<ApkPackageInfo>),
-    /// The bytes were read and are not a package this parser can index. This is
-    /// a property of the bytes, so re-reading them cannot change the answer and
-    /// the verdict is recorded.
+    /// The object was read *to its end* and is not a package this parser can
+    /// index. This is a property of the bytes, so re-reading them cannot change
+    /// the answer and the verdict is recorded.
     Unreadable,
+    /// The head window filled before the control segment was found, so the object
+    /// runs past what was read. Says nothing about the bytes that were never
+    /// fetched — a valid package can carry its control segment further in than
+    /// this reader looks — so it is recorded as a limit of the window rather than
+    /// as a verdict, and a wider window retries it.
+    Truncated,
     /// The bytes could not be read at all. This says nothing about the package,
     /// so no verdict is recorded: a storage blip must not permanently de-index a
     /// good package. The artifact is retried on the next index request.
@@ -823,18 +869,21 @@ enum ApkBackfillOutcome {
 /// Read the head of a stored `.apk` and parse the index metadata out of it.
 ///
 /// Only [`APK_BACKFILL_HEAD_BYTES`] are fetched — the control segment precedes
-/// the data segment — and never more than the object holds, so the range is
-/// always within bounds.
+/// the data segment — so a multi-GB package never lands in memory.
+///
+/// The window is asked for in full rather than clamped to `artifact.size_bytes`,
+/// and every backend clamps the range to the object itself (a short read *is* the
+/// end of the object). That keeps the read bounded exactly as before while
+/// leaving the object's length to storage, which knows it, rather than to a
+/// column that may not: `size_bytes` carries no `CHECK` constraint, and one that
+/// understated its object used to truncate this read and get the resulting parse
+/// failure recorded as a verdict on the package.
 async fn read_apk_backfill(
     storage: &dyn StorageBackend,
     artifact: &AlpineArtifact,
 ) -> ApkBackfillOutcome {
-    let head_bytes = usize::try_from(artifact.size_bytes)
-        .unwrap_or(APK_BACKFILL_HEAD_BYTES)
-        .min(APK_BACKFILL_HEAD_BYTES);
-
     let head = match storage
-        .get_range(&artifact.storage_key, 0, head_bytes)
+        .get_range(&artifact.storage_key, 0, APK_BACKFILL_HEAD_BYTES)
         .await
     {
         Ok(head) => head,
@@ -849,9 +898,21 @@ async fn read_apk_backfill(
         }
     };
 
+    // Whether the parser saw the whole object. A read that stopped short of the
+    // window reached the object's end, so there are no bytes left for a wider
+    // window to find; one that filled the window may have left the control
+    // segment just past it. An object exactly the size of the window is treated
+    // as truncated — the read cannot tell it apart from a longer one, and the
+    // safe side of that ambiguity is to not record a verdict.
+    let complete = head.len() < APK_BACKFILL_HEAD_BYTES;
+
     match parse_apk_package(&head) {
         Some(apk_info) => ApkBackfillOutcome::Parsed(Box::new(apk_info)),
-        None => {
+        // The parser read the object end to end and found no control segment.
+        // Recorded against APK_PARSER_VERSION, so a reader that learns to handle
+        // these bytes — an apk v3 reader, a larger APK_MAX_SEGMENT_INFLATED_BYTES
+        // for a control segment this one refused to inflate — retries them.
+        None if complete => {
             tracing::warn!(
                 artifact_id = %artifact.id,
                 path = %artifact.path,
@@ -860,15 +921,26 @@ async fn read_apk_backfill(
             );
             ApkBackfillOutcome::Unreadable
         }
+        None => {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                path = %artifact.path,
+                head_bytes = APK_BACKFILL_HEAD_BYTES,
+                "Alpine index backfill: no apk control segment within the head window; \
+                 package will not be indexed until the window is widened"
+            );
+            ApkBackfillOutcome::Truncated
+        }
     }
 }
 
 /// Derive the missing index metadata for packages stored before it was recorded
 /// at upload time, so they are not silently dropped from the index.
 ///
-/// Every artifact this touches ends up with a persisted verdict — its index
-/// metadata, or a [`APK_PARSE_FAILED_FIELD`] marker — so a package's bytes are
-/// read at most once per parser version rather than on every index request. The
+/// Every artifact this touches ends up with a persisted result — its index
+/// metadata, or a [`APK_PARSE_FAILED_FIELD`] / [`APK_PARSE_TRUNCATED_FIELD`]
+/// marker — so a package's bytes are read at most once per parser version and
+/// head window rather than on every index request. The
 /// work is capped per request ([`APK_BACKFILL_MAX_PER_REQUEST`]) and persisted as
 /// it goes, so a large repository converges over successive requests and a
 /// cancelled request keeps the progress it made.
@@ -902,6 +974,14 @@ async fn backfill_apk_metadata(
                 // parser that learns to read them retries automatically.
                 let mut fields = serde_json::Map::new();
                 fields.insert(APK_PARSE_FAILED_FIELD.into(), APK_PARSER_VERSION.into());
+                fields
+            }
+            ApkBackfillOutcome::Truncated => {
+                // Bound the re-reads without condemning the package: keyed by the
+                // window that was too small, so widening it retries automatically.
+                let mut fields = serde_json::Map::new();
+                let window = i64::try_from(APK_BACKFILL_HEAD_BYTES).unwrap_or(i64::MAX);
+                fields.insert(APK_PARSE_TRUNCATED_FIELD.into(), window.into());
                 fields
             }
             ApkBackfillOutcome::Unavailable => continue,
@@ -1699,13 +1779,15 @@ mod tests {
 
         assert!(matches!(outcome, ApkBackfillOutcome::Parsed(_)));
         assert_eq!(backend.full_reads(), 0, "backfill read the whole object");
-        assert_eq!(backend.reads(), vec![(0, MARKER_APK.len())]);
+        // The window is requested in full and the backend clamps it to the
+        // object; a package smaller than the window still costs one ranged read.
+        assert_eq!(backend.reads(), vec![(0, APK_BACKFILL_HEAD_BYTES)]);
     }
 
-    /// The range is clamped to the object's own size, so it never runs past the
-    /// end of a package smaller than the head window.
+    /// The read is bounded by the window and nothing else — a package may be
+    /// gigabytes, and an index request must not pull one into memory.
     #[tokio::test]
-    async fn test_backfill_head_read_is_capped_and_never_exceeds_object() {
+    async fn test_backfill_head_read_is_capped_at_the_window() {
         let big = 8 * 1024 * 1024;
         let mut artifact = unindexed_artifact(MARKER_APK);
         artifact.size_bytes = big as i64;
@@ -1729,6 +1811,50 @@ mod tests {
         let outcome = read_apk_backfill(&backend, &artifact).await;
 
         assert!(matches!(outcome, ApkBackfillOutcome::Unreadable));
+    }
+
+    /// A verdict on an artifact's bytes has to come from its bytes. `size_bytes`
+    /// is a column — `004_artifacts.sql` declares it `BIGINT NOT NULL` with no
+    /// `CHECK`, unlike `115_oci_upload_session_parts.sql` — so a row that
+    /// understates its object must not make a readable package permanently
+    /// unindexable. Upload parses the full bytes and would have indexed this
+    /// package; the backfill has to agree.
+    #[tokio::test]
+    async fn test_backfill_does_not_judge_a_package_on_an_understated_size() {
+        let backend = RecordingBackend::new(MARKER_APK);
+        let mut artifact = unindexed_artifact(MARKER_APK);
+        artifact.size_bytes = 0;
+
+        let outcome = read_apk_backfill(&backend, &artifact).await;
+
+        assert!(
+            matches!(outcome, ApkBackfillOutcome::Parsed(_)),
+            "a readable package was judged on a size column instead of its bytes"
+        );
+    }
+
+    /// A package whose control segment sits past the head window is one this
+    /// reader cannot read to the end of — a limit of the reader, not a property
+    /// of the bytes. Recording it as unreadable would condemn a valid package on
+    /// evidence the parser never saw.
+    #[tokio::test]
+    async fn test_backfill_does_not_condemn_a_package_it_never_read_to_the_end() {
+        let mut content = vec![0u8; APK_BACKFILL_HEAD_BYTES];
+        content.extend_from_slice(MARKER_APK);
+        let backend = RecordingBackend::new(&content);
+        let artifact = unindexed_artifact(&content);
+
+        let outcome = read_apk_backfill(&backend, &artifact).await;
+
+        assert!(
+            !matches!(outcome, ApkBackfillOutcome::Unreadable),
+            "a package the reader never saw the end of was recorded as unreadable"
+        );
+        assert!(matches!(outcome, ApkBackfillOutcome::Truncated));
+        // Still bounded: the object is larger than the window, and only the
+        // window was read.
+        assert_eq!(backend.reads(), vec![(0, APK_BACKFILL_HEAD_BYTES)]);
+        assert_eq!(backend.full_reads(), 0, "backfill read the whole object");
     }
 
     /// A storage failure says nothing about the package, so it is reported as
@@ -1799,6 +1925,33 @@ mod tests {
             APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION + 1,
         }));
         assert!(!needs_apk_backfill(&artifact));
+    }
+
+    /// A truncated read still has to bound the re-reads: the artifact is not
+    /// fetched again while the window is the same size that already fell short.
+    #[test]
+    fn test_needs_backfill_is_false_after_a_recorded_truncated_read() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_PARSE_TRUNCATED_FIELD: APK_BACKFILL_HEAD_BYTES as i64,
+        }));
+        assert!(
+            !needs_apk_backfill(&artifact),
+            "an artifact whose head window already fell short would be re-read forever"
+        );
+    }
+
+    /// The truncated marker is scoped to the window that produced it, so it
+    /// records the artifact without condemning it: widening the window retries
+    /// every package whose control segment was out of reach.
+    #[test]
+    fn test_needs_backfill_is_true_when_truncation_predates_a_wider_window() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_PARSE_TRUNCATED_FIELD: (APK_BACKFILL_HEAD_BYTES as i64) / 2,
+        }));
+        assert!(
+            needs_apk_backfill(&artifact),
+            "a wider window may now reach the control segment and must retry"
+        );
     }
 
     /// A failure marker never overrides a checksum that is actually present.
