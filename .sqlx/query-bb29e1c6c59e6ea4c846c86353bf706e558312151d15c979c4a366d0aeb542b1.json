@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT name, version\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND left(md5(name), 3) = $2\n          AND (\n            quarantine_status IS NULL\n            OR quarantine_status NOT IN ('quarantined', 'rejected')\n            OR (\n              quarantine_status = 'quarantined'\n              AND quarantine_until IS NOT NULL\n              AND quarantine_until <= NOW()\n            )\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "bb29e1c6c59e6ea4c846c86353bf706e558312151d15c979c4a366d0aeb542b1"
+}
