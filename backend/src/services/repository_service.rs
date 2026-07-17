@@ -1485,7 +1485,10 @@ impl RepositoryService {
         // reports a few KiB of manifests while holding GiBs of layers.
         // `oci_blobs` is UNIQUE(repository_id, digest), so this sum counts
         // each stored blob once per repo — the same per-repo logical figure
-        // the stats refresher computes.
+        // the stats refresher computes. A blob cross-repo-mounted into N
+        // repos counts in each of them; physical-footprint dedup on shared
+        // cloud backends is the refresher's `DedupScope` concern, not this
+        // SUM's.
         let usage = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
@@ -3729,6 +3732,187 @@ mod tests {
                 .bind(owner_id)
                 .execute(&pool)
                 .await;
+        }
+
+        // ---------------------------------------------------------------
+        // get_storage_usage (#2625): the live SUM must include `oci_blobs`
+        // ---------------------------------------------------------------
+
+        async fn insert_artifact(pool: &PgPool, repo: Uuid, path: &str, key: &str, size: i64) {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, $3, $3, $4, repeat('a', 64), \
+                         'application/octet-stream', $5, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(path)
+            .bind(size)
+            .bind(key)
+            .execute(pool)
+            .await
+            .expect("insert artifact row");
+        }
+
+        async fn insert_oci_blob(pool: &PgPool, repo: Uuid, digest: &str, size: i64) {
+            sqlx::query(
+                "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(digest)
+            .bind(size)
+            .bind(format!("oci-blobs/{digest}"))
+            .execute(pool)
+            .await
+            .expect("insert oci_blobs row");
+        }
+
+        async fn insert_proxy_cache(pool: &PgPool, repo: Uuid, path: &str, size: i64) {
+            sqlx::query(
+                "INSERT INTO proxy_cache_artifacts \
+                   (id, repository_id, path, storage_key, metadata_key, size_bytes) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(path)
+            .bind(format!("proxy-cache/{repo}/{path}/__content__"))
+            .bind(format!("proxy-cache/{repo}/{path}/__cache_meta__.json"))
+            .bind(size)
+            .execute(pool)
+            .await
+            .expect("insert proxy cache row");
+        }
+
+        /// Regression for the "3.42 MB docker repo" display bug (#2625): OCI
+        /// layer/config blobs live in `oci_blobs`, not `artifacts` (only
+        /// manifests land there), so the live usage SUM behind
+        /// `storage_used_bytes` must include them. On unfixed code this
+        /// returns 700 (manifest only).
+        #[tokio::test]
+        async fn test_get_storage_usage_counts_oci_blobs() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            // Manifest as an `artifacts` row + two layers in `oci_blobs`.
+            insert_artifact(
+                &pool,
+                repo.id,
+                "img/manifests/1.0",
+                "oci-manifests/sha256:aa",
+                700,
+            )
+            .await;
+            let d1 = format!("sha256:{}", Uuid::new_v4().simple());
+            let d2 = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &d1, 500_000).await;
+            insert_oci_blob(&pool, repo.id, &d2, 250_000).await;
+
+            let usage = service
+                .get_storage_usage(repo.id)
+                .await
+                .expect("storage usage");
+            assert_eq!(usage, 750_700, "manifest (700) + layers (500k + 250k)");
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Intended semantics pin: `storage_used_bytes` is a per-repo
+        /// *logical* figure. A blob cross-repo-mounted into two repos (same
+        /// digest, one `oci_blobs` row per repo) counts in EACH repo's total
+        /// — it is never globally deduped here. Physical-footprint dedup is
+        /// the stats refresher's job (`DedupScope`), not this SUM's.
+        #[tokio::test]
+        async fn test_get_storage_usage_counts_shared_blob_in_each_repo() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo_a = service
+                .create(make_create_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Docker,
+                ))
+                .await
+                .expect("create repo a");
+            let repo_b = service
+                .create(make_create_req(
+                    &format!("{suffix}b"),
+                    RepositoryFormat::Docker,
+                ))
+                .await
+                .expect("create repo b");
+
+            let shared = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo_a.id, &shared, 40_000).await;
+            insert_oci_blob(&pool, repo_b.id, &shared, 40_000).await;
+            // Distinct second blob in A so its total discriminates from B's.
+            let only_a = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo_a.id, &only_a, 5_000).await;
+
+            let usage_a = service.get_storage_usage(repo_a.id).await.expect("usage a");
+            let usage_b = service.get_storage_usage(repo_b.id).await.expect("usage b");
+            assert_eq!(usage_a, 45_000, "repo A: shared blob + its own blob");
+            assert_eq!(usage_b, 40_000, "repo B: shared blob counts here too");
+
+            cleanup_repo(&pool, repo_a.id).await;
+            cleanup_repo(&pool, repo_b.id).await;
+        }
+
+        /// Non-OCI repos have no `oci_blobs` rows; the added UNION branch must
+        /// not disturb their totals. Also re-pins the #2218 semantics the SUM
+        /// already had: proxy catalog rows count, legacy `proxy-cache/%`
+        /// leftovers in `artifacts` stay excluded.
+        #[tokio::test]
+        async fn test_get_storage_usage_without_oci_rows_unchanged() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(
+                &pool,
+                repo.id,
+                "a/1",
+                &format!("cas/ee/ff/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            insert_proxy_cache(&pool, repo.id, "cached/pkg.tgz", 2_500).await;
+            // Legacy backfilled leftover: must NOT be double counted (#2218).
+            insert_artifact(
+                &pool,
+                repo.id,
+                "cached/pkg.tgz",
+                &format!("proxy-cache/{}/cached/pkg.tgz/__content__", repo.id),
+                9_999,
+            )
+            .await;
+
+            let usage = service
+                .get_storage_usage(repo.id)
+                .await
+                .expect("storage usage");
+            assert_eq!(usage, 3_500, "artifacts + proxy catalog only");
+
+            cleanup_repo(&pool, repo.id).await;
         }
     }
 }
