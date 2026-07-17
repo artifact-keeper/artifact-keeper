@@ -334,6 +334,14 @@ fn migration_sha384(sql: &str) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// Application-specific key for the transaction-scoped advisory lock that
+/// serializes `repair_release_1_5_x_divergence` across concurrent replica
+/// boots. The high 32 bits are non-zero (ASCII `AK` = 0x414B, then issue
+/// 2686 = 0x2686), which places the value above 2^32 and therefore outside
+/// the range sqlx's own migrator lock uses (a `crc32(current_database())`
+/// cast to `i64`, always < 2^32) - so the two locks can never collide.
+const REPAIR_ADVISORY_LOCK_KEY: i64 = 0x414B_2686_0000_0001;
+
 /// Repair a `_sqlx_migrations` ledger left by an in-place upgrade from
 /// `release/1.5.x` (v1.5.7 / v1.5.8) into `main` (1.6.0). See issue #2686.
 ///
@@ -364,10 +372,17 @@ fn migration_sha384(sql: &str) -> Vec<u8> {
 ///   * `UPDATE _sqlx_migrations SET version = 163 WHERE version = 155`
 ///     (only when 155 is applied with the v1.5.8 maven-flat checksum).
 ///
-/// After the renumber, versions 154/155/156 (and, for v1.5.7, 163) are
-/// absent from the ledger, so the migrator applies main's fresh 154/155/156
-/// (whose objects do not exist on a v1.5.x database) and skips 157/163
-/// (already applied under their renumbered rows). Startup then completes.
+/// After the renumber the migrator runs and reconciles the rest of the
+/// chain differently per source version:
+///   * v1.5.7 (only 154 renumbered): slots 154/155/156 AND 163
+///     (`maven_flat_object_attribution`) are all absent, so the migrator
+///     applies each of them fresh and skips only 157 (`storage_key_index`,
+///     now present under its renumbered row).
+///   * v1.5.8 (154 and 155 renumbered): slots 154/155/156 are absent and
+///     applied fresh, while BOTH 157 and 163 are already present under
+///     their renumbered rows and are skipped.
+///
+/// Either way, startup then completes.
 ///
 /// The detection key is the stored *storage_key_index* checksum at slot
 /// 154, so this function is a strict no-op on:
@@ -377,8 +392,16 @@ fn migration_sha384(sql: &str) -> Vec<u8> {
 ///   * any ledger whose 154 checksum is neither of those.
 ///
 /// It also refuses to renumber onto an occupied slot (156/157 already
-/// present, or 163 present for the v1.5.8 branch), leaving such non-pristine
-/// ledgers for the migrator to adjudicate.
+/// present, or 163 present for the v1.5.8 branch), and -- fail-closed --
+/// refuses to renumber a row whose backing object does not actually exist
+/// (`idx_artifacts_storage_key` for 154->157, `maven_flat_object_owner`
+/// for 155->163), leaving such non-pristine or phantom ledgers for the
+/// migrator to adjudicate rather than silently booting without the #2504
+/// index.
+///
+/// The whole detect->decide->renumber body runs under a transaction-scoped
+/// advisory lock, so concurrent replica boots serialize on the repair
+/// explicitly rather than relying on `UPDATE` idempotence alone.
 pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
     // Skip on fresh installs - no _sqlx_migrations table yet. `to_regclass`
     // resolves the unqualified name against the connection's search_path,
@@ -392,6 +415,21 @@ pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
     if !table_exists {
         return Ok(());
     }
+
+    // Everything from here on runs in one transaction. Take a transaction-
+    // scoped advisory lock FIRST, then read the ledger, so two replicas
+    // booting the upgrade at once cannot both observe the pre-repair state
+    // and race the renumber. The lock (and any uncommitted work) is released
+    // when the transaction ends, including on the early-return no-op paths.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(REPAIR_ADVISORY_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Read the stored checksums for the slots that diverged. This is a
     // FROM-less SELECT of scalar sub-queries, so it always returns exactly
@@ -413,7 +451,7 @@ pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
              (SELECT checksum FROM _sqlx_migrations WHERE version = 157), \
              (SELECT checksum FROM _sqlx_migrations WHERE version = 163)",
     )
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     let Some((stored_154, stored_155, stored_156, stored_157, stored_163)) = row else {
@@ -460,32 +498,66 @@ pub async fn repair_release_1_5_x_divergence(db: &PgPool) -> Result<()> {
         Some(_) => return Ok(()),
     };
 
+    // Fail-closed object guard: a checksum-matching ledger row is only worth
+    // renumbering if the migration's object actually exists. If it is
+    // missing (a phantom row), do NOT renumber - let the migrator fail
+    // closed as it would pre-repair, rather than boot silently without the
+    // #2504 index. The names are the exact objects created by 157/163.
+    let storage_key_index_present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.idx_artifacts_storage_key') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if !storage_key_index_present {
+        return Ok(());
+    }
+    if renumber_155 {
+        let maven_flat_table_present: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.maven_flat_object_owner') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        if !maven_flat_table_present {
+            return Ok(());
+        }
+    }
+
+    // Renumber. The rows' checksums already match main's 157/163 files
+    // (byte-identical), so only the version moves. Each UPDATE targets a
+    // single primary-key row; capture the affected counts to prove exactly
+    // one row moved per renumber and to record it in the audit log.
+    let moved_154 = sqlx::query("UPDATE _sqlx_migrations SET version = 157 WHERE version = 154")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+    let moved_155 = if renumber_155 {
+        sqlx::query("UPDATE _sqlx_migrations SET version = 163 WHERE version = 155")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected()
+    } else {
+        0
+    };
+    debug_assert_eq!(moved_154, 1, "exactly one row must move from 154 to 157");
+    debug_assert_eq!(
+        moved_155,
+        u64::from(renumber_155),
+        "155->163 must move exactly one row when and only when renumber_155"
+    );
+
     tracing::warn!(
         event = "migration_release_1_5_x_divergence_repair",
         renumber_155,
+        moved_154,
+        moved_155,
         "Detected v1.5.7/v1.5.8 -> 1.6.0 upgrade with the storage_key_index \
-         migration recorded at slot 154 (main uses 157). Renumbering the \
+         migration recorded at slot 154 (main uses 157). Renumbered the \
          applied _sqlx_migrations row(s) so main's fresh 154/155/156 apply \
          and 157/163 are skipped. See issue #2686."
     );
 
-    // Renumber inside a single transaction so a crash mid-repair cannot
-    // leave a half-renumbered ledger. The rows' checksums already match
-    // main's 157/163 files (byte-identical), so only the version moves.
-    let mut tx = db
-        .begin()
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    sqlx::query("UPDATE _sqlx_migrations SET version = 157 WHERE version = 154")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    if renumber_155 {
-        sqlx::query("UPDATE _sqlx_migrations SET version = 163 WHERE version = 155")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    }
     tx.commit()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1047,18 +1119,14 @@ mod tests {
         }
     }
 
-    /// The core regression: a synthetic v1.5.7 ledger fails the real
-    /// migrator with `VersionMismatch(154)` before the repair, and boots
-    /// cleanly through the whole main chain after it. DB-backed; skips
-    /// silently without `DATABASE_URL`.
-    #[tokio::test]
-    async fn v1_5_7_upgrade_red_then_green_through_real_migrator() {
-        let Some((admin_url, name, pool)) = setup_scratch_database("issue2686_157").await else {
-            return;
-        };
-
-        // Build the v1.5.7 state: everything through 153 for real, plus the
-        // storage_key_index object recorded at slot 154 (release numbering).
+    /// Build a synthetic release/1.5.x scratch database: real migrations
+    /// through 153, the storage_key_index object + ledger row at slot 154
+    /// (release numbering), and -- when `v1_5_8` -- the
+    /// maven_flat_object_owner object + ledger row at slot 155. Shared by
+    /// the v1.5.7 and v1.5.8 real-migrator tests so neither copies the
+    /// setup. `None` (skip) without `DATABASE_URL`.
+    async fn setup_v1_5_x_state(prefix: &str, v1_5_8: bool) -> Option<(String, String, PgPool)> {
+        let (admin_url, name, pool) = setup_scratch_database(prefix).await?;
         apply_migrations_through(&pool, 153).await;
         sqlx::raw_sql(include_str!(
             "../migrations/157_artifacts_storage_key_index.sql"
@@ -1073,18 +1141,68 @@ mod tests {
             &storage_key_checksum(),
         )
         .await;
-
-        // RED: the unrepaired ledger aborts the migrator at slot 154.
-        let err = sqlx::migrate!("./migrations")
-            .run(&pool)
+        if v1_5_8 {
+            sqlx::raw_sql(include_str!(
+                "../migrations/163_maven_flat_object_attribution.sql"
+            ))
+            .execute(&pool)
             .await
-            .expect_err("unrepaired v1.5.7 ledger must fail the migrator");
+            .expect("apply maven_flat_object_owner object");
+            seed_ledger_row(
+                &pool,
+                155,
+                "maven_flat_object_attribution",
+                &maven_flat_checksum(),
+            )
+            .await;
+        }
+        Some((admin_url, name, pool))
+    }
+
+    /// The unrepaired ledger must abort the real migrator at slot 154.
+    async fn assert_migrator_red_at_154(pool: &PgPool) {
+        let err = sqlx::migrate!("./migrations")
+            .run(pool)
+            .await
+            .expect_err("unrepaired v1.5.x ledger must fail the migrator");
         match err {
             sqlx::migrate::MigrateError::VersionMismatch(v) => {
                 assert_eq!(v, 154, "mismatch must be reported at the storage_key slot");
             }
             other => panic!("expected VersionMismatch(154), got {other:?}"),
         }
+    }
+
+    async fn assert_applied_success(pool: &PgPool, version: i64) {
+        let success: bool =
+            sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
+                .bind(version)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|_| panic!("slot {version} must be applied"));
+        assert!(success, "slot {version} must be recorded successful");
+    }
+
+    async fn installed_on(pool: &PgPool, version: i64) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar("SELECT installed_on FROM _sqlx_migrations WHERE version = $1")
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| panic!("slot {version} must exist"))
+    }
+
+    /// The core regression: a synthetic v1.5.7 ledger fails the real
+    /// migrator with `VersionMismatch(154)` before the repair, and boots
+    /// cleanly through the whole main chain after it. DB-backed; skips
+    /// silently without `DATABASE_URL`.
+    #[tokio::test]
+    async fn v1_5_7_upgrade_red_then_green_through_real_migrator() {
+        let Some((admin_url, name, pool)) = setup_v1_5_x_state("issue2686_157", false).await else {
+            return;
+        };
+
+        // RED: the unrepaired ledger aborts the migrator at slot 154.
+        assert_migrator_red_at_154(&pool).await;
 
         // Repair, and prove it is idempotent before the migrator runs: the
         // 154 row is renumbered to 157, and a second call is a no-op.
@@ -1105,8 +1223,9 @@ mod tests {
         );
         assert!(
             ledger_checksum(&pool, 155).await.is_none()
-                && ledger_checksum(&pool, 156).await.is_none(),
-            "main's 155/156 must not yet be applied"
+                && ledger_checksum(&pool, 156).await.is_none()
+                && ledger_checksum(&pool, 163).await.is_none(),
+            "main's 155/156 and maven-flat 163 must not yet be applied"
         );
 
         // GREEN: the real migrator now completes the full main chain.
@@ -1115,10 +1234,12 @@ mod tests {
             .await
             .expect("migrator must boot after repair");
 
-        // End-state ledger: main's 154/155/156 applied fresh, 157 preserved.
+        // End-state ledger: main's 154/155/156 applied fresh, 157 preserved,
+        // and 163 (maven_flat) applied fresh for a v1.5.7 upgrade.
         for (version, checksum) in [
             (154i64, webhook_checksum()),
             (157i64, storage_key_checksum()),
+            (163i64, maven_flat_checksum()),
         ] {
             assert_eq!(
                 ledger_checksum(&pool, version).await.as_deref(),
@@ -1126,14 +1247,8 @@ mod tests {
                 "slot {version} must carry the expected main checksum"
             );
         }
-        for version in [154i64, 155, 156, 157] {
-            let success: bool =
-                sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
-                    .bind(version)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or_else(|_| panic!("slot {version} must be applied"));
-            assert!(success, "slot {version} must be recorded successful");
+        for version in [154i64, 155, 156, 157, 163, 168] {
+            assert_applied_success(&pool, version).await;
         }
 
         // A repair on the now-main ledger (154 = webhook) is a no-op.
@@ -1151,41 +1266,26 @@ mod tests {
     }
 
     /// v1.5.8 also applied 155 (`maven_flat_object_attribution`), which on
-    /// main lives at 163. The repair must renumber both 154 -> 157 and
-    /// 155 -> 163. Ledger-level (no migrator) so it runs on the isolated
-    /// pool like the other divergence tests.
+    /// main lives at 163. The unrepaired ledger fails the real migrator at
+    /// 154; after the repair renumbers 154->157 AND 155->163 the migrator
+    /// boots the full chain, skipping 163 (already applied) and applying
+    /// 168 fresh. DB-backed; skips silently without `DATABASE_URL`.
     #[tokio::test]
-    async fn v1_5_8_ledger_renumbers_154_and_155() {
-        let Some((url, schema, pool)) = setup_isolated_pool("issue2686_v158").await else {
+    async fn v1_5_8_upgrade_red_then_green_through_real_migrator() {
+        let Some((admin_url, name, pool)) = setup_v1_5_x_state("issue2686_163", true).await else {
             return;
         };
-        create_sqlx_migrations_table(&pool).await;
-        seed_ledger_row(
-            &pool,
-            154,
-            "artifacts_storage_key_index",
-            &storage_key_checksum(),
-        )
-        .await;
-        seed_ledger_row(
-            &pool,
-            155,
-            "maven_flat_object_attribution",
-            &maven_flat_checksum(),
-        )
-        .await;
+
+        // RED: same VersionMismatch(154) - 154 is validated before 155.
+        assert_migrator_red_at_154(&pool).await;
 
         repair_release_1_5_x_divergence(&pool)
             .await
             .expect("v1.5.8 repair must succeed");
-
         assert!(
-            ledger_checksum(&pool, 154).await.is_none(),
-            "154 renumbered"
-        );
-        assert!(
-            ledger_checksum(&pool, 155).await.is_none(),
-            "155 renumbered"
+            ledger_checksum(&pool, 154).await.is_none()
+                && ledger_checksum(&pool, 155).await.is_none(),
+            "both 154 and 155 must be renumbered away"
         );
         assert_eq!(
             ledger_checksum(&pool, 157).await.as_deref(),
@@ -1198,18 +1298,38 @@ mod tests {
             "155 must move to 163"
         );
 
-        // Idempotent.
-        repair_release_1_5_x_divergence(&pool)
+        // Record 163's install time to prove the migrator SKIPS it (does not
+        // re-apply the renumbered row) during the GREEN run.
+        let maven_installed_on = installed_on(&pool, 163).await;
+
+        // GREEN: the real migrator completes the full main chain.
+        sqlx::migrate!("./migrations")
+            .run(&pool)
             .await
-            .expect("second call is a no-op");
-        assert!(ledger_checksum(&pool, 154).await.is_none());
+            .expect("migrator must boot after v1.5.8 repair");
+
+        // 163 skipped: still the renumbered row, untouched install time.
         assert_eq!(
             ledger_checksum(&pool, 163).await.as_deref(),
-            Some(maven_flat_checksum().as_slice())
+            Some(maven_flat_checksum().as_slice()),
+            "163 must remain the renumbered maven_flat row"
+        );
+        assert_eq!(
+            installed_on(&pool, 163).await,
+            maven_installed_on,
+            "163 must be skipped (not re-applied) by the migrator"
+        );
+        // 168 (maven_flat_object_attribution_backend) applies fresh.
+        for version in [154i64, 155, 156, 157, 163, 168] {
+            assert_applied_success(&pool, version).await;
+        }
+        assert_eq!(
+            ledger_checksum(&pool, 154).await.as_deref(),
+            Some(webhook_checksum().as_slice()),
+            "154 must now be main's webhook_deliveries_claim"
         );
 
-        drop(pool);
-        drop_isolation_schema(&url, &schema).await;
+        drop_scratch_database(&admin_url, pool, &name).await;
     }
 
     /// No-op when 154 already carries main's `webhook_deliveries_claim`
@@ -1243,6 +1363,109 @@ mod tests {
         assert!(
             ledger_checksum(&pool, 157).await.is_none(),
             "no spurious 157 row must be created"
+        );
+
+        drop(pool);
+        drop_isolation_schema(&url, &schema).await;
+    }
+
+    /// No-op (zero rows changed) when a target slot is already occupied
+    /// (156/157 present) or when 155 carries an unexpected checksum. These
+    /// paths return before the object guard, so no objects are needed.
+    #[tokio::test]
+    async fn v1_5_x_repair_no_op_on_occupied_slot_and_unexpected_155() {
+        let Some((url, schema, pool)) = setup_isolated_pool("issue2686_guard").await else {
+            return;
+        };
+        create_sqlx_migrations_table(&pool).await;
+
+        // (a) 154 = storage_key signature, but 157 is already occupied: not a
+        //     pristine v1.5.x ledger, so leave it entirely alone.
+        seed_ledger_row(
+            &pool,
+            154,
+            "artifacts_storage_key_index",
+            &storage_key_checksum(),
+        )
+        .await;
+        seed_ledger_row(
+            &pool,
+            157,
+            "artifacts_storage_key_index",
+            &storage_key_checksum(),
+        )
+        .await;
+        repair_release_1_5_x_divergence(&pool)
+            .await
+            .expect("no-op when 157 occupied");
+        assert_eq!(
+            ledger_checksum(&pool, 154).await.as_deref(),
+            Some(storage_key_checksum().as_slice()),
+            "154 must be untouched when 157 is occupied"
+        );
+
+        // (b) 154 = storage_key signature, but 155 is an unexpected checksum
+        //     (neither absent nor maven_flat). Remove 157, add the bogus 155.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 157")
+            .execute(&pool)
+            .await
+            .expect("clear 157");
+        let bogus = vec![0x5au8; 48];
+        seed_ledger_row(&pool, 155, "something_else", &bogus).await;
+        repair_release_1_5_x_divergence(&pool)
+            .await
+            .expect("no-op on unexpected 155");
+        assert_eq!(
+            ledger_checksum(&pool, 154).await.as_deref(),
+            Some(storage_key_checksum().as_slice()),
+            "154 must be untouched on unexpected 155"
+        );
+        assert_eq!(
+            ledger_checksum(&pool, 155).await.as_deref(),
+            Some(bogus.as_slice()),
+            "the unexpected 155 row must be untouched"
+        );
+        assert!(
+            ledger_checksum(&pool, 157).await.is_none(),
+            "no renumber must have happened"
+        );
+
+        drop(pool);
+        drop_isolation_schema(&url, &schema).await;
+    }
+
+    /// Fail-closed object guard: a 154 row carrying the storage_key_index
+    /// checksum but with NO backing `idx_artifacts_storage_key` object (a
+    /// phantom ledger) must NOT be renumbered - the migrator should still
+    /// fail closed rather than boot without the #2504 index. The isolated
+    /// schema has no `public.idx_artifacts_storage_key`, so this exercises
+    /// the missing-object path directly.
+    #[tokio::test]
+    async fn v1_5_x_repair_no_op_when_storage_key_index_missing() {
+        let Some((url, schema, pool)) = setup_isolated_pool("issue2686_phantom").await else {
+            return;
+        };
+        create_sqlx_migrations_table(&pool).await;
+        seed_ledger_row(
+            &pool,
+            154,
+            "artifacts_storage_key_index",
+            &storage_key_checksum(),
+        )
+        .await;
+
+        repair_release_1_5_x_divergence(&pool)
+            .await
+            .expect("phantom-ledger repair must be a no-op");
+
+        assert_eq!(
+            ledger_checksum(&pool, 154).await.as_deref(),
+            Some(storage_key_checksum().as_slice()),
+            "154 must NOT be renumbered when the index object is missing"
+        );
+        assert!(
+            ledger_checksum(&pool, 157).await.is_none(),
+            "no 157 row must be created for a phantom ledger"
         );
 
         drop(pool);
