@@ -1,0 +1,33 @@
+-- Hex registry signing keys.
+--
+-- A hex repository is only usable by a real `mix` client if its registry
+-- resources (/names, /versions, /packages/{name}) are signed and the matching
+-- public key is published at /hex/{repo}/public_key. Unlike Debian's optional
+-- Release.gpg, the signature is mandatory in the hex protocol, so every hosted
+-- hex repository needs exactly one dedicated registry key. The key is
+-- provisioned when the repository is created and reuses the existing
+-- `signing_keys` table (RSA material, private half encrypted at rest).
+--
+-- This partial unique index makes that provisioning idempotent: concurrent
+-- provisioning attempts race on the INSERT, the losers hit ON CONFLICT DO
+-- NOTHING and re-select the winner's row, so a repository can never end up
+-- with two *active* registry keys (which would make signatures verify only
+-- half the time, depending on which row was read).
+--
+-- The `is_active` term is load-bearing and must match the lookup predicate in
+-- `SigningService::find_hex_registry_key` (`... AND is_active = true`) exactly.
+-- Without it the index constrains a strictly wider row set than the lookup
+-- reads, and the two disagree the moment a key is revoked: `revoke_key` sets
+-- `is_active = false` and leaves the row in place, so the lookup stops finding
+-- it (correctly — it is revoked) while the index still counts it. Re-provision
+-- then hits the inactive row via ON CONFLICT DO NOTHING, re-selects nothing,
+-- and the repository is wedged on a 500 with no API-reachable recovery — and
+-- burns an RSA-2048 keygen per request on the way, on an anonymously reachable
+-- path. Scoping the index to active rows lets a revoked key's row remain as an
+-- audit record while a fresh key is provisioned over it, which is precisely the
+-- revoke-then-redistribute flow operators need during a key-compromise
+-- incident. Keeping the two predicates identical is what makes revoke
+-- recoverable instead of terminal.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signing_keys_hex_registry_per_repo
+    ON signing_keys (repository_id)
+    WHERE name = 'hex-registry' AND repository_id IS NOT NULL AND is_active = true;

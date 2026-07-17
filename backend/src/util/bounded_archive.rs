@@ -200,6 +200,10 @@ pub fn acquire_ingest_extraction() -> Result<IngestExtractionGuard> {
 ///     .map_err(|e| e.into_response())?   // 503 shed
 ///     .map_err(|e| bad_request(e))?;     // decode's own error
 /// ```
+///
+/// **This budget is for the *ingest* (publish/upload) path only.** A read path
+/// that needs to re-open a stored archive must use
+/// [`with_registry_extraction`] instead — see its docs for why.
 pub fn with_ingest_extraction<T>(decode: impl FnOnce() -> T) -> Result<T> {
     with_ingest_extraction_from(ingest_extraction_semaphore(), decode)
 }
@@ -221,6 +225,94 @@ where
 {
     let _permit = acquire_ingest_extraction_from(ingest_extraction_semaphore())?;
     Ok(decode().await)
+}
+
+// ---------------------------------------------------------------------------
+// Registry/read-path extraction budget
+//
+// A few read paths must re-open an archive that is already stored, to recover a
+// fact about it that was not captured at publish (the hex registry's
+// `inner_checksum` for artifacts published before that capture existed). That
+// decode needs the same bounding as ingestion, but it must NOT draw on the same
+// budget:
+//
+//   * The ingest semaphore is shared by EVERY format's publish path. Spending
+//     its permits on reads lets read traffic shed *publishes* — across formats
+//     that have nothing to do with the reader. A handful of concurrent
+//     anonymous GETs could 503 every upload in the product.
+//   * The two have opposite shapes. Ingest decode is once per upload, bounded
+//     by the client's own upload rate. A registry read can fan out to one
+//     decode per release *within a single request*, so it saturates a small
+//     budget far more easily.
+//
+// Reads therefore get their own semaphore with the same fast-fail-503
+// discipline. Saturating it degrades registry reads only; publishes are
+// untouched. This budget is a backstop, not the primary mechanism — callers are
+// expected to persist what they recover so the re-read happens at most once per
+// artifact rather than once per request.
+// ---------------------------------------------------------------------------
+
+/// Default cap on how many registry/read-path archive decompressions may run at
+/// once. Separate from (and additive to)
+/// [`DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS`].
+pub const DEFAULT_MAX_CONCURRENT_REGISTRY_EXTRACTIONS: usize = 4;
+
+/// Env var overriding [`DEFAULT_MAX_CONCURRENT_REGISTRY_EXTRACTIONS`]. Same
+/// blank/non-numeric/zero fallback rules as the ingest cap.
+pub const MAX_CONCURRENT_REGISTRY_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_REGISTRY_EXTRACTIONS";
+
+/// Effective concurrent-registry-extraction cap.
+fn max_concurrent_registry_extractions() -> usize {
+    clamp_ingest_permits(positive_env_or(
+        MAX_CONCURRENT_REGISTRY_EXTRACTIONS_ENV,
+        DEFAULT_MAX_CONCURRENT_REGISTRY_EXTRACTIONS as u64,
+    ))
+}
+
+/// Process-wide semaphore bounding concurrent registry/read-path
+/// decompressions. Deliberately a *different* singleton from
+/// [`ingest_extraction_semaphore`] so read load can never shed uploads.
+fn registry_extraction_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_registry_extractions())))
+}
+
+/// Run `decode` (a synchronous archive decompression on a *read* path) while
+/// holding one process-wide registry-decompression slot. Identical
+/// fast-fail-503 semantics to [`with_ingest_extraction`], but on its own budget
+/// — see the module note above for why the two must not share.
+pub fn with_registry_extraction<T>(decode: impl FnOnce() -> T) -> Result<T> {
+    with_ingest_extraction_from(registry_extraction_semaphore(), decode)
+}
+
+/// Test-only scaffolding for suites that manipulate the process-wide extraction
+/// semaphores.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Serializes tests that touch the PROCESS-WIDE extraction semaphores,
+    /// wherever they live in the crate.
+    ///
+    /// `cargo test` runs tests as threads in one process, so a test that
+    /// deliberately saturates a singleton would otherwise shed a concurrent
+    /// test's acquire and make it flake. (Under `cargo nextest`, which CI uses,
+    /// each test is its own process and this is moot — but the suite must be
+    /// correct under both runners.) The semaphores are process-wide, so the lock
+    /// guarding them has to be too: a per-module lock would not serialize a
+    /// handler test against a `bounded_archive` test.
+    ///
+    /// A `tokio::sync::Mutex` rather than a `std` one because async tests hold
+    /// the guard across `.await`.
+    static SINGLETON_SEM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the lock from a synchronous test.
+    pub(crate) fn lock_singletons() -> tokio::sync::MutexGuard<'static, ()> {
+        SINGLETON_SEM_LOCK.blocking_lock()
+    }
+
+    /// Take the lock from an async test; safe to hold across `.await`.
+    pub(crate) async fn lock_singletons_async() -> tokio::sync::MutexGuard<'static, ()> {
+        SINGLETON_SEM_LOCK.lock().await
+    }
 }
 
 /// A `Read` wrapper enforcing a hard cumulative-byte budget on a *decoded*
@@ -630,6 +722,9 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Tests using only local semaphores need not take these.
+    use super::test_support::{lock_singletons, lock_singletons_async};
 
     fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -1056,6 +1151,7 @@ mod tests {
 
     #[test]
     fn global_wrappers_uncontended_happy_path() {
+        let _lock = lock_singletons();
         // The process-wide entry points (which the handlers call) work
         // uncontended: acquire + release, then a scoped decode passes through.
         let guard = acquire_ingest_extraction().expect("global acquire uncontended");
@@ -1093,6 +1189,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_ingest_extraction_async_holds_across_await() {
+        let _lock = lock_singletons_async().await;
         // Happy path on the process-wide semaphore (uncontended in tests):
         // the future runs to completion and its value passes through.
         let out = with_ingest_extraction_async(|| async { 7 * 6 })
@@ -1115,5 +1212,74 @@ mod tests {
             "the 5th concurrent extraction past a cap of 4 must shed"
         );
         drop((g1, g2, g3, g4));
+    }
+
+    /// The registry (read) budget and the ingest (publish) budget must be
+    /// SEPARATE singletons. This is the invariant that stops read traffic from
+    /// shedding uploads: the hex registry read path re-reads stored tarballs
+    /// once per release, so a single anonymous request can fan out to many
+    /// extractions. If those spent ingest permits, ~8 concurrent anonymous
+    /// registry GETs would 503 publishes across EVERY format in the product.
+    #[test]
+    fn registry_and_ingest_extraction_semaphores_are_distinct_singletons() {
+        assert!(
+            !Arc::ptr_eq(
+                ingest_extraction_semaphore(),
+                registry_extraction_semaphore()
+            ),
+            "reads and publishes must not share one budget"
+        );
+    }
+
+    #[test]
+    fn registry_and_ingest_extraction_budgets_are_independent() {
+        let _lock = lock_singletons();
+        // Saturate the real ingest budget completely.
+        let ingest_sem = ingest_extraction_semaphore();
+        let mut held = Vec::new();
+        while let Ok(g) = acquire_ingest_extraction_from(ingest_sem) {
+            held.push(g);
+        }
+        assert!(!held.is_empty(), "ingest budget must have had permits");
+        assert!(
+            acquire_ingest_extraction_from(ingest_sem).is_err(),
+            "ingest budget is now saturated"
+        );
+
+        // A registry read must still proceed: it draws on its own budget.
+        let out = with_registry_extraction(|| "read served")
+            .expect("registry reads must not be shed by a saturated INGEST budget");
+        assert_eq!(out, "read served");
+
+        drop(held);
+    }
+
+    /// The converse: a saturated registry budget must never shed a publish.
+    #[test]
+    fn saturated_registry_budget_does_not_shed_ingest() {
+        let _lock = lock_singletons();
+        let registry_sem = registry_extraction_semaphore();
+        let mut held = Vec::new();
+        while let Ok(g) = acquire_ingest_extraction_from(registry_sem) {
+            held.push(g);
+        }
+        assert!(!held.is_empty(), "registry budget must have had permits");
+        assert!(
+            acquire_ingest_extraction_from(registry_sem).is_err(),
+            "registry budget is now saturated"
+        );
+
+        let out = with_ingest_extraction(|| "publish served")
+            .expect("publishes must not be shed by a saturated REGISTRY budget");
+        assert_eq!(out, "publish served");
+
+        drop(held);
+    }
+
+    #[test]
+    fn registry_extraction_runs_the_decode_and_passes_the_value_through() {
+        let _lock = lock_singletons();
+        let out = with_registry_extraction(|| 6 * 7).expect("uncontended decode runs");
+        assert_eq!(out, 42);
     }
 }

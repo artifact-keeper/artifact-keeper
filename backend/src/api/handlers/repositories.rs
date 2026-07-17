@@ -44,6 +44,7 @@ use crate::services::repository_service::{
     RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 
 /// Require that the request is authenticated, returning an error if not.
@@ -2298,6 +2299,8 @@ pub async fn create_repository(
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
     let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
+    // Computed before `format` is moved into the create request below.
+    let is_hex_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Hex);
 
     // Validate up-front that virtual repos do not arrive with an explicit
     // empty `member_repos: []`. Omitted-field (deferred-population) is
@@ -2468,6 +2471,35 @@ pub async fn create_repository(
             created_by: Some(auth.user_id),
         })
         .await?;
+
+    // Provision the hex registry signing key (#2641). A hosted hex repository is
+    // unusable by a real `mix` client until its registry resources are signed,
+    // so — unlike Debian's optional Release.gpg — there is no unsigned-but-
+    // working mode and the key is not optional. Doing it here, at creation, is
+    // what keeps it off the read path: registry fetches are anonymous on a
+    // public repo, and an RSA-2048 keygen is the kind of work that must never be
+    // reachable by an unauthenticated GET. This is authenticated, happens once,
+    // and races with nothing.
+    //
+    // `get_or_create_hex_registry_key` remains on the read path purely as a
+    // self-heal for repositories created before this existed (or by paths that
+    // do not run this hook), and after a key is revoked.
+    if is_hex_hosted {
+        let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+        // Warn-and-continue on failure: the repository is already created and
+        // committed at this point, so failing the request would hand the
+        // operator an error for an operation whose primary effect succeeded —
+        // and a retry would then hit "already exists". A keyless repo is
+        // covered by the read path's `get_or_create` self-heal.
+        if let Err(e) = signing_svc.provision_hex_registry_key(repo.id).await {
+            tracing::warn!(
+                repo_id = %repo.id,
+                error = %e,
+                "Failed to eagerly provision the hex registry signing key; \
+                 the first registry read will self-heal it"
+            );
+        }
+    }
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
@@ -17225,6 +17257,99 @@ mod tests {
              got {} with body: {}",
             status,
             String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// #2641: creating a hosted hex repository provisions its registry signing
+    /// key right there, under the creator's authenticated request.
+    ///
+    /// This is what keeps RSA-2048 keygen off the anonymous read path. A hex
+    /// registry is unusable unsigned (no "unsigned but working" mode, unlike
+    /// Debian's optional `Release.gpg`), so the key cannot simply be optional —
+    /// it has to be minted somewhere, and the only safe somewhere is an
+    /// authenticated, once-per-repo operation. `get_or_create` survives on the
+    /// read path only as a self-heal for repos created before this existed.
+    #[tokio::test]
+    async fn hosted_hex_repo_provisions_its_registry_key_at_creation_2641() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir =
+            std::env::temp_dir().join(format!("hex-2641-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("hex-2641-{}", Uuid::new_v4().simple());
+        let created = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            make_create_request(
+                &repo_key,
+                "Hex 2641",
+                "hex",
+                serde_json::json!({ "repo_type": "local" }),
+            ),
+        )
+        .await
+        .expect("creating a hosted hex repo must succeed")
+        .0;
+
+        let key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signing_keys \
+             WHERE repository_id = $1 AND name = 'hex-registry' AND is_active = true",
+        )
+        .bind(created.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count registry keys");
+
+        // A non-hex repo must NOT get one — the hook is format-scoped.
+        let other_key = format!("gen-2641-{}", Uuid::new_v4().simple());
+        let other = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            make_create_request(
+                &other_key,
+                "Generic 2641",
+                "generic",
+                serde_json::json!({ "repo_type": "local" }),
+            ),
+        )
+        .await
+        .expect("creating a generic repo must succeed")
+        .0;
+        let other_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signing_keys WHERE repository_id = $1 AND name = 'hex-registry'",
+        )
+        .bind(other.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count registry keys");
+
+        sqlx::query("DELETE FROM signing_keys WHERE repository_id = ANY($1)")
+            .bind(vec![created.id, other.id])
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![repo_key.clone(), other_key.clone()])
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            key_count, 1,
+            "a hosted hex repo must have its registry key provisioned at creation, \
+             so no anonymous read ever triggers a keygen"
+        );
+        assert_eq!(
+            other_count, 0,
+            "only hex repos get a hex registry key; the hook must be format-scoped"
         );
     }
 

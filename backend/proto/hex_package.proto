@@ -1,0 +1,72 @@
+// Hex registry `/packages/{name}` resource.
+//
+// Mirrors hex_core's `mix_hex_pb_package` schema (verified field-for-field
+// against the real client: hex 2.5.1 `mix_hex_pb_package:get_msg_defs/0`).
+syntax = "proto2";
+
+package hexpb.pkg;
+
+message Package {
+  repeated Release releases = 1;
+  required string name = 2;
+  required string repository = 3;
+  repeated SecurityAdvisory advisories = 4;
+}
+
+message Release {
+  required string version = 1;
+  // SHA-256 of the tarball's inner contents, i.e. the raw bytes carried by the
+  // `CHECKSUM` member of the outer tar. Recorded in the consumer's `mix.lock`.
+  required bytes inner_checksum = 2;
+  repeated Dependency dependencies = 3;
+  optional RetirementStatus retired = 4;
+  // SHA-256 over the whole `.tar`; the client re-hashes the download and
+  // refuses the package when it disagrees.
+  optional bytes outer_checksum = 5;
+  repeated uint32 advisory_indexes = 6;
+  optional Timestamp published_at = 7;
+}
+
+message RetirementStatus {
+  required RetirementReason reason = 1;
+  optional string message = 2;
+}
+
+enum RetirementReason {
+  RETIRED_OTHER = 0;
+  RETIRED_INVALID = 1;
+  RETIRED_SECURITY = 2;
+  RETIRED_DEPRECATED = 3;
+  RETIRED_RENAMED = 4;
+}
+
+message SecurityAdvisory {
+  required string id = 1;
+  required string summary = 2;
+  required string html_url = 3;
+  optional AdvisorySeverity severity = 4;
+  optional float cvss_score = 5;
+  required string api_url = 6;
+  repeated string aliases = 7;
+}
+
+enum AdvisorySeverity {
+  SEVERITY_NONE = 0;
+  SEVERITY_LOW = 1;
+  SEVERITY_MEDIUM = 2;
+  SEVERITY_HIGH = 3;
+  SEVERITY_CRITICAL = 4;
+}
+
+message Dependency {
+  required string package = 1;
+  required string requirement = 2;
+  optional bool optional = 3;
+  optional string app = 4;
+  optional string repository = 5;
+}
+
+message Timestamp {
+  required int64 seconds = 1;
+  required int32 nanos = 2;
+}

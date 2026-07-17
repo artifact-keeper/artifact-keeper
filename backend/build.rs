@@ -11,6 +11,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .compile_protos(&["proto/sbom.proto"], &["proto"])?;
 
+    // Hex registry resources (`/names`, `/versions`, `/packages/{name}`) are
+    // plain protobuf messages with no gRPC service, so they are generated with
+    // prost only. The schemas mirror hex_core's `mix_hex_pb_*` definitions.
+    prost_build::Config::new()
+        .out_dir(&out_dir)
+        .compile_protos(
+            &[
+                "proto/hex_signed.proto",
+                "proto/hex_names.proto",
+                "proto/hex_versions.proto",
+                "proto/hex_package.proto",
+            ],
+            &["proto"],
+        )?;
+
     let git_sha = std::env::var("GIT_SHA")
         .ok()
         .filter(|s| !s.is_empty())

@@ -280,6 +280,8 @@ mod tests {
     fn test_repository_type_from_db_str_unknown_is_none() {
         assert_eq!(RepositoryType::from_db_str(""), None);
         assert_eq!(RepositoryType::from_db_str("federated"), None);
+        // "hosted" is a predicate over types, not a type of its own.
+        assert_eq!(RepositoryType::from_db_str("hosted"), None);
         // The DB enum is lowercase.
         assert_eq!(RepositoryType::from_db_str("Local"), None);
     }

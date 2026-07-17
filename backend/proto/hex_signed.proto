@@ -1,0 +1,15 @@
+// Hex registry `Signed` envelope.
+//
+// Mirrors hex_core's `mix_hex_pb_signed` schema (verified field-for-field
+// against the real client: hex 2.5.1 `mix_hex_pb_signed:get_msg_defs/0`).
+// Every registry resource is served as gzip(Signed{payload, signature}).
+syntax = "proto2";
+
+package hexpb.signed;
+
+message Signed {
+  // Encoded Names/Versions/Package payload.
+  required bytes payload = 1;
+  // RSA PKCS#1 v1.5 signature over `payload`, digest SHA-512.
+  optional bytes signature = 2;
+}
