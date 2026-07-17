@@ -11,8 +11,6 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -29,8 +27,6 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
-use crate::models::user::User;
-use crate::services::auth_service::AuthService;
 use crate::services::curation_service::version_compare;
 
 // ---------------------------------------------------------------------------
@@ -846,43 +842,24 @@ async fn push_package(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
+    // `repo_visibility_middleware` resolves the caller for every format route
+    // — including the `X-NuGet-ApiKey` push credential (#2642) — and rejects an
+    // unauthenticated or invalid-credential write with 401 before this handler
+    // runs, so the auth extension is always present here.
+    //
+    // Require it rather than re-authenticating locally: a second credential
+    // path in the handler would be strictly weaker than the middleware's,
+    // because it can only reach `require_scope_response` with `None`, which is
+    // a no-op — silently skipping the GHSA-vvc3-h39c-mrq5 write-scope check.
+    let auth = auth.ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("Authentication required"))
+            .unwrap()
+    })?;
     // GHSA-vvc3-h39c-mrq5: enforce write scope before doing anything else.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
-    let user_id = match auth {
-        Some(ext) => ext.user_id,
-        None => {
-            let api_key = headers
-                .get("X-NuGet-ApiKey")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Body::from("Authentication required"))
-                        .unwrap()
-                })?;
-            let (username, password) = if let Some((u, p)) = api_key.split_once(':') {
-                (u.to_string(), p.to_string())
-            } else {
-                ("apikey".to_string(), api_key.to_string())
-            };
-            let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
-                user.id
-            } else if let Ok(validation) = auth_service.validate_api_token(&password).await {
-                validation.user.id
-            } else if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
-                let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
-                    .bind(claims.sub)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?
-                    .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
-                user.id
-            } else {
-                return Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response());
-            }
-        }
-    };
+    crate::api::middleware::auth::require_scope_response(Some(&auth), "write")?;
+    let user_id = auth.user_id;
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1204,58 +1181,63 @@ mod tests {
     // Extracted pure functions (test-only)
     // -----------------------------------------------------------------------
 
+    /// The handler must never authenticate a push itself.
+    ///
+    /// `repo_visibility_middleware` is the single credential authority for
+    /// format routes: it resolves `X-NuGet-ApiKey` on the push route (#2642)
+    /// and 401s an unauthenticated or invalid-credential write before this
+    /// handler runs. The handler previously carried its own `X-NuGet-ApiKey`
+    /// fallback (`user:pass` -> `authenticate()`, or a raw JWT); those shapes
+    /// are unreachable now, and that path was strictly weaker — it could only
+    /// reach `require_scope_response` with `None`, which is a no-op that skips
+    /// the GHSA-vvc3-h39c-mrq5 write-scope check.
+    ///
+    /// Pin the deletion: a missing auth extension is 401 no matter what the
+    /// header carries, so the parallel auth path cannot be reintroduced by
+    /// accident.
     #[tokio::test]
-    async fn test_push_package_requires_nuget_api_key_when_unauthenticated() {
-        let state = test_state_with_secret("test-secret-at-least-32-bytes-long-for-testing");
-        let headers = HeaderMap::new();
-
-        let resp = push_package(
-            State(state),
-            Extension(None),
-            Path("nuget-test".to_string()),
-            headers,
-            Body::from("dummy"),
-        )
-        .await
-        .expect_err("missing api key should fail before repo resolution");
-
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            "Authentication required"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_push_package_jwt_api_key_fallback_returns_invalid_key_on_db_error() {
+    async fn test_push_package_rejects_unauthenticated_push_whatever_the_api_key_header() {
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
-        let state = test_state_with_secret(secret);
         let jwt = mint_access_jwt(secret, "ci-user");
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-NuGet-ApiKey",
-            HeaderValue::from_str(&format!("ci-user:{}", jwt)).expect("api key header"),
-        );
+        // No header, plus both credential shapes the removed fallback accepted.
+        let api_keys = [
+            None,
+            Some(format!("ci-user:{}", jwt)),
+            Some(jwt.clone()),
+            Some("apikey-value".to_string()),
+        ];
 
-        let resp = push_package(
-            State(state),
-            Extension(None),
-            Path("nuget-test".to_string()),
-            headers,
-            Body::from("dummy"),
-        )
-        .await
-        .expect_err("lazy pool should make JWT user lookup fail as invalid key");
+        for api_key in api_keys {
+            let state = test_state_with_secret(secret);
+            let mut headers = HeaderMap::new();
+            if let Some(key) = &api_key {
+                headers.insert(
+                    "X-NuGet-ApiKey",
+                    HeaderValue::from_str(key).expect("api key header"),
+                );
+            }
 
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = to_bytes(resp.into_body(), usize::MAX)
+            let resp = push_package(
+                State(state),
+                Extension(None),
+                Path("nuget-test".to_string()),
+                headers,
+                Body::from("dummy"),
+            )
             .await
-            .expect("read body");
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "Invalid API key");
+            .expect_err("no auth extension must fail before repo resolution");
+
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let body = to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                "Authentication required",
+                "X-NuGet-ApiKey {api_key:?} must not authenticate at the handler"
+            );
+        }
     }
 
     /// Build the base URL for NuGet service index resources.
