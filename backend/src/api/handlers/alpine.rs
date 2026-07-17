@@ -680,13 +680,13 @@ fn create_apkindex_tar_gz(
 /// or an error response.
 ///
 /// The three outcomes are distinct and must stay distinct:
-///   * `Ok(None)`    — the repository has no active signing key, so serving the
-///                     index unsigned is the intended, configured behaviour.
-///   * `Ok(Some(_))` — a signature was produced; embed it.
-///   * `Err(_)`      — signing was configured but failed. This must surface as a
-///                     hard 500, never be collapsed into "serve unsigned": apk
-///                     clients that require signatures would otherwise be handed
-///                     an unsigned index under a 200 (#2660).
+/// * `Ok(None)` — the repository has no active signing key, so serving the index
+///   unsigned is the intended, configured behaviour.
+/// * `Ok(Some(_))` — a signature was produced; embed it.
+/// * `Err(_)` — signing was configured but failed. This must surface as a hard
+///   500, never be collapsed into "serve unsigned": apk clients that require
+///   signatures would otherwise be handed an unsigned index under a 200 (#2660).
+#[allow(clippy::result_large_err)]
 fn resolve_apkindex_signature(
     result: crate::error::Result<Option<Vec<u8>>>,
 ) -> Result<Option<Vec<u8>>, Response> {
