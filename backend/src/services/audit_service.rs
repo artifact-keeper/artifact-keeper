@@ -102,6 +102,16 @@ pub enum AuditAction {
     // outbound sync and when. Appended at the END of the enum to keep the
     // additive change conflict-free with in-flight taxonomy work.
     CurationSyncTriggered,
+
+    // Curated RPM snapshot publish (#2358 — RPM Phase-3). `CurationVersionCreated`
+    // is recorded when an authorized principal freezes the approved curation set
+    // into a new immutable `repository_version`; `CurationVersionPublished` when
+    // that version's signed repodata is generated and served under `/rpm/{key}/@N/`.
+    // Both capture repo_key + version_number + package_count only (no upstream
+    // secrets). Appended at the END of the enum to keep the additive change
+    // conflict-free with in-flight taxonomy work.
+    CurationVersionCreated,
+    CurationVersionPublished,
 }
 
 impl AuditAction {
@@ -155,6 +165,8 @@ impl AuditAction {
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
+            AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
+            AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
         }
     }
 }

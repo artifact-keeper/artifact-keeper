@@ -43,4 +43,12 @@ pub struct CurationPackage {
     pub metadata: serde_json::Value,
     pub first_seen_at: DateTime<Utc>,
     pub upstream_updated_at: Option<DateTime<Utc>>,
+    /// The STRUCTURED, validated primary.xml metadata this package was synced
+    /// from (#2358 RPM Phase-3, A-hardened). Stored as JSONB so a curated
+    /// snapshot publish re-serializes it CANONICALLY under AK's escaping and
+    /// AK-derived `<location>`, instead of re-emitting attacker-influenced
+    /// upstream markup. `NULL` for rows synced before this column existed (they
+    /// must be re-synced before a publish can include them — the publish path
+    /// fails closed on missing metadata) and for non-RPM formats.
+    pub primary_metadata: Option<serde_json::Value>,
 }

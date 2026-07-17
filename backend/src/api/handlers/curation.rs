@@ -17,6 +17,7 @@ use crate::error::AppError;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::curation_service::CurationService;
 use crate::services::repository_service::RepositoryService;
+use crate::services::signing_service::SigningService;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -35,6 +36,8 @@ use crate::services::repository_service::RepositoryService;
         re_evaluate,
         trigger_sync,
         search_packages,
+        create_version,
+        publish_version,
         stats,
     ),
     components(schemas(
@@ -46,6 +49,7 @@ use crate::services::repository_service::RepositoryService;
         PackageListQuery,
         PackageSearchQuery,
         SyncTriggerResponse,
+        VersionResponse,
         ReEvaluateRequest,
         StatsResponse,
         StatusCount,
@@ -77,6 +81,12 @@ pub fn router() -> Router<SharedState> {
         // Per-repo manual sync trigger (#2357 WI-5) + package search (WI-6)
         .route("/repos/:repo_key/sync", post(trigger_sync))
         .route("/repos/:repo_key/packages/search", get(search_packages))
+        // Curated snapshot versions + signed immutable @N publication (#2358)
+        .route("/repos/:repo_key/versions", post(create_version))
+        .route(
+            "/repos/:repo_key/versions/:n/publish",
+            post(publish_version),
+        )
         // Stats
         .route("/stats", get(stats))
 }
@@ -711,6 +721,178 @@ async fn search_packages(
         )
         .await?;
     Ok(Json(packages.into_iter().map(pkg_to_response).collect()))
+}
+
+// ---------------------------------------------------------------------------
+// Curated snapshot versions + signed immutable @N publication (#2358)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VersionResponse {
+    /// The repository key the version belongs to.
+    pub repository: String,
+    /// The monotonic snapshot number (published/served under `/rpm/{key}/@N/`).
+    pub version_number: i64,
+    /// The number of approved packages frozen into the snapshot.
+    pub package_count: i64,
+    /// Whether this version's signed repodata has been published yet.
+    pub published: bool,
+}
+
+/// Resolve the target repo and enforce #2567's DUAL curation gate: the global
+/// capability (admin OR an API token carrying `trigger:sync`) AND, independently
+/// of the admin flag, the tenant-ownership gate. Returns the resolved repo on
+/// success. Shared by the version-create and publish handlers so both apply the
+/// exact same authorization the sync trigger does (never `require_repo_access`).
+async fn authorize_version_action(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo_key: &str,
+) -> Result<crate::models::repository::Repository, AppError> {
+    let has_sync_scope = auth.is_api_token && auth.has_scope("trigger:sync");
+    ensure_sync_authorized(auth.is_admin, has_sync_scope)?;
+
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service
+        .get_by_key(repo_key)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::NotFound("Repository not found".to_string()),
+            other => other,
+        })?;
+
+    let has_grant = repo_service
+        .user_can_access_repo(repo.id, auth.user_id)
+        .await?;
+    if !sync_tenant_access_allowed(repo.is_public, has_grant) {
+        return Err(AppError::Authorization(format!(
+            "You are not authorized to manage curated versions for the '{}' repository's tenant",
+            repo.key
+        )));
+    }
+    Ok(repo)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/curation/repos/{repo_key}/versions",
+    operation_id = "create_curation_version",
+    params(("repo_key" = String, Path, description = "Staging repository key")),
+    responses(
+        (status = 201, body = VersionResponse),
+        (status = 400, description = "No approved packages / packages need re-sync"),
+        (status = 403, description = "Not authorized for this repo"),
+        (status = 404, description = "Repository not found"),
+    ),
+    tag = "Curation"
+)]
+async fn create_version(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(repo_key): Path<String>,
+) -> Result<(StatusCode, Json<VersionResponse>), AppError> {
+    let repo = authorize_version_action(&state, &auth, &repo_key).await?;
+
+    let summary =
+        crate::services::rpm_publish_service::create_version(&state.db, repo.id, auth.user_id)
+            .await?;
+
+    // Audit (#2358): repo key + version number + package count only.
+    let _ = AuditService::new(state.db.clone())
+        .log(
+            AuditEntry::new(
+                AuditAction::CurationVersionCreated,
+                ResourceType::Repository,
+            )
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details(serde_json::json!({
+                "repo_key": repo.key,
+                "version_number": summary.version_number,
+                "package_count": summary.package_count,
+            })),
+        )
+        .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(VersionResponse {
+            repository: repo.key,
+            version_number: summary.version_number,
+            package_count: summary.package_count,
+            published: false,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/curation/repos/{repo_key}/versions/{n}/publish",
+    operation_id = "publish_curation_version",
+    params(
+        ("repo_key" = String, Path, description = "Staging repository key"),
+        ("n" = i64, Path, description = "Version number to publish"),
+    ),
+    responses(
+        (status = 200, body = VersionResponse),
+        (status = 400, description = "Empty version / missing snippet / no signing key"),
+        (status = 403, description = "Not authorized for this repo"),
+        (status = 404, description = "Repository or version not found"),
+        (status = 409, description = "Version already published (immutable)"),
+    ),
+    tag = "Curation"
+)]
+async fn publish_version(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((repo_key, n)): Path<(String, i64)>,
+) -> Result<Json<VersionResponse>, AppError> {
+    let repo = authorize_version_action(&state, &auth, &repo_key).await?;
+
+    let storage = state
+        .storage_for_repo(&crate::storage::StorageLocation {
+            backend: repo.storage_backend.clone(),
+            path: repo.storage_path.clone(),
+        })
+        .map_err(|e| AppError::Storage(format!("Storage backend unavailable: {e}")))?;
+    let signing = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+
+    let summary = crate::services::rpm_publish_service::publish(
+        &state.db,
+        storage.as_ref(),
+        &signing,
+        repo.id,
+        n,
+    )
+    .await?;
+
+    // Audit (#2358): repo key + version number + package count only.
+    let _ = AuditService::new(state.db.clone())
+        .log(
+            AuditEntry::new(
+                AuditAction::CurationVersionPublished,
+                ResourceType::Repository,
+            )
+            .user(auth.user_id)
+            .resource(repo.id)
+            .actor_name(auth.username.clone())
+            .resource_name(repo.key.clone())
+            .details(serde_json::json!({
+                "repo_key": repo.key,
+                "version_number": summary.version_number,
+                "package_count": summary.package_count,
+            })),
+        )
+        .await;
+
+    Ok(Json(VersionResponse {
+        repository: repo.key,
+        version_number: summary.version_number,
+        package_count: summary.package_count,
+        published: true,
+    }))
 }
 
 #[utoipa::path(
