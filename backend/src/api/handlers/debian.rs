@@ -37,6 +37,7 @@ use sqlx::PgPool;
 use tracing::info;
 use xz2::read::XzDecoder;
 
+use crate::api::handlers::error_helpers::require_signing_key;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
@@ -1577,23 +1578,14 @@ async fn signed_release_cache_invalidate(state: &SharedState, repo_key: &str, di
 /// none is configured. We refuse to silently fall through to unsigned
 /// `InRelease` (#1236): clients trust the signature, so absence of a key
 /// is a configuration error the operator needs to see, not a soft fallback.
+///
+/// The 404-vs-500 decision itself lives in `error_helpers::require_signing_key`
+/// so RPM's repomd.xml.asc resolves its key identically (#2636).
 async fn require_active_signing_key(
     signing_svc: &SigningService,
     repo_id: uuid::Uuid,
 ) -> Result<SigningKey, Response> {
-    match signing_svc.get_active_key_for_repo(repo_id).await {
-        Ok(Some(k)) => Ok(k),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to load signing key: {}", e),
-        )
-            .into_response()),
-    }
+    require_signing_key(signing_svc.get_active_key_for_repo(repo_id).await)
 }
 
 /// Iterate the virtual repo's Remote members for `upstream_path` and

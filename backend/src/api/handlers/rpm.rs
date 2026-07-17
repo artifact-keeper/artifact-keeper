@@ -8,8 +8,8 @@
 //!   GET  /rpm/{repo_key}/repodata/filelists.xml.gz  - File lists (stub)
 //!   GET  /rpm/{repo_key}/repodata/other.xml.gz      - Other metadata (stub)
 //!   GET  /rpm/{repo_key}/repodata/updateinfo.xml.gz - Update advisories (stub)
-//!   GET  /rpm/{repo_key}/repodata/repomd.xml.asc    - Detached GPG signature
-//!   GET  /rpm/{repo_key}/repodata/repomd.xml.key    - Public key (PEM)
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.asc    - Detached OpenPGP signature
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.key    - OpenPGP public key
 //!   GET  /rpm/{repo_key}/packages/*path              - Download RPM package
 //!   PUT  /rpm/{repo_key}/packages/*path              - Upload RPM package
 //!   POST /rpm/{repo_key}/upload                      - Upload RPM (alternative)
@@ -22,14 +22,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use tracing::info;
+use tracing::{error, info};
 
+use crate::api::handlers::error_helpers::require_signing_key;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -438,37 +438,43 @@ async fn repomd_xml_asc(
     let repomd_content = generate_repomd_xml_content(&artifacts);
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, repomd_content.as_bytes())
+    // #2636: this endpoint must emit a real detached OpenPGP signature — the
+    // same thing Debian's Release.gpg serves — because that is the only form
+    // `dnf` (repo_gpgcheck=1) and `rpm --import` can verify. It previously
+    // signed via `SigningService::sign_data()`, which returns raw PKCS#1 v1.5
+    // bytes, and hand-wrapped them in "BEGIN PGP SIGNATURE" markers: no packet
+    // framing and no CRC24 armor checksum, so every real client rejected it.
+    let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
+    let armored = signing_svc
+        .sign_openpgp_detached_with_key(&key, repomd_content.as_bytes())
         .await
-        .unwrap_or(None);
-
-    match signature {
-        Some(sig_bytes) => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
-            // Wrap base64 at 76 characters per line (PGP armor convention)
-            let wrapped: Vec<&str> = b64
-                .as_bytes()
-                .chunks(76)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            let armored = format!(
-                "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-                wrapped.join("\n"),
+        .map_err(|e| {
+            // A key that cannot sign is a server-side failure, not a missing
+            // configuration. Log it and return it: the previous
+            // `.unwrap_or(None)` collapsed this into a 404 "No signing key
+            // configured" while repomd.xml.key was serving that very key.
+            error!(
+                repo_id = %repo.id,
+                key_id = %key.id,
+                error = %e,
+                "failed to sign repomd.xml with the repository's active signing key",
             );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to sign repomd.xml: {}", e),
+            )
+                .into_response()
+        })?;
+    // Best-effort `last_used_at` stamp; the signature already succeeded, so an
+    // audit-update error must not fail the request.
+    let _ = signing_svc.mark_key_used(key.id).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/pgp-signature")
-                .body(Body::from(armored))
-                .unwrap())
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
-    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-signature")
+        .header(CONTENT_LENGTH, armored.len().to_string())
+        .body(Body::from(armored))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -482,23 +488,19 @@ async fn repomd_xml_key(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let public_key = signing_svc
-        .get_repo_public_key(repo.id)
-        .await
-        .unwrap_or(None);
+    // #2636: `dnf`'s `gpgkey=` and `rpm --import` both require an OpenPGP
+    // public key. The active key's stored `public_key_pem` is that armored
+    // OpenPGP block for `key_type=gpg` keys — the same material Debian's
+    // gpg-key.asc serves. A lookup error is surfaced rather than swallowed, so
+    // "cannot load the key" is never reported as "no key configured".
+    let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
 
-    match public_key {
-        Some(pem) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/x-pem-file")
-            .body(Body::from(pem))
-            .unwrap()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
-    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-keys")
+        .header(CONTENT_LENGTH, key.public_key_pem.len().to_string())
+        .body(Body::from(key.public_key_pem))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,19 +1244,9 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 
-    /// Wrap a base64-encoded signature in PGP armor format.
-    fn pgp_armor_signature(b64: &str) -> String {
-        let wrapped: Vec<&str> = b64
-            .as_bytes()
-            .chunks(76)
-            .map(|c| std::str::from_utf8(c).unwrap_or(""))
-            .collect();
-        format!(
-            "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-            wrapped.join("\n"),
-        )
-    }
+    use crate::services::signing_service::{verify_detached, CreateKeyRequest};
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
@@ -1699,47 +1691,6 @@ mod tests {
             extract_rpm_filename(&headers, "hash1234567890123456"),
             "quoted.rpm"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // pgp_armor_signature
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_armor_signature_basic() {
-        let armored = pgp_armor_signature("dGVzdA==");
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-        assert!(armored.contains("dGVzdA=="));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_wrapping() {
-        // Create a long base64 string that exceeds 76 chars
-        let long_b64 = "A".repeat(200);
-        let armored = pgp_armor_signature(&long_b64);
-        // Each line in the body should be at most 76 characters
-        let body = armored
-            .strip_prefix("-----BEGIN PGP SIGNATURE-----\n\n")
-            .unwrap()
-            .strip_suffix("\n-----END PGP SIGNATURE-----\n")
-            .unwrap();
-        for line in body.lines() {
-            assert!(line.len() <= 76, "Line exceeds 76 chars: {}", line);
-        }
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_empty() {
-        let armored = pgp_armor_signature("");
-        assert!(armored.contains("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.contains("-----END PGP SIGNATURE-----"));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_short() {
-        let armored = pgp_armor_signature("YQ==");
-        assert!(armored.contains("YQ=="));
     }
 
     // -----------------------------------------------------------------------
@@ -2767,5 +2718,225 @@ mod tests {
             .await
             .ok();
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // repomd.xml.asc / repomd.xml.key — the OpenPGP contract (#2636)
+    //
+    // These replace the former `pgp_armor_signature` tests, which asserted the
+    // shape of hand-rolled "BEGIN PGP SIGNATURE" markers wrapped around raw
+    // base64 PKCS#1 bytes. Those tests passed against output no OpenPGP client
+    // could parse: they pinned the bug. What matters is not that the markers
+    // are present, but that the bytes between them are a real OpenPGP
+    // signature packet that verifies against the key the repo advertises.
+    // -----------------------------------------------------------------------
+
+    /// Mint a signing key of `key_type` and attach it to the fixture repo for
+    /// metadata signing. Returns the armored public key the repo will serve.
+    async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: Some(f.repo_id),
+                name: format!("rpm-sign-{}", f.repo_key),
+                key_type: key_type.to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK RPM".to_string()),
+                uid_email: Some("rpm@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(f.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+        key.public_key_pem
+    }
+
+    async fn get_repodata(f: &tdh::Fixture, file: &str) -> (StatusCode, Bytes) {
+        tdh::send(
+            f.router_anon(super::router()),
+            tdh::get(format!("/{}/repodata/{}", f.repo_key, file)),
+        )
+        .await
+    }
+
+    /// The end-to-end contract `dnf repo_gpgcheck=1` enforces: the signature
+    /// served at repodata/repomd.xml.asc must be real, CRC24-armored OpenPGP
+    /// that verifies over the exact repomd.xml bytes under the key served at
+    /// repodata/repomd.xml.key.
+    ///
+    /// Before #2636 this endpoint returned raw PKCS#1 RSA bytes base64'd
+    /// inside hand-rolled "BEGIN PGP SIGNATURE" markers — no packet framing,
+    /// no CRC24 — and the key endpoint served an X.509 SPKI PEM.
+    #[tokio::test]
+    async fn test_repomd_asc_is_verifiable_openpgp_against_advertised_key() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (xml_status, repomd) = get_repodata(&f, "repomd.xml").await;
+        let (asc_status, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(xml_status, StatusCode::OK);
+        assert_eq!(
+            asc_status,
+            StatusCode::OK,
+            "asc: {}",
+            String::from_utf8_lossy(&asc)
+        );
+        assert_eq!(key_status, StatusCode::OK);
+
+        let asc = String::from_utf8(asc.to_vec()).expect("asc must be ASCII armor");
+        let pubkey = String::from_utf8(pubkey.to_vec()).expect("key must be ASCII armor");
+
+        assert!(asc.starts_with("-----BEGIN PGP SIGNATURE-----"));
+        assert!(asc.trim_end().ends_with("-----END PGP SIGNATURE-----"));
+        // Real armor carries a CRC24 checksum line ("=XXXX") before END; its
+        // absence is what made gpg report "invalid packet (ctb=37)".
+        assert!(
+            asc.lines().any(|l| l.len() == 5 && l.starts_with('=')),
+            "armor must carry a CRC24 checksum line; got:\n{}",
+            asc
+        );
+        // Decisive: a parseable signature packet that verifies over the served
+        // metadata under the advertised key — exactly what dnf and gpg do.
+        StandaloneSignature::from_string(&asc)
+            .expect("armor must parse as an OpenPGP signature packet");
+        verify_detached(&pubkey, &repomd, &asc)
+            .expect("the served signature must verify against the advertised key");
+
+        f.teardown().await;
+    }
+
+    /// The served signature must not verify over metadata it did not sign.
+    #[tokio::test]
+    async fn test_repomd_asc_rejects_tampered_metadata() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (_, repomd) = get_repodata(&f, "repomd.xml").await;
+        let (_, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (_, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        let asc = String::from_utf8(asc.to_vec()).unwrap();
+        let pubkey = String::from_utf8(pubkey.to_vec()).unwrap();
+
+        let tampered = String::from_utf8(repomd.to_vec())
+            .unwrap()
+            .replace("</repomd>", "<data type=\"evil\"></data></repomd>");
+        assert!(
+            verify_detached(&pubkey, tampered.as_bytes(), &asc).is_err(),
+            "a tampered repomd.xml must fail signature verification"
+        );
+
+        f.teardown().await;
+    }
+
+    /// repodata/repomd.xml.key must serve an importable OpenPGP public key.
+    /// `dnf`'s `gpgkey=` and `rpm --import` reject an X.509 SPKI PEM
+    /// ("no valid OpenPGP data found").
+    #[tokio::test]
+    async fn test_repomd_key_serves_importable_openpgp_key() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (status, body) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(status, StatusCode::OK);
+        let pubkey = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            pubkey.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+            "must be an OpenPGP key block, got: {}",
+            pubkey.lines().next().unwrap_or("")
+        );
+        assert!(
+            !pubkey.contains("BEGIN PUBLIC KEY"),
+            "must not be an X.509 SubjectPublicKeyInfo PEM"
+        );
+        let (parsed, _) = SignedPublicKey::from_string(&pubkey).expect("key must parse as OpenPGP");
+        parsed.verify().expect("advertised key must self-verify");
+
+        f.teardown().await;
+    }
+
+    /// **The regression guard that matters (#2636).**
+    ///
+    /// A key that cannot produce an OpenPGP signature must surface a real,
+    /// logged 500 — never a 404 "No signing key configured for this
+    /// repository" while repomd.xml.key serves that very key.
+    ///
+    /// The old path was `sign_data(..).await.unwrap_or(None)`: the `Err`
+    /// collapsed into `None`, and the resulting misleading 404 is why this
+    /// stayed invisible. An X.509 (`key_type=rsa`) key reproduces that load
+    /// failure, since OpenPGP signing requires `key_type=gpg`.
+    #[tokio::test]
+    async fn test_unusable_signing_key_is_a_loud_500_not_a_misleading_404() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "rsa").await;
+
+        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
+        let (asc_status, body) = get_repodata(&f, "repomd.xml.asc").await;
+
+        assert_eq!(
+            key_status,
+            StatusCode::OK,
+            "the repo advertises a key, so the signing failure below must not be reported as 'not configured'",
+        );
+        assert_eq!(
+            asc_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a signing failure must not be swallowed into 404 'No signing key configured'",
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Failed to sign repomd.xml"),
+            "the response must carry the real cause, got: {}",
+            body
+        );
+
+        f.teardown().await;
+    }
+
+    /// A repo with genuinely no signing key still 404s: the 500 above is a
+    /// signing *failure*, not a missing configuration. Keeps the two distinct.
+    #[tokio::test]
+    async fn test_repo_without_signing_key_still_404s() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        let (asc_status, _) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(asc_status, StatusCode::NOT_FOUND);
+        assert_eq!(key_status, StatusCode::NOT_FOUND);
+
+        f.teardown().await;
+    }
+
+    /// The 404-vs-500 decision itself, as a pure mapping (#2636). A *missing*
+    /// key is a client-visible 404; a key that fails to load is a loud 500
+    /// carrying the real error. Collapsing the second into the first is the
+    /// bug class this guards.
+    #[test]
+    fn test_require_signing_key_separates_missing_from_broken() {
+        let missing = require_signing_key(Ok(None)).expect_err("None must be an error response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let broken = require_signing_key(Err(crate::error::AppError::Internal(
+            "Failed to parse OpenPGP private key".to_string(),
+        )))
+        .expect_err("Err must be an error response");
+        assert_eq!(
+            broken.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a key-load failure must be a loud 500, never a 404 'not configured'"
+        );
     }
 }

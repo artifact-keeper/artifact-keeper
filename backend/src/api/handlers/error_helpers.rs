@@ -4,9 +4,11 @@
 //! `AppError` response, replacing the repetitive closure pattern that was
 //! copy-pasted across maven, npm, pypi, and cargo handlers.
 
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::AppError;
+use crate::models::signing_key::SigningKey;
 
 /// Convert any `Display`-able error into a `Database` `AppError` response.
 ///
@@ -30,6 +32,43 @@ pub fn map_db_err(e: impl std::fmt::Display) -> Response {
 /// Usage: `.map_err(map_storage_err)?`
 pub fn map_storage_err(e: impl std::fmt::Display) -> Response {
     AppError::Storage(e.to_string()).into_response()
+}
+
+/// Resolve the outcome of an active-signing-key lookup for a repository
+/// metadata-signing endpoint (`InRelease`, `Release.gpg`, `repomd.xml.asc`, ...).
+///
+/// The two failure modes are deliberately kept distinct (#2636):
+///
+///   * `Ok(None)`  — the repository genuinely has no active signing key.
+///     That is a client-visible configuration state: **404**.
+///   * `Err(e)`    — the key exists but could not be loaded (decrypt failure,
+///     DB error, unparseable key material). That is a *server* failure and
+///     must stay loud: **500**, carrying the real error.
+///
+/// Collapsing the second case into the first is what let the RPM signing
+/// breakage hide: a repo that advertised a key it could not sign with reported
+/// "No signing key configured for this repository", so the real parse error
+/// was never seen. Taking the lookup `Result` by value keeps this decision a
+/// pure function, so the distinction is unit-testable without a database.
+// `Response` is the crate-wide handler error type; boxing it here would just
+// force every call site to unbox (see the same allow on the format handlers).
+#[allow(clippy::result_large_err)]
+pub fn require_signing_key(
+    lookup: crate::error::Result<Option<SigningKey>>,
+) -> Result<SigningKey, Response> {
+    match lookup {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load signing key: {}", e),
+        )
+            .into_response()),
+    }
 }
 
 #[cfg(test)]
