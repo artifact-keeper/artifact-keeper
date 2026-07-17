@@ -364,8 +364,25 @@ async fn fetch_chart_via_index(
             (StatusCode::NOT_FOUND, "Chart not found in upstream index").into_response()
         })?;
 
-    let fetch_url = resolve_chart_url(upstream_url, &chart_url);
+    // A `.prov` provenance file is not its own `index.yaml` entry: helm derives
+    // its URL by string-appending `.prov` to the chart URL it resolved from the
+    // index (see module docs). We do the same against the upstream so
+    // `helm pull --verify` works through a remote/proxy repo (#2653): resolve the
+    // chart URL from the index, then append `.prov` for a provenance request.
+    let is_prov = is_prov_filename(filename);
+    let mut fetch_url = resolve_chart_url(upstream_url, &chart_url);
+    if is_prov {
+        fetch_url.push_str(PROV_SUFFIX);
+    }
+    // Cache under the stable requested filename (`charts/{filename}`), which is
+    // already the `.prov` name for a provenance request, so warm reads are served
+    // from the local proxy cache on the next request.
     let cache_path = format!("charts/{}", filename);
+    let content_type = if is_prov {
+        PROV_CONTENT_TYPE
+    } else {
+        "application/gzip"
+    };
     // #2192 / #1608 Phase 4c: the chart itself is a package BLOB, not metadata.
     // The buffered fallback (#2181) capped it at DEFAULT_METADATA_MAX_BYTES and
     // 502'd charts larger than the cap even though the primary download path
@@ -382,7 +399,7 @@ async fn fetch_chart_via_index(
         RepositoryFormat::Helm,
     )
     .await?;
-    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(filename))
+    proxy_helpers::stream_fetch_result(result, content_type, Some(filename))
 }
 
 /// Attempt to download a chart from a Remote or Virtual repo by resolving the
@@ -400,6 +417,15 @@ async fn download_chart_via_index(
 ) -> Result<Option<Response>, Response> {
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
+    };
+
+    // `filename` may be a chart (`<chart>-<version>.tgz`) or its provenance
+    // (`<chart>-<version>.tgz.prov`). A provenance served from a local/hosted
+    // member must carry the prov content type, not `application/gzip` (#2653).
+    let content_type = if is_prov_filename(filename) {
+        PROV_CONTENT_TYPE
+    } else {
+        "application/gzip"
     };
 
     if repo.repo_type == RepositoryType::Remote {
@@ -435,7 +461,7 @@ async fn download_chart_via_index(
                 {
                     return proxy_helpers::stream_fetch_result(
                         result,
-                        "application/gzip",
+                        content_type,
                         Some(filename),
                     )
                     .map(Some);
@@ -489,37 +515,43 @@ async fn download_chart(
     let is_prov = is_prov_filename(&filename);
 
     // Find artifact by filename pattern; helper escapes wildcards in `filename`.
-    let artifact = match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename)
-        .await?
-    {
-        Some(a) => a,
-        None => {
-            if is_prov {
-                // Provenance is only ever served from local storage: helm
-                // derives this URL by appending `.prov` to the chart URL, so
-                // there is no upstream index entry to resolve it through.
-                return Err((StatusCode::NOT_FOUND, "Chart provenance not found").into_response());
-            }
-            // Parse name and version so we can look up the real download URL
-            // from the upstream's index.yaml instead of assuming
-            // {upstream_url}/charts/{name}-{version}.tgz.
-            let info = HelmHandler::parse_path(&filename).ok();
-            let name_version = info
-                .as_ref()
-                .and_then(|i| i.name.as_deref().zip(i.version.as_deref()))
-                .map(|(n, v)| (n.to_string(), v.to_string()));
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename).await? {
+            Some(a) => a,
+            None => {
+                // Not in local storage. On a remote/proxy (or virtual) repo, resolve
+                // the real download URL from the upstream's index.yaml instead of
+                // assuming {upstream_url}/charts/{name}-{version}.tgz.
+                //
+                // #2653: a `.prov` request must take this path too. Its name/version
+                // come from the CHART filename, so strip the `.prov` suffix before
+                // parsing; `fetch_chart_via_index` then re-appends `.prov` to the
+                // resolved chart URL to fetch the provenance from upstream. Previously
+                // provenance was served only from local storage, so `helm pull
+                // --verify` against a remote AK helm repo always 404'd.
+                let chart_filename = filename.strip_suffix(PROV_SUFFIX).unwrap_or(&filename);
+                let info = HelmHandler::parse_path(chart_filename).ok();
+                let name_version = info
+                    .as_ref()
+                    .and_then(|i| i.name.as_deref().zip(i.version.as_deref()))
+                    .map(|(n, v)| (n.to_string(), v.to_string()));
 
-            if let Some((name, version)) = name_version {
-                if let Some(resp) =
-                    download_chart_via_index(&state, &repo, &name, &version, &filename).await?
-                {
-                    return Ok(resp);
+                if let Some((name, version)) = name_version {
+                    if let Some(resp) =
+                        download_chart_via_index(&state, &repo, &name, &version, &filename).await?
+                    {
+                        return Ok(resp);
+                    }
                 }
-            }
 
-            return Err((StatusCode::NOT_FOUND, "Chart not found").into_response());
-        }
-    };
+                let not_found = if is_prov {
+                    "Chart provenance not found"
+                } else {
+                    "Chart not found"
+                };
+                return Err((StatusCode::NOT_FOUND, not_found).into_response());
+            }
+        };
 
     let content_type = if is_prov {
         PROV_CONTENT_TYPE
@@ -1968,6 +2000,157 @@ entries:
         // `.expect(1)` on the chart mock is verified on server drop.
         drop(server);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote/proxy provenance (#2653)
+    //
+    // `helm pull --verify` against a REMOTE/PROXY repo resolves the chart URL
+    // from the upstream `index.yaml` and string-appends `.prov`. Before #2653
+    // that request could only ever be served from LOCAL storage, so a remote
+    // AK helm repo 404'd every `.prov` and `--verify` failed. The remote path
+    // must now derive the upstream `.prov` URL (chart URL + `.prov`), fetch it
+    // through the streaming proxy, and serve it with the provenance content
+    // type.
+    // -----------------------------------------------------------------------
+
+    /// Unit: `fetch_chart_via_index` for a `.prov` request must fetch the
+    /// upstream `<chart>.tgz.prov` (not the `.tgz`) and serve the provenance
+    /// bytes with the prov content type.
+    ///
+    /// FAILS before #2653: the pre-fix code ignored the `.prov` suffix, fetched
+    /// the chart `.tgz`, and returned chart bytes as `application/gzip`.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_fetch_chart_via_index_serves_upstream_prov_2653() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = make_index_yaml("mychart", "1.0.0", "charts/mychart-1.0.0.tgz");
+        let chart_bytes: &[u8] = b"fake-chart-content";
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        // The chart itself: present, but must NOT be what a `.prov` request gets.
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes))
+            .mount(&server)
+            .await;
+        // The provenance sibling helm derives by appending `.prov`.
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz.prov"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(REAL_PROV))
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_chart_via_index(
+            &proxy,
+            repo_id,
+            "helm-proxy-prov",
+            &upstream_url,
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz.prov",
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok()),
+                    Some(PROV_CONTENT_TYPE),
+                    "a .prov must be served with the provenance content type, not application/gzip"
+                );
+                assert_eq!(
+                    resp.headers()
+                        .get("content-disposition")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("attachment; filename=\"mychart-1.0.0.tgz.prov\"")
+                );
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect streamed prov body");
+                assert_eq!(
+                    &body[..],
+                    REAL_PROV,
+                    "the .prov request must return the upstream provenance, not the chart .tgz"
+                );
+            }
+            Err(resp) => panic!(
+                "fetch_chart_via_index must fetch the upstream .prov, got {}",
+                resp.status()
+            ),
+        }
+    }
+
+    /// End-to-end: a `GET .../charts/<chart>.tgz.prov` against a REMOTE helm
+    /// repo must be routed through the proxy fetch (not short-circuited by the
+    /// hosted-only 404) and serve the upstream provenance byte-for-byte.
+    ///
+    /// FAILS before #2653: `download_chart` returned 404 "Chart provenance not
+    /// found" for any `.prov` that was not already in local storage, so a
+    /// remote repo could never serve it.
+    #[tokio::test]
+    async fn test_remote_helm_prov_download_via_index_2653() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let index_yaml = make_index_yaml("mychart", "1.0.0", "charts/mychart-1.0.0.tgz");
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz.prov"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(REAL_PROV))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/mychart-1.0.0.tgz.prov", fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != StatusCode::OK {
+            teardown().await;
+            panic!("a .prov against a remote helm repo must be proxied, not 404'd; got {status}");
+        }
+        assert_eq!(
+            &body[..],
+            REAL_PROV,
+            "remote .prov must be the upstream provenance, byte-for-byte"
+        );
+        teardown().await;
     }
 
     #[tokio::test]
