@@ -1983,6 +1983,49 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_visibility_token_malformed_auth_header_not_rescued_by_nuget_key() {
+        // Precedence must hold for a MALFORMED Authorization header, not just a
+        // valid one: a caller who presents a broken credential gets that
+        // credential's (failing) outcome, never a silent rescue by
+        // X-NuGet-ApiKey.
+        //
+        // This property currently rests on an implementation detail —
+        // `extract_token_from_auth_header` never returns `None`, so the early
+        // return in `extract_visibility_token` always fires and the worst case
+        // is `Invalid`, which `repo_visibility_middleware` maps to
+        // `InvalidCredential` -> 401. A refactor that made the parser return
+        // `None` for an unparseable header would silently open a real fallback
+        // (bogus Authorization + valid api key -> authenticated). Pin it here
+        // so that refactor fails loudly instead.
+        for (header_value, expected) in [
+            // Parsed as Basic, but the credentials are not valid base64 ->
+            // rejected downstream as InvalidCredential.
+            ("Basic !!!bad!!!", ExtractedToken::Basic("!!!bad!!!")),
+            // Unparseable: no known scheme, and multi-word so it cannot be
+            // taken for a scheme-less cargo token -> Invalid.
+            ("!!! bad !!!", ExtractedToken::Invalid),
+            ("Bogus scheme-with args", ExtractedToken::Invalid),
+        ] {
+            let mut request =
+                nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                axum::http::HeaderValue::from_str(header_value).unwrap(),
+            );
+            let resolved = extract_visibility_token(&request);
+            assert!(
+                !matches!(resolved, ExtractedToken::ApiKey("nuget-key-123")),
+                "malformed Authorization {header_value:?} must not fall back to X-NuGet-ApiKey"
+            );
+            match (&resolved, &expected) {
+                (ExtractedToken::Basic(got), ExtractedToken::Basic(want)) => assert_eq!(got, want),
+                (ExtractedToken::Invalid, ExtractedToken::Invalid) => {}
+                _ => panic!("Authorization {header_value:?} resolved to an unexpected credential"),
+            }
+        }
+    }
+
+    #[test]
     fn test_extract_visibility_token_empty_nuget_api_key_is_none() {
         // An empty header value is not a credential: fall through to anonymous
         // so the write gate fails closed with 401.
@@ -2031,19 +2074,29 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_visibility_token_nuget_api_key_ignored_on_read_methods() {
-        // Scoped to the PUT push. A GET carrying the header stays anonymous,
-        // so it can never unlock a private-repo read.
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/nuget/my-feed/api/v2/package")
-            .header("x-nuget-apikey", "nuget-key-123")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert!(matches!(
-            extract_visibility_token(&request),
-            ExtractedToken::None
-        ));
+    fn test_extract_visibility_token_nuget_api_key_ignored_on_other_methods() {
+        // Scoped to the PUT push and nothing else. A GET/HEAD carrying the
+        // header stays anonymous, so it can never unlock a private-repo read;
+        // POST/PATCH/DELETE on the push route are equally inert, so the header
+        // cannot become a credential for any other verb the router may grow.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("/nuget/my-feed/api/v2/package")
+                .header("x-nuget-apikey", "nuget-key-123")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored on {method}"
+            );
+        }
     }
 
     #[test]
