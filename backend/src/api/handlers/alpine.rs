@@ -30,6 +30,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 use crate::services::signing_service::SigningService;
+use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -68,9 +69,30 @@ async fn resolve_alpine_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 // APK filename parsing
 // ---------------------------------------------------------------------------
 
+/// Whether a string is usable as an APKINDEX package name or version.
+///
+/// APKINDEX is a line-oriented `key:value` format with no quoting or escaping,
+/// so any character outside this set — a newline above all — would let the value
+/// terminate its own field and forge further index entries. Path parameters are
+/// percent-decoded before they reach the handler, so `%0A` in an upload URL
+/// arrives here as a real newline; the guard is what keeps it out of the index.
+///
+/// The set is what apk itself produces: every one of the ~25k package names and
+/// versions in Alpine v3.21 `main` and `community` matches it.
+fn is_valid_apk_name_or_version(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
 /// Parse an APK filename into (name, version).
 /// Expected format: `{name}-{version}.apk`
 /// Version starts at the first hyphen followed by a digit.
+///
+/// Both halves are charset-validated ([`is_valid_apk_name_or_version`]); a
+/// filename that would yield a name or version the APKINDEX cannot represent
+/// unambiguously is rejected outright rather than parsed into one.
 ///
 /// Examples:
 ///   curl-8.5.0-r0.apk   -> ("curl", "8.5.0-r0")
@@ -84,7 +106,7 @@ fn parse_apk_filename(filename: &str) -> Option<(String, String)> {
         if chars[i - 1] == '-' && chars[i].is_ascii_digit() {
             let name = &stem[..i - 1];
             let version = &stem[i..];
-            if !name.is_empty() && !version.is_empty() {
+            if is_valid_apk_name_or_version(name) && is_valid_apk_name_or_version(version) {
                 return Some((name.to_string(), version.to_string()));
             }
         }
@@ -159,6 +181,44 @@ async fn list_alpine_artifacts(
 /// scripts, so anything bigger is not one; the cap keeps a crafted upload from
 /// exhausting memory here.
 const APK_MAX_SEGMENT_INFLATED_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a stored `.apk` the index backfill reads to find the control
+/// segment.
+///
+/// An apk v2 package is `[signature segment] control segment data segment`, so
+/// everything the index needs sits at the front and the (potentially multi-GB)
+/// data segment never has to be fetched. Reading only this window is what keeps
+/// an index request from pulling whole packages into memory: uploads are capped
+/// by `MAX_UPLOAD_SIZE` (10 GB by default), not by anything this handler
+/// controls.
+///
+/// A package whose control segment does not fit in the window is treated as
+/// unreadable *at this parser version* — see [`APK_PARSER_VERSION`], which is
+/// what makes widening the window a safe, retrying change.
+const APK_BACKFILL_HEAD_BYTES: usize = 1024 * 1024;
+
+/// Maximum number of artifacts whose bytes a single index request will read.
+///
+/// The backfill is opportunistic and persists per artifact, so a repository with
+/// more unindexed packages than this simply finishes over the next few index
+/// requests instead of turning one request into an unbounded sequential fetch.
+const APK_BACKFILL_MAX_PER_REQUEST: usize = 32;
+
+/// Version of the `.apk` parser whose verdict is recorded by
+/// [`APK_PARSE_FAILED_FIELD`].
+///
+/// Bump this whenever the parser learns to read packages it previously could
+/// not — an apk v3 reader, a wider [`APK_BACKFILL_HEAD_BYTES`] window — and every
+/// artifact marked unreadable by an older parser is retried automatically.
+const APK_PARSER_VERSION: i64 = 1;
+
+/// Metadata field recording that a parser gave up on an artifact's bytes.
+///
+/// Holds the [`APK_PARSER_VERSION`] that failed, not a bare boolean, so the
+/// marker suppresses re-reads only for the parser that already saw those exact
+/// bytes. Also makes the skipped population queryable:
+/// `SELECT ... WHERE metadata ? 'apk_parse_failed'`.
+const APK_PARSE_FAILED_FIELD: &str = "apk_parse_failed";
 
 /// Number of leading gzip segments searched for `.PKGINFO`. An apk v2 package is
 /// `[signature segment] control segment data segment`, so the control segment is
@@ -346,7 +406,9 @@ fn parse_apk_package(data: &[u8]) -> Option<ApkPackageInfo> {
 ///
 /// Entries without a stored apk checksum are skipped: apk-tools rejects an index
 /// it cannot parse a `C:` value from, so emitting such an entry would make the
-/// whole repository unusable instead of just that one package.
+/// whole repository unusable instead of just that one package. Entries whose name
+/// or version cannot be represented in the index unambiguously are skipped for
+/// the same reason — see [`is_valid_apk_name_or_version`].
 fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
     let mut text = String::new();
 
@@ -403,17 +465,25 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let installed_size = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("installed_size"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        // A name or version outside the index charset would end its own line and
+        // let the rest be read as further index fields, so the entry is left out
+        // rather than emitted. Uploads are rejected on the same rule
+        // (`parse_apk_filename`); this also covers rows stored before that gate
+        // and the metadata-supplied values, which do not come through it.
+        if !is_valid_apk_name_or_version(&name) || !is_valid_apk_name_or_version(&version) {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                path = %artifact.path,
+                "skipping Alpine package whose name or version is not representable in an APKINDEX"
+            );
+            continue;
+        }
 
         // The `C:` value is the apk-native package checksum recorded at upload
         // (`Q1` + base64(SHA1(control segment))). Without it apk-tools cannot key
         // the entry, so leave the package out of the index rather than emitting
-        // something it will reject.
+        // something it will reject. Checked before the other metadata so an
+        // artifact that predates the checksum reports the reason it is skipped.
         let Some(checksum) = artifact
             .metadata
             .as_ref()
@@ -425,6 +495,24 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
                 artifact_id = %artifact.id,
                 path = %artifact.path,
                 "skipping Alpine package with no apk checksum in metadata"
+            );
+            continue;
+        };
+
+        // `I:` is what apk allocates for the package's files. Emitting 0 for a
+        // package that has a checksum would let apk install it as empty, so a
+        // missing installed size is treated like a missing checksum: skip the
+        // entry rather than publish one that silently unpacks to nothing.
+        let Some(installed_size) = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("installed_size"))
+            .and_then(|v| v.as_u64())
+        else {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                path = %artifact.path,
+                "skipping Alpine package with no installed size in metadata"
             );
             continue;
         };
@@ -693,18 +781,103 @@ fn has_apk_checksum(artifact: &AlpineArtifact) -> bool {
         .is_some_and(|c| !c.is_empty())
 }
 
+/// Whether a parser at least as new as this one already failed on these bytes.
+///
+/// `>=` rather than `==` so a marker left by a *newer* parser is still honoured
+/// after a rollback: if a better parser could not read the package, this one
+/// cannot either.
+fn apk_parse_already_failed(artifact: &AlpineArtifact) -> bool {
+    artifact
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(APK_PARSE_FAILED_FIELD))
+        .and_then(|v| v.as_i64())
+        .is_some_and(|version| version >= APK_PARSER_VERSION)
+}
+
+/// Whether the index backfill should read this artifact's bytes.
+///
+/// Both terms matter. Without the checksum test a package would be re-read once
+/// it is already indexed; without the failure-marker test an artifact this parser
+/// cannot read would be fetched and re-parsed on *every* index request forever,
+/// which is unmetered work for an endpoint that is anonymous on public
+/// repositories.
+fn needs_apk_backfill(artifact: &AlpineArtifact) -> bool {
+    !has_apk_checksum(artifact) && !apk_parse_already_failed(artifact)
+}
+
+/// What reading a stored package told us about it.
+enum ApkBackfillOutcome {
+    /// The package was read and parsed; its index metadata is available.
+    Parsed(Box<ApkPackageInfo>),
+    /// The bytes were read and are not a package this parser can index. This is
+    /// a property of the bytes, so re-reading them cannot change the answer and
+    /// the verdict is recorded.
+    Unreadable,
+    /// The bytes could not be read at all. This says nothing about the package,
+    /// so no verdict is recorded: a storage blip must not permanently de-index a
+    /// good package. The artifact is retried on the next index request.
+    Unavailable,
+}
+
+/// Read the head of a stored `.apk` and parse the index metadata out of it.
+///
+/// Only [`APK_BACKFILL_HEAD_BYTES`] are fetched — the control segment precedes
+/// the data segment — and never more than the object holds, so the range is
+/// always within bounds.
+async fn read_apk_backfill(
+    storage: &dyn StorageBackend,
+    artifact: &AlpineArtifact,
+) -> ApkBackfillOutcome {
+    let head_bytes = usize::try_from(artifact.size_bytes)
+        .unwrap_or(APK_BACKFILL_HEAD_BYTES)
+        .min(APK_BACKFILL_HEAD_BYTES);
+
+    let head = match storage
+        .get_range(&artifact.storage_key, 0, head_bytes)
+        .await
+    {
+        Ok(head) => head,
+        Err(e) => {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                storage_key = %artifact.storage_key,
+                "Alpine index backfill: cannot read package, will retry: {}",
+                e
+            );
+            return ApkBackfillOutcome::Unavailable;
+        }
+    };
+
+    match parse_apk_package(&head) {
+        Some(apk_info) => ApkBackfillOutcome::Parsed(Box::new(apk_info)),
+        None => {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                path = %artifact.path,
+                parser_version = APK_PARSER_VERSION,
+                "Alpine index backfill: no apk control segment; package will not be indexed"
+            );
+            ApkBackfillOutcome::Unreadable
+        }
+    }
+}
+
 /// Derive the missing index metadata for packages stored before it was recorded
 /// at upload time, so they are not silently dropped from the index.
 ///
-/// The values are read back from the stored package and persisted, making this a
-/// one-off cost per artifact. Failures are logged and leave the artifact
-/// unindexed rather than failing the whole index request.
+/// Every artifact this touches ends up with a persisted verdict — its index
+/// metadata, or a [`APK_PARSE_FAILED_FIELD`] marker — so a package's bytes are
+/// read at most once per parser version rather than on every index request. The
+/// work is capped per request ([`APK_BACKFILL_MAX_PER_REQUEST`]) and persisted as
+/// it goes, so a large repository converges over successive requests and a
+/// cancelled request keeps the progress it made.
 async fn backfill_apk_metadata(
     state: &SharedState,
     repo: &RepoInfo,
     artifacts: &mut [AlpineArtifact],
 ) {
-    if artifacts.iter().all(has_apk_checksum) {
+    if !artifacts.iter().any(needs_apk_backfill) {
         return;
     }
 
@@ -716,55 +889,62 @@ async fn backfill_apk_metadata(
         }
     };
 
-    for artifact in artifacts.iter_mut().filter(|a| !has_apk_checksum(a)) {
-        let content = match storage.get(&artifact.storage_key).await {
-            Ok(content) => content,
-            Err(e) => {
-                tracing::warn!(
-                    "Alpine index backfill: cannot read {}: {}",
-                    artifact.storage_key,
-                    e
-                );
-                continue;
+    for artifact in artifacts
+        .iter_mut()
+        .filter(|a| needs_apk_backfill(a))
+        .take(APK_BACKFILL_MAX_PER_REQUEST)
+    {
+        let fields = match read_apk_backfill(storage.as_ref(), artifact).await {
+            ApkBackfillOutcome::Parsed(apk_info) => apk_info_metadata_fields(&apk_info),
+            ApkBackfillOutcome::Unreadable => {
+                // Record the failure so these bytes are not fetched and re-parsed
+                // on every subsequent index request. Keyed by parser version, so a
+                // parser that learns to read them retries automatically.
+                let mut fields = serde_json::Map::new();
+                fields.insert(APK_PARSE_FAILED_FIELD.into(), APK_PARSER_VERSION.into());
+                fields
             }
-        };
-        let Some(apk_info) = parse_apk_package(&content) else {
-            tracing::warn!(
-                "Alpine index backfill: no apk control segment in {}",
-                artifact.path
-            );
-            continue;
+            ApkBackfillOutcome::Unavailable => continue,
         };
 
-        let mut metadata = artifact
-            .metadata
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let Some(map) = metadata.as_object_mut() else {
-            continue;
-        };
-        map.extend(apk_info_metadata_fields(&apk_info));
-
+        let patch = serde_json::Value::Object(fields.clone());
+        // Merge server-side (`||`) rather than writing back a snapshot read before
+        // the package fetch: concurrent index requests and uploads touch the same
+        // row, and a plain `SET metadata = $2` would drop whatever they wrote in
+        // the meantime.
         let stored = sqlx::query!(
             r#"
             INSERT INTO artifact_metadata (artifact_id, format, metadata)
             VALUES ($1, 'alpine', $2)
-            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+            ON CONFLICT (artifact_id)
+            DO UPDATE SET metadata = artifact_metadata.metadata || $2
             "#,
             artifact.id,
-            metadata,
+            patch,
         )
         .execute(&state.db)
         .await;
 
         if let Err(e) = stored {
             tracing::warn!(
+                artifact_id = %artifact.id,
                 "Alpine index backfill: cannot persist metadata for {}: {}",
                 artifact.path,
                 e
             );
+            // Not persisted: leave the in-memory metadata alone so this request
+            // does not index an entry the next request would have to redo.
+            continue;
         }
-        artifact.metadata = Some(metadata);
+
+        let mut metadata = artifact
+            .metadata
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(map) = metadata.as_object_mut() {
+            map.extend(fields);
+            artifact.metadata = Some(metadata);
+        }
     }
 }
 
@@ -1405,6 +1585,230 @@ mod tests {
 
     fn marker_apk_info() -> ApkPackageInfo {
         parse_apk_package(MARKER_APK).expect("marker .apk should parse")
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill read accounting
+    //
+    // The index backfill reads artifact bytes on an endpoint that is anonymous
+    // on public repositories, so *how often* and *how much* it reads is part of
+    // the contract, not an implementation detail. This backend records both.
+    // -----------------------------------------------------------------------
+
+    struct RecordingBackend {
+        content: Bytes,
+        /// `(offset, length)` of every ranged read.
+        ranges: std::sync::Mutex<Vec<(u64, usize)>>,
+        /// Whole-object reads. The backfill must never make one: `get` pulls the
+        /// entire object into memory regardless of how large it is.
+        full_reads: std::sync::atomic::AtomicUsize,
+        /// Simulate the backend being unable to serve the object.
+        fail: bool,
+    }
+
+    impl RecordingBackend {
+        fn new(content: &[u8]) -> Self {
+            Self {
+                content: Bytes::copy_from_slice(content),
+                ranges: std::sync::Mutex::new(Vec::new()),
+                full_reads: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::new(MARKER_APK)
+            }
+        }
+
+        fn reads(&self) -> Vec<(u64, usize)> {
+            self.ranges.lock().unwrap().clone()
+        }
+
+        fn full_reads(&self) -> usize {
+            self.full_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RecordingBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            self.full_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(crate::error::AppError::Storage("backend down".into()));
+            }
+            Ok(self.content.clone())
+        }
+
+        async fn get_range(
+            &self,
+            _key: &str,
+            offset: u64,
+            length: usize,
+        ) -> crate::error::Result<Bytes> {
+            self.ranges.lock().unwrap().push((offset, length));
+            if self.fail {
+                return Err(crate::error::AppError::Storage("backend down".into()));
+            }
+            let start = (offset as usize).min(self.content.len());
+            let end = start.saturating_add(length).min(self.content.len());
+            Ok(self.content.slice(start..end))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    /// An artifact whose stored bytes are `content` and which carries no index
+    /// metadata yet — the state the backfill exists to resolve.
+    fn unindexed_artifact(content: &[u8]) -> AlpineArtifact {
+        let mut artifact = alpine_artifact(serde_json::json!({}));
+        artifact.size_bytes = content.len() as i64;
+        artifact
+    }
+
+    /// The backfill reads only the head of a package, never the whole object.
+    /// `.apk` puts the control segment before the (arbitrarily large) data
+    /// segment, and `MAX_UPLOAD_SIZE` lets a package be gigabytes.
+    #[tokio::test]
+    async fn test_backfill_reads_only_the_head_of_a_package() {
+        let backend = RecordingBackend::new(MARKER_APK);
+        let artifact = unindexed_artifact(MARKER_APK);
+
+        let outcome = read_apk_backfill(&backend, &artifact).await;
+
+        assert!(matches!(outcome, ApkBackfillOutcome::Parsed(_)));
+        assert_eq!(backend.full_reads(), 0, "backfill read the whole object");
+        assert_eq!(backend.reads(), vec![(0, MARKER_APK.len())]);
+    }
+
+    /// The range is clamped to the object's own size, so it never runs past the
+    /// end of a package smaller than the head window.
+    #[tokio::test]
+    async fn test_backfill_head_read_is_capped_and_never_exceeds_object() {
+        let big = 8 * 1024 * 1024;
+        let mut artifact = unindexed_artifact(MARKER_APK);
+        artifact.size_bytes = big as i64;
+        let backend = RecordingBackend::new(MARKER_APK);
+
+        let _ = read_apk_backfill(&backend, &artifact).await;
+
+        // A package larger than the window is read up to the window, not beyond.
+        assert_eq!(backend.reads(), vec![(0, APK_BACKFILL_HEAD_BYTES)]);
+        assert!(APK_BACKFILL_HEAD_BYTES < big);
+    }
+
+    /// Bytes that are not a readable package are a deterministic failure: the
+    /// verdict is about the bytes, so re-reading them cannot change it.
+    #[tokio::test]
+    async fn test_backfill_reports_unparsable_bytes_as_unreadable() {
+        let junk = vec![0u8; 4096];
+        let backend = RecordingBackend::new(&junk);
+        let artifact = unindexed_artifact(&junk);
+
+        let outcome = read_apk_backfill(&backend, &artifact).await;
+
+        assert!(matches!(outcome, ApkBackfillOutcome::Unreadable));
+    }
+
+    /// A storage failure says nothing about the package, so it is reported as
+    /// retryable rather than as a verdict on the bytes.
+    #[tokio::test]
+    async fn test_backfill_reports_storage_failure_as_unavailable_not_unreadable() {
+        let backend = RecordingBackend::failing();
+        let artifact = unindexed_artifact(MARKER_APK);
+
+        let outcome = read_apk_backfill(&backend, &artifact).await;
+
+        assert!(
+            matches!(outcome, ApkBackfillOutcome::Unavailable),
+            "a storage error must not be recorded as an unreadable package"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill gate
+    // -----------------------------------------------------------------------
+
+    /// An artifact that is already indexed is not read again.
+    #[test]
+    fn test_needs_backfill_is_false_once_indexed() {
+        let artifact = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+        }));
+        assert!(!needs_apk_backfill(&artifact));
+    }
+
+    /// An artifact with no metadata at all is what the backfill is for.
+    #[test]
+    fn test_needs_backfill_is_true_when_unindexed() {
+        assert!(needs_apk_backfill(&alpine_artifact(serde_json::json!({}))));
+    }
+
+    /// The heart of the DoS fix: once this parser has failed on an artifact's
+    /// bytes, it must not fetch and re-parse them on every later index request.
+    #[test]
+    fn test_needs_backfill_is_false_after_a_recorded_parse_failure() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION,
+        }));
+        assert!(
+            !needs_apk_backfill(&artifact),
+            "an artifact this parser already failed on would be re-read forever"
+        );
+    }
+
+    /// The marker is scoped to the parser that produced it: a newer parser — an
+    /// apk v3 reader, say — retries everything an older one gave up on.
+    #[test]
+    fn test_needs_backfill_is_true_when_marker_predates_this_parser() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION - 1,
+        }));
+        assert!(
+            needs_apk_backfill(&artifact),
+            "a parser that may now understand these bytes must retry them"
+        );
+    }
+
+    /// A marker left by a *newer* parser is honoured after a rollback: if a
+    /// better parser could not read the package, this one cannot either.
+    #[test]
+    fn test_needs_backfill_is_false_when_marker_is_from_a_newer_parser() {
+        let artifact = alpine_artifact(serde_json::json!({
+            APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION + 1,
+        }));
+        assert!(!needs_apk_backfill(&artifact));
+    }
+
+    /// A failure marker never overrides a checksum that is actually present.
+    #[test]
+    fn test_indexed_artifact_is_not_read_even_if_marked_failed() {
+        let artifact = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            APK_PARSE_FAILED_FIELD: APK_PARSER_VERSION - 1,
+        }));
+        assert!(!needs_apk_backfill(&artifact));
     }
 
     fn alpine_artifact(metadata: serde_json::Value) -> AlpineArtifact {
@@ -2155,7 +2559,8 @@ mod tests {
                 checksum_sha256: "hash1".to_string(),
                 storage_key: "key1".to_string(),
                 metadata: Some(serde_json::json!({
-                    "apk_checksum": "Q1O3f05G1QIlK5QBrIDIGE0gDWKs4="
+                    "apk_checksum": "Q1O3f05G1QIlK5QBrIDIGE0gDWKs4=",
+                    "installed_size": 4096,
                 })),
             },
             AlpineArtifact {
@@ -2167,7 +2572,8 @@ mod tests {
                 checksum_sha256: "hash2".to_string(),
                 storage_key: "key2".to_string(),
                 metadata: Some(serde_json::json!({
-                    "apk_checksum": "Q1eqUIbEJ3d0FoAdQOSHqPQoUw7cQ="
+                    "apk_checksum": "Q1eqUIbEJ3d0FoAdQOSHqPQoUw7cQ=",
+                    "installed_size": 8192,
                 })),
             },
         ];
@@ -2193,12 +2599,129 @@ mod tests {
                 "name": "busybox",
                 "version": "1.36",
                 "apk_checksum": "Q1O3f05G1QIlK5QBrIDIGE0gDWKs4=",
+                "installed_size": 1024,
             })),
         }];
         let text = generate_apkindex_text(&artifacts, "x86_64");
         // depends is empty, D: line should NOT be present
         assert!(!text.contains("D:"));
         assert!(text.contains("P:busybox"));
+    }
+
+    // -----------------------------------------------------------------------
+    // APKINDEX field injection
+    //
+    // Path parameters are percent-decoded before the handler sees them, so an
+    // upload URL can carry a newline into the package name. APKINDEX has no
+    // escaping, so an unfiltered name would end its own `P:` line and let the
+    // remainder be read as further index fields.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apk_name_charset_accepts_real_alpine_names_and_versions() {
+        // Sampled from Alpine v3.21 main/community, which between them use no
+        // character outside this set across ~25k packages.
+        for value in [
+            "busybox",
+            "ca-certificates",
+            "py3-yaml",
+            "libstdc++",
+            "gcc-gnat-12",
+            "1.36.1-r0",
+            "3.1.4_git20240105-r2",
+            "0.9.8_pre1-r0",
+        ] {
+            assert!(
+                is_valid_apk_name_or_version(value),
+                "rejected a real Alpine name/version: {}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_apk_name_charset_rejects_index_control_characters() {
+        for value in [
+            "",
+            "evil\nC:Q1deadbeef",
+            "evil\rC:x",
+            "has space",
+            "colon:here",
+            "tab\there",
+        ] {
+            assert!(
+                !is_valid_apk_name_or_version(value),
+                "accepted a name that cannot be represented in an APKINDEX: {:?}",
+                value
+            );
+        }
+    }
+
+    /// A filename whose decoded name carries a newline is rejected outright,
+    /// rather than parsed into a name that would forge index entries.
+    #[test]
+    fn test_parse_apk_filename_rejects_newline_in_name() {
+        assert_eq!(
+            parse_apk_filename("evil\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nP:openssl-1.0-r0.apk"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_apk_filename_rejects_newline_in_version() {
+        assert_eq!(parse_apk_filename("pkg-1.0\nP:openssl.apk"), None);
+    }
+
+    /// The name is a prefix of the stem, so a bad character cannot be escaped by
+    /// letting the parser try a later version boundary.
+    #[test]
+    fn test_parse_apk_filename_rejects_injection_with_multiple_version_boundaries() {
+        assert_eq!(parse_apk_filename("evil\nP:x-1.2-3.0-r0.apk"), None);
+    }
+
+    /// Defence in depth for rows stored before the upload gate existed: an
+    /// unrepresentable name is left out of the index rather than emitted.
+    #[test]
+    fn test_generate_apkindex_text_skips_entry_with_injected_name() {
+        let mut artifact = alpine_artifact(serde_json::json!({
+            "name": "evil\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nP:openssl",
+            "version": "1.0-r0",
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+            "installed_size": 22,
+        }));
+        artifact.path = "v3.21/main/aarch64/legacy.apk".to_string();
+
+        let text = generate_apkindex_text(&[artifact], "aarch64");
+
+        assert!(
+            !text.contains("openssl"),
+            "a stored name forged an index entry: {:?}",
+            text
+        );
+        assert_eq!(text, "", "the unrepresentable entry should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // `I:` fail-safe
+    // -----------------------------------------------------------------------
+
+    /// `I:` is what apk allocates for the package's files. Emitting `I:0` for a
+    /// package that has a valid checksum makes apk install it as an empty
+    /// package, so the entry is skipped instead.
+    #[test]
+    fn test_generate_apkindex_text_skips_entry_with_no_installed_size() {
+        let artifact = alpine_artifact(serde_json::json!({
+            "apk_checksum": MARKER_APK_APK_TOOLS_CHECKSUM,
+        }));
+
+        let text = generate_apkindex_text(&[artifact], "aarch64");
+
+        assert!(
+            !text.contains("I:0"),
+            "index would make apk install an empty package: {:?}",
+            text
+        );
+        assert_eq!(text, "");
     }
 
     // -----------------------------------------------------------------------
@@ -2466,6 +2989,180 @@ mod db_cov_tests {
             stored.as_deref(),
             Some(super::MARKER_APK_APK_TOOLS_CHECKSUM)
         );
+        fx.teardown().await;
+    }
+
+    /// Path to the stored bytes of the fixture repo's single artifact.
+    async fn stored_package_path(fx: &tdh::Fixture) -> std::path::PathBuf {
+        let key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read storage key");
+        fx.storage_dir.join(key)
+    }
+
+    /// Read back the recorded parse-failure marker, if any.
+    async fn parse_failed_marker(fx: &tdh::Fixture) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(&format!(
+            "SELECT (metadata->>'{}')::bigint FROM artifact_metadata \
+             WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+            super::APK_PARSE_FAILED_FIELD
+        ))
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read parse-failure marker")
+    }
+
+    /// Strip the index metadata recorded at upload, leaving the artifact in the
+    /// state the backfill exists to resolve.
+    async fn rewind_to_unindexed(fx: &tdh::Fixture) {
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata - 'apk_checksum' - 'installed_size' \
+             WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("strip apk metadata");
+    }
+
+    /// An artifact this parser cannot read is read *once*, not on every index
+    /// request forever.
+    ///
+    /// `APKINDEX.tar.gz` is anonymous on public repositories, so a package that
+    /// stayed unmarked would let one junk upload turn every later `apk update`
+    /// into another full read of it.
+    ///
+    /// The re-read is observed rather than counted: after the first request the
+    /// stored bytes are replaced with a package that *does* parse. A backfill
+    /// that re-read the artifact would index it; one that honours the recorded
+    /// verdict leaves it out.
+    #[tokio::test]
+    async fn test_unparsable_package_is_read_once_and_not_reread() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+
+        // Upload something that is not a readable apk package. The upload is
+        // accepted (uploads are not gated on parsing) but cannot be indexed.
+        let (status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{k}/v3.21/main/aarch64/junk-1.0-r0.apk"),
+                bytes::Bytes::from_static(&[0u8; 4096]),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+
+        assert_eq!(
+            parse_failed_marker(&fx).await,
+            None,
+            "nothing has read the package yet"
+        );
+
+        // First index request: reads the bytes, fails to parse them, records it.
+        let text = fetch_index(&fx).await;
+        assert_eq!(text, "", "unparsable package must not reach the index");
+        assert_eq!(
+            parse_failed_marker(&fx).await,
+            Some(super::APK_PARSER_VERSION),
+            "the parse failure was not recorded, so the bytes would be re-read forever"
+        );
+
+        // Swap in bytes that parse. Only a re-read could notice.
+        tokio::fs::write(stored_package_path(&fx).await, super::MARKER_APK)
+            .await
+            .expect("replace stored bytes");
+
+        let text = fetch_index(&fx).await;
+        assert!(
+            !text.contains(&format!("C:{}", super::MARKER_APK_APK_TOOLS_CHECKSUM)),
+            "the package was re-read and re-parsed on a later index request: {}",
+            text
+        );
+        assert_eq!(text, "");
+
+        fx.teardown().await;
+    }
+
+    /// A storage failure must not be mistaken for a verdict on the package: a
+    /// transient blip that marked the artifact would de-index a perfectly good
+    /// package permanently.
+    #[tokio::test]
+    async fn test_transient_storage_failure_does_not_permanently_mark_package() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        publish_marker_and_fetch_index(&fx).await;
+        rewind_to_unindexed(&fx).await;
+
+        // Make the stored bytes unreadable, the way a storage outage would.
+        let path = stored_package_path(&fx).await;
+        let saved = tokio::fs::read(&path).await.expect("read stored bytes");
+        tokio::fs::remove_file(&path).await.expect("remove bytes");
+
+        let text = fetch_index(&fx).await;
+        assert_eq!(text, "", "package cannot be indexed while storage is down");
+        assert_eq!(
+            parse_failed_marker(&fx).await,
+            None,
+            "a storage failure was recorded as an unreadable package, permanently de-indexing it"
+        );
+
+        // Storage comes back: the package indexes normally, no operator action.
+        tokio::fs::write(&path, &saved)
+            .await
+            .expect("restore bytes");
+
+        let text = fetch_index(&fx).await;
+        assert!(
+            text.contains(&format!("C:{}\n", super::MARKER_APK_APK_TOOLS_CHECKSUM)),
+            "package did not recover after the storage failure cleared: {}",
+            text
+        );
+
+        fx.teardown().await;
+    }
+
+    /// An upload whose percent-decoded filename carries a newline is rejected,
+    /// so it can never reach the index generator. Without the charset gate the
+    /// name lands in `P:` and forges an entry for another package.
+    #[tokio::test]
+    async fn test_upload_rejects_apkindex_field_injection_in_filename() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+
+        // Decodes to: evil\nC:Q1<forged>\nP:openssl-1.0-r0.apk
+        let injected = "evil%0AC%3AQ1AAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%0AP%3Aopenssl-1.0-r0.apk";
+        let (status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{k}/v3.21/main/aarch64/{injected}"),
+                bytes::Bytes::from_static(super::MARKER_APK),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "an APKINDEX-injecting filename was accepted"
+        );
+
+        let text = fetch_index(&fx).await;
+        assert!(
+            !text.contains("openssl"),
+            "injected package name reached the index: {}",
+            text
+        );
+
         fx.teardown().await;
     }
 }
