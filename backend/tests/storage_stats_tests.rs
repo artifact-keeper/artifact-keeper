@@ -18,6 +18,7 @@ use common::require_db_pool;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use artifact_keeper_backend::services::repository_service::RepositoryService;
 use artifact_keeper_backend::services::storage_stats_service::StorageStatsService;
 
 fn unique(prefix: &str) -> String {
@@ -357,6 +358,68 @@ async fn quota_usage_unchanged_by_dedup_stats() {
     let s = read_stats(&pool, repo).await;
     assert_eq!(s.logical, 1200);
     assert_eq!(s.physical, 400, "dedup stat is separate from quota");
+
+    cleanup(&pool, repo).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn storage_usage_counts_oci_blobs() {
+    // Regression for the "3.42 MB docker repo" display bug: OCI layer/config
+    // blobs live in `oci_blobs`, not `artifacts` (only manifests land there),
+    // so the live usage SUM behind `storage_used_bytes` must include them.
+    let pool = require_db_pool().await;
+    let repo = insert_repo(&pool, "filesystem").await;
+
+    // Manifest as an `artifacts` row + two layers in `oci_blobs`.
+    insert_artifact(
+        &pool,
+        repo,
+        "img/manifests/1.0",
+        "oci-manifests/sha256:aa",
+        700,
+    )
+    .await;
+    let d1 = format!("sha256:{}", Uuid::new_v4().simple());
+    let d2 = format!("sha256:{}", Uuid::new_v4().simple());
+    insert_oci_blob(&pool, repo, &d1, 500_000).await;
+    insert_oci_blob(&pool, repo, &d2, 250_000).await;
+
+    let usage = RepositoryService::new(pool.clone())
+        .get_storage_usage(repo)
+        .await
+        .expect("storage usage");
+    assert_eq!(
+        usage,
+        700 + 500_000 + 250_000,
+        "layers + manifest all count"
+    );
+
+    cleanup(&pool, repo).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn storage_usage_without_oci_rows_unchanged() {
+    // Hosted non-OCI repos have no `oci_blobs` rows; the added UNION branch
+    // must not disturb their totals (including the proxy-cache exclusion).
+    let pool = require_db_pool().await;
+    let repo = insert_repo(&pool, "filesystem").await;
+    insert_artifact(
+        &pool,
+        repo,
+        "a/1",
+        &format!("cas/ee/ff/{}", Uuid::new_v4()),
+        1_000,
+    )
+    .await;
+    insert_proxy_cache(&pool, repo, "cached/pkg.tgz", 2_500).await;
+
+    let usage = RepositoryService::new(pool.clone())
+        .get_storage_usage(repo)
+        .await
+        .expect("storage usage");
+    assert_eq!(usage, 3_500, "artifacts + proxy catalog only");
 
     cleanup(&pool, repo).await;
 }

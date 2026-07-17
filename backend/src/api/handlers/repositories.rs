@@ -2166,6 +2166,11 @@ pub async fn list_repositories(
             // an object that is also lazily backfilled into the catalog is not
             // summed twice. Hosted repos have no `proxy-cache/%` keys and an
             // empty catalog, so their totals are unchanged.
+            //
+            // OCI layer/config blobs live in `oci_blobs` (`artifacts` only
+            // holds manifests), so docker repos need the third branch or the
+            // listing shows KiBs for repos holding GiBs of layers. Must stay
+            // in lockstep with `RepositoryService::get_storage_usage`.
             r#"
             SELECT repository_id, COALESCE(SUM(bytes), 0)::BIGINT
             FROM (
@@ -2176,6 +2181,10 @@ pub async fn list_repositories(
                 UNION ALL
                 SELECT repository_id, size_bytes AS bytes
                   FROM proxy_cache_artifacts
+                 WHERE repository_id = ANY($1)
+                UNION ALL
+                SELECT repository_id, size_bytes AS bytes
+                  FROM oci_blobs
                  WHERE repository_id = ANY($1)
             ) t
             GROUP BY repository_id

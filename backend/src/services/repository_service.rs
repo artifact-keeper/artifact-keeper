@@ -1479,6 +1479,13 @@ impl RepositoryService {
         // no `artifacts` rows); legacy `proxy-cache/%` leftovers in `artifacts`
         // are excluded so a backfilled object is never double counted. Hosted
         // repos are unaffected (no proxy keys, empty catalog).
+        //
+        // OCI layer/config blobs live in `oci_blobs`, not `artifacts` (only
+        // manifests land there), so without the third branch a docker repo
+        // reports a few KiB of manifests while holding GiBs of layers.
+        // `oci_blobs` is UNIQUE(repository_id, digest), so this sum counts
+        // each stored blob once per repo — the same per-repo logical figure
+        // the stats refresher computes.
         let usage = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
@@ -1490,6 +1497,10 @@ impl RepositoryService {
                 UNION ALL
                 SELECT size_bytes AS bytes
                   FROM proxy_cache_artifacts
+                 WHERE repository_id = $1
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM oci_blobs
                  WHERE repository_id = $1
             ) t
             "#,
