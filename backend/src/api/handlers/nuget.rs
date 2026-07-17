@@ -469,10 +469,18 @@ async fn registration_index(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            // The registration leaf `@id` must dereference to a route the
+            // server actually serves. There is no per-version leaf route
+            // (`/v3/registration/{id}/{version}.json` 404s); the only served
+            // registration route is the index. Point the leaf (and its
+            // catalogEntry) at that index with a `#{version}` fragment — the
+            // fragment identifies the inlined item and is stripped by the
+            // client before the GET, so it resolves to `registration_index`
+            // (200). This mirrors the page `@id` below (`index.json#page/0`).
             serde_json::json!({
-                "@id": format!("{}/v3/registration/{}/{}.json", base, package_id_lower, version),
+                "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
                 "catalogEntry": {
-                    "@id": format!("{}/v3/registration/{}/{}.json", base, package_id_lower, version),
+                    "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
                     "id": package_id_lower,
                     "version": version,
                     "description": description,
@@ -2595,6 +2603,56 @@ mod read_db_tests {
         assert_eq!(json["data"][0]["id"], "qa.fedpkg");
 
         drop_virtual(&f.pool, vid).await;
+        f.teardown().await;
+    }
+
+    // Finding (#2656): the registration leaf `@id` advertised
+    // `/v3/registration/{id}/{version}.json`, a route the server never
+    // registers, so a NuGet client that dereferences the leaf `@id` got a 404.
+    // This test derives the request path FROM the emitted `@id` (not a
+    // hard-coded literal) and asserts it resolves to a real served route.
+    // Pre-fix the derived path is `.../{version}.json` → 404; post-fix it is
+    // `.../index.json#{version}` (fragment stripped by the client) → 200.
+    #[tokio::test]
+    async fn registration_leaf_id_resolves_to_a_served_route() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.LeafPkg", "1.0.0", "leaf id package").await;
+
+        // Fetch the registration index and pull out the inlined leaf `@id`.
+        let (status, json) = get_json(
+            &f,
+            format!("/{}/v3/registration/qa.leafpkg/index.json", f.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "registration index; body={json}");
+        let leaf_id = json["items"][0]["items"][0]["@id"]
+            .as_str()
+            .expect("registration leaf @id")
+            .to_string();
+
+        // Turn the advertised absolute `@id` into a request path for the
+        // handler router. `base` is `{base_url}/nuget/{repo_key}`; the test
+        // router is mounted without the `/nuget` nest, and a client drops the
+        // `#fragment` before issuing the GET.
+        let from_nuget = &leaf_id[leaf_id
+            .find("/nuget/")
+            .expect("@id must be built off the /nuget base path")..];
+        let path_no_fragment = from_nuget.split('#').next().unwrap();
+        let served_path = path_no_fragment
+            .strip_prefix("/nuget")
+            .expect("path under /nuget")
+            .to_string();
+
+        // A GET against the exact advertised leaf path must be a real route.
+        let (leaf_status, leaf_json) = get_json(&f, served_path.clone()).await;
+        assert_eq!(
+            leaf_status,
+            StatusCode::OK,
+            "leaf @id {leaf_id} must dereference to a served route (got {leaf_status} for {served_path}); body={leaf_json}"
+        );
+
         f.teardown().await;
     }
 }
