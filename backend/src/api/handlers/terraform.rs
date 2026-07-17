@@ -18,7 +18,13 @@
 //! Provider Registry:
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/versions
 //!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/download/{os}/{arch}
+//!   GET  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/binary/{os}/{arch}
 //!   PUT  /terraform/{repo_key}/v1/providers/{namespace}/{type}/{version}/{os}/{arch}
+//!
+//! Note the two distinct provider endpoints, which the Provider Registry
+//! Protocol keeps separate: `.../download/{os}/{arch}` returns the JSON
+//! *package document*, whose `download_url` field then points at
+//! `.../binary/{os}/{arch}`, which streams the `.zip` itself.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -43,6 +49,13 @@ use crate::models::repository::{RepositoryFormat, RepositoryType};
 // Router
 // ---------------------------------------------------------------------------
 
+/// The path prefix [`router`] is mounted at (see `crate::api::routes`).
+///
+/// The absolute URLs this module advertises to clients (`download_url`,
+/// `X-Terraform-Get`) must carry this prefix to resolve, so the mount point and
+/// the advertised locations are both derived from this one constant.
+pub const MOUNT_PREFIX: &str = "/terraform";
+
 pub fn router() -> Router<SharedState> {
     Router::new()
         // Service discovery
@@ -62,6 +75,13 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v1/modules/:namespace/:name/:provider/:version/download",
             get(download_module),
         )
+        // Module registry - the archive `download_module`'s `X-Terraform-Get`
+        // header advertises. Must stay registered for that advertised location
+        // to resolve (#2580 class).
+        .route(
+            "/:repo_key/v1/modules/:namespace/:name/:provider/:version/archive",
+            get(download_module_archive),
+        )
         // Module registry - latest version
         .route(
             "/:repo_key/v1/modules/:namespace/:name/:provider",
@@ -77,10 +97,17 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v1/providers/:namespace/:type_name/versions",
             get(list_provider_versions),
         )
-        // Provider registry - download
+        // Provider registry - download (the JSON package document)
         .route(
             "/:repo_key/v1/providers/:namespace/:type_name/:version/download/:os/:arch",
             get(download_provider),
+        )
+        // Provider registry - the archive `download_provider`'s `download_url`
+        // advertises. Must stay registered for that advertised location to
+        // resolve (#2580 class).
+        .route(
+            "/:repo_key/v1/providers/:namespace/:type_name/:version/binary/:os/:arch",
+            get(download_provider_binary),
         )
         // Provider upload
         .route(
@@ -94,7 +121,9 @@ pub fn router() -> Router<SharedState> {
         //     network_mirror { url = "https://host/terraform/<repo_key>/" }
         //   }
         // Terraform/OpenTofu then appends `<hostname>/<namespace>/<type>/...`
-        // to that base, which lands on the routes below.
+        // to that base, which lands on the routes below. Served for hosted
+        // repos (from their own uploaded packages) and for remote repos (by
+        // translating to the configured upstream registry).
         //
         // List available versions of a provider.
         .route(
@@ -123,13 +152,53 @@ async fn resolve_terraform_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo,
 }
 
 // ---------------------------------------------------------------------------
+// Artifact coordinates
+//
+// The `artifacts.path` a module/provider is filed under at upload time is the
+// same key every read path looks it up by, so both sides derive it from these
+// helpers rather than re-formatting the string at each site.
+// ---------------------------------------------------------------------------
+
+/// `artifacts.path` for a module version.
+fn build_module_artifact_path(
+    namespace: &str,
+    name: &str,
+    provider: &str,
+    version: &str,
+) -> String {
+    format!("{}/{}/{}/{}", namespace, name, provider, version)
+}
+
+/// `artifacts.path` for one provider package (a single os/arch build).
+fn build_provider_artifact_path(
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        namespace,
+        type_name,
+        version,
+        build_platform(os, arch)
+    )
+}
+
+/// The `<os>_<arch>` platform token Terraform names a package by.
+fn build_platform(os: &str, arch: &str) -> String {
+    format!("{}_{}", os, arch)
+}
+
+// ---------------------------------------------------------------------------
 // GET /{repo_key}/.well-known/terraform.json — Service Discovery
 // ---------------------------------------------------------------------------
 
 async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Response> {
     let json = serde_json::json!({
-        "modules.v1": format!("/terraform/{}/v1/modules/", repo_key),
-        "providers.v1": format!("/terraform/{}/v1/providers/", repo_key),
+        "modules.v1": format!("{}/{}/v1/modules/", MOUNT_PREFIX, repo_key),
+        "providers.v1": format!("{}/{}/v1/providers/", MOUNT_PREFIX, repo_key),
     });
 
     Ok(Response::builder()
@@ -308,17 +377,68 @@ async fn download_module(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    // Return 204 with X-Terraform-Get header pointing to the archive download URL
-    let download_url = format!(
-        "/terraform/{}/v1/modules/{}/{}/{}/{}/archive",
-        repo_key, namespace, name, provider, version
-    );
+    // Return 204 with X-Terraform-Get header pointing to the archive download
+    // URL served by `download_module_archive`.
+    let download_url = build_module_archive_url(&repo_key, &namespace, &name, &provider, &version);
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("X-Terraform-Get", download_url)
         .body(Body::empty())
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/modules/{namespace}/{name}/{provider}/{version}/archive
+// ---------------------------------------------------------------------------
+
+/// The location [`download_module`] advertises in `X-Terraform-Get`. Built here
+/// (rather than inline) so the advertised URL and the registered route are
+/// derived from one shared definition.
+fn build_module_archive_url(
+    repo_key: &str,
+    namespace: &str,
+    name: &str,
+    provider: &str,
+    version: &str,
+) -> String {
+    format!(
+        "{}/{}/v1/modules/{}/{}/{}/{}/archive",
+        MOUNT_PREFIX, repo_key, namespace, name, provider, version
+    )
+}
+
+/// Stream a hosted module's stored archive — the bytes `X-Terraform-Get`
+/// points a client at.
+async fn download_module_archive(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name, provider, version)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
+    let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
+
+    let result = proxy_helpers::local_fetch_by_path(
+        &state.db,
+        &state,
+        repo.id,
+        &repo.storage_location(),
+        &artifact_path,
+    )
+    .await?;
+
+    if let Some(artifact_id) = result.artifact_id {
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
+    }
+
+    let filename = format!("{}-{}-{}-{}.tar.gz", namespace, name, provider, version);
+    proxy_helpers::stream_fetch_result(result, "application/gzip", Some(&filename))
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +636,7 @@ async fn upload_module(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
-    let artifact_path = format!("{}/{}/{}/{}", namespace, name, provider, version);
+    let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = format!(
         "terraform/modules/{}/{}/{}/{}.tar.gz",
         namespace, name, provider, version
@@ -727,7 +847,10 @@ async fn download_provider(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
-    let platform_path = super::escape_like_literal(&format!("{}_{}", os, arch));
+    let platform = build_platform(&os, &arch);
+    // LIKE-escaped form for the query only: `_` is a LIKE wildcard, so the
+    // escaped value carries backslashes and must never reach a response body.
+    let platform_path = super::escape_like_literal(&platform);
 
     let artifact = sqlx::query!(
         r#"
@@ -827,16 +950,13 @@ async fn download_provider(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let filename = format!(
-        "terraform-provider-{}_{}_{}.zip",
-        type_name, version, platform_path
-    );
+    let filename = build_provider_filename(&type_name, &version, &platform);
 
-    // The provider download endpoint returns JSON with download information
-    let download_url = format!(
-        "/terraform/{}/v1/providers/{}/{}/{}/binary/{}/{}",
-        repo_key, namespace, type_name, version, os, arch
-    );
+    // Per the Provider Registry Protocol this endpoint returns the package
+    // *document*, not the package: `download_url` points at the separate route
+    // that streams the archive (`download_provider_binary`).
+    let download_url =
+        build_provider_binary_url(&repo_key, &namespace, &type_name, &version, &os, &arch);
 
     let json = serde_json::json!({
         "protocols": ["5.0"],
@@ -859,6 +979,123 @@ async fn download_provider(
         .unwrap())
 }
 
+// ---------------------------------------------------------------------------
+// GET /v1/providers/{namespace}/{type}/{version}/binary/{os}/{arch}
+// ---------------------------------------------------------------------------
+
+/// The location [`download_provider`] advertises as `download_url`. Built here
+/// (rather than inline) so the advertised URL and the registered route are
+/// derived from one shared definition.
+fn build_provider_binary_url(
+    repo_key: &str,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+) -> String {
+    format!(
+        "{}/{}/v1/providers/{}/{}/{}/binary/{}/{}",
+        MOUNT_PREFIX, repo_key, namespace, type_name, version, os, arch
+    )
+}
+
+/// The archive filename Terraform expects for a provider package.
+fn build_provider_filename(type_name: &str, version: &str, platform: &str) -> String {
+    format!(
+        "terraform-provider-{}_{}_{}.zip",
+        type_name, version, platform
+    )
+}
+
+/// The coordinates of one provider package (a single os/arch build). The five
+/// segments always travel together, so they are passed as one value.
+struct ProviderPackageRef<'a> {
+    namespace: &'a str,
+    type_name: &'a str,
+    version: &'a str,
+    os: &'a str,
+    arch: &'a str,
+}
+
+impl ProviderPackageRef<'_> {
+    /// `artifacts.path` this package is stored under.
+    fn artifact_path(&self) -> String {
+        build_provider_artifact_path(
+            self.namespace,
+            self.type_name,
+            self.version,
+            self.os,
+            self.arch,
+        )
+    }
+
+    /// The archive filename Terraform expects for this package.
+    fn filename(&self) -> String {
+        build_provider_filename(
+            self.type_name,
+            self.version,
+            &build_platform(self.os, self.arch),
+        )
+    }
+}
+
+/// Stream a stored provider package's `.zip`.
+///
+/// Shared by the registry `binary` route (the location the package document
+/// advertises) and by the hosted network mirror's archive route, so both serve
+/// the same bytes resolved the same way.
+async fn serve_provider_archive(
+    state: &SharedState,
+    repo: &RepoInfo,
+    pkg: &ProviderPackageRef<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let result = proxy_helpers::local_fetch_by_path(
+        &state.db,
+        state,
+        repo.id,
+        &repo.storage_location(),
+        &pkg.artifact_path(),
+    )
+    .await?;
+
+    if let Some(artifact_id) = result.artifact_id {
+        crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+    }
+
+    proxy_helpers::stream_fetch_result(result, "application/zip", Some(&pkg.filename()))
+}
+
+/// Stream the provider archive a package document's `download_url` points at.
+async fn download_provider_binary(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version, os, arch)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
+    serve_provider_archive(
+        &state,
+        &repo,
+        &ProviderPackageRef {
+            namespace: &namespace,
+            type_name: &type_name,
+            version: &version,
+            os: &os,
+            arch: &arch,
+        },
+        &ctx,
+    )
+    .await
+}
+
 async fn upload_provider(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -878,9 +1115,9 @@ async fn upload_provider(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
     let provider_name = format!("{}/{}", namespace, type_name);
-    let platform = format!("{}_{}", os, arch);
+    let platform = build_platform(&os, &arch);
 
-    let artifact_path = format!("{}/{}/{}/{}", namespace, type_name, version, platform);
+    let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1111,15 +1348,25 @@ fn platforms_for_version(registry: &serde_json::Value, version: &str) -> Vec<(St
     out
 }
 
+/// Convert a hex SHA-256 of a provider `.zip` into the `zh:` hash form
+/// Terraform expects in a mirror archive entry.
+///
+/// `zh:` ("zip hash") is defined as the SHA-256 of the archive file itself,
+/// which Terraform verifies against the package it downloads from the mirror
+/// (`PackageMatchesAnyHash` -> `PackageHashLegacyZipSHA`). Returns `None` for
+/// a missing/empty checksum, in which case the entry is advertised without
+/// hashes rather than with a wrong one.
+fn shasum_to_mirror_hash(shasum: Option<&str>) -> Option<String> {
+    shasum
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("zh:{}", s))
+}
+
 /// Convert a registry-protocol download document's `shasum` (hex SHA-256) into
 /// the `zh:` hash form Terraform expects in a mirror archive entry. Returns
 /// `None` when no usable shasum is present.
 fn registry_shasum_to_mirror_hash(download: &serde_json::Value) -> Option<String> {
-    download
-        .get("shasum")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("zh:{}", s))
+    shasum_to_mirror_hash(download.get("shasum").and_then(|v| v.as_str()))
 }
 
 /// Build one mirror archive entry from the AK-local archive URL plus an
@@ -1132,39 +1379,201 @@ fn build_mirror_archive_entry(url: &str, hashes: Vec<String>) -> serde_json::Val
     }
 }
 
-/// Outcome of validating a repo for the network-mirror protocol. Kept as a
+/// How a repo must serve network-mirror requests, or why it cannot. Kept as a
 /// pure enum so the (otherwise async) guard's branching is unit-testable.
 #[derive(Debug, PartialEq, Eq)]
 enum MirrorGuard {
-    Ok,
-    /// Repo exists but is not a remote/proxy repo.
-    NotRemote,
+    /// Hosted repo: serve the packages uploaded to this repo directly.
+    Local,
+    /// Remote repo configured for proxying: translate mirror requests into
+    /// registry-protocol calls against the upstream.
+    Proxy,
     /// Remote repo missing an upstream URL or with proxying disabled.
     NotProxyable,
+    /// A repo type the mirror cannot serve (virtual: no single package source
+    /// to mirror).
+    Unsupported,
 }
 
-/// Decide whether a resolved repo can serve network-mirror requests, given its
-/// type and whether an upstream URL and a proxy service are available.
-fn classify_mirror_repo(is_remote: bool, has_upstream: bool, has_proxy: bool) -> MirrorGuard {
-    if !is_remote {
-        MirrorGuard::NotRemote
-    } else if has_upstream && has_proxy {
-        MirrorGuard::Ok
+/// Decide how a resolved repo serves network-mirror requests, given its type
+/// and whether an upstream URL and a proxy service are available.
+///
+/// A hosted repo mirrors its own uploaded providers; only remote repos need an
+/// upstream and a proxy service.
+fn classify_mirror_repo(repo_type: &str, has_upstream: bool, has_proxy: bool) -> MirrorGuard {
+    if repo_type == RepositoryType::Remote {
+        if has_upstream && has_proxy {
+            MirrorGuard::Proxy
+        } else {
+            MirrorGuard::NotProxyable
+        }
+    } else if repo_type == RepositoryType::Virtual {
+        MirrorGuard::Unsupported
     } else {
-        MirrorGuard::NotProxyable
+        // Local / Staging.
+        MirrorGuard::Local
     }
 }
 
-/// Map a non-`Ok` [`MirrorGuard`] to the client-facing error response.
+/// Map a non-servable [`MirrorGuard`] to the client-facing error response.
 fn mirror_guard_error(guard: MirrorGuard) -> Response {
     let msg = match guard {
-        MirrorGuard::NotRemote => {
-            "Provider network mirror is only available on remote Terraform repositories"
+        MirrorGuard::Unsupported => {
+            "Provider network mirror is not available on virtual Terraform repositories"
         }
         MirrorGuard::NotProxyable => "Remote repository is not configured for proxying",
-        MirrorGuard::Ok => "", // unreachable; callers only map error variants
+        // Unreachable; callers only map the non-servable variants.
+        MirrorGuard::Local | MirrorGuard::Proxy => "",
     };
     (StatusCode::NOT_FOUND, msg.to_string()).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Hosted mirror source
+//
+// For a hosted repo the mirror documents are built from the packages uploaded
+// to that repo, so `terraform init` can install a provider that only ever
+// existed in Artifact Keeper. The document shapes are identical to the proxied
+// (remote) source's — both funnel through `assemble_mirror_archives`.
+// ---------------------------------------------------------------------------
+
+/// A provider package a hosted repo stores locally.
+struct LocalProviderPackage {
+    os: String,
+    arch: String,
+    /// Hex SHA-256 of the stored `.zip` (`artifacts.checksum_sha256`).
+    shasum: String,
+}
+
+/// Build the mirror `index.json` document from the versions a hosted repo
+/// actually stores. Mirror shape: `{ "versions": { "1.0.0": {}, … } }`.
+fn local_versions_to_mirror_index(versions: &[String]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for version in versions {
+        map.insert(version.clone(), serde_json::json!({}));
+    }
+    serde_json::json!({ "versions": serde_json::Value::Object(map) })
+}
+
+/// Recover a stored package's `(os, arch)`: from its upload metadata when
+/// present, else from the `<os>_<arch>` tail of its artifact path (the shape
+/// [`build_provider_artifact_path`] writes). Returns `None` for a package whose
+/// platform cannot be determined, so it is omitted rather than advertised under
+/// a guessed platform.
+fn provider_platform_from(
+    metadata: Option<&serde_json::Value>,
+    path: &str,
+) -> Option<(String, String)> {
+    if let Some(md) = metadata {
+        let os = md.get("os").and_then(|v| v.as_str());
+        let arch = md.get("arch").and_then(|v| v.as_str());
+        if let (Some(os), Some(arch)) = (os, arch) {
+            if !os.is_empty() && !arch.is_empty() {
+                return Some((os.to_string(), arch.to_string()));
+            }
+        }
+    }
+    let (os, arch) = path.rsplit('/').next()?.split_once('_')?;
+    if os.is_empty() || arch.is_empty() {
+        return None;
+    }
+    Some((os.to_string(), arch.to_string()))
+}
+
+/// Split locally stored packages into the `(platforms, shasums)` pair
+/// [`assemble_mirror_archives`] consumes, so a hosted mirror emits the same
+/// `<version>.json` shape as a proxied one.
+#[allow(clippy::type_complexity)]
+fn local_packages_to_archive_inputs(
+    packages: &[LocalProviderPackage],
+) -> (
+    Vec<(String, String)>,
+    std::collections::HashMap<(String, String), String>,
+) {
+    let mut platforms = Vec::new();
+    let mut shasums = std::collections::HashMap::new();
+    for pkg in packages {
+        let platform = (pkg.os.clone(), pkg.arch.clone());
+        if !platforms.contains(&platform) {
+            platforms.push(platform.clone());
+        }
+        if let Some(hash) = shasum_to_mirror_hash(Some(pkg.shasum.as_str())) {
+            shasums.insert(platform, hash);
+        }
+    }
+    (platforms, shasums)
+}
+
+/// List the versions of a provider a hosted repo stores.
+async fn local_provider_versions(
+    db: &PgPool,
+    repo: &RepoInfo,
+    namespace: &str,
+    type_name: &str,
+) -> Result<Vec<String>, Response> {
+    let provider_name = format!("{}/{}", namespace, type_name);
+    let versions: Vec<Option<String>> = sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND name = $2
+          AND is_deleted = false
+          AND version IS NOT NULL
+        ORDER BY version
+        "#,
+        repo.id,
+        provider_name,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    Ok(versions.into_iter().flatten().collect())
+}
+
+/// List the packages (one per platform) a hosted repo stores for one provider
+/// version.
+async fn local_provider_packages(
+    db: &PgPool,
+    repo: &RepoInfo,
+    namespace: &str,
+    type_name: &str,
+    version: &str,
+) -> Result<Vec<LocalProviderPackage>, Response> {
+    let provider_name = format!("{}/{}", namespace, type_name);
+    let rows = sqlx::query!(
+        r#"
+        SELECT a.path, a.checksum_sha256, am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.name = $2
+          AND a.version = $3
+          AND a.is_deleted = false
+        ORDER BY a.path
+        "#,
+        repo.id,
+        provider_name,
+        version,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let (os, arch) = provider_platform_from(row.metadata.as_ref(), &row.path)?;
+            Some(LocalProviderPackage {
+                os,
+                arch,
+                // `checksum_sha256` is CHAR(64): trim so a short value's blank
+                // padding can never be advertised as part of a `zh:` hash.
+                shasum: row.checksum_sha256.trim().to_string(),
+            })
+        })
+        .collect())
 }
 
 /// Assemble the mirror `<version>.json` `archives` object from the discovered
@@ -1197,6 +1606,15 @@ fn extract_download_url(download: &serde_json::Value) -> Option<&str> {
         .get("download_url")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// 404 response for a provider the mirror serves no versions of.
+fn mirror_provider_not_found(namespace: &str, type_name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!("Provider {}/{} not found", namespace, type_name),
+    )
+        .into_response()
 }
 
 /// 404 response for an unknown provider/version on the mirror.
@@ -1275,32 +1693,41 @@ struct MirrorRemote<'a> {
     proxy: &'a crate::services::proxy_service::ProxyService,
 }
 
-/// Resolve a Terraform repo for the network-mirror protocol, asserting it is a
-/// remote repo configured for proxying. Centralizes the guard shared by all
-/// three mirror handlers so the logic exists once (#1566).
-async fn resolve_mirror_remote<'a>(
+/// Where a repo's network-mirror documents come from.
+enum MirrorSource<'a> {
+    /// Hosted repo: its own uploaded provider packages.
+    Local(RepoInfo),
+    /// Remote repo: the configured upstream registry, proxied.
+    Remote(MirrorRemote<'a>),
+}
+
+/// Resolve a Terraform repo for the network-mirror protocol into the source
+/// that serves it. Centralizes the guard shared by all three mirror handlers so
+/// the logic exists once (#1566).
+async fn resolve_mirror_source<'a>(
     state: &'a SharedState,
     repo_key: &str,
-) -> Result<MirrorRemote<'a>, Response> {
+) -> Result<MirrorSource<'a>, Response> {
     let repo = resolve_terraform_repo(&state.db, repo_key).await?;
 
-    let guard = classify_mirror_repo(
-        repo.repo_type == RepositoryType::Remote,
+    match classify_mirror_repo(
+        &repo.repo_type,
         repo.upstream_url.is_some(),
         state.proxy_service.is_some(),
-    );
-    if guard != MirrorGuard::Ok {
-        return Err(mirror_guard_error(guard));
+    ) {
+        MirrorGuard::Local => Ok(MirrorSource::Local(repo)),
+        MirrorGuard::Proxy => {
+            // Both unwraps are guaranteed by the `Proxy` classification.
+            let upstream_url = repo.upstream_url.clone().unwrap();
+            let proxy = state.proxy_service.as_ref().unwrap();
+            Ok(MirrorSource::Remote(MirrorRemote {
+                repo,
+                upstream_url,
+                proxy,
+            }))
+        }
+        guard => Err(mirror_guard_error(guard)),
     }
-
-    // Both unwraps are guaranteed by the guard above.
-    let upstream_url = repo.upstream_url.clone().unwrap();
-    let proxy = state.proxy_service.as_ref().unwrap();
-    Ok(MirrorRemote {
-        repo,
-        upstream_url,
-        proxy,
-    })
 }
 
 /// Fetch a registry-protocol document from the upstream and parse it as JSON,
@@ -1342,12 +1769,23 @@ async fn mirror_index(
     State(state): State<SharedState>,
     Path((repo_key, _hostname, namespace, type_name)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let remote = resolve_mirror_remote(&state, &repo_key).await?;
-    let path = build_registry_versions_path(&namespace, &type_name);
-    let registry = fetch_upstream_json(&remote, &repo_key, &path).await?;
-    Ok(json_ok_response(&registry_versions_to_mirror_index(
-        &registry,
-    )))
+    match resolve_mirror_source(&state, &repo_key).await? {
+        MirrorSource::Local(repo) => {
+            let versions =
+                local_provider_versions(&state.db, &repo, &namespace, &type_name).await?;
+            if versions.is_empty() {
+                return Err(mirror_provider_not_found(&namespace, &type_name));
+            }
+            Ok(json_ok_response(&local_versions_to_mirror_index(&versions)))
+        }
+        MirrorSource::Remote(remote) => {
+            let path = build_registry_versions_path(&namespace, &type_name);
+            let registry = fetch_upstream_json(&remote, &repo_key, &path).await?;
+            Ok(json_ok_response(&registry_versions_to_mirror_index(
+                &registry,
+            )))
+        }
+    }
 }
 
 /// GET /:repo_key/:hostname/:namespace/:type/<version>.json — mirror packages.
@@ -1362,32 +1800,44 @@ async fn mirror_version(
     )>,
 ) -> Result<Response, Response> {
     let version = version_from_mirror_file(&version_file)?;
-    let remote = resolve_mirror_remote(&state, &repo_key).await?;
 
-    // Discover the platforms this version ships for via the registry's
-    // `versions` document.
-    let versions_path = build_registry_versions_path(&namespace, &type_name);
-    let registry = fetch_upstream_json(&remote, &repo_key, &versions_path).await?;
+    let (platforms, shasums) = match resolve_mirror_source(&state, &repo_key).await? {
+        MirrorSource::Local(repo) => {
+            // The stored packages are the source of truth for both the
+            // platform list and the hashes.
+            let packages =
+                local_provider_packages(&state.db, &repo, &namespace, &type_name, version).await?;
+            local_packages_to_archive_inputs(&packages)
+        }
+        MirrorSource::Remote(remote) => {
+            // Discover the platforms this version ships for via the registry's
+            // `versions` document.
+            let versions_path = build_registry_versions_path(&namespace, &type_name);
+            let registry = fetch_upstream_json(&remote, &repo_key, &versions_path).await?;
+            let platforms = platforms_for_version(&registry, version);
 
-    let platforms = platforms_for_version(&registry, version);
+            // Best-effort: pull each per-platform download doc to obtain the
+            // shasum. A failed/absent shasum just omits the hash (Terraform
+            // downloads without pinning) rather than failing the whole request.
+            let mut shasums = std::collections::HashMap::new();
+            for (os, arch) in &platforms {
+                let dl_path =
+                    build_registry_download_path(&namespace, &type_name, version, os, arch);
+                if let Some(hash) = fetch_upstream_json(&remote, &repo_key, &dl_path)
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(registry_shasum_to_mirror_hash)
+                {
+                    shasums.insert((os.clone(), arch.clone()), hash);
+                }
+            }
+            (platforms, shasums)
+        }
+    };
+
     if platforms.is_empty() {
         return Err(mirror_not_found(&namespace, &type_name, version));
-    }
-
-    // Best-effort: pull each per-platform download doc to obtain the shasum.
-    // A failed/absent shasum just omits the hash (Terraform downloads without
-    // pinning) rather than failing the whole request.
-    let mut shasums = std::collections::HashMap::new();
-    for (os, arch) in &platforms {
-        let dl_path = build_registry_download_path(&namespace, &type_name, version, os, arch);
-        if let Some(hash) = fetch_upstream_json(&remote, &repo_key, &dl_path)
-            .await
-            .ok()
-            .as_ref()
-            .and_then(registry_shasum_to_mirror_hash)
-        {
-            shasums.insert((os.clone(), arch.clone()), hash);
-        }
     }
 
     Ok(json_ok_response(&assemble_mirror_archives(
@@ -1408,8 +1858,27 @@ async fn mirror_download(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let remote = resolve_mirror_remote(&state, &repo_key).await?;
+    let remote = match resolve_mirror_source(&state, &repo_key).await? {
+        // Hosted: the archive is our own stored package.
+        MirrorSource::Local(repo) => {
+            return serve_provider_archive(
+                &state,
+                &repo,
+                &ProviderPackageRef {
+                    namespace: &namespace,
+                    type_name: &type_name,
+                    version: &version,
+                    os: &os,
+                    arch: &arch,
+                },
+                &ctx,
+            )
+            .await;
+        }
+        MirrorSource::Remote(remote) => remote,
+    };
 
     // Resolve the upstream registry download document to learn the real
     // archive URL, then stream that archive back through the proxy (cached).
@@ -1574,47 +2043,14 @@ mod tests {
         format!("{}/{}", namespace, type_name)
     }
 
-    /// Build the download URL for a module.
-    fn build_module_download_url(
-        repo_key: &str,
-        namespace: &str,
-        name: &str,
-        provider: &str,
-        version: &str,
-    ) -> String {
-        format!(
-            "/terraform/{}/v1/modules/{}/{}/{}/{}/archive",
-            repo_key, namespace, name, provider, version
-        )
-    }
-
-    /// Build the download URL for a provider binary.
-    fn build_provider_download_url(
-        repo_key: &str,
-        namespace: &str,
-        type_name: &str,
-        version: &str,
-        os: &str,
-        arch: &str,
-    ) -> String {
-        format!(
-            "/terraform/{}/v1/providers/{}/{}/{}/binary/{}/{}",
-            repo_key, namespace, type_name, version, os, arch
-        )
-    }
-
-    /// Build the provider binary filename.
-    fn build_provider_filename(type_name: &str, version: &str, platform_path: &str) -> String {
-        format!(
-            "terraform-provider-{}_{}_{}.zip",
-            type_name, version, platform_path
-        )
-    }
-
-    /// Build the platform path string (os_arch).
-    fn build_platform_path(os: &str, arch: &str) -> String {
-        format!("{}_{}", os, arch)
-    }
+    // NOTE: `build_module_archive_url`, `build_provider_binary_url`,
+    // `build_provider_filename` and `build_platform` are the production
+    // functions (via `use super::*`). This module used to carry private copies
+    // of them, so their tests only ever asserted that a test-local `format!`
+    // matched a literal — which is why the advertised-but-unrouted
+    // `download_url` went unnoticed. The copies are gone; the tests below
+    // exercise the real builders, and `test_advertised_*` asserts the
+    // resulting URLs against the real router.
 
     /// Build the storage key for a Terraform module.
     fn build_module_storage_key(
@@ -1640,26 +2076,6 @@ mod tests {
             "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
             namespace, type_name, version, type_name, platform
         )
-    }
-
-    /// Build the artifact path for a module.
-    fn build_module_artifact_path(
-        namespace: &str,
-        name: &str,
-        provider: &str,
-        version: &str,
-    ) -> String {
-        format!("{}/{}/{}/{}", namespace, name, provider, version)
-    }
-
-    /// Build the artifact path for a provider.
-    fn build_provider_artifact_path(
-        namespace: &str,
-        type_name: &str,
-        version: &str,
-        platform: &str,
-    ) -> String {
-        format!("{}/{}/{}/{}", namespace, type_name, version, platform)
     }
 
     /// Build module metadata JSON.
@@ -2150,18 +2566,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_module_download_url / build_provider_download_url
+    // build_module_archive_url / build_provider_binary_url
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_module_download_url() {
-        let url = build_module_download_url("repo", "ns", "name", "prov", "1.0.0");
+    fn test_build_module_archive_url() {
+        let url = build_module_archive_url("repo", "ns", "name", "prov", "1.0.0");
         assert_eq!(url, "/terraform/repo/v1/modules/ns/name/prov/1.0.0/archive");
     }
 
     #[test]
-    fn test_build_provider_download_url() {
-        let url = build_provider_download_url("repo", "ns", "aws", "5.0.0", "linux", "amd64");
+    fn test_build_provider_binary_url() {
+        let url = build_provider_binary_url("repo", "ns", "aws", "5.0.0", "linux", "amd64");
         assert_eq!(
             url,
             "/terraform/repo/v1/providers/ns/aws/5.0.0/binary/linux/amd64"
@@ -2169,7 +2585,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_provider_filename / build_platform_path
+    // build_provider_filename / build_platform
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2181,9 +2597,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_platform_path() {
-        assert_eq!(build_platform_path("linux", "amd64"), "linux_amd64");
-        assert_eq!(build_platform_path("darwin", "arm64"), "darwin_arm64");
+    fn test_build_platform() {
+        assert_eq!(build_platform("linux", "amd64"), "linux_amd64");
+        assert_eq!(build_platform("darwin", "arm64"), "darwin_arm64");
     }
 
     // -----------------------------------------------------------------------
@@ -2221,7 +2637,7 @@ mod tests {
     #[test]
     fn test_build_provider_artifact_path() {
         assert_eq!(
-            build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux_amd64"),
+            build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64"),
             "hashicorp/aws/5.0.0/linux_amd64"
         );
     }
@@ -2503,24 +2919,48 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_mirror_repo() {
-        assert_eq!(classify_mirror_repo(true, true, true), MirrorGuard::Ok);
+    fn test_classify_mirror_repo_remote_proxies_upstream() {
         assert_eq!(
-            classify_mirror_repo(false, true, true),
-            MirrorGuard::NotRemote
-        );
-        // Type guard takes precedence over proxyability.
-        assert_eq!(
-            classify_mirror_repo(false, false, false),
-            MirrorGuard::NotRemote
+            classify_mirror_repo("remote", true, true),
+            MirrorGuard::Proxy
         );
         assert_eq!(
-            classify_mirror_repo(true, false, true),
+            classify_mirror_repo("remote", false, true),
             MirrorGuard::NotProxyable
         );
         assert_eq!(
-            classify_mirror_repo(true, true, false),
+            classify_mirror_repo("remote", true, false),
             MirrorGuard::NotProxyable
+        );
+    }
+
+    /// A hosted repo mirrors its own uploaded providers, so it needs neither an
+    /// upstream nor a proxy service to be servable.
+    #[test]
+    fn test_classify_mirror_repo_hosted_serves_locally() {
+        assert_eq!(
+            classify_mirror_repo("local", false, false),
+            MirrorGuard::Local
+        );
+        assert_eq!(
+            classify_mirror_repo("staging", false, false),
+            MirrorGuard::Local
+        );
+        assert_eq!(
+            classify_mirror_repo("local", true, true),
+            MirrorGuard::Local
+        );
+    }
+
+    #[test]
+    fn test_classify_mirror_repo_virtual_unsupported() {
+        assert_eq!(
+            classify_mirror_repo("virtual", false, false),
+            MirrorGuard::Unsupported
+        );
+        assert_eq!(
+            classify_mirror_repo("virtual", true, true),
+            MirrorGuard::Unsupported
         );
     }
 
@@ -2528,16 +2968,20 @@ mod tests {
     fn test_mirror_guard_error_status() {
         use axum::http::StatusCode;
         assert_eq!(
-            mirror_guard_error(MirrorGuard::NotRemote).status(),
+            mirror_guard_error(MirrorGuard::Unsupported).status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
             mirror_guard_error(MirrorGuard::NotProxyable).status(),
             StatusCode::NOT_FOUND
         );
-        // Ok variant maps to a (degenerate) 404 too; callers never hit it.
+        // Servable variants map to a (degenerate) 404 too; callers never hit them.
         assert_eq!(
-            mirror_guard_error(MirrorGuard::Ok).status(),
+            mirror_guard_error(MirrorGuard::Local).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            mirror_guard_error(MirrorGuard::Proxy).status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -2810,6 +3254,435 @@ mod tests {
             serde_json::to_value(&index).unwrap(),
             serde_json::json!({ "versions": { "0.7.2": {} } })
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hosted mirror document builders
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_local_versions_to_mirror_index() {
+        let index = local_versions_to_mirror_index(&["1.0.0".to_string(), "2.1.0".to_string()]);
+        assert_eq!(
+            index,
+            serde_json::json!({ "versions": { "1.0.0": {}, "2.1.0": {} } })
+        );
+    }
+
+    #[test]
+    fn test_local_versions_to_mirror_index_empty() {
+        // Shape stays valid with no versions; the handler 404s before emitting
+        // this, but the document must never be malformed.
+        assert_eq!(
+            local_versions_to_mirror_index(&[]),
+            serde_json::json!({ "versions": {} })
+        );
+    }
+
+    #[test]
+    fn test_shasum_to_mirror_hash() {
+        assert_eq!(
+            shasum_to_mirror_hash(Some("abc123")),
+            Some("zh:abc123".to_string())
+        );
+        assert_eq!(shasum_to_mirror_hash(Some("")), None);
+        assert_eq!(shasum_to_mirror_hash(None), None);
+    }
+
+    #[test]
+    fn test_provider_platform_from_metadata() {
+        let md = serde_json::json!({ "os": "darwin", "arch": "arm64" });
+        assert_eq!(
+            provider_platform_from(Some(&md), "ns/type/1.0.0/linux_amd64"),
+            Some(("darwin".to_string(), "arm64".to_string())),
+            "metadata must win over the path when both are present"
+        );
+    }
+
+    #[test]
+    fn test_provider_platform_from_path_fallback() {
+        // No metadata row: recover the platform from the stored path.
+        assert_eq!(
+            provider_platform_from(None, "ns/type/1.0.0/linux_arm64"),
+            Some(("linux".to_string(), "arm64".to_string()))
+        );
+        // Metadata present but unusable: same fallback.
+        let md = serde_json::json!({ "kind": "provider" });
+        assert_eq!(
+            provider_platform_from(Some(&md), "ns/type/1.0.0/linux_arm64"),
+            Some(("linux".to_string(), "arm64".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_provider_platform_from_unrecoverable() {
+        // A package whose platform cannot be determined is omitted rather than
+        // advertised under a guessed platform.
+        assert_eq!(
+            provider_platform_from(None, "ns/type/1.0.0/noplatform"),
+            None
+        );
+        assert_eq!(provider_platform_from(None, "ns/type/1.0.0/_amd64"), None);
+        assert_eq!(provider_platform_from(None, ""), None);
+    }
+
+    #[test]
+    fn test_local_packages_to_archive_inputs() {
+        let packages = vec![
+            LocalProviderPackage {
+                os: "linux".to_string(),
+                arch: "arm64".to_string(),
+                shasum: "aaa".to_string(),
+            },
+            LocalProviderPackage {
+                os: "darwin".to_string(),
+                arch: "arm64".to_string(),
+                shasum: String::new(),
+            },
+        ];
+        let (platforms, shasums) = local_packages_to_archive_inputs(&packages);
+        assert_eq!(
+            platforms,
+            vec![
+                ("linux".to_string(), "arm64".to_string()),
+                ("darwin".to_string(), "arm64".to_string())
+            ]
+        );
+        assert_eq!(
+            shasums.get(&("linux".to_string(), "arm64".to_string())),
+            Some(&"zh:aaa".to_string())
+        );
+        assert!(
+            !shasums.contains_key(&("darwin".to_string(), "arm64".to_string())),
+            "a package with no checksum must be advertised without a hash, not with a wrong one"
+        );
+    }
+
+    /// The hosted source must feed `assemble_mirror_archives` a shape that
+    /// produces exactly the mirror `<version>.json` document Terraform parses.
+    #[test]
+    fn test_local_packages_produce_mirror_version_document() {
+        let packages = vec![LocalProviderPackage {
+            os: "linux".to_string(),
+            arch: "arm64".to_string(),
+            shasum: "21c38f6b".to_string(),
+        }];
+        let (platforms, shasums) = local_packages_to_archive_inputs(&packages);
+        let doc = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "archives": {
+                    "linux_arm64": {
+                        "url": "1.0.0/download/linux/arm64",
+                        "hashes": ["zh:21c38f6b"]
+                    }
+                }
+            })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2580 class)
+    //
+    // These assert the URL a document hands a client against the REAL router.
+    // The unit tests above can only prove a builder emits the string it was
+    // written to emit; only routing the advertised URL proves it resolves.
+    // -----------------------------------------------------------------------
+
+    /// The terraform routes mounted exactly where `api::routes` mounts them.
+    ///
+    /// The advertised URLs are absolute and carry [`MOUNT_PREFIX`], so a router
+    /// mounted at the root could not resolve them — the mount point is part of
+    /// what these tests are pinning.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest(MOUNT_PREFIX, super::router())
+    }
+
+    /// Publish a provider package through the real upload handler.
+    async fn publish_provider(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        zip: &'static [u8],
+    ) -> axum::http::StatusCode {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (status, _) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/providers/dtf/marker/1.0.0/linux/arm64",
+                    MOUNT_PREFIX, fx.repo_key
+                ),
+                Bytes::from_static(zip),
+            ),
+        )
+        .await;
+        status
+    }
+
+    /// Resolve a (possibly relative) advertised URL the way a client does —
+    /// against the URL of the document that advertised it — and return the
+    /// path+query to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..].to_string()
+    }
+
+    /// The `download_url` the provider package document advertises must be a
+    /// live route that streams the package. Regression guard: the document
+    /// advertised `.../binary/...` while no such route was registered, so
+    /// publish + `versions` both passed while any protocol-conformant client
+    /// 404'd on the download.
+    #[tokio::test]
+    async fn test_advertised_provider_download_url_resolves() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK\x03\x04 terraform provider archive bytes";
+        let published = publish_provider(&fx, zip).await;
+
+        // The package document a client fetches first.
+        let doc_path = format!(
+            "{}/{}/v1/providers/dtf/marker/1.0.0/download/linux/arm64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (doc_status, doc_body) =
+            tdh::send(fx.router_anon(mounted_router()), tdh::get(doc_path.clone())).await;
+        let doc: serde_json::Value = serde_json::from_slice(&doc_body).unwrap_or_default();
+        let advertised = doc
+            .get("download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let filename = doc
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Follow it exactly as a client would.
+        let (dl_status, dl_body) = if advertised.is_empty() {
+            (axum::http::StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&format!("http://ak.test{}", doc_path), &advertised);
+            tdh::send(fx.router_anon(mounted_router()), tdh::get(path)).await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED, "publish");
+        assert_eq!(doc_status, axum::http::StatusCode::OK, "package document");
+        assert_eq!(
+            dl_status,
+            axum::http::StatusCode::OK,
+            "the advertised download_url ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            zip,
+            "the advertised download_url must serve the published package bytes"
+        );
+        assert_eq!(
+            filename, "terraform-provider-marker_1.0.0_linux_arm64.zip",
+            "advertised filename must not carry LIKE-escaping"
+        );
+    }
+
+    /// The `X-Terraform-Get` location the module download advertises must be a
+    /// live route too — same class as the provider `download_url`.
+    #[tokio::test]
+    async fn test_advertised_module_archive_url_resolves() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b terraform module tarball bytes";
+        let k = fx.repo_key.clone();
+        let m = MOUNT_PREFIX;
+
+        let (published, _) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::put(
+                format!("{m}/{k}/v1/modules/dtf/net/aws/1.0.0"),
+                Bytes::from_static(tarball),
+            ),
+        )
+        .await;
+
+        let doc_path = format!("{m}/{k}/v1/modules/dtf/net/aws/1.0.0/download");
+        let app = fx.router_anon(mounted_router());
+        let response = tower::ServiceExt::oneshot(app, tdh::get(doc_path.clone()))
+            .await
+            .expect("module download");
+        let doc_status = response.status();
+        let advertised = response
+            .headers()
+            .get("X-Terraform-Get")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if advertised.is_empty() {
+            (axum::http::StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&format!("http://ak.test{}", doc_path), &advertised);
+            tdh::send(fx.router_anon(mounted_router()), tdh::get(path)).await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED, "publish");
+        assert_eq!(
+            doc_status,
+            axum::http::StatusCode::NO_CONTENT,
+            "module download document"
+        );
+        assert_eq!(
+            dl_status,
+            axum::http::StatusCode::OK,
+            "the advertised X-Terraform-Get location ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tarball,
+            "archive must serve the published bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hosted network mirror
+    // -----------------------------------------------------------------------
+
+    /// The full network-mirror chain a real `terraform init` walks against a
+    /// HOSTED repo: `index.json` -> `<version>.json` -> archive. Regression
+    /// guard: the mirror was gated to remote/proxy repos, so a hosted repo's
+    /// own uploaded providers 404'd on the very first request with "only
+    /// available on remote Terraform repositories".
+    #[tokio::test]
+    async fn test_hosted_mirror_serves_uploaded_provider() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK\x03\x04 hosted mirror provider archive";
+        let published = publish_provider(&fx, zip).await;
+        let expected_sha = format!("{:x}", Sha256::digest(zip));
+        let k = fx.repo_key.clone();
+        let m = MOUNT_PREFIX;
+
+        // 1. index.json — the request `terraform init` makes first.
+        let (index_status, index_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/marker/index.json")),
+        )
+        .await;
+        let index: serde_json::Value = serde_json::from_slice(&index_body).unwrap_or_default();
+
+        // 2. <version>.json.
+        let version_doc_path = format!("{m}/{k}/tf.dtf.local/dtf/marker/1.0.0.json");
+        let (version_status, version_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(version_doc_path.clone()),
+        )
+        .await;
+        let version_doc: serde_json::Value =
+            serde_json::from_slice(&version_body).unwrap_or_default();
+        let archive_url = version_doc
+            .pointer("/archives/linux_arm64/url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let hashes = version_doc
+            .pointer("/archives/linux_arm64/hashes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        // 3. The archive, at the URL the mirror advertised (relative to the
+        //    document that advertised it, exactly as Terraform resolves it).
+        let (archive_status, archive_body) = if archive_url.is_empty() {
+            (axum::http::StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(
+                &format!("http://tf.dtf.local{}", version_doc_path),
+                &archive_url,
+            );
+            tdh::send(fx.router_anon(mounted_router()), tdh::get(path)).await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED, "publish");
+        assert_eq!(
+            index_status,
+            axum::http::StatusCode::OK,
+            "hosted mirror index.json must be served"
+        );
+        assert_eq!(
+            index,
+            serde_json::json!({ "versions": { "1.0.0": {} } }),
+            "index must list the uploaded version"
+        );
+        assert_eq!(
+            version_status,
+            axum::http::StatusCode::OK,
+            "hosted mirror <version>.json must be served"
+        );
+        assert_eq!(
+            hashes,
+            serde_json::json!([format!("zh:{expected_sha}")]),
+            "the advertised zh: hash must be the SHA-256 of the stored archive"
+        );
+        assert_eq!(
+            archive_status,
+            axum::http::StatusCode::OK,
+            "the mirror-advertised archive url ({archive_url}) must resolve"
+        );
+        assert_eq!(
+            &archive_body[..],
+            zip,
+            "the mirror must serve the uploaded package bytes"
+        );
+    }
+
+    /// A hosted mirror still 404s a provider it has no packages for, rather
+    /// than advertising an empty version list.
+    #[tokio::test]
+    async fn test_hosted_mirror_404s_unknown_provider() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let m = MOUNT_PREFIX;
+
+        let (index_status, _) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/absent/index.json")),
+        )
+        .await;
+        let (version_status, _) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/absent/9.9.9.json")),
+        )
+        .await;
+        let (archive_status, _) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!(
+                "{m}/{k}/tf.dtf.local/dtf/absent/9.9.9/download/linux/arm64"
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(index_status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(version_status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(archive_status, axum::http::StatusCode::NOT_FOUND);
     }
 }
 
