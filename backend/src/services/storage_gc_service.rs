@@ -183,10 +183,13 @@ pub struct OciBlobRepoFootprint {
     pub repository_id: Uuid,
     /// Number of `oci_blobs` rows attributed to this repository.
     pub blob_rows: i64,
-    /// Sum of `oci_blobs.size_bytes` for this repository's rows. Because OCI
-    /// blob storage is content-addressed and deduplicated across repos, the
+    /// Sum of `oci_blobs.size_bytes` for this repository's rows. On shared
+    /// backends (anything other than `filesystem`) blobs are deduplicated
+    /// across repos — one physical object per digest per backend — so the
     /// same physical bytes can be counted under more than one repository
-    /// here; see [`OciBlobFootprintReport::physical_bytes`] for the
+    /// here. On `filesystem` each repository stores its own independent
+    /// copy under its `storage_path`, so its rows are that repo's real
+    /// bytes. See [`OciBlobFootprintReport::physical_bytes`] for the
     /// dedup-aware total.
     pub logical_bytes: i64,
 }
@@ -199,31 +202,43 @@ pub struct OciBlobRepoFootprint {
 /// layers before any garbage-collection mechanism is enabled.
 ///
 /// It deliberately does NOT attempt to classify which blobs are
-/// "reclaimable orphans": that requires a manifest -> blob reference table
-/// that does not yet exist in the schema, and any per-`(repository_id,
-/// digest)` orphan heuristic would mis-handle the cross-repo dedup case
-/// (multiple `oci_blobs` rows, one physical object) and report in-use
-/// blobs as reclaimable. The numbers here are exact aggregates only.
+/// "reclaimable orphans": that is the blob GC's job (mark-and-sweep over
+/// `manifest_blob_refs`, per [`BLOB_PROTECTED_BY_REFS_SQL`]). A naive
+/// per-`(repository_id, digest)` orphan heuristic would mis-handle shared
+/// backends (anything other than `filesystem`), where all referencing
+/// repos share ONE physical object per digest per backend, and report
+/// in-use blobs as reclaimable; on `filesystem` each repository keeps an
+/// independent copy under its own `storage_path`. The numbers here are
+/// exact aggregates only.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct OciBlobFootprintReport {
     /// Total number of `oci_blobs` rows across all repositories.
     pub total_blob_rows: i64,
     /// Number of distinct blob digests (content-addressed identities). When
     /// this is smaller than `total_blob_rows`, the difference is cross-repo
-    /// deduplication: rows that share one physical storage object.
+    /// sharing of a content identity (one physical object shared by all
+    /// referencing repos on shared backends; an independent copy per
+    /// repository on `filesystem`).
     pub distinct_digests: i64,
     /// Sum of `size_bytes` over every `oci_blobs` row. Double-counts
     /// deduplicated blobs once per referencing repository.
     pub logical_bytes: i64,
-    /// Sum of `size_bytes` counting each distinct digest exactly once. This
-    /// approximates the physical bytes occupied in the storage backend.
+    /// Sum of `size_bytes` counting each distinct **physical storage
+    /// object** exactly once, per the ownership model of
+    /// [`BLOB_PROTECTED_BY_REFS_SQL`]: on shared backends (anything other
+    /// than `filesystem`) a digest is one object per backend; on
+    /// `filesystem` each repository stores its own copy under its
+    /// `storage_path`, so the same digest in two filesystem repositories
+    /// counts twice.
     pub physical_bytes: i64,
     /// Grace window (hours) applied to the `aged_*` figures below.
     pub grace_hours: i64,
-    /// Distinct digests older than `grace_hours` (eligible to be *considered*
-    /// by a future GC sweep once a reference table exists). Reporting only.
+    /// Distinct digests with at least one physical copy older than
+    /// `grace_hours` (eligible to be *considered* by a future GC sweep once
+    /// a reference table exists). Reporting only.
     pub aged_distinct_digests: i64,
-    /// Physical bytes (distinct-digest) older than `grace_hours`.
+    /// Physical bytes (same physical-object grouping as `physical_bytes`)
+    /// older than `grace_hours`.
     pub aged_physical_bytes: i64,
     /// Per-repository logical footprint, largest `logical_bytes` first.
     pub per_repository: Vec<OciBlobRepoFootprint>,
@@ -1026,10 +1041,10 @@ impl StorageGcService {
 
     /// Build the read-only OCI blob footprint report (issue #1408).
     ///
-    /// Performs only `SELECT` aggregates against `oci_blobs`; it never
-    /// deletes anything, takes no row locks, and touches no storage
-    /// backend. Safe to call on a hot production database — the two
-    /// aggregate queries are index-friendly scans of `oci_blobs`.
+    /// Performs only `SELECT` aggregates against `oci_blobs` (joined to
+    /// `repositories` for backend/path scoping); it never deletes
+    /// anything, takes no row locks, and touches no storage backend. Safe
+    /// to call on a hot production database.
     ///
     /// `grace_hours` is clamped to a sane range via
     /// [`clamp_grace_hours`]; the clamped value is echoed back in the
@@ -1041,30 +1056,62 @@ impl StorageGcService {
         let grace_hours = clamp_grace_hours(grace_hours);
 
         // Aggregate 1: global totals + dedup-aware physical bytes + aged
-        // figures, all in one pass. `size_bytes` is taken as MAX per digest
-        // so a single physical object is counted once even though it has one
-        // row per referencing repository (rows for the same digest share a
-        // size, so MAX == the per-object size).
+        // figures, all in one pass.
+        //
+        // Physical identity mirrors [`BLOB_PROTECTED_BY_REFS_SQL`] (and
+        // `StorageRegistry::backend_is_repo_isolated`): on shared backends
+        // (anything other than 'filesystem') the content-addressed key
+        // `oci-blobs/<digest>` resolves to ONE object per backend, so a
+        // digest counts once per backend; on 'filesystem' every repository
+        // roots its own tree at `storage_path`, so the same digest under
+        // two paths is two real files and must count twice. `per_object`
+        // therefore groups by (digest, backend, path-if-filesystem);
+        // `size_bytes` is MAX within a group (rows for the same digest
+        // share a size) and `first_seen` is the group's oldest row.
+        // `distinct_digests` stays digest-level (content identities),
+        // independent of how many physical copies exist; counting it over
+        // `per_object` equals counting over `oci_blobs` directly (the NOT
+        // NULL `repository_id` FK means the join drops no rows) and saves
+        // a fourth scan of the table.
+        //
+        // DELIBERATE: rows with `pending_delete_at IS NOT NULL` (the
+        // mark-and-sweep marker, migration 141) are INCLUDED in every
+        // figure — marked-but-not-yet-swept bytes are still physically on
+        // disk, and this is a footprint view. Do not "fix" by excluding
+        // them.
+        //
+        // `grace_hours` binds as int8, but `make_interval` only defines int4
+        // named parameters, so the SQL must cast `$1::int` or Postgres
+        // rejects the call outright (#2626). Safe: clamp_grace_hours caps
+        // the value at 8760. The SUM(...) columns need `::BIGINT` because
+        // SUM over bigint yields NUMERIC, which the i64 decodes below
+        // reject — and a failed decode is a hard error (propagated), never
+        // a silent zero.
         let totals_sql = r#"
-            WITH per_digest AS (
-                SELECT digest,
-                       MAX(size_bytes) AS size_bytes,
-                       MIN(created_at) AS first_seen
-                FROM oci_blobs
-                GROUP BY digest
+            WITH per_object AS (
+                SELECT ob.digest,
+                       MAX(ob.size_bytes) AS size_bytes,
+                       MIN(ob.created_at) AS first_seen
+                FROM oci_blobs ob
+                JOIN repositories r ON r.id = ob.repository_id
+                GROUP BY ob.digest,
+                         r.storage_backend,
+                         CASE WHEN r.storage_backend = 'filesystem'
+                              THEN r.storage_path ELSE '' END
             )
             SELECT
                 (SELECT COUNT(*) FROM oci_blobs)                       AS total_blob_rows,
-                (SELECT COALESCE(SUM(size_bytes), 0) FROM oci_blobs)   AS logical_bytes,
-                COUNT(*)                                               AS distinct_digests,
-                COALESCE(SUM(size_bytes), 0)                           AS physical_bytes,
-                COUNT(*) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1)
+                (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+                   FROM oci_blobs)                                     AS logical_bytes,
+                COUNT(DISTINCT digest)                                 AS distinct_digests,
+                COALESCE(SUM(size_bytes), 0)::BIGINT                   AS physical_bytes,
+                COUNT(DISTINCT digest) FILTER (
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
                 )                                                      AS aged_distinct_digests,
                 COALESCE(SUM(size_bytes) FILTER (
-                    WHERE first_seen < NOW() - make_interval(hours => $1)
-                ), 0)                                                  AS aged_physical_bytes
-            FROM per_digest
+                    WHERE first_seen < NOW() - make_interval(hours => $1::int)
+                ), 0)::BIGINT                                          AS aged_physical_bytes
+            FROM per_object
         "#;
 
         let totals = sqlx::query(totals_sql)
@@ -1077,7 +1124,7 @@ impl StorageGcService {
         let per_repo_sql = r#"
             SELECT repository_id,
                    COUNT(*) AS blob_rows,
-                   COALESCE(SUM(size_bytes), 0) AS logical_bytes
+                   COALESCE(SUM(size_bytes), 0)::BIGINT AS logical_bytes
             FROM oci_blobs
             GROUP BY repository_id
             ORDER BY logical_bytes DESC, repository_id ASC
@@ -1095,19 +1142,19 @@ impl StorageGcService {
                     .map_err(|e| AppError::Database(e.to_string()))?;
                 Ok(map_repo_footprint(
                     repository_id,
-                    row.try_get("blob_rows").unwrap_or(0),
-                    row.try_get("logical_bytes").unwrap_or(0),
+                    decode_report_i64(&row, "blob_rows")?,
+                    decode_report_i64(&row, "logical_bytes")?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let totals = BlobFootprintTotals {
-            total_blob_rows: totals.try_get("total_blob_rows").unwrap_or(0),
-            distinct_digests: totals.try_get("distinct_digests").unwrap_or(0),
-            logical_bytes: totals.try_get("logical_bytes").unwrap_or(0),
-            physical_bytes: totals.try_get("physical_bytes").unwrap_or(0),
-            aged_distinct_digests: totals.try_get("aged_distinct_digests").unwrap_or(0),
-            aged_physical_bytes: totals.try_get("aged_physical_bytes").unwrap_or(0),
+            total_blob_rows: decode_report_i64(&totals, "total_blob_rows")?,
+            distinct_digests: decode_report_i64(&totals, "distinct_digests")?,
+            logical_bytes: decode_report_i64(&totals, "logical_bytes")?,
+            physical_bytes: decode_report_i64(&totals, "physical_bytes")?,
+            aged_distinct_digests: decode_report_i64(&totals, "aged_distinct_digests")?,
+            aged_physical_bytes: decode_report_i64(&totals, "aged_physical_bytes")?,
         };
 
         Ok(assemble_blob_footprint_report(
@@ -1873,6 +1920,19 @@ pub(crate) struct BlobFootprintTotals {
     pub physical_bytes: i64,
     pub aged_distinct_digests: i64,
     pub aged_physical_bytes: i64,
+}
+
+/// Decode an `i64` aggregate column from a footprint-report row,
+/// propagating the failure as a database error.
+///
+/// Deliberately NOT `unwrap_or(0)`: a decode mismatch (e.g. an un-cast
+/// `NUMERIC` from `SUM`) silently reporting "0 bytes" is the swallow class
+/// this codebase keeps re-finding — a plausible default standing in for an
+/// error — and a footprint report that reads 0 could steer a wrong
+/// deletion decision downstream.
+fn decode_report_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64> {
+    row.try_get(column)
+        .map_err(|e| AppError::Database(format!("decode footprint column {column}: {e}")))
 }
 
 /// Build a single per-repository footprint row from decoded column values.
@@ -5535,5 +5595,181 @@ mod tests {
             "re-marking an already-marked blob must preserve the original pending_delete_at \
              so the sweep grace is measured from the first mark"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // oci_blob_footprint_report: DB-backed regression test (#2626)
+    // -----------------------------------------------------------------------
+
+    /// Seed one repository plus its `oci_blobs` rows for the footprint test.
+    /// `storage_path` is derived from the unique key, so two filesystem
+    /// repos never share a path and two cloud repos never share one either
+    /// (proving path is IGNORED for shared backends).
+    async fn seed_footprint_repo(pool: &PgPool, backend: &str, blobs: &[(&str, i64)]) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("gc-fp-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories \
+                 (id, key, name, format, repo_type, storage_backend, storage_path) \
+             VALUES ($1, $2, $2, 'docker'::repository_format, \
+                     'local'::repository_type, $3, $4)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(backend)
+        .bind(format!("/data/{key}"))
+        .execute(pool)
+        .await
+        .expect("insert repository");
+        for (digest, size) in blobs {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, 'oci-blobs/' || $2)",
+            )
+            .bind(id)
+            .bind(digest)
+            .bind(size)
+            .execute(pool)
+            .await
+            .expect("insert oci blob");
+        }
+        id
+    }
+
+    /// #2626 regression + physical-bytes model + age filter, end to end
+    /// against real Postgres (`--lib`, so the coverage/unit CI jobs run it):
+    ///
+    /// 1. The report must EXECUTE: `make_interval` only defines int4 named
+    ///    parameters, so the un-cast int8 bind made every call fail with
+    ///    "function make_interval(hours => bigint) does not exist".
+    /// 2. Physical bytes follow [`BLOB_PROTECTED_BY_REFS_SQL`]'s ownership
+    ///    model: a digest shared by two `filesystem` repos is TWO real
+    ///    files (counted per `storage_path`), while a digest shared by two
+    ///    repos on a shared backend is ONE object.
+    /// 3. The age filter is genuinely exercised: backdating a blob past the
+    ///    grace window must move the `aged_*` figures by that blob. A
+    ///    vacuous filter (always true or always false) yields a zero delta
+    ///    either way and fails.
+    ///
+    /// Global totals are asserted as before/after DELTAS with `>=`:
+    /// `oci_blobs` is cluster-wide and other DB-backed suites seed it
+    /// concurrently (their inserts only inflate the deltas). Per-repository
+    /// rows are keyed by our own repo ids and asserted exactly.
+    #[tokio::test]
+    async fn test_oci_blob_footprint_report_executes_dedups_and_ages() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        // The backdated orphan blob below is old enough for a concurrent
+        // blob-GC mark/sweep test to reap mid-assertion; serialize with
+        // that cluster the same way the run_blob_gc tests do.
+        let _gc_guard = tdh::blob_gc_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let svc = StorageGcService::new(pool.clone(), registry);
+
+        // On main this call errors with `function make_interval(hours =>
+        // bigint) does not exist` before returning any row.
+        let r0 = svc
+            .oci_blob_footprint_report(24)
+            .await
+            .expect("baseline footprint report must execute (#2626)");
+        assert_eq!(r0.grace_hours, 24);
+
+        // Fixture: a digest shared by two filesystem repos (distinct
+        // storage_path => two physical files), a digest unique to repo_a,
+        // and a digest shared by two repos on a shared backend ('s3': one
+        // physical object regardless of path).
+        let shared_fs = format!("sha256:{}", Uuid::new_v4().simple());
+        let only_a = format!("sha256:{}", Uuid::new_v4().simple());
+        let shared_cloud = format!("sha256:{}", Uuid::new_v4().simple());
+        let repo_a =
+            seed_footprint_repo(&pool, "filesystem", &[(&shared_fs, 1_000), (&only_a, 300)]).await;
+        let repo_b = seed_footprint_repo(&pool, "filesystem", &[(&shared_fs, 1_000)]).await;
+        let repo_c = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
+        let repo_d = seed_footprint_repo(&pool, "s3", &[(&shared_cloud, 700)]).await;
+
+        let r1 = svc
+            .oci_blob_footprint_report(24)
+            .await
+            .expect("footprint report must execute after seeding");
+
+        assert!(r1.total_blob_rows - r0.total_blob_rows >= 5);
+        assert!(r1.distinct_digests - r0.distinct_digests >= 3);
+        let logical_delta = r1.logical_bytes - r0.logical_bytes;
+        let physical_delta = r1.physical_bytes - r0.physical_bytes;
+        assert!(
+            logical_delta >= 3_700,
+            "1000+300+1000 fs + 700+700 cloud rows seeded, got {logical_delta}"
+        );
+        // Filesystem copies count per storage_path (2000 + 300) and the
+        // cloud digest counts once (700). Global per-digest dedup would
+        // report only 2000 here and MUST fail this.
+        assert!(
+            physical_delta >= 3_000,
+            "fs digest per path + cloud digest once, got {physical_delta}"
+        );
+        // The cloud pair is the only sharing we introduced whose copies
+        // dedup away: logical exceeds physical by that one 700-byte copy.
+        // Per-path-everywhere counting would make our contribution to this
+        // difference 0 and MUST fail this.
+        assert!(
+            logical_delta - physical_delta >= 700,
+            "exactly one cloud copy dedups away, got {}",
+            logical_delta - physical_delta
+        );
+        assert!(r1.logical_bytes >= r1.physical_bytes);
+        assert!(r1.aged_physical_bytes <= r1.physical_bytes);
+
+        // Backdate the unique digest past the 24h grace window: the aged
+        // figures must move by at least that blob (all our other rows are
+        // seconds old). A filter that ignores `first_seen` in either
+        // direction produces a ~0 delta here.
+        sqlx::query(
+            "UPDATE oci_blobs SET created_at = NOW() - INTERVAL '48 hours' \
+             WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_a)
+        .bind(&only_a)
+        .execute(&pool)
+        .await
+        .expect("backdate blob");
+
+        let r2 = svc
+            .oci_blob_footprint_report(24)
+            .await
+            .expect("footprint report must execute after backdating");
+        assert!(
+            r2.aged_physical_bytes - r1.aged_physical_bytes >= 300,
+            "backdated 300-byte blob crossed the grace window: {} -> {}",
+            r1.aged_physical_bytes,
+            r2.aged_physical_bytes
+        );
+        assert!(r2.aged_distinct_digests - r1.aged_distinct_digests >= 1);
+        assert!(r2.aged_physical_bytes <= r2.physical_bytes);
+
+        // Per-repo rows are isolated to our repos and exact.
+        let by_repo: std::collections::HashMap<Uuid, (i64, i64)> = r2
+            .per_repository
+            .iter()
+            .map(|r| (r.repository_id, (r.blob_rows, r.logical_bytes)))
+            .collect();
+        assert_eq!(by_repo.get(&repo_a), Some(&(2, 1_300)));
+        assert_eq!(by_repo.get(&repo_b), Some(&(1, 1_000)));
+        assert_eq!(by_repo.get(&repo_c), Some(&(1, 700)));
+        assert_eq!(by_repo.get(&repo_d), Some(&(1, 700)));
+
+        // Cleanup (repositories cascade-deletes oci_blobs).
+        for repo in [repo_a, repo_b, repo_c, repo_d] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
     }
 }
