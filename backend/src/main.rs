@@ -708,10 +708,53 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::info!("Proxy service initialized for remote repositories");
         }
         Err(e) => {
-            tracing::warn!(
-                "Failed to initialize proxy service, remote repositories disabled: {}",
-                e
-            );
+            if artifact_keeper_backend::services::storage_service::backend_supports_proxy_cache(
+                &config.storage_backend,
+            ) {
+                // A backend that *can* back the proxy facade failed for a
+                // transient/optional reason (e.g. missing S3 credentials on a
+                // hosted-only deployment). Preserve the historical graceful
+                // degrade: remote repositories are simply disabled.
+                tracing::warn!(
+                    "Failed to initialize proxy service, remote repositories disabled: {}",
+                    e
+                );
+            } else {
+                // Structural gap (#2670/#1555): this backend has no proxy-cache
+                // StorageService arm (Azure). Booting green here silently
+                // black-holes every remote/proxy repository — the format
+                // handlers skip the upstream fetch when the proxy service is
+                // absent, so requests just fail to find packages with no error.
+                // Fail closed if any remote repository is already configured;
+                // otherwise log loudly so the gap is visible rather than silent.
+                let remote_repo_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM repositories \
+                     WHERE repo_type = 'remote'::repository_type",
+                )
+                .fetch_one(&db_pool)
+                .await?;
+
+                if remote_repo_count > 0 {
+                    return Err(artifact_keeper_backend::error::AppError::Config(format!(
+                        "STORAGE_BACKEND={} cannot serve remote/proxy repositories \
+                         (proxy StorageService unavailable: {}), but {} remote \
+                         repository(ies) are configured. Refusing to start rather than \
+                         boot healthy and silently black-hole their upstream traffic. \
+                         See #1555 for Azure proxy-cache support.",
+                        config.storage_backend, e, remote_repo_count
+                    )));
+                }
+
+                tracing::error!(
+                    backend = %config.storage_backend,
+                    error = %e,
+                    "Remote/proxy repositories are NOT supported on this storage \
+                     backend: the proxy StorageService has no arm for it (#1555). No \
+                     remote repositories are configured yet, so startup continues, \
+                     but any remote repository created later will silently fail to \
+                     proxy upstream content until #1555 is resolved."
+                );
+            }
         }
     }
 
