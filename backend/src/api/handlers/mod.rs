@@ -202,6 +202,7 @@ pub fn escape_path_prefix(components: &[&str]) -> String {
 }
 
 pub mod error_helpers;
+pub mod metadata_epoch;
 
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
