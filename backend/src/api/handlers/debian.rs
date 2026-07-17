@@ -868,14 +868,25 @@ fn take_first_line(s: &str) -> String {
 /// reader of a given repository state, including separate backend replicas.
 ///
 /// Counting deleted rows is deliberate: it keeps the stamp monotonic. Filtering
-/// them out would move `Date:` *backward* when the newest artifact is removed,
-/// which apt treats as a rollback attack. It does not follow that every content
+/// them out would move `Date:` *backward* when the newest artifact is removed —
+/// and apt clients holding a newer cached `Date:` do not reject a backward
+/// step, they silently keep the cached metadata and `apt-get update` exits 0
+/// with no diagnostics (see `release_date_floor` for the measured mechanism),
+/// so the repo would freeze for existing clients with nothing alerting anyone.
+/// It does not follow that every content
 /// change moves the stamp forward — only writers that stamp `updated_at` do.
 /// `ArtifactService::delete_artifact` does; the retention/lifecycle sweeps in
 /// `lifecycle_service` and the Conan overwrite-supersede path do not, so those
 /// deletions change the index without advancing `Date:`. That is a fidelity gap
 /// in what `Date:` reports, not a signature hazard: both renders of a given
 /// state still agree, which is the invariant this function exists to hold.
+///
+/// The state stamp is floored at [`release_date_floor`] (the binary's build
+/// timestamp). Without the floor, deploying the state-derived `Date:` would
+/// step it *backward* exactly once on every pre-existing repo — from the last
+/// `Utc::now()` a pre-fix build served to the last repo mutation — and every
+/// apt client that had already cached the newer value would silently pin to
+/// its pre-deploy metadata (see [`release_date_floor`]).
 ///
 /// Errors propagate. A failed read here must fail the request, not fall back to
 /// a default: `Release` and `Release.gpg` are separate requests, so a transient
@@ -906,13 +917,54 @@ async fn release_publish_timestamp(
     // this request, so a NULL here means the repository was deleted mid-render.
     // Fail rather than stamp a placeholder: a placeholder would differ from the
     // sibling request that still saw the repo.
-    stamp.and_then(|(t,)| t).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "Repository no longer exists".to_string(),
-        )
-            .into_response()
-    })
+    stamp
+        .and_then(|(t,)| t)
+        .map(|t| t.max(release_date_floor()))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Repository no longer exists".to_string(),
+            )
+                .into_response()
+        })
+}
+
+/// Monotonic floor for the `Release` `Date:` field: the moment this binary was
+/// built (`RELEASE_DATE_FLOOR_EPOCH`, baked by `build.rs`; honors
+/// `SOURCE_DATE_EPOCH` so reproducible builds stay reproducible).
+///
+/// Why a floor exists: [`release_publish_timestamp`] replaced a `Utc::now()`
+/// stamp with a state-derived one, so at deploy every pre-existing repo steps
+/// `Date:` backward exactly once — from "the last time a client fetched
+/// `Release`" to "the last time anything changed", potentially months on a
+/// quiescent repo. apt does not reject a backward `Date:` and does not warn:
+/// `pkgAcqMetaBase::VerifyVendor` (apt-pkg/acquire-item.cc; verified identical
+/// in apt 2.2.4, 2.6.1 and 2.8.3, detached `Release`+`Release.gpg` and
+/// `InRelease` alike) converts it into a fake If-Modified-Since hit, discards
+/// the downloaded metadata, keeps the client's cached set, and `apt-get
+/// update` exits 0 with zero diagnostics. No configuration option controls
+/// that path (`Acquire::Check-Date=false` does not unlock it — that option
+/// governs the separate *future*-Date check). Every existing client would
+/// therefore silently freeze on pre-deploy metadata until `Date:` climbs past
+/// its cached value — indefinitely on a quiescent repo. Flooring the stamp at
+/// the build timestamp keeps the first post-deploy render at least as new as
+/// any wall-clock `Date:` the previous build served before this build existed.
+///
+/// Why the *build* timestamp specifically: the floor must be (a) at least the
+/// last `Utc::now()` a pre-fix build served, (b) identical across replicas —
+/// every replica runs the same image, so a compile-time constant is — and
+/// (c) stable across process restarts. A process-start time fails (b) and (c):
+/// replicas start at different moments, so the same repository state would
+/// render different bytes on different replicas and the detached-signature
+/// invariant this file exists to hold would break again.
+fn release_date_floor() -> chrono::DateTime<chrono::Utc> {
+    // Compile-time constant; build.rs validates it parses, but degrade to
+    // "no floor" (epoch 0) rather than panic inside a request handler.
+    env!("RELEASE_DATE_FLOOR_EPOCH")
+        .parse::<i64>()
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 
 /// Render the `Date:` field value. Split out so the exact wire format is
@@ -5458,5 +5510,79 @@ mod apt_release_metadata_db_tests {
              to a default stamp would let Release and Release.gpg disagree and \
              produce a signature over bytes never served"
         );
+    }
+
+    /// Deploy-time monotonic floor: repository state older than the binary's
+    /// build timestamp must render `Date:` == the floor, never the older
+    /// state stamp.
+    ///
+    /// Why: swapping `Utc::now()` for a state-derived stamp steps `Date:`
+    /// backward once at deploy on every pre-existing repo. apt does not
+    /// reject a backward `Date:` — it silently fakes an IMS hit
+    /// (`pkgAcqMetaBase::VerifyVendor`, measured identical on apt
+    /// 2.2.4/2.6.1/2.8.3, no option controls it), keeps its cached
+    /// pre-deploy metadata, and `apt-get update` exits 0. Without the floor
+    /// every existing client freezes on stale metadata — indefinitely on a
+    /// quiescent repo — with nothing alerting anyone.
+    #[tokio::test]
+    async fn release_publish_timestamp_is_floored_at_the_build_timestamp() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        // Deploy-shape state: a quiescent repo whose newest mutation is far
+        // older than this binary. No artifacts, so the repo's own created_at
+        // is the raw state stamp.
+        sqlx::query("UPDATE repositories SET created_at = '2001-02-03T04:05:06Z' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("backdate repository");
+
+        let floor = release_date_floor();
+        assert!(
+            floor
+                > chrono::DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+                    .expect("parse fixture")
+                    .with_timezone(&chrono::Utc),
+            "build-time floor must postdate the backdated fixture"
+        );
+
+        let stamp = release_publish_timestamp(&pool, repo_id)
+            .await
+            .map_err(|_| "release_publish_timestamp failed")
+            .expect("publish timestamp");
+        assert_eq!(
+            stamp, floor,
+            "state older than the build-time floor must be floored: apt clients \
+             that cached a pre-deploy wall-clock Date silently pin to stale \
+             metadata (fake IMS hit, exit 0, no diagnostics) whenever Date: \
+             steps backward"
+        );
+
+        // The floored render must stay deterministic: the floor is a
+        // compile-time constant, not a clock read, so two renders across a
+        // second boundary are still byte-identical and stamp the floor.
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let served = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let signed = generate_release_content(&state, repo_id, "stable")
+            .await
+            .map_err(|_| "generate_release_content failed")
+            .expect("render Release");
+        assert_eq!(
+            served, signed,
+            "floored renders must be byte-identical across a second boundary"
+        );
+        assert!(
+            served.contains(&format!("Date: {}\n", format_release_date(floor))),
+            "rendered Date: must be the floor, got:\n{served}"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
     }
 }
