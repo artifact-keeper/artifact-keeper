@@ -848,9 +848,10 @@ async fn download_provider(
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
     let platform = build_platform(&os, &arch);
-    // LIKE-escaped form for the query only: `_` is a LIKE wildcard, so the
-    // escaped value carries backslashes and must never reach a response body.
-    let platform_path = super::escape_like_literal(&platform);
+    // Resolve the package by the exact `artifacts.path` it is stored under —
+    // the same coordinates the `binary` route this document advertises resolves
+    // by, so a document can only be produced for a package that route can serve.
+    let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
 
     let artifact = sqlx::query!(
         r#"
@@ -859,14 +860,14 @@ async fn download_provider(
         WHERE repository_id = $1
           AND name = $2
           AND version = $3
-          AND path LIKE '%' || $4 || '%' ESCAPE '\'
+          AND path = $4
           AND is_deleted = false
         LIMIT 1
         "#,
         repo.id,
         provider_name,
         version,
-        platform_path,
+        artifact_path,
     )
     .fetch_optional(&state.db)
     .await
@@ -1400,18 +1401,29 @@ enum MirrorGuard {
 ///
 /// A hosted repo mirrors its own uploaded providers; only remote repos need an
 /// upstream and a proxy service.
+///
+/// Serving is opt-in per known repository type: an unrecognized `repo_type` is
+/// [`MirrorGuard::Unsupported`], never `Local`. `Local` releases this repo's
+/// own stored packages, so an `else` arm that caught everything would serve
+/// them for the empty string `resolve_repo_by_key` yields when the column read
+/// fails, and for any `RepositoryType` variant added after this match.
 fn classify_mirror_repo(repo_type: &str, has_upstream: bool, has_proxy: bool) -> MirrorGuard {
-    if repo_type == RepositoryType::Remote {
-        if has_upstream && has_proxy {
-            MirrorGuard::Proxy
-        } else {
-            MirrorGuard::NotProxyable
+    let Some(repo_type) = RepositoryType::from_db_str(repo_type) else {
+        return MirrorGuard::Unsupported;
+    };
+
+    match repo_type {
+        RepositoryType::Remote => {
+            if has_upstream && has_proxy {
+                MirrorGuard::Proxy
+            } else {
+                MirrorGuard::NotProxyable
+            }
         }
-    } else if repo_type == RepositoryType::Virtual {
-        MirrorGuard::Unsupported
-    } else {
-        // Local / Staging.
-        MirrorGuard::Local
+        // Local / Staging: serve the repo's own uploaded providers.
+        t if t.is_hosted() => MirrorGuard::Local,
+        // Virtual: no single package source to mirror.
+        _ => MirrorGuard::Unsupported,
     }
 }
 
@@ -1419,7 +1431,7 @@ fn classify_mirror_repo(repo_type: &str, has_upstream: bool, has_proxy: bool) ->
 fn mirror_guard_error(guard: MirrorGuard) -> Response {
     let msg = match guard {
         MirrorGuard::Unsupported => {
-            "Provider network mirror is not available on virtual Terraform repositories"
+            "Provider network mirror is not available on this Terraform repository type"
         }
         MirrorGuard::NotProxyable => "Remote repository is not configured for proxying",
         // Unreachable; callers only map the non-servable variants.
@@ -2964,6 +2976,36 @@ mod tests {
         );
     }
 
+    /// An unrecognized `repo_type` must not be served as if it were hosted.
+    ///
+    /// `MirrorGuard::Local` releases the repo's own stored packages, so the
+    /// classifier opts each known type in rather than defaulting to it:
+    /// `resolve_repo_by_key` yields `""` when the `repo_type` read fails, and a
+    /// `RepositoryType` variant added later is unknown to this match. Both must
+    /// 404 rather than serve.
+    #[test]
+    fn test_classify_mirror_repo_unknown_is_unsupported() {
+        // The empty string a failed column read produces.
+        assert_eq!(
+            classify_mirror_repo("", false, false),
+            MirrorGuard::Unsupported
+        );
+        assert_eq!(
+            classify_mirror_repo("", true, true),
+            MirrorGuard::Unsupported
+        );
+        // A repository type this match predates.
+        assert_eq!(
+            classify_mirror_repo("federated", false, false),
+            MirrorGuard::Unsupported
+        );
+        // The DB enum is lowercase; anything else is not a known type.
+        assert_eq!(
+            classify_mirror_repo("LOCAL", false, false),
+            MirrorGuard::Unsupported
+        );
+    }
+
     #[test]
     fn test_mirror_guard_error_status() {
         use axum::http::StatusCode;
@@ -3486,8 +3528,64 @@ mod tests {
         );
         assert_eq!(
             filename, "terraform-provider-marker_1.0.0_linux_arm64.zip",
-            "advertised filename must not carry LIKE-escaping"
+            "advertised filename must be the archive name, with no query-escaping \
+             artifacts in it"
         );
+    }
+
+    /// A platform the repo holds no package for must 404 at `download` — the
+    /// negative half of [`test_advertised_provider_download_url_resolves`].
+    ///
+    /// The `download` document exists only to advertise a `download_url`, and
+    /// the `binary` route it points at resolves by exact `artifacts.path`. A
+    /// document for a platform `binary` cannot serve is therefore a dead
+    /// advertisement by construction, so `download` must not emit one.
+    ///
+    /// Regression guard: `download` resolved by an unanchored
+    /// `path LIKE '%' || os_arch || '%'` while `binary` resolved by exact path,
+    /// so the two endpoints answered to different keys. Any *substring* of a
+    /// stored platform returned a 200 document quoting the stored package's
+    /// `shasum` under the requested platform's name, whose advertised
+    /// `download_url` then 404'd. That was reachable with two real platforms,
+    /// not only with truncations: `linux_arm` is a prefix of `linux_arm64`.
+    #[tokio::test]
+    async fn test_unadvertised_platform_404s_at_download() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK\x03\x04 terraform provider archive bytes";
+        let published = publish_provider(&fx, zip).await;
+
+        // Only `linux/arm64` is published. Both of these are substrings of the
+        // stored `linux_arm64`: a truncation of each segment, and the real
+        // platform `linux/arm`.
+        let mut probes = Vec::new();
+        for (os, arch) in [("inux", "arm6"), ("linux", "arm")] {
+            let (status, body) = tdh::send(
+                fx.router_anon(mounted_router()),
+                tdh::get(format!(
+                    "{}/{}/v1/providers/dtf/marker/1.0.0/download/{}/{}",
+                    MOUNT_PREFIX, fx.repo_key, os, arch
+                )),
+            )
+            .await;
+            probes.push((os, arch, status, body));
+        }
+
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED, "publish");
+        for (os, arch, status, body) in probes {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::NOT_FOUND,
+                "{os}/{arch} was never published, so `download` must 404 instead \
+                 of advertising a download_url that 404s (body: {})",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 
     /// The `X-Terraform-Get` location the module download advertises must be a
