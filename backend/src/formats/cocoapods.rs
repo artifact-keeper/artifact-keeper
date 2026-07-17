@@ -48,6 +48,30 @@ use crate::models::repository::RepositoryFormat;
 /// manifest are all derived from it.
 pub const CDN_PREFIX_LENGTHS: [usize; 3] = [1, 1, 1];
 
+/// Total number of hex characters of the pod-name MD5 consumed by the shard
+/// fan-out, i.e. the concatenation of every `CDN_PREFIX_LENGTHS` slice.
+///
+/// Because the fragments are consecutive slices off the front of the hash, this
+/// is also the length of the MD5 prefix that identifies a shard, which is what
+/// lets the index query filter shards in SQL (`left(md5(name), N)`).
+pub const CDN_SHARD_HEX_LEN: usize = {
+    let mut total = 0;
+    let mut i = 0;
+    while i < CDN_PREFIX_LENGTHS.len() {
+        total += CDN_PREFIX_LENGTHS[i];
+        i += 1;
+    }
+    total
+};
+
+// An MD5 is 32 hex characters; the fan-out can only slice what the hash has.
+// `cdn_shard_fragment` splits the hash by these lengths, so a longer fan-out
+// would panic at runtime. Fail the build instead.
+const _: () = assert!(
+    CDN_SHARD_HEX_LEN <= 32,
+    "CDN_PREFIX_LENGTHS cannot consume more than the 32 hex characters of an MD5"
+);
+
 /// The minimum CocoaPods client version advertised in `CocoaPods-version.yml`.
 ///
 /// The client refuses a source whose `min` is above its own version
@@ -83,6 +107,128 @@ impl Default for CdnMetadata {
             prefix_lengths: CDN_PREFIX_LENGTHS.to_vec(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pod name / version grammar
+// ---------------------------------------------------------------------------
+//
+// The shard index is a line-oriented format: one pod per line, fields separated
+// by `/`:
+//
+//     <pod>/<v1>/<v2>/...\n
+//
+// So `/` and the line terminators are structural. A name or version carrying
+// either would let a publisher close its own record and open a synthetic one for
+// a pod it does not own, provided the crafted name hashes into the target's
+// shard -- which is only a 4096-way search. The index is rendered from
+// `artifacts.name`/`artifacts.version` (`VARCHAR(512)`, no CHECK), so the
+// grammar has to be enforced in the application, at push.
+//
+// The rule below is `cocoapods-core`'s own, from
+// `Specification::Linter#_validate_name` (the check that `pod spec lint` and
+// trunk apply on publish):
+//
+//     name =~ %r{/}   -> "The name of a spec should not contain a slash."
+//     name =~ /\s/    -> "The name of a spec should not contain whitespace."
+//     name[0, 1] == '.' -> "The name of a spec should not begin with a period."
+//
+// Using the upstream rule rather than an invented allowlist matters: real pod
+// names are not `[A-Za-z0-9_.+-]`. Checked against every pod published on the
+// trunk CDN (102,688 names read from all 4,096 `all_pods_versions_*` indexes),
+// names legitimately contain `!`, `&`, `(`, `)`, `@`, CJK characters and emoji
+// (`ChatK!t`, `AFDateHelper(icanzilb)`, `cocoapods制作`, `Floater💩`). A
+// character allowlist would reject 94 of them. The upstream rule rejects exactly
+// one (`ID.me WebVerify`, a legacy git-era entry that upstream's own linter also
+// rejects today), and every one of the 79,393 published versions passes.
+//
+// The no-leading-period rule also keeps a name from being `.` or `..`, which
+// would otherwise traverse a level in the `cocoapods/<name>/<version>/...`
+// storage key.
+
+/// Longest accepted pod name or version.
+///
+/// `artifacts.name`/`artifacts.version` are `VARCHAR(512)`, so this only refuses
+/// what the column could not store anyway. The longest name on the trunk CDN is
+/// 56 characters and the longest version 67, so this bounds abuse without
+/// coming near real usage.
+pub const MAX_POD_NAME_LEN: usize = 512;
+
+/// Reject a character that cannot appear in a pod name or version.
+///
+/// `/` and the line terminators are structural in the shard index;
+/// `\` is refused so a name can never introduce a path separator on any
+/// platform; the remaining control characters and whitespace are refused per
+/// `Linter#_validate_name`. Ruby's `/\s/` is `[ \t\r\n\f\v]`; `char::is_whitespace`
+/// is the Unicode superset of it, which costs nothing (no published pod name
+/// contains any other Unicode space).
+fn is_forbidden_pod_char(c: char) -> bool {
+    c == '/' || c == '\\' || c.is_whitespace() || c.is_control()
+}
+
+/// Validate a pod name against the CocoaPods naming rules.
+///
+/// See the module notes above: this is `cocoapods-core`'s
+/// `Specification::Linter#_validate_name`, plus a length bound and an explicit
+/// refusal of `\` and control characters.
+pub fn validate_pod_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("pod name must not be empty".to_string());
+    }
+    if name.len() > MAX_POD_NAME_LEN {
+        return Err(format!(
+            "pod name exceeds the maximum length of {} characters (got {})",
+            MAX_POD_NAME_LEN,
+            name.len()
+        ));
+    }
+    if name.starts_with('.') {
+        return Err("pod name must not begin with a period".to_string());
+    }
+    if let Some(c) = name.chars().find(|c| is_forbidden_pod_char(*c)) {
+        return Err(format!(
+            "pod name must not contain {:?}: a slash, backslash, whitespace or \
+             control character would corrupt the CDN shard index",
+            c
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a pod version against the CocoaPods naming rules.
+///
+/// A version occupies the same line-oriented index record as the name, so it
+/// carries the same structural constraints. Every version published on the trunk
+/// CDN satisfies this.
+pub fn validate_pod_version(version: &str) -> std::result::Result<(), String> {
+    if version.is_empty() {
+        return Err("pod version must not be empty".to_string());
+    }
+    if version.len() > MAX_POD_NAME_LEN {
+        return Err(format!(
+            "pod version exceeds the maximum length of {} characters (got {})",
+            MAX_POD_NAME_LEN,
+            version.len()
+        ));
+    }
+    if let Some(c) = version.chars().find(|c| is_forbidden_pod_char(*c)) {
+        return Err(format!(
+            "pod version must not contain {:?}: a slash, backslash, whitespace or \
+             control character would corrupt the CDN shard index",
+            c
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a stored `(name, version)` pair is safe to render into the shard
+/// index.
+///
+/// `validate_pod_name`/`validate_pod_version` gate new pushes, but rows that
+/// predate the gate may already hold a structurally unsafe name, so the renderer
+/// re-checks rather than trusting the table.
+pub fn is_indexable_pod(name: &str, version: &str) -> bool {
+    validate_pod_name(name).is_ok() && validate_pod_version(version).is_ok()
 }
 
 /// Compute the CDN shard fragment for a pod name.
@@ -215,6 +361,7 @@ impl CocoaPodsHandler {
                         name: name.to_string(),
                         version: version.to_string(),
                         artifact_type: CocoaPodsArtifactType::Podspec,
+                        layout: CocoaPodsSpecLayout::Cdn,
                     });
                 }
             }
@@ -230,6 +377,7 @@ impl CocoaPodsHandler {
                         name,
                         version,
                         artifact_type: CocoaPodsArtifactType::Podspec,
+                        layout: CocoaPodsSpecLayout::Flat,
                     });
                 }
             }
@@ -249,6 +397,7 @@ impl CocoaPodsHandler {
                             name,
                             version,
                             artifact_type: CocoaPodsArtifactType::Pod,
+                            layout: CocoaPodsSpecLayout::Flat,
                         });
                     }
                 }
@@ -276,6 +425,23 @@ pub struct CocoaPodsPathInfo {
     pub version: String,
     /// Type of artifact (Podspec or Pod)
     pub artifact_type: CocoaPodsArtifactType,
+    /// Which layout the path was written in.
+    pub layout: CocoaPodsSpecLayout,
+}
+
+/// Which addressing scheme a parsed path used.
+///
+/// The CDN MD5-sharded tree and the pre-existing flat tree are both accepted,
+/// but they are not equivalent: the CDN tree is part of the client-facing CDN
+/// contract (hosted repositories only, and case-sensitive, because the shard is
+/// keyed by the exact bytes of the name), whereas the flat tree is an Artifact
+/// Keeper convenience that predates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CocoaPodsSpecLayout {
+    /// `Specs/<a>/<b>/<c>/<name>/<version>/<name>.podspec.json`
+    Cdn,
+    /// `Specs/<name>/<version>/<name>.podspec.json`, or a `pods/` archive path.
+    Flat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,15 +855,38 @@ mod tests {
         assert_eq!(meta.prefix_lengths, vec![1, 1, 1]);
     }
 
+    /// The manifest the trunk CDN publishes, captured verbatim from
+    /// `https://cdn.cocoapods.org/CocoaPods-version.yml` (2026-07-17).
+    ///
+    /// Pinned as a fixture rather than re-serialised here: asserting that
+    /// `serde_yaml` can read back what `serde_yaml` just wrote says nothing about
+    /// whether the document matches the one a real client is known to accept.
+    const TRUNK_VERSION_YML: &str =
+        include_str!("../../test_fixtures/cocoapods_trunk_CocoaPods-version.yml");
+
     #[test]
-    fn test_cdn_metadata_yaml_shape_matches_trunk() {
-        // The client parses this with YAML and reads `min` + `prefix_lengths`
-        // (Source::Metadata#initialize). Keep the emitted document in the shape
-        // the trunk CDN publishes.
-        let yaml = serde_yaml::to_string(&CdnMetadata::default()).unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed["min"].as_str(), Some("1.0.0"));
-        let lengths: Vec<usize> = parsed["prefix_lengths"]
+    fn test_cdn_metadata_matches_the_trunk_manifest_fixture() {
+        // What we serve.
+        let served: serde_yaml::Value =
+            serde_yaml::from_str(&serde_yaml::to_string(&CdnMetadata::default()).unwrap()).unwrap();
+        // What the trunk CDN serves.
+        let trunk: serde_yaml::Value = serde_yaml::from_str(TRUNK_VERSION_YML).unwrap();
+
+        // The two fields the client actually reads (`Source::Metadata#initialize`)
+        // must agree with trunk. `last` is trunk's newest-client marker and is
+        // deliberately not published: it is advisory, and ours is not a mirror of
+        // trunk's release train.
+        assert_eq!(
+            served["min"], trunk["min"],
+            "advertised minimum client version must match the trunk CDN",
+        );
+        assert_eq!(
+            served["prefix_lengths"], trunk["prefix_lengths"],
+            "advertised shard fan-out must match the trunk CDN",
+        );
+
+        // And the fan-out we advertise must be the one we shard by.
+        let lengths: Vec<usize> = trunk["prefix_lengths"]
             .as_sequence()
             .unwrap()
             .iter()
@@ -707,13 +896,143 @@ mod tests {
     }
 
     #[test]
-    fn test_cdn_prefix_lengths_are_consistent_with_md5_width() {
-        // Guard against a prefix_lengths change that would over-run the digest.
-        let total: usize = CDN_PREFIX_LENGTHS.iter().sum();
+    fn test_cdn_metadata_parses_as_the_client_reads_it() {
+        // A real client deserialises the document into min + prefix_lengths;
+        // unknown keys (trunk's `last`) must not make it unreadable.
+        let from_trunk: CdnMetadata = serde_yaml::from_str(TRUNK_VERSION_YML).unwrap();
+        assert_eq!(from_trunk, CdnMetadata::default());
+    }
+
+    // `CDN_SHARD_HEX_LEN <= 32` is asserted at compile time (see the `const _`
+    // next to CDN_PREFIX_LENGTHS), so an over-wide fan-out fails the build rather
+    // than panicking in `cdn_shard_fragment` at runtime.
+    #[test]
+    fn test_cdn_shard_hex_len_is_the_sum_of_the_prefix_lengths() {
+        assert_eq!(CDN_SHARD_HEX_LEN, CDN_PREFIX_LENGTHS.iter().sum::<usize>());
+        // The shard fragments concatenate to exactly the MD5 prefix of that
+        // width. The index query depends on this to filter shards in SQL with
+        // `left(md5(name), CDN_SHARD_HEX_LEN)`.
+        let shard = cdn_shard_fragment("Alamofire").concat();
+        assert_eq!(shard.len(), CDN_SHARD_HEX_LEN);
+        assert_eq!(shard, "da2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pod name / version grammar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_index_injection_payload_is_rejected() {
+        // A name that closes its own index record and opens a synthetic one for
+        // another pod. Brute-forcing such a name into a chosen pod's shard is
+        // only a 4096-way search, so the shard offers no protection: this payload
+        // hashes into `d/a/2`, which is Alamofire's own shard.
+        let payload = "evilpod3722\nAlamofire/99.99.99";
+        assert_eq!(cdn_shard_fragment(payload), cdn_shard_fragment("Alamofire"));
         assert!(
-            total <= 32,
-            "MD5 hex is 32 chars; cannot slice {} of it",
-            total
+            validate_pod_name(payload).is_err(),
+            "a name carrying the index record separators must be rejected",
         );
+        assert!(!is_indexable_pod(payload, "1.0.0"));
+    }
+
+    #[test]
+    fn test_pod_name_rejects_structural_and_control_characters() {
+        for bad in [
+            "a/b",        // record separator
+            "a\nb",       // line separator
+            "a\rb",       // line separator
+            "a\r\nb",     //
+            "a b",        // whitespace (upstream linter)
+            "a\tb",       // whitespace
+            "a\u{0000}b", // control
+            "a\\b",       // path separator
+            ".hidden",    // leading period (upstream linter)
+            ".",          // would traverse in the storage key
+            "..",         // would traverse in the storage key
+            "",           // empty
+        ] {
+            assert!(
+                validate_pod_name(bad).is_err(),
+                "name {:?} must be rejected",
+                bad,
+            );
+        }
+        assert!(validate_pod_name(&"a".repeat(MAX_POD_NAME_LEN + 1)).is_err());
+        assert!(validate_pod_name(&"a".repeat(MAX_POD_NAME_LEN)).is_ok());
+    }
+
+    #[test]
+    fn test_pod_version_rejects_structural_and_control_characters() {
+        for bad in [
+            "1.0/2.0",
+            "1.0\n2.0",
+            "1.0\r2.0",
+            "1.0 2.0",
+            "1.0\u{0000}",
+            "",
+        ] {
+            assert!(
+                validate_pod_version(bad).is_err(),
+                "version {:?} must be rejected",
+                bad,
+            );
+        }
+        assert!(validate_pod_version(&"1".repeat(MAX_POD_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn test_real_pod_names_are_accepted() {
+        // Sampled from the published trunk index (all 4096 `all_pods_versions_*`
+        // files, 102,688 pods). Real names are not `[A-Za-z0-9_.+-]`: an
+        // allowlist of that shape rejects 94 published pods, so the grammar
+        // follows cocoapods-core's `Linter#_validate_name` instead. Every
+        // published name except `ID.me WebVerify` (a legacy entry that upstream's
+        // own linter rejects for the same reason we do) passes, as does every one
+        // of the 79,393 published versions.
+        for name in [
+            "Alamofire",
+            "SnapKit",
+            "Moya",
+            "AFNetworking",
+            "RxSwift",
+            "ChatK!t",                             // '!'
+            "eppz!swizzler",                       // '!'
+            "AFDateHelper(icanzilb)",              // parentheses
+            "AFKissXMLRequestOperation@aceontech", // '@'
+            "TKAlert&TKActionSheet",               // '&'
+            "AFNetworking+AutoRetry",              // '+'
+            "31jinfu_github",                      // '_'
+            "cocoapods制作",                       // CJK
+            "Floater💩",                           // emoji
+            "TestMe-SDᛕ",                          // non-latin script
+            "※ikemen",                             // leading non-ASCII symbol
+            "cordova-ios-sdk",
+            "libPhoneNumber-iOS",
+            "1PasswordExtension",
+        ] {
+            assert!(
+                validate_pod_name(name).is_ok(),
+                "published pod name {:?} must be accepted: {:?}",
+                name,
+                validate_pod_name(name),
+            );
+        }
+
+        for version in [
+            "1.0.0",
+            "5.0.0-beta.1",
+            "5.0.0.beta.1",
+            "5.0.0-RC16",
+            "4.4.0+build.16",
+            "7.4.11+1",
+            "2.0.3-SNAPSHOT-20250926131439",
+        ] {
+            assert!(
+                validate_pod_version(version).is_ok(),
+                "published version {:?} must be accepted",
+                version,
+            );
+        }
     }
 }

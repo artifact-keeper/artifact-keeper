@@ -1,0 +1,61 @@
+-- Migration: functional MD5-prefix index on artifacts for CocoaPods CDN shard
+-- index lookups (#2638 follow-up).
+--
+-- A CocoaPods client resolves a pod by reading the pre-rendered index for the
+-- shard the pod name hashes into: `all_pods_versions_<a>_<b>_<c>.txt`. Artifact
+-- Keeper renders those files on demand from the repository's artifacts, keyed on
+-- the leading hex characters of `md5(name)` -- the same fan-out
+-- `Source::Metadata#path_fragment` computes in cocoapods-core.
+--
+-- There are 4096 such files (a `[1, 1, 1]` fan-out over hex), each one selecting
+-- roughly 1/4096 of the repository, and on a public repository they are
+-- anonymously reachable. Without this index the shard predicate is a function of
+-- `name`, which is not sargable against `idx_artifacts_repo_name_version`:
+-- Postgres range-scans every row of the repository and discards the ~4095/4096
+-- that belong to other shards, so a sweep of the whole index costs 4096 full
+-- reads of the repository's artifacts. This functional index makes the shard
+-- predicate sargable, so each request touches only its own shard's rows.
+--
+-- The prefix length (3) is the sum of `CDN_PREFIX_LENGTHS` in
+-- `backend/src/formats/cocoapods.rs`, which is the single source of truth for the
+-- fan-out. The handler inlines the same literal so the query matches this index
+-- expression (a bound parameter would not), and a compile-time assertion there
+-- fails the build if the constant and the literal ever diverge.
+--
+-- `md5(text)` and `left(text, int)` are both IMMUTABLE, so the expression is
+-- indexable. Postgres hashes the UTF-8 bytes of `name`, which are the same bytes
+-- the Rust side hashes, so the index agrees with the rendered output for the
+-- non-ASCII pod names that exist in the wild.
+--
+-- The `WHERE is_deleted = false` partial predicate keeps the index small and
+-- matches the index query, which never serves tombstoned artifacts.
+--
+-- The index is not scoped to CocoaPods repositories: an index predicate has to be
+-- self-contained, and a repository's format lives in another table. It follows
+-- the same trade-off as `idx_artifacts_repo_lower_name` (migration 106), which is
+-- likewise maintained for every format to serve particular ones.
+--
+-- CREATE INDEX CONCURRENTLY is intentionally not used here: sqlx::migrate runs
+-- each migration file inside a transaction, and CONCURRENTLY is rejected inside a
+-- transaction block. The non-concurrent build takes ACCESS EXCLUSIVE on
+-- `artifacts` for the duration of the build, so new artifact uploads will block
+-- until it finishes. On installs with millions of artifact rows, plan the upgrade
+-- window accordingly.
+--
+-- Operators who cannot accept the lock window can skip this migration and create
+-- the index out of band against a quiescent table:
+--
+--   CREATE INDEX CONCURRENTLY idx_artifacts_repo_cocoapods_shard
+--     ON artifacts (repository_id, left(md5(name), 3))
+--     WHERE is_deleted = false;
+--
+-- Functionality continues to work without the index; the shard query falls back
+-- to scanning the repository's rows. The index is purely a query-plan
+-- accelerator.
+--
+-- Idempotent via IF NOT EXISTS so re-running on an already-migrated DB is a
+-- no-op.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_repo_cocoapods_shard
+  ON artifacts (repository_id, left(md5(name), 3))
+  WHERE is_deleted = false;
