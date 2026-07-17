@@ -29,6 +29,22 @@ pub struct SigningKey {
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
+impl SigningKey {
+    /// Whether this key can produce an OpenPGP chain — a detached signature
+    /// (`repomd.xml.asc`, `Release.gpg`) plus an importable public key that
+    /// `dnf`/`apt` will accept.
+    ///
+    /// Only `key_type = "gpg"` stores OpenPGP material. An `rsa` key — the
+    /// *default* type — stores an X.509 keypair, which cannot produce an
+    /// OpenPGP signature at all; `SigningService::load_openpgp_secret_key`
+    /// rejects it. Callers use this to refuse the operation up front, rather
+    /// than advertising a key the repository can never sign with (#2636,
+    /// #2651).
+    pub fn supports_openpgp(&self) -> bool {
+        self.key_type == "gpg"
+    }
+}
+
 /// Public view of a signing key (no private material).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SigningKeyPublic {

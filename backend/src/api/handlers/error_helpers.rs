@@ -71,6 +71,46 @@ pub fn require_signing_key(
     }
 }
 
+/// Require that a repository's active signing key can produce an OpenPGP
+/// chain, for the endpoints that can only serve OpenPGP (`repomd.xml.asc`,
+/// `repomd.xml.key`, `Release.gpg`, ...).
+///
+/// An `rsa` key (the *default* `key_type`) holds X.509 material and can never
+/// satisfy these endpoints, so this is **409 Conflict**, not 500: the request
+/// is fine and the server is healthy — the repository's signing *configuration*
+/// conflicts with what the endpoint must produce, and only an operator can
+/// resolve it. Nothing will change until they do (#2651 proposes rejecting the
+/// combination at config time, upstream of here).
+///
+/// The status matters operationally, because these endpoints are anonymous:
+/// every `dnf` poll of a misconfigured repo hits this path. Returning 500 +
+/// `ERROR!` would let any unauthenticated client drive unbounded error logs and
+/// 500-rate alerts — paging an on-call engineer for someone else's config
+/// mistake. A 500 must keep meaning "this server is broken"; callers log this
+/// at `WARN` instead.
+///
+/// A key that *claims* `key_type=gpg` but whose material will not parse is a
+/// different animal — that is a genuine server-side fault and stays a loud 500
+/// at the point of signing.
+///
+/// Pure, like `require_signing_key`, so the mapping is unit-testable.
+#[allow(clippy::result_large_err)]
+pub fn require_openpgp_capable_key(key: SigningKey) -> Result<SigningKey, Response> {
+    if key.supports_openpgp() {
+        return Ok(key);
+    }
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "This repository's active signing key '{}' has key_type='{}', which cannot \
+             produce an OpenPGP signature. Metadata signing requires a key with \
+             key_type='gpg'.",
+            key.name, key.key_type
+        ),
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

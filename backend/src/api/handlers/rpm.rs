@@ -27,9 +27,10 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::api::handlers::error_helpers::require_signing_key;
+use crate::api::handlers::error_helpers::{require_openpgp_capable_key, require_signing_key};
+use crate::api::handlers::metadata_epoch::metadata_epoch;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -228,8 +229,22 @@ struct RpmArtifact {
     checksum_sha256: String,
     storage_key: String,
     metadata: Option<serde_json::Value>,
+    /// Drives the repodata metadata epoch (`<revision>`/`<timestamp>`) so the
+    /// render stays a pure function of repository state (#2636).
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// List a repository's RPM artifacts in a **deterministic total order**.
+///
+/// The order is part of the repodata contract, not a display choice: it fixes
+/// the package order in `primary.xml`/`filelists.xml`, hence their checksums,
+/// hence the `repomd.xml` bytes that `repomd.xml.asc` signs. The previous
+/// `ORDER BY a.created_at DESC` was not a *total* order — artifacts sharing a
+/// `created_at` (a bulk upload commits many rows with the same `NOW()`) could
+/// come back in either order, so two renders of unchanged state could differ
+/// and the detached signature would not match the served document (#2636).
+/// `(name, version, path)` is the order Debian's package index already uses;
+/// `id` is unique, so appending it makes the order total.
 async fn list_rpm_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -237,11 +252,11 @@ async fn list_rpm_artifacts(
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, am.metadata as "metadata?"
+               a.storage_key, a.updated_at, am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1 AND a.is_deleted = false
-        ORDER BY a.created_at DESC
+        ORDER BY a.name, a.version, a.path, a.id
         "#,
         repo_id
     )
@@ -260,6 +275,7 @@ async fn list_rpm_artifacts(
             checksum_sha256: r.checksum_sha256,
             storage_key: r.storage_key,
             metadata: r.metadata,
+            updated_at: r.updated_at,
         })
         .collect())
 }
@@ -272,6 +288,13 @@ async fn list_rpm_artifacts(
 /// `packages="0"` and `dnf` treats the aggregate repo as empty even though
 /// the members hold packages (#1780). We resolve the member repo IDs via
 /// `fetch_virtual_members` and concatenate each member's artifact list.
+///
+/// The result is sorted into the same deterministic total order
+/// `list_rpm_artifacts` returns. Concatenating per-member lists inherits
+/// `fetch_virtual_members`' `ORDER BY vrm.priority`, which is not a total
+/// order — members sharing a priority can be visited in either order — so the
+/// merged list needed its own ordering for the render (and therefore the
+/// detached signature) to be reproducible (#2636).
 async fn collect_repodata_artifacts(
     db: &sqlx::PgPool,
     repo: &RepoInfo,
@@ -285,6 +308,9 @@ async fn collect_repodata_artifacts(
     for member in &members {
         artifacts.extend(list_rpm_artifacts(db, member.id).await?);
     }
+    artifacts.sort_by(|a, b| {
+        (&a.name, &a.version, &a.path, &a.id).cmp(&(&b.name, &b.version, &b.path, &b.id))
+    });
     Ok(artifacts)
 }
 
@@ -321,10 +347,15 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
     let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
     let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // #2636: the metadata epoch is derived from repository *state*, never from
+    // the clock. `repomd.xml` and `repomd.xml.asc` render this document
+    // independently, one request apart, and the client verifies the signature
+    // from the second render against the bytes of the first. A `now()` here
+    // makes those two renders disagree whenever the requests straddle a second
+    // boundary — a BAD signature on a repo nobody touched. See the
+    // `metadata_epoch` module docs; Debian's `Release`/`Release.gpg` pair has
+    // the same defect (#2652).
+    let timestamp = metadata_epoch(artifacts.iter().map(|a| a.updated_at)).timestamp();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -445,6 +476,19 @@ async fn repomd_xml_asc(
     // bytes, and hand-wrapped them in "BEGIN PGP SIGNATURE" markers: no packet
     // framing and no CRC24 armor checksum, so every real client rejected it.
     let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
+    // An X.509 (`key_type=rsa`) key can never sign OpenPGP, so refuse before
+    // attempting it: 409 + WARN, not 500 + ERROR. This route is anonymous, so
+    // every `dnf` poll of a misconfigured repo lands here; a 500 would let an
+    // unauthenticated client drive unbounded ERROR logs and 500-rate alerts for
+    // what is an operator config mistake, not a server fault.
+    let key = require_openpgp_capable_key(key).map_err(|resp| {
+        warn!(
+            repo_id = %repo.id,
+            "repomd.xml.asc requested but the repository's active signing key cannot \
+             produce an OpenPGP signature (requires key_type='gpg')",
+        );
+        resp
+    })?;
     let armored = signing_svc
         .sign_openpgp_detached_with_key(&key, repomd_content.as_bytes())
         .await
@@ -494,6 +538,20 @@ async fn repomd_xml_key(
     // gpg-key.asc serves. A lookup error is surfaced rather than swallowed, so
     // "cannot load the key" is never reported as "no key configured".
     let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
+    // For any other key type `public_key_pem` is an X.509 SPKI PEM: not
+    // importable by `rpm --import`, and useless to `dnf gpgkey=` even if it
+    // were served honestly as `application/x-pem-file`, because the matching
+    // `.asc` can never exist. Refusing here keeps the repo from advertising a
+    // key it cannot sign with, and means the `application/pgp-keys` below is
+    // always the truth rather than a claim about the bytes.
+    let key = require_openpgp_capable_key(key).map_err(|resp| {
+        warn!(
+            repo_id = %repo.id,
+            "repomd.xml.key requested but the repository's active signing key is not an \
+             OpenPGP key (requires key_type='gpg')",
+        );
+        resp
+    })?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1697,6 +1755,14 @@ mod tests {
     // XML generation helpers
     // -----------------------------------------------------------------------
 
+    /// A fixed `updated_at` for artifact fixtures. Deliberately a constant and
+    /// never `Utc::now()`: the repodata render must be a pure function of
+    /// repository state, so a fixture that carried a clock reading would let
+    /// the very bug these tests pin (#2636) slip back in unnoticed.
+    fn test_updated_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0).unwrap()
+    }
+
     #[test]
     fn test_generate_primary_xml_empty() {
         let xml = generate_primary_xml(&[]);
@@ -1715,6 +1781,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/test-1.0-1.x86_64.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "test",
                 "version": "1.0",
@@ -1740,6 +1807,7 @@ mod tests {
             size_bytes: 512,
             checksum_sha256: "def456".to_string(),
             storage_key: "rpm/1/test.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "test<pkg>",
                 "version": "1.0",
@@ -1763,6 +1831,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -1782,6 +1851,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -1803,6 +1873,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -1827,6 +1898,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/weird.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -1853,6 +1925,7 @@ mod tests {
             size_bytes: 256,
             checksum_sha256: "sha256hash".to_string(),
             storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "hello",
                 "version": "1.0",
@@ -1883,6 +1956,7 @@ mod tests {
             size_bytes: 4096,
             checksum_sha256: "otherhash".to_string(),
             storage_key: "rpm/1/util.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "util",
                 "version": "2.0",
@@ -1934,6 +2008,7 @@ mod tests {
             size_bytes: 2048,
             checksum_sha256: "fallbackhash".to_string(),
             storage_key: "rpm/1/curl.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -2581,6 +2656,78 @@ mod tests {
         );
     }
 
+    /// **The determinism gate (#2636).**
+    ///
+    /// `repomd.xml` and `repomd.xml.asc` render this document independently,
+    /// one request apart, and the client verifies the second render's
+    /// signature against the first render's bytes. So the render must depend
+    /// on repository state and nothing else — above all, not on the clock.
+    ///
+    /// The `sleep` is the whole point: this stamped `SystemTime::now()` into
+    /// `<revision>` and every `<data><timestamp>`, so back-to-back renders
+    /// agreed ~99.9% of the time and *looked* fine. Crossing a second boundary
+    /// is what exposes it — and is exactly what a real `dnf` run does between
+    /// fetching the two URLs.
+    #[test]
+    fn test_repomd_render_is_byte_identical_over_unchanged_state() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/det-1.0-1.x86_64.rpm".to_string(),
+            name: "det".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "feed".to_string(),
+            storage_key: "rpm/det.rpm".to_string(),
+            metadata: None,
+            updated_at: test_updated_at(),
+        }];
+
+        let first = generate_repomd_xml_content(&artifacts);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = generate_repomd_xml_content(&artifacts);
+
+        assert_eq!(
+            first, second,
+            "unchanged repository state must render byte-identical repomd.xml across a \
+             second boundary; a wall-clock read in the render makes repomd.xml.asc sign \
+             different bytes than repomd.xml serves",
+        );
+    }
+
+    /// The epoch must come from repository state, not the clock: it equals the
+    /// newest artifact's `updated_at`, and an empty repo pins to 0.
+    #[test]
+    fn test_repomd_revision_is_the_repo_state_epoch() {
+        let mk = |secs: i64| RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: format!("packages/p-{secs}.rpm"),
+            name: format!("p{secs}"),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1,
+            checksum_sha256: "aa".to_string(),
+            storage_key: format!("rpm/p-{secs}.rpm"),
+            metadata: None,
+            updated_at: chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, 0).unwrap(),
+        };
+
+        let xml = generate_repomd_xml_content(&[mk(1_600_000_000), mk(1_700_000_000)]);
+        assert!(
+            xml.contains("<revision>1700000000</revision>"),
+            "<revision> must be the most recent artifact updated_at: {xml}"
+        );
+        assert_eq!(
+            xml.matches("<timestamp>1700000000</timestamp>").count(),
+            4,
+            "every <data><timestamp> must carry the repo-state epoch: {xml}"
+        );
+
+        let empty = generate_repomd_xml_content(&[]);
+        assert!(
+            empty.contains("<revision>0</revision>"),
+            "an empty repo has no state to date, and must not fall back to now(): {empty}"
+        );
+    }
+
     #[test]
     fn test_generate_repomd_open_checksum_matches_uncompressed_primary() {
         // The primary <open-checksum> must equal sha256 of the *uncompressed*
@@ -2761,6 +2908,32 @@ mod tests {
         .await
     }
 
+    /// Give the repo a package, so the metadata epoch is derived from real
+    /// repository state rather than the empty-repo fallback.
+    async fn insert_rpm_artifact(f: &tdh::Fixture, name: &str) {
+        sqlx::query!(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+            f.repo_id,
+            format!("packages/{}-1.0-1.x86_64.rpm", name),
+            name,
+            "1.0-1",
+            1024i64,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "application/x-rpm",
+            format!("rpm/{}/{}-1.0-1.x86_64.rpm", f.repo_key, name),
+            f.user_id,
+        )
+        .execute(&f.pool)
+        .await
+        .expect("insert rpm artifact");
+    }
+
     /// The end-to-end contract `dnf repo_gpgcheck=1` enforces: the signature
     /// served at repodata/repomd.xml.asc must be real, CRC24-armored OpenPGP
     /// that verifies over the exact repomd.xml bytes under the key served at
@@ -2806,6 +2979,77 @@ mod tests {
             .expect("armor must parse as an OpenPGP signature packet");
         verify_detached(&pubkey, &repomd, &asc)
             .expect("the served signature must verify against the advertised key");
+
+        f.teardown().await;
+    }
+
+    /// **The cross-request determinism gate (#2636).**
+    ///
+    /// A real `dnf` run fetches `repomd.xml` and `repomd.xml.asc` as two
+    /// separate requests, and verifies the signature from the second against
+    /// the bytes of the first. The two handlers render the document
+    /// independently, so anything clock-derived in the render makes them
+    /// disagree whenever the fetches straddle a second boundary — `BAD
+    /// signature` on a repo nobody touched, at roughly `gap / 1s` probability.
+    /// dnf's metadata cache makes it worse: a `repomd.xml` retained from an
+    /// earlier run can never match a freshly stamped signature.
+    ///
+    /// `test_repomd_asc_is_verifiable_openpgp_against_advertised_key` models
+    /// the same contract but fetches back-to-back in well under a millisecond,
+    /// so it passed ~99.9% of the time even while this was broken — a latent
+    /// flake, not a gate. The sleep is what turns it into one.
+    #[tokio::test]
+    async fn test_repomd_asc_verifies_against_a_repomd_fetched_a_second_earlier() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+        insert_rpm_artifact(&f, "delayed").await;
+
+        let (xml_status, repomd) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(xml_status, StatusCode::OK);
+
+        // Straddle a second boundary, as any real client trivially does.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let (asc_status, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(asc_status, StatusCode::OK);
+        assert_eq!(key_status, StatusCode::OK);
+
+        let asc = String::from_utf8(asc.to_vec()).expect("asc must be ASCII armor");
+        let pubkey = String::from_utf8(pubkey.to_vec()).expect("key must be ASCII armor");
+
+        verify_detached(&pubkey, &repomd, &asc).expect(
+            "repomd.xml.asc must verify over the repomd.xml served a second earlier: the \
+             signature must cover repository state, not the time the request arrived",
+        );
+
+        f.teardown().await;
+    }
+
+    /// The same repository state must serve byte-identical `repomd.xml` no
+    /// matter when it is asked for — through the real route, over a second
+    /// boundary. This is what makes the metadata cacheable and reproducible,
+    /// and what lets a cached `repomd.xml` still match a later signature.
+    #[tokio::test]
+    async fn test_repomd_xml_route_is_byte_stable_over_time() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        insert_rpm_artifact(&f, "stable").await;
+
+        let (_, first) = get_repodata(&f, "repomd.xml").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (_, second) = get_repodata(&f, "repomd.xml").await;
+
+        assert_eq!(
+            first,
+            second,
+            "unchanged repo state must serve identical repomd.xml bytes; got:\n{}\n---\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second),
+        );
 
         f.teardown().await;
     }
@@ -2866,39 +3110,85 @@ mod tests {
 
     /// **The regression guard that matters (#2636).**
     ///
-    /// A key that cannot produce an OpenPGP signature must surface a real,
-    /// logged 500 — never a 404 "No signing key configured for this
-    /// repository" while repomd.xml.key serves that very key.
+    /// A key that claims `key_type=gpg` but whose stored material will not
+    /// parse as an OpenPGP secret key (a legacy PEM key predating OpenPGP
+    /// support) is a genuine server-side fault: it must surface a real, logged
+    /// 500 carrying the cause — never a 404 "No signing key configured for
+    /// this repository" while `repomd.xml.key` serves that very key.
     ///
     /// The old path was `sign_data(..).await.unwrap_or(None)`: the `Err`
     /// collapsed into `None`, and the resulting misleading 404 is why this
-    /// stayed invisible. An X.509 (`key_type=rsa`) key reproduces that load
-    /// failure, since OpenPGP signing requires `key_type=gpg`.
+    /// stayed invisible. Storing X.509 material under `key_type=gpg`
+    /// reproduces that load failure past the key-type gate.
     #[tokio::test]
-    async fn test_unusable_signing_key_is_a_loud_500_not_a_misleading_404() {
+    async fn test_unloadable_signing_key_is_a_loud_500_not_a_misleading_404() {
         let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
             return;
         };
         attach_signing_key(&f, "rsa").await;
+        // Present X.509 material as an OpenPGP key: the key type now claims it
+        // can sign, so the failure happens where the material is parsed.
+        sqlx::query!(
+            "UPDATE signing_keys SET key_type = 'gpg' WHERE repository_id = $1",
+            f.repo_id
+        )
+        .execute(&f.pool)
+        .await
+        .expect("force key_type=gpg");
 
-        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
         let (asc_status, body) = get_repodata(&f, "repomd.xml.asc").await;
 
         assert_eq!(
-            key_status,
-            StatusCode::OK,
-            "the repo advertises a key, so the signing failure below must not be reported as 'not configured'",
-        );
-        assert_eq!(
             asc_status,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "a signing failure must not be swallowed into 404 'No signing key configured'",
+            "a key that cannot be loaded is a server fault, and must not be swallowed \
+             into 404 'No signing key configured'",
         );
         let body = String::from_utf8_lossy(&body);
         assert!(
             body.contains("Failed to sign repomd.xml"),
             "the response must carry the real cause, got: {}",
             body
+        );
+
+        f.teardown().await;
+    }
+
+    /// An `rsa` key — the *default* `key_type` — cannot produce an OpenPGP
+    /// chain, so both signing endpoints refuse with **409 Conflict**: the
+    /// repository's signing config conflicts with what these endpoints must
+    /// serve. Distinctly not 404 (the repo *does* advertise a key) and
+    /// distinctly not 500 (nothing is broken server-side).
+    ///
+    /// The status is load-bearing: these routes are anonymous, so every `dnf`
+    /// poll of a misconfigured repo lands here. A 500 would let an
+    /// unauthenticated client drive unbounded ERROR logs and 500-rate alerts —
+    /// paging an on-call engineer for an operator config mistake.
+    #[tokio::test]
+    async fn test_rsa_key_is_a_409_conflict_on_both_signing_endpoints() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "rsa").await;
+
+        let (asc_status, asc_body) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
+
+        assert_eq!(
+            asc_status,
+            StatusCode::CONFLICT,
+            "an unsignable key type is a config conflict, not a server error",
+        );
+        assert_eq!(
+            key_status,
+            StatusCode::CONFLICT,
+            "the repo must not advertise a key it can never sign with",
+        );
+        let asc_body = String::from_utf8_lossy(&asc_body);
+        assert!(
+            asc_body.contains("key_type='gpg'"),
+            "the response must name the fix, got: {}",
+            asc_body
         );
 
         f.teardown().await;
@@ -2937,6 +3227,47 @@ mod tests {
             broken.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a key-load failure must be a loud 500, never a 404 'not configured'"
+        );
+    }
+
+    fn key_of_type(key_type: &str) -> crate::models::signing_key::SigningKey {
+        crate::models::signing_key::SigningKey {
+            id: uuid::Uuid::new_v4(),
+            repository_id: None,
+            name: "k".to_string(),
+            key_type: key_type.to_string(),
+            fingerprint: None,
+            key_id: None,
+            public_key_pem: String::new(),
+            private_key_enc: Vec::new(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: None,
+            uid_email: None,
+            expires_at: None,
+            is_active: true,
+            created_at: test_updated_at(),
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    /// The 409-vs-500 decision as a pure mapping (#2636): a key type that can
+    /// never sign OpenPGP is an operator config conflict, not a server fault.
+    #[test]
+    fn test_require_openpgp_capable_key_separates_conflict_from_capable() {
+        assert!(
+            require_openpgp_capable_key(key_of_type("gpg")).is_ok(),
+            "a gpg key must be accepted"
+        );
+
+        let conflict = require_openpgp_capable_key(key_of_type("rsa"))
+            .expect_err("an rsa key cannot produce an OpenPGP chain");
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "an unsignable key type must be a 409 an anonymous client cannot turn into \
+             an ERROR-log/500-alert amplifier",
         );
     }
 }
