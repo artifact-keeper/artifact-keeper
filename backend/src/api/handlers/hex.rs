@@ -21,6 +21,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -30,6 +31,7 @@ use crate::formats::hex::{
 };
 use crate::formats::hex_registry;
 use crate::models::repository::{Repository, RepositoryType};
+use crate::services::curation_service::version_compare;
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -130,16 +132,81 @@ fn release_facts_from_metadata(
     Some((inner, dependencies))
 }
 
+/// Persist registry facts recovered from a stored tarball back onto the
+/// artifact, so the expensive path runs at most once per artifact.
+///
+/// This is the backfill. A SQL migration cannot do it: `inner_checksum` lives in
+/// the `CHECKSUM` member *inside* the tarball, which is in object storage, not
+/// in any column — deriving it requires fetching and parsing the bytes. So the
+/// backfill is lazy, driven by the first read of each release, and from then on
+/// that release takes the same fast path a newly published one does.
+///
+/// Best-effort by construction: the value is a pure function of bytes we
+/// already hold, so a failed write-back costs a re-derive on the next read and
+/// nothing else. It must never fail the request — the caller already has the
+/// correct answer in hand.
+async fn backfill_release_facts(
+    state: &SharedState,
+    artifact_id: Uuid,
+    inner_hex: &str,
+    dependencies: &[hex_registry::HexDependency],
+) {
+    let patch = serde_json::json!({
+        "inner_checksum": inner_hex,
+        "requirements": dependencies,
+    });
+
+    // The artifact may have no `artifact_metadata` row at all (LEFT JOIN on the
+    // read side), so this upserts. `metadata || patch` merges at the top level,
+    // preserving whatever else the row carries and making a concurrent
+    // write-back of the same facts idempotent.
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'hex', $2)
+        ON CONFLICT (artifact_id)
+        DO UPDATE SET metadata = artifact_metadata.metadata || $2
+        "#,
+        artifact_id,
+        patch,
+    )
+    .execute(&state.db)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            artifact_id = %artifact_id,
+            "Hex registry: could not back-fill registry facts (will re-derive next read): {}",
+            e
+        );
+    }
+}
+
 /// Resolve the `inner_checksum` + dependencies a release must advertise.
 ///
-/// Fast path: the facts recorded at publish. Fallback: re-read the stored
-/// tarball, which is what artifacts published before those facts were captured
-/// need. `inner_checksum` is a required field the client copies into
-/// `mix.lock`, so there is no correct way to omit it — a release we cannot
-/// describe is an error rather than a silently incomplete registry.
+/// Fast path: the facts recorded at publish, or back-filled by an earlier read.
+/// Fallback: re-read the stored tarball, which is what artifacts published
+/// before those facts were captured need. `inner_checksum` is a required field
+/// the client copies into `mix.lock`, so there is no correct way to omit it — a
+/// release we cannot describe is an error rather than a silently incomplete
+/// registry.
+///
+/// The fallback is the expensive path — a storage GET plus a tar parse, once per
+/// release — so it does two things to stay off the ingest path's back:
+///
+/// * it draws on the *registry* extraction budget, never the ingest one, so a
+///   burst of registry reads can never 503 publishes (`with_registry_extraction`);
+/// * it writes what it recovers back onto the artifact, so a given release takes
+///   this path at most once in its lifetime instead of on every request.
+///
+/// Without the write-back this is not a "fallback" at all on an existing
+/// deployment — no artifact published before this change has the facts, so
+/// every release of every package would re-read its tarball on every request,
+/// forever.
 async fn resolve_release_facts(
     state: &SharedState,
     repo: &RepoInfo,
+    artifact_id: Uuid,
     storage_key: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<(Vec<u8>, Vec<hex_registry::HexDependency>), Response> {
@@ -164,7 +231,7 @@ async fn resolve_release_facts(
             .into_response()
     })?;
 
-    let facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+    let facts = crate::util::bounded_archive::with_registry_extraction(|| {
         extract_registry_facts_from_tarball(&bytes)
     })
     .map_err(|e| e.into_response())?
@@ -190,6 +257,8 @@ async fn resolve_release_facts(
         )
             .into_response()
     })?;
+
+    backfill_release_facts(state, artifact_id, &inner_hex, &facts.dependencies).await;
 
     Ok((inner, facts.dependencies))
 }
@@ -260,7 +329,7 @@ async fn package_info(
         WHERE a.repository_id = $1
           AND a.is_deleted = false
           AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.name DESC
         "#,
         repo.id,
         name
@@ -349,9 +418,22 @@ async fn package_info(
     // Hosted: emit the real registry resource — gzipped, signed protobuf.
     // See `list_names` for why plain JSON is not consumable by `mix`.
     if is_hosted(&repo.repo_type) {
-        let mut releases = Vec::with_capacity(artifacts.len());
-        // Advertise oldest-first, matching `mix hex.registry build`.
-        for a in artifacts.iter().rev() {
+        // Advertise ascending by VERSION, matching `mix hex.registry build`,
+        // which sorts releases by version rather than by publish time. Ordering
+        // by `created_at` agrees with that only while versions happen to be
+        // published in order; publishing 1.0.0 and then backporting 0.9.0 makes
+        // the two diverge. `artifacts` arrives newest-first by `created_at`.
+        let mut ordered: Vec<_> = artifacts.iter().collect();
+        ordered.sort_by(|a, b| {
+            version_compare(
+                a.version.as_deref().unwrap_or_default(),
+                b.version.as_deref().unwrap_or_default(),
+            )
+            .cmp(&0)
+        });
+
+        let mut releases = Vec::with_capacity(ordered.len());
+        for a in &ordered {
             let version = a.version.clone().unwrap_or_default();
             let outer_checksum =
                 hex_registry::decode_outer_checksum(&a.checksum_sha256).map_err(|e| {
@@ -365,7 +447,8 @@ async fn package_info(
                         .into_response()
                 })?;
             let (inner_checksum, dependencies) =
-                resolve_release_facts(&state, &repo, &a.storage_key, a.metadata.as_ref()).await?;
+                resolve_release_facts(&state, &repo, a.id, &a.storage_key, a.metadata.as_ref())
+                    .await?;
             releases.push(hex_registry::HexRelease {
                 version,
                 inner_checksum,
@@ -373,6 +456,10 @@ async fn package_info(
                 dependencies,
             });
         }
+        // The name the registry advertises for this package. Must be chosen the
+        // same way `list_names` chooses it (newest artifact's spelling), because
+        // the client pattern-matches the `name` in this payload against the name
+        // it asked for and rejects a mismatch — see `canonical_hex_name`.
         let canonical_name = artifacts
             .first()
             .map(|a| a.name.clone())
@@ -742,6 +829,55 @@ async fn publish_package(
 // GET /hex/{repo_key}/names -- List all package names
 // ---------------------------------------------------------------------------
 
+/// Fold case-variant spellings of a package name down to the single name the
+/// registry advertises, newest-first wins.
+///
+/// `/names` groups artifacts by exact name, but `/packages/{name}` matches
+/// case-insensitively (`LOWER(a.name) = LOWER($2)`) and echoes back the newest
+/// matching artifact's spelling. Two artifacts differing only in case therefore
+/// desynchronize the two resources: `/names` advertises both `Foo` and `foo`,
+/// and a client that dutifully asks for `Foo` gets a payload naming `foo`. The
+/// hex client pattern-matches that field against the name it requested and
+/// rejects the mismatch (`bad_repo_name`), so the package is simply unusable.
+///
+/// Folding here makes `/names` advertise exactly the names `/packages/{name}`
+/// can echo. The winner is the case variant whose newest artifact is newest —
+/// the same rule `package_info` applies — with the name itself as a tiebreak so
+/// the two agree even when timestamps collide. The group's `updated_at` is the
+/// newest across all variants, since they are all the same package.
+fn canonical_hex_names(rows: &[(String, i64)]) -> Vec<hex_registry::HexPackageName> {
+    let mut folded: std::collections::BTreeMap<String, (String, i64)> =
+        std::collections::BTreeMap::new();
+
+    for (name, updated_at_secs) in rows {
+        let key = name.to_lowercase();
+        folded
+            .entry(key)
+            .and_modify(|winner| {
+                // Newest wins; on a timestamp tie the greater name wins, which
+                // is what `ORDER BY created_at DESC, name DESC` yields.
+                if (*updated_at_secs, name) > (winner.1, &winner.0) {
+                    *winner = (name.clone(), *updated_at_secs);
+                }
+                // `updated_at` tracks the whole group regardless of which
+                // spelling won.
+                winner.1 = winner.1.max(*updated_at_secs);
+            })
+            .or_insert_with(|| (name.clone(), *updated_at_secs));
+    }
+
+    let mut out: Vec<hex_registry::HexPackageName> = folded
+        .into_values()
+        .map(|(name, updated_at_secs)| hex_registry::HexPackageName {
+            name,
+            updated_at_secs: Some(updated_at_secs),
+        })
+        .collect();
+    // `mix hex.registry build` advertises names in sorted order.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 async fn list_names(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
@@ -769,13 +905,15 @@ async fn list_names(
     // this used to return failed at `:zlib.gunzip/1` with `:data_error` and
     // made hosted hex repos unusable by the real client.
     if is_hosted(&repo.repo_type) {
-        let packages: Vec<hex_registry::HexPackageName> = name_rows
+        // Fold case variants so every advertised name is one `/packages/{name}`
+        // can echo back verbatim. The JSON arm below is left as-is: it is the
+        // remote/virtual path and is not consumed by the `mix` client, so it
+        // does not carry the name-matching constraint.
+        let rows: Vec<(String, i64)> = name_rows
             .iter()
-            .map(|r| hex_registry::HexPackageName {
-                name: r.name.clone(),
-                updated_at_secs: Some(r.updated_at.timestamp()),
-            })
+            .map(|r| (r.name.clone(), r.updated_at.timestamp()))
             .collect();
+        let packages = canonical_hex_names(&rows);
         let payload = hex_registry::encode_names_payload(&repo_key, &packages);
         return signed_registry_response(&state, repo.id, payload).await;
     }
@@ -841,6 +979,53 @@ async fn list_names(
 // GET /hex/{repo_key}/versions -- List all packages with versions
 // ---------------------------------------------------------------------------
 
+/// Group `(name, version, created_at_secs)` rows into the `(name, versions)`
+/// pairs `/versions` advertises.
+///
+/// Applies the same case-folding rule as [`canonical_hex_names`] — `/versions`
+/// keys packages by name too, so it has to agree with `/names` and
+/// `/packages/{name}` about which spelling is real, or the client looks up a
+/// package it was told exists and misses.
+///
+/// Versions within a package are ordered ascending by version, matching `mix
+/// hex.registry build`. Ordering by `created_at` instead only coincides with
+/// that while releases are published in version order — a backported 0.9.0
+/// published after 1.0.0 would be advertised last.
+fn canonical_hex_versions(rows: &[(String, String, i64)]) -> Vec<(String, Vec<String>)> {
+    struct Group {
+        name: String,
+        newest: i64,
+        versions: Vec<String>,
+    }
+    let mut folded: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
+
+    for (name, version, created_at_secs) in rows {
+        let key = name.to_lowercase();
+        let group = folded.entry(key).or_insert_with(|| Group {
+            name: name.clone(),
+            newest: *created_at_secs,
+            versions: Vec::new(),
+        });
+        if (*created_at_secs, name) > (group.newest, &group.name) {
+            group.name = name.clone();
+        }
+        group.newest = group.newest.max(*created_at_secs);
+        if !group.versions.contains(version) {
+            group.versions.push(version.clone());
+        }
+    }
+
+    let mut out: Vec<(String, Vec<String>)> = folded
+        .into_values()
+        .map(|mut g| {
+            g.versions.sort_by(|a, b| version_compare(a, b).cmp(&0));
+            (g.name, g.versions)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 async fn list_versions(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
@@ -849,7 +1034,7 @@ async fn list_versions(
 
     let artifacts = sqlx::query!(
         r#"
-        SELECT name, version
+        SELECT name, version, created_at
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -874,16 +1059,17 @@ async fn list_versions(
     // Hosted: emit the real registry resource — gzipped, signed protobuf.
     // See `list_names` for why plain JSON is not consumable by `mix`.
     if is_hosted(&repo.repo_type) {
-        let pkgs: Vec<(String, Vec<String>)> = packages
+        let rows: Vec<(String, String, i64)> = artifacts
             .iter()
-            .map(|(name, versions)| {
-                // The query returns newest-first; registries advertise oldest
-                // first (`mix hex.registry build` sorts ascending).
-                let mut versions = versions.clone();
-                versions.reverse();
-                (name.clone(), versions)
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    a.version.clone().unwrap_or_default(),
+                    a.created_at.timestamp(),
+                )
             })
             .collect();
+        let pkgs = canonical_hex_versions(&rows);
         let payload = hex_registry::encode_versions_payload(&repo_key, &pkgs);
         return signed_registry_response(&state, repo.id, payload).await;
     }
@@ -1352,6 +1538,159 @@ mod tests {
     fn test_is_hosted_covers_local_and_staging() {
         assert!(is_hosted("local"));
         assert!(is_hosted("staging"));
+    }
+
+    // -----------------------------------------------------------------------
+    // canonical_hex_names / canonical_hex_versions — /names, /versions and
+    // /packages/{name} must agree on which spelling of a name is real, and on
+    // release ordering (#2641 review)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_canonical_hex_names_folds_case_variants_to_one_name() {
+        // `/packages/{name}` matches case-insensitively and echoes the newest
+        // artifact's spelling. If `/names` advertised both spellings, a client
+        // asking for the older one would get a payload naming the other and
+        // reject it as `bad_repo_name`.
+        let out = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 200)]);
+        assert_eq!(out.len(), 1, "case variants must collapse to one name");
+        assert_eq!(out[0].name, "foo", "the newest spelling wins");
+        assert_eq!(
+            out[0].updated_at_secs,
+            Some(200),
+            "updated_at must span the whole group"
+        );
+    }
+
+    #[test]
+    fn test_canonical_hex_names_newest_spelling_wins_regardless_of_row_order() {
+        // Same data, opposite input order — the winner must not depend on it.
+        let a = canonical_hex_names(&[("foo".to_string(), 200), ("Foo".to_string(), 100)]);
+        let b = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 200)]);
+        assert_eq!(a[0].name, "foo");
+        assert_eq!(b[0].name, "foo");
+    }
+
+    #[test]
+    fn test_canonical_hex_names_ties_break_deterministically() {
+        // Equal timestamps must still yield a stable, order-independent winner,
+        // matching `ORDER BY created_at DESC, name DESC` on the packages side.
+        let a = canonical_hex_names(&[("Foo".to_string(), 100), ("foo".to_string(), 100)]);
+        let b = canonical_hex_names(&[("foo".to_string(), 100), ("Foo".to_string(), 100)]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "foo", "greater name wins a timestamp tie");
+        assert_eq!(
+            a[0].name, b[0].name,
+            "the tiebreak must be order-independent"
+        );
+    }
+
+    #[test]
+    fn test_canonical_hex_names_distinct_names_are_untouched_and_sorted() {
+        let out = canonical_hex_names(&[
+            ("zeta".to_string(), 100),
+            ("alpha".to_string(), 200),
+            ("mid".to_string(), 150),
+        ]);
+        let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn test_canonical_hex_names_empty_repo() {
+        assert!(canonical_hex_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_canonical_hex_versions_orders_by_version_not_publish_time() {
+        // The regression: `mix hex.registry build` sorts releases ascending by
+        // VERSION. Ordering by publish time diverges the moment a backport is
+        // published after a newer release — here 0.9.0 published last.
+        let out = canonical_hex_versions(&[
+            ("p".to_string(), "1.0.0".to_string(), 100),
+            ("p".to_string(), "0.9.0".to_string(), 300),
+            ("p".to_string(), "1.1.0".to_string(), 200),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].1,
+            vec!["0.9.0", "1.0.0", "1.1.0"],
+            "releases must be advertised ascending by version, not by publish time"
+        );
+    }
+
+    #[test]
+    fn test_canonical_hex_versions_sorts_numerically_not_lexically() {
+        // Lexical ordering would put 10.0.0 before 9.0.0.
+        let out = canonical_hex_versions(&[
+            ("p".to_string(), "10.0.0".to_string(), 100),
+            ("p".to_string(), "9.0.0".to_string(), 200),
+            ("p".to_string(), "2.0.0".to_string(), 300),
+        ]);
+        assert_eq!(out[0].1, vec!["2.0.0", "9.0.0", "10.0.0"]);
+    }
+
+    #[test]
+    fn test_canonical_hex_versions_folds_case_variants() {
+        let out = canonical_hex_versions(&[
+            ("Foo".to_string(), "1.0.0".to_string(), 100),
+            ("foo".to_string(), "2.0.0".to_string(), 200),
+        ]);
+        assert_eq!(out.len(), 1, "case variants are one package");
+        assert_eq!(out[0].0, "foo", "newest spelling wins, as in /names");
+        assert_eq!(
+            out[0].1,
+            vec!["1.0.0", "2.0.0"],
+            "both variants' releases belong to the folded package"
+        );
+    }
+
+    #[test]
+    fn test_canonical_hex_versions_agrees_with_canonical_hex_names_on_the_winner() {
+        // The invariant that matters: whatever `/names` advertises must be what
+        // `/versions` keys the package under, or a client looks up a package it
+        // was just told exists and misses.
+        let rows = [
+            ("Foo".to_string(), "1.0.0".to_string(), 100),
+            ("foo".to_string(), "2.0.0".to_string(), 200),
+            ("BAR".to_string(), "1.0.0".to_string(), 500),
+            ("bar".to_string(), "0.1.0".to_string(), 50),
+        ];
+        let name_rows: Vec<(String, i64)> =
+            rows.iter()
+                .map(|(n, _, t)| (n.clone(), *t))
+                .fold(Vec::new(), |mut acc, (n, t)| {
+                    // Mimic `/names`' GROUP BY name → MAX(created_at) per spelling.
+                    match acc.iter_mut().find(|(an, _): &&mut (String, i64)| *an == n) {
+                        Some(entry) => entry.1 = entry.1.max(t),
+                        None => acc.push((n, t)),
+                    }
+                    acc
+                });
+
+        let advertised: Vec<String> = canonical_hex_names(&name_rows)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let keyed: Vec<String> = canonical_hex_versions(&rows)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            advertised, keyed,
+            "/names and /versions must advertise identical package names"
+        );
+        assert_eq!(advertised, vec!["BAR".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn test_canonical_hex_versions_dedupes_identical_versions_across_case_variants() {
+        let out = canonical_hex_versions(&[
+            ("Foo".to_string(), "1.0.0".to_string(), 100),
+            ("foo".to_string(), "1.0.0".to_string(), 200),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, vec!["1.0.0"], "a version must be advertised once");
     }
 
     #[test]
@@ -2612,6 +2951,165 @@ mod tests {
         );
 
         tdh::cleanup(&pool, virtual_repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-fact backfill (#2641 review)
+    //
+    // Artifacts published before registry-fact capture existed carry no
+    // `inner_checksum`, so on any upgraded deployment the "fallback" path is
+    // 100% of the data, not an edge case. These tests pin the two properties
+    // that keep that from being a per-request tarball re-read on the global
+    // ingest budget.
+    // -----------------------------------------------------------------------
+
+    /// Seed a hex artifact the way a pre-change publish left it: a real tarball
+    /// in storage, a valid outer checksum, and NO recorded registry facts.
+    async fn seed_pre_change_release(
+        f: &tdh::Fixture,
+        name: &str,
+        version: &str,
+    ) -> (Uuid, String) {
+        let metadata =
+            format!("{{<<\"name\">>,<<\"{name}\">>}}.\n{{<<\"version\">>,<<\"{version}\">>}}.\n");
+        let tar = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let repo = f.repo_info("local", None);
+        let storage_key = format!("{name}-{version}.tar");
+        let artifact_id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &storage_key,
+            &storage_key,
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from(tar),
+            f.user_id,
+        )
+        .await;
+
+        // `seed_artifact` stores a placeholder checksum; the registry needs a
+        // real 32-byte digest to advertise as `outer_checksum`.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind("9c3091fb556d0b0aa0bd5df5a40466b1c18bac00538d0169a35e067598ff7456")
+            .bind(artifact_id)
+            .execute(&f.pool)
+            .await
+            .expect("set checksum");
+
+        // Pre-change rows have no registry facts recorded.
+        sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&f.pool)
+            .await
+            .expect("clear metadata");
+
+        (artifact_id, storage_key)
+    }
+
+    async fn recorded_inner_checksum(f: &tdh::Fixture, artifact_id: Uuid) -> Option<String> {
+        let row: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&f.pool)
+                .await
+                .expect("read metadata");
+        row.and_then(|m| {
+            m.get("inner_checksum")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    }
+
+    /// A pre-change release must resolve, and resolving it must WRITE BACK the
+    /// facts so the tarball re-read happens once per artifact rather than once
+    /// per request. Without this, every release of every package re-reads its
+    /// tarball on every registry fetch, forever.
+    #[tokio::test]
+    async fn test_pre_change_release_backfills_registry_facts_on_first_read() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let (artifact_id, _) = seed_pre_change_release(&f, "oldpkg", "1.0.0").await;
+
+        assert!(
+            recorded_inner_checksum(&f, artifact_id).await.is_none(),
+            "precondition: the seeded row must have no registry facts"
+        );
+
+        let app = f.router_anon(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/packages/oldpkg", f.repo_key))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a pre-change release must still resolve"
+        );
+
+        assert_eq!(
+            recorded_inner_checksum(&f, artifact_id).await.as_deref(),
+            Some(REAL_CHECKSUM),
+            "the first read must back-fill inner_checksum so later reads take the fast path"
+        );
+
+        // And the backfilled facts serve an identical response.
+        let app = f.router_anon(super::router());
+        let (status2, _) =
+            tdh::send(app, tdh::get(format!("/{}/packages/oldpkg", f.repo_key))).await;
+        assert_eq!(status2, StatusCode::OK, "the fast path must serve the same");
+
+        f.teardown().await;
+    }
+
+    /// The read path must not draw on the INGEST budget. With every ingest
+    /// permit held, a registry read of a pre-change release — the expensive
+    /// path, which really does re-read the tarball — must still succeed.
+    ///
+    /// Before this change it shared the process-wide ingest semaphore, so ~8
+    /// concurrent anonymous registry GETs could exhaust the budget that every
+    /// format's publish path depends on and 503 uploads product-wide.
+    #[tokio::test]
+    async fn test_registry_read_does_not_consume_the_ingest_budget() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        // The ingest semaphore is process-wide; serialize against other tests
+        // that touch it.
+        let _lock = crate::util::bounded_archive::test_support::lock_singletons_async().await;
+        let (artifact_id, _) = seed_pre_change_release(&f, "budgetpkg", "1.0.0").await;
+
+        // Hold EVERY ingest permit, as a burst of concurrent publishes would.
+        let mut held = Vec::new();
+        while let Ok(g) = crate::util::bounded_archive::acquire_ingest_extraction() {
+            held.push(g);
+        }
+        assert!(!held.is_empty(), "ingest budget must have had permits");
+        assert!(
+            crate::util::bounded_archive::acquire_ingest_extraction().is_err(),
+            "precondition: the ingest budget is saturated"
+        );
+
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/packages/budgetpkg", f.repo_key))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a registry read must not be shed by a saturated INGEST budget: {:?}",
+            String::from_utf8_lossy(&body[..])
+        );
+        assert_eq!(
+            recorded_inner_checksum(&f, artifact_id).await.as_deref(),
+            Some(REAL_CHECKSUM),
+            "the read really did take the tarball re-read path"
+        );
+
+        drop(held);
+        f.teardown().await;
     }
 }
 

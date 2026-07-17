@@ -31,9 +31,15 @@ pub const HEX_REGISTRY_KEY_NAME: &str = "hex-registry";
 
 /// Key strength for hex registry keys. Hex fixes the signature algorithm
 /// (RSA + SHA-512) but not the modulus size; 2048 matches what `mix
-/// hex.registry build` produces via `openssl genrsa` and keeps first-touch
-/// provisioning fast.
+/// hex.registry build` produces via `openssl genrsa` and keeps provisioning
+/// fast.
 pub const HEX_REGISTRY_KEY_ALGORITHM: &str = "rsa2048";
+
+/// Namespace (first key) for the two-key `pg_advisory_xact_lock(int4, int4)`
+/// that serializes hex registry key provisioning per repository. The second key
+/// is `hashtext(repository_id)`. Namespacing keeps this lock space disjoint
+/// from the other two-key advisory-lock users in the codebase.
+const HEX_REGISTRY_KEY_LOCK_NAMESPACE: i32 = 0x4845_5801; // "HEX\x01"
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -763,7 +769,14 @@ impl SigningService {
     }
 
     /// Look up a repository's dedicated hex registry key, if it has one.
-    async fn find_hex_registry_key(&self, repo_id: Uuid) -> Result<Option<SigningKey>> {
+    ///
+    /// The predicate here is mirrored exactly by the partial unique index in
+    /// migration 166. Changing one without the other lets provisioning conflict
+    /// against a row this lookup cannot see (see that migration's note).
+    async fn find_hex_registry_key_exec<'e, E>(exec: E, repo_id: Uuid) -> Result<Option<SigningKey>>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
         let key = sqlx::query_as!(
             SigningKey,
             r#"
@@ -774,32 +787,67 @@ impl SigningService {
             repo_id,
             HEX_REGISTRY_KEY_NAME,
         )
-        .fetch_optional(&self.db)
+        .fetch_optional(exec)
         .await?;
         Ok(key)
     }
 
-    /// Get (or provision on first use) the RSA key that signs a hosted hex
-    /// repository's registry resources.
+    /// Look up a repository's dedicated hex registry key on the pool.
+    async fn find_hex_registry_key(&self, repo_id: Uuid) -> Result<Option<SigningKey>> {
+        Self::find_hex_registry_key_exec(&self.db, repo_id).await
+    }
+
+    /// Provision the RSA key that signs a hosted hex repository's registry
+    /// resources, if it does not already have an active one.
     ///
     /// Hex differs from the other signed formats in that signing is not
     /// optional: a registry with no signature is unusable, so there is no
     /// "unsigned but working" mode to fall back to and a repo with no key would
-    /// simply be broken. Rather than require an out-of-band setup step, the key
-    /// is created on first touch and stored like every other signing key
-    /// (`signing_keys`, private half encrypted at rest).
+    /// simply be broken. The key is therefore provisioned eagerly when a hosted
+    /// hex repository is created (an authenticated, once-per-repo operation) and
+    /// stored like every other signing key (`signing_keys`, private half
+    /// encrypted at rest).
+    ///
+    /// [`Self::get_or_create_hex_registry_key`] calls this as a *self-heal* for
+    /// repositories that predate eager provisioning, and after a revoke.
     ///
     /// Deliberately does **not** write `repository_signing_config`: that table
     /// drives the Debian/Conda `sign_metadata` behaviour and the promotion
     /// `require_signature` gate, and a hex repo publishing its own registry key
     /// must not imply anything about those.
     ///
-    /// Keygen is CPU-bound, so it runs on the blocking pool (via
-    /// `generate_key_material`) and happens at most once per repository — the
-    /// partial unique index from migration 166 collapses concurrent first
-    /// touches onto a single row.
-    pub async fn get_or_create_hex_registry_key(&self, repo_id: Uuid) -> Result<SigningKey> {
+    /// ## Why the advisory lock
+    ///
+    /// Keygen is CPU-bound and runs on the blocking pool (via
+    /// `generate_key_material`). The partial unique index dedupes the resulting
+    /// *row*, but it cannot dedupe the *work*: without serialization, N
+    /// concurrent callers each complete a full RSA-2048 keygen and N-1 of them
+    /// throw the result away on conflict. A transaction-scoped advisory lock
+    /// keyed on the repository makes the check-then-generate sequence atomic, so
+    /// exactly one keygen runs per repository and the losers wake up and read
+    /// the winner's row. The lock is released automatically when the transaction
+    /// ends, including on error.
+    pub async fn provision_hex_registry_key(&self, repo_id: Uuid) -> Result<SigningKey> {
+        // Cheap un-serialized pre-check: the overwhelmingly common case is that
+        // the key already exists, and that path should not take a lock at all.
         if let Some(key) = self.find_hex_registry_key(repo_id).await? {
+            return Ok(key);
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        // Serialize provisioning per repository. Two-key advisory lock space,
+        // namespaced to keep it distinct from other advisory-lock users
+        // (`cluster_lock`, `repository_service`, the admin-password init).
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind(HEX_REGISTRY_KEY_LOCK_NAMESPACE)
+            .bind(repo_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        // Re-check under the lock: a concurrent caller may have provisioned the
+        // key between the pre-check and acquiring the lock.
+        if let Some(key) = Self::find_hex_registry_key_exec(&mut *tx, repo_id).await? {
             return Ok(key);
         }
 
@@ -832,14 +880,36 @@ impl SigningService {
             HEX_REGISTRY_KEY_ALGORITHM,
             Utc::now(),
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
 
-        // Re-select rather than trusting the INSERT: on a concurrent first
-        // touch the conflicting writer's row is the one that must be used.
-        self.find_hex_registry_key(repo_id).await?.ok_or_else(|| {
-            AppError::Internal("Failed to provision hex registry signing key".to_string())
-        })
+        // Re-select rather than trusting the INSERT: the advisory lock makes a
+        // conflict here vanishingly unlikely, but ON CONFLICT DO NOTHING still
+        // means the row that must be used is whichever one is actually there.
+        let key = Self::find_hex_registry_key_exec(&mut *tx, repo_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("Failed to provision hex registry signing key".to_string())
+            })?;
+
+        tx.commit().await?;
+        Ok(key)
+    }
+
+    /// Get a repository's hex registry key, provisioning it if absent.
+    ///
+    /// Provisioning normally happens at repository creation, so on the registry
+    /// read path this is expected to be a plain lookup. It stays a
+    /// `get_or_create` as a self-heal for the two cases where an active key can
+    /// legitimately be missing:
+    ///
+    /// * the repository was created before eager provisioning existed, or by a
+    ///   path that does not run it (import, direct DB seed);
+    /// * the key was revoked, and the repository needs a fresh one.
+    ///
+    /// See [`Self::provision_hex_registry_key`] for the concurrency story.
+    pub async fn get_or_create_hex_registry_key(&self, repo_id: Uuid) -> Result<SigningKey> {
+        self.provision_hex_registry_key(repo_id).await
     }
 
     /// Create an ASCII-armored detached OpenPGP signature for repository metadata.
@@ -1022,6 +1092,23 @@ impl SigningService {
     ///
     /// The slow CPU keygen runs *before* the transaction so no DB lock is held
     /// across it.
+    ///
+    /// ## Hex registry keys are not rotatable through here
+    ///
+    /// Rotation mints a successor under a *derived* name
+    /// ([`build_rotated_key_name`]). That is fine for the Debian/Conda keys,
+    /// which are addressed by id through `repository_signing_config`, but the
+    /// hex registry key is addressed **by name** (`hex-registry`): a successor
+    /// called `hex-registry (rotated)` is a key no lookup will ever find, and
+    /// the repository would silently self-heal a *third* key over it. Rotation
+    /// also buys nothing here — hex consumers pin the public key explicitly with
+    /// `mix hex.repo add --public-key`, so any replacement key requires every
+    /// consumer to re-pin regardless, and there is no overlap window to
+    /// preserve. Replacing a hex registry key is therefore expressed as
+    /// **revoke** ([`Self::revoke_key`]), which leaves the old row as an audit
+    /// record and lets [`Self::get_or_create_hex_registry_key`] provision a
+    /// fresh key on the next registry fetch. Rejecting rotation keeps exactly
+    /// one supported way to do it, and that way works.
     pub async fn rotate_key(
         &self,
         old_key_id: Uuid,
@@ -1038,6 +1125,17 @@ impl SigningService {
         .fetch_optional(&self.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
+
+        // A name-addressed key cannot be rotated to a renamed successor; see
+        // the doc comment. Point the operator at revoke, which does work.
+        if old_key.name == HEX_REGISTRY_KEY_NAME && old_key.repository_id.is_some() {
+            return Err(AppError::Conflict(
+                "The hex registry key is addressed by name and cannot be rotated; revoke it \
+                 instead — the next registry fetch provisions a replacement, and consumers \
+                 must re-pin the new key with `mix hex.repo add --public-key`"
+                    .to_string(),
+            ));
+        }
 
         // Successor inherits the old key's parameters.
         let req = CreateKeyRequest {
@@ -2793,5 +2891,208 @@ mod tests {
         .await
         .expect("count failed");
         assert_eq!(total, 0, "metadata signing must attest zero artifacts");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hex registry key lifecycle (#2641)
+    // -----------------------------------------------------------------------
+
+    async fn seed_hex_repo(pool: &sqlx::PgPool) -> Uuid {
+        let key = format!("hex-key-test-{}", Uuid::new_v4().as_simple());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'hex', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test hex repository")
+    }
+
+    /// Revoking the registry key must leave the repository RECOVERABLE: the
+    /// next fetch provisions a fresh key instead of 500ing forever.
+    ///
+    /// This is the regression test for the index/lookup predicate mismatch. The
+    /// unique index used to omit `is_active`, while the lookup required it. A
+    /// revoked key therefore stayed *invisible to the lookup but visible to the
+    /// index*: every subsequent request ran a full RSA-2048 keygen, hit
+    /// `ON CONFLICT DO NOTHING` against the revoked row, re-selected nothing and
+    /// returned `AppError::Internal` — a permanent 500 with no API-reachable
+    /// recovery, and an anonymous CPU-burn on the way. Revoking a leaked key is
+    /// exactly what an operator does during an incident, so this path has to
+    /// work.
+    #[tokio::test]
+    async fn hex_registry_key_reprovisions_after_revoke() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_hex_repo(&pool).await;
+
+        let first = service
+            .get_or_create_hex_registry_key(repo)
+            .await
+            .expect("initial provisioning failed");
+
+        service
+            .revoke_key(first.id, None)
+            .await
+            .expect("revoke failed");
+
+        // The whole point: this must NOT be an Internal error.
+        let second = service
+            .get_or_create_hex_registry_key(repo)
+            .await
+            .expect("re-provisioning after revoke must succeed, not 500");
+
+        assert_ne!(
+            second.id, first.id,
+            "a revoked key must not be handed back out"
+        );
+        assert!(second.is_active, "the replacement key must be active");
+        assert_eq!(
+            active_key_ids(&pool, repo).await,
+            vec![second.id],
+            "exactly one active registry key must remain after revoke + re-provision"
+        );
+
+        // The revoked row survives as an audit record rather than being deleted.
+        let revoked_still_present: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM signing_keys WHERE id = $1 AND is_active = false)",
+        )
+        .bind(first.id)
+        .fetch_one(&pool)
+        .await
+        .expect("query failed");
+        assert!(
+            revoked_still_present,
+            "the revoked key's row must remain for audit"
+        );
+
+        // And the cycle is repeatable — revoke is not a one-shot escape hatch.
+        service
+            .revoke_key(second.id, None)
+            .await
+            .expect("second revoke failed");
+        let third = service
+            .get_or_create_hex_registry_key(repo)
+            .await
+            .expect("second re-provisioning must also succeed");
+        assert_ne!(third.id, second.id);
+        assert!(third.is_active);
+    }
+
+    /// A steady-state fetch must be a pure lookup: no new key, no keygen.
+    #[tokio::test]
+    async fn hex_registry_key_is_stable_across_fetches() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_hex_repo(&pool).await;
+
+        let first = service.provision_hex_registry_key(repo).await.unwrap();
+        for _ in 0..3 {
+            let again = service.get_or_create_hex_registry_key(repo).await.unwrap();
+            assert_eq!(
+                again.id, first.id,
+                "a repeat fetch must reuse the existing key, never mint a new one"
+            );
+        }
+        assert_eq!(active_key_ids(&pool, repo).await.len(), 1);
+    }
+
+    /// Concurrent provisioning collapses onto ONE key — and, thanks to the
+    /// advisory lock, one keygen. The unique index alone dedupes the row but not
+    /// the work: without serialization each caller completes a full RSA-2048
+    /// keygen and all but one throw it away.
+    #[tokio::test]
+    async fn hex_registry_key_concurrent_provisioning_yields_one_key() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_hex_repo(&pool).await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let svc = rotation_test_service(pool.clone());
+            set.spawn(async move { svc.get_or_create_hex_registry_key(repo).await });
+        }
+        let mut ids = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let key = joined
+                .expect("task panicked")
+                .expect("concurrent provisioning must not error");
+            ids.push(key.id);
+        }
+
+        assert_eq!(ids.len(), 5);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "all concurrent callers must observe the same key, got {unique:?}"
+        );
+        assert_eq!(
+            active_key_ids(&pool, repo).await.len(),
+            1,
+            "concurrent provisioning must leave exactly one active key"
+        );
+        let _ = &service;
+    }
+
+    /// The hex registry key is addressed by NAME, so a renamed successor is a
+    /// key nothing can find. `rotate_key` must say so rather than silently
+    /// orphaning it. Replacement is expressed as revoke + re-provision.
+    #[tokio::test]
+    async fn hex_registry_key_cannot_be_rotated() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_hex_repo(&pool).await;
+        let key = service.provision_hex_registry_key(repo).await.unwrap();
+
+        let err = service
+            .rotate_key(key.id, None)
+            .await
+            .expect_err("rotating the hex registry key must be refused");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
+
+        // The refusal must be inert: the key is untouched and still usable.
+        let after = service.get_or_create_hex_registry_key(repo).await.unwrap();
+        assert_eq!(
+            after.id, key.id,
+            "a refused rotation must leave the existing key in place"
+        );
+        assert_eq!(active_key_ids(&pool, repo).await, vec![key.id]);
+    }
+
+    /// Rotation must still work for the keys it is meant for — the guard is
+    /// scoped to the hex registry key by name, not a blanket block.
+    #[tokio::test]
+    async fn rotate_still_works_for_non_hex_keys() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let old = seed_active_key(&service, repo).await;
+
+        let new = service
+            .rotate_key(old, None)
+            .await
+            .expect("rotating an ordinary signing key must still succeed");
+        assert_ne!(new.id, old);
+        assert_eq!(active_key_ids(&pool, repo).await, vec![new.id]);
     }
 }

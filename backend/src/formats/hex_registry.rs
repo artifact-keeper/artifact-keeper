@@ -439,8 +439,37 @@ mod tests {
     /// `Names{packages: [{name: "dtf_marker", updated_at: {1784245817, 0}}], repository: "dtf"}`
     const GOLDEN_NAMES_PAYLOAD: &str = "0A160A0A6474665F6D61726B65721A0808B9DCE5D20610001203647466";
 
+    /// `Versions{packages: [{name: "dtf_marker", versions: ["1.0.0"]}], repository: "dtf"}`
+    ///
+    /// From `public/versions` of the same `mix hex.registry build` run as
+    /// [`GOLDEN_NAMES_PAYLOAD`].
+    const GOLDEN_VERSIONS_PAYLOAD: &str = "0A130A0A6474665F6D61726B65721205312E302E301203647466";
+
+    /// `Package{releases: [{version: "1.0.0", inner_checksum: <32B>, outer_checksum: <32B>}],
+    ///  name: "dtf_marker", repository: "dtf"}`
+    ///
+    /// From `public/packages/dtf_marker` of the same run. The two checksums are
+    /// the ones the real client wrote into `mix.lock` for this package.
+    const GOLDEN_PACKAGE_PAYLOAD: &str = "0A4B0A05312E302E3012204157D617FA279E00440545FBDB0BB74B8E0A96A776DAACCE33C690721F09A9C12A209C3091FB556D0B0AA0BD5DF5A40466B1C18BAC00538D0169A35E067598FF7456120A6474665F6D61726B65721A03647466";
+
+    /// `inner_checksum` of `dtf_marker-1.0.0` — the `CHECKSUM` member of the
+    /// real tarball, and the second checksum in the client's `mix.lock` entry.
+    const GOLDEN_INNER_CHECKSUM_HEX: &str =
+        "4157D617FA279E00440545FBDB0BB74B8E0A96A776DAACCE33C690721F09A9C1";
+
+    /// `outer_checksum` of `dtf_marker-1.0.0` — SHA-256 over the whole `.tar`.
+    const GOLDEN_OUTER_CHECKSUM_HEX: &str =
+        "9C3091FB556D0B0AA0BD5DF5A40466B1C18BAC00538D0169A35E067598FF7456";
+
     fn to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02X}", b)).collect()
+    }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -490,6 +519,13 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_versions_payload_matches_real_hex_client_golden_bytes() {
+        let payload =
+            encode_versions_payload("dtf", &[("dtf_marker".to_string(), vec!["1.0.0".into()])]);
+        assert_eq!(to_hex(&payload), GOLDEN_VERSIONS_PAYLOAD);
+    }
+
+    #[test]
     fn test_encode_versions_payload_round_trips_through_prost() {
         let payload =
             encode_versions_payload("dtf", &[("dtf_marker".to_string(), vec!["1.0.0".into()])]);
@@ -518,6 +554,21 @@ mod tests {
                 "2.0.0".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_encode_package_payload_matches_real_hex_client_golden_bytes() {
+        let payload = encode_package_payload(
+            "dtf",
+            "dtf_marker",
+            &[HexRelease {
+                version: "1.0.0".to_string(),
+                inner_checksum: from_hex(GOLDEN_INNER_CHECKSUM_HEX),
+                outer_checksum: from_hex(GOLDEN_OUTER_CHECKSUM_HEX),
+                dependencies: vec![],
+            }],
+        );
+        assert_eq!(to_hex(&payload), GOLDEN_PACKAGE_PAYLOAD);
     }
 
     #[test]
