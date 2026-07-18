@@ -73,6 +73,130 @@ jobs:
           .github/scripts/assert-release-absent.sh "${GITHUB_REF_NAME}"
 
   # ════════════════════════════════════════════════════════════════════════════
+  # RESOLVE CANDIDATE IMAGE DIGEST  (issue #2696)
+  #
+  # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
+  # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. Nothing
+  # connects the two workflows except this poll of the registry. Once
+  # merge-backend has pushed the tag, `assert-stable-tag-free` in
+  # docker-publish.yml guarantees it can never be re-pointed, so the
+  # tag->digest binding is stable the moment it first resolves.
+  #
+  # This job blocks the release gate until that manifest list exists and
+  # captures its digest, so the gate deploys and tests the EXACT bytes that
+  # will be published -- not :dev, not a fresh source build. It also confirms
+  # openscap + web :${VERSION} exist, because the gate's version-set-integrity
+  # check probes web before it will run.
+  #
+  # Ordering (A5): preflight -> resolve (blocks <=35 min on the publish) ->
+  # release-gate/mesh -> build-binaries -> verify-images-published -> release.
+  # The GitHub Release object still publishes strictly last; this job only
+  # moves the gate's START to after the candidate bytes exist.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  resolve-candidate-digest:
+    name: Resolve candidate image digest
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    # docker-publish's multi-arch build + cosign + provenance takes 15-25 min
+    # (see verify-images-published comment below); poll with a 35-min internal
+    # deadline inside a 40-min job timeout.
+    timeout-minutes: 40
+    permissions:
+      packages: read
+    outputs:
+      backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Wait for docker-publish to publish :$VERSION and capture its digest
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Resolving candidate images for version: ${VERSION}"
+
+          # Same ghcr token-exchange + Accept headers as verify-images-published
+          # (this file, below). The only difference is we issue a HEAD (-sI) and
+          # read the Docker-Content-Digest response header instead of discarding
+          # the body with -o /dev/null.
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          # Resolve a ghcr image's manifest-list digest from the
+          # Docker-Content-Digest response header. Prints "sha256:..." on
+          # success; prints nothing and returns non-zero when the tag is not
+          # published yet (so the caller keeps polling).
+          resolve_ghcr_digest() {
+            local name="$1"; local tag="$2"
+            local token digest
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            # --proto =https refuses HTTPS->HTTP redirects so the Bearer token
+            # can never leak over plaintext. -I issues a HEAD; the header name
+            # is case-insensitive, and awk keeps the LAST match so a redirected
+            # response (multiple header blocks) still yields the final digest.
+            digest=$(curl -sI --proto =https \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}" \
+              | tr -d '\r' \
+              | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }')
+            [ -n "${digest}" ] || return 1
+            printf '%s' "${digest}"
+          }
+
+          # Poll for up to 35 minutes; a dead docker-publish must fail this job
+          # RED (exit 1) rather than let a skipped gate slip the release through.
+          DEADLINE=$(($(date +%s) + 35*60))
+
+          BACKEND_DIGEST=""
+          echo ""
+          echo "Polling ghcr backend:${VERSION} for its manifest-list digest"
+          while true; do
+            BACKEND_DIGEST="$(resolve_ghcr_digest "artifact-keeper/artifact-keeper-backend" "${VERSION}" || true)"
+            if [ -n "${BACKEND_DIGEST}" ]; then
+              echo "  ✓ backend:${VERSION} -> ${BACKEND_DIGEST}"
+              break
+            fi
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "::error title=Candidate not published::backend:${VERSION} not on ghcr.io after 35m -- docker-publish.yml did not finish. Release blocked."
+              exit 1
+            fi
+            echo "  not yet present, waiting 30s..."
+            sleep 30
+          done
+
+          # The gate's version-set-integrity check probes web (and openscap) at
+          # :${VERSION} before it will run, so confirm they exist too -- the gate
+          # must not start against a half-published image set. These are pinned
+          # by tag in v1, so we only assert existence, not a digest.
+          for extra in artifact-keeper-openscap artifact-keeper-web; do
+            echo ""
+            echo "Confirming ghcr ${extra}:${VERSION} is present"
+            while true; do
+              if [ -n "$(resolve_ghcr_digest "artifact-keeper/${extra}" "${VERSION}" || true)" ]; then
+                echo "  ✓ ${extra}:${VERSION} present"
+                break
+              fi
+              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                echo "::error title=Candidate not published::${extra}:${VERSION} not on ghcr.io after 35m. Release blocked."
+                exit 1
+              fi
+              echo "  not yet present, waiting 30s..."
+              sleep 30
+            done
+          done
+
+          echo ""
+          echo "backend_digest=${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
+          echo "Candidate resolved: backend ${VERSION}@${BACKEND_DIGEST}"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -87,18 +211,27 @@ jobs:
 
   mesh-e2e-gate:
     name: Mesh Replication E2E (optional)
-    needs: [release-preflight]
+    # Advisory, but it was the last `dev` literal on the release path; run it
+    # against the published candidate tag like everything else.
+    needs: [release-preflight, resolve-candidate-digest]
     uses: ./.github/workflows/mesh-e2e.yml
     with:
-      image_tag: dev
+      image_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
     secrets: inherit
 
   release-gate:
     name: Release Gate (Full Suite)
-    needs: [release-preflight]
+    # Gate must not start until the candidate manifest exists (resolve blocks on
+    # the publish). It then deploys the EXACT published bytes: version tag +
+    # manifest-list digest for the backend, version tag for web (was defaulting
+    # to :latest). The digest input is consumed by release-gate.yml (#261,
+    # already merged) as `name:tag@sha256:...` deploy refs.
+    needs: [release-preflight, resolve-candidate-digest]
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
-      backend_tag: dev
+      backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
+      backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
+      web_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       test_suite: all
     secrets: inherit
 
@@ -240,7 +373,10 @@ jobs:
     # where it quietly skipped this job -- and a skipped required gate then
     # skipped the release itself after an hour of work, with nothing red to
     # explain why. The workflow only triggers on v-tags now.
-    needs: [build-binaries]
+    #
+    # `resolve-candidate-digest` is added so the digest-equality tripwire below
+    # can compare what was published against what the gate tested.
+    needs: [build-binaries, resolve-candidate-digest]
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -394,6 +530,52 @@ jobs:
           fi
           echo ""
           echo "All required images present on ghcr.io AND docker.io for version ${VERSION}."
+
+      # ── Candidate-digest tripwire (issue #2696) ─────────────────────────────
+      # Re-resolve the published ghcr backend:${VERSION} digest and assert it
+      # EQUALS the digest resolve-candidate-digest handed the gate. With
+      # docker-publish's `assert-stable-tag-free` in place a mismatch should be
+      # impossible; this step makes "bytes tested == bytes published" observable
+      # and RED per release -- the direct "prove it" artifact for the bar. Paste
+      # this line, the gate's pod-imageID assertion, and resolve's output into
+      # the release record; all three must be the same sha256:.
+      - name: Assert published backend digest == gate-tested digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_DIGEST: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          NAME="artifact-keeper/artifact-keeper-backend"
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${NAME}:pull" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            | jq -r '.token // empty')
+          [ -n "${token}" ] || { echo "::error::could not obtain a ghcr pull token for ${NAME}"; exit 1; }
+
+          # shellcheck disable=SC2086
+          published=$(curl -sI --proto =https \
+            -H "Authorization: Bearer ${token}" \
+            ${MANIFEST_ACCEPT} \
+            "https://ghcr.io/v2/${NAME}/manifests/${VERSION}" \
+            | tr -d '\r' \
+            | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }')
+
+          echo "gate-tested digest : ${EXPECTED_DIGEST}"
+          echo "published digest   : ${published}"
+
+          if [ -z "${EXPECTED_DIGEST}" ]; then
+            echo "::error::resolve-candidate-digest produced no digest; cannot verify parity."; exit 1
+          fi
+          if [ -z "${published}" ]; then
+            echo "::error::could not resolve published backend:${VERSION} digest from ghcr.io."; exit 1
+          fi
+          if [ "${published}" != "${EXPECTED_DIGEST}" ]; then
+            echo "::error title=Candidate digest drift::bytes drifted between gate and publish -- the gate tested ${EXPECTED_DIGEST} but ghcr backend:${VERSION} now resolves to ${published}."
+            exit 1
+          fi
+          echo "OK: bytes tested == bytes published (${published})."
 
   # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE
