@@ -177,6 +177,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
 
+    // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
+    // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
+    // databases, so running them unconditionally is safe -- and it is
+    // necessary: an operator who applies migrations out-of-band with
+    // SKIP_MIGRATIONS=true still needs the ledger renumbered, otherwise the
+    // v1.5.7/v1.5.8 -> 1.6.0 upgrade aborts (issue #2686) and any later
+    // out-of-band `sqlx migrate` hits the same VersionMismatch the repair
+    // exists to clear.
+    artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
+    artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool).await?;
+    artifact_keeper_backend::migration_repair::repair_release_1_5_x_divergence(&db_pool).await?;
+
     // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
         .unwrap_or_default()
@@ -186,9 +198,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
-        artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
-            .await?;
         // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
