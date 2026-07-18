@@ -1437,12 +1437,22 @@ mod tests {
     /// Fail-closed object guard: a 154 row carrying the storage_key_index
     /// checksum but with NO backing `idx_artifacts_storage_key` object (a
     /// phantom ledger) must NOT be renumbered - the migrator should still
-    /// fail closed rather than boot without the #2504 index. The isolated
-    /// schema has no `public.idx_artifacts_storage_key`, so this exercises
-    /// the missing-object path directly.
+    /// fail closed rather than boot without the #2504 index.
+    ///
+    /// This runs in an isolated *database* (not just a schema), because the
+    /// object guard resolves `public.idx_artifacts_storage_key` and the
+    /// shared CI Postgres already has every migration - including 157 - applied
+    /// to `public` before the test suite runs. A schema-isolated pool would
+    /// still see that real index and the guard would (correctly) proceed,
+    /// making the assertion flap by environment. A fresh throwaway database
+    /// has an empty `public`, so the index genuinely does not exist and the
+    /// missing-object path is exercised deterministically. Seed the ledger by
+    /// hand (a version-154 row with the storage_key checksum) WITHOUT creating
+    /// the index object; skips silently without `DATABASE_URL`.
     #[tokio::test]
     async fn v1_5_x_repair_no_op_when_storage_key_index_missing() {
-        let Some((url, schema, pool)) = setup_isolated_pool("issue2686_phantom").await else {
+        let Some((admin_url, name, pool)) = setup_scratch_database("issue2686_phantom").await
+        else {
             return;
         };
         create_sqlx_migrations_table(&pool).await;
@@ -1468,7 +1478,6 @@ mod tests {
             "no 157 row must be created for a phantom ledger"
         );
 
-        drop(pool);
-        drop_isolation_schema(&url, &schema).await;
+        drop_scratch_database(&admin_url, pool, &name).await;
     }
 }
