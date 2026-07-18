@@ -94,6 +94,18 @@ jobs:
       - name: Check auth-event audit coverage
         run: ./scripts/ci/check-auth-event-audit.sh
 
+      # Migration-ledger divergence guardrail (#2689): fail the build if `main`
+      # and an active `release/*` branch assign the SAME migration version
+      # number to DIFFERENT content, which bricks upgrades across the fork with
+      # `sqlx migrate run` VersionMismatch (root cause of #2686). Known/handled
+      # divergences (release/1.5.x slots 154/155, reconciled by
+      # migration_repair::repair_release_1_5_x_divergence) are pinned by SHA-384
+      # in scripts/ci/migration-ledger-allowlist.txt; only NEW, unhandled reuse
+      # fails. The script self-fetches the release branches (git fetch
+      # --depth=1), so the shallow default checkout above needs no depth change.
+      - name: Check migration-ledger divergence
+        run: ./scripts/ci/check-migration-ledger.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",

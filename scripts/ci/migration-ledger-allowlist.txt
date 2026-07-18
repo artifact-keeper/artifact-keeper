@@ -1,0 +1,37 @@
+# Migration-ledger divergence allowlist (issue #2689)
+#
+# check-migration-ledger.sh FAILS the build when `main` and an active
+# `release/*` branch assign the SAME migration version number to DIFFERENT
+# content (different filename and/or different file bytes). That reuse is a
+# ledger divergence: a database that applied the release-branch migration N
+# carries a checksum that `sqlx migrate run` then rejects against main's
+# migration N on upgrade (VersionMismatch(N)) -- the exact class of bug that
+# bricked v1.5.x -> 1.6.0 upgrades (#2686, 1st occurrence was release/1.1.x
+# slots 73-75).
+#
+# An entry here declares a KNOWN, HANDLED divergence. Every entry must be
+# reconciled at runtime by a `backend/src/migration_repair.rs` routine that
+# renumbers the release-branch checksum onto its main slot on upgrade.
+# Without both the repair routine AND the allowlist entry, a divergence must
+# fail: either add a migration_repair reconciliation + an allowlist entry, or
+# renumber the migration so the version numbers no longer collide.
+#
+# Format (one divergence per line, whitespace-separated; `#` starts a comment):
+#
+#   <release_branch>  <version>  <main_filename>  <main_sha384>  <release_filename>  <release_sha384>
+#
+# The pair is pinned by SHA-384 of the file bytes on BOTH sides. If either
+# side's content later changes, the pin no longer matches and the build fails
+# again -- forcing a fresh review of the reconciliation. `main_*` is the file
+# in the current tree (HEAD); `release_*` is the file on the named branch.
+
+# --- release/1.5.x slots 154 & 155 (#2686) ------------------------------------
+# main 154 = webhook_deliveries_claim ; release/1.5.x 154 = artifacts_storage_key_index
+# (byte-identical to main's 157). Reconciled by
+# migration_repair::repair_release_1_5_x_divergence: 154 -> 157 on upgrade.
+release/1.5.x  154  154_webhook_deliveries_claim.sql  58a85b511b2fd5cba56a8b19f1fb79dece519aab2e54ded5c07fc32600f7189b32b9246deb7194cbd8d9f03dfcc4ea30  154_artifacts_storage_key_index.sql  e4648192b5bb34ad41fa716ba893358a874b78faa9ce9265f2ec4cff8edae2947be431b3300a5207b375207ece1e78b4
+
+# main 155 = projects ; release/1.5.x 155 = maven_flat_object_attribution
+# (byte-identical to main's 163, applied only on v1.5.8). Reconciled by
+# migration_repair::repair_release_1_5_x_divergence: 155 -> 163 on upgrade.
+release/1.5.x  155  155_projects.sql  83f0c782c3d027e6ab5360629c7932a8a25624442550585ab743a3342a66057d5804debeee9e2e7570cd91d98d885524  155_maven_flat_object_attribution.sql  19034ca283f2ad31d3b116ba7a6e09fd1f5206022c063d8424845eabc12f62b1eb0e36a1a4a95bf9b4cdd5feee4494c1
