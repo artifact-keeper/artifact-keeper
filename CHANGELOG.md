@@ -5,20 +5,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - TBD
+
+A security- and correctness-hardening release closing the 1.6.0 milestone: 24 security fixes, 9 features and enhancements, and 47 bug fixes, spanning multi-tenant isolation, supply-chain signing, ingestion/scan resource limits, native-client format fidelity across a dozen ecosystems, proxy/cache accounting, and SSO group mapping. It also folds in the cross-repository Maven flat-key attribution hardening and the npm replication-feed and webhook cluster-safety fixes carried over from the 1.5.x hotfix line. In-place upgrade from 1.5.x is automatic — a startup migration-ledger reconciliation resolves the history divergence with no operator action (#2686). The release date is stamped at cut.
 
 ### Security
 
 - **Row-less Maven flat-key objects are attributed to their owning repository on shared cloud storage** (#2574, #2584): #2504 hardened shared cloud namespaces (S3/GCS/Azure) by refusing to serve any bare `maven/{path}` object not anchored to an artifact row scoped to the requesting repository. That also stopped serving legitimate *row-less* legacy objects — GAV-grouped companion files (`.pom`, `.module`, `-sources.jar`), verbatim `maven-metadata.xml`, and stored checksum sidecars — because a row-less object on a flat namespace carries no inherent repository attribution. This change adds a catalog-derived attribution mechanism (`services/maven_flat_attribution`, backed by the new `maven_flat_object_owner` table in migration 163) that resolves the single owning repository of a flat key from live artifact rows, parent-artifact metadata (including single-owner artifact-, SNAPSHOT-, and group-level `maven-metadata.xml` rollups), and a first-writer-wins claim recorded on write. Reads serve a row-less object only to its genuine owner and 404 for everyone else; keys owned by two or more repositories (ambiguous) and truly-orphan keys stay unreadable on cloud backends. Every Maven flat-key write is guarded before it reaches storage: overwriting a key owned by a different repository is refused with `403`. The pre-write guard is read-only; the attribution claim is committed only after the object bytes are successfully written, so an aborted or coordinate-invalid write can never flip ownership of a foreign unattributed key — closing the write-side cross-repository poisoning and claim-based read-back gap (#2584). Filesystem backends, which physically isolate each repository's key space, are unaffected — every legacy read and write behaves exactly as before.
+- **Cross-repository authorization hardened** across the promotion-rules, approval, curation, signing, and quality routes (#2443).
+- **Quality-check results can no longer be read across repository boundaries** (#2437).
+- **gRPC methods enforce token action scopes** instead of authorizing on admin status alone (#2432).
+- **npm virtual-repo scope policies now cover tarball and direct-remote paths**, support glob patterns, and are configurable at create time and in the UI (#2424).
+- **Storage stats no longer expose a cross-tenant deduplication existence oracle** via shared-bytes on cloud backends (#2560).
+- **The promotion "require signature" gate is now enforced** and honors key revocation (#2535).
+- **Signing-key rotation is atomic** — concurrent rotations can no longer orphan keys or leave the instance without an active signing key (#2534).
+- **Repeated signing-key rotations no longer wedge the key on a name-length limit** (#2543).
+- **Rotating registry signing keys now requires authorization** — previously any authenticated user could rotate them (#2513).
+- **Debian `Release`/`Release.gpg` are rendered deterministically** so the detached signature always matches the served bytes, eliminating spurious apt-secure "BAD signature" errors on untampered repos (#2652).
+- **Helm `.prov` provenance files are stored and served** instead of silently discarded, so `helm pull --verify` can succeed (#2635).
+- **Upload-time archive extraction is now bounded**, closing a decompression-bomb surface at ingestion (separate from scanning) (#2556).
+- **Added a concurrent-extraction cap** so per-request extraction budgets can't be multiplied across parallel uploads (#2561).
+- **Scan-archive extraction is bounded**, preventing scan-workspace disk exhaustion (#2514).
+- **Added a global concurrent extraction budget for scanning**, on top of the per-archive cap (#2540).
+- **Removed an unbounded dead-code extraction path** that could have reintroduced the decompression bomb if re-wired (#2541).
+- **Remote-instance proxying no longer buffers request and response bodies unbounded** (#2515).
+- **Scan scheduling applies per-user/tenant fairness** so a single tenant can't monopolize the scan queue (#2555).
+- **Reading and modifying plugin configuration now requires authorization** — previously any authenticated user could do both (#2512).
+- **Plugin callback SSRF guards hardened** ahead of enabling webhook/validator dispatch (#2536).
+- **npm virtual-repo scope filtering scrubs package names in kept keys' values** (`/-/by-user`), scalar keys, and search siblings (#2594).
+- **npm scope filtering also covers the legacy `/-/all` and `/-/by-user` map response shapes** (#2542).
+- **npm metadata filtering fails closed on unrecognized response shapes** instead of passing them through (#2551).
+- **CVE blast-radius reports enumerate users who can access a restricted repo but haven't downloaded the affected artifact** (#2386).
 
 ### Added
 
 - **Opt-in upstream change-feed subscription for proactive npm packument invalidation** (#2249): a small, generic feed-subscription framework (`services/upstream_feed.rs`) that consumes an upstream's change stream and proactively drops now-stale cached metadata, tightening freshness below the packument cache's TTL/stale-while-revalidate floor. The first adapter polls npm's `replicate.npmjs.com/_changes` and, per changed package, evicts the computed packuments in every remote npm repository whose upstream the feed covers (host-scoped to `registry.npmjs.org`/`registry.npmjs.com`) and in every virtual repo containing one — reusing the same fan-out as the local-write invalidation path. Consumption is **off by default** and gated behind `NPM_UPSTREAM_FEED_ENABLED` (also requires the packument cache; feed URL configurable via `NPM_UPSTREAM_FEED_URL`, validated against SSRF at the entry point). A single consumer runs cluster-wide via the existing advisory-lock primitive in bounded 5-minute leadership terms so a silently-lost lock reconverges to one consumer; first enablement starts at the feed head (never replaying npm's full change history); the resume cursor is persisted per feed in `upstream_feed_state` (migration 156). The feed is a freshness optimisation, never the correctness mechanism — the TTL/SWR floor still bounds staleness if the consumer is disabled or failing.
+- **Advanced Debian/APT repository functionality** (#2407).
+- **Debian proxy hardening** — SSRF, integrity, and cache safety for remote APT repositories (#2459).
+- **Debian distribution/component/architecture filtering for proxied repositories** (#2460).
+- **Debian hosted repositories support `Release` metadata customization** (#2489).
+- **RPM curation: the trusted GPG key is now configurable through the create/update API** (#2568).
+- **Real deduplicated storage usage per repository and folder** (#2056).
+- **Structured audit-log export with a published, versioned schema for SIEM ingestion** (#2413).
+- **Proxy-cache downloads are now counted correctly on first serve** (#2537).
+- **Scanner UX** — not-applicable image-family rows are collapsed in results, and `TRIVY_ADAPTER_URL` is documented in the base compose (#2471).
 
 ### Fixed
 
 - **npm replication-feed adapter now speaks the real `replicate.npmjs.com` dialect** (#2249, #2258): the feed consumer spoke a CouchDB long-poll dialect the real endpoint (`engine: npm-replicate`) rejects with 400 — it sent `feed=longpoll`, `timeout=`, `limit=` and `since=now`, all unsupported — so the consumer error-looped at the backoff cap and could never invalidate anything. It now polls with a numeric `since` + `limit` only, bootstraps the head cursor from the feed root's `update_seq` (never replaying npm's ~119M-event history from genesis), paces idle polls at 30s (no long-poll to block server-side), caps `_changes` and root response bodies at 8 MiB (an unbounded upstream body previously OOM'd AK, #1607/#1608), escalates persistent poll/bootstrap failures from debug to warn so a permanently-broken feed is visible, and scrubs credentialed feed URLs out of error logs via `without_url()`. The feed remains off by default and a best-effort freshness optimisation over the packument cache's TTL/SWR floor.
 - **Webhook retry deliveries are claimed atomically before the re-POST** (#2219): with multiple backend replicas sharing one database, every replica's retry tick selected the same due deliveries, so one failed delivery could be re-POSTed once per replica per tick — and exhausting `max_attempts` could fire the dead-letter auto-disable notifier once per replica. Due deliveries are now claimed in a single `FOR UPDATE SKIP LOCKED` statement with a per-claim token (the same `cluster_work` pattern as the #2275 sync-task claim), the claim is re-extended immediately before each send, and success/retry/dead-letter updates are token-guarded so a stale owner cannot clobber a re-claimed delivery. A crashed replica's claim simply expires, making the delivery due again with no operator action.
+- **Alpine: APKINDEX is now consumable by real apk clients** (checksum, tar typeflag, and size fields fixed) (#2633).
+- **Alpine: APKINDEX signing failures now fail the request** instead of silently serving an unsigned index (#2660).
+- **RubyGems: specs index is served in the Marshal format** gem/bundler expect, making hosted repos usable (#2630).
+- **conda: token-authenticated channels no longer return 401** on repodata and downloads (#2629).
+- **NuGet: registration leaf no longer advertises a download URL that 404s** (#2656).
+- **NuGet: `dotnet nuget push --api-key` works** — the API-key header is now recognized by repo-visibility checks (#2642).
+- **Hex: hosted repositories serve the signed registry format `mix deps.get` requires**, instead of JSON (#2641).
+- **CocoaPods: hosted repos serve a CDN layout** so `pod repo add-cdn` and `pod install` work (#2638).
+- **Terraform: hosted providers are usable by real clients** — fixed the advertised download URL and opened the network mirror beyond remote-only (#2647).
+- **Helm: remote/proxy repositories serve provenance**, so `helm pull --verify` works against them (#2653).
+- **RPM: fixed hosted repositories returning 404** (#2580).
+- **RPM: repodata signing now produces a verification chain dnf accepts** (#2636).
+- **RPM: remote sync and on-demand package search (phase 2)** (#2357).
+- **RPM: large-repodata tier pinned with a regression test** (#2664).
+- **Metadata signing configuration rejects key types that can never produce verifiable signatures (RSA)** (#2651).
+- **Git LFS: file locking works** instead of returning 500 on every lock request (#2627).
+- **Mixed-backend deployments no longer 404 their own objects** — Maven storage keys are qualified by backend (#2671).
+- **Azure deployments no longer silently lose all remote/proxy repositories** (#2670).
+- **Invalid `STORAGE_BACKEND` values now fail startup** instead of silently falling back to filesystem and disabling cross-tenant guards (#2669).
+- **Docker repository storage usage now includes OCI layer blobs** (previously showed KiBs for GiB repos) (#2625).
+- **OCI blob report endpoint no longer returns 500** (#2626).
+- **Per-repository storage usage now includes proxy-cached storage** (#2218).
+- **Download statistics no longer silently miss artifact downloads** (#2260).
+- **Maven/Ivy downloads on S3 use presigned-URL redirects** instead of streaming through the backend (#1945).
+- **Proxy metadata buffering is now capped across concurrent requests**, not just per request (#2665).
+- **Proxy-cached artifacts are now cataloged in the database**, fixing storage accounting, download tracking, and cache visibility (#2270).
+- **Warm proxy-cache hits no longer pay 300ms+ per request** in repeated cache-metadata roundtrips (#2301).
+- **Virtual Maven repositories no longer iterate all members on every `maven-metadata.xml` request** (~200ms saved per request) (#2302).
+- **Remote repositories support a custom User-Agent on outbound requests** (#2080).
+- **Service-account-typed private-repo permission grants are honored** instead of silently ignored (#2433).
+- **Service-account grants are validated for principal type/ID correspondence**, and direct service-account grants now surface on group targets (#2503).
+- **SAML: assertion groups map to group memberships**, matching OIDC behavior (#2333).
+- **Web UI toggle for the OIDC "map groups to groups" setting** (#1879).
+- **Guest-access guard recognizes format-specific credentials** (conda URL token, NuGet API key) when guest access is disabled (#2655).
+- **Docs: SSO admin guidance on group mapping** — trusting the IdP's group taxonomy and privileged-group name collisions (#2493).
+- **In-place upgrade from 1.5.x boots cleanly** — the migration-ledger divergence between the 1.5.x hotfix line and 1.6.0 is reconciled automatically at startup (#2686).
+- **CI now fails the build when main and a release branch reuse a migration version number for different content** (#2689).
+- **Fixed a column-decoding error when migrating to 1.2.0-era schemas** (#2456).
+- **Curation package detail routes no longer 404 for everyone** (#2447).
+- **Quality-checks admin page works** — the backend now supports list-all and repository filtering (#2419).
+- **Backend Trivy health check works with Docker service hostnames**, not just direct IPs (#2478).
+- **Release-gate CVE image check no longer flakes on Trivy vulnerability-DB rate limits** (#2167).
+- **docker-publish tag verification no longer wrongly requires a version-matched scanner-adapter image** (#2428).
+- **Fixed a source-scan false failure on clean builds** (streaming-invariant allowlist drift) (#2491).
+- **Fixed a flaky test that asserted row order from an unordered query** (#2663).
 
 ## [1.5.3] - 2026-07-12
 
