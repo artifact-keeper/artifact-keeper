@@ -981,8 +981,9 @@ async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
 
 /// One row of the curation-sync work query: `(staging_id, format,
 /// remote_id, upstream_url, default_action, sync_interval_secs,
-/// trusted_gpg_key)`. Named to keep the `query_as` type off clippy's
-/// `type_complexity` radar (#2357 added the trusted-key column).
+/// trusted_gpg_key, allow_unverified)`. Named to keep the `query_as` type off
+/// clippy's `type_complexity` radar (#2357 added the trusted-key column; #2569
+/// added the fail-closed opt-out flag).
 type CurationSyncRow = (
     uuid::Uuid,
     String,
@@ -991,7 +992,37 @@ type CurationSyncRow = (
     String,
     i32,
     Option<String>,
+    bool,
 );
+
+/// Outcome of the keyless RPM curation-sync gate (#2569). When no trusted GPG
+/// key is configured, the sync no longer defaults open: it is fail-closed and
+/// ingests nothing unless the repo has explicitly opted into unverified
+/// upstream ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeylessSync {
+    /// The repo opted into unverified upstream (`curation_allow_unverified =
+    /// true`): proceed, but treat the batch as UNVERIFIED (no checksum-chain
+    /// enforcement — the legacy pre-#2357 behavior, preserved for existing
+    /// keyless repos that opt in).
+    ProceedUnverified,
+    /// No trusted key and no opt-in: refuse (fail-closed default). Skip this
+    /// repo — zero packages ingested — rather than trusting unauthenticated
+    /// upstream metadata.
+    Refuse,
+}
+
+/// Decide the keyless-upstream outcome (#2569). Pure so the fail-closed default
+/// is unit-testable without any DB or network I/O: `false` (no opt-in) must be
+/// `Refuse`; only an explicit `curation_allow_unverified = true` opts back into
+/// the legacy unverified-ingest behavior.
+fn keyless_sync_decision(allow_unverified: bool) -> KeylessSync {
+    if allow_unverified {
+        KeylessSync::ProceedUnverified
+    } else {
+        KeylessSync::Refuse
+    }
+}
 
 /// Find all staging repos with curation enabled, fetch upstream metadata, and evaluate new packages.
 ///
@@ -1013,7 +1044,7 @@ pub(crate) async fn run_curation_sync_cycle(
     let repos: Vec<CurationSyncRow> = sqlx::query_as(
         r#"SELECT r.id, r.format::text, r.curation_source_repo_id, remote.upstream_url,
                       r.curation_default_action, r.curation_sync_interval_secs,
-                      remote.trusted_gpg_key
+                      remote.trusted_gpg_key, r.curation_allow_unverified
                FROM repositories r
                JOIN repositories remote ON remote.id = r.curation_source_repo_id
                WHERE r.curation_enabled = true
@@ -1035,8 +1066,16 @@ pub(crate) async fn run_curation_sync_cycle(
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
-    for (staging_id, format, remote_id, upstream_url, default_action, _interval, trusted_gpg_key) in
-        &repos
+    for (
+        staging_id,
+        format,
+        remote_id,
+        upstream_url,
+        default_action,
+        _interval,
+        trusted_gpg_key,
+        allow_unverified,
+    ) in &repos
     {
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
@@ -1080,7 +1119,11 @@ pub(crate) async fn run_curation_sync_cycle(
                 // detached signature over repomd.xml. Fail-closed — any fetch,
                 // parse, or verification failure skips this repo (zero packages
                 // ingested) rather than trusting unauthenticated metadata. With
-                // no trusted key the batch proceeds as "unverified upstream".
+                // no trusted key the sync is now ALSO fail-closed by default
+                // (#2569): it refuses to ingest unverified upstream metadata
+                // unless the repo has explicitly opted in via
+                // `curation_allow_unverified`, in which case the batch proceeds
+                // as "unverified upstream" (the legacy behavior).
                 // `verified` gates the primary.xml checksum-chain enforcement
                 // below: a signature over repomd alone does NOT authenticate a
                 // tampered primary — repomd's <checksum> must pin it.
@@ -1126,13 +1169,26 @@ pub(crate) async fn run_curation_sync_cycle(
                             }
                         }
                     }
-                    None => {
-                        tracing::warn!(
-                            "RPM curation sync: no trusted GPG key configured for staging repo {}; ingesting UNVERIFIED upstream metadata (set trusted_gpg_key to enforce upstream signatures)",
-                            staging_id
-                        );
-                        false
-                    }
+                    None => match keyless_sync_decision(*allow_unverified) {
+                        // Fail-closed default (#2569): no trusted key and no
+                        // explicit opt-in — refuse the upstream, ingest nothing.
+                        KeylessSync::Refuse => {
+                            tracing::warn!(
+                                "RPM curation sync: no trusted GPG key configured for staging repo {} and curation_allow_unverified is not set; refusing UNVERIFIED upstream (0 packages ingested). Set trusted_gpg_key to authenticate the upstream, or curation_allow_unverified=true to opt into unverified ingest.",
+                                staging_id
+                            );
+                            continue;
+                        }
+                        // Explicit opt-in: proceed as "unverified upstream"
+                        // (legacy behavior; no checksum-chain enforcement).
+                        KeylessSync::ProceedUnverified => {
+                            tracing::warn!(
+                                "RPM curation sync: no trusted GPG key configured for staging repo {}; curation_allow_unverified is set, ingesting UNVERIFIED upstream metadata (set trusted_gpg_key to enforce upstream signatures)",
+                                staging_id
+                            );
+                            false
+                        }
+                    },
                 };
 
                 // Parse the primary reference (href + repomd-pinned checksums)
@@ -1414,6 +1470,33 @@ mod tests {
             "nginx must be present after debian decompress+parse"
         );
         assert!(entries.iter().all(|e| e.format == "debian"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2569 — RPM curation keyless-sync fail-closed default
+    // -----------------------------------------------------------------------
+
+    /// The security-relevant guard: with NO trusted GPG key configured, a
+    /// curation sync must be fail-closed by DEFAULT — it refuses to ingest
+    /// unverified upstream metadata. Only an explicit opt-in
+    /// (`curation_allow_unverified = true`) reverts to the legacy
+    /// unverified-ingest behavior. Before #2569 the keyless path always
+    /// ingested unverified (equivalent to `ProceedUnverified` for both inputs);
+    /// this pins the flipped default.
+    #[test]
+    fn test_keyless_sync_defaults_fail_closed() {
+        // Default (no opt-in) -> refuse (0 packages ingested).
+        assert_eq!(
+            keyless_sync_decision(false),
+            KeylessSync::Refuse,
+            "keyless sync with no opt-in must be fail-closed (refuse), not ingest unverified"
+        );
+        // Explicit opt-in -> proceed as unverified (legacy escape hatch).
+        assert_eq!(
+            keyless_sync_decision(true),
+            KeylessSync::ProceedUnverified,
+            "curation_allow_unverified=true must opt back into unverified ingest"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -43,6 +43,11 @@ pub struct CreateRepositoryRequest {
     /// verification (#2568). `None` leaves the column NULL ("unverified
     /// upstream"). Validated by the handler before it reaches the service.
     pub trusted_gpg_key: Option<String>,
+    /// Opt into ingesting UNVERIFIED upstream metadata on the keyless RPM
+    /// curation-sync path (#2569). `None`/`Some(false)` keep the fail-closed
+    /// default (a keyless sync refuses to ingest); `Some(true)` reverts to the
+    /// legacy unverified-ingest behavior. Persisted in the create tx.
+    pub curation_allow_unverified: Option<bool>,
     /// User who is creating this repository. When set, the repository records
     /// this user as `created_by` and the creator is auto-granted the
     /// `developer` role scoped to the new repository (owner auto-grant), so the
@@ -75,6 +80,10 @@ pub struct UpdateRepositoryRequest {
     /// leaves the stored key unchanged. Validated by the handler before it
     /// reaches the service.
     pub trusted_gpg_key: Option<Option<String>>,
+    /// When `Some`, sets the keyless-sync unverified-ingest opt-in (#2569);
+    /// `None` leaves it unchanged. `Some(false)` restores the fail-closed
+    /// default; `Some(true)` opts into legacy unverified ingest.
+    pub curation_allow_unverified: Option<bool>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -773,6 +782,21 @@ impl RepositoryService {
                         .await
                         .map_err(|e| AppError::Database(e.to_string()))?;
                 }
+                // Keyless-sync unverified-ingest opt-in (#2569). Persisted in the
+                // same tx as the INSERT. Off the `Repository` model (the sync
+                // reads it via its own targeted query, like `trusted_gpg_key`);
+                // the column defaults false (fail-closed) so only an explicit
+                // value needs a write.
+                if let Some(allow_unverified) = req.curation_allow_unverified {
+                    sqlx::query(
+                        "UPDATE repositories SET curation_allow_unverified = $1 WHERE id = $2",
+                    )
+                    .bind(allow_unverified)
+                    .bind(repo.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
                 // Owner auto-grant: record the creator and grant them the
                 // `developer` role scoped to this repository, so the creator
                 // retains access under per-repo authorization. Runs inside the
@@ -1110,6 +1134,20 @@ impl RepositoryService {
                 "UPDATE repositories SET trusted_gpg_key = $1, updated_at = NOW() WHERE id = $2",
             )
             .bind(gpg_key.as_deref())
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        // Keyless-sync unverified-ingest opt-in (#2569). `None` leaves it
+        // unchanged; `Some(v)` sets it (false restores the fail-closed default,
+        // true opts into legacy unverified ingest).
+        if let Some(allow_unverified) = req.curation_allow_unverified {
+            sqlx::query(
+                "UPDATE repositories SET curation_allow_unverified = $1, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(allow_unverified)
             .bind(id)
             .execute(&self.db)
             .await
@@ -1785,6 +1823,7 @@ mod tests {
             format_key: None,
             project_id: None,
             trusted_gpg_key: None,
+            curation_allow_unverified: None,
             created_by: None,
         };
         assert_eq!(req.key, "my-repo");
@@ -1812,6 +1851,7 @@ mod tests {
             format_key: None,
             project_id: None,
             trusted_gpg_key: None,
+            curation_allow_unverified: None,
             created_by: None,
         };
         assert_eq!(
@@ -1838,6 +1878,7 @@ mod tests {
             promotion_only: None,
             project_id: None,
             trusted_gpg_key: None,
+            curation_allow_unverified: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -1860,6 +1901,7 @@ mod tests {
             promotion_only: None,
             project_id: None,
             trusted_gpg_key: None,
+            curation_allow_unverified: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -1880,6 +1922,7 @@ mod tests {
             promotion_only: None,
             project_id: None,
             trusted_gpg_key: None,
+            curation_allow_unverified: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -3039,6 +3082,7 @@ mod tests {
                 format_key: None,
                 project_id: None,
                 trusted_gpg_key: None,
+                curation_allow_unverified: None,
                 created_by: None,
             }
         }
@@ -3148,6 +3192,7 @@ mod tests {
                 versioning_enabled: None,
                 project_id: None,
                 trusted_gpg_key: Some(None),
+                curation_allow_unverified: None,
             };
             service.update(repo.id, clear_req).await.expect("clear gpg");
             assert!(
@@ -3167,6 +3212,7 @@ mod tests {
                 versioning_enabled: None,
                 project_id: None,
                 trusted_gpg_key: Some(Some(TEST_TRUSTED_PUB_KEY.to_string())),
+                curation_allow_unverified: None,
             };
             service.update(repo.id, set_req).await.expect("set gpg");
             assert_eq!(
@@ -3187,6 +3233,7 @@ mod tests {
                 versioning_enabled: None,
                 project_id: None,
                 trusted_gpg_key: None,
+                curation_allow_unverified: None,
             };
             service.update(repo.id, noop_req).await.expect("noop gpg");
             assert_eq!(
@@ -3196,6 +3243,107 @@ mod tests {
             );
 
             cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2569: the `curation_allow_unverified` opt-in round-trips through
+        /// create and update, and the column defaults false (fail-closed) when
+        /// the field is omitted. The column is read directly (it is off the
+        /// `Repository` model, like `trusted_gpg_key`) — the keyless sync path
+        /// consults it to decide whether to refuse or ingest unverified upstream.
+        #[tokio::test]
+        async fn test_curation_allow_unverified_create_update_roundtrip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+
+            let read_flag = |pool: PgPool, id: Uuid| async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT curation_allow_unverified FROM repositories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read curation_allow_unverified")
+            };
+
+            // Create with the field omitted -> column defaults false (fail-closed).
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Rpm))
+                .await
+                .expect("create rpm curation repo");
+            assert!(
+                !read_flag(pool.clone(), repo.id).await,
+                "default must be fail-closed (curation_allow_unverified = false)"
+            );
+
+            // A builder for an all-omitted update carrying only the opt-in flag,
+            // so each call gets its own owned request (update takes ownership).
+            let allow_update = |flag: Option<bool>| UpdateRepositoryRequest {
+                key: None,
+                name: None,
+                description: None,
+                is_public: None,
+                quota_bytes: None,
+                upstream_url: None,
+                promotion_only: None,
+                versioning_enabled: None,
+                project_id: None,
+                trusted_gpg_key: None,
+                curation_allow_unverified: flag,
+            };
+
+            // Update -> Some(true) opts into unverified ingest.
+            service
+                .update(repo.id, allow_update(Some(true)))
+                .await
+                .expect("set allow_unverified");
+            assert!(
+                read_flag(pool.clone(), repo.id).await,
+                "Some(true) update must set the opt-in"
+            );
+
+            // Update -> Some(false) restores the fail-closed default.
+            service
+                .update(repo.id, allow_update(Some(false)))
+                .await
+                .expect("clear allow_unverified");
+            assert!(
+                !read_flag(pool.clone(), repo.id).await,
+                "Some(false) update must restore fail-closed default"
+            );
+
+            // Update with the field omitted (None) -> unchanged. First set it
+            // true, then a no-op update (opt-in omitted), and assert it stays true.
+            service
+                .update(repo.id, allow_update(Some(true)))
+                .await
+                .expect("re-set allow_unverified");
+            service
+                .update(repo.id, allow_update(None))
+                .await
+                .expect("noop update");
+            assert!(
+                read_flag(pool.clone(), repo.id).await,
+                "omitted field must leave the opt-in unchanged"
+            );
+
+            // Create with Some(true) -> persisted in the create tx.
+            let suffix2 = format!("{}", uuid::Uuid::new_v4().simple());
+            let mut create_true = make_create_req(&suffix2, RepositoryFormat::Rpm);
+            create_true.curation_allow_unverified = Some(true);
+            let repo2 = service
+                .create(create_true)
+                .await
+                .expect("create with opt-in");
+            assert!(
+                read_flag(pool.clone(), repo2.id).await,
+                "create with Some(true) must persist the opt-in"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+            cleanup_repo(&pool, repo2.id).await;
         }
 
         /// Regression (#1783 HIGH): a duplicate key on create must roll back the

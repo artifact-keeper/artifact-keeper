@@ -571,6 +571,12 @@ pub struct CreateRepositoryRequest {
     /// the response exposes only the boolean `has_trusted_gpg_key`, never the
     /// key material.
     pub trusted_gpg_key: Option<String>,
+    /// Opt into ingesting UNVERIFIED upstream metadata on the keyless RPM
+    /// curation-sync path (#2569). Omit or `false` to keep the fail-closed
+    /// default (a keyless curation sync refuses to ingest unverified upstream
+    /// packages); `true` reverts to the legacy unverified-ingest behavior. Only
+    /// meaningful for RPM curation staging repositories.
+    pub curation_allow_unverified: Option<bool>,
     /// Custom Origin field for Debian/APT Release files.
     /// Stored in `repository_config` under `apt_origin`.
     pub apt_origin: Option<String>,
@@ -683,6 +689,11 @@ pub struct UpdateRepositoryRequest {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
     pub trusted_gpg_key: Option<Option<String>>,
+    /// Update the keyless-sync unverified-ingest opt-in (#2569). When provided,
+    /// sets `curation_allow_unverified` (`false` restores the fail-closed
+    /// default; `true` opts into legacy unverified ingest). Omit to leave it
+    /// unchanged.
+    pub curation_allow_unverified: Option<bool>,
     /// Custom Origin field for Debian/APT Release files. Pass an empty string
     /// to reset to the default ("artifact-keeper").
     /// Stored in `repository_config` under `apt_origin`.
@@ -2466,6 +2477,9 @@ pub async fn create_repository(
             // Trusted upstream GPG key for RPM curation (#2568). Already
             // validated up-front; the service persists it in the create tx.
             trusted_gpg_key: payload.trusted_gpg_key,
+            // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
+            // default; only an explicit `true` opts into unverified ingest.
+            curation_allow_unverified: payload.curation_allow_unverified,
             // Owner auto-grant: record the creator and grant them per-repo
             // access so they retain access under per-repo authorization.
             created_by: Some(auth.user_id),
@@ -3053,6 +3067,9 @@ pub async fn update_repository(
                 // Trusted upstream GPG key (#2568). Three-way: omit = unchanged,
                 // Some(None) = clear, Some(Some(key)) = set (already validated).
                 trusted_gpg_key: payload.trusted_gpg_key,
+                // Keyless-sync unverified-ingest opt-in (#2569): omit = unchanged,
+                // Some(false) = fail-closed default, Some(true) = unverified.
+                curation_allow_unverified: payload.curation_allow_unverified,
             },
         )
         .await?;
