@@ -751,6 +751,23 @@ pub async fn promote_artifact(
     }
 
     let new_artifact_id = Uuid::new_v4();
+
+    // Cross-repository write guard (#2511): the promotion copy re-uses the
+    // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
+    // shared-namespace cloud backend that key may already be owned by a third
+    // repository, so a grant-holding promoter could overwrite/collide another
+    // repo's object. This is the same guard the per-format upload handlers apply;
+    // it is skipped for repo-isolated (filesystem) backends where each repo has
+    // its own directory tree. `require_promotion_tenant_access` above already
+    // gates who may promote — this closes the residual write attribution hole.
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        target_repo.id,
+        &target_repo.storage_backend,
+        &artifact.storage_key,
+    )
+    .await?;
+
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
 
@@ -1000,6 +1017,28 @@ pub async fn promote_artifacts_bulk(
                 ));
                 continue;
             }
+        }
+
+        // Cross-repository write guard (#2511): fail just this item (not the
+        // batch) if the source's flat storage key is already owned by another
+        // repository on a shared-namespace cloud backend. Same guard the
+        // per-format upload handlers apply; skipped for repo-isolated
+        // (filesystem) backends. See the single-promote path for the rationale.
+        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+            &state.db,
+            target_repo.id,
+            &target_repo.storage_backend,
+            &artifact.storage_key,
+        )
+        .await
+        {
+            failed += 1;
+            results.push(failed_response(
+                source_display,
+                target_display,
+                e.to_string(),
+            ));
+            continue;
         }
 
         let source_storage = state.storage_for_repo(&source_repo.storage_location())?;

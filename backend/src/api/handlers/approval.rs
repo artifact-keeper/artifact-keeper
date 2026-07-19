@@ -827,6 +827,22 @@ pub async fn approve_promotion(
         }
     }
 
+    // Cross-repository write guard (#2511): the approval-execute copy re-uses the
+    // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
+    // shared-namespace cloud backend that key may already be owned by a third
+    // repository, so an approval-grant holder could overwrite/collide another
+    // repo's object. This is the same guard the per-format upload handlers apply;
+    // it is skipped for repo-isolated (filesystem) backends. The tenant-access
+    // gate above governs who may execute the approval — this closes the residual
+    // write attribution hole.
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        target_repo.id,
+        &target_repo.storage_backend,
+        &artifact.storage_key,
+    )
+    .await?;
+
     // Copy storage content
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;

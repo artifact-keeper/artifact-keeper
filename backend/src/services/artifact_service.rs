@@ -1994,6 +1994,33 @@ pub async fn guard_foreign_storage_key(
     Ok(())
 }
 
+/// Isolation-aware cross-repository write guard (service layer, `AppError`).
+///
+/// Same guard the per-format upload handlers apply through
+/// [`crate::api::handlers::proxy_helpers::guard_cross_repo_write`], but returning
+/// the service-layer [`AppError`] so `Result<_, AppError>` callers (promotion /
+/// approval copy paths) can invoke it with `?`. This is the single source of
+/// truth for the "skip repo-isolated backends, then check for a foreign owner"
+/// sequence — `guard_cross_repo_write` delegates here.
+///
+/// The foreign-owner check applies **only to shared-namespace (cloud) backends**.
+/// On a repo-isolated backend (`filesystem`) each repository has its own physically
+/// separate directory tree, so two repositories legitimately hold the same
+/// coordinate key without colliding; running the check there would wrongly reject
+/// the second repository's write. `storage_backend` is therefore checked first and
+/// the guard is skipped for filesystem.
+pub async fn guard_foreign_storage_key_for_backend(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
+    if crate::storage::backend_is_repo_isolated(storage_backend) {
+        return Ok(());
+    }
+    guard_foreign_storage_key(db, repository_id, storage_key).await
+}
+
 /// Best-effort recorder for a completed local-artifact download (#2365).
 ///
 /// Writes real attribution (validated client IP or NULL, authenticated user
@@ -2234,6 +2261,68 @@ mod tests {
         guard_foreign_storage_key(&pool, repo_a, &key)
             .await
             .expect("same-repo soft-deleted reclaim must be allowed");
+    }
+
+    // -- #2511 cross-repo write guard on the promotion/approval copy paths -----
+    // These exercise `guard_foreign_storage_key_for_backend` — the isolation-aware
+    // guard the promotion (`promote_artifact` / `promote_artifacts_bulk`) and
+    // approval-execute copy sites now call before writing the SOURCE artifact's
+    // flat key into the TARGET repo.
+
+    #[tokio::test]
+    async fn test_promotion_guard_blocks_cross_repo_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (foreign_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // A third repository already owns the flat coordinate the promotion copy
+        // would re-use in `target_repo`.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, foreign_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // On a shared-namespace cloud backend the promotion/approval copy MUST be
+        // refused (409 Conflict) — this is the cross-tenant write hole (#2511).
+        let err = guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
+            .await
+            .expect_err("cross-repo-attributed key must be blocked on cloud");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_allows_cross_repo_key_on_filesystem_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (foreign_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, foreign_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // On a repo-isolated (filesystem) backend each repo has its own directory
+        // tree, so the same coordinate legitimately coexists — a legit
+        // cross-repo filesystem promotion must NOT be blocked.
+        guard_foreign_storage_key_for_backend(&pool, target_repo, "filesystem", &key)
+            .await
+            .expect("filesystem promotion must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_allows_same_repo_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // A legitimate same-tenant re-promotion of a key this repo already owns.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, target_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
+            .await
+            .expect("same-repo promotion must be allowed on cloud");
     }
 
     // -----------------------------------------------------------------------

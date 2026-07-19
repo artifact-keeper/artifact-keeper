@@ -3992,12 +3992,10 @@ pub async fn guard_cross_repo_write(
     storage_backend: &str,
     storage_key: &str,
 ) -> Result<(), Response> {
-    if crate::storage::backend_is_repo_isolated(storage_backend) {
-        return Ok(());
-    }
-    crate::services::artifact_service::guard_foreign_storage_key(
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
         &state.db,
         repository_id,
+        storage_backend,
         storage_key,
     )
     .await
