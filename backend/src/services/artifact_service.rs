@@ -388,6 +388,48 @@ impl ArtifactService {
         Ok(())
     }
 
+    /// Verify client-declared `x-checksum-*` headers against digests already
+    /// computed by the streaming stage pass, without re-reading the body.
+    ///
+    /// Semantically identical to [`Self::verify_checksums`] (same case-insensitive
+    /// comparison, same per-algorithm error messages) but takes the precomputed
+    /// [`ContentDigests`] instead of a full in-memory buffer. The streaming
+    /// upload path computes SHA-256/SHA-1/MD5 in a single pass while spooling the
+    /// body to scratch (#2517), so this makes the extra hashing passes that
+    /// `verify_checksums` performed unnecessary.
+    pub fn verify_declared_digests(
+        digests: &ContentDigests,
+        declared_sha256: Option<&str>,
+        declared_sha1: Option<&str>,
+        declared_md5: Option<&str>,
+    ) -> Result<()> {
+        if let Some(declared) = declared_sha256 {
+            if !declared.eq_ignore_ascii_case(&digests.sha256) {
+                return Err(AppError::Validation(format!(
+                    "SHA-256 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.sha256
+                )));
+            }
+        }
+        if let Some(declared) = declared_sha1 {
+            if !declared.eq_ignore_ascii_case(&digests.sha1) {
+                return Err(AppError::Validation(format!(
+                    "SHA-1 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.sha1
+                )));
+            }
+        }
+        if let Some(declared) = declared_md5 {
+            if !declared.eq_ignore_ascii_case(&digests.md5) {
+                return Err(AppError::Validation(format!(
+                    "MD5 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.md5
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Generate content-addressable storage key from checksum
     pub fn storage_key_from_checksum(checksum: &str) -> String {
         // Use first 4 chars for directory sharding: ab/cd/abcd...
@@ -2724,6 +2766,57 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains(declared));
         assert!(err.contains(&actual_sha256));
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_declared_digests (#2517): the streaming upload path verifies
+    // declared `x-checksum-*` headers against the digests computed in the single
+    // staging pass. It must be byte-for-byte equivalent to the old buffered
+    // `verify_checksums`.
+    // -----------------------------------------------------------------------
+
+    fn digests_of(data: &[u8]) -> ContentDigests {
+        let mut h = MultiHasher::new();
+        h.update(data);
+        h.finalize()
+    }
+
+    #[test]
+    fn test_verify_declared_digests_matches_verify_checksums() {
+        let data = vec![0x5Au8; 200_000];
+        let d = digests_of(&data);
+        // All three declared and correct (mixed case) -> Ok, same as buffered.
+        assert!(ArtifactService::verify_checksums(
+            &data,
+            Some(&d.sha256.to_uppercase()),
+            Some(&d.sha1),
+            Some(&d.md5.to_uppercase()),
+        )
+        .is_ok());
+        assert!(ArtifactService::verify_declared_digests(
+            &d,
+            Some(&d.sha256.to_uppercase()),
+            Some(&d.sha1),
+            Some(&d.md5.to_uppercase()),
+        )
+        .is_ok());
+        // None declared -> Ok (nothing to check).
+        assert!(ArtifactService::verify_declared_digests(&d, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_verify_declared_digests_rejects_each_mismatch() {
+        let d = digests_of(b"streamed artifact body");
+        // Wrong SHA-256.
+        let e = ArtifactService::verify_declared_digests(&d, Some("deadbeef"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("SHA-256"));
+        assert!(e.contains(&d.sha256));
+        // Wrong SHA-1.
+        assert!(ArtifactService::verify_declared_digests(&d, None, Some("00"), None).is_err());
+        // Wrong MD5.
+        assert!(ArtifactService::verify_declared_digests(&d, None, None, Some("ff")).is_err());
     }
 
     // -----------------------------------------------------------------------

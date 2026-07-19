@@ -5589,10 +5589,10 @@ pub async fn upload_artifact(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, Json<ArtifactResponse>)> {
-    let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    body: Body,
+) -> std::result::Result<Response, Response> {
+    let auth = require_auth(auth).map_err(|e| e.into_response())?;
+    auth.require_scope("write").map_err(|e| e.into_response())?;
 
     // Validate the composed artifact path against traversal, null bytes,
     // backslashes, percent-encoded traversal, absolute paths, etc. This
@@ -5601,68 +5601,149 @@ pub async fn upload_artifact(
     // Filesystem storage's `key_to_path` would strip `..` segments, but S3
     // and other object backends would happily accept `../etc/passwd`.
     upload_service::validate_artifact_path(&path)
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
+    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+
+    // Stream the request body straight to a bounded scratch file, computing
+    // SHA-256/SHA-1/MD5 in a single pass — the whole artifact is never buffered
+    // in memory (#2517). The stager enforces `max_upload_size_bytes` mid-stream
+    // (413 on breach) instead of relying on a request-body-limit layer.
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+
+    persist_generic_staged_upload(
+        &state,
+        &auth,
+        &repo_service,
+        &repo,
+        key,
+        path,
+        &headers,
+        staged,
+        digests,
+    )
+    .await
+}
+
+/// Authorize a generic artifact write: resolve the repository and enforce the
+/// write gates shared by the raw-`PUT` and multipart upload entry points, before
+/// any request body is consumed.
+async fn authorize_generic_upload(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+) -> std::result::Result<(RepositoryService, crate::models::repository::Repository), Response> {
     let repo_service = RepositoryService::new(state.db.clone());
-    let repo = repo_service.get_by_key(&key).await?;
-    require_repo_write_access(&auth, &repo, &repo_service).await?;
+    let repo = repo_service
+        .get_by_key(key)
+        .await
+        .map_err(|e| e.into_response())?;
+    require_repo_write_access(auth, &repo, &repo_service)
+        .await
+        .map_err(|e| e.into_response())?;
     // Fine-grained write gate (#2321 G2): the tenant gate above admits any
     // grantee (incl. a read-only one) and any authed caller on a public repo,
     // collapsing read/write. Require the `write` action when rules exist, the
     // same block `upload.rs::create_session` applies to the chunked path.
-    require_repo_fine_grained_action(&auth, repo.id, "write", &state.permission_service).await?;
+    require_repo_fine_grained_action(auth, repo.id, "write", &state.permission_service)
+        .await
+        .map_err(|e| e.into_response())?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
     // the promotion service writes through its own path and is unaffected. This
     // applies to all callers including admins.
-    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_upload(
-        repo.promotion_only,
-        auth.is_admin,
-    ) {
+    if proxy_helpers::promotion_only_blocks_direct_upload(repo.promotion_only, auth.is_admin) {
         return Err(AppError::Authorization(
             "Direct uploads are disabled for this repository; publish via promotion".to_string(),
-        ));
+        )
+        .into_response());
     }
 
-    // Verify declared checksums against actual content before storing anything.
+    Ok((repo_service, repo))
+}
+
+/// Finish a generic artifact upload from an already-staged scratch file (#2517).
+///
+/// The raw-`PUT` and multipart entry points authorize the request and stream the
+/// body to a bounded scratch file (computing the content digests in one pass);
+/// this shared tail verifies declared checksums, runs any WASM format plugin,
+/// derives the artifact coordinates, and persists via the streaming service
+/// method — never buffering the whole artifact in memory.
+#[allow(clippy::too_many_arguments)]
+async fn persist_generic_staged_upload(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo_service: &RepositoryService,
+    repo: &crate::models::repository::Repository,
+    key: String,
+    path: String,
+    headers: &HeaderMap,
+    staged: proxy_helpers::StagedUpload,
+    digests: crate::services::artifact_service::ContentDigests,
+) -> std::result::Result<Response, Response> {
+    // Verify declared checksums against the digests computed while staging —
+    // same semantics as the old `verify_checksums(&body, ...)`, but with no
+    // extra pass over the body.
     let declared_sha256 = headers
         .get("x-checksum-sha256")
         .and_then(|v| v.to_str().ok());
     let declared_sha1 = headers.get("x-checksum-sha1").and_then(|v| v.to_str().ok());
     let declared_md5 = headers.get("x-checksum-md5").and_then(|v| v.to_str().ok());
-    ArtifactService::verify_checksums(&body, declared_sha256, declared_sha1, declared_md5)?;
+    ArtifactService::verify_declared_digests(
+        &digests,
+        declared_sha256,
+        declared_sha1,
+        declared_md5,
+    )
+    .map_err(|e| e.into_response())?;
 
-    let storage = state.storage_for_repo(&repo.storage_location())?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
 
     // Extract name from path
     let name = path.split('/').next_back().unwrap_or(&path).to_string();
 
     // Check if this repo has a WASM plugin format handler
-    let format_key = repo_service.get_format_key(repo.id).await?;
+    let format_key = repo_service
+        .get_format_key(repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
     let mut wasm_metadata = None;
 
     if let (Some(ref fk), Some(ref registry)) = (&format_key, &state.plugin_registry) {
         if registry.has_format(fk).await {
-            // Run WASM plugin validate + parse_metadata
-            match registry.execute_validate(fk, &path, &body).await {
+            // WASM-PLUGIN-INPUT (#2517 product decision): format plugins receive
+            // the whole artifact body by value across the WASM ABI. A repo with a
+            // registered WASM format handler therefore still materialises the
+            // staged file here, preserving the exact pre-existing plugin-input
+            // semantics rather than silently feeding the plugin a truncated view.
+            // Bounding this to a prefix read — or extending the plugin ABI to
+            // accept a stream/path so large plugin-backed formats also stay
+            // off-heap — is a separate product/ABI decision, deliberately left
+            // out of this streaming conversion. The common (non-plugin) generic
+            // upload never reaches this branch and streams end-to-end.
+            let plugin_body = tokio::fs::read(staged.path())
+                .await
+                .map_err(|e| proxy_helpers::internal_error("Reading staged upload", e))?;
+            match registry.execute_validate(fk, &path, &plugin_body).await {
                 Ok(Ok(())) => {}
                 Ok(Err(validation_err)) => {
-                    return Err(crate::error::AppError::Validation(
-                        validation_err.to_string(),
-                    ));
+                    return Err(AppError::Validation(validation_err.to_string()).into_response());
                 }
                 Err(e) => {
                     tracing::error!("WASM plugin validate error for {}: {}", fk, e);
-                    return Err(crate::error::AppError::Internal(format!(
-                        "Plugin error: {}",
-                        e
-                    )));
+                    return Err(AppError::Internal(format!("Plugin error: {}", e)).into_response());
                 }
             }
 
-            match registry.execute_parse_metadata(fk, &path, &body).await {
+            match registry
+                .execute_parse_metadata(fk, &path, &plugin_body)
+                .await
+            {
                 Ok(meta) => {
                     wasm_metadata = Some(meta);
                 }
@@ -5718,38 +5799,49 @@ pub async fn upload_artifact(
         .map(|m| m.content_type.clone())
         .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
 
-    // No pre-cleanup here: this generic upload endpoint (and the multipart
-    // variants that delegate to it) persists through
-    // `artifact_service::upload_with_sync_options`, whose release-immutability
-    // backstop must SEE any soft-deleted tombstone at this coordinate — purging
-    // it first would hide a release-immutability swap (DELETE + re-upload of
-    // DIFFERENT bytes to a released coordinate, the exploited path). The
-    // service's `ON CONFLICT (repository_id, path) DO UPDATE ... is_deleted =
-    // false` resurrects the tombstone for the allowed cases (identical-bytes
-    // republish / mutable index files), so the UNIQUE(repository_id, path)
-    // constraint is still satisfied without the manual purge.
+    // No pre-cleanup here: this generic upload endpoint persists through
+    // `artifact_service::upload_stream_with_sync_options`, whose
+    // release-immutability backstop must SEE any soft-deleted tombstone at this
+    // coordinate — purging it first would hide a release-immutability swap
+    // (DELETE + re-upload of DIFFERENT bytes to a released coordinate, the
+    // exploited path). The service's `ON CONFLICT (repository_id, path) DO UPDATE
+    // ... is_deleted = false` resurrects the tombstone for the allowed cases
+    // (identical-bytes republish / mutable index files), so the
+    // UNIQUE(repository_id, path) constraint is still satisfied without the
+    // manual purge.
 
+    let size_bytes = staged.size_bytes();
+    let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
     let artifact = artifact_service
-        .upload_with_sync_options(
+        .upload_stream_with_sync_options(
             repo.id,
             &path,
             &name,
             version.as_deref(),
             &content_type,
-            body,
+            content_stream,
+            digests,
+            size_bytes,
             Some(auth.user_id),
-            !is_replication_request(&headers),
+            !is_replication_request(headers),
         )
-        .await?;
+        .await
+        .map_err(|e| e.into_response())?;
+    // Scratch file no longer needed once the service has consumed the stream.
+    drop(staged);
 
-    let downloads = artifact_service.get_download_stats(artifact.id).await?;
+    let downloads = artifact_service
+        .get_download_stats(artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
     // #2367: echo the revision this upload landed at for versioned repos.
     let (revision, version_label) = if versioning_active {
         artifact_service
             .latest_version_info(repo.id, &artifact.path)
-            .await?
+            .await
+            .map_err(|e| e.into_response())?
             .map(|(rev, label)| (Some(rev), label))
             .unwrap_or((None, None))
     } else {
@@ -5779,7 +5871,8 @@ pub async fn upload_artifact(
             revision,
             version_label,
         }),
-    ))
+    )
+        .into_response())
 }
 
 /// Resolve the Content-Type for a generic artifact upload.
@@ -5817,19 +5910,30 @@ async fn upload_artifact_multipart_with_path(
     Path((key, path)): Path<(String, String)>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<(StatusCode, Json<ArtifactResponse>)> {
-    let (body, filename) = extract_multipart_file(multipart).await?;
+) -> std::result::Result<Response, Response> {
+    let auth = require_auth(auth).map_err(|e| e.into_response())?;
+    auth.require_scope("write").map_err(|e| e.into_response())?;
+    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+
+    let (staged, digests, filename) = stage_multipart_file(&state, multipart).await?;
     let artifact_path = if path.is_empty() || path == "/" {
         filename
     } else {
         path
     };
-    upload_artifact(
-        State(state),
-        Extension(auth),
-        Path((key, artifact_path)),
-        headers,
-        body,
+    upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
+    persist_generic_staged_upload(
+        &state,
+        &auth,
+        &repo_service,
+        &repo,
+        key,
+        artifact_path,
+        &headers,
+        staged,
+        digests,
     )
     .await
 }
@@ -5851,15 +5955,27 @@ async fn upload_artifact_multipart(
     Path(key): Path<String>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<(StatusCode, Json<ArtifactResponse>)> {
-    let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
+) -> std::result::Result<Response, Response> {
+    let auth = require_auth(auth).map_err(|e| e.into_response())?;
+    auth.require_scope("write").map_err(|e| e.into_response())?;
+    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+
+    let (staged, digests, filename, custom_path) =
+        stage_multipart_file_and_path(&state, multipart).await?;
     let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
-    upload_artifact(
-        State(state),
-        Extension(auth),
-        Path((key, artifact_path)),
-        headers,
-        body,
+    upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
+    persist_generic_staged_upload(
+        &state,
+        &auth,
+        &repo_service,
+        &repo,
+        key,
+        artifact_path,
+        &headers,
+        staged,
+        digests,
     )
     .await
 }
@@ -5889,76 +6005,87 @@ fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
     }
 }
 
-/// Extract the first file field from a multipart form.
-async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, String)> {
+/// Stream the first file field of a multipart form to a bounded scratch file,
+/// computing SHA-256/SHA-1/MD5 in one pass (#2517). Never buffers the field in
+/// memory. Returns the staged scratch handle, its content digests, and the
+/// original filename.
+async fn stage_multipart_file(
+    state: &SharedState,
+    mut multipart: Multipart,
+) -> std::result::Result<
+    (
+        proxy_helpers::StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+        String,
+    ),
+    Response,
+> {
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")).into_response())?
     {
         // Accept any field that has a filename (i.e. a file upload)
-        let filename = field.file_name().map(|s| s.to_string());
-        if let Some(filename) = filename {
-            #[allow(clippy::disallowed_methods)]
-            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-            let data: Bytes = field
-                .bytes()
-                .await
-                .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
-            return Ok((data, filename));
+        if let Some(filename) = field.file_name().map(|s| s.to_string()) {
+            let (staged, digests) =
+                proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+            return Ok((staged, digests, filename));
         }
     }
-    Err(AppError::Validation(
-        "No file field found in multipart form".to_string(),
-    ))
+    Err(AppError::Validation("No file field found in multipart form".to_string()).into_response())
 }
 
-/// Extract both a file field and an optional `path` text field from a
-/// multipart form.
+/// Streaming variant of the file+path extractor (#2517): spool the file field
+/// to a bounded scratch file (digests in one pass) and read the small optional
+/// `path` text field.
 ///
-/// Iterates the full form: a file field (one with a `filename`) yields the
-/// body and original filename; a `path` field (any non-file field named
-/// `path`) yields the requested artifact path. Either may appear in any
-/// order. Returns an error if no file is found.
-async fn extract_multipart_file_and_path(
+/// Iterates the full form: a file field (one with a `filename`) is staged; a
+/// `path` field (any non-file field named `path`) yields the requested artifact
+/// path. Either may appear in any order. Returns an error if no file is found.
+async fn stage_multipart_file_and_path(
+    state: &SharedState,
     mut multipart: Multipart,
-) -> Result<(Bytes, String, Option<String>)> {
-    let mut file: Option<(Bytes, String)> = None;
+) -> std::result::Result<
+    (
+        proxy_helpers::StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+        String,
+        Option<String>,
+    ),
+    Response,
+> {
+    let mut file = None;
     let mut custom_path: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")).into_response())?
     {
         let filename = field.file_name().map(|s| s.to_string());
         let name = field.name().map(|s| s.to_string());
         if let Some(filename) = filename {
             // File upload field
             if file.is_none() {
-                #[allow(clippy::disallowed_methods)]
-                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
-                let data: Bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
-                file = Some((data, filename));
+                let (staged, digests) =
+                    proxy_helpers::stage_upload_field_content_addressed(state, field).await?;
+                file = Some((staged, digests, filename));
             }
         } else if name.as_deref() == Some("path") {
-            // Custom path text field
-            let value = field
-                .text()
-                .await
-                .map_err(|e| AppError::Validation(format!("Failed to read path field: {e}")))?;
+            // Custom path text field (small; read as text)
+            let value = field.text().await.map_err(|e| {
+                AppError::Validation(format!("Failed to read path field: {e}")).into_response()
+            })?;
             custom_path = Some(value);
         }
     }
 
     match file {
-        Some((body, filename)) => Ok((body, filename, custom_path)),
-        None => Err(AppError::Validation(
-            "No file field found in multipart form".to_string(),
-        )),
+        Some((staged, digests, filename)) => Ok((staged, digests, filename, custom_path)),
+        None => Err(
+            AppError::Validation("No file field found in multipart form".to_string())
+                .into_response(),
+        ),
     }
 }
 
@@ -11292,7 +11419,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"ORIGINAL-RELEASE-BYTES"),
+            Body::from(Bytes::from_static(b"ORIGINAL-RELEASE-BYTES")),
         )
         .await;
         assert!(up.is_ok(), "initial publish must succeed: {up:?}");
@@ -11315,11 +11442,12 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"SWAPPED-MALICIOUS-BYTES"),
+            Body::from(Bytes::from_static(b"SWAPPED-MALICIOUS-BYTES")),
         )
         .await;
-        assert!(
-            matches!(swap, Err(AppError::Conflict(_))),
+        assert_eq!(
+            swap.as_ref().err().map(|r| r.status()),
+            Some(StatusCode::CONFLICT),
             "DELETE + re-upload of DIFFERENT bytes to a released coordinate must 409, got: {swap:?}"
         );
 
@@ -11384,7 +11512,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"RELEASE-BYTES"),
+            Body::from(Bytes::from_static(b"RELEASE-BYTES")),
         )
         .await
         .expect("initial publish must succeed");
@@ -11436,7 +11564,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path2.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"NORMAL-REPO-BYTES"),
+            Body::from(Bytes::from_static(b"NORMAL-REPO-BYTES")),
         )
         .await
         .expect("publish to normal repo must succeed");
@@ -11482,7 +11610,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            body.clone(),
+            Body::from(body.clone()),
         )
         .await
         .expect("publish jar");
@@ -11499,7 +11627,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            body.clone(),
+            Body::from(body.clone()),
         )
         .await;
         assert!(
@@ -11514,7 +11642,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), meta.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"<metadata>v1</metadata>"),
+            Body::from(Bytes::from_static(b"<metadata>v1</metadata>")),
         )
         .await
         .expect("publish metadata");
@@ -11531,7 +11659,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), meta.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"<metadata>v2-updated</metadata>"),
+            Body::from(Bytes::from_static(b"<metadata>v2-updated</metadata>")),
         )
         .await;
         assert!(
@@ -12117,11 +12245,12 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"BYTES"),
+            Body::from(Bytes::from_static(b"BYTES")),
         )
         .await;
-        assert!(
-            matches!(denied, Err(AppError::Authorization(_))),
+        assert_eq!(
+            denied.as_ref().err().map(|r| r.status()),
+            Some(StatusCode::FORBIDDEN),
             "read-only grantee must be denied write, got: {denied:?}"
         );
 
@@ -12131,7 +12260,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"BYTES"),
+            Body::from(Bytes::from_static(b"BYTES")),
         )
         .await;
         assert!(allowed.is_ok(), "write grant must upload, got: {allowed:?}");
@@ -12146,7 +12275,7 @@ mod tests {
             Extension(Some(admin)),
             Path((key.clone(), "pkg/2.0.0/pkg.bin".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"BYTES"),
+            Body::from(Bytes::from_static(b"BYTES")),
         )
         .await;
         assert!(admin_ok.is_ok(), "admin must bypass, got: {admin_ok:?}");
@@ -12170,11 +12299,12 @@ mod tests {
             Extension(Some(tdh::make_auth(user_id, &username))),
             Path((pub_key.clone(), "pub/1.0.0/pub.bin".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"BYTES"),
+            Body::from(Bytes::from_static(b"BYTES")),
         )
         .await;
-        assert!(
-            matches!(nonmember_pub, Err(AppError::Authorization(_))),
+        assert_eq!(
+            nonmember_pub.as_ref().err().map(|r| r.status()),
+            Some(StatusCode::FORBIDDEN),
             "non-member must be denied write on a public repo with a write rule, got: {nonmember_pub:?}"
         );
 
@@ -12209,7 +12339,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"BYTES"),
+            Body::from(Bytes::from_static(b"BYTES")),
         )
         .await
         .expect("publish must succeed with write+delete grant");
@@ -15884,16 +16014,17 @@ mod tests {
             Extension(Some(auth)),
             Path((fx.repo_key.clone(), composed)),
             HeaderMap::new(),
-            Bytes::from_static(b"payload-should-never-be-stored"),
+            Body::from(Bytes::from_static(b"payload-should-never-be-stored")),
         )
         .await;
 
         let err = result.expect_err("traversal path must be rejected");
         // AppError::Validation maps to 400 Bad Request via IntoResponse
-        // (see error.rs status_and_code). Pinning the variant here is
-        // equivalent and avoids reaching into a private method.
-        assert!(
-            matches!(err, AppError::Validation(_)),
+        // (see error.rs status_and_code); the streaming upload handler returns
+        // that as a fully-formed Response, so assert on its status.
+        assert_eq!(
+            err.status(),
+            StatusCode::BAD_REQUEST,
             "traversal path must surface as Validation (400), got {err:?}",
         );
 
@@ -15929,14 +16060,16 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((fx.repo_key.clone(), "foo/bar.txt".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"directwrite"),
+            Body::from(Bytes::from_static(b"directwrite")),
         )
         .await;
 
         let err = blocked.expect_err("admin direct upload to promotion_only repo must be blocked");
-        // AppError::Authorization maps to 403 Forbidden (see error.rs).
-        assert!(
-            matches!(err, AppError::Authorization(_)),
+        // AppError::Authorization maps to 403 Forbidden (see error.rs); the
+        // streaming upload handler returns that as a fully-formed Response.
+        assert_eq!(
+            err.status(),
+            StatusCode::FORBIDDEN,
             "admin direct upload to promotion_only repo must surface as Authorization (403), got {err:?}",
         );
 
@@ -15947,16 +16080,16 @@ mod tests {
             .await
             .expect("clear promotion_only");
 
-        let (status, _) = upload_artifact(
+        let resp = upload_artifact(
             State(fx.state.clone()),
             Extension(Some(auth)),
             Path((fx.repo_key.clone(), "foo/bar.txt".to_string())),
             HeaderMap::new(),
-            Bytes::from_static(b"directwrite"),
+            Body::from(Bytes::from_static(b"directwrite")),
         )
         .await
         .expect("admin upload to a normal repo must succeed");
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
         fx.teardown().await;
     }
@@ -17658,7 +17791,7 @@ mod tests {
                 Extension(auth.clone()),
                 Path((key.clone(), p.clone())),
                 HeaderMap::new(),
-                Bytes::from_static(b"TARBALL-BYTES"),
+                Body::from(Bytes::from_static(b"TARBALL-BYTES")),
             )
             .await
             .expect("publish must succeed");
@@ -17791,7 +17924,7 @@ mod tests {
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
             HeaderMap::new(),
-            Bytes::from_static(b"GENERIC-BYTES"),
+            Body::from(Bytes::from_static(b"GENERIC-BYTES")),
         )
         .await
         .expect("publish must succeed");

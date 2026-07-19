@@ -34,7 +34,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
+// `Bytes` and the `sha2` digest types are now only referenced by the unit
+// tests: the upload handlers stream the body and take their digests from the
+// shared staging primitive (#2517), so gate these imports to test builds to
+// keep the production build free of unused-import warnings.
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -600,7 +606,7 @@ async fn upload_module(
         String,
         String,
     )>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
@@ -630,33 +636,26 @@ async fn upload_module(
             .into_response());
     }
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum = format!("{:x}", hasher.finalize());
+    // Stream the request body to a bounded scratch file, computing the content
+    // digests in one pass — never buffering the module archive in memory
+    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    let checksum = digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
 
-    let size_bytes = body.len() as i64;
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = format!(
         "terraform/modules/{}/{}/{}/{}.tar.gz",
         namespace, name, provider, version
     );
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    // Store the file, streamed from the staged scratch file.
+    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
+    // writing, then streams the object to storage.
+    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -1108,7 +1107,7 @@ async fn upload_provider(
         String,
         String,
     )>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
@@ -1147,30 +1146,23 @@ async fn upload_provider(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum = format!("{:x}", hasher.finalize());
+    // Stream the request body to a bounded scratch file, computing the content
+    // digests in one pass — never buffering the provider archive in memory
+    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    let checksum = digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
 
-    let size_bytes = body.len() as i64;
     let storage_key = format!(
         "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
         namespace, type_name, version, type_name, platform
     );
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
 
-    // Store the file
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    // Store the file, streamed from the staged scratch file.
+    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
+    // writing, then streams the object to storage.
+    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
