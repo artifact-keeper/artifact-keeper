@@ -36,8 +36,9 @@
 //!     items) is skipped without a fetch, so the walker is a no-op there and
 //!     cannot regress the Artifactory path.
 //!   * **DoS-bounded.** A visited-digest set guards against cycles and
-//!     re-fetching shared layers; recursion depth, per-index fan-out, and
-//!     total blob/manifest counts are all capped.
+//!     re-fetching shared layers; recursion depth, per-index fan-out, total
+//!     blob/manifest counts, per-blob byte size, and the per-image aggregate
+//!     byte total are all capped (#2575).
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -56,6 +57,33 @@ use crate::services::oci_manifest_refs_backfill::MAX_INDEX_MANIFEST_BYTES;
 use crate::services::source_registry::{OciContentKind, SourceRegistry};
 use crate::storage::StorageBackend;
 
+/// Default per-blob byte ceiling (10 GiB). A single config/layer blob larger
+/// than this is rejected mid-stream, before it is spilled to the staging temp
+/// file, so a hostile source cannot copy one arbitrarily-large blob into
+/// storage. Overridable via [`MAX_MIGRATION_WALK_BLOB_BYTES_ENV`].
+pub const DEFAULT_MAX_WALK_BLOB_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Default per-image (per-job) total-byte ceiling (64 GiB) across every blob
+/// the walk copies for one root manifest, all arches combined. Bounds the total
+/// bytes a single migrated image can stream into storage regardless of the
+/// per-blob count/size caps. Overridable via [`MAX_MIGRATION_WALK_TOTAL_BYTES_ENV`].
+pub const DEFAULT_MAX_WALK_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Env var overriding the per-blob byte ceiling (plain decimal byte count).
+pub const MAX_MIGRATION_WALK_BLOB_BYTES_ENV: &str = "MAX_MIGRATION_WALK_BLOB_BYTES";
+
+/// Env var overriding the per-image total-byte ceiling (plain decimal byte count).
+pub const MAX_MIGRATION_WALK_TOTAL_BYTES_ENV: &str = "MAX_MIGRATION_WALK_TOTAL_BYTES";
+
+/// Resolve a byte-size cap from an optional override string, falling back to
+/// `default` when the value is absent, blank, non-numeric, or zero. A zero cap
+/// would reject every blob, so it is treated as "unset" rather than honoured.
+fn resolve_byte_cap(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
 /// Bounds on a single referenced-content walk. Every limit fails the item
 /// (fail-closed) rather than truncating silently, so a pathological source
 /// image cannot exhaust memory, storage, or the DB connection.
@@ -72,6 +100,13 @@ pub struct WalkCaps {
     pub max_blobs_total: usize,
     /// Maximum total child manifests fetched across the whole image.
     pub max_manifests_total: usize,
+    /// Maximum bytes of any single referenced blob. Enforced mid-stream so an
+    /// over-cap blob is rejected before it is spilled to the staging temp file.
+    pub max_blob_bytes: u64,
+    /// Maximum total bytes of all referenced blobs copied for this image (all
+    /// arches). Bounds the aggregate storage/bandwidth a single migrated image
+    /// can consume even when each individual blob is within `max_blob_bytes`.
+    pub max_total_bytes: u64,
 }
 
 impl Default for WalkCaps {
@@ -81,6 +116,14 @@ impl Default for WalkCaps {
             max_index_fanout: 1024,
             max_blobs_total: 4096,
             max_manifests_total: 1024,
+            max_blob_bytes: resolve_byte_cap(
+                std::env::var(MAX_MIGRATION_WALK_BLOB_BYTES_ENV).ok(),
+                DEFAULT_MAX_WALK_BLOB_BYTES,
+            ),
+            max_total_bytes: resolve_byte_cap(
+                std::env::var(MAX_MIGRATION_WALK_TOTAL_BYTES_ENV).ok(),
+                DEFAULT_MAX_WALK_TOTAL_BYTES,
+            ),
         }
     }
 }
@@ -94,6 +137,9 @@ pub struct WalkStats {
     pub children_registered: usize,
     /// Referenced digests skipped because they were already present.
     pub deduped: usize,
+    /// Total bytes of referenced blobs copied into storage (excludes deduped
+    /// skips). Accumulated to enforce the per-image `max_total_bytes` cap.
+    pub bytes_fetched: u64,
 }
 
 /// Walk and register the content an already-registered manifest references.
@@ -291,9 +337,32 @@ async fn ensure_blob(
             caps.max_blobs_total
         )));
     }
+    // Per-image total-bytes budget: refuse before fetching another blob once the
+    // aggregate is already spent, so a huge image cannot keep streaming bytes
+    // just because each individual blob is within the per-blob cap.
+    if stats.bytes_fetched >= caps.max_total_bytes {
+        return Err(MigrationError::Other(format!(
+            "referenced-content walk for image '{image}' exceeded the max total bytes ({})",
+            caps.max_total_bytes
+        )));
+    }
+    // Cap this single blob at the per-blob ceiling AND at whatever remains of
+    // the per-image budget, whichever is smaller, so neither is overrun and the
+    // over-cap blob is aborted mid-stream before it lands on disk.
+    let remaining = caps.max_total_bytes - stats.bytes_fetched;
+    let blob_cap = caps.max_blob_bytes.min(remaining);
 
-    let (storage_key, size) =
-        fetch_verify_store_blob(storage, client, staging_dir, repo_key, image, digest).await?;
+    let (storage_key, size) = fetch_verify_store_blob(
+        storage,
+        client,
+        staging_dir,
+        repo_key,
+        image,
+        digest,
+        blob_cap,
+    )
+    .await?;
+    stats.bytes_fetched = stats.bytes_fetched.saturating_add(size as u64);
 
     // Mirror the monolithic-upload / migration blob insert: resurrect a
     // GC-marked blob on conflict.
@@ -377,9 +446,12 @@ async fn fetch_verify_store_blob(
     repo_key: &str,
     image: &str,
     digest: &str,
+    max_blob_bytes: u64,
 ) -> Result<(String, i64), MigrationError> {
-    // Blobs are not size-capped here (config/layer sizes are legitimate and
-    // large); count caps + fail-closed transfer bound the walk.
+    // Config/layer sizes are legitimately large, but not unbounded: the caller
+    // passes the smaller of the per-blob cap and the remaining per-image budget
+    // so a hostile source cannot spill one arbitrarily-large blob to disk. The
+    // cap is enforced MID-STREAM (rejected before the overflowing chunk lands).
     let (temp, computed, size) = stream_to_temp(
         client,
         staging_dir,
@@ -387,7 +459,7 @@ async fn fetch_verify_store_blob(
         image,
         digest,
         OciContentKind::Blob,
-        None,
+        Some(usize::try_from(max_blob_bytes).unwrap_or(usize::MAX)),
     )
     .await?;
     if computed != digest {
@@ -484,15 +556,14 @@ async fn stream_to_temp(
     let mut size: i64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(MigrationError::from)?;
-        // Enforce the size cap MID-STREAM (manifest fetches): reject before the
-        // overflowing chunk is written, so a hostile source cannot spill a
-        // multi-GB body to the staging temp file behind a manifest URL before
-        // rejection. Blob fetches pass `None` and stay uncapped here.
+        // Enforce the size cap MID-STREAM: reject before the overflowing chunk
+        // is written, so a hostile source cannot spill a multi-GB body to the
+        // staging temp file behind a manifest OR blob URL before rejection.
         let next_size = size + chunk.len() as i64;
         if let Some(cap) = max_bytes {
             if next_size as usize > cap {
                 return Err(MigrationError::Other(format!(
-                    "OCI manifest '{image}/{}/{digest}' exceeds the {cap} byte cap mid-stream; aborting fetch",
+                    "OCI content '{image}/{}/{digest}' exceeds the {cap} byte cap mid-stream; aborting fetch",
                     kind.path_segment()
                 )));
             }
@@ -1099,5 +1170,177 @@ mod tests {
         assert!(c.max_index_fanout >= 1);
         assert!(c.max_blobs_total >= c.max_index_fanout);
         assert!(c.max_manifests_total >= 1);
+        assert!(c.max_blob_bytes >= 1);
+        assert!(c.max_total_bytes >= c.max_blob_bytes);
+    }
+
+    #[test]
+    fn resolve_byte_cap_honours_override_and_rejects_junk() {
+        // A valid decimal override wins.
+        assert_eq!(resolve_byte_cap(Some("123".into()), 999), 123);
+        assert_eq!(resolve_byte_cap(Some(" 4096 ".into()), 999), 4096);
+        // Absent / blank / non-numeric / zero all fall back to the default.
+        assert_eq!(resolve_byte_cap(None, 999), 999);
+        assert_eq!(resolve_byte_cap(Some("".into()), 999), 999);
+        assert_eq!(resolve_byte_cap(Some("nope".into()), 999), 999);
+        assert_eq!(resolve_byte_cap(Some("0".into()), 999), 999);
+    }
+
+    /// #2575: a single referenced blob larger than the per-blob byte cap fails
+    /// the walk (fail-closed) instead of being copied into storage, and a walk
+    /// whose blobs are within the cap still succeeds.
+    #[tokio::test]
+    async fn walker_rejects_blob_exceeding_per_blob_byte_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (storage, tmp, repo_id) = setup(&pool).await;
+
+        let config = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        // An oversized layer: 4096 bytes, well past the 64-byte cap below.
+        let big_layer = bytes::Bytes::from(vec![b'x'; 4096]);
+        let manifest = image_manifest(&config, &[&big_layer]);
+
+        let mut src = DigestSource::new();
+        for b in [&config, &big_layer] {
+            src.blobs.insert(sha256_digest(b), b.clone());
+        }
+        let client: Arc<dyn SourceRegistry> = Arc::new(src);
+
+        // Cap per-blob bytes far below the oversized layer. (config is 14 bytes,
+        // within the cap, so the failure is attributable to the big layer.)
+        let caps = WalkCaps {
+            max_blob_bytes: 64,
+            ..WalkCaps::default()
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let res = walk_and_register_referenced_content(
+            &mut tx,
+            &storage,
+            &client,
+            tmp.path(),
+            repo_id,
+            "app",
+            "app",
+            &ManifestClass::Image,
+            &manifest,
+            &caps,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a blob exceeding the per-blob byte cap must fail the walk"
+        );
+        drop(tx);
+
+        // The oversized layer must NOT have been committed to oci_blobs.
+        let big_digest = sha256_digest(&big_layer);
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&big_digest)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(row.is_none(), "over-cap blob must not be registered");
+
+        // A within-budget walk (generous per-blob cap) succeeds for the same
+        // manifest, proving the cap does not reject legitimate content.
+        let (storage2, tmp2, repo_id2) = setup(&pool).await;
+        let mut src2 = DigestSource::new();
+        for b in [&config, &big_layer] {
+            src2.blobs.insert(sha256_digest(b), b.clone());
+        }
+        let client2: Arc<dyn SourceRegistry> = Arc::new(src2);
+        let ok_caps = WalkCaps {
+            max_blob_bytes: 1024 * 1024,
+            ..WalkCaps::default()
+        };
+        let mut tx2 = pool.begin().await.unwrap();
+        let stats = walk_and_register_referenced_content(
+            &mut tx2,
+            &storage2,
+            &client2,
+            tmp2.path(),
+            repo_id2,
+            "app",
+            "app",
+            &ManifestClass::Image,
+            &manifest,
+            &ok_caps,
+        )
+        .await
+        .expect("within-budget walk succeeds");
+        tx2.commit().await.unwrap();
+        assert_eq!(stats.blobs_registered, 2, "config + layer");
+        assert_eq!(stats.bytes_fetched, (config.len() + big_layer.len()) as u64);
+
+        for id in [repo_id, repo_id2] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let _ = (tmp, tmp2);
+    }
+
+    /// #2575: an image whose blobs each fit the per-blob cap but together exceed
+    /// the per-image total-bytes budget fails the walk (aggregate DoS guard).
+    #[tokio::test]
+    async fn walker_rejects_walk_exceeding_total_byte_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (storage, tmp, repo_id) = setup(&pool).await;
+
+        // Two layers of 400 bytes each + a small config; total ~ >800 bytes.
+        let config = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_a = bytes::Bytes::from(vec![b'a'; 400]);
+        let layer_b = bytes::Bytes::from(vec![b'b'; 400]);
+        let manifest = image_manifest(&config, &[&layer_a, &layer_b]);
+
+        let mut src = DigestSource::new();
+        for b in [&config, &layer_a, &layer_b] {
+            src.blobs.insert(sha256_digest(b), b.clone());
+        }
+        let client: Arc<dyn SourceRegistry> = Arc::new(src);
+
+        // Per-blob cap generous (each blob fits) but the per-image total is tiny
+        // so the aggregate is what trips.
+        let caps = WalkCaps {
+            max_blob_bytes: 4096,
+            max_total_bytes: 500,
+            ..WalkCaps::default()
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let res = walk_and_register_referenced_content(
+            &mut tx,
+            &storage,
+            &client,
+            tmp.path(),
+            repo_id,
+            "app",
+            "app",
+            &ManifestClass::Image,
+            &manifest,
+            &caps,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "aggregate bytes beyond the per-image total cap must fail the walk"
+        );
+        drop(tx);
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = tmp;
     }
 }
