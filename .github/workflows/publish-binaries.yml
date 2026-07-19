@@ -1,0 +1,129 @@
+name: Publish Release Binaries
+
+# Standalone, gate-independent binary publisher. `build-binaries` in release.yml
+# only runs when the full Release Gate passes; when a release is cut another way
+# (e.g. an owner-approved gate waiver), the cross-compiled binaries never get
+# built or attached. This workflow rebuilds the exact 5-target matrix from the
+# tag and uploads the tarballs + checksums to the EXISTING GitHub Release, so a
+# release can be completed with its binaries without re-running the gate.
+#
+# Idempotent: uploads use --clobber, so re-running replaces assets in place.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach binaries to (e.g. v1.6.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-attach:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-arm64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-windows-amd64
+
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get install -y mingw-w64
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set version from tag
+        run: |
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          echo "Setting workspace version to ${VERSION}"
+          # Portable in-place edit (GNU vs BSD sed) -- matches release.yml #1538.
+          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          head -5 Cargo.toml
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Package binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+          cd dist
+          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          fi
+
+      - name: Package binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
+          cd dist
+          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            dist/${{ matrix.name }}.tar.gz dist/${{ matrix.name }}.tar.gz.sha256 \
+            --repo "${{ github.repository }}" --clobber 2>/dev/null \
+          || gh release upload "${{ inputs.tag }}" \
+            dist/${{ matrix.name }}.exe dist/${{ matrix.name }}.exe.sha256 \
+            --repo "${{ github.repository }}" --clobber
