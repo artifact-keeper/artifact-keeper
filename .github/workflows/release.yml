@@ -85,8 +85,9 @@ jobs:
   # This job blocks the release gate until that manifest list exists and
   # captures its digest, so the gate deploys and tests the EXACT bytes that
   # will be published -- not :dev, not a fresh source build. It also confirms
-  # openscap + web :${VERSION} exist, because the gate's version-set-integrity
-  # check probes web before it will run.
+  # openscap :${VERSION} exists so the gate does not start against a
+  # half-published image set. web is a decoupled SDK consumer and is no
+  # longer part of the backend release's version set (issue #2708).
   #
   # Ordering (A5): preflight -> resolve (blocks <=35 min on the publish) ->
   # release-gate/mesh -> build-binaries -> verify-images-published -> release.
@@ -170,11 +171,12 @@ jobs:
             sleep 30
           done
 
-          # The gate's version-set-integrity check probes web (and openscap) at
-          # :${VERSION} before it will run, so confirm they exist too -- the gate
-          # must not start against a half-published image set. These are pinned
-          # by tag in v1, so we only assert existence, not a digest.
-          for extra in artifact-keeper-openscap artifact-keeper-web; do
+          # The gate's version-set-integrity check probes openscap at
+          # :${VERSION} before it will run, so confirm it exists too -- the gate
+          # must not start against a half-published image set. web is a decoupled
+          # SDK consumer and is no longer required at :${VERSION} (issue #2708).
+          # This is pinned by tag in v1, so we only assert existence, not a digest.
+          for extra in artifact-keeper-openscap; do
             echo ""
             echo "Confirming ghcr ${extra}:${VERSION} is present"
             while true; do
@@ -223,15 +225,17 @@ jobs:
     name: Release Gate (Full Suite)
     # Gate must not start until the candidate manifest exists (resolve blocks on
     # the publish). It then deploys the EXACT published bytes: version tag +
-    # manifest-list digest for the backend, version tag for web (was defaulting
-    # to :latest). The digest input is consumed by release-gate.yml (#261,
-    # already merged) as `name:tag@sha256:...` deploy refs.
+    # manifest-list digest for the backend. web is a decoupled SDK consumer with
+    # its own release cadence, so the gate deploys/probes the CURRENT released
+    # web (:latest) -- a same-version web image will not exist for a standalone
+    # backend cut (issue #2708). The digest input is consumed by release-gate.yml
+    # (#261, already merged) as `name:tag@sha256:...` deploy refs.
     needs: [release-preflight, resolve-candidate-digest]
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
-      web_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
+      web_tag: latest
       test_suite: all
     secrets: inherit
 
@@ -353,9 +357,12 @@ jobs:
   #
   # Cross-repo image-publish gate. v1.1.8 shipped with no
   # ghcr.io/.../artifact-keeper-web:1.1.8 published, breaking every fresh
-  # helm install. This job polls ghcr.io for every image the chart
-  # references at the release version tag, and fails if any is missing
+  # helm install. This job polls ghcr.io for every image the backend release
+  # owns at the release version tag, and fails if any is missing
   # after the docker-publish workflows have had time to complete.
+  # web is now a decoupled SDK consumer with its own release cadence and is no
+  # longer verified at :${VERSION} here (issue #2708); the chart pins web to its
+  # own published version rather than the backend ${VERSION}.
   #
   # When this gate fails, the GitHub Release job does not run.
   #
@@ -442,7 +449,6 @@ jobs:
           IMAGES=(
             "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
-            "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
             # scanner-adapter has its own independent semver (see
             # docker/scanner-adapter/VERSION); the chart pins its MAJOR, so the
             # release verifies the adapter's major tag (currently 1) rather than
@@ -450,7 +456,6 @@ jobs:
             "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:1"
             "docker.io|artifactkeeper/backend:${VERSION}"
             "docker.io|artifactkeeper/openscap:${VERSION}"
-            "docker.io|artifactkeeper/web:${VERSION}"
             "docker.io|artifactkeeper/scanner-adapter:1"
           )
 
