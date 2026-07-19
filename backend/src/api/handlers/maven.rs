@@ -39,6 +39,35 @@ use crate::models::repository::RepositoryType;
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
 
+/// Roll back a pre-write flat-key claim ([`claim_flat_key_for_write`]) when the
+/// gated `storage.put` fails, so an aborted write leaves a foreign unattributed
+/// key unattributed (#2586 / V3b). Best-effort: a release failure is logged but
+/// never masks the original storage error the caller is about to return.
+async fn release_flat_key_claim_best_effort(
+    db: &PgPool,
+    claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) {
+    if let Err(e) = crate::services::maven_flat_attribution::release_flat_key_claim(
+        db,
+        claim,
+        repository_id,
+        storage_backend,
+        storage_key,
+    )
+    .await
+    {
+        warn!(
+            error = %e,
+            storage_key = %storage_key,
+            "failed to release flat-key write claim after a failed put; \
+             a later write or the migration-163 backfill will reconcile it"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Maven `maven-metadata.xml` generation cache (#2079)
 // ---------------------------------------------------------------------------
@@ -2129,11 +2158,11 @@ async fn upload(
     // These row-less puts create no artifact row, so attribution is committed
     // here -- only after the object bytes are durably written (#2574, V3b).
     if parse_checksum_path(&path).is_some() {
-        storage
-            .put(&storage_key, body)
-            .await
-            .map_err(map_storage_err)?;
-        crate::services::maven_flat_attribution::claim_flat_key_on_write(
+        // Atomically claim the flat key BEFORE writing its bytes: exactly one
+        // concurrent first-publisher wins, the rest are refused, so the stored
+        // bytes and the attributed owner can never disagree (#2586). Release the
+        // freshly-inserted claim if the put itself fails (V3b).
+        let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
             &repo.storage_backend,
@@ -2141,6 +2170,17 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
+        if let Err(e) = storage.put(&storage_key, body).await {
+            release_flat_key_claim_best_effort(
+                &state.db,
+                claim,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+            )
+            .await;
+            return Err(map_storage_err(e));
+        }
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -2150,11 +2190,9 @@ async fn upload(
     // If this is a maven-metadata.xml upload, just store it. Row-less put: same
     // claim-on-write-success rule as the checksum branch (#2574, V3b).
     if MavenHandler::is_metadata(&path) {
-        storage
-            .put(&storage_key, body)
-            .await
-            .map_err(map_storage_err)?;
-        crate::services::maven_flat_attribution::claim_flat_key_on_write(
+        // Row-less metadata put: atomic claim-gate before the write, same as the
+        // checksum branch (#2586); release on put failure (V3b).
+        let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
             &repo.storage_backend,
@@ -2162,6 +2200,17 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
+        if let Err(e) = storage.put(&storage_key, body).await {
+            release_flat_key_claim_best_effort(
+                &state.db,
+                claim,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+            )
+            .await;
+            return Err(map_storage_err(e));
+        }
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -2224,11 +2273,32 @@ async fn upload(
         .map_err(|e| e.into_response())?;
     }
 
+    // Atomically claim the flat key BEFORE writing its bytes so that of two
+    // concurrent first-publishers of the same key exactly one proceeds and the
+    // other is refused (#2586). This runs after coordinate parsing + the
+    // duplicate check, so an invalid/aborted request never claims (V3b); if the
+    // put fails, the freshly-inserted claim is released below.
+    let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
     // Store file in object storage regardless of grouping outcome
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(map_storage_err)?;
+    if let Err(e) = storage.put(&storage_key, body.clone()).await {
+        release_flat_key_claim_best_effort(
+            &state.db,
+            flat_key_claim,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await;
+        return Err(map_storage_err(e));
+    }
 
     // Build metadata JSON for this physical Maven file.
     let handler = MavenHandler::new();
@@ -2292,18 +2362,12 @@ async fn upload(
         .await
         .map_err(map_db_err)?;
 
-    // The live artifacts row above already attributes this key (resolution
-    // layer (a)); record a durable claim as well so ownership survives a later
-    // soft-delete of the row, matching the #2504 write guard's soft-delete
-    // awareness. Committed only now, after the put + row insert both succeeded.
-    crate::services::maven_flat_attribution::claim_flat_key_on_write(
-        &state.db,
-        repo.id,
-        &repo.storage_backend,
-        &storage_key,
-    )
-    .await
-    .map_err(|e| e.into_response())?;
+    // The durable attribution claim for this key was already committed by the
+    // atomic `claim_flat_key_for_write` gate above (before the put), so it is
+    // not re-inserted here. The live `artifacts` row also attributes the key
+    // (resolution layer (a)); the durable claim additionally keeps ownership
+    // after a later soft-delete of the row, matching the #2504 write guard's
+    // soft-delete awareness.
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;

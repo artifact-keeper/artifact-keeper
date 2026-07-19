@@ -264,6 +264,152 @@ pub async fn claim_flat_key_on_write(
     insert_claim(db, repository_id, storage_backend, storage_key).await
 }
 
+/// Outcome of an atomic pre-write first-claim on a flat key
+/// ([`claim_flat_key_for_write`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatKeyWriteClaim {
+    /// Filesystem backend: each repository owns an isolated key space, so there
+    /// is no shared namespace to claim and nothing to release.
+    NotApplicable,
+    /// This repository just inserted the first-writer claim row for a
+    /// previously-unclaimed key. It may proceed with the write; if the write
+    /// does NOT complete, the caller MUST call [`release_flat_key_claim`] so an
+    /// aborted or storage-failed write never leaves a foreign unattributed key
+    /// attributed to this repository (V3b, #2584).
+    Claimed,
+    /// This repository already owned the key: an idempotent overwrite of its
+    /// own object. Nothing new was inserted, so a failed write leaves prior,
+    /// valid ownership intact and no release is performed.
+    AlreadyOwned,
+}
+
+impl FlatKeyWriteClaim {
+    /// True when this outcome represents a claim row freshly inserted by the
+    /// current request that must be rolled back if the gated write fails.
+    pub fn needs_release_on_failure(self) -> bool {
+        matches!(self, FlatKeyWriteClaim::Claimed)
+    }
+}
+
+/// Atomically claim a flat `maven/{path}` key for a write, BEFORE the object
+/// bytes are written -- closing the first-publish TOCTOU race (#2586).
+///
+/// [`guard_flat_key_writable`] is a read-only check, so two repositories that
+/// concurrently first-publish the SAME previously-unowned key both observe it
+/// as unowned, both pass the guard, and both write. The object store is
+/// last-writer-wins on the bytes, while the historical post-write
+/// `ON CONFLICT DO NOTHING` claim ([`claim_flat_key_on_write`]) attributes the
+/// key to whichever INSERT landed first. Those two "winners" are independent, so
+/// the persisted bytes and the attributed owner can disagree -- and the loser's
+/// bytes are then served to the attributed winner, cross-tenant, defeating the
+/// #2504/#2574 write guard for the first writer.
+///
+/// This closes the window by making the first-claim the *gate* on the write: a
+/// single atomic `INSERT ... ON CONFLICT DO NOTHING` picks the one owner before
+/// any bytes are written. Exactly one concurrent first-writer inserts the row
+/// ([`FlatKeyWriteClaim::Claimed`]) and proceeds; a repository that already owns
+/// the key overwrites its own object ([`FlatKeyWriteClaim::AlreadyOwned`]); every
+/// other repository is refused with `403 Forbidden` and NEVER writes, so it can
+/// never overwrite the winner's bytes. The persisted bytes and the attributed
+/// owner are thus always the same repository.
+///
+/// This runs AFTER [`guard_flat_key_writable`], which must be kept: the guard
+/// rejects a key already owned by another repository via a live artifact row,
+/// parent metadata `files[]`, or a metadata rollup -- ownership that is NOT in
+/// the claim table and so would not conflict here. The atomic claim only closes
+/// the remaining concurrent-first-publish window on an otherwise-unowned key.
+///
+/// V3b is preserved: call this immediately before the `storage.put` (after all
+/// coordinate parsing and validation), so an aborted or invalid request never
+/// reaches it; and if the `put` itself fails, release a freshly
+/// [`Claimed`](FlatKeyWriteClaim::Claimed) row with [`release_flat_key_claim`].
+///
+/// Filesystem backends short-circuit to
+/// [`NotApplicable`](FlatKeyWriteClaim::NotApplicable).
+pub async fn claim_flat_key_for_write(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<FlatKeyWriteClaim> {
+    if storage_backend == "filesystem" {
+        return Ok(FlatKeyWriteClaim::NotApplicable);
+    }
+    // Atomic first-writer-wins: of N concurrent writers to the same unclaimed
+    // (backend, key), exactly one INSERT returns a row; the rest hit the
+    // primary-key ON CONFLICT and return nothing.
+    let inserted: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO maven_flat_object_owner \
+         (storage_backend, storage_key, repository_id, source) \
+         VALUES ($1, $2, $3, 'write_claim') \
+         ON CONFLICT (storage_backend, storage_key) DO NOTHING \
+         RETURNING repository_id",
+    )
+    .bind(storage_backend)
+    .bind(storage_key)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if inserted.is_some() {
+        return Ok(FlatKeyWriteClaim::Claimed);
+    }
+    // A claim row already existed. The conflict is on this exact
+    // (storage_backend, storage_key) primary key, so the attribution table is
+    // authoritative for who holds the key: read it directly.
+    let owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM maven_flat_object_owner \
+         WHERE storage_backend = $1 AND storage_key = $2",
+    )
+    .bind(storage_backend)
+    .bind(storage_key)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    match owner {
+        Some(owner) if owner == repository_id => Ok(FlatKeyWriteClaim::AlreadyOwned),
+        // Owned by another repository (lost the race, or a pre-existing foreign
+        // claim), or a row that vanished under us: fail closed, never write.
+        _ => Err(AppError::Authorization(format!(
+            "storage key '{storage_key}' was concurrently claimed by another \
+             repository; refusing cross-repository first-publish race"
+        ))),
+    }
+}
+
+/// Roll back a freshly-inserted [`FlatKeyWriteClaim::Claimed`] row when the
+/// write it gated did not complete, so an aborted or storage-failed write never
+/// leaves a foreign unattributed key attributed to this repository (V3b, #2584).
+///
+/// Deletes only a `write_claim` row for exactly this (backend, key) owned by
+/// this repository -- never a backfilled/derived attribution or another
+/// repository's row. Non-[`Claimed`](FlatKeyWriteClaim::Claimed) outcomes and
+/// filesystem backends are no-ops. Best-effort at the call site: a release
+/// failure must not mask the original write error.
+pub async fn release_flat_key_claim(
+    db: &PgPool,
+    claim: FlatKeyWriteClaim,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
+    if !claim.needs_release_on_failure() {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM maven_flat_object_owner \
+         WHERE storage_backend = $1 AND storage_key = $2 \
+           AND repository_id = $3 AND source = 'write_claim'",
+    )
+    .bind(storage_backend)
+    .bind(storage_key)
+    .bind(repository_id)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +651,154 @@ mod tests {
 
         clear_claims(&pool, &[attacker]).await;
         tdh::cleanup(&pool, attacker, Uuid::nil()).await;
+    }
+
+    /// #2586 regression: the first-publish TOCTOU race is closed.
+    ///
+    /// Two repositories concurrently first-publish the SAME previously-unowned
+    /// flat key. Both pass the read-only `guard_flat_key_writable` (the key is
+    /// unowned for both), then both drive the atomic write-claim gate. Exactly
+    /// ONE must win and be allowed to write; the other must be refused (403),
+    /// so the stored bytes and the attributed owner can never disagree.
+    ///
+    /// PRE-FIX behavior (demonstrated by the assertions): the write path was
+    /// `guard` (both pass) -> `put` (both write, last bytes win) ->
+    /// `claim_flat_key_on_write` (an `ON CONFLICT DO NOTHING` that returns
+    /// `Ok(())` for BOTH). Both writers therefore succeeded, so the loser's
+    /// bytes could be served under the winner's attribution. This test FAILS
+    /// against that gate (both `claim_flat_key_on_write` calls return `Ok`, so
+    /// there is no single winner) and PASSES against the atomic
+    /// `claim_flat_key_for_write` gate (one `Claimed`, one `Authorization`).
+    #[tokio::test]
+    async fn test_first_publish_race_single_winner_2586() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
+        set_repo_backend(&pool, repo_b, "s3").await;
+
+        // A brand-new flat key, unowned by either repository.
+        let key = format!("maven/com/acme/race/1.0/race-1.0-{}.pom", Uuid::new_v4());
+
+        // Both first-publishers pass the read-only guard (the TOCTOU window).
+        guard_flat_key_writable(&pool, repo_a, "s3", &key)
+            .await
+            .expect("repo A passes the read-only guard on an unowned key");
+        guard_flat_key_writable(&pool, repo_b, "s3", &key)
+            .await
+            .expect("repo B passes the read-only guard on an unowned key");
+
+        // Drive the atomic claim gate for both, concurrently, on the same key.
+        let (res_a, res_b) = tokio::join!(
+            claim_flat_key_for_write(&pool, repo_a, "s3", &key),
+            claim_flat_key_for_write(&pool, repo_b, "s3", &key),
+        );
+
+        // Exactly one is allowed to proceed (Claimed) and one is refused (403).
+        let a_ok = matches!(res_a, Ok(FlatKeyWriteClaim::Claimed));
+        let b_ok = matches!(res_b, Ok(FlatKeyWriteClaim::Claimed));
+        assert!(
+            a_ok ^ b_ok,
+            "exactly one first-publisher may win the flat key; got A={res_a:?} B={res_b:?}"
+        );
+        let (loser_res, winner) = if a_ok {
+            (res_b, repo_a)
+        } else {
+            (res_a, repo_b)
+        };
+        assert!(
+            matches!(loser_res, Err(AppError::Authorization(_))),
+            "the losing first-publisher must be refused as cross-repository; got {loser_res:?}"
+        );
+
+        // The attributed owner is exactly the winner, and only the winner may
+        // read the key -- bytes and attribution agree, so no cross-tenant serve.
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            Some(winner),
+            "the single winner owns the key"
+        );
+        let loser = if winner == repo_a { repo_b } else { repo_a };
+        assert!(flat_key_readable(&pool, winner, "s3", &key).await);
+        assert!(
+            !flat_key_readable(&pool, loser, "s3", &key).await,
+            "the loser must not be able to read the winner's object"
+        );
+
+        // The winner may idempotently overwrite its own key (AlreadyOwned), and
+        // the loser is still refused on a retry.
+        assert_eq!(
+            claim_flat_key_for_write(&pool, winner, "s3", &key)
+                .await
+                .expect("winner re-claim"),
+            FlatKeyWriteClaim::AlreadyOwned
+        );
+        assert!(matches!(
+            claim_flat_key_for_write(&pool, loser, "s3", &key).await,
+            Err(AppError::Authorization(_))
+        ));
+
+        clear_claims(&pool, &[repo_a, repo_b]).await;
+        tdh::cleanup(&pool, repo_b, Uuid::nil()).await;
+        tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
+    }
+
+    /// #2586 / V3b: a claimed-but-failed write releases its claim, leaving a
+    /// foreign unattributed key unattributed (no ownership flip on abort).
+    #[tokio::test]
+    async fn test_claim_release_restores_unowned_2586() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
+        let key = format!("maven/com/victimco/legacy-{}.bin", Uuid::new_v4());
+
+        // Claim (as if about to write), then the put fails -> release.
+        let claim = claim_flat_key_for_write(&pool, repo_a, "s3", &key)
+            .await
+            .expect("claim");
+        assert_eq!(claim, FlatKeyWriteClaim::Claimed);
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            Some(repo_a),
+            "a fresh claim attributes the key while the write is in flight"
+        );
+        release_flat_key_claim(&pool, claim, repo_a, "s3", &key)
+            .await
+            .expect("release");
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            None,
+            "releasing a failed write's claim leaves the key unattributed (V3b)"
+        );
+
+        // A NotApplicable/AlreadyOwned outcome never deletes anything.
+        insert_claim(&pool, repo_a, "s3", &key)
+            .await
+            .expect("re-seed a durable claim");
+        release_flat_key_claim(&pool, FlatKeyWriteClaim::AlreadyOwned, repo_a, "s3", &key)
+            .await
+            .expect("no-op release");
+        assert_eq!(
+            attributed_owner(&pool, "s3", &key).await.expect("query"),
+            Some(repo_a),
+            "AlreadyOwned release must not delete the durable claim"
+        );
+
+        // Filesystem backends short-circuit the whole gate.
+        let fs_key = format!("maven/com/acme/fs-{}.pom", Uuid::new_v4());
+        assert_eq!(
+            claim_flat_key_for_write(&pool, repo_a, "filesystem", &fs_key)
+                .await
+                .expect("filesystem claim"),
+            FlatKeyWriteClaim::NotApplicable
+        );
+
+        clear_claims(&pool, &[repo_a]).await;
+        tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
     }
 
     async fn set_repo_backend(pool: &PgPool, repo_id: Uuid, backend: &str) {
