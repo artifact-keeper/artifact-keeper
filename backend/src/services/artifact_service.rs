@@ -741,6 +741,31 @@ impl ArtifactService {
             None
         };
 
+        // Atomic quota admission (#2523). The authoritative quota check runs
+        // here, in the same transaction as the artifact INSERT, holding a
+        // `FOR UPDATE` lock on the repository's usage-ledger row. This closes
+        // the over-admission race: the preflight `check_quota` above is an
+        // unlocked best-effort early reject, so two concurrent near-limit
+        // uploads can both pass it; here the second admission blocks on the
+        // first's lock and, once the first's INSERT commits, observes those
+        // bytes and is rejected when the quota would be exceeded.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let admission = self
+            .repo_service
+            .check_quota_locked(&mut tx, repository_id, path, size_bytes)
+            .await?;
+        if !admission.allowed {
+            // Drop `tx` (rolls back). The content blob is content-addressed;
+            // if this upload orphaned it, storage GC reclaims it.
+            return Err(AppError::QuotaExceeded(
+                "Repository storage quota exceeded".to_string(),
+            ));
+        }
+
         // Create artifact record.
         //
         // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
@@ -788,9 +813,15 @@ impl ArtifactService {
             storage_key,
             uploaded_by
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Commit the admission + INSERT together, releasing the ledger-row
+        // lock. Everything below is a post-commit side effect on the pool.
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         // #2367: append an immutable revision to `artifact_versions` for
         // versioning-enabled Generic/Mlmodel repos. Identical-bytes
@@ -810,11 +841,17 @@ impl ArtifactService {
         )
         .await;
 
-        // Check quota warning threshold after successful upload
-        if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
-            if let Some(quota) = repo.quota_bytes {
-                if let Ok(current_usage) = self.repo_service.get_storage_usage(repository_id).await
-                {
+        // Check quota warning threshold after successful upload.
+        //
+        // PF-007 (#2523): reuse the usage computed during atomic admission
+        // instead of re-running the full 3-way aggregate here. `base_usage`
+        // excludes the row we just wrote at `path`, so post-upload usage is
+        // `base_usage + size_bytes`. It is `Some` only when a finite quota is
+        // set (the only case a warning can fire).
+        if let Some(base_usage) = admission.base_usage {
+            if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
+                if let Some(quota) = repo.quota_bytes {
+                    let current_usage = base_usage + size_bytes;
                     if crate::services::repository_service::exceeds_quota_warning_threshold(
                         current_usage,
                         quota,
@@ -3473,6 +3510,85 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "flag-off repos must record no version history"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// PF-007 (#2523): two concurrent uploads that each fit but together exceed
+    /// the quota must NOT both be admitted. Before the transactional,
+    /// ledger-serialized admission, both preflight reads saw the pre-upload
+    /// usage (0) and both uploads succeeded — the over-admission race. Now the
+    /// second upload blocks on the first's `FOR UPDATE` lock, observes its
+    /// committed bytes, and is rejected. Exactly one succeeds.
+    ///
+    /// Discriminating: on the unfixed code this asserts `successes == 1` and
+    /// fails because both succeed (`successes == 2`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_uploads_cannot_over_admit_quota() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // 100 KiB quota; two 60 KiB uploads fit individually, not together.
+        sqlx::query("UPDATE repositories SET quota_bytes = 100000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc_a = ArtifactService::new(pool.clone(), storage.clone());
+        let svc_b = ArtifactService::new(pool.clone(), storage);
+        let body_a = Bytes::from(vec![b'a'; 60_000]);
+        let body_b = Bytes::from(vec![b'b'; 60_000]);
+
+        let (ra, rb) = tokio::join!(
+            svc_a.upload_with_sync_options(
+                repo_id,
+                "pkg/a.bin",
+                "a.bin",
+                None,
+                "application/octet-stream",
+                body_a,
+                Some(user_id),
+                false,
+            ),
+            svc_b.upload_with_sync_options(
+                repo_id,
+                "pkg/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                body_b,
+                Some(user_id),
+                false,
+            ),
+        );
+
+        let successes = [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(
+            successes,
+            1,
+            "exactly one of two 60 KiB uploads may enter a 100 KiB quota \
+             (ra={:?}, rb={:?})",
+            ra.as_ref().map(|a| &a.path),
+            rb.as_ref().map(|a| &a.path),
+        );
+        let rejected = [ra, rb]
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("exactly one upload must be rejected");
+        assert!(
+            matches!(rejected, AppError::QuotaExceeded(_)),
+            "the rejected upload must fail with QuotaExceeded, got {rejected:?}"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) ON CONFLICT (repository_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6614b4b457098efe3024979fbd1d42a2ea3b123f1aa9b97d041fa3acac2273ea"
+}
