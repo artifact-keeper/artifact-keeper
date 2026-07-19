@@ -8,7 +8,7 @@ use futures::StreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::api::download_response::try_presigned_redirect;
+use crate::api::download_response::{content_disposition_attachment, try_presigned_redirect};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::AppState;
 use crate::error::AppError;
@@ -830,10 +830,7 @@ pub(crate) fn build_streaming_response_with_disposition(
         builder = builder.header("content-length", len);
     }
     if let Some(fname) = filename {
-        builder = builder.header(
-            "content-disposition",
-            format!("attachment; filename=\"{}\"", fname),
-        );
+        builder = builder.header("content-disposition", content_disposition_attachment(fname));
     }
     let body = axum::body::Body::from_stream(
         result
@@ -4510,10 +4507,7 @@ pub(crate) fn build_download_response(
         .header("Content-Type", ct)
         .header("Content-Length", content.len().to_string());
     if let Some(fname) = filename {
-        builder = builder.header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", fname),
-        );
+        builder = builder.header("Content-Disposition", content_disposition_attachment(fname));
     }
     builder.body(axum::body::Body::from(content)).unwrap()
 }
@@ -6919,6 +6913,34 @@ mod tests {
         );
         let cd = resp.headers().get("Content-Disposition").unwrap();
         assert_eq!(cd, "attachment; filename=\"pkg-1.0.0.tgz\"");
+    }
+
+    #[test]
+    fn test_build_download_response_filename_crlf_and_quote_not_injectable() {
+        // #2654: a crafted filename carrying CRLF, a double quote, and a
+        // non-ASCII char must not inject/split the Content-Disposition header.
+        let resp = build_download_response(
+            Bytes::from_static(b"x"),
+            None,
+            "application/octet-stream",
+            Some("evil\"\r\nSet-Cookie: pwn=1\r\n名前.tgz"),
+        );
+        let cd = resp
+            .headers()
+            .get("Content-Disposition")
+            .unwrap()
+            .to_str()
+            .expect("header value must be valid (no raw control bytes)");
+
+        // No raw CR/LF survived into the header value.
+        assert!(!cd.contains('\r') && !cd.contains('\n'), "cd = {cd:?}");
+        // The injected header name did not leak as a standalone header.
+        assert!(resp.headers().get("Set-Cookie").is_none());
+        // The embedded double quote is backslash-escaped in the quoted-string.
+        assert!(cd.contains("filename=\"evil\\\""), "cd = {cd:?}");
+        // Non-ASCII name triggers the RFC 5987 extended form (percent-encoded).
+        assert!(cd.contains("filename*=UTF-8''"), "cd = {cd:?}");
+        assert!(!cd.contains('名'), "raw non-ASCII must not appear: {cd:?}");
     }
 
     #[test]

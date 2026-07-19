@@ -16,6 +16,50 @@ use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend};
 /// Header to indicate how the artifact was served
 pub const X_ARTIFACT_STORAGE: &str = "x-artifact-storage";
 
+/// Build a safe `Content-Disposition: attachment` header value for a
+/// caller/artifact-supplied filename, per RFC 6266 / RFC 5987 (#2654).
+///
+/// The suggested download name can originate in untrusted content (e.g. a
+/// `Chart.yaml` `name` inside an uploaded archive), so it must never be
+/// interpolated into the header verbatim. This helper:
+///
+/// - **strips control characters** (including CR/LF), so a crafted name can
+///   never split or inject response headers;
+/// - always emits an ASCII `filename="…"` form with `"` and `\` escaped per
+///   the quoted-string grammar (non-ASCII bytes collapse to `_` there); and
+/// - when the name contains non-ASCII characters, additionally emits
+///   `filename*=UTF-8''<percent-encoded>` so modern clients recover the exact
+///   UTF-8 name while legacy clients fall back to the ASCII form.
+///
+/// The returned string is always a valid `HeaderValue`.
+pub(crate) fn content_disposition_attachment(filename: &str) -> String {
+    // Drop control characters (incl. CR, LF, NUL, tab) up front so nothing that
+    // could break the header survives into either rendered form.
+    let cleaned: String = filename.chars().filter(|c| !c.is_control()).collect();
+
+    // RFC 6266 quoted-string ASCII fallback: non-ASCII -> '_', escape '\' and '"'.
+    let mut ascii = String::with_capacity(cleaned.len());
+    for c in cleaned.chars() {
+        match c {
+            _ if !c.is_ascii() => ascii.push('_'),
+            '"' | '\\' => {
+                ascii.push('\\');
+                ascii.push(c);
+            }
+            _ => ascii.push(c),
+        }
+    }
+
+    if cleaned.is_ascii() {
+        format!("attachment; filename=\"{ascii}\"")
+    } else {
+        // RFC 5987 extended value carries the exact UTF-8 name for clients that
+        // support it; the ASCII `filename` above remains for those that don't.
+        let encoded = urlencoding::encode(&cleaned);
+        format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+    }
+}
+
 /// Download response that can be either a redirect or streamed content
 pub enum DownloadResponse {
     /// 302 redirect to presigned URL
@@ -91,10 +135,8 @@ impl IntoResponse for DownloadResponse {
                     .header(X_ARTIFACT_STORAGE, "proxy");
 
                 if let Some(name) = filename {
-                    builder = builder.header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", name),
-                    );
+                    builder = builder
+                        .header("Content-Disposition", content_disposition_attachment(&name));
                 }
 
                 builder.body(Body::from(data)).unwrap()
@@ -216,6 +258,45 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use bytes::Bytes;
+
+    #[test]
+    fn test_content_disposition_attachment_plain_ascii_unchanged() {
+        // Normal names (incl. spaces) still render the familiar quoted form.
+        assert_eq!(
+            content_disposition_attachment("pkg-1.0.0.tgz"),
+            "attachment; filename=\"pkg-1.0.0.tgz\""
+        );
+        assert_eq!(
+            content_disposition_attachment("my package 1.0.tgz"),
+            "attachment; filename=\"my package 1.0.tgz\""
+        );
+    }
+
+    #[test]
+    fn test_content_disposition_attachment_strips_crlf() {
+        // #2654: CR/LF must never survive into the header value.
+        let v = content_disposition_attachment("a\r\nSet-Cookie: x=1.tgz");
+        assert!(!v.contains('\r') && !v.contains('\n'), "v = {v:?}");
+        assert_eq!(v, "attachment; filename=\"aSet-Cookie: x=1.tgz\"");
+    }
+
+    #[test]
+    fn test_content_disposition_attachment_escapes_quote_and_backslash() {
+        let v = content_disposition_attachment("a\"b\\c.tgz");
+        assert_eq!(v, "attachment; filename=\"a\\\"b\\\\c.tgz\"");
+    }
+
+    #[test]
+    fn test_content_disposition_attachment_non_ascii_uses_rfc5987() {
+        // Non-ASCII names emit both an ASCII fallback (non-ASCII -> '_') and the
+        // RFC 5987 extended, percent-encoded parameter.
+        let v = content_disposition_attachment("naïve-café.tgz");
+        assert!(v.starts_with("attachment; filename=\""), "v = {v:?}");
+        assert!(v.contains("filename*=UTF-8''"), "v = {v:?}");
+        assert!(!v.contains('ï') && !v.contains('é'), "v = {v:?}");
+        // Percent-encoded UTF-8 bytes for the accented characters are present.
+        assert!(v.contains("%C3%AF") && v.contains("%C3%A9"), "v = {v:?}");
+    }
 
     #[test]
     fn test_redirect_constructor() {
