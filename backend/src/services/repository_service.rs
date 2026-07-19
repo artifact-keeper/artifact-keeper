@@ -15,6 +15,30 @@ use crate::models::repository::{
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
+/// Outcome of an atomic, in-transaction quota admission check
+/// ([`RepositoryService::check_quota_locked`]).
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaAdmission {
+    /// Whether the upload is permitted under the repository's storage quota.
+    pub allowed: bool,
+    /// The repository's live usage EXCLUDING the row currently being written
+    /// at the target path (so an overwrite is charged only its net size
+    /// delta). `None` when the repository has no finite quota, in which case
+    /// usage is neither computed nor enforced.
+    pub base_usage: Option<i64>,
+}
+
+/// Summary of a [`RepositoryService::reconcile_all_usage_ledgers`] pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UsageLedgerReconcileReport {
+    /// Repositories whose ledger row was recomputed.
+    pub repositories_checked: usize,
+    /// Repositories whose ledger total changed (drift that was repaired).
+    pub repositories_repaired: usize,
+    /// Sum of the absolute per-repository drift that was corrected, in bytes.
+    pub total_drift_bytes: i64,
+}
+
 /// Request to create a new repository
 #[derive(Debug)]
 pub struct CreateRepositoryRequest {
@@ -1596,6 +1620,219 @@ impl RepositoryService {
             // NULL or a non-positive sentinel (0 / negative) => unlimited.
             _ => true,
         }
+    }
+
+    /// Atomically admit (or reject) an upload of `new_size` bytes to `path`
+    /// under the repository's storage quota, **inside the caller's
+    /// transaction**.
+    ///
+    /// This closes the over-admission race (#2523). `check_quota` alone reads
+    /// the live sum without any lock, so two concurrent near-limit uploads can
+    /// both read the pre-upload usage and both be admitted beyond the quota.
+    /// Here we INSERT (if absent) and then `SELECT ... FOR UPDATE` the
+    /// repository's `repository_usage_ledger` row, so uploads into the same
+    /// repository serialize on that row. Because the caller performs the
+    /// artifact INSERT in the *same* transaction, the second admission observes
+    /// the first upload's committed bytes and is rejected when the quota would
+    /// be exceeded.
+    ///
+    /// Usage is read from the authoritative live source tables (the same 3-way
+    /// sum the quota gate has always used) net of any existing row at `path`,
+    /// so an in-place overwrite is charged only its size delta rather than
+    /// double-counting the bytes it replaces.
+    ///
+    /// A `None`/non-positive quota means unlimited: the call returns
+    /// `allowed = true` without locking or scanning.
+    pub async fn check_quota_locked(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: Uuid,
+        path: &str,
+        new_size: i64,
+    ) -> Result<QuotaAdmission> {
+        let quota_bytes: Option<i64> = sqlx::query_scalar!(
+            "SELECT quota_bytes FROM repositories WHERE id = $1",
+            repo_id
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let quota = match quota_bytes {
+            Some(quota) if quota > 0 => quota,
+            // NULL or a non-positive sentinel => unlimited: nothing to lock or
+            // count.
+            _ => {
+                return Ok(QuotaAdmission {
+                    allowed: true,
+                    base_usage: None,
+                })
+            }
+        };
+
+        // Serialize same-repo admissions on the ledger row: create it if the
+        // repository predates the ledger, then take a row lock held until the
+        // caller commits (after its artifact INSERT).
+        sqlx::query!(
+            "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) \
+             ON CONFLICT (repository_id) DO NOTHING",
+            repo_id
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query_scalar!(
+            "SELECT hosted_bytes FROM repository_usage_ledger \
+             WHERE repository_id = $1 FOR UPDATE",
+            repo_id
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Authoritative live usage: the same components the quota aggregate
+        // summed (artifacts + proxy_cache_artifacts + oci_blobs).
+        let total: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
+            FROM (
+                SELECT size_bytes AS bytes
+                  FROM artifacts
+                 WHERE repository_id = $1 AND is_deleted = false
+                   AND storage_key NOT LIKE 'proxy-cache/%'
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM proxy_cache_artifacts
+                 WHERE repository_id = $1
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM oci_blobs
+                 WHERE repository_id = $1
+            ) t
+            "#,
+            repo_id
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Net-delta accounting for overwrites: subtract the bytes already
+        // charged for the (repository_id, path) row we are about to replace.
+        let existing_at_path: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+              FROM artifacts
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+               AND storage_key NOT LIKE 'proxy-cache/%'
+            "#,
+            repo_id,
+            path
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let base_usage = total - existing_at_path;
+        Ok(QuotaAdmission {
+            allowed: base_usage + new_size <= quota,
+            base_usage: Some(base_usage),
+        })
+    }
+
+    /// Recompute one repository's usage-ledger components from the
+    /// authoritative source tables and upsert them. Returns the reconciled
+    /// total (`hosted + proxy + oci`). Used by the background reconciler, by
+    /// lazy row creation, and by tests.
+    pub async fn reconcile_usage_ledger(&self, repo_id: Uuid) -> Result<i64> {
+        let hosted: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+              FROM artifacts
+             WHERE repository_id = $1 AND is_deleted = false
+               AND storage_key NOT LIKE 'proxy-cache/%'
+            "#,
+            repo_id
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let proxy: i64 = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+                 FROM proxy_cache_artifacts WHERE repository_id = $1"#,
+            repo_id
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let oci: i64 = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
+                 FROM oci_blobs WHERE repository_id = $1"#,
+            repo_id
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query!(
+            "INSERT INTO repository_usage_ledger \
+                 (repository_id, hosted_bytes, proxy_bytes, oci_bytes, updated_at) \
+             VALUES ($1, $2, $3, $4, now()) \
+             ON CONFLICT (repository_id) DO UPDATE SET \
+                 hosted_bytes = EXCLUDED.hosted_bytes, \
+                 proxy_bytes  = EXCLUDED.proxy_bytes, \
+                 oci_bytes    = EXCLUDED.oci_bytes, \
+                 updated_at   = now()",
+            repo_id,
+            hosted,
+            proxy,
+            oci
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(hosted + proxy + oci)
+    }
+
+    /// True up every repository's usage ledger against the authoritative live
+    /// sums, repairing drift from any write path that did not maintain the
+    /// ledger. Runs on the background scheduler; safe to run at any time.
+    pub async fn reconcile_all_usage_ledgers(&self) -> Result<UsageLedgerReconcileReport> {
+        let ids: Vec<Uuid> = sqlx::query_scalar!("SELECT id FROM repositories")
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut report = UsageLedgerReconcileReport::default();
+        for id in ids {
+            let before: i64 = sqlx::query_scalar!(
+                r#"SELECT COALESCE(hosted_bytes + proxy_bytes + oci_bytes, 0)::BIGINT as "t!"
+                     FROM repository_usage_ledger WHERE repository_id = $1"#,
+                id
+            )
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(0);
+
+            // Per-repository failures are non-fatal: a repository can be
+            // deleted between the id snapshot above and this upsert (the FK
+            // then rejects the write), and one bad row must not abort the whole
+            // pass. Skip and continue.
+            match self.reconcile_usage_ledger(id).await {
+                Ok(after) => {
+                    report.repositories_checked += 1;
+                    if after != before {
+                        report.repositories_repaired += 1;
+                        report.total_drift_bytes += (after - before).abs();
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("skipping usage-ledger reconcile for {}: {}", id, e);
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Convert a Repository model to a search RepositoryDocument.
@@ -4059,6 +4296,117 @@ mod tests {
                 .await
                 .expect("storage usage");
             assert_eq!(usage, 3_500, "artifacts + proxy catalog only");
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// PF-007 (#2523): after inserts across all three components the
+        /// reconciled ledger must equal the authoritative 3-way sum, split into
+        /// the correct per-component columns.
+        #[tokio::test]
+        async fn test_usage_ledger_reconcile_matches_union() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            insert_artifact(
+                &pool,
+                repo.id,
+                "a/1",
+                &format!("cas/aa/bb/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            insert_proxy_cache(&pool, repo.id, "cached/pkg.tgz", 2_500).await;
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 500_000).await;
+
+            let total = service
+                .reconcile_usage_ledger(repo.id)
+                .await
+                .expect("reconcile ledger");
+            assert_eq!(total, 503_500, "hosted 1000 + proxy 2500 + oci 500000");
+
+            let (hosted, proxy, oci): (i64, i64, i64) = sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+                 FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .fetch_one(&pool)
+            .await
+            .expect("ledger row");
+            assert_eq!((hosted, proxy, oci), (1_000, 2_500, 500_000));
+
+            // Ledger total agrees with the authoritative live sum.
+            let union_usage = service
+                .get_storage_usage(repo.id)
+                .await
+                .expect("storage usage");
+            assert_eq!(hosted + proxy + oci, union_usage);
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// PF-007 (#2523): the reconciler is the drift safety net — an injected
+        /// bad ledger value is repaired back to the true sum and reported.
+        #[tokio::test]
+        async fn test_usage_ledger_reconciler_repairs_drift() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(
+                &pool,
+                repo.id,
+                "a/1",
+                &format!("cas/cc/dd/{}", Uuid::new_v4()),
+                7_000,
+            )
+            .await;
+            service
+                .reconcile_usage_ledger(repo.id)
+                .await
+                .expect("initial reconcile");
+
+            // Inject drift: pretend a write path miscounted.
+            sqlx::query(
+                "UPDATE repository_usage_ledger SET hosted_bytes = 999_999 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject drift");
+
+            let report = service
+                .reconcile_all_usage_ledgers()
+                .await
+                .expect("reconcile all");
+            assert!(
+                report.repositories_repaired >= 1,
+                "the drifted repo must be counted as repaired"
+            );
+
+            let hosted: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .fetch_one(&pool)
+            .await
+            .expect("ledger row");
+            assert_eq!(hosted, 7_000, "drift repaired back to the true sum");
 
             cleanup_repo(&pool, repo.id).await;
         }

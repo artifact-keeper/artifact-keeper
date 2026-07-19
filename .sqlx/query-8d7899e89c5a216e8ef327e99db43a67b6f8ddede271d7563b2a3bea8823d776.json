@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(hosted_bytes + proxy_bytes + oci_bytes, 0)::BIGINT as \"t!\"\n                     FROM repository_usage_ledger WHERE repository_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "t!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8d7899e89c5a216e8ef327e99db43a67b6f8ddede271d7563b2a3bea8823d776"
+}

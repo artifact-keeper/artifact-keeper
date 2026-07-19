@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as \"bytes!\"\n              FROM artifacts\n             WHERE repository_id = $1 AND is_deleted = false\n               AND storage_key NOT LIKE 'proxy-cache/%'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bytes!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e73bbba52979f82096c5efd14dd5c6dfdb9d950a7feb871b82eb3253120e0198"
+}

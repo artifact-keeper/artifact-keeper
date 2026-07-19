@@ -549,6 +549,38 @@ pub fn spawn_all(
         });
     }
 
+    // Usage-ledger reconciler (PF-007 #2523, every 30 min).
+    // Trues up `repository_usage_ledger` against the authoritative live sums
+    // so drift from any write path that did not maintain the ledger self-heals.
+    // Cheap index-ranged aggregates off the request path; the mandatory safety
+    // net behind the ledger-serialized quota admission.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(200)).await;
+            let repo_service = crate::services::repository_service::RepositoryService::new(db);
+            let mut ticker = interval(Duration::from_secs(1800));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match repo_service.reconcile_all_usage_ledgers().await {
+                    Ok(report) if report.repositories_repaired > 0 => {
+                        tracing::warn!(
+                            repositories_checked = report.repositories_checked,
+                            repositories_repaired = report.repositories_repaired,
+                            drift_bytes = report.total_drift_bytes,
+                            "Repaired repository_usage_ledger drift"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Usage-ledger reconciliation failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Backup schedule execution (check every 5 minutes)
     {
         let db = db.clone();
