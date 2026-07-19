@@ -528,11 +528,15 @@ mod tests {
     use crate::storage::PresignedUrl as PU;
     use async_trait::async_trait;
 
-    /// A mock backend that supports presigned URLs.
-    struct RedirectBackend;
+    /// A mock backend; `redirect: true` advertises presigned-URL support
+    /// (mirroring the old separate `RedirectBackend` / `NoRedirectBackend`
+    /// doubles, merged to avoid duplicated impl boilerplate).
+    struct MockBackend {
+        redirect: bool,
+    }
 
     #[async_trait]
-    impl StorageBackend for RedirectBackend {
+    impl StorageBackend for MockBackend {
         async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
             Ok(())
         }
@@ -546,13 +550,16 @@ mod tests {
             Ok(())
         }
         fn supports_redirect(&self) -> bool {
-            true
+            self.redirect
         }
         async fn get_presigned_url(
             &self,
             key: &str,
             expires_in: Duration,
         ) -> AppResult<Option<PU>> {
+            if !self.redirect {
+                return Ok(None);
+            }
             Ok(Some(PU {
                 url: format!("https://s3.example.com/{}", key),
                 expires_in,
@@ -568,35 +575,9 @@ mod tests {
         }
     }
 
-    /// A mock backend that does not support presigned URLs.
-    struct NoRedirectBackend;
-
-    #[async_trait]
-    impl StorageBackend for NoRedirectBackend {
-        async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
-            Ok(())
-        }
-        async fn get(&self, _key: &str) -> AppResult<Bytes> {
-            Ok(Bytes::from_static(b"data"))
-        }
-        async fn exists(&self, _key: &str) -> AppResult<bool> {
-            Ok(true)
-        }
-        async fn delete(&self, _key: &str) -> AppResult<()> {
-            Ok(())
-        }
-        async fn put_stream(
-            &self,
-            key: &str,
-            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
-        ) -> crate::error::Result<crate::storage::PutStreamResult> {
-            crate::storage::buffered_put_stream_fallback(self, key, stream).await
-        }
-    }
-
     #[tokio::test]
     async fn test_try_presigned_redirect_enabled_and_supported() {
-        let backend = RedirectBackend;
+        let backend = MockBackend { redirect: true };
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -615,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_disabled() {
-        let backend = RedirectBackend;
+        let backend = MockBackend { redirect: true };
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -632,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_backend_no_support() {
-        let backend = NoRedirectBackend;
+        let backend = MockBackend { redirect: false };
         let result = super::try_presigned_redirect(
             &backend,
             "cas/ab/cd/abcdef",
@@ -649,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_presigned_redirect_uses_configured_expiry() {
-        let backend = RedirectBackend;
+        let backend = MockBackend { redirect: true };
         let result =
             super::try_presigned_redirect(&backend, "test-key", true, Duration::from_secs(600))
                 .await;
