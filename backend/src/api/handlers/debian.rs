@@ -12,6 +12,7 @@
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages.gz - Compressed Packages index
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages.xz - XZ-compressed Packages index
 //!   GET  /debian/{repo_key}/dists/{distribution}/*path                              - Catch-all dists proxy (i18n, Sources, etc.)
+//!   GET  /debian/{repo_key}/gpg-key.asc                                             - Repository public key
 //!   GET  /debian/{repo_key}/pool/{component}/*path                                  - Download .deb
 //!   PUT  /debian/{repo_key}/pool/{component}/*path                                  - Upload .deb
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
@@ -71,9 +72,11 @@ pub fn router() -> Router<SharedState> {
             get(release_gpg),
         )
         // Public key endpoint
+        .route("/:repo_key/gpg-key.asc", get(gpg_key_asc))
+        // Public key endpoint (legacy)
         .route(
             "/:repo_key/dists/:distribution/gpg-key.asc",
-            get(gpg_key_asc),
+            get(gpg_key_asc_legacy),
         )
         // Packages indices and i18n/Sources/etc. share a single wildcard route
         // and are dispatched in-handler. axum's matchit router rejects
@@ -2097,12 +2100,12 @@ async fn release_gpg(
 }
 
 // ---------------------------------------------------------------------------
-// GET /debian/{repo_key}/dists/{distribution}/gpg-key.asc
+// GET /debian/{repo_key}/gpg-key.asc
 // ---------------------------------------------------------------------------
 
 async fn gpg_key_asc(
     State(state): State<SharedState>,
-    Path((repo_key, _distribution)): Path<(String, String)>,
+    Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
@@ -2130,6 +2133,17 @@ async fn gpg_key_asc(
         )
             .into_response()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/dists/{distribution}/gpg-key.asc
+// ---------------------------------------------------------------------------
+
+async fn gpg_key_asc_legacy(
+    state: State<SharedState>,
+    Path((repo_key, _distribution)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    gpg_key_asc(state, Path(repo_key)).await
 }
 
 // ---------------------------------------------------------------------------
