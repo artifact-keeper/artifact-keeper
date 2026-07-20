@@ -324,6 +324,40 @@ async fn package_info(
 ) -> Result<Response, Response> {
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
 
+    // Remote: the registry resource is upstream's already-signed protobuf —
+    // pass it through regardless of local cache state. This used to be gated
+    // on the local `artifacts` rows being empty, so the first cached tarball
+    // silently flipped the response to the plain-JSON arm below, which the
+    // hex client cannot consume (it gunzips every registry response first,
+    // so it dies in `:zlib.gunzip/1`) — the repo "worked until it cached its
+    // first artifact" (#2658). Cached tarball BYTES still serve locally via
+    // `download_tarball`; only the registry metadata stays a pass-through,
+    // which also keeps the client's pinned upstream signing key valid.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let upstream_path = format!("packages/{}", name);
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &upstream_path,
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(content))
+                .unwrap());
+        }
+    }
+
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -344,32 +378,6 @@ async fn package_info(
     .map_err(super::db_err)?;
 
     if artifacts.is_empty() {
-        // Remote: fetch package metadata from the upstream hex registry.
-        if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                let upstream_path = format!("packages/{}", name);
-                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-        }
-
         // Virtual: check every member's `artifacts` table (local or remote
         // cache) before falling back to remote upstream proxy. The previous
         // implementation called `resolve_virtual_metadata` directly, which
@@ -1090,9 +1098,12 @@ async fn list_names(
         return signed_registry_response(&state, repo.id, payload).await;
     }
 
-    // Remote with no local artifacts: proxy the names list from upstream.
-    // hex.pm's /names endpoint returns a signed protobuf payload; pass it through as-is.
-    if names.is_empty() && repo.repo_type == RepositoryType::Remote {
+    // Remote: proxy the names list from upstream regardless of local cache
+    // state. hex.pm's /names endpoint returns a signed protobuf payload; pass
+    // it through as-is. Gating this on the cache being empty made the first
+    // cached artifact flip the response to the JSON arm below, which the hex
+    // client cannot gunzip (#2658).
+    if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
@@ -1242,9 +1253,12 @@ async fn list_versions(
         return signed_registry_response(&state, repo.id, payload).await;
     }
 
-    // Remote with no local artifacts: proxy the versions list from upstream.
-    // hex.pm's /versions endpoint returns a signed protobuf payload; pass it through as-is.
-    if artifacts.is_empty() && repo.repo_type == RepositoryType::Remote {
+    // Remote: proxy the versions list from upstream regardless of local cache
+    // state. hex.pm's /versions endpoint returns a signed protobuf payload;
+    // pass it through as-is. Gating this on the cache being empty made the
+    // first cached artifact flip the response to the JSON arm below, which
+    // the hex client cannot gunzip (#2658).
+    if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
@@ -3711,6 +3725,104 @@ mod tests {
         );
 
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2658: a Remote hex repo's registry must stay an upstream pass-through
+    // after its first artifact is cached. The old code gated the pass-through
+    // on the local cache being empty, so the first successful `deps.get`
+    // flipped /names, /versions and /packages/{name} to the plain-JSON arm,
+    // which the hex client cannot gunzip — the repo worked exactly once.
+    // -----------------------------------------------------------------------
+
+    /// Distinctive stand-in for upstream's signed+gzipped protobuf registry
+    /// bytes. The assertions only need to tell "upstream bytes passed
+    /// through verbatim" apart from "locally rebuilt JSON".
+    const UPSTREAM_SIGNED_REGISTRY: &[u8] = b"\x1f\x8b\x08upstream-signed-registry-bytes";
+
+    #[tokio::test]
+    async fn test_hex_remote_registry_stays_passthrough_after_first_cache_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
+            return;
+        };
+
+        let upstream = MockServer::start().await;
+        for p in ["/versions", "/names", "/packages/phoenix"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(UPSTREAM_SIGNED_REGISTRY)
+                        .insert_header("content-type", "application/octet-stream"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let resources = [
+            format!("/{}/versions", fx.repo_key),
+            format!("/{}/names", fx.repo_key),
+            format!("/{}/packages/phoenix", fx.repo_key),
+        ];
+
+        // Before anything is cached: all three registry resources pass
+        // upstream's bytes through (the state the issue calls "works").
+        for uri in &resources {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must serve pre-cache");
+            assert_eq!(
+                &body[..],
+                UPSTREAM_SIGNED_REGISTRY,
+                "{uri} must pass upstream bytes through pre-cache"
+            );
+        }
+
+        // Cache one artifact, exactly as the first successful `deps.get`
+        // would leave the repository.
+        let repo = fx.repo_info("remote", Some(&upstream.uri()));
+        tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &repo,
+            "hex/phoenix/1.7.0/phoenix-1.7.0.tar",
+            "phoenix/1.7.0/phoenix-1.7.0.tar",
+            "phoenix",
+            "1.7.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"cached-tarball-bytes"),
+            fx.user_id,
+        )
+        .await;
+
+        // After caching: the registry must STILL be the upstream
+        // pass-through, not a locally rebuilt JSON document (#2658).
+        for uri in &resources {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must serve post-cache");
+            assert_eq!(
+                &body[..],
+                UPSTREAM_SIGNED_REGISTRY,
+                "{uri} must stay an upstream pass-through after the first artifact is cached (#2658)"
+            );
+        }
+
+        // The cached tarball itself still serves from the local cache.
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/phoenix-1.7.0.tar", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "cached tarball must serve locally");
+        assert_eq!(&body[..], b"cached-tarball-bytes");
+
+        fx.teardown().await;
     }
 }
 
