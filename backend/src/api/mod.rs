@@ -20,6 +20,7 @@ use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
+use crate::services::rpm_repodata_cache::RpmRepodataCache;
 use crate::services::scanner_service::ScannerService;
 use crate::services::smtp_service::SmtpService;
 use crate::services::wasm_plugin_service::WasmPluginService;
@@ -139,6 +140,12 @@ pub struct AppState {
     /// can evict just the entries belonging to a specific
     /// `(repo_key, distribution)` when the underlying Release flips.
     pub signed_release_cache_index: SignedReleaseCacheIndex,
+    /// Fingerprint-validated cache of rendered RPM repodata sets (#2521):
+    /// warm `repomd.xml` / `primary.xml.gz` / `filelists.xml.gz` /
+    /// `other.xml.gz` requests serve prebuilt bytes validated by one cheap
+    /// aggregate query instead of refetching every artifact row and
+    /// regenerating + recompressing the whole document set per request.
+    pub rpm_repodata_cache: Arc<RpmRepodataCache>,
     /// Concurrency cap for bcrypt-bound auth work (login, password verify,
     /// API token verify). `None` when `auth_max_concurrency == 0`, in which
     /// case auth runs without a process-wide cap (legacy behaviour).
@@ -205,6 +212,7 @@ impl AppState {
             npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
+            rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
         }
     }
@@ -250,6 +258,7 @@ impl AppState {
             npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
+            rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
         }
     }
