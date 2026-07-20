@@ -15,6 +15,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::services::auth_config_service::AuthConfigService;
 
 /// Router for the system configuration endpoint.
 ///
@@ -72,6 +73,35 @@ pub struct AuthConfig {
     /// Whether SAML SSO is configured (derived from the SSO admin settings in the DB,
     /// but for this endpoint we report whether the OIDC issuer is set as a proxy).
     pub sso_enabled: bool,
+    /// Whether the login UI should offer the local username/password form
+    /// (issue #2621). `true` when no SSO provider is enabled; with SSO
+    /// enabled it is `true` only when the operator explicitly opted in via
+    /// `ALLOW_LOCAL_ADMIN_LOGIN=true` and has not enforced strict SSO-only
+    /// via `SSO_DISABLE_ADMIN_BREAK_GLASS`. Display-only: the login endpoint
+    /// independently enforces the same policy server-side
+    /// (`api::handlers::auth::local_login_gate`), so this flag never grants
+    /// access by itself. LDAP is separate — the UI shows the credentials form
+    /// for enabled LDAP providers regardless of this flag.
+    pub local_login_enabled: bool,
+}
+
+/// Whether the local username/password login form should be offered to the
+/// (pre-authentication) login UI. Mirrors the *operator-visible* subset of the
+/// login-time policy in `api::handlers::auth::local_login_gate`:
+///
+/// * No SSO provider enabled → local login is the only way in, always `true`.
+/// * SSO enabled → `true` only when `ALLOW_LOCAL_ADMIN_LOGIN=true` was set
+///   and `SSO_DISABLE_ADMIN_BREAK_GLASS` (which takes precedence, #2018) is
+///   not. The quiet default admin break-glass (#443) is intentionally *not*
+///   advertised here: absent the explicit opt-in, the form stays hidden so
+///   SSO-first deployments don't present password fields that reject every
+///   non-admin (#350 / #2621).
+fn local_login_form_enabled(
+    sso_enabled: bool,
+    allow_local_admin_login: bool,
+    disable_admin_break_glass: bool,
+) -> bool {
+    !sso_enabled || (allow_local_admin_login && !disable_admin_break_glass)
 }
 
 /// Runtime configuration values.
@@ -158,10 +188,27 @@ pub async fn get_system_config(
 
     // Public-safe fields: always returned. Login UI needs to know which
     // providers are available before the user authenticates.
+    //
+    // `local_login_enabled` uses the same enabled-provider source of truth as
+    // the login-time policy (`AuthConfigService::list_enabled_providers`, see
+    // `enforce_local_login_sso_policy` in handlers::auth) rather than the env
+    // proxies above, so the advertised form matches what the login endpoint
+    // will actually accept. On a lookup error we fail toward showing the form
+    // (matching the login page's own fail-safe); the login endpoint still
+    // enforces the policy server-side, so this is display-only either way.
+    let sso_provider_enabled = AuthConfigService::list_enabled_providers(&state.db)
+        .await
+        .map(|providers| !providers.is_empty())
+        .unwrap_or(false);
     let auth_config = AuthConfig {
         oidc_enabled: config.oidc_issuer.is_some(),
         ldap_enabled: config.ldap_url.is_some(),
         sso_enabled: config.oidc_issuer.is_some(),
+        local_login_enabled: local_login_form_enabled(
+            sso_provider_enabled,
+            config.allow_local_admin_login,
+            config.sso_disable_admin_break_glass,
+        ),
     };
 
     // Non-admin / anonymous callers receive only the public-safe subset. The
@@ -277,6 +324,7 @@ mod tests {
                 oidc_enabled: false,
                 ldap_enabled: false,
                 sso_enabled: false,
+                local_login_enabled: true,
             },
             oidc_issuer: None,
             permissions: Some(PermissionsConfig {
@@ -344,6 +392,7 @@ mod tests {
                 oidc_enabled: true,
                 ldap_enabled: true,
                 sso_enabled: true,
+                local_login_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
             permissions: Some(PermissionsConfig {
@@ -424,11 +473,13 @@ mod tests {
             oidc_enabled: true,
             ldap_enabled: false,
             sso_enabled: true,
+            local_login_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"oidc_enabled\":true"));
         assert!(json.contains("\"ldap_enabled\":false"));
         assert!(json.contains("\"sso_enabled\":true"));
+        assert!(json.contains("\"local_login_enabled\":true"));
     }
 
     #[test]
@@ -448,6 +499,7 @@ mod tests {
                 oidc_enabled: true,
                 ldap_enabled: false,
                 sso_enabled: true,
+                local_login_enabled: false,
             },
             ..minimal_response()
         };
@@ -775,5 +827,123 @@ mod tests {
         assert_eq!(obj["search_engine"], "database");
         assert_eq!(obj["scanners"]["trivy_enabled"], false);
         assert_eq!(obj["permissions"]["enforcement_enabled"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // local_login_form_enabled — public local-login affordance (issue #2621)
+    //
+    // Full matrix. The flag only *advertises* the form; enforcement lives in
+    // handlers::auth::local_login_gate, so nothing here can widen access.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_local_login_form_no_sso_always_enabled() {
+        // Without SSO, local login is the only way in — the form must be
+        // offered regardless of either flag.
+        for allow in [false, true] {
+            for strict in [false, true] {
+                assert!(local_login_form_enabled(false, allow, strict));
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_login_form_sso_requires_explicit_opt_in() {
+        // SSO enabled + ALLOW_LOCAL_ADMIN_LOGIN unset/false: the form stays
+        // hidden (the quiet #443 admin break-glass is not advertised).
+        for strict in [false, true] {
+            assert!(!local_login_form_enabled(true, false, strict));
+        }
+    }
+
+    #[test]
+    fn test_local_login_form_sso_with_flag_enabled() {
+        // The #2621 case: OIDC/SSO enabled AND ALLOW_LOCAL_ADMIN_LOGIN=true
+        // must advertise the local login form.
+        assert!(local_login_form_enabled(true, true, false));
+    }
+
+    #[test]
+    fn test_local_login_form_strict_sso_overrides_flag() {
+        // SSO_DISABLE_ADMIN_BREAK_GLASS (#2018) takes precedence: even with
+        // the opt-in flag set, strict SSO-only hides the form because the
+        // login endpoint would reject every local credential anyway.
+        assert!(!local_login_form_enabled(true, true, true));
+    }
+
+    /// DB-backed (#2621): the handler must compute `auth.local_login_enabled`
+    /// from the *enabled-provider* source of truth (same as the login gate)
+    /// combined with the ALLOW_LOCAL_ADMIN_LOGIN / strict-SSO config flags.
+    #[tokio::test]
+    async fn test_handler_local_login_enabled_matrix_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Serialize against other tests that seed enabled SSO providers —
+        // list_enabled_providers is a whole-database question.
+        let _guard = tdh::sso_provider_serial_lock().await;
+        let provider = format!("sysconfig-2621-ldap-{}", uuid::Uuid::new_v4());
+
+        // Only assert the "no SSO -> form offered" case when no other
+        // enabled provider exists (a prior suite may have left rows behind).
+        let preexisting = !AuthConfigService::list_enabled_providers(&pool)
+            .await
+            .expect("list providers")
+            .is_empty();
+        if !preexisting {
+            let state = tdh::build_state(pool.clone(), "/tmp/sysconfig-2621");
+            let obj = call_handler(state, None).await;
+            assert_eq!(
+                obj["auth"]["local_login_enabled"], true,
+                "no SSO providers: local login form must be offered"
+            );
+        }
+
+        // Enable one provider (LDAP row keeps the seed minimal; the gate and
+        // this endpoint treat any enabled provider type identically).
+        sqlx::query(
+            "INSERT INTO ldap_configs (name, server_url, user_base_dn, is_enabled) \
+             VALUES ($1, 'ldap://test.invalid', 'dc=test', true)",
+        )
+        .bind(&provider)
+        .execute(&pool)
+        .await
+        .expect("seed enabled LDAP provider");
+
+        // SSO enabled + flag unset (default): form hidden — this is the
+        // pre-#2621 behaviour and must not change.
+        let state = tdh::build_state(pool.clone(), "/tmp/sysconfig-2621");
+        let obj = call_handler(state, None).await;
+        assert_eq!(
+            obj["auth"]["local_login_enabled"], false,
+            "SSO enabled without ALLOW_LOCAL_ADMIN_LOGIN: form must stay hidden"
+        );
+
+        // SSO enabled + ALLOW_LOCAL_ADMIN_LOGIN=true: the broken case from
+        // issue #2621 — the form must now be advertised.
+        let state = tdh::build_state_with(pool.clone(), "/tmp/sysconfig-2621", |c| {
+            c.allow_local_admin_login = true;
+        });
+        let obj = call_handler(state, None).await;
+        assert_eq!(
+            obj["auth"]["local_login_enabled"], true,
+            "SSO enabled with ALLOW_LOCAL_ADMIN_LOGIN=true: form must be offered"
+        );
+
+        // Strict SSO-only (#2018) wins over the opt-in flag.
+        let state = tdh::build_state_with(pool.clone(), "/tmp/sysconfig-2621", |c| {
+            c.allow_local_admin_login = true;
+            c.sso_disable_admin_break_glass = true;
+        });
+        let obj = call_handler(state, None).await;
+        assert_eq!(
+            obj["auth"]["local_login_enabled"], false,
+            "strict SSO-only must hide the form even with the opt-in flag"
+        );
+
+        let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")
+            .bind(&provider)
+            .execute(&pool)
+            .await;
     }
 }

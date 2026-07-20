@@ -1023,6 +1023,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // Serialize against other tests that seed enabled SSO providers
+        // (e.g. the system-config local-login matrix, #2621) — the
+        // enabled-provider lookup is a whole-database question.
+        let _guard = tdh::sso_provider_serial_lock().await;
         let dir = std::env::temp_dir().join(format!("ph-sso-{}", Uuid::new_v4()));
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
         let uid = Uuid::new_v4();
