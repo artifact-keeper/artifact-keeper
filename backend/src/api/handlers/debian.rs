@@ -104,10 +104,22 @@ async fn resolve_debian_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 // ---------------------------------------------------------------------------
 
 /// Load the operator-configured Debian proxy filter (dist/component/arch
-/// allowlists) for a repository. An absent or unparseable config yields the
-/// default (empty) filter, which selects everything — i.e. the pre-#2460
-/// full-proxy behaviour is preserved for repositories with no filter set.
-async fn load_debian_filter(db: &PgPool, repo_id: uuid::Uuid) -> DebianRepositoryConfig {
+/// allowlists) for a repository.
+///
+/// An *absent* config (no `debian_config` row) yields the default (empty)
+/// filter, which selects everything — i.e. the pre-#2460 full-proxy behaviour
+/// is preserved for repositories with no filter set (unset = allow all).
+///
+/// An *error* loading the filter — a database failure, or a config row that is
+/// present but cannot be parsed — must NOT be silently downgraded to that
+/// allow-all default (#2672). Both are returned as an `Err(Response)` (503) so
+/// the request fails CLOSED: a transient DB blip or a corrupt config can no
+/// longer convert a configured request filter into no filter.
+#[allow(clippy::result_large_err)]
+async fn load_debian_filter(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<DebianRepositoryConfig, Response> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
     )
@@ -115,12 +127,40 @@ async fn load_debian_filter(db: &PgPool, repo_id: uuid::Uuid) -> DebianRepositor
     .bind(DEBIAN_CONFIG_KEY)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten();
-    value
-        .as_deref()
-        .and_then(|v| serde_json::from_str::<DebianRepositoryConfig>(v).ok())
-        .unwrap_or_default()
+    .map_err(|e| {
+        // Fail CLOSED on a genuine DB error rather than treating it as
+        // "no filter configured" (allow all) — see #2672.
+        tracing::error!(
+            repo_id = %repo_id,
+            error = %e,
+            "failed to load Debian proxy filter; failing closed (#2672)"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Debian proxy filter temporarily unavailable",
+        )
+            .into_response()
+    })?;
+
+    match value.as_deref() {
+        // No config row: the documented default is "empty filter = allow all".
+        None => Ok(DebianRepositoryConfig::default()),
+        // A config row exists but cannot be parsed: this is an *error loading*
+        // the operator's intended filter, not an unset filter, so fail closed
+        // rather than fall open to allow-all (#2672).
+        Some(v) => serde_json::from_str::<DebianRepositoryConfig>(v).map_err(|e| {
+            tracing::error!(
+                repo_id = %repo_id,
+                error = %e,
+                "Debian proxy filter config present but unparseable; failing closed (#2672)"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Debian proxy filter configuration is invalid",
+            )
+                .into_response()
+        }),
+    }
 }
 
 /// Response returned when a request is refused by the P2 filter. A filtered-out
@@ -1963,7 +2003,7 @@ async fn release_file(
     // distribution passes through unchanged so the P1 signed-Release integrity
     // path stays byte-identical.
     if let Some(base) = repo_remote_upstream(&repo) {
-        let filter = load_debian_filter(&state.db, repo.id).await;
+        let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release")?;
     }
     proxy
@@ -1991,7 +2031,7 @@ async fn in_release_file(
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
     // gating on the reqwest-normalised path.
     if let Some(base) = repo_remote_upstream(&repo) {
-        let filter = load_debian_filter(&state.db, repo.id).await;
+        let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "InRelease")?;
     }
     proxy
@@ -2051,7 +2091,7 @@ async fn release_gpg(
     // #2460 P2: deny a distribution outside the operator allowlist (pre-fetch),
     // gating on the reqwest-normalised path.
     if let Some(base) = repo_remote_upstream(&repo) {
-        let filter = load_debian_filter(&state.db, repo.id).await;
+        let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, "Release.gpg")?;
     }
     // Release.gpg is the detached signature of Release. We do not need
@@ -2309,7 +2349,7 @@ async fn dists_dispatch(
         // through to the catch-all, which applies the same normalised gate.
         let repo = resolve_debian_repo(&state.0.db, &repo_key).await?;
         if let Some(base) = repo_remote_upstream(&repo) {
-            let filter = load_debian_filter(&state.0.db, repo.id).await;
+            let filter = load_debian_filter(&state.0.db, repo.id).await?;
             gate_debian_dists(&filter, base, &distribution, &dists_path)?;
         }
 
@@ -2346,7 +2386,7 @@ async fn dists_proxy_catchall(
     // second pass cross-references the requested SHA-256 against the signed
     // Release. An empty filter permits everything.
     if let Some(base) = repo_remote_upstream(&repo) {
-        let filter = load_debian_filter(&state.db, repo.id).await;
+        let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_dists(&filter, base, &distribution, &dists_path)?;
         if let Some(proxy) = state.proxy_service.as_deref() {
             enforce_by_hash_arch(
@@ -2480,7 +2520,7 @@ async fn pool_download(
     // from the `.deb` filename, fail-closed when unparseable). An empty filter
     // permits everything.
     if let Some(base) = repo_remote_upstream(&repo) {
-        let filter = load_debian_filter(&state.db, repo.id).await;
+        let filter = load_debian_filter(&state.db, repo.id).await?;
         gate_debian_pool(&filter, base, &component, &path)?;
     }
 
@@ -5584,5 +5624,112 @@ mod apt_release_metadata_db_tests {
         );
 
         cleanup(&pool, repo_id, &dir).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2672 — load_debian_filter must fail CLOSED on an *error*, while an
+    // *absent* config still means "allow all". A DB error or an unparseable
+    // config row must no longer be silently downgraded to the empty (allow-all)
+    // filter.
+    // -----------------------------------------------------------------------
+
+    /// A genuine DB error while loading the filter must fail CLOSED (503),
+    /// NOT be swallowed into the empty allow-all default. This is the core
+    /// regression for #2672 and needs no live database: a lazily-connected
+    /// pool pointed at an unreachable server errors on first query.
+    #[tokio::test]
+    async fn test_load_debian_filter_db_error_fails_closed() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy");
+        let result = load_debian_filter(&pool, Uuid::new_v4()).await;
+        let resp =
+            result.expect_err("a DB error must fail closed (Err), not fall open to allow-all");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a filter-load DB error must deny the request with 503, not allow it"
+        );
+    }
+
+    /// A repository with NO `debian_config` row is a legitimate unset state:
+    /// the documented default is "empty filter = allow all". This must keep
+    /// working after the #2672 fail-closed change.
+    #[tokio::test]
+    async fn test_load_debian_filter_absent_config_allows_all() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+
+        let filter = load_debian_filter(&pool, repo_id)
+            .await
+            .expect("absent config must succeed with the allow-all default");
+        assert_eq!(
+            filter,
+            DebianRepositoryConfig::default(),
+            "no config row must yield the empty (allow-all) default"
+        );
+        // The empty filter still selects everything.
+        assert!(
+            debian_filter_decision(&filter, Some("bookworm"), Some("contrib"), Some("arm64"))
+                .is_ok(),
+            "unset filter must allow all dimensions"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// A validly-configured filter is loaded and honored (the legitimate
+    /// configured path is unaffected by the fail-closed change).
+    #[tokio::test]
+    async fn test_load_debian_filter_valid_config_parses() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        set_cfg(
+            &pool,
+            repo_id,
+            DEBIAN_CONFIG_KEY,
+            r#"{"distributions":["bookworm"],"components":["main"],"architectures":["amd64"]}"#,
+        )
+        .await;
+
+        let filter = load_debian_filter(&pool, repo_id)
+            .await
+            .expect("a valid config must load");
+        assert_eq!(filter.distribution_paths, vec!["bookworm".to_string()]);
+        assert_eq!(filter.components, vec!["main".to_string()]);
+        assert_eq!(filter.architectures, vec!["amd64".to_string()]);
+        // An out-of-allowlist request is denied by the loaded filter.
+        assert!(
+            debian_filter_decision(&filter, Some("sid"), None, None).is_err(),
+            "a configured filter must still deny out-of-allowlist dimensions"
+        );
+
+        cleanup(&pool, repo_id, &dir).await;
+    }
+
+    /// A config row that is PRESENT but unparseable is an error loading the
+    /// operator's intended filter, not an unset filter, so it must fail CLOSED
+    /// (503) rather than fall open to allow-all (#2672 swallow class).
+    #[tokio::test]
+    async fn test_load_debian_filter_unparseable_config_fails_closed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, dir) = insert_hosted_debian(&pool).await;
+        set_cfg(&pool, repo_id, DEBIAN_CONFIG_KEY, "{ not valid json").await;
+
+        let result = load_debian_filter(&pool, repo_id).await;
+        let status = result.as_ref().err().map(|r| r.status());
+
+        cleanup(&pool, repo_id, &dir).await;
+
+        assert!(
+            result.is_err(),
+            "a present-but-corrupt filter config must fail closed, not allow-all"
+        );
+        assert_eq!(status, Some(StatusCode::SERVICE_UNAVAILABLE));
     }
 }
