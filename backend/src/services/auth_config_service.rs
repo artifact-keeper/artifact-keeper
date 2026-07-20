@@ -1046,30 +1046,100 @@ impl AuthConfigService {
         Ok(Self::ldap_row_to_response(row))
     }
 
-    /// Attempt a TCP connection to the LDAP server to verify reachability.
+    /// Test an LDAP provider configuration end-to-end (#2486).
+    ///
+    /// Runs in two stages:
+    /// 1. SSRF-vet and TCP-probe the configured host/port (unchanged
+    ///    behaviour: generic failure messages, no port-scan oracle).
+    /// 2. If a bind DN and password are stored for this provider, perform a
+    ///    REAL LDAP simple bind with the stored (decrypted) credentials,
+    ///    honouring the configured STARTTLS/TLS settings — the same code
+    ///    path the login flow uses. A rejected bind now reports failure;
+    ///    raw TCP reachability alone is no longer reported as success.
+    ///
+    /// When no service account is configured, only reachability can be
+    /// verified (user auth on such providers is direct-bind, which cannot be
+    /// tested without a user credential), and the message says so
+    /// explicitly.
+    ///
+    /// Note: the bind stage re-dials by hostname via the LDAP client, so a
+    /// DNS rebind between the vetted probe and the bind is a residual — the
+    /// same exposure as the login path, which dials the stored URL on every
+    /// login attempt.
     pub async fn test_ldap_connection(pool: &PgPool, id: Uuid) -> Result<LdapTestResult> {
-        let row = sqlx::query_as::<_, LdapConfigRow>(
-            r#"
-            SELECT id, name, server_url, bind_dn, bind_password_encrypted,
-                   user_base_dn, user_filter, group_base_dn, group_filter,
-                   email_attribute, display_name_attribute, username_attribute,
-                   groups_attribute, admin_group_dn, use_starttls,
-                   is_enabled, priority, created_at, updated_at
-            FROM ldap_configs
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
-        .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
+        let start = std::time::Instant::now();
+        let (row, bind_password) = Self::get_ldap_decrypted(pool, id).await?;
 
         // Parse host and port from server_url (e.g. ldap://host:389 or ldaps://host:636)
-        let url = &row.server_url;
-        let (host, port) = Self::parse_ldap_url(url)?;
+        let (host, port) = Self::parse_ldap_url(&row.server_url)?;
 
-        Self::probe_ldap_endpoint(&host, port).await
+        let probe = Self::probe_ldap_endpoint(&host, port).await?;
+        if !probe.success {
+            return Ok(probe);
+        }
+
+        let has_bind_creds = row.bind_dn.as_deref().is_some_and(|dn| !dn.is_empty())
+            && bind_password.as_deref().is_some_and(|pw| !pw.is_empty());
+        if !has_bind_creds {
+            return Ok(LdapTestResult {
+                success: true,
+                message: format!(
+                    "Connected to {host}:{port}; no bind DN/password configured, \
+                     so credentials were not verified"
+                ),
+                response_time_ms: probe.response_time_ms,
+            });
+        }
+
+        let svc = crate::services::ldap_service::LdapService::from_db_config(
+            pool.clone(),
+            &row.name,
+            &row.server_url,
+            row.bind_dn.as_deref(),
+            bind_password.as_deref(),
+            &row.user_base_dn,
+            &row.user_filter,
+            &row.username_attribute,
+            &row.email_attribute,
+            &row.display_name_attribute,
+            &row.groups_attribute,
+            row.admin_group_dn.as_deref(),
+            row.use_starttls,
+        );
+
+        let bind_result = svc.verify_bind().await;
+        Ok(Self::bind_result_to_test_result(
+            bind_result,
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+
+    /// Map the outcome of the verification bind to the API test result.
+    ///
+    /// Pure helper so the pass/fail decision is unit-testable. Messages stay
+    /// generic: no raw LDAP/OS error text (logged server-side instead) and
+    /// never the bind credentials.
+    fn bind_result_to_test_result(bind_result: Result<()>, elapsed_ms: u64) -> LdapTestResult {
+        match bind_result {
+            Ok(()) => LdapTestResult {
+                success: true,
+                message: "Connection and LDAP bind successful".to_string(),
+                response_time_ms: elapsed_ms,
+            },
+            Err(AppError::Authentication(_)) => LdapTestResult {
+                success: false,
+                message: "LDAP bind rejected: check the bind DN and bind password".to_string(),
+                response_time_ms: elapsed_ms,
+            },
+            Err(e) => {
+                tracing::warn!(target: "security", error = %e, "LDAP test: bind stage failed");
+                LdapTestResult {
+                    success: false,
+                    message: "LDAP connection failed during bind".to_string(),
+                    response_time_ms: elapsed_ms,
+                }
+            }
+        }
     }
 
     /// Resolve, SSRF-vet, and probe a TCP connection to `host:port`.
@@ -2103,6 +2173,48 @@ mod tests {
     fn test_parse_ldap_url_invalid_port() {
         let result = AuthConfigService::parse_ldap_url("ldap://myhost:notaport");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_result_to_test_result (#2486): the test-connection endpoint must
+    // report the TRUE bind outcome, with generic credential-free messages.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bind_result_mapping_success() {
+        let res = AuthConfigService::bind_result_to_test_result(Ok(()), 12);
+        assert!(res.success);
+        assert_eq!(res.message, "Connection and LDAP bind successful");
+        assert_eq!(res.response_time_ms, 12);
+    }
+
+    #[test]
+    fn test_bind_result_mapping_rejected_bind_is_failure() {
+        // A rejected bind (bad bind DN/password) must NOT report success —
+        // this is the exact bug in #2486, where TCP reachability alone was
+        // reported as "Connection Successful".
+        let res = AuthConfigService::bind_result_to_test_result(
+            Err(AppError::Authentication("Invalid credentials".into())),
+            7,
+        );
+        assert!(!res.success);
+        assert!(res.message.contains("bind DN"));
+        assert_eq!(res.response_time_ms, 7);
+    }
+
+    #[test]
+    fn test_bind_result_mapping_connection_error_is_generic() {
+        // Connection-level details (raw OS/TLS errors) stay server-side.
+        let res = AuthConfigService::bind_result_to_test_result(
+            Err(AppError::Internal(
+                "LDAP connection failed: os error 111 secret-internal-detail".into(),
+            )),
+            3,
+        );
+        assert!(!res.success);
+        assert!(!res.message.contains("secret-internal-detail"));
+        assert!(!res.message.contains("os error"));
+        assert_eq!(res.message, "LDAP connection failed during bind");
     }
 
     // -----------------------------------------------------------------------
