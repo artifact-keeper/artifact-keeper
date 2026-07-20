@@ -640,6 +640,8 @@ pub async fn ldap_login(
         bind_password.as_deref(),
         &row.user_base_dn,
         &row.user_filter,
+        row.group_base_dn.as_deref(),
+        row.group_filter.as_deref(),
         &row.username_attribute,
         &row.email_attribute,
         &row.display_name_attribute,
@@ -666,6 +668,12 @@ pub async fn ldap_login(
         }
     };
 
+    // Keep copies for the group sync below; the `ldap_user` fields move
+    // into FederatedCredentials.
+    let ldap_dn = ldap_user.dn.clone();
+    let ldap_username = ldap_user.username.clone();
+    let ldap_member_of = ldap_user.groups.clone();
+
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -684,6 +692,30 @@ pub async fn ldap_login(
             },
         )
         .await?;
+
+    // Issue #2468: when group sync is configured (group_base_dn and/or
+    // group_filter set), reflect the user's LDAP/AD groups as Artifact
+    // Keeper group memberships through the shared external-group
+    // reconciler (same mechanism as OIDC #1094 / SAML #2333): groups are
+    // auto-created tagged external_source = 'ldap', memberships upserted,
+    // and stale 'ldap'-managed memberships pruned per provider. Non-fatal:
+    // login still succeeds if the directory or DB hiccups.
+    if ldap_svc.group_sync_configured() {
+        let group_names = ldap_svc
+            .resolve_group_names(&ldap_dn, &ldap_username, &ldap_member_of)
+            .await;
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "ldap", &group_names)
+                .await
+        {
+            tracing::warn!(
+                user_id = %user.id,
+                provider_id = %id,
+                error = %e,
+                "Failed to sync LDAP groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     audit_federated_login(
         &state,
@@ -1169,9 +1201,18 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
 /// Reconcile a federated user's group memberships against the `groups` table.
 ///
 /// For each group name in `idp_groups`:
-/// - Find the group by name; if missing, auto-create it tagged with
-///   `external_source = source` and `external_provider_id = provider_id`.
+/// - Find the group by name **within this provider's namespace** — i.e. only
+///   a group already tagged with `external_source = source` and
+///   `external_provider_id = provider_id` is reused; if missing, auto-create
+///   it with those tags.
 /// - Ensure a `user_group_members` row exists.
+///
+/// A name collision with any group OUTSIDE that namespace — operator-managed
+/// (`external_source IS NULL`) or owned by another source/provider — is
+/// refused and logged instead of granting membership (issue #2759): matching
+/// by name alone would let an IdP-supplied group name (e.g. an AD `cn` from a
+/// low-privilege OU, #2468) attach a federated user to a same-named
+/// privileged local group the operator created.
 ///
 /// Then remove the user from any group that:
 /// - is tagged with this same `external_source` + `external_provider_id`, AND
@@ -1180,7 +1221,7 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
 /// The prune is scoped to `(source, provider_id)`, so SAML-managed and
 /// OIDC-managed memberships never strip each other, and operator-managed
 /// groups (NULL `external_source`) are never modified by this sync.
-/// (Issues #1094, #2333.)
+/// (Issues #1094, #2333, #2759.)
 pub(crate) async fn sync_federated_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -1200,37 +1241,57 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
             continue;
         }
 
-        // Find-or-create the group atomically. Concurrent first-logins for
-        // the same brand-new group name from different users would race a
-        // separate SELECT + INSERT, with the loser of the race hitting the
-        // UNIQUE constraint on `groups.name` and aborting the transaction.
-        // ON CONFLICT (name) DO UPDATE … RETURNING id collapses the race
-        // into a single atomic upsert. The `DO UPDATE` (a no-op assignment)
-        // is what makes RETURNING populate for the conflicting row; a plain
-        // DO NOTHING would return zero rows on conflict. Operator-managed
-        // groups (NULL external_source) are reused without modification
-        // because we only assign description/external_source/external_provider_id
-        // when inserting, and the ON CONFLICT branch does not touch those
-        // columns.
-        let (group_id,): (Uuid,) = sqlx::query_as(
+        // Find-or-create the group atomically, scoped to THIS provider's
+        // namespace. Concurrent first-logins for the same brand-new group
+        // name from different users would race a separate SELECT + INSERT,
+        // with the loser of the race hitting the UNIQUE constraint on
+        // `groups.name` and aborting the transaction. ON CONFLICT (name)
+        // DO UPDATE … RETURNING id collapses the race into a single atomic
+        // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
+        // populate for the conflicting row.
+        //
+        // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
+        // conflicting row is "updated" (and therefore returned) ONLY when it
+        // is already tagged with this same source + provider id. A collision
+        // with an operator-managed group (NULL external_source — the
+        // NULL = $3 comparison is never true) or with a group owned by a
+        // different source/provider returns no row, and membership is
+        // refused below instead of silently attaching the federated user to
+        // a same-named — potentially privileged — local group.
+        let group_id: Option<(Uuid,)> = sqlx::query_as(
             r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            WHERE groups.external_source = EXCLUDED.external_source
+              AND groups.external_provider_id = EXCLUDED.external_provider_id
             RETURNING id
             "#,
         )
         .bind(name)
-        .bind(if source == "saml" {
-            format!("Auto-created from SAML group attribute: {name}")
-        } else {
-            format!("Auto-created from OIDC group claim: {name}")
+        .bind(match source {
+            "saml" => format!("Auto-created from SAML group attribute: {name}"),
+            "ldap" => format!("Auto-created from LDAP group: {name}"),
+            _ => format!("Auto-created from OIDC group claim: {name}"),
         })
         .bind(source)
         .bind(provider_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some((group_id,)) = group_id else {
+            tracing::warn!(
+                group = %name,
+                source = %source,
+                provider_id = %provider_id,
+                user_id = %user_id,
+                "Refusing to add federated user to name-colliding group not \
+                 managed by this provider (operator-managed or foreign-source \
+                 group of the same name exists); membership not granted (#2759)"
+            );
+            continue;
+        };
 
         sqlx::query(
             r#"
@@ -2806,8 +2867,13 @@ mod tests {
             cleanup_user(&pool, user_id).await;
         }
 
+        /// #2759 contract (flipped from the pre-hardening behaviour, which
+        /// asserted the federated user WAS attached): a name collision with
+        /// an operator-managed group (NULL external_source) must NOT grant
+        /// membership in that group, and the group itself must be left
+        /// untouched.
         #[tokio::test]
-        async fn test_sync_reuses_operator_managed_group_without_modifying_source() {
+        async fn test_sync_never_attaches_federated_user_to_operator_managed_group() {
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -2832,16 +2898,123 @@ mod tests {
                 std::slice::from_ref(&name),
             )
             .await
-            .expect("sync");
+            .expect("sync must not fail on the collision — it skips the group");
 
-            // The same group id must be reused (not duplicated).
+            // No duplicate group appears (UNIQUE(name)), the operator group
+            // keeps its id and NULL source, and — the point of #2759 — the
+            // federated user is NOT a member of it.
             let found_id = group_id_by_name(&pool, &name).await.expect("found");
             assert_eq!(found_id, preexisting_id);
-            assert!(user_is_in_group(&pool, user_id, found_id).await);
-            // external_source must remain NULL (operator-managed).
             assert!(group_external_source(&pool, found_id).await.is_none());
+            assert!(
+                !user_is_in_group(&pool, user_id, found_id).await,
+                "federated sync must not grant membership in an \
+                 operator-managed group of the same name"
+            );
 
             cleanup_groups(&pool, &[found_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2759 via the #2468 LDAP path: an AD `cn` from a low-privilege OU
+        /// (mapped cn-only by the LDAP group sync) colliding with a
+        /// privileged operator-managed local group must not grant that
+        /// group's membership — while legitimate ldap-namespaced groups in
+        /// the SAME sync still create and attach normally.
+        #[tokio::test]
+        async fn test_ldap_cn_collision_with_privileged_operator_group_is_refused() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let privileged = rand_group_name("developers");
+            let legit = rand_group_name("ldap-contractors");
+
+            let privileged_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)")
+                .bind(privileged_id)
+                .bind(&privileged)
+                .bind("operator-managed privileged group")
+                .execute(&pool)
+                .await
+                .expect("create privileged group");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                &[privileged.clone(), legit.clone()],
+            )
+            .await
+            .expect("sync succeeds; colliding name is skipped, not fatal");
+
+            assert!(
+                !user_is_in_group(&pool, user_id, privileged_id).await,
+                "AD cn collision must not grant the operator-managed \
+                 privileged group"
+            );
+            // The legitimate group from the same sync still works end to end.
+            let legit_id = group_id_by_name(&pool, &legit).await.expect("legit group");
+            assert!(user_is_in_group(&pool, user_id, legit_id).await);
+            assert_eq!(
+                group_external_source(&pool, legit_id).await.as_deref(),
+                Some("ldap")
+            );
+
+            cleanup_groups(&pool, &[privileged_id, legit_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2759 cross-namespace variant: a group owned by a DIFFERENT
+        /// source (or provider) is just as off-limits as an operator-managed
+        /// one — an LDAP sync must not attach to an OIDC-owned group of the
+        /// same name.
+        #[tokio::test]
+        async fn test_sync_never_attaches_to_foreign_source_group() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("cross-src");
+
+            // Group owned by an OIDC provider (same provider UUID to prove
+            // the source participates in the namespace, not just the id).
+            let oidc_group_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO groups (id, name, external_source, external_provider_id) \
+                 VALUES ($1, $2, 'oidc', $3)",
+            )
+            .bind(oidc_group_id)
+            .bind(&name)
+            .bind(provider_id)
+            .execute(&pool)
+            .await
+            .expect("create oidc-owned group");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync succeeds; foreign-source collision is skipped");
+
+            assert!(
+                !user_is_in_group(&pool, user_id, oidc_group_id).await,
+                "LDAP sync must not attach to an OIDC-owned group of the same name"
+            );
+            assert_eq!(
+                group_external_source(&pool, oidc_group_id).await.as_deref(),
+                Some("oidc"),
+                "foreign group's ownership tags must be untouched"
+            );
+
+            cleanup_groups(&pool, &[oidc_group_id]).await;
             cleanup_user(&pool, user_id).await;
         }
 
@@ -3039,6 +3212,61 @@ mod tests {
             );
 
             cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // LDAP variant (#2468) — same reconciler via the "ldap" source from
+        // the ldap_login handler. Groups resolved from AD memberOf / group
+        // search are auto-created tagged external_source = 'ldap' and stale
+        // ldap-managed memberships are pruned on the next login.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_ldap_sync_creates_groups_tagged_ldap_and_prunes() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let devops = rand_group_name("ldap-devops");
+            let qa = rand_group_name("ldap-qa");
+
+            // First login: user is in both AD groups.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                &[devops.clone(), qa.clone()],
+            )
+            .await
+            .expect("first ldap sync");
+
+            let devops_id = group_id_by_name(&pool, &devops).await.expect("devops");
+            let qa_id = group_id_by_name(&pool, &qa).await.expect("qa");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(user_is_in_group(&pool, user_id, qa_id).await);
+            assert_eq!(
+                group_external_source(&pool, devops_id).await.as_deref(),
+                Some("ldap")
+            );
+
+            // Second login: dropped from qa in AD -> membership pruned,
+            // devops survives.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                std::slice::from_ref(&devops),
+            )
+            .await
+            .expect("second ldap sync");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(!user_is_in_group(&pool, user_id, qa_id).await);
+
+            cleanup_groups(&pool, &[devops_id, qa_id]).await;
             cleanup_user(&pool, user_id).await;
         }
 

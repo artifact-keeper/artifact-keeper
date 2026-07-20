@@ -1099,6 +1099,8 @@ impl AuthConfigService {
             bind_password.as_deref(),
             &row.user_base_dn,
             &row.user_filter,
+            row.group_base_dn.as_deref(),
+            row.group_filter.as_deref(),
             &row.username_attribute,
             &row.email_attribute,
             &row.display_name_attribute,
