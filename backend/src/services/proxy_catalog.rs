@@ -161,6 +161,121 @@ pub async fn sum_by_repo(db: &PgPool, repository_id: Uuid) -> Result<i64> {
     Ok(sum)
 }
 
+/// One catalog row as surfaced by the remote-repository browse listing
+/// (PF-002 / #2519). Unlike [`ProxyCacheEntry`] this carries `cached_at`, so
+/// the listing can render the cache timestamp without reading the storage
+/// sidecar for each page item.
+#[derive(Debug, Clone)]
+pub struct ProxyCacheBrowseRow {
+    pub path: String,
+    pub size_bytes: i64,
+    pub checksum_sha256: Option<String>,
+    pub content_type: Option<String>,
+    pub cached_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Whether ANY catalog row exists for the repository. O(1) via the
+/// `(repository_id, path)` unique index. The browse listing uses this to
+/// decide between catalog-backed keyset paging (PF-002 / #2519) and the
+/// legacy storage-prefix reconstruction for pre-catalog caches that have no
+/// rows yet.
+pub async fn has_rows(db: &PgPool, repository_id: Uuid) -> Result<bool> {
+    let exists = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM proxy_cache_artifacts WHERE repository_id = $1
+        ) AS "exists!"
+        "#,
+        repository_id
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(exists)
+}
+
+/// One keyset page of the remote-repository browse listing (PF-002 / #2519),
+/// ordered by `path` and examining O(page) rows via the `(repository_id,
+/// path)` unique index — never the whole cached set.
+///
+/// `prefix_like` / `q_like` are complete, pre-escaped `LIKE` patterns (the
+/// caller appends/wraps `%` around `escape_like_literal` output) matched
+/// under `ESCAPE '\'`; `q_like` matches case-insensitively (`ILIKE`),
+/// mirroring the legacy in-memory substring filter. `after_path` is the last
+/// path of the previous page (exclusive keyset bound); `offset` supports the
+/// legacy `page=N` addressing when no cursor is supplied (pass 0 with a
+/// cursor). The caller passes `limit = per_page + 1` and uses the extra row
+/// as the authoritative `has_more` signal (#2520 pattern).
+pub async fn browse_page(
+    db: &PgPool,
+    repository_id: Uuid,
+    prefix_like: Option<&str>,
+    q_like: Option<&str>,
+    after_path: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<ProxyCacheBrowseRow>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT path, size_bytes, checksum_sha256, content_type, cached_at
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1
+          AND ($2::TEXT IS NULL OR path LIKE $2 ESCAPE '\')
+          AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
+          AND ($4::TEXT IS NULL OR path > $4)
+        ORDER BY path
+        LIMIT $5 OFFSET $6
+        "#,
+        repository_id,
+        prefix_like,
+        q_like,
+        after_path,
+        limit,
+        offset,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ProxyCacheBrowseRow {
+            path: r.path,
+            size_bytes: r.size_bytes,
+            checksum_sha256: r.checksum_sha256,
+            content_type: r.content_type,
+            cached_at: r.cached_at,
+        })
+        .collect())
+}
+
+/// Exact match count for [`browse_page`]'s filters, behind the listing's
+/// explicit `?count=exact` opt-in (#2520 pattern): the default response
+/// reports a cheap lower-bound total plus an authoritative `has_more`.
+pub async fn browse_count(
+    db: &PgPool,
+    repository_id: Uuid,
+    prefix_like: Option<&str>,
+    q_like: Option<&str>,
+) -> Result<i64> {
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*)::BIGINT AS "count!"
+        FROM proxy_cache_artifacts
+        WHERE repository_id = $1
+          AND ($2::TEXT IS NULL OR path LIKE $2 ESCAPE '\')
+          AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\')
+        "#,
+        repository_id,
+        prefix_like,
+        q_like,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(count)
+}
+
 /// Keyset-paged catalog listing for one repository, ordered by `path`
 /// (#2270 visibility / PF-002 seam). `after` is the last path from the previous
 /// page (exclusive); pass `None` for the first page.
@@ -513,6 +628,162 @@ mod tests {
             next.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
             ["c/3"]
         );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// PF-002 (#2519): the browse page must return exact contents across a
+    /// full keyset walk, with each call bounded by `limit` — it must never
+    /// hand the caller the whole cached set at once.
+    #[tokio::test]
+    async fn test_browse_page_keyset_walk_is_bounded_and_exact() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let total = 25usize;
+        let per_page = 10usize;
+        for i in 0..total {
+            let p = format!("pkg/obj-{i:03}.bin");
+            upsert(
+                &pool,
+                repo,
+                &p,
+                &format!("proxy-cache/{}/{p}/__content__", repo.simple()),
+                "m",
+                i as i64,
+                Some("c"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let rows = browse_page(
+                &pool,
+                repo,
+                None,
+                None,
+                after.as_deref(),
+                0,
+                (per_page + 1) as i64,
+            )
+            .await
+            .unwrap();
+            // Bounded: never more than per_page + 1 rows per call, even
+            // though 25 rows exist.
+            assert!(rows.len() <= per_page + 1, "page is bounded by limit");
+            let has_more = rows.len() > per_page;
+            let page_rows = &rows[..rows.len().min(per_page)];
+            walked.extend(page_rows.iter().map(|r| r.path.clone()));
+            pages += 1;
+            match (has_more, pages) {
+                (true, 1 | 2) => {} // first two pages are full with more behind
+                (false, 3) => break,
+                (hm, n) => panic!("unexpected has_more={hm} on page {n}"),
+            }
+            after = page_rows.last().map(|r| r.path.clone());
+        }
+
+        let expected: Vec<String> = (0..total).map(|i| format!("pkg/obj-{i:03}.bin")).collect();
+        assert_eq!(walked, expected, "full walk yields every row exactly once");
+        assert_eq!(browse_count(&pool, repo, None, None).await.unwrap(), 25);
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// PF-002 (#2519): prefix + substring filters match the legacy in-memory
+    /// semantics (prefix = starts_with, `q` = case-insensitive substring) and
+    /// LIKE metacharacters in user input match literally.
+    #[tokio::test]
+    async fn test_browse_page_filters_and_like_escaping() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        // Paths are all-lowercase and same-case so the asserted relative
+        // order is identical under any database collation (C vs linguistic);
+        // case-insensitivity is exercised through the QUERY side below.
+        for p in ["a/one.whl", "a/two.whl", "b/100%_done.whl", "b/100xy.whl"] {
+            upsert(
+                &pool,
+                repo,
+                p,
+                &format!("proxy-cache/{}/{p}/__content__", repo.simple()),
+                "m",
+                1,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let escape = |s: &str| {
+            let mut out = String::new();
+            for ch in s.chars() {
+                if matches!(ch, '\\' | '%' | '_') {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out
+        };
+
+        // Prefix filter: starts_with semantics.
+        let rows = browse_page(&pool, repo, Some("a/%"), None, None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["a/one.whl", "a/two.whl"]
+        );
+
+        // Substring filter is case-insensitive, like the legacy
+        // `to_lowercase().contains()` filter: an upper-cased needle still
+        // matches the lower-cased stored path.
+        let rows = browse_page(&pool, repo, None, Some("%TWO%"), None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["a/two.whl"]
+        );
+
+        // `%` / `_` in user input match literally once escaped: `100%_`
+        // must match only the literal path, not wildcard onto `100xy`.
+        let q = format!("%{}%", escape("100%_"));
+        let rows = browse_page(&pool, repo, None, Some(&q), None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["b/100%_done.whl"]
+        );
+        assert_eq!(
+            browse_count(&pool, repo, None, Some(&q)).await.unwrap(),
+            1,
+            "count applies the same escaped filters as the page"
+        );
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `has_rows` distinguishes a cataloged repo from a pre-catalog (or empty)
+    /// one, which is what gates the legacy storage-listing fallback.
+    #[tokio::test]
+    async fn test_has_rows_gates_catalog_vs_fallback() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        assert!(!has_rows(&pool, repo).await.unwrap(), "empty catalog");
+        upsert(&pool, repo, "p", "proxy-k", "m", 1, None, None, None)
+            .await
+            .unwrap();
+        assert!(has_rows(&pool, repo).await.unwrap(), "cataloged repo");
         cleanup_repo(&pool, repo).await;
     }
 

@@ -3833,16 +3833,17 @@ pub struct ListArtifactsQuery {
     ///   referenced layer blobs.  The grouped rows are returned in the
     ///   `docker_tags` array.
     pub group_by: Option<String>,
-    /// Opaque keyset cursor for grouped listings (#2520). Pass the
-    /// `next_cursor` value from the previous response to fetch the next
-    /// page; `page` is ignored while a cursor is present. Supported by
-    /// `group_by=docker_tag` and by `group_by=maven_component` on remote
-    /// repositories; other listing modes ignore it.
+    /// Opaque keyset cursor (#2520, #2519). Pass the `next_cursor` value
+    /// from the previous response to fetch the next page; `page` is ignored
+    /// while a cursor is present. Supported by `group_by=docker_tag`, by
+    /// `group_by=maven_component` on remote repositories, and by the flat
+    /// cached-artifact listing of remote repositories; other listing modes
+    /// ignore it.
     pub cursor: Option<String>,
-    /// Total-count mode for grouped listings (#2520). `count=exact` runs a
-    /// dedicated COUNT query so `pagination.total` is exact; otherwise the
-    /// keyset-paged grouped listings report a cheap lower bound (rows seen
-    /// so far, +1 when another page exists) and `has_more` is the
+    /// Total-count mode for keyset-paged listings (#2520, #2519).
+    /// `count=exact` runs a dedicated COUNT query so `pagination.total` is
+    /// exact; otherwise the keyset-paged listings report a cheap lower bound
+    /// (rows seen so far, +1 when another page exists) and `has_more` is the
     /// authoritative "is there a next page" signal.
     pub count: Option<String>,
 }
@@ -4138,6 +4139,8 @@ pub async fn list_artifacts(
             &key,
             query.path_prefix.as_deref(),
             query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
             page,
             per_page,
         )
@@ -4256,32 +4259,60 @@ pub async fn list_artifacts(
 
 /// List the artifacts a remote (proxy) repository has cached.
 ///
-/// Proxy-cached items are not in the `artifacts` table (#1280), so they are
-/// reconstructed from the storage backend by [`ProxyService::list_cached_artifacts`].
-/// Each entry is mapped to an [`ArtifactResponse`]; entries carry no DB id,
+/// Proxy-cached items are not in the `artifacts` table (#1280). Since
+/// migration 159 they ARE indexed in the `proxy_cache_artifacts` catalog
+/// (written at sidecar-commit time, lazily backfilled on cache hit), so the
+/// listing pages straight out of that catalog with a `path` keyset — O(page)
+/// DB rows per request, no storage I/O (PF-002 / #2519). Each entry is
+/// mapped to an [`ArtifactResponse`]; entries carry no DB artifact id,
 /// version, or download count, so those fields take their natural defaults
 /// (a deterministic synthetic id derived from `repo_key + path`, `None`
-/// version, zero downloads). Filtering and pagination happen in-process over
-/// the recovered set, since there is no DB query to push them into. See #1548
-/// and web #424.
+/// version, zero downloads). See #1548 and web #424.
+///
+/// Legacy fallback: a repository whose cache predates the catalog and has
+/// not been touched since (zero catalog rows) still reconstructs the listing
+/// from the storage backend the old way — a whole-prefix `storage.list`
+/// call, O(total cached objects) per request. That path disappears for a
+/// repo as soon as one entry is cataloged (any cache write or hit). Bulk
+/// storage->catalog reconciliation for cold legacy caches is follow-up work
+/// tracked on #2270.
+#[allow(clippy::too_many_arguments)]
 async fn list_remote_cached_artifacts(
     state: &SharedState,
     repo: &crate::models::repository::Repository,
     key: &str,
     path_prefix: Option<&str>,
     q: Option<&str>,
+    cursor: Option<&str>,
+    count_exact: bool,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
-    // Two-phase listing (#1571): first recover just the cached path strings
-    // (no sidecar reads), filter + slice them to the requested page, and only
-    // then load sidecars for that page. Both listing filters are path-based,
-    // so paging on the paths is exact and avoids the previous O(N) sidecar
-    // read on every request. The trade-off is that `total` counts paths whose
-    // sidecar may since have gone missing (a half-written / legacy cache
-    // write); such a path is still dropped from the returned page, matching
-    // the old per-entry skip, but is no longer pre-excluded from the count —
-    // an acceptable approximation in exchange for O(page) reads.
+    if crate::services::proxy_catalog::has_rows(&state.db, repo.id).await? {
+        return list_remote_cached_from_catalog(
+            state,
+            repo,
+            key,
+            path_prefix,
+            q,
+            cursor,
+            count_exact,
+            page,
+            per_page,
+        )
+        .await;
+    }
+
+    // Legacy two-phase listing (#1571) for pre-catalog caches: first recover
+    // just the cached path strings (no sidecar reads), filter + slice them to
+    // the requested page, and only then load sidecars for that page. Both
+    // listing filters are path-based, so paging on the paths is exact and
+    // avoids the previous O(N) sidecar read on every request. The trade-off
+    // is that `total` counts paths whose sidecar may since have gone missing
+    // (a half-written / legacy cache write); such a path is still dropped
+    // from the returned page, matching the old per-entry skip, but is no
+    // longer pre-excluded from the count — an acceptable approximation in
+    // exchange for O(page) reads.
     let proxy = state.proxy_service.as_deref();
     let paths = match proxy {
         Some(proxy) => proxy.list_cached_paths(&repo.key).await,
@@ -4315,6 +4346,142 @@ async fn list_remote_cached_artifacts(
         next_cursor: None,
         has_more: None,
     }))
+}
+
+/// Page a remote repository's cached-artifact listing out of the
+/// `proxy_cache_artifacts` catalog (PF-002 / #2519), replacing the per-request
+/// whole-prefix `storage.list` enumeration with an indexed keyset query that
+/// examines O(page) rows.
+///
+/// Paging mirrors the #2520 grouped-listing contract: an opaque `?cursor=`
+/// (the previous response's `next_cursor`, keyed on the last `path`) takes
+/// precedence; without a cursor, legacy `page=N` addressing still works via
+/// OFFSET. `has_more` is authoritative (fetched as `per_page + 1` rows);
+/// `pagination.total` is a cheap lower bound unless the client opts into
+/// `?count=exact`. Filters keep the legacy semantics: `path_prefix` is a
+/// starts-with match, `q` a case-insensitive substring match, both applied
+/// as escaped `LIKE` patterns so user-supplied `%`/`_` match literally.
+#[allow(clippy::too_many_arguments)]
+async fn list_remote_cached_from_catalog(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    key: &str,
+    path_prefix: Option<&str>,
+    q: Option<&str>,
+    cursor: Option<&str>,
+    count_exact: bool,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    use crate::services::proxy_catalog;
+
+    // The cached-listing cursor is single-key (`path`); the shared two-part
+    // cursor codec is reused with an empty second component so all listing
+    // cursors stay one opaque format.
+    let keyset = decode_cursor_param(cursor)?;
+    let after_path = keyset.as_ref().map(|(path, _)| path.as_str());
+    let offset = if after_path.is_some() {
+        0
+    } else {
+        i64::from(page.saturating_sub(1)) * i64::from(per_page)
+    };
+
+    let prefix_like = path_prefix
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{}%", super::escape_like_literal(p)));
+    let q_like = q
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", super::escape_like_literal(s)));
+
+    let mut rows = proxy_catalog::browse_page(
+        &state.db,
+        repo.id,
+        prefix_like.as_deref(),
+        q_like.as_deref(),
+        after_path,
+        offset,
+        i64::from(per_page) + 1,
+    )
+    .await?;
+    let has_more = rows.len() > per_page as usize;
+    rows.truncate(per_page as usize);
+    let next_cursor = if has_more {
+        rows.last().map(|r| encode_keyset_cursor(&r.path, ""))
+    } else {
+        None
+    };
+
+    let exact_total = if count_exact {
+        Some(
+            proxy_catalog::browse_count(
+                &state.db,
+                repo.id,
+                prefix_like.as_deref(),
+                q_like.as_deref(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let total = grouped_listing_total(exact_total, offset, rows.len(), has_more);
+
+    let items = rows
+        .iter()
+        .map(|row| build_catalog_artifact_response(row, key))
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items,
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages: grouped_total_pages(total, per_page),
+        },
+        components: None,
+        docker_tags: None,
+        next_cursor,
+        has_more: Some(has_more),
+    }))
+}
+
+/// Map a `proxy_cache_artifacts` catalog row to the listing's
+/// [`ArtifactResponse`], mirroring [`build_cached_artifact_response`]'s
+/// sidecar mapping: same deterministic synthetic id, `analyzable: false`,
+/// and the `application/octet-stream` content-type default. A transient
+/// placeholder row awaiting its tee refresh (see
+/// `proxy_catalog::record_proxy_download`) surfaces with size 0 and an empty
+/// checksum until the authoritative upsert lands.
+fn build_catalog_artifact_response(
+    row: &crate::services::proxy_catalog::ProxyCacheBrowseRow,
+    repo_key: &str,
+) -> ArtifactResponse {
+    let name = row.path.rsplit('/').next().unwrap_or(&row.path).to_string();
+    ArtifactResponse {
+        id: cached_artifact_id(repo_key, &row.path),
+        repository_key: repo_key.to_string(),
+        path: row.path.clone(),
+        name,
+        version: None,
+        size_bytes: row.size_bytes,
+        checksum_sha256: row.checksum_sha256.clone().unwrap_or_default(),
+        content_type: row
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        download_count: 0,
+        created_at: row.cached_at,
+        metadata: None,
+        // Same rationale as the sidecar-recovered path: synthetic id, no
+        // `artifacts` row, so SBOM/scan cannot resolve the object.
+        analyzable: false,
+        cache_cached_at: Some(row.cached_at),
+        cache_expires_at: None,
+        revision: None,
+        version_label: None,
+    }
 }
 
 /// Apply the listing's `path_prefix` and `q` filters to the recovered proxy
@@ -11976,6 +12143,157 @@ mod tests {
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PF-002 (#2519): the remote cached-artifact listing pages out of the
+    /// `proxy_cache_artifacts` catalog — exact page contents and an
+    /// authoritative `has_more` across a full cursor walk — WITHOUT touching
+    /// the storage backend. Nothing is written to storage here (and the test
+    /// state has no proxy service), so the pre-#2519 whole-prefix
+    /// enumeration path would return an empty listing: this test fails
+    /// against the old implementation.
+    #[tokio::test]
+    async fn remote_cached_listing_pages_from_catalog_2519() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_catalog;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "generic").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let repo = RepositoryService::new(pool.clone())
+            .get_by_key(&key)
+            .await
+            .expect("remote repo");
+
+        // Seed 25 catalog rows. No object is written to storage, so any code
+        // path that still enumerates the storage prefix sees zero entries.
+        let total = 25usize;
+        for i in 0..total {
+            let p = format!("pkg/obj-{i:03}.bin");
+            proxy_catalog::upsert(
+                &pool,
+                repo_id,
+                &p,
+                &format!("proxy-cache/{key}/{p}/__content__"),
+                &format!("proxy-cache/{key}/{p}/__cache_meta__.json"),
+                10 + i as i64,
+                Some("f00d"),
+                Some("application/x-test"),
+                None,
+            )
+            .await
+            .expect("seed catalog row");
+        }
+
+        // Full cursor walk: 10 + 10 + 5, has_more true/true/false, and the
+        // concatenated pages equal the seeded set exactly (no gaps, no dups).
+        let mut cursor: Option<String> = None;
+        let mut walked: Vec<String> = Vec::new();
+        let mut hops = 0;
+        loop {
+            let resp = list_remote_cached_artifacts(
+                &state,
+                &repo,
+                &key,
+                None,
+                None,
+                cursor.as_deref(),
+                false,
+                1,
+                10,
+            )
+            .await
+            .expect("catalog-paged listing")
+            .0;
+            assert!(resp.items.len() <= 10, "page bounded by per_page");
+            walked.extend(resp.items.iter().map(|i| i.path.clone()));
+            hops += 1;
+            match (resp.has_more, hops) {
+                (Some(true), 1 | 2) => {
+                    cursor = resp.next_cursor.clone();
+                    assert!(cursor.is_some(), "has_more page carries next_cursor");
+                }
+                (Some(false), 3) => {
+                    assert!(resp.next_cursor.is_none(), "last page has no cursor");
+                    assert_eq!(resp.items.len(), 5, "final short page");
+                    break;
+                }
+                (hm, n) => panic!("unexpected has_more={hm:?} on page {n}"),
+            }
+        }
+        let expected: Vec<String> = (0..total).map(|i| format!("pkg/obj-{i:03}.bin")).collect();
+        assert_eq!(walked, expected, "cursor walk yields every row in order");
+
+        // Response mapping mirrors the sidecar path: synthetic id semantics,
+        // not analyzable, catalog timestamp surfaced as cache_cached_at.
+        let first =
+            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, false, 1, 10)
+                .await
+                .expect("first page")
+                .0;
+        let item = &first.items[0];
+        assert_eq!(item.path, "pkg/obj-000.bin");
+        assert_eq!(item.name, "obj-000.bin");
+        assert_eq!(item.size_bytes, 10);
+        assert_eq!(item.checksum_sha256, "f00d");
+        assert_eq!(item.content_type, "application/x-test");
+        assert!(!item.analyzable);
+        assert!(item.cache_cached_at.is_some());
+        assert_eq!(item.id, cached_artifact_id(&key, "pkg/obj-000.bin"));
+
+        // Legacy page=N addressing still works without a cursor, and
+        // `count=exact` opts into the exact total (default is a lower bound
+        // with authoritative has_more).
+        let page3 =
+            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, true, 3, 10)
+                .await
+                .expect("page 3")
+                .0;
+        assert_eq!(
+            page3
+                .items
+                .iter()
+                .map(|i| i.path.as_str())
+                .collect::<Vec<_>>(),
+            expected[20..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(page3.pagination.total, 25, "count=exact total");
+        assert_eq!(page3.has_more, Some(false));
+
+        // The substring filter keeps its legacy case-insensitive semantics.
+        let filtered = list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            None,
+            Some("OBJ-013"),
+            None,
+            false,
+            1,
+            10,
+        )
+        .await
+        .expect("filtered")
+        .0;
+        assert_eq!(
+            filtered
+                .items
+                .iter()
+                .map(|i| i.path.as_str())
+                .collect::<Vec<_>>(),
+            ["pkg/obj-013.bin"]
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
