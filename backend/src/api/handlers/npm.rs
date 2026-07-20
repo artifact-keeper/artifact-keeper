@@ -1256,7 +1256,9 @@ async fn npm_meta_get(
     // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
             if let Some(resp) =
                 proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
             {
@@ -1277,7 +1279,9 @@ async fn npm_meta_get(
             let Some(ref upstream_url) = member.upstream_url else {
                 continue;
             };
-            let policy = fetch_npm_scope_policy(&state.db, member.id).await;
+            let policy = fetch_npm_scope_policy(&state.db, member.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
             if let Some(resp) =
                 proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
             {
@@ -1335,7 +1339,9 @@ async fn security_advisories_bulk(
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
             // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
             if !policy.is_active() {
                 return Ok(proxy_npm_audit_post(
@@ -1384,7 +1390,9 @@ async fn security_audits_quick(
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
             // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
             if !policy.is_active() {
                 return Ok(proxy_npm_audit_post(
@@ -1817,19 +1825,59 @@ impl NpmScopePolicy {
     }
 }
 
+/// Fail-closed error for an npm scope-policy value that is *present* in
+/// `repository_config` but cannot be parsed (#2726). The admin write path only
+/// ever stores serde-encoded JSON lists and literal `"true"`/`"false"`, so a
+/// corrupt value is never a legitimate state — treating it as "unset" would
+/// silently lift the operator's allowlist (same swallow class as #2672).
+fn npm_policy_value_corrupt(
+    repo_id: uuid::Uuid,
+    key: &str,
+    err: &dyn std::fmt::Display,
+) -> AppError {
+    tracing::error!(
+        repo_id = %repo_id,
+        key,
+        error = %err,
+        "npm scope policy value present but unparseable; failing closed (#2726)"
+    );
+    AppError::ServiceUnavailable("npm scope policy configuration is invalid".to_string())
+}
+
+/// Parse a stored JSON string-list policy value (scopes / name patterns),
+/// case-folded. A present-but-corrupt value fails closed (#2726).
+fn parse_npm_policy_list(
+    repo_id: uuid::Uuid,
+    key: &str,
+    value: &str,
+) -> Result<Vec<String>, AppError> {
+    Ok(serde_json::from_str::<Vec<String>>(value)
+        .map_err(|e| npm_policy_value_corrupt(repo_id, key, &e))?
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect())
+}
+
 /// Batch-load the npm scope policies for a set of member repositories in a
 /// single query. Repositories with no stored policy are absent from the map
 /// (treated as unrestricted). Mirrors the runtime-query style of
 /// `fetch_pypi_upstream_index_path` (no compile-time sqlx macro) so offline
 /// `cargo check` needs no prepared query data.
+///
+/// An *absent* policy row keeps meaning "unrestricted" — the legitimate
+/// unconfigured state. An *error* — a database failure, or a stored value that
+/// is present but cannot be parsed — must NOT be silently downgraded to that
+/// unrestricted default (#2726, same class as #2672): both return
+/// `Err(AppError::ServiceUnavailable)` (503) so the request fails CLOSED
+/// instead of a DB blip or a corrupt row lifting the operator's allowlist.
 async fn fetch_npm_scope_policies(
     db: &PgPool,
     repo_ids: &[uuid::Uuid],
-) -> std::collections::HashMap<uuid::Uuid, NpmScopePolicy> {
+) -> Result<std::collections::HashMap<uuid::Uuid, NpmScopePolicy>, AppError> {
     let mut policies: std::collections::HashMap<uuid::Uuid, NpmScopePolicy> =
         std::collections::HashMap::new();
     if repo_ids.is_empty() {
-        return policies;
+        return Ok(policies);
     }
     let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
         "SELECT repository_id, key, value FROM repository_config \
@@ -1841,38 +1889,46 @@ async fn fetch_npm_scope_policies(
     .bind(NPM_ALLOWED_NAME_PATTERNS_KEY)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| {
+        // Fail CLOSED on a genuine DB error rather than treating it as
+        // "no policy configured" (allow all) — see #2726.
+        tracing::error!(
+            error = %e,
+            "failed to load npm scope policies; failing closed (#2726)"
+        );
+        AppError::ServiceUnavailable("npm scope policy temporarily unavailable".to_string())
+    })?;
 
     for (repo_id, key, value) in rows {
         let policy = policies.entry(repo_id).or_default();
         if key == NPM_ALLOWED_SCOPES_KEY {
-            policy.allowed_scopes = serde_json::from_str::<Vec<String>>(&value)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
+            policy.allowed_scopes = parse_npm_policy_list(repo_id, &key, &value)?;
         } else if key == NPM_ALLOW_UNSCOPED_KEY {
-            policy.allow_unscoped = value.parse::<bool>().ok();
+            // A present-but-corrupt boolean must not silently become "unset":
+            // that would lift an explicit `false` (block-unscoped) — #2726.
+            policy.allow_unscoped = Some(
+                value
+                    .parse::<bool>()
+                    .map_err(|e| npm_policy_value_corrupt(repo_id, &key, &e))?,
+            );
         } else if key == NPM_ALLOWED_NAME_PATTERNS_KEY {
-            // Malformed JSON => empty (unrestricted by this key), consistent
-            // with the `npm_allowed_scopes` parse above (#2424).
-            policy.allowed_name_patterns = serde_json::from_str::<Vec<String>>(&value)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
+            policy.allowed_name_patterns = parse_npm_policy_list(repo_id, &key, &value)?;
         }
     }
-    policies
+    Ok(policies)
 }
 
 /// Fetch the npm scope policy for a single repository. Returns the default
-/// (inactive, unrestricted) policy when nothing is configured.
-pub(crate) async fn fetch_npm_scope_policy(db: &PgPool, repo_id: uuid::Uuid) -> NpmScopePolicy {
-    fetch_npm_scope_policies(db, &[repo_id])
-        .await
+/// (inactive, unrestricted) policy when nothing is configured; propagates a
+/// load failure so the caller fails closed (#2726).
+pub(crate) async fn fetch_npm_scope_policy(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<NpmScopePolicy, AppError> {
+    Ok(fetch_npm_scope_policies(db, &[repo_id])
+        .await?
         .remove(&repo_id)
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Whether a virtual-repo member may serve as a candidate for
@@ -1913,7 +1969,9 @@ async fn get_package_metadata(
         // otherwise bypass the filter the virtual metadata loops apply. An
         // out-of-scope name returns 404 (parity with the virtual "skipped by
         // policy => not found" behaviour; avoids confirming the name exists).
-        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        let policy = fetch_npm_scope_policy(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
         if !policy.allows(package_name) {
             return Err(AppError::NotFound("Package not found".to_string()).into_response());
         }
@@ -1960,7 +2018,9 @@ async fn get_package_metadata(
 
         // Batch-load per-member npm scope policies once per request (#2327).
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+            .await
+            .map_err(IntoResponse::into_response)?;
 
         for member in &members {
             // For Local/Staging members, query artifacts from the DB.
@@ -2144,7 +2204,9 @@ async fn fetch_remote_packument(
 ) -> Result<serde_json::Value, Response> {
     // Enforce the repository's own npm scope policy on the direct-remote
     // packument path (#2424); an out-of-scope name returns 404.
-    let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+    let policy = fetch_npm_scope_policy(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     if !policy.allows(package_name) {
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
@@ -2190,7 +2252,9 @@ async fn fetch_virtual_packument(
 
     // Batch-load per-member npm scope policies once per request (#2327).
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     for member in &members {
         if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
@@ -2674,7 +2738,9 @@ async fn serve_tarball(
         // tarball path (#2424). A pinned-lockfile tarball GET for an
         // out-of-scope name would otherwise stream straight through; an
         // out-of-scope name now returns 404.
-        let policy = fetch_npm_scope_policy(&state.db, repo.id).await;
+        let policy = fetch_npm_scope_policy(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
         if !policy.allows(package_name) {
             return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
         }
@@ -2776,7 +2842,9 @@ async fn serve_tarball(
         // shadowing guard and the local-only primitive above.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+            .await
+            .map_err(IntoResponse::into_response)?;
         let members: Vec<_> = members
             .into_iter()
             .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
@@ -4387,10 +4455,10 @@ mod tests {
     }
 
     /// DB-backed: `fetch_npm_scope_policy` / `fetch_npm_scope_policies` read
-    /// the `repository_config` rows written by the admin endpoint and
-    /// tolerate every degenerate stored shape — no rows (default policy),
-    /// malformed JSON in the scope list, an unparseable boolean, mixed-case
-    /// stored scopes (case-folded), and an empty id set (no query at all).
+    /// the `repository_config` rows written by the admin endpoint. Absent rows
+    /// yield the default (inactive, unrestricted) policy; well-formed rows are
+    /// case-folded and honored; a PRESENT-but-corrupt value fails CLOSED
+    /// (#2726) instead of degrading to "unset" (which lifted the allowlist).
     /// Skips when no `DATABASE_URL` is configured.
     #[tokio::test]
     async fn fetch_npm_scope_policy_parses_stored_config_db() {
@@ -4415,28 +4483,66 @@ mod tests {
                 .expect("upsert repository_config");
             }
         };
+        let delete = |key: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                    .bind(repo_id)
+                    .bind(key)
+                    .execute(&pool)
+                    .await
+                    .expect("delete repository_config");
+            }
+        };
 
         // Empty id slice: no rows requested, empty map back.
-        assert!(fetch_npm_scope_policies(&pool, &[]).await.is_empty());
+        assert!(fetch_npm_scope_policies(&pool, &[])
+            .await
+            .expect("empty id slice must succeed")
+            .is_empty());
 
-        // No rows stored: default (inactive, unrestricted) policy.
-        let empty = fetch_npm_scope_policy(&pool, repo_id).await;
+        // No rows stored: default (inactive, unrestricted) policy. This is
+        // the legitimate unconfigured state and must stay allow-all after the
+        // #2726 fail-closed change.
+        let empty = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("absent policy rows must succeed with the default policy");
         assert_eq!(empty, NpmScopePolicy::default());
         assert!(!empty.is_active());
+        assert!(empty.allows("lodash"), "unset policy must allow everything");
 
-        // Malformed JSON scope list + unparseable boolean: both degrade to
-        // the unrestricted default rather than erroring the request path.
+        // #2726: a PRESENT-but-corrupt value is an error loading the
+        // operator's intended policy, not an unset policy — it must fail
+        // CLOSED rather than degrade to the unrestricted default. Each key
+        // is exercised in isolation.
         upsert(NPM_ALLOWED_SCOPES_KEY, "not-json").await;
-        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
-        let degenerate = fetch_npm_scope_policy(&pool, repo_id).await;
-        assert!(degenerate.allowed_scopes.is_empty());
-        assert_eq!(degenerate.allow_unscoped, None);
-        assert!(!degenerate.is_active());
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allowed_scopes must fail closed, not fall open"
+        );
+        delete(NPM_ALLOWED_SCOPES_KEY).await;
 
-        // Well-formed rows: scopes case-folded, boolean parsed.
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allow_unscoped must fail closed, not lift an explicit false"
+        );
+        delete(NPM_ALLOW_UNSCOPED_KEY).await;
+
+        upsert(NPM_ALLOWED_NAME_PATTERNS_KEY, "not-json").await;
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allowed_name_patterns must fail closed, not fall open"
+        );
+        delete(NPM_ALLOWED_NAME_PATTERNS_KEY).await;
+
+        // Well-formed rows: scopes case-folded, boolean parsed, and the
+        // configured policy still denies out-of-allowlist names.
         upsert(NPM_ALLOWED_SCOPES_KEY, "[\"@Types\",\"@partner\"]").await;
         upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
-        let stored = fetch_npm_scope_policy(&pool, repo_id).await;
+        let stored = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
         assert_eq!(stored.allowed_scopes, vec!["@types", "@partner"]);
         assert_eq!(stored.allow_unscoped, Some(false));
         assert!(stored.is_active());
@@ -4445,23 +4551,23 @@ mod tests {
 
         // Boolean flips to true: unscoped resolution allowed again.
         upsert(NPM_ALLOW_UNSCOPED_KEY, "true").await;
-        let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
+        let flipped = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
         assert_eq!(flipped.allow_unscoped, Some(true));
         assert!(flipped.allows("lodash"));
 
-        // #2424: the new name-pattern key parses into a lowercased Vec and
-        // composes with the scope list; malformed JSON degrades to empty
-        // (unrestricted by that key), consistent with the scope-list parse.
-        upsert(NPM_ALLOWED_NAME_PATTERNS_KEY, "not-json").await;
-        let bad_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
-        assert!(bad_patterns.allowed_name_patterns.is_empty());
+        // #2424: the name-pattern key parses into a lowercased Vec and
+        // composes with the scope list.
         upsert(
             NPM_ALLOWED_NAME_PATTERNS_KEY,
             "[\"@Acme/*\",\"internal-*\"]",
         )
         .await;
         upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
-        let with_patterns = fetch_npm_scope_policy(&pool, repo_id).await;
+        let with_patterns = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
         assert_eq!(
             with_patterns.allowed_name_patterns,
             vec!["@acme/*", "internal-*"]
@@ -4480,6 +4586,50 @@ mod tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+    }
+
+    /// #2726 core regression: a genuine DB error while loading the npm scope
+    /// policies must fail CLOSED (503 ServiceUnavailable), NOT be swallowed
+    /// into an empty allow-all map. Needs no live database: a lazily-connected
+    /// pool pointed at an unreachable server errors on first query. Before the
+    /// fix, `unwrap_or_default()` turned this exact failure into "every repo
+    /// unrestricted", silently lifting the operator's allowlist at all proxy
+    /// gates (tarball, metadata, packument, meta/audit).
+    #[tokio::test]
+    async fn test_fetch_npm_scope_policies_db_error_fails_closed() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy");
+        let repo_id = uuid::Uuid::new_v4();
+
+        let err = fetch_npm_scope_policies(&pool, &[repo_id])
+            .await
+            .expect_err("a DB error must fail closed (Err), not fall open to allow-all");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "a policy-load DB error must map to 503, got: {err:?}"
+        );
+
+        // The single-repo wrapper propagates the same failure (this feeds the
+        // live gates at get_package_metadata / fetch_remote_packument /
+        // serve_tarball).
+        let err = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect_err("single-repo policy fetch must also fail closed on a DB error");
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    /// #2726: the pure parse helpers fail closed on corrupt values and accept
+    /// well-formed ones (no DB needed).
+    #[test]
+    fn test_parse_npm_policy_list_corrupt_fails_closed() {
+        let repo_id = uuid::Uuid::new_v4();
+        let err = parse_npm_policy_list(repo_id, NPM_ALLOWED_SCOPES_KEY, "not-json")
+            .expect_err("corrupt JSON must be an error, not an empty (unrestricted) list");
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+
+        let ok = parse_npm_policy_list(repo_id, NPM_ALLOWED_SCOPES_KEY, "[\"@Types\"]")
+            .expect("well-formed JSON must parse");
+        assert_eq!(ok, vec!["@types"]);
     }
 
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —

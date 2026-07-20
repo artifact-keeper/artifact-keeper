@@ -1589,17 +1589,19 @@ async fn apply_npm_scope_policy_config(
 /// `repository_config` (#2424) so create/get/update echo the stored policy.
 /// A no-op for non-npm-Remote repositories and for repositories with no stored
 /// policy (fields stay `None` and are skipped in the serialised JSON).
+/// A policy-load failure propagates (#2726) rather than silently echoing
+/// "no policy" for a repository that has one configured.
 async fn with_npm_scope_policy(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     repo_type: &RepositoryType,
     format: &RepositoryFormat,
     mut response: RepositoryResponse,
-) -> RepositoryResponse {
+) -> Result<RepositoryResponse> {
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
-        return response;
+        return Ok(response);
     }
-    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(db, repo_id).await;
+    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(db, repo_id).await?;
     if !policy.allowed_scopes.is_empty() {
         response.npm_allowed_scopes = Some(policy.allowed_scopes);
     }
@@ -1609,7 +1611,7 @@ async fn with_npm_scope_policy(
     if !policy.allowed_name_patterns.is_empty() {
         response.npm_allowed_name_patterns = Some(policy.allowed_name_patterns);
     }
-    response
+    Ok(response)
 }
 
 /// Set the npm scope policy for a Remote repository (#2327).
@@ -1731,7 +1733,7 @@ pub async fn get_npm_scope_policy(
         }
     }
 
-    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await;
+    let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await?;
     let active = policy.is_active();
     Ok(Json(NpmScopePolicyResponse {
         repository_key: key,
@@ -2694,7 +2696,7 @@ pub async fn create_repository(
         &repo_format_out,
         response,
     )
-    .await;
+    .await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
@@ -2750,7 +2752,7 @@ pub async fn get_repository(
     )
     .await;
     let response =
-        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
+        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
@@ -3359,7 +3361,7 @@ pub async fn update_repository(
     )
     .await;
     let response =
-        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await;
+        with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_trusted_gpg_key(&state.db, repo_id, response).await;
     Ok(Json(response))
 }
