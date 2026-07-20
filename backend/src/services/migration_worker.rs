@@ -1479,6 +1479,59 @@ impl MigrationWorker {
                 }
 
                 tx.commit().await?;
+
+                // #2676: surface the migrated artifact in the packages
+                // catalog. The web UI's Packages tab reads `packages` /
+                // `package_versions` (via /api/v1/packages), NOT `artifacts`
+                // — every live publish path (nuget, npm, pypi, helm proxy,
+                // the OCI manifest-PUT, the generic upload path) populates
+                // the catalog after its artifact insert, but the import
+                // path only wrote `artifacts` (+ the OCI index tables), so
+                // a migrated repository showed artifacts under an empty
+                // Packages tab. Reuse the exact shared UPSERT path the live
+                // handlers call: it is idempotent (re-running a migration
+                // re-upserts the same rows instead of duplicating them) and
+                // best-effort by contract (a catalog failure must not fail
+                // an item whose content already committed — the wrapper
+                // logs and swallows, mirroring the live paths).
+                if let Some(entry) = migration_catalog_entry(package_type, &oci_role, &parsed) {
+                    let size_bytes = match (&oci_role, &oci_manifest_body) {
+                        // Docker: size the catalog row like the live push —
+                        // config+layers for an image manifest, plus the sum
+                        // of already-imported child manifest sizes for a
+                        // multi-arch index (whose own body carries no
+                        // layers).
+                        (OciRole::Manifest { .. }, Some(body)) => {
+                            let base = crate::api::handlers::oci_v2::manifest_total_size(body);
+                            let child_sum = if matches!(
+                                oci_manifest_class,
+                                Some(crate::api::handlers::oci_v2::ManifestClass::Index)
+                            ) {
+                                crate::api::handlers::oci_v2::index_child_artifact_size_sum(
+                                    &self.db,
+                                    repository_id,
+                                    &computed_digest,
+                                )
+                                .await
+                            } else {
+                                0
+                            };
+                            base.saturating_add(child_sum)
+                        }
+                        _ => content_size as i64,
+                    };
+                    crate::services::package_service::PackageService::new(self.db.clone())
+                        .try_create_or_update_from_artifact(
+                            repository_id,
+                            &entry.name,
+                            &entry.version,
+                            size_bytes,
+                            &sha256_hex,
+                            None,
+                            Some(serde_json::json!({ "format": entry.format })),
+                        )
+                        .await;
+                }
             }
         }
 
@@ -2186,6 +2239,62 @@ fn migration_artifact_path(
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
             _ => format!("{}/{}", repo_key, artifact_path),
         },
+    }
+}
+
+/// The `packages`-catalog identity of a migrated artifact, or `None` when
+/// the artifact must not produce a catalog row (#2676).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEntry {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) format: String,
+}
+
+/// Decide whether a migrated artifact gets a `packages`/`package_versions`
+/// row and under what identity, mirroring the live publish paths (#2676):
+///
+/// - Docker/OCI: only tag manifests are user-facing versions — the catalog
+///   row is `<image>@<tag>`, exactly like the live manifest-PUT handler.
+///   Digest-addressed child manifests and layer/config blobs are skipped
+///   (mirrors the live path's `oci_reference_is_tag` filter).
+/// - Maven family: skipped. Live maven catalog names are
+///   `groupId:artifactId` and `parse_name_and_version` recovers only the
+///   artifactId, so writing rows here would diverge from the shape the
+///   repository components view expects (follow-up, not in #2676's scope).
+/// - Everything else (helm, nuget, npm, pypi, generic, ...): a row is
+///   written whenever the importer recovered a version, under the same
+///   `(name, version)` the artifact row itself carries.
+pub(crate) fn migration_catalog_entry(
+    package_type: &str,
+    oci_role: &OciRole,
+    parsed: &crate::services::artifact_metadata::ParsedArtifact,
+) -> Option<CatalogEntry> {
+    match oci_role {
+        OciRole::Blob { .. } => None,
+        OciRole::Manifest { image, reference } => {
+            if crate::api::handlers::oci_v2::oci_reference_is_tag(reference) {
+                Some(CatalogEntry {
+                    name: image.clone(),
+                    version: reference.clone(),
+                    format: "docker".to_string(),
+                })
+            } else {
+                None
+            }
+        }
+        OciRole::NotOci => {
+            let pt = package_type.to_lowercase();
+            if matches!(pt.as_str(), "maven" | "gradle" | "sbt" | "ivy") {
+                return None;
+            }
+            let version = parsed.version.clone()?;
+            Some(CatalogEntry {
+                name: parsed.name.clone(),
+                version,
+                format: pt,
+            })
+        }
     }
 }
 
@@ -4939,6 +5048,22 @@ mod tests {
         hex::encode(hasher.finalize())
     }
 
+    /// Build a Docker schema2 image-manifest body over the given config and
+    /// layer bytes. Shared by the import tests so the JSON scaffolding lives
+    /// in one place.
+    fn docker_image_manifest_json(config_bytes: &[u8], layer_bytes: &[u8]) -> String {
+        format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+              \"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
+            config_bytes.len(),
+            sha256_hex_of(config_bytes),
+            layer_bytes.len(),
+            sha256_hex_of(layer_bytes)
+        )
+    }
+
     /// Build a worker + filesystem storage rooted in a fresh temp dir and a
     /// repository row pointing at it. Returns everything a #2457 import test
     /// needs.
@@ -5028,16 +5153,7 @@ mod tests {
         let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-2457");
         let config_hex = sha256_hex_of(&config_bytes);
         let layer_hex = sha256_hex_of(&layer_bytes);
-        let manifest = format!(
-            "{{\"schemaVersion\":2,\
-              \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
-              \"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"sha256:{}\"}},\
-              \"layers\":[{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
-            config_bytes.len(),
-            config_hex,
-            layer_bytes.len(),
-            layer_hex
-        );
+        let manifest = docker_image_manifest_json(&config_bytes, &layer_bytes);
         let manifest_bytes = bytes::Bytes::from(manifest);
         let manifest_digest = format!("sha256:{}", sha256_hex_of(&manifest_bytes));
 
@@ -5625,5 +5741,284 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2676: packages-catalog population (decision logic, pure, no DB)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catalog_entry_docker_tag_manifest() {
+        let parsed = crate::services::artifact_metadata::ParsedArtifact {
+            name: "manifest.json".to_string(),
+            version: None,
+        };
+        let entry = migration_catalog_entry(
+            "docker",
+            &OciRole::Manifest {
+                image: "org/app".to_string(),
+                reference: "v1.2".to_string(),
+            },
+            &parsed,
+        )
+        .expect("tag manifest must produce a catalog entry");
+        assert_eq!(entry.name, "org/app");
+        assert_eq!(entry.version, "v1.2");
+        assert_eq!(entry.format, "docker");
+    }
+
+    #[test]
+    fn test_catalog_entry_skips_digest_manifests_and_blobs() {
+        let parsed = crate::services::artifact_metadata::ParsedArtifact {
+            name: "manifest.json".to_string(),
+            version: None,
+        };
+        // A digest-addressed child manifest is not a user-facing version
+        // (mirrors the live push path's tag-only filter).
+        assert_eq!(
+            migration_catalog_entry(
+                "docker",
+                &OciRole::Manifest {
+                    image: "app".to_string(),
+                    reference: format!("sha256:{}", "a".repeat(64)),
+                },
+                &parsed,
+            ),
+            None
+        );
+        // Layer/config blobs never surface in the catalog.
+        assert_eq!(
+            migration_catalog_entry(
+                "docker",
+                &OciRole::Blob {
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                },
+                &parsed,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_catalog_entry_non_oci_formats() {
+        let parsed = crate::services::artifact_metadata::ParsedArtifact {
+            name: "MyPackage".to_string(),
+            version: Some("1.0.0".to_string()),
+        };
+        // Version recovered => catalog row under the parsed identity, with
+        // the format key lowercased.
+        let entry = migration_catalog_entry("NuGet", &OciRole::NotOci, &parsed)
+            .expect("versioned non-OCI artifact must produce a catalog entry");
+        assert_eq!(entry.name, "MyPackage");
+        assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.format, "nuget");
+
+        // No version => no catalog row (`packages.version` is NOT NULL and a
+        // version-less blob is not a package release).
+        let unversioned = crate::services::artifact_metadata::ParsedArtifact {
+            name: "blob.bin".to_string(),
+            version: None,
+        };
+        assert_eq!(
+            migration_catalog_entry("generic", &OciRole::NotOci, &unversioned),
+            None
+        );
+
+        // Maven-family catalog names are `groupId:artifactId`; the parser
+        // only recovers the artifactId, so no row is written (follow-up).
+        assert_eq!(
+            migration_catalog_entry("maven", &OciRole::NotOci, &parsed),
+            None
+        );
+        assert_eq!(
+            migration_catalog_entry("gradle", &OciRole::NotOci, &parsed),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2676: packages-catalog population on import (DB-gated via try_pool)
+    // -----------------------------------------------------------------------
+
+    /// Count the catalog rows for a repository:
+    /// `(packages rows, package_versions rows)`.
+    async fn catalog_counts(pool: &sqlx::PgPool, repo_id: Uuid) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM packages WHERE repository_id = $1), \
+                    (SELECT COUNT(*) FROM package_versions pv \
+                     JOIN packages p ON p.id = pv.package_id \
+                     WHERE p.repository_id = $1)",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count catalog rows")
+    }
+
+    /// The single `(name, version)` catalog row for a repository, if any.
+    async fn single_catalog_row(pool: &sqlx::PgPool, repo_id: Uuid) -> Option<(String, String)> {
+        sqlx::query_as(
+            "SELECT p.name, pv.version FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_optional(pool)
+        .await
+        .expect("query catalog")
+    }
+
+    /// Delete the test repository row (cascades to artifacts + catalog rows).
+    async fn cleanup_repo(pool: &sqlx::PgPool, repo_id: Uuid) {
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// A migrated NuGet package must land in `packages`/`package_versions`
+    /// (the tables the web UI's Packages tab reads) exactly like a live
+    /// `nuget push`, and re-running the migration must not duplicate rows.
+    /// Pre-fix, the import wrote only `artifacts` and the tab stayed empty.
+    #[tokio::test]
+    async fn test_nuget_import_populates_package_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2676-nuget", "nuget").await;
+
+        let path = "MyPackage/1.0.0/MyPackage.1.0.0.nupkg";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            path.to_string(),
+            bytes::Bytes::from_static(b"fake nupkg bytes"),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "nuget", path)
+            .await
+            .expect("nuget transfer must succeed");
+
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("MyPackage".to_string(), "1.0.0".to_string())),
+            "migrated nuget package must appear in the packages catalog"
+        );
+
+        // Re-import (migration re-run) must be idempotent: same single row.
+        transfer_one(&worker, &storage, &files, &repo_key, "nuget", path)
+            .await
+            .expect("nuget re-import must succeed");
+        assert_eq!(
+            catalog_counts(&pool, repo_id).await,
+            (1, 1),
+            "re-running the migration must not duplicate catalog rows"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// Same guarantee for Helm: the chart identity parsed from
+    /// `<name>-<version>.tgz` must land in the packages catalog.
+    #[tokio::test]
+    async fn test_helm_import_populates_package_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2676-helm", "helm").await;
+
+        let path = "mychart-1.2.3.tgz";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            path.to_string(),
+            bytes::Bytes::from_static(b"not a real tgz - metadata extraction is best-effort"),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "helm", path)
+            .await
+            .expect("helm transfer must succeed");
+
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("mychart".to_string(), "1.2.3".to_string())),
+            "migrated helm chart must appear in the packages catalog"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// Docker: importing a tagged image manifest must create a catalog row
+    /// `<image>@<tag>` sized from the manifest's config+layers (mirroring the
+    /// live manifest-PUT), while the by-digest blobs the walker fetches must
+    /// NOT create rows of their own.
+    #[tokio::test]
+    async fn test_docker_import_populates_package_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2676-docker", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-2676");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let layer_hex = sha256_hex_of(&layer_bytes);
+        let manifest = docker_image_manifest_json(&config_bytes, &layer_bytes);
+        let manifest_bytes = bytes::Bytes::from(manifest);
+
+        // Nexus layout: only the tag is enumerated; the walker fetches the
+        // config/layer blobs by digest.
+        let manifest_path = "v2/hello/manifests/latest".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(manifest_path.clone(), manifest_bytes.clone());
+        files.insert(
+            format!("v2/hello/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        );
+        files.insert(
+            format!("v2/hello/blobs/sha256:{layer_hex}"),
+            layer_bytes.clone(),
+        );
+
+        transfer_one(
+            &worker,
+            &storage,
+            &files,
+            &repo_key,
+            "docker",
+            &manifest_path,
+        )
+        .await
+        .expect("docker manifest import must succeed");
+
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT p.name, pv.version, pv.size_bytes FROM packages p \
+             JOIN package_versions pv ON pv.package_id = p.id \
+             WHERE p.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog");
+        let (name, version, size) =
+            row.expect("migrated docker tag must appear in the packages catalog");
+        assert_eq!(name, "hello");
+        assert_eq!(version, "latest");
+        assert_eq!(
+            size,
+            (config_bytes.len() + layer_bytes.len()) as i64,
+            "catalog size must be config+layers, like the live push path"
+        );
+
+        // Exactly one catalog row: the walked-in blobs and the digest child
+        // content must not surface as packages.
+        assert_eq!(catalog_counts(&pool, repo_id).await, (1, 1));
+
+        cleanup_repo(&pool, repo_id).await;
     }
 }
