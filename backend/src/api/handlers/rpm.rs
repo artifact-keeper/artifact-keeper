@@ -306,6 +306,13 @@ struct RpmArtifact {
 /// and the detached signature would not match the served document (#2636).
 /// `(name, version, path)` is the order Debian's package index already uses;
 /// `id` is unique, so appending it makes the order total.
+///
+/// Only actual `.rpm` package objects (including `.src.rpm`) are listed: the
+/// generic chunked upload flow can place arbitrary companions (signature
+/// sidecars, checksum files, `.repo` snippets) in an RPM repository, and
+/// repodata must never describe those as packages (#2590). Delta RPMs
+/// (`.drpm`) are also excluded — they belong in `prestodelta` metadata,
+/// which we do not generate, not in `primary.xml`.
 async fn list_rpm_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
@@ -317,6 +324,7 @@ async fn list_rpm_artifacts(
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1 AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
         ORDER BY a.name, a.version, a.path, a.id
         "#,
         repo_id
@@ -2981,6 +2989,95 @@ mod tests {
             .await
             .ok();
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2590: repodata must describe only actual `.rpm` packages. The generic
+    // chunked upload flow can place arbitrary objects (signature sidecars,
+    // checksum files, `.repo` snippets) into an RPM repository; those must
+    // not leak into primary.xml/filelists.xml/other.xml, or dnf/yum trip on
+    // metadata entries that are not packages.
+    // -----------------------------------------------------------------------
+
+    /// Insert an arbitrary (non-`.rpm`) object row into the fixture repo,
+    /// mimicking what the generic upload flow stores.
+    async fn insert_repo_object(f: &tdh::Fixture, path: &str, name: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .bind(name)
+        .bind(64i64)
+        .bind("1111111111111111111111111111111111111111111111111111111111111111")
+        .bind("application/octet-stream")
+        .bind(path)
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert non-rpm repo object");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_excludes_non_rpm_objects() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        // Two real packages: a binary RPM and a source RPM (both must stay).
+        insert_rpm_artifact(&f, "realpkg").await;
+        insert_repo_object(&f, "packages/realpkg-1.0-1.src.rpm", "realpkg-src").await;
+        // Non-package companions the generic flow can store (all must go).
+        insert_repo_object(&f, "packages/realpkg-1.0-1.x86_64.rpm.asc", "realpkg-sig").await;
+        insert_repo_object(&f, "realpkg-1.0-1.x86_64.rpm.sha256", "realpkg-sum").await;
+        insert_repo_object(&f, "test.repo", "test-repo").await;
+
+        // The query helper itself must only return the package rows.
+        let listed = super::list_rpm_artifacts(&f.pool, f.repo_id)
+            .await
+            .expect("list_rpm_artifacts");
+        let paths: Vec<&str> = listed.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "packages/realpkg-1.0-1.x86_64.rpm",
+                "packages/realpkg-1.0-1.src.rpm",
+            ],
+            "list_rpm_artifacts must return only .rpm package objects"
+        );
+
+        // End to end: primary.xml must describe exactly the two packages.
+        let (status, body) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut decoder = GzDecoder::new(&body[..]);
+        let mut primary = String::new();
+        decoder
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+
+        f.teardown().await;
+
+        assert!(
+            primary.contains("packages=\"2\""),
+            "primary.xml must count only the .rpm packages, got: {primary}"
+        );
+        assert!(primary.contains("realpkg-1.0-1.x86_64.rpm"));
+        assert!(primary.contains("realpkg-1.0-1.src.rpm"));
+        for junk in [".rpm.asc", ".rpm.sha256", "test.repo"] {
+            assert!(
+                !primary.contains(junk),
+                "non-package object {junk} leaked into primary.xml: {primary}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

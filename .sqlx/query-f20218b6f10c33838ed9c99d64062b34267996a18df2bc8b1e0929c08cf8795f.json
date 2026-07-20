@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,\n               a.storage_key, a.updated_at, am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1 AND a.is_deleted = false\n        ORDER BY a.name, a.version, a.path, a.id\n        ",
+  "query": "\n        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,\n               a.storage_key, a.updated_at, am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1 AND a.is_deleted = false\n          AND a.path LIKE '%.rpm'\n        ORDER BY a.name, a.version, a.path, a.id\n        ",
   "describe": {
     "columns": [
       {
@@ -66,5 +66,5 @@
       false
     ]
   },
-  "hash": "c8bf6d407a918f252604042bc99771308da0a1aabe2a377339c7996d931198f5"
+  "hash": "f20218b6f10c33838ed9c99d64062b34267996a18df2bc8b1e0929c08cf8795f"
 }
