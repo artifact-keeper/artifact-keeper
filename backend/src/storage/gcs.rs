@@ -243,8 +243,10 @@ enum TokenSource {
         service_account_email: String,
         signing_key: Box<RsaPrivateKey>,
     },
-    /// GCE metadata server (ADC / Workload Identity).
-    MetadataServer,
+    /// GCE metadata server (ADC / Workload Identity). Carries the token URL
+    /// (production: [`GCP_METADATA_TOKEN_URL`]) so tests can point the fetch
+    /// at a mock metadata server by hostname.
+    MetadataServer { token_url: String },
 }
 
 /// Token provider with RwLock cache, mirroring Azure's `TokenCredentialProvider`.
@@ -288,7 +290,9 @@ impl GcsTokenProvider {
                 self.fetch_jwt_token(service_account_email, signing_key)
                     .await?
             }
-            TokenSource::MetadataServer => self.fetch_metadata_token().await?,
+            TokenSource::MetadataServer { token_url } => {
+                self.fetch_metadata_token(token_url).await?
+            }
         };
 
         *cache = Some(CachedToken {
@@ -354,10 +358,10 @@ impl GcsTokenProvider {
     }
 
     /// Fetch a token from the GCE metadata server.
-    async fn fetch_metadata_token(&self) -> Result<(String, u64)> {
+    async fn fetch_metadata_token(&self, token_url: &str) -> Result<(String, u64)> {
         let response = self
             .client
-            .get(GCP_METADATA_TOKEN_URL)
+            .get(token_url)
             .header("Metadata-Flavor", "Google")
             .send()
             .await
@@ -371,6 +375,36 @@ impl GcsTokenProvider {
 
         Ok((token_resp.access_token, token_resp.expires_in))
     }
+}
+
+/// Build the HTTP client used exclusively for the GCE metadata server token
+/// endpoint ([`GCP_METADATA_TOKEN_URL`]).
+///
+/// This deliberately does NOT use `http_client::base_client_builder()`: that
+/// builder installs the SSRF-guard DNS resolver, which hard-blocks
+/// cloud-metadata / link-local addresses in every trust class — so
+/// `metadata.google.internal` (169.254.169.254) can never connect through it
+/// and every ADC / Workload Identity token fetch fails at resolve time
+/// (issue #2611: `checkout dropped for ("http", metadata.google.internal)`,
+/// HTTP 500 on docker push). The guard exists for attacker-influenceable
+/// URLs; this client is only ever handed the hardcoded metadata token URL,
+/// never user input. Redirects are disabled so the request (and its
+/// mandatory `Metadata-Flavor: Google` header) cannot be steered off the
+/// metadata host, and proxy env vars are ignored because the link-local
+/// metadata endpoint must always be dialed directly, never via an egress
+/// proxy.
+fn metadata_server_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to create GCP metadata server HTTP client: {}",
+                e
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +544,11 @@ impl GcsConfig {
 /// Google Cloud Storage backend.
 pub struct GcsBackend {
     config: GcsConfig,
-    /// Control-plane client (get/put/exists/delete/metadata/list, token
-    /// acquisition). Short 30 s timeout so a stuck control op fails fast.
+    /// Control-plane client (get/put/exists/delete/metadata/list, and JWT
+    /// token exchange in service-account-key mode). Short 30 s timeout so a
+    /// stuck control op fails fast. ADC / Workload Identity token fetches use
+    /// the dedicated [`metadata_server_client`] instead — this client's
+    /// SSRF-guard resolver blocks the metadata server's link-local address.
     client: reqwest::Client,
     /// Long-timeout client used only for the streaming GET (`get_stream`) and
     /// the resumable PUT chunks in `put_stream`. A multi-GiB resumable upload's
@@ -533,8 +570,9 @@ impl GcsBackend {
     /// Create a new GCS backend.
     pub async fn new(config: GcsConfig) -> Result<Self> {
         // Control-plane client: 30 s is plenty for metadata, list, delete, and
-        // single-shot puts of single-MB OCI layers. Token acquisition rides
-        // this client too.
+        // single-shot puts of single-MB OCI layers. JWT token exchange
+        // (service-account-key mode) rides this client too; ADC metadata
+        // token fetches do NOT (see metadata_server_client).
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -575,7 +613,17 @@ impl GcsBackend {
                 provider,
             }
         } else {
-            let provider = GcsTokenProvider::new(TokenSource::MetadataServer, client.clone());
+            // ADC / Workload Identity: token fetches go to the GCE metadata
+            // server, whose link-local address the shared SSRF-guarded
+            // control-plane client refuses to resolve (issue #2611). Use the
+            // dedicated metadata client for token acquisition only; all GCS
+            // API traffic stays on the guarded clients.
+            let provider = GcsTokenProvider::new(
+                TokenSource::MetadataServer {
+                    token_url: GCP_METADATA_TOKEN_URL.to_string(),
+                },
+                metadata_server_client()?,
+            );
             GcsAuthMode::Adc { provider }
         };
 
@@ -2621,6 +2669,88 @@ mod tests {
         assert!(msg.contains("500"), "error: {}", msg);
     }
 
+    // ---- Metadata-server token fetch (ADC / Workload Identity, #2611) ----
+
+    /// Serve a mock metadata token endpoint that only matches requests
+    /// carrying the mandatory `Metadata-Flavor: Google` header (the GCE
+    /// metadata server rejects requests without it), and return its token
+    /// URL addressed by HOSTNAME. The hostname is the crucial part: reqwest
+    /// only consults a custom `dns_resolver` for names (IP-literal URLs
+    /// bypass it), so a hostname URL exercises the same resolver path as
+    /// production's `metadata.google.internal`.
+    async fn mock_metadata_server() -> (wiremock::MockServer, String) {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .and(header("Metadata-Flavor", "Google"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "metadata-token",
+                "expires_in": 599,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+
+        let token_url = format!(
+            "http://localhost:{}/computeMetadata/v1/instance/service-accounts/default/token",
+            server.address().port()
+        );
+        (server, token_url)
+    }
+
+    /// The ADC / Workload Identity token fetch must (a) reach a metadata
+    /// endpoint addressed by hostname and (b) carry `Metadata-Flavor:
+    /// Google` (the mock only matches when the header is present). Uses the
+    /// same dedicated metadata client production wires in
+    /// [`GcsBackend::new`]; with the shared SSRF-guarded client this fails
+    /// at DNS-resolve time — the exact production failure of issue #2611.
+    #[tokio::test]
+    async fn test_metadata_token_fetch_by_hostname_sends_flavor_header() {
+        let (_server, token_url) = mock_metadata_server().await;
+
+        let provider = GcsTokenProvider::new(
+            TokenSource::MetadataServer { token_url },
+            metadata_server_client().unwrap(),
+        );
+
+        let token = provider
+            .get_token()
+            .await
+            .expect("metadata token fetch must succeed");
+        assert_eq!(token, "metadata-token");
+    }
+
+    /// Pin the root cause of issue #2611: the shared SSRF-guarded client
+    /// (used for GCS storage API calls) can NOT reach a metadata endpoint by
+    /// hostname — its DNS resolver hard-blocks loopback / link-local /
+    /// cloud-metadata addresses in every trust class. This is why the token
+    /// provider needs its own dedicated client, and it proves the guard
+    /// itself stays fail-closed.
+    #[tokio::test]
+    async fn test_ssrf_guarded_client_cannot_fetch_metadata_token_by_hostname() {
+        let (_server, token_url) = mock_metadata_server().await;
+
+        let guarded = crate::services::http_client::base_client_builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let provider = GcsTokenProvider::new(TokenSource::MetadataServer { token_url }, guarded);
+
+        let err = provider
+            .get_token()
+            .await
+            .expect_err("SSRF-guarded client must fail to resolve a blocked host");
+        assert!(
+            err.to_string().contains("Failed to fetch GCP access token"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ---- Wiremock-based StorageBackend tests ----
 
     /// Create an ADC-mode GcsBackend pointed at the given base URL with a
@@ -2639,7 +2769,12 @@ mod tests {
             path_format,
         };
         let client = reqwest::Client::new();
-        let provider = GcsTokenProvider::new(TokenSource::MetadataServer, client.clone());
+        let provider = GcsTokenProvider::new(
+            TokenSource::MetadataServer {
+                token_url: GCP_METADATA_TOKEN_URL.to_string(),
+            },
+            client.clone(),
+        );
 
         // Seed the token cache so get_token() never hits the metadata server
         {
