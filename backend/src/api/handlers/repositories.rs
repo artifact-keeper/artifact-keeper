@@ -6490,7 +6490,7 @@ pub async fn download_artifact(
                 let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
                     .unwrap_or_else(|| path.clone());
 
-                Ok(proxy_helpers::proxy_fetch_streaming(
+                match proxy_helpers::proxy_fetch_streaming(
                     proxy,
                     repo.id,
                     &key,
@@ -6499,8 +6499,29 @@ pub async fn download_artifact(
                     "application/octet-stream",
                 )
                 .await
-                .unwrap_or_else(|e| e)
-                .into_response())
+                {
+                    Ok(response) => {
+                        // #2705: count the proxy serve exactly like the format
+                        // handlers' remote arm (`try_remote_or_virtual_download`)
+                        // does. A proxy-cached object has no `artifacts` row
+                        // (#1280), so `download_stream`'s recorder can never fire
+                        // for this branch — without this call, downloads through
+                        // the generic `/general/` path were invisible to proxy
+                        // download counting. Keyed on `fetch_path` (the cache
+                        // path the streaming tee commits). HEAD-guarded +
+                        // best-effort inside.
+                        proxy_helpers::record_proxy_download(
+                            &state,
+                            repo.id,
+                            &key,
+                            &fetch_path,
+                            &dl_ctx,
+                        )
+                        .await;
+                        Ok(response.into_response())
+                    }
+                    Err(e) => Ok(e.into_response()),
+                }
             } else {
                 Err(AppError::NotFound("Artifact not found".to_string()))
             }
