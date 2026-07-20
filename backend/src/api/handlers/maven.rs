@@ -2110,7 +2110,7 @@ async fn upload(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // this push endpoint. Require the write scope before doing any work.
@@ -2154,6 +2154,14 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
+    // Stream the request body to a bounded scratch file, computing
+    // SHA-256/SHA-1/MD5 in one pass — never buffering the artifact in memory
+    // (#2517). All three branches below (checksum sidecar, maven-metadata.xml,
+    // and the artifact itself) store from the staged file. The stager enforces
+    // `max_upload_size_bytes` mid-stream (413 on breach).
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
     // These row-less puts create no artifact row, so attribution is committed
     // here -- only after the object bytes are durably written (#2574, V3b).
@@ -2161,7 +2169,9 @@ async fn upload(
         // Atomically claim the flat key BEFORE writing its bytes: exactly one
         // concurrent first-publisher wins, the rest are refused, so the stored
         // bytes and the attributed owner can never disagree (#2586). Release the
-        // freshly-inserted claim if the put itself fails (V3b).
+        // freshly-inserted claim if the put itself fails (V3b). The staged
+        // stream is opened first so a local scratch-file failure never claims.
+        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -2170,7 +2180,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put(&storage_key, body).await {
+        if let Err(e) = storage.put_stream(&storage_key, stream).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -2191,7 +2201,9 @@ async fn upload(
     // claim-on-write-success rule as the checksum branch (#2574, V3b).
     if MavenHandler::is_metadata(&path) {
         // Row-less metadata put: atomic claim-gate before the write, same as the
-        // checksum branch (#2586); release on put failure (V3b).
+        // checksum branch (#2586); release on put failure (V3b). Staged stream
+        // opened first so a local scratch-file failure never claims.
+        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
         let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
             &state.db,
             repo.id,
@@ -2200,7 +2212,7 @@ async fn upload(
         )
         .await
         .map_err(|e| e.into_response())?;
-        if let Err(e) = storage.put(&storage_key, body).await {
+        if let Err(e) = storage.put_stream(&storage_key, stream).await {
             release_flat_key_claim_best_effort(
                 &state.db,
                 claim,
@@ -2221,17 +2233,15 @@ async fn upload(
     let coords = MavenHandler::parse_coordinates(&path)
         .map_err(|e| AppError::Validation(format!("Invalid Maven path: {}", e)).into_response())?;
 
-    // Compute checksums for the canonical artifact row. Maven checksum
-    // sidecars are stored separately, but the artifact ledger should still
-    // carry the common digests so checksum search, replication, and API
-    // responses have the same fidelity as generic uploads.
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum_sha256 = format!("{:x}", hasher.finalize());
-    let checksum_sha1 = compute_checksum(&body, ChecksumType::Sha1);
-    let checksum_md5 = compute_checksum(&body, ChecksumType::Md5);
+    // Content digests for the canonical artifact row come from the single
+    // streaming stage pass. Maven checksum sidecars are stored separately, but
+    // the artifact ledger still carries the common digests so checksum search,
+    // replication, and API responses have the same fidelity as generic uploads.
+    let checksum_sha256 = digests.sha256.clone();
+    let checksum_sha1 = digests.sha1.clone();
+    let checksum_md5 = digests.md5.clone();
 
-    let size_bytes = body.len() as i64;
+    let size_bytes = staged.size_bytes();
     let ct = content_type_for_path(&path);
 
     // Check for active (non-deleted) duplicate
@@ -2277,7 +2287,9 @@ async fn upload(
     // concurrent first-publishers of the same key exactly one proceeds and the
     // other is refused (#2586). This runs after coordinate parsing + the
     // duplicate check, so an invalid/aborted request never claims (V3b); if the
-    // put fails, the freshly-inserted claim is released below.
+    // put fails, the freshly-inserted claim is released below. The staged
+    // stream is opened first so a local scratch-file failure never claims.
+    let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
     let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
         &state.db,
         repo.id,
@@ -2287,8 +2299,9 @@ async fn upload(
     .await
     .map_err(|e| e.into_response())?;
 
-    // Store file in object storage regardless of grouping outcome
-    if let Err(e) = storage.put(&storage_key, body.clone()).await {
+    // Store file in object storage regardless of grouping outcome — streamed
+    // from the staged scratch file, not a heap buffer (#2517).
+    if let Err(e) = storage.put_stream(&storage_key, stream).await {
         release_flat_key_claim_best_effort(
             &state.db,
             flat_key_claim,
@@ -2300,18 +2313,34 @@ async fn upload(
         return Err(map_storage_err(e));
     }
 
-    // Build metadata JSON for this physical Maven file.
+    // Build metadata JSON for this physical Maven file. `parse_metadata` only
+    // inspects the body for POM files (small XML); every other maven file (jars,
+    // ...) derives its metadata from the coordinates alone. Read the small POM
+    // back from the staged file; skip the read entirely for everything else so a
+    // large artifact is never materialised in memory.
     let handler = MavenHandler::new();
-    let mut file_metadata = crate::formats::FormatHandler::parse_metadata(&handler, &path, &body)
-        .await
-        .unwrap_or_else(|_| {
-            serde_json::json!({
-                "groupId": coords.group_id,
-                "artifactId": coords.artifact_id,
-                "version": coords.version,
-                "extension": coords.extension,
-            })
-        });
+    let pom_bytes = if MavenHandler::is_pom(&path) {
+        Bytes::from(
+            tokio::fs::read(staged.path())
+                .await
+                .map_err(|e| proxy_helpers::internal_error("Reading staged POM", e))?,
+        )
+    } else {
+        Bytes::new()
+    };
+    // Scratch file no longer needed once the object is stored and any POM read.
+    drop(staged);
+    let mut file_metadata =
+        crate::formats::FormatHandler::parse_metadata(&handler, &path, &pom_bytes)
+            .await
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "groupId": coords.group_id,
+                    "artifactId": coords.artifact_id,
+                    "version": coords.version,
+                    "extension": coords.extension,
+                })
+            });
 
     let name = coords.artifact_id.clone();
     let package_name = maven_package_name(&coords);
@@ -4605,7 +4634,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), path.to_string())),
             axum::http::HeaderMap::new(),
-            bytes::Bytes::copy_from_slice(body),
+            axum::body::Body::from(body.to_vec()),
         )
         .await
         .expect("upload must succeed");

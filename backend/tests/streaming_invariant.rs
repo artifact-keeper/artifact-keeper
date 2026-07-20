@@ -62,18 +62,28 @@ use std::path::{Path, PathBuf};
 ///     progress — the row is gone.
 ///
 /// Net: 31 -> 30 (+1 npm, -1 pypi, -1 remote_instances).
+///
+/// PF-005 (#2517) streamed the generic multipart upload extractors
+/// (`stage_multipart_file` / `stage_multipart_file_and_path`) onto the shared
+/// content-addressed staging primitive, deleting both `Field::bytes()` reads in
+/// repositories.rs: the repositories.rs row is removed, 30 -> 28.
+///
+/// Reconciliation (independent of PF-005): the RPM curation-sync merges (#2567 /
+/// #2599) added a third capped-metadata buffer site in scheduler_service.rs
+/// (an upstream repo-index gz-decode, not an artifact blob) without updating
+/// this allowlist. Reconciled here to match the current source: 2 -> 3, so the
+/// total is 28 + 1 = 29.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
     ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
-    ("src/api/handlers/repositories.rs", 2),
     ("src/api/middleware/rate_limit.rs", 1),
     ("src/main.rs", 1),
     ("src/services/artifactory_client.rs", 1),
     ("src/services/nexus_client.rs", 1),
-    ("src/services/scheduler_service.rs", 2),
+    ("src/services/scheduler_service.rs", 3),
     ("src/storage/azure.rs", 4),
     ("src/storage/gcs.rs", 4),
     ("src/storage/s3.rs", 2),
@@ -427,9 +437,198 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 30,
-        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
-         (npm packument cache +1; pypi and remote_instances streamed to storage, \
-         -1 each); got {total}"
+        total, 29,
+        "expected 29 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+         + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
+         + RPM curation-sync reconciliation (scheduler_service.rs +1); got {total}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PF-005 (#2517): `body: Bytes` blob-upload extractor guard.
+// ---------------------------------------------------------------------------
+
+/// Per-file count of `body: Bytes` request-body extractors that ALSO perform a
+/// blob storage write in the same function — i.e. artifact-upload routes that
+/// buffer the whole body on the heap before writing it to storage.
+///
+/// The clippy `disallowed-methods` gate and the `.bytes()` / `to_bytes` scan
+/// above cannot see a `body: Bytes` axum extractor: it is an ordinary typed
+/// handler argument resolved by axum, with no gated method call. This ratchet
+/// closes that gap — any handler that takes `body: Bytes` and, in the same fn,
+/// calls a blob storage write (`storage.put(`, `put_stream(`,
+/// `put_artifact_stream(`, `upload[_stream]_with_sync_options(`) must be listed
+/// here with a justification, and the list must trend to zero as routes stream.
+///
+/// Control-plane / JSON routes that take `body: Bytes` for auth-before-parse
+/// (post-#1438, e.g. `create_repository`) are NOT matched: they perform no blob
+/// storage write in-fn, so they never appear here.
+///
+/// PF-005 (#2517) Phase 1 streamed the four "common" buffered blob routes
+/// (`repositories::upload_artifact` generic PUT, `maven::upload`, and
+/// `terraform::upload_module` + `upload_provider`), removing them from this
+/// list. The remainder are the long-tail format handlers (tracked for later
+/// PF-005 phases) plus two intentional small-body sinks that stay:
+///   * `oci_v2::handle_put_manifest` — an OCI *manifest* is a small bounded JSON
+///     document (blobs upload via the streamed `/blobs/uploads` path), and
+///   * `proxy_helpers::put_artifact_bytes` — the shared buffered helper the
+///     long-tail light-format handlers still call; it goes away when they do.
+const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
+    ("src/api/handlers/cocoapods.rs", 1),
+    ("src/api/handlers/composer.rs", 1),
+    ("src/api/handlers/conan.rs", 2),
+    ("src/api/handlers/debian.rs", 1),
+    ("src/api/handlers/gitlfs.rs", 1),
+    ("src/api/handlers/goproxy.rs", 2),
+    ("src/api/handlers/jetbrains.rs", 1),
+    ("src/api/handlers/oci_v2.rs", 1),
+    ("src/api/handlers/proxy_helpers.rs", 1),
+    ("src/api/handlers/sbt.rs", 1),
+    ("src/api/handlers/swift.rs", 1),
+    ("src/api/handlers/vscode.rs", 1),
+];
+
+/// Blob storage-write call fragments (matched after collapsing all whitespace,
+/// so a `storage\n    .put(` method chain split across lines is still found).
+const BLOB_WRITE_TOKENS: &[&str] = &[
+    "storage.put(",
+    ".put_stream(",
+    "put_artifact_stream(",
+    "upload_with_sync_options(",
+    "upload_stream_with_sync_options(",
+];
+
+/// `{ .. }` span of the function whose signature contains byte offset
+/// `sig_pos` (a `body: Bytes` match): the first `{` at/after `sig_pos` opens the
+/// fn body; brace-match to its close. Returns `(open, close)` byte offsets into
+/// `masked`, or `None` if unbalanced. Handler return types contain no `{`, so
+/// the first brace after the signature is always the body opener.
+fn fn_body_span(masked: &str, sig_pos: usize) -> Option<(usize, usize)> {
+    let bytes = masked.as_bytes();
+    let open = masked[sig_pos..].find('{').map(|o| sig_pos + o)?;
+    let mut depth = 0i32;
+    let mut j = open;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, j));
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Byte offsets of every standalone `body: Bytes` parameter in masked code (any
+/// run of spaces between `body:` and `Bytes`, with both `body` and `Bytes` whole
+/// words).
+fn raw_body_bytes_positions(masked: &str) -> Vec<usize> {
+    let b = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = masked[from..].find("body:") {
+        let at = from + rel;
+        from = at + "body:".len();
+        // `body` must be a whole word (previous char not an identifier char).
+        let prev_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        if !prev_ok {
+            continue;
+        }
+        let rest = masked[from..].trim_start();
+        if let Some(after) = rest.strip_prefix("Bytes") {
+            // `Bytes` must be a whole word too (next char not identifier char).
+            let next_ok = after
+                .chars()
+                .next()
+                .map(|c| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(true);
+            if next_ok {
+                out.push(at);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn streaming_invariant_no_new_buffered_blob_upload_routes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src, &mut files);
+    files.sort();
+
+    let allow: BTreeMap<&str, usize> = RAW_BODY_BLOB_ALLOWLIST.iter().copied().collect();
+    let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+
+    for file in &files {
+        let raw = std::fs::read_to_string(file).expect("read source file");
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // Whole-file test scaffold: skip entirely.
+        if raw.lines().any(|l| l.trim_start().starts_with(FILE_EXEMPT)) {
+            continue;
+        }
+
+        let masked = code_mask(&raw);
+        let test = test_lines(&masked);
+
+        let mut count = 0usize;
+        for pos in raw_body_bytes_positions(&masked) {
+            let line = masked[..pos].bytes().filter(|&c| c == b'\n').count() + 1;
+            if test.contains(&line) {
+                continue;
+            }
+            let Some((open, close)) = fn_body_span(&masked, pos) else {
+                continue;
+            };
+            let body: String = masked[open..close].split_whitespace().collect();
+            if BLOB_WRITE_TOKENS.iter().any(|t| body.contains(t)) {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            actual.insert(rel, count);
+        }
+    }
+
+    let expected: BTreeMap<String, usize> =
+        allow.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+
+    if actual != expected {
+        let mut diff = String::new();
+        for (k, v) in &expected {
+            match actual.get(k) {
+                Some(a) if a == v => {}
+                Some(a) => diff.push_str(&format!("  {k}: allowlist={v} actual={a}\n")),
+                None => diff.push_str(&format!(
+                    "  {k}: allowlist={v} actual=0 (route streamed — shrink RAW_BODY_BLOB_ALLOWLIST)\n"
+                )),
+            }
+        }
+        for (k, a) in &actual {
+            if !expected.contains_key(k) {
+                diff.push_str(&format!(
+                    "  {k}: allowlist=<absent> actual={a} (new buffered blob-upload route)\n"
+                ));
+            }
+        }
+        panic!(
+            "`body: Bytes` blob-upload routes no longer match the allowlist (PF-005, #2517).\n\
+             A handler that takes `body: Bytes` AND writes that body to storage in the same fn \
+             buffers the whole artifact in memory. Convert it to the streaming staging primitives \
+             (`stage_stream_content_addressed` + `upload_stream_with_sync_options` / \
+             `put_artifact_stream`) and shrink the list; or — if the body is genuinely small and \
+             bounded — add it with a justification.\n{diff}"
+        );
+    }
 }
