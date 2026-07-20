@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT version\n        FROM artifacts\n        WHERE repository_id = $1\n          AND name = $2\n          AND is_deleted = false\n          AND version IS NOT NULL\n          AND (\n            quarantine_status IS NULL\n            OR quarantine_status NOT IN ('quarantined', 'rejected')\n            OR (\n              quarantine_status = 'quarantined'\n              AND quarantine_until IS NOT NULL\n              AND quarantine_until <= NOW()\n            )\n          )\n        ORDER BY version\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c412ba01332def4c5bc26067f5eb1f157080965a59b455204ac4003baf263b28"
+}
