@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT path, size_bytes, checksum_sha256, content_type, cached_at\n        FROM proxy_cache_artifacts\n        WHERE repository_id = $1\n          AND ($2::TEXT IS NULL OR path LIKE $2 ESCAPE '\\')\n          AND ($3::TEXT IS NULL OR path ILIKE $3 ESCAPE '\\')\n          AND ($4::TEXT IS NULL OR path > $4)\n        ORDER BY path\n        LIMIT $5 OFFSET $6\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "checksum_sha256",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "cached_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "d6d68bd008026dfd081250a4d310452063d11d0150da6f63e063c0586208fad4"
+}
