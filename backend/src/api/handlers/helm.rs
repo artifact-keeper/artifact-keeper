@@ -131,6 +131,36 @@ fn upload_response_body(prov_stored: bool) -> serde_json::Value {
     }
 }
 
+/// Build the hosted chart download URL advertised in `index.yaml` for the
+/// repo's `charts/` route.
+///
+/// The Helm download route (`GET /helm/{repo}/charts/{filename}`) resolves a
+/// chart by the trailing filename suffix, so the advertised URL must carry the
+/// artifact's **actual** stored filename. Charts published through the native
+/// ChartMuseum route are stored at `{name}/{version}/{name}-{version}.tgz`,
+/// whose basename already equals `{name}-{version}.tgz` — so this is
+/// byte-identical to the previous reconstruction for them. But a chart pushed
+/// through the generic chunked-upload flow is stored at its bare filename with
+/// a generically-derived `name`/`version` (an empty version falls back to
+/// `sha256-<prefix>`; see `upload.rs::completed_format_artifact_version`), so
+/// reconstructing `{name}-{version}.tgz` would advertise a path the download
+/// route cannot resolve. Preferring the real basename of the stored `path`
+/// keeps the advertised URL coherent with the served route for both upload
+/// flows — the Helm analogue of the RPM `primary.xml` `<location>` fix
+/// (#2587 / #2589).
+///
+/// `path` is `None` only for remote upstream entries, which have no local
+/// stored object; those fall back to the `{name}-{version}.tgz` convention the
+/// upstream index itself uses.
+fn chart_download_url(repo_key: &str, path: Option<&str>, name: &str, version: &str) -> String {
+    let filename = path
+        .and_then(|p| p.rsplit('/').next())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-{}.tgz", name, version));
+    format!("/helm/{}/charts/{}", repo_key, filename)
+}
+
 /// Query Helm chart artifacts from a repository and append chart entries to `out`.
 ///
 /// Provenance rows are excluded: a `.prov` is stored as its own artifact under
@@ -144,7 +174,7 @@ async fn query_charts_from_repo(
 ) -> Result<(), Response> {
     let rows = sqlx::query(
         r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+        SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256,
                a.created_at,
                am.metadata
         FROM artifacts a
@@ -163,6 +193,7 @@ async fn query_charts_from_repo(
     for row in &rows {
         let name: String = row.get("name");
         let version: Option<String> = row.get("version");
+        let path: String = row.get("path");
         let checksum_sha256: String = row.get("checksum_sha256");
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
         let metadata: Option<serde_json::Value> = row.get("metadata");
@@ -203,8 +234,7 @@ async fn query_charts_from_repo(
             annotations: None,
         });
 
-        let filename = format!("{}-{}.tgz", name, version);
-        let url = format!("/helm/{}/charts/{}", repo_key, filename);
+        let url = chart_download_url(repo_key, Some(&path), &name, &version);
         let created = created_at.to_rfc3339();
         let digest = checksum_sha256;
 
@@ -270,8 +300,15 @@ async fn index_yaml(
         for (_member_key, index) in remote_indexes {
             for (_chart_name, entries) in index.entries {
                 for entry in entries {
-                    let filename = format!("{}-{}.tgz", entry.chart.name, entry.chart.version);
-                    let url = format!("/helm/{}/charts/{}", repo_key, filename);
+                    // Remote upstream entries have no local stored path; rebuild
+                    // the proxied URL from the chart's own name/version (the
+                    // ChartMuseum convention the upstream index already used).
+                    let url = chart_download_url(
+                        &repo_key,
+                        None,
+                        &entry.chart.name,
+                        &entry.chart.version,
+                    );
                     all_charts.push((entry.chart, url, entry.created, entry.digest));
                 }
             }
@@ -1106,6 +1143,53 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
 -----END PGP SIGNATURE-----\n";
 
     #[test]
+    fn test_chart_download_url_native_nested_path_is_byte_identical() {
+        // A natively-published chart is stored at
+        // `{name}/{version}/{name}-{version}.tgz`; the advertised URL must be
+        // byte-identical to the previous `{name}-{version}.tgz` reconstruction.
+        assert_eq!(
+            chart_download_url(
+                "myrepo",
+                Some("nginx/1.24.0/nginx-1.24.0.tgz"),
+                "nginx",
+                "1.24.0"
+            ),
+            "/helm/myrepo/charts/nginx-1.24.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_chart_download_url_bare_path_uses_actual_filename() {
+        // A chart pushed via the generic chunked-upload flow is stored at its
+        // bare filename with a generically-derived name and a `sha256-...`
+        // fallback version. The advertised URL must use the ACTUAL stored
+        // filename (which the download route resolves by suffix), NOT the
+        // broken `{name}-{version}.tgz` reconstruction that would 404 (#2589).
+        let url = chart_download_url(
+            "myrepo",
+            Some("nginx-1.24.0.tgz"),
+            "nginx-1.24.0.tgz",
+            "sha256-deadbeef0000",
+        );
+        assert_eq!(url, "/helm/myrepo/charts/nginx-1.24.0.tgz");
+        // Regression guard: the old reconstruction produced an unresolvable URL.
+        assert_ne!(
+            url,
+            "/helm/myrepo/charts/nginx-1.24.0.tgz-sha256-deadbeef0000.tgz"
+        );
+    }
+
+    #[test]
+    fn test_chart_download_url_no_path_falls_back_to_reconstruction() {
+        // Remote upstream entries have no local path; keep the ChartMuseum
+        // `{name}-{version}.tgz` convention the upstream index itself uses.
+        assert_eq!(
+            chart_download_url("myrepo", None, "nginx", "1.24.0"),
+            "/helm/myrepo/charts/nginx-1.24.0.tgz"
+        );
+    }
+
+    #[test]
     fn test_prov_filename_appends_to_chart_filename() {
         // helm derives the provenance URL by appending `.prov` to the chart
         // URL -- the stored filename must match byte for byte.
@@ -1297,6 +1381,72 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    /// REGRESSION GUARD (#2589): a chart pushed through the generic chunked
+    /// upload flow is stored at its BARE filename with a generically-derived
+    /// name (the whole basename) and a `sha256-<prefix>` fallback version. The
+    /// URL `index.yaml` advertises must be the one the `charts/` download route
+    /// actually serves. Before the fix, the index reconstructed
+    /// `{name}-{version}.tgz` (e.g. `mychart-0.1.0.tgz-sha256-....tgz`), a path
+    /// the suffix-resolving download route could never match -> `helm install`
+    /// 404'd even though the artifact was present and directly downloadable.
+    #[tokio::test]
+    async fn test_helm_index_url_resolves_for_bare_path_generic_upload() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        // Simulate the generic chunked-upload flow's stored coordinates for a
+        // bare-path push of `mychart-0.1.0.tgz`: bare path, name = basename,
+        // version = the deterministic `sha256-<prefix>` fallback.
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "abcd/ef/abcdef0123456789", // content-addressable storage key
+            "mychart-0.1.0.tgz",        // bare artifact path (no directory)
+            "mychart-0.1.0.tgz",        // generically-derived name
+            "sha256-abcdef012345",      // fallback version
+            "application/gzip",
+            bytes::Bytes::from_static(b"helm-chart-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        // Read the advertised URL out of index.yaml.
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let index: HelmIndex =
+            serde_yaml::from_str(std::str::from_utf8(&body).expect("utf8 index")).expect("index");
+        let entry = index
+            .entries
+            .values()
+            .flatten()
+            .next()
+            .expect("chart entry in index");
+        let chart_url = entry.urls.first().expect("chart url");
+        assert_eq!(
+            chart_url,
+            &format!("/helm/{}/charts/mychart-0.1.0.tgz", f.repo_key),
+            "index.yaml must advertise the actual stored filename, not the \
+             broken name/version reconstruction"
+        );
+
+        // THE POINT: the advertised URL must actually serve the chart. The
+        // router under test is mounted without the `/helm` nest prefix.
+        let download_path = chart_url.strip_prefix("/helm").expect("nest prefix");
+        let app = f.router_anon(super::router());
+        let (status, got) = tdh::send(app, tdh::get(download_path.to_string())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the URL helm derives from index.yaml must serve the chart"
+        );
+        assert_eq!(&got[..], b"helm-chart-bytes");
+
         f.teardown().await;
     }
 
