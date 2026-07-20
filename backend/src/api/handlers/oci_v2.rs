@@ -6932,6 +6932,33 @@ pub(crate) fn oci_reference_is_tag(reference: &str) -> bool {
     !reference.contains(':')
 }
 
+/// Total image size derived from a manifest body: `config.size` plus the sum
+/// of `layers[].size`, falling back to the body length when the body is not
+/// JSON. Shared by the live manifest-PUT path and the migration importer
+/// (#2676) so both size the artifact/catalog rows identically.
+pub(crate) fn manifest_total_size(body: &[u8]) -> i64 {
+    if let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(body) {
+        let config_size = manifest_json
+            .get("config")
+            .and_then(|c| c.get("size"))
+            .and_then(|s| s.as_i64())
+            .unwrap_or(0);
+        let layers_size: i64 = manifest_json
+            .get("layers")
+            .and_then(|l| l.as_array())
+            .map(|layers| {
+                layers
+                    .iter()
+                    .filter_map(|l| l.get("size").and_then(|s| s.as_i64()))
+                    .sum()
+            })
+            .unwrap_or(0);
+        config_size + layers_size
+    } else {
+        body.len() as i64
+    }
+}
+
 /// Sum of the artifact sizes recorded for an index manifest's child
 /// manifests, used to size the packages-catalog row for a multi-arch tag.
 ///
@@ -6941,7 +6968,11 @@ pub(crate) fn oci_reference_is_tag(reference: &str) -> bool {
 /// so their `artifacts` rows exist by the time the index is tagged). Same
 /// join the `docker_tag` grouping endpoint uses (`fetch_index_child_sizes`
 /// in repositories.rs). Best-effort: sizing must not fail the push.
-async fn index_child_artifact_size_sum(db: &PgPool, repo_id: Uuid, parent_digest: &str) -> i64 {
+pub(crate) async fn index_child_artifact_size_sum(
+    db: &PgPool,
+    repo_id: Uuid,
+    parent_digest: &str,
+) -> i64 {
     sqlx::query_scalar::<_, i64>(
         r#"SELECT COALESCE(SUM(a.size_bytes), 0)::BIGINT
            FROM oci_manifest_refs r
@@ -7107,27 +7138,7 @@ async fn handle_put_manifest(
     }
 
     // Calculate total image size from manifest (config + layers)
-    let total_size: i64 =
-        if let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            let config_size = manifest_json
-                .get("config")
-                .and_then(|c| c.get("size"))
-                .and_then(|s| s.as_i64())
-                .unwrap_or(0);
-            let layers_size: i64 = manifest_json
-                .get("layers")
-                .and_then(|l| l.as_array())
-                .map(|layers| {
-                    layers
-                        .iter()
-                        .filter_map(|l| l.get("size").and_then(|s| s.as_i64()))
-                        .sum()
-                })
-                .unwrap_or(0);
-            config_size + layers_size
-        } else {
-            body.len() as i64
-        };
+    let total_size: i64 = manifest_total_size(&body);
 
     // Also create an artifact record so it appears in the UI
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);

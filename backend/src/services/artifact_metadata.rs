@@ -42,6 +42,7 @@ pub fn parse_name_and_version(
         "helm" | "helm_oci" => parse_helm(filename),
         "npm" | "yarn" | "pnpm" | "bower" => parse_npm(filename, artifact_path),
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
+        "nuget" => parse_nuget(filename, artifact_path),
         _ => fallback(filename),
     }
 }
@@ -287,6 +288,52 @@ fn parse_maven(filename: &str, artifact_path: &str) -> ParsedArtifact {
         };
     }
     fallback(filename)
+}
+
+// ---------------------------------------------------------------------------
+// NuGet
+// ---------------------------------------------------------------------------
+
+/// NuGet parser (#2676). Packages are `<id>.<version>.nupkg` where `<id>`
+/// itself contains dots (`Newtonsoft.Json.13.0.3.nupkg`), so the split point
+/// is the first dot whose right-hand side is a valid NuGet version
+/// (2–4 numeric dot-segments plus an optional `-prerelease` suffix) — the
+/// same heuristic the NuGet client uses for folder layouts. Scanning
+/// left-to-right keeps ids with embedded numeric segments intact
+/// (`MyLib.2.Core.1.0.0` → `MyLib.2.Core` @ `1.0.0`, because `2.Core.1.0.0`
+/// is not a valid version). Falls back to the JFrog/Nexus
+/// `<id>/<version>/<filename>` path layout, then to the legacy
+/// filename-as-name behaviour.
+fn parse_nuget(filename: &str, artifact_path: &str) -> ParsedArtifact {
+    if let Some(stem) = filename
+        .strip_suffix(".nupkg")
+        .or_else(|| filename.strip_suffix(".snupkg"))
+    {
+        for (i, _) in stem.match_indices('.') {
+            let (name, rest) = (&stem[..i], &stem[i + 1..]);
+            if !name.is_empty() && is_nuget_version(rest) {
+                return ParsedArtifact {
+                    name: name.to_string(),
+                    version: Some(rest.to_string()),
+                };
+            }
+        }
+    }
+    parse_from_path_segments(artifact_path).unwrap_or_else(|| fallback(filename))
+}
+
+/// True when `s` is a NuGet-shaped version: 2–4 dot-separated numeric parts
+/// with an optional `-<prerelease>` suffix (`1.0.0`, `13.0.3-beta.1`,
+/// `4.7.0.5`). A single bare integer is rejected — package-id segments are
+/// frequently numeric (`MyLib.2`), and NuGet versions always carry at least
+/// `major.minor`.
+fn is_nuget_version(s: &str) -> bool {
+    let core = s.split_once('-').map_or(s, |(core, _pre)| core);
+    let parts: Vec<&str> = core.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -566,5 +613,99 @@ mod tests {
         let garbage = b"not a tarball";
         assert!(extract_artifact_metadata("npm", garbage).is_none());
         assert!(extract_artifact_metadata("helm", garbage).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // NuGet (#2676)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn nuget_simple_id() {
+        let p = parse_name_and_version("nuget", "MyPackage.1.0.0.nupkg", "MyPackage.1.0.0.nupkg");
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_dotted_id() {
+        let p = parse_name_and_version(
+            "nuget",
+            "Newtonsoft.Json.13.0.3.nupkg",
+            "Newtonsoft.Json/13.0.3/Newtonsoft.Json.13.0.3.nupkg",
+        );
+        assert_eq!(p.name, "Newtonsoft.Json");
+        assert_eq!(p.version.as_deref(), Some("13.0.3"));
+    }
+
+    #[test]
+    fn nuget_id_with_numeric_segment() {
+        // `2.Core.1.0.0` is not a valid version, so the split lands after
+        // the embedded numeric id segment, not at it.
+        let p = parse_name_and_version(
+            "nuget",
+            "MyLib.2.Core.1.0.0.nupkg",
+            "MyLib.2.Core.1.0.0.nupkg",
+        );
+        assert_eq!(p.name, "MyLib.2.Core");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_prerelease_version() {
+        let p = parse_name_and_version(
+            "nuget",
+            "MyPackage.1.0.0-beta.1.nupkg",
+            "MyPackage.1.0.0-beta.1.nupkg",
+        );
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0-beta.1"));
+    }
+
+    #[test]
+    fn nuget_four_part_version() {
+        let p = parse_name_and_version(
+            "nuget",
+            "Legacy.Pkg.4.7.0.5.nupkg",
+            "Legacy.Pkg.4.7.0.5.nupkg",
+        );
+        assert_eq!(p.name, "Legacy.Pkg");
+        assert_eq!(p.version.as_deref(), Some("4.7.0.5"));
+    }
+
+    #[test]
+    fn nuget_unparseable_filename_falls_back_to_path_segments() {
+        let p = parse_name_and_version("nuget", "weird.nupkg", "MyPackage/1.0.0/weird.nupkg");
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_unparseable_everything_falls_back_to_filename() {
+        let p = parse_name_and_version("nuget", "weird.bin", "weird.bin");
+        assert_eq!(p.name, "weird.bin");
+        assert_eq!(p.version, None);
+    }
+
+    #[test]
+    fn nuget_symbols_package() {
+        let p = parse_name_and_version(
+            "nuget",
+            "MyPackage.1.0.0.snupkg",
+            "MyPackage/1.0.0/MyPackage.1.0.0.snupkg",
+        );
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn is_nuget_version_shapes() {
+        assert!(is_nuget_version("1.0"));
+        assert!(is_nuget_version("1.0.0"));
+        assert!(is_nuget_version("4.7.0.5"));
+        assert!(is_nuget_version("13.0.3-beta.1"));
+        assert!(!is_nuget_version("2")); // bare integer = id segment, not version
+        assert!(!is_nuget_version("2.Core.1.0.0"));
+        assert!(!is_nuget_version("1.0.0.0.0"));
+        assert!(!is_nuget_version(""));
     }
 }
