@@ -3881,12 +3881,12 @@ pub struct ListArtifactsQuery {
     ///   referenced layer blobs.  The grouped rows are returned in the
     ///   `docker_tags` array.
     pub group_by: Option<String>,
-    /// Opaque keyset cursor (#2520, #2519). Pass the `next_cursor` value
-    /// from the previous response to fetch the next page; `page` is ignored
-    /// while a cursor is present. Supported by `group_by=docker_tag`, by
-    /// `group_by=maven_component` on remote repositories, and by the flat
-    /// cached-artifact listing of remote repositories; other listing modes
-    /// ignore it.
+    /// Opaque keyset cursor (#2520, #2519, #2518). Pass the `next_cursor`
+    /// value from the previous response to fetch the next page; `page` is
+    /// ignored while a cursor is present. Supported by the flat artifact
+    /// listing of hosted/local, virtual, and remote repositories (#2518,
+    /// #2519), by `group_by=docker_tag`, and by `group_by=maven_component`
+    /// on remote repositories; other listing modes ignore it.
     pub cursor: Option<String>,
     /// Total-count mode for keyset-paged listings (#2520, #2519).
     /// `count=exact` runs a dedicated COUNT query so `pagination.total` is
@@ -3992,13 +3992,14 @@ pub struct ArtifactListResponse {
     /// Docker tag grouping.  Only present when `group_by=docker_tag`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_tags: Option<Vec<DockerTagResponse>>,
-    /// Opaque keyset cursor for the next page (#2520). Present on grouped
-    /// listings when another page exists; pass it back via `?cursor=`.
+    /// Opaque keyset cursor for the next page (#2520, #2518). Present on
+    /// keyset-paged listings (flat and grouped) when another page exists;
+    /// pass it back via `?cursor=`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Whether another page exists after this one (#2520). Only present on
-    /// keyset-paged grouped listings; authoritative regardless of the
-    /// `pagination.total` mode (exact vs lower bound).
+    /// Whether another page exists after this one (#2520, #2518). Present on
+    /// keyset-paged listings (flat and grouped); authoritative regardless of
+    /// the `pagination.total` mode (exact vs lower bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
 }
@@ -4195,7 +4196,19 @@ pub async fn list_artifacts(
         .await;
     }
 
-    let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
+    // Flat hosted/virtual listing pages by `path` keyset (PF-001 / #2518),
+    // mirroring the #2520/#2519 contract: an opaque `?cursor=` (the previous
+    // response's `next_cursor`) takes precedence; without a cursor, legacy
+    // `page=N` addressing still works via OFFSET. `has_more` is
+    // authoritative (fetched as `per_page + 1` rows); `pagination.total` is
+    // a cheap lower bound unless the client opts into `?count=exact`, so a
+    // page request never pays a whole-catalog COUNT by default.
+    let keyset = decode_cursor_param(query.cursor.as_deref())?;
+    let after_path = keyset.as_ref().map(|(path, _)| path.as_str());
+    let offset = if after_path.is_some() { 0 } else { offset };
+    let fetch = i64::from(per_page) + 1;
+
+    let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
         // Members are returned in priority order; local/hosted members are
         // included alongside remote members so that locally published artifacts
@@ -4208,28 +4221,65 @@ pub async fn list_artifacts(
 
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
 
-        artifact_service
-            .list_for_repos(
+        let page_rows = artifact_service
+            .list_for_repos_page(
                 &member_ids,
                 query.path_prefix.as_deref(),
                 query.q.as_deref(),
+                after_path,
                 offset,
-                per_page as i64,
+                fetch,
             )
-            .await?
+            .await?;
+        let exact = if count_exact {
+            Some(
+                artifact_service
+                    .count_for_repos(
+                        &member_ids,
+                        query.path_prefix.as_deref(),
+                        query.q.as_deref(),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        (page_rows, exact)
     } else {
-        artifact_service
-            .list(
+        let page_rows = artifact_service
+            .list_page(
                 repo.id,
                 query.path_prefix.as_deref(),
                 query.q.as_deref(),
+                after_path,
                 offset,
-                per_page as i64,
+                fetch,
             )
-            .await?
+            .await?;
+        let exact = if count_exact {
+            Some(
+                artifact_service
+                    .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        (page_rows, exact)
     };
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let has_more = artifacts.len() > per_page as usize;
+    artifacts.truncate(per_page as usize);
+    let next_cursor = if has_more {
+        // Single-key (`path`) cursor; the shared two-part codec is reused
+        // with an empty second component so all listing cursors stay one
+        // opaque format (see `list_remote_cached_from_catalog`).
+        artifacts.last().map(|a| encode_keyset_cursor(&a.path, ""))
+    } else {
+        None
+    };
+    let total = grouped_listing_total(exact_total, offset, artifacts.len(), has_more);
+    let total_pages = grouped_total_pages(total, per_page);
 
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
     let download_counts = artifact_service
@@ -4300,8 +4350,8 @@ pub async fn list_artifacts(
         },
         components: None,
         docker_tags: None,
-        next_cursor: None,
-        has_more: None,
+        next_cursor,
+        has_more: Some(has_more),
     }))
 }
 
