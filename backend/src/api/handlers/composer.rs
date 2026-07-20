@@ -407,13 +407,16 @@ where
             continue;
         };
 
-        match proxy_helpers::proxy_fetch_capped(
+        // #2693: same v1-provider-discovery fallback as the single-repo
+        // remote path — the reported repro was a v1-only upstream behind a
+        // group (virtual) repo, which 404'd every member lookup.
+        match fetch_remote_composer_metadata(
             proxy,
             member.id,
             &member.key,
             upstream_url,
             upstream_path,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            full_name,
         )
         .await
         {
@@ -786,13 +789,17 @@ async fn resolve_composer_remote_dist_target(
     reference: &str,
 ) -> Result<ComposerRemoteDistTarget, Response> {
     let upstream_path = composer_v2_upstream_path(full_name);
-    let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+    // #2693: falls back to v1 provider discovery when the upstream does not
+    // speak the v2 protocol, mirroring the metadata handlers — otherwise the
+    // dist download would 404 against the same v1-only upstream whose
+    // metadata we just served.
+    let (content, _content_type) = fetch_remote_composer_metadata(
         proxy,
         repo_id,
         repo_key,
         upstream_url,
         &upstream_path,
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        full_name,
     )
     .await?;
 
@@ -805,6 +812,220 @@ async fn resolve_composer_remote_dist_target(
     })?;
 
     build_remote_dist_target(&doc, full_name, version, reference)
+}
+
+// ---------------------------------------------------------------------------
+// Composer v1 (providers-url / provider-includes) upstream discovery (#2693)
+//
+// Not every "composer" upstream speaks the v2 `p2/{vendor}/{package}.json`
+// protocol. Legacy v1 repositories (e.g. asset-packagist.org) advertise their
+// packages through the root `packages.json` -> `provider-includes` (hash-named
+// provider index files) -> `providers-url` (a per-package, hash-named metadata
+// document template), or through a `provider-lazy-url` template. The remote
+// proxy previously assumed v2 unconditionally, so every lookup against a
+// v1-only upstream returned (and negative-cached) a 404 even though the
+// package existed upstream (#2693).
+//
+// When the direct fetch of the requested metadata path 404s, we now read the
+// upstream's OWN `packages.json` and — if and only if it does NOT advertise
+// the v2 `metadata-url` — follow whichever v1 mechanism it declares. Every hop
+// rides `proxy_fetch_capped`, so the root index, the provider indexes (which
+// are hash-named and therefore immutable) and the final package document are
+// all proxy-cached like any other metadata fetch.
+// ---------------------------------------------------------------------------
+
+/// Ceiling on how many `provider-includes` index files a single lookup will
+/// fetch. Real v1 upstreams ship a handful (asset-packagist: 2); the cap
+/// bounds the work a hostile or misconfigured upstream can trigger per
+/// request.
+const V1_PROVIDER_INCLUDES_MAX: usize = 50;
+
+/// Strip the Composer 2 `~dev` metadata suffix from a package name. Composer 2
+/// requests `p2/{vendor}/{pkg}~dev.json` for dev versions, but the v1 protocol
+/// has no such split: both stability tiers live in one per-package document
+/// keyed by the bare name, and the Composer client filters versions by
+/// stability itself.
+fn composer_v1_base_name(full_name: &str) -> &str {
+    full_name.strip_suffix("~dev").unwrap_or(full_name)
+}
+
+/// Substitute the `%package%` / `%hash%` placeholders of a v1 URL template
+/// (`providers-url`, `provider-lazy-url`, or a `provider-includes` key) and
+/// normalize the result to an upstream-relative path.
+///
+/// Returns `None` when the template is an absolute URL (the discovery walk
+/// never leaves the configured upstream host) or when a placeholder cannot be
+/// filled (e.g. a `providers-url` requiring `%hash%` when no hash was found).
+fn v1_template_path(template: &str, package: Option<&str>, hash: Option<&str>) -> Option<String> {
+    if template.contains("://") {
+        return None;
+    }
+    let mut path = template.to_string();
+    if let Some(pkg) = package {
+        path = path.replace("%package%", pkg);
+    }
+    if let Some(h) = hash {
+        path = path.replace("%hash%", h);
+    }
+    if path.contains("%package%") || path.contains("%hash%") {
+        return None;
+    }
+    Some(path.trim_start_matches('/').to_string())
+}
+
+/// Extract `providers.{package}.sha256` from a v1 provider index document
+/// (either the root `packages.json`'s inline `providers` map or a fetched
+/// `provider-includes` file).
+fn v1_provider_hash(doc: &serde_json::Value, package: &str) -> Option<String> {
+    doc.get("providers")?
+        .get(package)?
+        .get("sha256")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Resolve a package's metadata document from a Composer v1-protocol upstream
+/// by following the mechanism its root `packages.json` advertises.
+///
+/// Returns `Ok(None)` when the upstream turns out to speak v2 (`metadata-url`
+/// present — the caller's original 404 was authoritative), advertises no v1
+/// mechanism, or does not know the package; the caller then surfaces its
+/// original 404 unchanged. Discovery-step failures degrade to `Ok(None)` for
+/// the same reason; only a non-404 failure fetching the final package
+/// document is propagated.
+async fn resolve_v1_provider_metadata(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    full_name: &str,
+) -> Result<Option<(Bytes, Option<String>)>, Response> {
+    let package = composer_v1_base_name(full_name);
+
+    // The upstream's own root index decides the protocol.
+    let Ok((root_bytes, _ct)) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        "packages.json",
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&root_bytes) else {
+        return Ok(None);
+    };
+
+    // v2 upstream: the direct `p2/...` (or `p/...`) 404 was authoritative.
+    if root.get("metadata-url").is_some() {
+        return Ok(None);
+    }
+
+    // Find the package's provider hash: the root's inline `providers` map
+    // first, then each hash-named `provider-includes` index file.
+    let mut hash = v1_provider_hash(&root, package);
+    if hash.is_none() {
+        if let Some(includes) = root.get("provider-includes").and_then(|v| v.as_object()) {
+            for (template, meta) in includes.iter().take(V1_PROVIDER_INCLUDES_MAX) {
+                let include_hash = meta.get("sha256").and_then(|s| s.as_str());
+                let Some(include_path) = v1_template_path(template, None, include_hash) else {
+                    continue;
+                };
+                let Ok((bytes, _ct)) = proxy_helpers::proxy_fetch_capped(
+                    proxy,
+                    repo_id,
+                    repo_key,
+                    upstream_url,
+                    &include_path,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                )
+                .await
+                else {
+                    continue;
+                };
+                let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                hash = v1_provider_hash(&index, package);
+                if hash.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build the final per-package document path from the advertised template:
+    // hashed `providers-url` when the hash was discovered, otherwise the
+    // hashless `provider-lazy-url`.
+    let doc_path = match (
+        hash.as_deref(),
+        root.get("providers-url").and_then(|v| v.as_str()),
+    ) {
+        (Some(h), Some(template)) => v1_template_path(template, Some(package), Some(h)),
+        _ => None,
+    }
+    .or_else(|| {
+        root.get("provider-lazy-url")
+            .and_then(|v| v.as_str())
+            .and_then(|template| v1_template_path(template, Some(package), None))
+    });
+    let Some(doc_path) = doc_path else {
+        return Ok(None);
+    };
+
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &doc_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(fetched) => Ok(Some(fetched)),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Fetch a composer metadata document from a Remote repo's upstream: try the
+/// requested wire path (`p2/...` or `p/...`) directly, and on an upstream 404
+/// fall back to Composer v1 provider discovery (#2693). Non-404 failures and
+/// v2-upstream misses surface unchanged, so behaviour against a genuine v2
+/// upstream (packagist.org) is identical to the direct fetch.
+async fn fetch_remote_composer_metadata(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    upstream_path: &str,
+    full_name: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(fetched) => Ok(fetched),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            match resolve_v1_provider_metadata(proxy, repo_id, repo_key, upstream_url, full_name)
+                .await?
+            {
+                Some(fetched) => Ok(fetched),
+                None => Err(resp),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,14 +1124,16 @@ async fn metadata_v2(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // #2693: not every upstream speaks v2 — on a p2 404, fall
+                // back to v1 provider discovery before giving up.
                 let upstream_path = composer_v2_upstream_path(&full_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                let (content, content_type) = fetch_remote_composer_metadata(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    &full_name,
                 )
                 .await?;
                 // #1652: rewrite the upstream `dist.url`s to our in-registry
@@ -978,14 +1201,17 @@ async fn metadata_v1(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // #2693: a v1 upstream with a hashed `providers-url` 404s the
+                // hashless `p/{vendor}/{package}.json` shape too — the same
+                // provider discovery recovers the hashed document.
                 let upstream_path = composer_v1_upstream_path(&full_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                let (content, content_type) = fetch_remote_composer_metadata(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    &full_name,
                 )
                 .await?;
                 // #1652: rewrite upstream `dist.url`s to route dist downloads
@@ -1675,6 +1901,231 @@ mod tests {
             "SSRF-blocked upstream dist URL must be refused with a 4xx, got {status}"
         );
     }
+
+    /// #2693: a Remote composer repo whose upstream speaks only the v1
+    /// protocol (root packages.json advertising `providers-url` +
+    /// `provider-includes`, e.g. asset-packagist.org) must resolve package
+    /// metadata by following the v1 provider chain instead of propagating the
+    /// upstream's `p2/...` 404. The served document must still get the #1652
+    /// in-registry dist.url rewrite, and the Composer 2 `~dev` variant of the
+    /// same lookup must resolve through the same (bare-named) v1 document.
+    #[tokio::test]
+    async fn test_remote_metadata_v2_falls_back_to_v1_providers_2693() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // v1-only upstream: no `metadata-url`, so every `p2/...` fetch 404s.
+        Mock::given(method("GET"))
+            .and(path("/p2/npm-asset/jquery.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/packages.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "providers-url": "/p/%package%$%hash%.json",
+                        "provider-includes": {
+                            "p/provider-latest$%hash%.json": { "sha256": "aa11" }
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/p/provider-latest$aa11.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "providers": {
+                            "npm-asset/jquery": { "sha256": "bb22" }
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        // The v1 per-package document: version map keyed by version string,
+        // both stability tiers in one file (the v1 wire shape).
+        Mock::given(method("GET"))
+            .and(path("/p/npm-asset/jquery$bb22.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "packages": {
+                            "npm-asset/jquery": {
+                                "3.7.1": {
+                                    "name": "npm-asset/jquery",
+                                    "version": "3.7.1",
+                                    "dist": {
+                                        "type": "zip",
+                                        "url": "https://cdn.example.org/jquery-3.7.1.zip",
+                                        "reference": "cc33"
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state.clone());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{key}/p2/npm-asset/jquery.json",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        // Composer 2 also asks for the `~dev` split; the v1 chain resolves it
+        // from the same bare-named provider entry.
+        let app_dev = tdh::router_anon(super::router(), state);
+        let (dev_status, _dev_body) = tdh::send(
+            app_dev,
+            tdh::get(format!(
+                "/{key}/p2/npm-asset/jquery~dev.json",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 via v1 provider fallback, got {status}");
+        }
+        let served: serde_json::Value =
+            serde_json::from_slice(&body).expect("served metadata must be JSON");
+        let entry = &served["packages"]["npm-asset/jquery"]["3.7.1"];
+        let dist_url = entry["dist"]["url"].as_str().unwrap_or_default();
+        let expected_suffix = format!(
+            "/composer/{key}/dist/npm-asset/jquery/3.7.1/cc33.zip",
+            key = fx.repo_key
+        );
+        let ok = dist_url.starts_with("http://localhost/")
+            && dist_url.ends_with(&expected_suffix)
+            && entry["dist"]["reference"] == serde_json::json!("cc33")
+            && dev_status == axum::http::StatusCode::OK;
+        teardown().await;
+        assert!(
+            ok,
+            "v1-provider metadata must be served with in-registry dist.url \
+             (and the ~dev variant must resolve, got {dev_status}); served: {}",
+            serde_json::to_string(&served).unwrap()
+        );
+    }
+
+    /// #2693: an upstream advertising `provider-lazy-url` (no hashed provider
+    /// indexes) resolves through direct template substitution.
+    #[tokio::test]
+    async fn test_remote_metadata_v1_lazy_url_fallback_2693() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                serde_json::json!({ "provider-lazy-url": "/lazy/%package%.json" }).to_string(),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/lazy/acme/widget.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    serde_json::json!({
+                        "packages": {
+                            "acme/widget": {
+                                "1.0.0": { "name": "acme/widget", "version": "1.0.0" }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{key}/p2/acme/widget.json", key = fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 via provider-lazy-url fallback, got {status}");
+        }
+        let served: serde_json::Value =
+            serde_json::from_slice(&body).expect("served metadata must be JSON");
+        let ok =
+            served["packages"]["acme/widget"]["1.0.0"]["version"] == serde_json::json!("1.0.0");
+        teardown().await;
+        assert!(
+            ok,
+            "provider-lazy-url metadata must be served, got: {}",
+            serde_json::to_string(&served).unwrap()
+        );
+    }
+
+    /// #2693 guard: when the upstream DOES advertise the v2 `metadata-url`, a
+    /// `p2/...` 404 is authoritative — no v1 walk, the 404 surfaces unchanged
+    /// (identical behaviour to before the fix for packagist-style upstreams).
+    #[tokio::test]
+    async fn test_remote_metadata_v2_upstream_404_stays_404_2693() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                serde_json::json!({ "metadata-url": "/p2/%package%.json" }).to_string(),
+            ))
+            .mount(&server)
+            .await;
+        // `p2/...` is unmatched -> wiremock's default 404, i.e. a genuine miss.
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!("/{key}/p2/acme/missing.json", key = fx.repo_key)),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        let not_found = status == axum::http::StatusCode::NOT_FOUND;
+        teardown().await;
+        assert!(not_found, "v2 upstream miss must stay a 404, got {status}");
+    }
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -1865,6 +2316,72 @@ mod tests {
         let repo_key = "composer-hosted";
         let metadata_url = format!("/composer/{}/p2/%package%.json", repo_key);
         assert_eq!(metadata_url, "/composer/composer-hosted/p2/%package%.json");
+    }
+
+    // -----------------------------------------------------------------------
+    // Composer v1 provider discovery helpers (#2693)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_v1_template_path_substitution_2693() {
+        // providers-url: both placeholders, leading slash normalized away.
+        assert_eq!(
+            v1_template_path(
+                "/p/%package%$%hash%.json",
+                Some("npm-asset/jquery"),
+                Some("bb22")
+            )
+            .as_deref(),
+            Some("p/npm-asset/jquery$bb22.json")
+        );
+        // provider-includes key: hash only, no leading slash.
+        assert_eq!(
+            v1_template_path("p/provider-latest$%hash%.json", None, Some("aa11")).as_deref(),
+            Some("p/provider-latest$aa11.json")
+        );
+        // provider-lazy-url: package only.
+        assert_eq!(
+            v1_template_path("/lazy/%package%.json", Some("acme/widget"), None).as_deref(),
+            Some("lazy/acme/widget.json")
+        );
+    }
+
+    #[test]
+    fn test_v1_template_path_rejects_unfilled_and_offhost_2693() {
+        // A hashed template with no hash available must not produce a path.
+        assert!(v1_template_path("/p/%package%$%hash%.json", Some("a/b"), None).is_none());
+        // Absolute URLs are refused: discovery never leaves the configured upstream.
+        assert!(v1_template_path(
+            "https://evil.example/p/%package%.json",
+            Some("a/b"),
+            Some("h")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_composer_v1_base_name_2693() {
+        assert_eq!(
+            composer_v1_base_name("npm-asset/jquery~dev"),
+            "npm-asset/jquery"
+        );
+        assert_eq!(
+            composer_v1_base_name("npm-asset/jquery"),
+            "npm-asset/jquery"
+        );
+    }
+
+    #[test]
+    fn test_v1_provider_hash_2693() {
+        let doc = serde_json::json!({
+            "providers": { "npm-asset/jquery": { "sha256": "bb22" } }
+        });
+        assert_eq!(
+            v1_provider_hash(&doc, "npm-asset/jquery").as_deref(),
+            Some("bb22")
+        );
+        assert!(v1_provider_hash(&doc, "acme/missing").is_none());
+        assert!(v1_provider_hash(&serde_json::json!({}), "npm-asset/jquery").is_none());
     }
 
     // -----------------------------------------------------------------------
