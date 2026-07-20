@@ -276,6 +276,64 @@ fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)
     ))
 }
 
+/// Build the `artifact_metadata` JSON for a stored `.rpm` package.
+///
+/// Combines the filename-derived NEVRA with whatever the RPM header yields
+/// (summary, description, license, sourcerpm, ...), preferring header fields —
+/// the header is authoritative, the filename is only a convention. Used by
+/// both the native RPM upload path and the generic chunked-upload completion
+/// so packages surface identical format metadata regardless of how they were
+/// pushed (#2588).
+///
+/// Header-parse failures are non-fatal: the filename-derived fields are kept
+/// and the header-only fields stay absent. Returns `None` only when *neither*
+/// source yields anything (non-NEVRA filename and unparseable content), in
+/// which case the caller should record no metadata at all.
+pub(crate) fn build_rpm_artifact_metadata(
+    filename: &str,
+    content: &[u8],
+) -> Option<serde_json::Value> {
+    let parsed = parse_rpm_filename(filename);
+    let header = crate::formats::rpm::RpmHandler::parse_rpm_header(content).ok();
+    if parsed.is_none() && header.is_none() {
+        return None;
+    }
+
+    let (file_name, file_version, file_release, file_arch) = parsed.unwrap_or_default();
+    let prefer = |from_header: Option<&String>, from_filename: String| -> String {
+        match from_header {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => from_filename,
+        }
+    };
+
+    let h = header.as_ref();
+    let mut metadata = serde_json::json!({
+        "name": prefer(h.map(|m| &m.name), file_name),
+        "version": prefer(h.map(|m| &m.version), file_version),
+        "release": prefer(h.map(|m| &m.release), file_release),
+        "arch": prefer(h.map(|m| &m.arch), file_arch),
+        "filename": filename,
+    });
+
+    if let Some(h) = header {
+        for (key, value) in [
+            ("summary", h.summary),
+            ("description", h.description),
+            ("license", h.license),
+            ("group", h.group),
+            ("url", h.url),
+            ("source_rpm", h.source_rpm),
+        ] {
+            if let Some(v) = value {
+                metadata[key] = serde_json::Value::String(v);
+            }
+        }
+    }
+
+    Some(metadata)
+}
+
 // ---------------------------------------------------------------------------
 // Artifact query helper
 // ---------------------------------------------------------------------------
@@ -1077,13 +1135,18 @@ async fn store_rpm(
     )
     .await?;
 
-    // Store RPM-specific metadata
-    let rpm_metadata = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "release": release,
-        "arch": arch,
-        "filename": filename,
+    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
+    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
+    // describe the package fully (#2588). The filename already parsed above,
+    // so the builder always yields metadata here.
+    let rpm_metadata = build_rpm_artifact_metadata(filename, &content).unwrap_or_else(|| {
+        serde_json::json!({
+            "name": pkg_name,
+            "version": pkg_version,
+            "release": release,
+            "arch": arch,
+            "filename": filename,
+        })
     });
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
@@ -1162,6 +1225,22 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             )
         };
 
+        // Header-derived fields recorded at upload time (#2588). Blank when the
+        // artifact predates header extraction or the header was unparseable.
+        let meta_str = |key: &str| -> String {
+            artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let description = meta_str("description");
+        let url = meta_str("url");
+        let license = meta_str("license");
+        let source_rpm = meta_str("source_rpm");
+
         // The hosted RPM route serves packages under `packages/<file>` (see the
         // `/rpm/{repo}/{path}` handler). Artifacts uploaded through the native
         // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
@@ -1180,8 +1259,14 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
     <arch>{arch}</arch>
     <checksum type="sha256" pkgid="YES">{checksum}</checksum>
     <summary>{summary}</summary>
+    <description>{description}</description>
+    <url>{url}</url>
     <size package="{size}" installed="0"/>
     <location href="{location}"/>
+    <format>
+      <rpm:license>{license}</rpm:license>
+      <rpm:sourcerpm>{source_rpm}</rpm:sourcerpm>
+    </format>
   </package>
 "#,
             name = xml_escape(&name),
@@ -1190,8 +1275,12 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             arch = xml_escape(&arch),
             checksum = artifact.checksum_sha256,
             summary = xml_escape(&summary),
+            description = xml_escape(&description),
+            url = xml_escape(&url),
             size = artifact.size_bytes,
             location = xml_escape(&location),
+            license = xml_escape(&license),
+            source_rpm = xml_escape(&source_rpm),
         ));
     }
 
@@ -1983,6 +2072,122 @@ mod tests {
             xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
             "nested non-packages path must map to packages/<basename>: {xml}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_artifact_metadata (#2588)
+    // -----------------------------------------------------------------------
+
+    /// Real minimal noarch RPM built with rpmbuild (Summary/License/URL/Group
+    /// set, so header extraction has something to find).
+    const TEST_RPM: &[u8] = include_bytes!("../../../tests/fixtures/ak-meta-test-1.0-1.noarch.rpm");
+
+    #[test]
+    fn test_build_rpm_artifact_metadata_extracts_header_fields() {
+        let meta = build_rpm_artifact_metadata("ak-meta-test-1.0-1.noarch.rpm", TEST_RPM)
+            .expect("metadata for a real RPM");
+        assert_eq!(meta["name"], "ak-meta-test");
+        assert_eq!(meta["version"], "1.0");
+        assert_eq!(meta["release"], "1");
+        assert_eq!(meta["arch"], "noarch");
+        assert_eq!(meta["filename"], "ak-meta-test-1.0-1.noarch.rpm");
+        assert_eq!(meta["summary"], "Artifact Keeper metadata test package");
+        assert_eq!(meta["license"], "MIT");
+        assert_eq!(meta["url"], "https://artifact-keeper.example/test");
+        assert_eq!(meta["source_rpm"], "ak-meta-test-1.0-1.src.rpm");
+    }
+
+    /// The header is authoritative: a filename that disagrees with the header
+    /// must not override the header-derived NEVRA.
+    #[test]
+    fn test_build_rpm_artifact_metadata_header_wins_over_filename() {
+        let meta = build_rpm_artifact_metadata("wrong-9.9-9.x86_64.rpm", TEST_RPM)
+            .expect("metadata for a real RPM");
+        assert_eq!(meta["name"], "ak-meta-test");
+        assert_eq!(meta["version"], "1.0");
+        assert_eq!(meta["arch"], "noarch");
+        // The stored filename still reflects what the client pushed.
+        assert_eq!(meta["filename"], "wrong-9.9-9.x86_64.rpm");
+    }
+
+    /// Unparseable content with a NEVRA filename degrades to filename-derived
+    /// fields (header-only fields absent), never an error.
+    #[test]
+    fn test_build_rpm_artifact_metadata_unparseable_content_uses_filename() {
+        let meta = build_rpm_artifact_metadata("hello-2.10-1.el8.noarch.rpm", b"not an rpm")
+            .expect("filename-derived metadata");
+        assert_eq!(meta["name"], "hello");
+        assert_eq!(meta["version"], "2.10");
+        assert_eq!(meta["release"], "1.el8");
+        assert_eq!(meta["arch"], "noarch");
+        assert!(meta.get("summary").is_none());
+        assert!(meta.get("source_rpm").is_none());
+    }
+
+    /// No signal from either source -> no metadata row at all.
+    #[test]
+    fn test_build_rpm_artifact_metadata_no_signal_returns_none() {
+        assert!(build_rpm_artifact_metadata("blob.bin", b"junk").is_none());
+        assert!(build_rpm_artifact_metadata("bad.rpm", b"junk").is_none());
+    }
+
+    /// primary.xml must surface the header-derived format metadata (#2588):
+    /// description/url plus the <format> block dnf's `Source:` field reads.
+    #[test]
+    fn test_generate_primary_xml_emits_format_metadata() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/test-1.0-1.x86_64.rpm".to_string(),
+            name: "test".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/test-1.0-1.x86_64.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: Some(serde_json::json!({
+                "name": "test",
+                "version": "1.0",
+                "release": "1",
+                "arch": "x86_64",
+                "summary": "A test package",
+                "description": "Longer description",
+                "url": "https://example.test",
+                "license": "MIT",
+                "source_rpm": "test-1.0-1.src.rpm",
+            })),
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("<summary>A test package</summary>"), "{xml}");
+        assert!(
+            xml.contains("<description>Longer description</description>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<url>https://example.test</url>"), "{xml}");
+        assert!(xml.contains("<rpm:license>MIT</rpm:license>"), "{xml}");
+        assert!(
+            xml.contains("<rpm:sourcerpm>test-1.0-1.src.rpm</rpm:sourcerpm>"),
+            "{xml}"
+        );
+    }
+
+    /// Artifacts recorded before header extraction existed keep rendering
+    /// (fields blank, not an error).
+    #[test]
+    fn test_generate_primary_xml_blank_format_fields_without_metadata() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("<rpm:license></rpm:license>"), "{xml}");
+        assert!(xml.contains("<rpm:sourcerpm></rpm:sourcerpm>"), "{xml}");
     }
 
     // Regression pin: a native `packages/`-prefixed path must be emitted

@@ -641,6 +641,22 @@ async fn complete(
         .await
         .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // #2588: packages pushed through the generic chunked flow must still
+    // surface format metadata (the native format routes parse it at upload
+    // time). Capture a bounded prefix of the uploaded file *before* the temp
+    // copy is deleted so the format header can be parsed once the artifact
+    // row exists. Replication sessions carry the source row's metadata
+    // instead, so nothing is read for them.
+    let format_header_prefix = if session.artifact_metadata_format.is_none()
+        && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+    {
+        read_file_prefix(&temp_path, FORMAT_HEADER_PREFIX_LIMIT)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
     // Clean up temp file
     let _ = tokio::fs::remove_file(&temp_path).await;
 
@@ -695,6 +711,22 @@ async fn complete(
             .set_metadata(artifact_id, format, metadata, properties)
             .await
             .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    } else if let Some(prefix) = &format_header_prefix {
+        // #2588: extract RPM header metadata for generically-pushed packages,
+        // mirroring what the native RPM upload route records. Best-effort:
+        // unparseable or non-package objects simply record no metadata, they
+        // never fail the upload.
+        let filename = artifact_name_from_path(&session.artifact_path);
+        if let Some(metadata) = super::rpm::build_rpm_artifact_metadata(filename, prefix) {
+            crate::api::handlers::proxy_helpers::record_artifact_metadata(
+                &state.db,
+                artifact_id,
+                session.repository_id,
+                "rpm",
+                &metadata,
+            )
+            .await;
+        }
     }
 
     if let Some((package_name, package_version)) = completed_package_catalog_entry(&session) {
@@ -876,6 +908,33 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 }
 
 /// Extract a simple artifact name from its path (last path component without extension).
+/// Upper bound on how much of a completed upload is read back for format
+/// header parsing (#2588). RPM signature+main headers live at the front of
+/// the file and are far smaller than this in practice; anything whose header
+/// does not fit simply records no metadata.
+const FORMAT_HEADER_PREFIX_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Whether a completed generic upload should get RPM header metadata
+/// extracted (#2588): the target repo is RPM-format and the object is an
+/// actual `.rpm` package. Companion objects (checksum sidecars, `.repo`
+/// snippets, `.drpm` deltas) are left alone.
+fn rpm_header_metadata_eligible(
+    format: &crate::models::repository::RepositoryFormat,
+    artifact_path: &str,
+) -> bool {
+    matches!(format, crate::models::repository::RepositoryFormat::Rpm)
+        && artifact_path.ends_with(".rpm")
+}
+
+/// Read at most `limit` bytes from the start of `path`.
+async fn read_file_prefix(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let mut buf = Vec::new();
+    file.take(limit).read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 fn artifact_name_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -1163,6 +1222,57 @@ mod tests {
             "create_session must call require_repo_write_access independent of \
              fine-grained rule existence (xtenant)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RPM header metadata extraction on generic completion (#2588)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpm_header_metadata_eligible_only_for_rpm_repo_and_rpm_path() {
+        use crate::models::repository::RepositoryFormat;
+        // .rpm in an rpm repo: eligible (nested paths included).
+        assert!(rpm_header_metadata_eligible(
+            &RepositoryFormat::Rpm,
+            "hello-1.0-1.x86_64.rpm"
+        ));
+        assert!(rpm_header_metadata_eligible(
+            &RepositoryFormat::Rpm,
+            "nested/dir/hello-1.0-1.x86_64.rpm"
+        ));
+        // Companion objects in an rpm repo: not eligible.
+        assert!(!rpm_header_metadata_eligible(
+            &RepositoryFormat::Rpm,
+            "CHECKSUMS.sha256"
+        ));
+        assert!(!rpm_header_metadata_eligible(
+            &RepositoryFormat::Rpm,
+            "hello-1.0-1.x86_64.drpm"
+        ));
+        // .rpm pushed into a non-rpm repo: not eligible.
+        assert!(!rpm_header_metadata_eligible(
+            &RepositoryFormat::Generic,
+            "hello-1.0-1.x86_64.rpm"
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_prefix_caps_at_limit() {
+        let dir = std::env::temp_dir().join(format!("ak2588-prefix-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob.bin");
+        std::fs::write(&path, [7u8; 64]).unwrap();
+
+        // Whole file when under the limit.
+        let all = read_file_prefix(&path, 1024).await.unwrap();
+        assert_eq!(all.len(), 64);
+        // Bounded read when over the limit.
+        let capped = read_file_prefix(&path, 16).await.unwrap();
+        assert_eq!(capped, vec![7u8; 16]);
+        // Missing file surfaces the io error (callers treat it as "no metadata").
+        assert!(read_file_prefix(&dir.join("missing"), 16).await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------
