@@ -268,8 +268,17 @@ async fn upload_artifact(
         "application/java-archive"
     };
 
-    // Store the file
-    let storage_key = format!("sbt/{}", artifact_path);
+    // Store the file. #2624: on shared cloud namespaces new objects embed the
+    // repository id (`sbt/{repository_id}/{path}`) so keys can never collide
+    // across repositories; filesystem backends and STORAGE_KEY_SCHEME=flat
+    // keep the legacy `sbt/{path}` shape. Downloads read the row-recorded
+    // storage_key, so objects written under either scheme stay readable.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "sbt",
+        repo.id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state

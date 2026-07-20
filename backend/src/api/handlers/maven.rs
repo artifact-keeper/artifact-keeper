@@ -944,6 +944,23 @@ async fn download(
         // to (#2504, #2574 — the same ownership rule as the write guard).
         // Foreign-owned and unattributed keys fall through to the row-gated
         // computed-checksum path below.
+        // #2624: new sidecar writes on cloud land at the repo-scoped key,
+        // which embeds this repository's id and therefore needs no catalog
+        // attribution gate — it cannot name another repository's object.
+        let key_scheme = crate::storage::StorageKeyScheme::from_env();
+        if checksum_compute_eligible(&repo.repo_type) {
+            if let Some(scoped_key) =
+                key_scheme.scoped_read_key(&repo.storage_backend, "maven", repo.id, &path)
+            {
+                if let Ok(content) = storage.get(&scoped_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
+        }
         let checksum_storage_key = format!("maven/{}", path);
         if checksum_compute_eligible(&repo.repo_type)
             && crate::services::maven_flat_attribution::flat_key_readable(
@@ -970,8 +987,25 @@ async fn download(
         // is served only to its attributed owner (#2504, #2574).
         if base_path.contains("-SNAPSHOT") {
             if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
-                let resolved_checksum_key =
-                    format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
+                let resolved_sidecar_path =
+                    format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
+                // Repo-scoped candidate first (#2624): physically owned by
+                // this repository, no attribution gate needed.
+                if let Some(scoped_key) = key_scheme.scoped_read_key(
+                    &repo.storage_backend,
+                    "maven",
+                    repo.id,
+                    &resolved_sidecar_path,
+                ) {
+                    if let Ok(content) = storage.get(&scoped_key).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+                let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
                 if crate::services::maven_flat_attribution::flat_key_readable(
                     &state.db,
                     repo.id,
@@ -1125,6 +1159,48 @@ async fn fetch_remote_member_metadata(
     std::str::from_utf8(&content).ok().map(|s| s.to_string())
 }
 
+/// Read a Local/Staging virtual member's stored metadata document at `path`.
+///
+/// Tries the member's repo-scoped key first (#2624) — the key embeds the
+/// member's repository id, so it is physically owned and needs no catalog
+/// attribution gate — then falls back to the legacy flat `maven/{path}` key.
+/// On shared cloud namespaces the flat key is served only when the catalog
+/// attributes it to the member (#2504, #2574). Scoped to `member.id`, both
+/// reads compose with the #1804 member authorization done by the caller.
+async fn read_member_stored_metadata(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Option<String> {
+    let member_storage = state.storage_for_repo(&member.storage_location()).ok()?;
+    if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+        &member.storage_backend,
+        "maven",
+        member.id,
+        path,
+    ) {
+        if let Ok(content) = member_storage.get(&scoped_key).await {
+            if let Ok(s) = std::str::from_utf8(&content) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    let member_storage_key = format!("maven/{}", path);
+    if crate::services::maven_flat_attribution::flat_key_readable(
+        &state.db,
+        member.id,
+        &member.storage_backend,
+        &member_storage_key,
+    )
+    .await
+    {
+        if let Ok(content) = member_storage.get(&member_storage_key).await {
+            return std::str::from_utf8(&content).ok().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1266,34 +1342,13 @@ async fn fetch_maven_metadata_bytes(
             let mut member_docs: Vec<String> = Vec::new();
             for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
                 let batch = futures::future::join_all(chunk.iter().map(|member| async {
-                    // Unanchored `maven/<path>` read: sound on filesystem
-                    // (physical isolation), or on a shared cloud namespace only
-                    // when the key is attributed to THIS member repository
-                    // (#2504, #2574). Scoped to `member.id`, it composes with the
-                    // #1804 member-authorization done by the caller.
-                    let member_storage_key = format!("maven/{}", path);
+                    // Stored-document read: repo-scoped key first, then the
+                    // attribution-gated legacy flat key (#2624, #2504, #2574);
+                    // see `read_member_stored_metadata`.
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
-                    } else if crate::services::maven_flat_attribution::flat_key_readable(
-                        &state.db,
-                        member.id,
-                        &member.storage_backend,
-                        &member_storage_key,
-                    )
-                    .await
-                    {
-                        match state.storage_for_repo(&member.storage_location()) {
-                            Ok(member_storage) => {
-                                member_storage.get(&member_storage_key).await.ok().and_then(
-                                    |content| {
-                                        std::str::from_utf8(&content).ok().map(|s| s.to_string())
-                                    },
-                                )
-                            }
-                            Err(_) => None,
-                        }
                     } else {
-                        None
+                        read_member_stored_metadata(state, member, path).await
                     }
                 }))
                 .await;
@@ -1325,30 +1380,14 @@ async fn fetch_maven_metadata_bytes(
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                     } else {
-                        // Unanchored `maven/<path>` read: sound on filesystem
-                        // (physical isolation); on a shared cloud namespace only
-                        // when the key is attributed to THIS member repository
-                        // (#2504, #2574). Otherwise rely on the row-scoped
-                        // snapshot entries below. Scoped to `member.id`, it
-                        // composes with the #1804 member authorization.
-                        let member_storage_key = format!("maven/{}", path);
-                        if crate::services::maven_flat_attribution::flat_key_readable(
-                            &state.db,
-                            member.id,
-                            &member.storage_backend,
-                            &member_storage_key,
-                        )
-                        .await
+                        // Stored-document read: repo-scoped key first, then the
+                        // attribution-gated legacy flat key (#2624, #2504,
+                        // #2574); see `read_member_stored_metadata`. A miss
+                        // falls through to the row-scoped snapshot entries.
+                        if let Some(xml_str) =
+                            read_member_stored_metadata(state, member, path).await
                         {
-                            if let Ok(member_storage) =
-                                state.storage_for_repo(&member.storage_location())
-                            {
-                                if let Ok(content) = member_storage.get(&member_storage_key).await {
-                                    if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                        entries.extend(parse_snapshot_versions_xml(xml_str));
-                                    }
-                                }
-                            }
+                            entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                         entries.extend(
                             collect_snapshot_entries(
@@ -1394,6 +1433,18 @@ async fn fetch_maven_metadata_bytes(
     // repository (#2504, #2574). This keeps a deliberately-uploaded verbatim
     // document authoritative for its owner instead of degrading to the dynamic
     // generation below, while foreign/unattributed keys fall through.
+    // Repo-scoped candidate first (#2624): the key embeds this repository's
+    // id, so no attribution gate is needed for it.
+    if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+        &repo.storage_backend,
+        "maven",
+        repo.id,
+        path,
+    ) {
+        if let Ok(content) = storage.get(&scoped_key).await {
+            return Ok(content);
+        }
+    }
     let meta_storage_key = format!("maven/{}", path);
     if crate::services::maven_flat_attribution::flat_key_readable(
         &state.db,
@@ -1812,6 +1863,28 @@ async fn serve_artifact(
             // attributes the key to this repository (#2504, #2574 — the same
             // ownership rule as the write guard). A foreign-owned or
             // unattributed key 404s rather than serving another repo's bytes.
+            // Repo-scoped candidate first (#2624): row-less sidecars written
+            // under the scoped scheme (checksums, verbatim metadata) live at
+            // `maven/{repo.id}/{path}`. The key embeds this repository's id,
+            // so it needs no attribution gate.
+            if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            {
+                if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env()
+                    .scoped_read_key(&repo.storage_backend, "maven", repo.id, path)
+                {
+                    let storage = state
+                        .storage_for_repo(&repo.storage_location())
+                        .map_err(|e| e.into_response())?;
+                    if let Ok(stream) = storage.get_stream(&scoped_key).await {
+                        let ct = content_type_for_path(path);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, ct)
+                            .body(Body::from_stream(stream))
+                            .unwrap());
+                    }
+                }
+            }
             let legacy_storage_key = format!("maven/{}", path);
             if (repo.repo_type == RepositoryType::Local
                 || repo.repo_type == RepositoryType::Staging)
@@ -2133,10 +2206,24 @@ async fn upload(
     .unwrap_or(false);
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
-    let storage_key = format!("maven/{}", path);
+    // #2624: on shared cloud namespaces new objects are written under a
+    // repository-scoped key (`maven/{repository_id}/{path}`) so the physical
+    // key can never collide with — or be claimed by — another repository.
+    // Filesystem backends and the `STORAGE_KEY_SCHEME=flat` opt-out keep the
+    // legacy `maven/{path}` shape. Existing objects are untouched: their
+    // artifact rows still carry the flat key they were written under, and the
+    // derived-read sites fall back to the flat key.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "maven",
+        repo.id,
+        &path,
+    );
     // Guard every flat-key write before it reaches storage (#2584). On a shared
     // cloud namespace this refuses to overwrite a *different* repository's object
-    // living at this exact key (403). It is a READ-ONLY check: it must not
+    // living at this exact key (403). A repo-scoped key embeds this repository's
+    // id and can never be foreign-owned, so the guard passes trivially there.
+    // It is a READ-ONLY check: it must not
     // attribute the key here, because this runs before the bytes are written and
     // before coordinate parsing/validation that can still reject the request --
     // claiming here would flip ownership of a foreign *unattributed* key on any
@@ -2851,7 +2938,10 @@ mod tests {
     // build_maven_storage_key
     // -----------------------------------------------------------------------
 
-    /// Build the Maven storage key from a raw path.
+    /// Build the LEGACY flat Maven storage key from a raw path — the shape
+    /// used on repo-isolated (filesystem) backends and under
+    /// `STORAGE_KEY_SCHEME=flat`. Cloud writes under the default repo-scoped
+    /// scheme use `StorageKeyScheme::write_key` instead (#2624).
     fn build_maven_storage_key(path: &str) -> String {
         format!("maven/{}", path)
     }
@@ -3834,6 +3924,203 @@ mod tests {
         assert_eq!(version_count, 1);
 
         fx.teardown().await;
+    }
+
+    /// #2624: on a shared cloud namespace (registered "s3" backend) Maven
+    /// uploads must write REPO-SCOPED storage keys (`maven/{repo_id}/{path}`)
+    /// so the same coordinate in two repositories can never collide on one
+    /// physical object — and every read path (row-anchored artifact download,
+    /// row-less checksum sidecar, verbatim maven-metadata.xml) must resolve
+    /// the scoped object back.
+    #[tokio::test]
+    async fn test_cloud_upload_uses_repo_scoped_key_2624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        // -- Artifact upload lands at the repo-scoped key, and ONLY there.
+        let path = "com/example/scoped2624/demo/1.0.0/demo-1.0.0.jar";
+        let jar = bytes::Bytes::from_static(b"scoped-jar-bytes-2624");
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "PUT failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let db_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(
+            db_key, scoped_key,
+            "artifact row must record the repo-scoped physical key"
+        );
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert!(
+                objects.contains_key(&scoped_key),
+                "bytes must live at the repo-scoped key"
+            );
+            assert!(
+                !objects.contains_key(&format!("maven/{path}")),
+                "the legacy flat key must NOT be written"
+            );
+        }
+
+        // -- Row-anchored download resolves the recorded scoped key.
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, jar);
+
+        // -- Row-less checksum sidecar: stored scoped, served via the scoped
+        //    read candidate (no attribution row needed).
+        let sha1_path = format!("{path}.sha1");
+        let sha1 = bytes::Bytes::from_static(b"da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{sha1_path}"), sha1.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(mem
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("maven/{repo_id}/{sha1_path}")));
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{sha1_path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, sha1);
+
+        // -- Verbatim maven-metadata.xml round-trips through the scoped key.
+        let meta_path = "com/example/scoped2624/demo/maven-metadata.xml";
+        let meta = bytes::Bytes::from_static(
+            b"<metadata><groupId>com.example.scoped2624</groupId>\
+              <artifactId>demo</artifactId><versioning><versions>\
+              <version>1.0.0</version></versions></versioning></metadata>",
+        );
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{meta_path}"), meta.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(mem
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("maven/{repo_id}/{meta_path}")));
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{meta_path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, meta);
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #2624 back-compat: objects stored under the LEGACY flat scheme
+    /// (`maven/{path}`) must stay readable after the repo-scoped scheme takes
+    /// over new writes — row-anchored artifacts through the storage_key their
+    /// row recorded, and row-less sidecars through the attribution-gated flat
+    /// fallback (owner inherited from the base artifact row). Nothing is
+    /// re-keyed or stranded.
+    #[tokio::test]
+    async fn test_cloud_legacy_flat_keys_still_served_2624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        // Seed a pre-scheme artifact: bytes at the FLAT key, row recording it.
+        let path = "com/example/legacy2624/old/1.0.0/old-1.0.0.jar";
+        let flat_key = format!("maven/{path}");
+        let jar = bytes::Bytes::from_static(b"legacy-flat-jar-bytes-2624");
+        mem.objects
+            .lock()
+            .unwrap()
+            .insert(flat_key.clone(), jar.clone());
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 'old', '1.0.0', $3, $4, 'application/java-archive', $5, $6)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(jar.len() as i64)
+        .bind("ab".repeat(32))
+        .bind(&flat_key)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy artifact row");
+
+        // Row-anchored read: served through the row's recorded flat key.
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, jar);
+
+        // Row-less legacy sidecar at the flat key: the scoped candidate
+        // misses, and the flat fallback serves it because attribution
+        // inherits the base artifact row's owner (#2504/#2574 rules intact).
+        let sha1_flat_key = format!("{flat_key}.sha1");
+        let sha1 = bytes::Bytes::from_static(b"cafebabecafebabecafebabecafebabecafebabe");
+        mem.objects
+            .lock()
+            .unwrap()
+            .insert(sha1_flat_key, sha1.clone());
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}.sha1"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, sha1);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
     /// Direct Maven uploads bypass the generic ArtifactService upload path, so
