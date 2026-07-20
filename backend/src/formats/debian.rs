@@ -135,6 +135,14 @@ pub struct DebianRepositoryConfig {
     /// rather than silently advertising content the proxy would then block.
     #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
     pub package_queries: Vec<String>,
+    /// Defense-in-depth (#2562): when `false` (the default) a proxy request
+    /// whose path carries a percent-encoded path separator (`%2f` = `/`,
+    /// `%5c` = `\`, at any decode layer) is rejected with 400 before any
+    /// upstream fetch. APT never percent-encodes path separators, so this only
+    /// ever blocks path-confusion/traversal probes; set it `true` to opt out
+    /// for a nonstandard upstream that genuinely requires encoded separators.
+    #[serde(default)]
+    pub allow_encoded_separators: bool,
 }
 
 /// Partial-update patch for [`DebianRepositoryConfig`]. Fields left absent are
@@ -163,6 +171,8 @@ pub struct DebianConfigPatch {
     pub package_fetch_strategy: Option<DebianPackageFetchStrategy>,
     #[serde(default)]
     pub package_queries: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_encoded_separators: Option<bool>,
 }
 
 impl DebianConfigPatch {
@@ -197,6 +207,9 @@ impl DebianConfigPatch {
         }
         if let Some(v) = self.package_queries {
             base.package_queries = v;
+        }
+        if let Some(v) = self.allow_encoded_separators {
+            base.allow_encoded_separators = v;
         }
         base
     }
@@ -1968,6 +1981,38 @@ Size: 100
             vec!["main".to_string(), "contrib".to_string()]
         );
         assert_eq!(merged.architectures, vec!["amd64".to_string()]);
+    }
+
+    #[test]
+    fn test_allow_encoded_separators_defaults_to_reject() {
+        // #2562: the guard is on by default (allow flag false) so the
+        // defense-in-depth is active without any operator action.
+        assert!(!DebianRepositoryConfig::default().allow_encoded_separators);
+        // Absent in JSON -> false (reject). Set true -> honored.
+        let cfg: DebianRepositoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.allow_encoded_separators);
+        let cfg: DebianRepositoryConfig =
+            serde_json::from_str(r#"{"allow_encoded_separators": true}"#).unwrap();
+        assert!(cfg.allow_encoded_separators);
+    }
+
+    #[test]
+    fn test_config_patch_toggles_allow_encoded_separators() {
+        let base = DebianRepositoryConfig::default();
+        assert!(!base.allow_encoded_separators);
+        let patch = DebianConfigPatch {
+            allow_encoded_separators: Some(true),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        assert!(merged.allow_encoded_separators);
+        // A patch that omits the field preserves the stored value.
+        let base = DebianRepositoryConfig {
+            allow_encoded_separators: true,
+            ..Default::default()
+        };
+        let merged = DebianConfigPatch::default().apply_to(base);
+        assert!(merged.allow_encoded_separators);
     }
 
     #[test]
