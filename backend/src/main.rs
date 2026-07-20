@@ -171,7 +171,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     #[cfg(feature = "profiling")]
     tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
 
-    tracing::info!("Starting Artifact Keeper");
+    tracing::info!(
+        version = artifact_keeper_backend::build_info::VERSION,
+        git = artifact_keeper_backend::build_info::short_sha(),
+        "Starting Artifact Keeper"
+    );
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
