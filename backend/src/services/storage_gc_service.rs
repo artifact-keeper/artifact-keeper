@@ -157,6 +157,108 @@ const BLOB_PROTECTED_BY_REFS_SQL: &str = r#"
     )
 "#;
 
+/// Storage-key prefix shared by every flat Maven object (artifacts, checksum
+/// sidecars, `maven-metadata.xml`). Mirrors the `format!("maven/{}", path)`
+/// key construction in `api/handlers/maven.rs`.
+const MAVEN_FLAT_KEY_PREFIX: &str = "maven/";
+
+/// Checksum sidecar suffixes the Maven upload handler stores as *row-less*
+/// puts (no `artifacts` row; see `parse_checksum_path` in
+/// `api/handlers/maven.rs`). These objects are invisible to the
+/// artifacts-driven orphan sweep, which is exactly why GC used to leave
+/// `.md5`/`.sha1` files behind after their base artifact was reclaimed
+/// (#2668). GC derives these keys from the base key when reclaiming it.
+const MAVEN_SIDECAR_SUFFIXES: [&str; 4] = [".md5", ".sha1", ".sha256", ".sha512"];
+
+/// Upper bound on flat-object attribution rows examined per GC pass.
+const ORPHAN_MAVEN_FLAT_SCAN_LIMIT: i64 = 1000;
+
+/// SQL fragment expressing the orphaned row-less Maven flat-object predicate
+/// over an outer `maven_flat_object_owner` row aliased `o` (#2668).
+///
+/// Row-less Maven objects (checksum sidecars, verbatim `maven-metadata.xml`,
+/// legacy GAV-grouped companions) have no `artifacts` row, so the main
+/// artifacts-driven sweep can never reclaim them. Their only durable DB
+/// record is the `maven_flat_object_owner` attribution table (#2574/#2584),
+/// which this sweep walks. A row is collectable only when every catalog
+/// layer that could anchor (make readable) its object is gone:
+///
+/// 1. No `artifacts` row — live OR soft-deleted — on the same backend still
+///    uses the key. Soft-deleted rows protect the object until the main
+///    sweep hard-deletes them, so a resurrectable coordinate is never
+///    stripped of its companions early.
+/// 2. No parent artifact's metadata `files[]` (any parent, live or
+///    soft-deleted) lists the key (legacy GAV-grouped companions).
+/// 3. A `maven-metadata.xml` key (or a checksum sidecar of one) additionally
+///    requires that NO live artifact exists under its directory prefix on
+///    the same backend: the metadata document stays while any version of
+///    its groupId/artifactId (or group, for group-level plugin metadata)
+///    is still live. The `LIKE` prefix test can only over-match (SQL
+///    wildcards in a key match a superset), i.e. only ever over-PROTECT.
+/// 4. A checksum sidecar additionally requires its base key to be anchored
+///    by neither an `artifacts` row (any state) nor a metadata `files[]`
+///    reference on the same backend.
+///
+/// The one-hour age floor keeps the sweep away from in-flight first
+/// publishes, whose claim row is inserted just before the object bytes are
+/// written. Scan and per-row locked re-check share this constant so the two
+/// predicates cannot drift (the #1180 lesson).
+const ORPHAN_MAVEN_FLAT_PREDICATE_SQL: &str = r#"
+o.storage_key LIKE 'maven/%'
+AND o.created_at < NOW() - INTERVAL '1 hour'
+AND NOT EXISTS (
+    SELECT 1 FROM artifacts a
+    JOIN repositories ar ON ar.id = a.repository_id
+    WHERE a.storage_key = o.storage_key
+      AND ar.storage_backend = o.storage_backend
+)
+AND NOT EXISTS (
+    SELECT 1 FROM artifact_metadata am
+    JOIN artifacts pa ON pa.id = am.artifact_id
+    JOIN repositories pr ON pr.id = pa.repository_id
+    WHERE pr.storage_backend = o.storage_backend
+      AND jsonb_typeof(am.metadata->'files') = 'array'
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f
+        WHERE f->>'storage_key' = o.storage_key
+      )
+)
+AND NOT EXISTS (
+    SELECT 1 FROM artifacts a2
+    JOIN repositories r2 ON r2.id = a2.repository_id
+    WHERE regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
+            LIKE '%/maven-metadata.xml'
+      AND r2.storage_backend = o.storage_backend
+      AND a2.is_deleted = false
+      AND a2.storage_key LIKE substr(
+            regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', ''),
+            1,
+            length(regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', ''))
+              - length('maven-metadata.xml')
+          ) || '%'
+)
+AND NOT EXISTS (
+    SELECT 1 FROM artifacts ab
+    JOIN repositories rb ON rb.id = ab.repository_id
+    WHERE o.storage_key ~ '\.(md5|sha1|sha256|sha512)$'
+      AND ab.storage_key = regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
+      AND rb.storage_backend = o.storage_backend
+)
+AND NOT EXISTS (
+    SELECT 1 FROM artifact_metadata am2
+    JOIN artifacts pa2 ON pa2.id = am2.artifact_id
+    JOIN repositories pr2 ON pr2.id = pa2.repository_id
+    WHERE o.storage_key ~ '\.(md5|sha1|sha256|sha512)$'
+      AND pr2.storage_backend = o.storage_backend
+      AND jsonb_typeof(am2.metadata->'files') = 'array'
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(am2.metadata->'files') f2
+        WHERE f2->>'storage_key'
+              = regexp_replace(o.storage_key, '\.(md5|sha1|sha256|sha512)$', '')
+      )
+)
+"#;
+
 /// Result of a storage GC run.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StorageGcResult {
@@ -435,6 +537,30 @@ impl StorageGcService {
                     continue;
                 }
 
+                // Row-less Maven checksum sidecars (`.md5`, `.sha1`, ...) are
+                // written with no `artifacts` row of their own, so this sweep
+                // never enumerates them; reclaim them together with their base
+                // object or they leak on storage forever (#2668). A failure
+                // here rolls the key back: the base storage delete is already
+                // idempotent (NotFound => Ok), so the next pass retries the
+                // whole key and the invariant stays "a reclaimed Maven key
+                // takes its sidecars with it".
+                if let Err(e) = reclaim_maven_sidecars(
+                    &mut tx,
+                    storage.as_ref(),
+                    &storage_key,
+                    &storage_backend,
+                )
+                .await
+                {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("delete maven sidecars", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+
                 if let Err(e) = tx.commit().await {
                     let msg = format_gc_error("commit gc tx", &storage_key, &e.to_string());
                     tracing::warn!("{}", msg);
@@ -481,6 +607,18 @@ impl StorageGcService {
         {
             let msg = format_gc_error(
                 "run pending OCI upload cleanup-key reaper",
+                "<sweep>",
+                &e.to_string(),
+            );
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+        }
+        if let Err(e) = self
+            .cleanup_orphan_maven_flat_objects(dry_run, &mut result)
+            .await
+        {
+            let msg = format_gc_error(
+                "run orphan Maven flat-object sweep",
                 "<sweep>",
                 &e.to_string(),
             );
@@ -1642,6 +1780,319 @@ impl StorageGcService {
             .map(|row| decode_oci_cleanup_key_row(&row))
             .collect()
     }
+
+    /// Reclaim orphaned row-less Maven flat objects (#2668).
+    ///
+    /// Checksum sidecars, verbatim `maven-metadata.xml` documents, and legacy
+    /// GAV-grouped companion files are stored with no `artifacts` row, so the
+    /// artifacts-driven orphan sweep never sees them. Their durable DB record
+    /// is the `maven_flat_object_owner` attribution table (#2574/#2584): this
+    /// sweep walks it and deletes the storage object + attribution row for
+    /// every key whose catalog anchors are all gone, per
+    /// [`ORPHAN_MAVEN_FLAT_PREDICATE_SQL`]. In particular this reclaims the
+    /// `maven-metadata.xml` (+ sidecars) of a groupId/artifactId whose last
+    /// version has been deleted and GC'd — the exact class of files reported
+    /// leaking on S3.
+    ///
+    /// Safety mirrors the main sweep: each candidate is re-verified under a
+    /// per-row `FOR UPDATE` lock on its attribution row before its object is
+    /// deleted, using the same predicate constant as the scan (#1180
+    /// discipline), and the one-hour age floor in the predicate keeps the
+    /// sweep away from claims inserted by an in-flight first publish. The
+    /// storage delete tolerates an already-absent object (NotFound => Ok,
+    /// #1660) so a crash between the object delete and the row delete leaves
+    /// a re-collectable orphan, never an error loop.
+    ///
+    /// Attribution rows exist only for shared cloud namespaces
+    /// (S3/GCS/Azure); filesystem repositories keep an isolated key space and
+    /// have their sidecars reclaimed inline by the main sweep
+    /// ([`reclaim_maven_sidecars`]) and their remaining metadata at
+    /// repository deletion.
+    async fn cleanup_orphan_maven_flat_objects(
+        &self,
+        dry_run: bool,
+        result: &mut StorageGcResult,
+    ) -> Result<()> {
+        let candidates = self.select_orphan_maven_flat_objects().await?;
+        let mut objects_removed = 0_i64;
+
+        for row in candidates {
+            let storage_key: String = row
+                .try_get("storage_key")
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let storage_backend: String = row
+                .try_get("storage_backend")
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let storage_path: String = row
+                .try_get("storage_path")
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if dry_run {
+                result.storage_keys_deleted += 1;
+                continue;
+            }
+
+            let location = StorageLocation {
+                backend: storage_backend.clone(),
+                path: storage_path,
+            };
+            let storage = match self.storage_for_location(&location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg =
+                        format_gc_error("resolve maven flat storage", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            let mut tx = match self.db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg =
+                        format_gc_error("begin maven flat gc tx", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            // Re-verify under the row lock so a claim that a concurrent
+            // publish re-anchored (new artifact row / files[] reference /
+            // live version under a metadata directory) is observed and
+            // skipped.
+            match is_maven_flat_object_still_orphan(&mut tx, &storage_backend, &storage_key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = tx.rollback().await;
+                    tracing::debug!(
+                        storage_key = storage_key.as_str(),
+                        "Maven flat GC skipped key: no longer orphan after row-lock re-check"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("re-check maven flat orphan", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            match storage.delete(&storage_key).await {
+                Ok(()) | Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("delete maven flat object", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            if let Err(e) = sqlx::query(
+                "DELETE FROM maven_flat_object_owner \
+                 WHERE storage_backend = $1 AND storage_key = $2",
+            )
+            .bind(&storage_backend)
+            .bind(&storage_key)
+            .execute(&mut *tx)
+            .await
+            {
+                let _ = tx.rollback().await;
+                let msg = format_gc_error(
+                    "delete maven flat attribution row",
+                    &storage_key,
+                    &e.to_string(),
+                );
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if let Err(e) = tx.commit().await {
+                let msg = format_gc_error("commit maven flat gc tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            tracing::info!(
+                storage_key = storage_key.as_str(),
+                "Storage GC: reclaimed orphaned row-less Maven flat object"
+            );
+            objects_removed += 1;
+            result.storage_keys_deleted += 1;
+        }
+
+        if objects_removed > 0 {
+            tracing::info!(
+                "Storage GC: reclaimed {} orphaned row-less Maven flat objects",
+                objects_removed
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Candidate scan for [`Self::cleanup_orphan_maven_flat_objects`]. A
+    /// snapshot only — every candidate is re-verified under a `FOR UPDATE`
+    /// row lock before deletion. `pub(crate)` so unit tests can assert on
+    /// per-key candidacy without racing sibling tests on shared counters
+    /// (#1493 pattern).
+    pub(crate) async fn select_orphan_maven_flat_objects(
+        &self,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let sql = format!(
+            r#"
+            SELECT o.storage_key, o.storage_backend, r.storage_path
+            FROM maven_flat_object_owner o
+            JOIN repositories r ON r.id = o.repository_id
+            WHERE {predicate}
+            ORDER BY o.storage_key
+            LIMIT $1
+            "#,
+            predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+        );
+        sqlx::query(&sql)
+            .bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+}
+
+/// Delete the row-less checksum sidecars of a reclaimed Maven storage key and
+/// drop the attribution rows of the key + its sidecars (#2668).
+///
+/// Called by the main orphan sweep inside the per-key transaction, after the
+/// base object has been deleted and the `artifacts` rows hard-deleted. Maven
+/// checksum sidecars (`.md5`, `.sha1`, `.sha256`, `.sha512`) are row-less
+/// puts, so they are never orphan candidates themselves; deriving them from
+/// the base key at reclaim time is what keeps them from leaking on storage.
+///
+/// Safety:
+/// - No-op for non-Maven keys.
+/// - A derived sidecar key that has its own `artifacts` row (any state, same
+///   backend) is skipped: a row-backed object is owned by the artifacts
+///   sweep, never blind-deleted here.
+/// - Sidecars inherit their base object's owner by construction
+///   (`maven_flat_attribution::strip_checksum_suffix` resolution + the
+///   flat-key write guard), so once the base key is provably orphan — the
+///   caller has just re-verified `ORPHAN_PREDICATE_SQL` under row locks — no
+///   other repository can legitimately serve these sidecars.
+/// - Storage deletes tolerate absent objects (NotFound => Ok); most bases
+///   have fewer than four sidecars.
+/// - The attribution-row cleanup keeps a hard-deleted key from staying
+///   claimed forever, which would otherwise lock the coordinate against
+///   every other tenant on the backend after the data is gone.
+///
+/// Any error propagates so the caller rolls back and retries the whole key
+/// on the next pass (the base storage delete is idempotent).
+async fn reclaim_maven_sidecars(
+    tx: &mut Transaction<'_, Postgres>,
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+    storage_backend: &str,
+) -> Result<()> {
+    if !storage_key.starts_with(MAVEN_FLAT_KEY_PREFIX) {
+        return Ok(());
+    }
+
+    // The base key's attribution row is dropped unconditionally: its object
+    // and rows are already gone.
+    let mut attribution_keys: Vec<String> = vec![storage_key.to_string()];
+
+    for suffix in MAVEN_SIDECAR_SUFFIXES {
+        let sidecar_key = format!("{storage_key}{suffix}");
+
+        // Never touch a key that is row-backed on this backend (live or
+        // soft-deleted): it belongs to the artifacts-driven sweep.
+        let row_backed: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 WHERE a.storage_key = $1 AND r.storage_backend = $2 \
+             )",
+        )
+        .bind(&sidecar_key)
+        .bind(storage_backend)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if row_backed {
+            continue;
+        }
+
+        match storage.delete(&sidecar_key).await {
+            Ok(()) | Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        attribution_keys.push(sidecar_key);
+    }
+
+    sqlx::query(
+        "DELETE FROM maven_flat_object_owner \
+         WHERE storage_backend = $1 AND storage_key = ANY($2)",
+    )
+    .bind(storage_backend)
+    .bind(&attribution_keys)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Re-verify the orphaned-flat-object predicate for a single
+/// (storage_backend, storage_key) attribution row inside an open transaction,
+/// holding a `FOR UPDATE` lock on that row (#2668).
+///
+/// Step 1 locks the attribution row (a vanished row returns `false`); step 2
+/// re-evaluates [`ORPHAN_MAVEN_FLAT_PREDICATE_SQL`] — the same constant the
+/// candidate scan uses, so the two checks cannot drift (#1180).
+async fn is_maven_flat_object_still_orphan(
+    tx: &mut Transaction<'_, Postgres>,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<bool> {
+    let locked = sqlx::query(
+        "SELECT storage_key FROM maven_flat_object_owner \
+         WHERE storage_backend = $1 AND storage_key = $2 \
+         FOR UPDATE",
+    )
+    .bind(storage_backend)
+    .bind(storage_key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if locked.is_none() {
+        return Ok(false);
+    }
+
+    let sql = format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM maven_flat_object_owner o
+            WHERE o.storage_backend = $1
+              AND o.storage_key = $2
+              AND {predicate}
+        ) AS still_orphan
+        "#,
+        predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+    );
+    let row = sqlx::query(&sql)
+        .bind(storage_backend)
+        .bind(storage_key)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.try_get::<bool, _>("still_orphan").unwrap_or(false))
 }
 
 /// Decode an `oci_upload_cleanup_keys` JOIN `repositories` row into an
@@ -2769,6 +3220,310 @@ mod tests {
 
         let orphans = orphans.expect("dry-run candidate scan succeeds");
         assert_key_not_orphaned(&orphans, &storage_key, &storage_path_str, "oci_blobs");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2668: row-less Maven sidecar + metadata reclamation
+    // -----------------------------------------------------------------------
+
+    /// The sidecar suffix list and the regex alternation embedded (three
+    /// times) in [`ORPHAN_MAVEN_FLAT_PREDICATE_SQL`] must not drift: a suffix
+    /// missing from the SQL would silently exempt that sidecar class from the
+    /// flat-object sweep.
+    #[test]
+    fn test_maven_sidecar_suffixes_match_flat_predicate_sql() {
+        for suffix in MAVEN_SIDECAR_SUFFIXES {
+            let bare = suffix.trim_start_matches('.');
+            assert!(
+                ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(bare),
+                "ORPHAN_MAVEN_FLAT_PREDICATE_SQL is missing sidecar suffix {suffix}"
+            );
+        }
+        let expected_alternation = format!(
+            "({})",
+            MAVEN_SIDECAR_SUFFIXES
+                .map(|s| s.trim_start_matches('.'))
+                .join("|")
+        );
+        assert!(
+            ORPHAN_MAVEN_FLAT_PREDICATE_SQL.contains(&expected_alternation),
+            "the SQL sidecar regex alternation must be built from \
+             MAVEN_SIDECAR_SUFFIXES; expected {expected_alternation}"
+        );
+    }
+
+    /// Insert a Maven `artifacts` row pointing at `storage_key`
+    /// (`path` = key without the `maven/` prefix).
+    async fn insert_maven_artifact_row(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        storage_key: &str,
+        is_deleted: bool,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by, is_deleted
+            )
+            VALUES ($1, $2, $3, 'gc2668', '1.0', 10, 'cafe', 'application/java-archive',
+                    $4, $5, $6)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(storage_key.trim_start_matches("maven/"))
+        .bind(storage_key)
+        .bind(user_id)
+        .bind(is_deleted)
+        .execute(pool)
+        .await
+        .expect("insert maven artifact row");
+    }
+
+    /// Insert a `maven_flat_object_owner` attribution row aged `age_hours`
+    /// into the past (0 = fresh).
+    async fn insert_flat_attribution_row(
+        pool: &PgPool,
+        repo_id: Uuid,
+        storage_key: &str,
+        age_hours: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO maven_flat_object_owner \
+                 (storage_backend, storage_key, repository_id, source, created_at) \
+             VALUES ('filesystem', $1, $2, 'write_claim', \
+                     NOW() - make_interval(hours => $3))",
+        )
+        .bind(storage_key)
+        .bind(repo_id)
+        .bind(age_hours)
+        .execute(pool)
+        .await
+        .expect("insert flat attribution row");
+    }
+
+    fn fixture_storage(
+        fixture: &crate::api::handlers::test_db_helpers::Fixture,
+    ) -> Arc<dyn crate::storage::StorageBackend> {
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fixture.storage_dir.to_string_lossy().to_string(),
+        };
+        fixture
+            .state
+            .storage_registry
+            .backend_for(&location)
+            .expect("filesystem backend")
+    }
+    /// Shared scaffolding for the #2668 tests: maven fixture, its filesystem
+    /// storage backend, a GC service, and a unique key namespace.
+    async fn maven_gc_2668_setup() -> Option<(
+        crate::api::handlers::test_db_helpers::Fixture,
+        Arc<dyn crate::storage::StorageBackend>,
+        StorageGcService,
+        String,
+    )> {
+        let fixture =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "maven").await?;
+        let storage = fixture_storage(&fixture);
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let uid = Uuid::new_v4().simple().to_string();
+        Some((fixture, storage, service, uid))
+    }
+
+    async fn seed_objects(storage: &Arc<dyn crate::storage::StorageBackend>, keys: &[&String]) {
+        for key in keys {
+            storage
+                .put(key, Bytes::from_static(b"gc2668"))
+                .await
+                .expect("seed object");
+        }
+    }
+
+    /// `exists()` per key, in order. Errors fail the test (filesystem exists
+    /// checks should never error here).
+    async fn objects_left(
+        storage: &Arc<dyn crate::storage::StorageBackend>,
+        keys: &[&String],
+    ) -> Vec<bool> {
+        let mut left = Vec::with_capacity(keys.len());
+        for key in keys {
+            left.push(storage.exists(key).await.expect("exists check"));
+        }
+        left
+    }
+
+    async fn count_rows(pool: &PgPool, table_sql: &str, key: &str) -> i64 {
+        sqlx::query_scalar(table_sql)
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .expect("count rows")
+    }
+
+    const COUNT_ARTIFACTS_SQL: &str = "SELECT COUNT(*) FROM artifacts WHERE storage_key = $1";
+    const COUNT_ATTRIBUTION_SQL: &str =
+        "SELECT COUNT(*) FROM maven_flat_object_owner WHERE storage_key = $1";
+
+    /// #2668 exploit repro, fixed: deleting a Maven package left its `.md5` /
+    /// `.sha1` checksum sidecars on storage forever, because those are
+    /// row-less puts the artifacts-driven sweep never enumerates. Reclaiming
+    /// the base key must now take its sidecars with it.
+    #[tokio::test]
+    async fn test_run_gc_reclaims_maven_checksum_sidecars_2668() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        let jar = format!("maven/gc2668/{uid}/app/1.0/app-1.0.jar");
+        let sha1 = format!("{jar}.sha1");
+        let md5 = format!("{jar}.md5");
+        seed_objects(&storage, &[&jar, &sha1, &md5]).await;
+        insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, &jar, true)
+            .await;
+
+        let gc = service.run_gc(false).await;
+
+        let left = objects_left(&storage, &[&jar, &sha1, &md5]).await;
+        let rows_left = count_rows(&fixture.pool, COUNT_ARTIFACTS_SQL, &jar).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc succeeds");
+        assert_eq!(
+            left,
+            vec![false, false, false],
+            "orphan Maven base object AND its row-less .sha1/.md5 sidecars \
+             must all be reclaimed (#2668)"
+        );
+        assert_eq!(rows_left, 0, "soft-deleted artifact rows are hard-deleted");
+    }
+
+    /// Reference-safety: a live Maven artifact keeps its object AND its
+    /// sidecars; and a key that merely LOOKS like a sidecar but is backed by
+    /// its own live `artifacts` row is never blind-deleted when the
+    /// lookalike base is reclaimed.
+    #[tokio::test]
+    async fn test_run_gc_never_deletes_referenced_maven_objects_2668() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        // Scenario 1: live artifact + sidecar -> everything survives.
+        let live_jar = format!("maven/gc2668/{uid}/live/1.0/live-1.0.jar");
+        let live_sha1 = format!("{live_jar}.sha1");
+        // Scenario 2: orphan base whose ".sha512" key is a real, LIVE,
+        // row-backed artifact -> base reclaimed, lookalike untouched.
+        let orphan_jar = format!("maven/gc2668/{uid}/edge/1.0/edge-1.0.jar");
+        let lookalike = format!("{orphan_jar}.sha512");
+        seed_objects(&storage, &[&live_jar, &live_sha1, &orphan_jar, &lookalike]).await;
+        for (key, is_deleted) in [(&live_jar, false), (&orphan_jar, true), (&lookalike, false)] {
+            insert_maven_artifact_row(
+                &fixture.pool,
+                fixture.repo_id,
+                fixture.user_id,
+                key,
+                is_deleted,
+            )
+            .await;
+        }
+
+        let gc = service.run_gc(false).await;
+
+        let left = objects_left(&storage, &[&live_jar, &live_sha1, &orphan_jar, &lookalike]).await;
+        let lookalike_rows = count_rows(&fixture.pool, COUNT_ARTIFACTS_SQL, &lookalike).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc succeeds");
+        assert_eq!(
+            left,
+            vec![true, true, false, true],
+            "live artifact + its sidecar survive; the orphan base is reclaimed; \
+             a row-backed live object whose key looks like a sidecar is never \
+             blind-deleted (#2668 safety)"
+        );
+        assert_eq!(lookalike_rows, 1, "the live lookalike row must be intact");
+    }
+
+    /// The flat-object sweep reclaims a stored `maven-metadata.xml` (and its
+    /// sidecar) once no live artifact remains under its directory, and drops
+    /// the attribution rows so the key is not locked forever.
+    #[tokio::test]
+    async fn test_run_gc_collects_orphan_maven_metadata_2668() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        let meta = format!("maven/gc2668/{uid}/lib/maven-metadata.xml");
+        let meta_sha1 = format!("{meta}.sha1");
+        seed_objects(&storage, &[&meta, &meta_sha1]).await;
+        // Aged rows (past the 1h in-flight-publish grace); no live artifacts
+        // exist under maven/gc2668/{uid}/lib/.
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &meta, 2).await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &meta_sha1, 2).await;
+
+        let gc = service.run_gc(false).await;
+
+        let left = objects_left(&storage, &[&meta, &meta_sha1]).await;
+        let rows_left = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &meta).await
+            + count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &meta_sha1).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc succeeds");
+        assert_eq!(
+            left,
+            vec![false, false],
+            "orphaned maven-metadata.xml and its checksum sidecar must be \
+             reclaimed once their directory has no live artifacts (#2668)"
+        );
+        assert_eq!(
+            rows_left, 0,
+            "attribution rows are dropped with the objects"
+        );
+    }
+
+    /// Safety + grace: a stored `maven-metadata.xml` whose directory still
+    /// holds a live version is protected, and a freshly-claimed key (younger
+    /// than the in-flight-publish grace) is not touched even when orphan.
+    #[tokio::test]
+    async fn test_run_gc_keeps_live_and_fresh_maven_metadata_2668() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some((fixture, storage, service, uid)) = maven_gc_2668_setup().await else {
+            return;
+        };
+
+        // Live version under the GA directory protects its metadata.
+        let jar = format!("maven/gc2668/{uid}/keep/1.0/keep-1.0.jar");
+        let meta = format!("maven/gc2668/{uid}/keep/maven-metadata.xml");
+        // Fresh orphan claim: inside the grace window.
+        let fresh_meta = format!("maven/gc2668/{uid}/fresh/maven-metadata.xml");
+        seed_objects(&storage, &[&jar, &meta, &fresh_meta]).await;
+        insert_maven_artifact_row(&fixture.pool, fixture.repo_id, fixture.user_id, &jar, false)
+            .await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &meta, 2).await;
+        insert_flat_attribution_row(&fixture.pool, fixture.repo_id, &fresh_meta, 0).await;
+
+        let gc = service.run_gc(false).await;
+
+        let left = objects_left(&storage, &[&meta, &fresh_meta]).await;
+        let rows_left = count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &meta).await
+            + count_rows(&fixture.pool, COUNT_ATTRIBUTION_SQL, &fresh_meta).await;
+        fixture.teardown().await;
+
+        gc.expect("run_gc succeeds");
+        assert_eq!(
+            left,
+            vec![true, true],
+            "maven-metadata.xml survives while a live version exists under its \
+             directory, and a claim younger than the grace window is not swept \
+             (#2668 safety)"
+        );
+        assert_eq!(rows_left, 2, "both attribution rows must be intact");
     }
 
     /// End-to-end variant of the manifest-survival test: run GC with
