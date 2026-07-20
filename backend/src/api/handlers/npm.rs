@@ -7260,6 +7260,187 @@ mod tests {
         );
     }
 
+    /// #2490: a hosted publish must invalidate the computed-packument cache
+    /// on EVERY replica, not only the one that handled the publish.
+    ///
+    /// Simulates two replicas as two process-local `SharedState`s sharing one
+    /// database: replica B warms its virtual-repo packument cache (both the
+    /// full and the abbreviated/corgi Accept variants — the two documents one
+    /// `npm pack`/`npm install` resolves), replica A publishes a new version
+    /// with a `canary` dist-tag, and replica B — whose cached entries would
+    /// otherwise serve the pre-publish packument as *fresh* for the whole
+    /// fresh TTL (300 s here) — must converge through the Postgres NOTIFY
+    /// fanout within seconds, coherently across both variants. Also asserts
+    /// read-your-writes on the publishing replica itself, immediately and
+    /// without polling. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_invalidates_virtual_packument_across_replicas() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cache_invalidation;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // A virtual repo with the hosted repo as its only member: reads go
+        // through the virtual (cached), publishes to the hosted member.
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&fx.pool, "virtual", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+
+        // "Replica B": its own in-process packument cache over the same
+        // database, with its cross-replica invalidation listener running.
+        let state_b = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let _listener_b = cache_invalidation::start_cache_invalidation_listener(
+            fx.pool.clone(),
+            cache_invalidation::CacheInvalidationHandles {
+                repo_cache: state_b.repo_cache.clone(),
+                permission_service: state_b.permission_service.clone(),
+                npm_packument_cache: state_b.npm_packument_cache.clone(),
+            },
+            shutdown.clone(),
+        )
+        .await;
+
+        // v1.0.0 exists before the caches are warmed.
+        let path = "widget/1.0.0/widget-1.0.0.tgz";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            path,
+            "widget",
+            "1.0.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        let base_url = "http://localhost";
+        let full_headers = HeaderMap::new();
+        let mut corgi_headers = HeaderMap::new();
+        corgi_headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.npm.install-v1+json".parse().unwrap(),
+        );
+
+        async fn packument_json(
+            state: &SharedState,
+            repo_key: &str,
+            base_url: &str,
+            headers: &HeaderMap,
+        ) -> serde_json::Value {
+            let resp =
+                super::get_package_metadata_cached(state, repo_key, "widget", base_url, headers)
+                    .await
+                    .unwrap_or_else(|r| panic!("packument read failed: HTTP {}", r.status()));
+            let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .expect("read packument body");
+            serde_json::from_slice(&bytes).expect("parse packument json")
+        }
+
+        // Warm replica B's cache in BOTH Accept variants and prove the warm
+        // state: without an invalidation these entries serve as fresh for the
+        // whole 300 s fresh TTL.
+        for headers in [&full_headers, &corgi_headers] {
+            let json = packument_json(&state_b, &virtual_key, base_url, headers).await;
+            assert!(
+                json["versions"]["1.0.0"].is_object(),
+                "warmed packument must contain the seeded version"
+            );
+        }
+        let warm_key = packument_cache::cache_key(&virtual_key, "widget", false, false, base_url);
+        assert!(
+            state_b
+                .npm_packument_cache
+                .as_ref()
+                .expect("test state has the packument cache enabled")
+                .lookup(&warm_key)
+                .await
+                .is_some(),
+            "replica B's virtual packument must be cached before the publish"
+        );
+
+        // Replica A publishes 2.0.0 with a `canary` dist-tag.
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz2");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "2.0.0": { "name": "widget", "version": "2.0.0" } },
+            "_attachments": { "widget-2.0.0.tgz": { "data": tarball_b64 } },
+            "dist-tags": { "canary": "2.0.0" }
+        });
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+        assert!(
+            published.is_ok(),
+            "publish should succeed: {:?}",
+            published.err().map(|r| r.status())
+        );
+
+        // Read-your-writes on the publishing replica: immediate, no polling.
+        let json_a = packument_json(&fx.state, &virtual_key, base_url, &full_headers).await;
+
+        // Replica B must converge via the NOTIFY fanout well before the
+        // 300 s fresh TTL; poll briefly for the asynchronous delivery. Both
+        // Accept variants must agree (the incoherence that split `npm pack`'s
+        // printed filename from its written bytes in #2490).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut converged = false;
+        while std::time::Instant::now() < deadline {
+            let full = packument_json(&state_b, &virtual_key, base_url, &full_headers).await;
+            let corgi = packument_json(&state_b, &virtual_key, base_url, &corgi_headers).await;
+            if [&full, &corgi].iter().all(|json| {
+                json["versions"]["2.0.0"].is_object() && json["dist-tags"]["canary"] == "2.0.0"
+            }) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Tear down before asserting so a failure never leaks DB state.
+        shutdown.cancel();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete virtual repo");
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+        fx.teardown().await;
+
+        assert!(
+            json_a["versions"]["2.0.0"].is_object() && json_a["dist-tags"]["canary"] == "2.0.0",
+            "publishing replica must read its own write immediately, got {:?}",
+            json_a["dist-tags"]
+        );
+        assert!(
+            converged,
+            "replica B must see 2.0.0 and dist-tags.canary coherently in both \
+             Accept variants within seconds of the publish (would take up to \
+             the fresh TTL + per-variant SWR reads without the fanout, #2490)"
+        );
+    }
+
     /// #2022: a direct `npm publish` to a `promotion_only` repository must be
     /// rejected with 409 CONFLICT; the same publish to a normal repository must
     /// still succeed. Skips when no test database is configured.

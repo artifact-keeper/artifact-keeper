@@ -1205,9 +1205,17 @@ impl NpmPackumentCache {
 }
 
 /// Drop every cached variant of `package` in the repository AND in every
-/// virtual repository containing it. Shared by the local-write invalidation
-/// path (publish, dist-tag change, delete) and the upstream feed consumer
-/// (#2249), so "a package changed" means the same thing from both directions.
+/// virtual repository containing it, then fan the invalidation out to every
+/// other replica over the Postgres `LISTEN`/`NOTIFY` channel (#2490).
+///
+/// Without the fanout, a hosted publish handled by one replica leaves the
+/// other replicas' process-local entries serving the pre-publish packument
+/// as *fresh* for the whole fresh window, and each (replica × Accept variant
+/// × encoding × base URL) entry only converges when its own SWR refresh is
+/// triggered by a read — so successive reads through a load balancer can
+/// disagree about the same dist-tag for hours. The fanout also bumps the
+/// receiving replicas' invalidation generations, so their in-flight computes
+/// started before this write cannot re-install pre-write data.
 pub async fn invalidate_package_and_virtuals(
     db: &sqlx::PgPool,
     cache: &NpmPackumentCache,
@@ -1215,10 +1223,17 @@ pub async fn invalidate_package_and_virtuals(
     repo_key: &str,
     package: &str,
 ) {
+    let mut repo_keys = vec![repo_key.to_string()];
     cache.invalidate_package(repo_key, package).await;
     for virtual_key in virtual_repo_keys(db, repo_id).await {
         cache.invalidate_package(&virtual_key, package).await;
+        repo_keys.push(virtual_key);
     }
+    // After the local invalidation, so the emitting replica's own delivery is
+    // an idempotent no-op and receiving replicas recompute from the already
+    // committed write.
+    crate::services::cache_invalidation::notify_npm_packument_invalidated(db, &repo_keys, package)
+        .await;
 }
 
 /// Keys of every virtual repository containing `repo_id` as a member.
