@@ -708,6 +708,36 @@ impl LdapService {
         &self.config.url
     }
 
+    /// Verify the configured service-account credentials via a real LDAP
+    /// simple bind (admin "test connection" flow, #2486).
+    ///
+    /// Unlike [`check_health`], which is a liveness probe that silently
+    /// passes when no service account is configured, this method exists to
+    /// answer "are these settings actually valid?": it connects with the
+    /// configured TLS/STARTTLS settings, performs a simple bind with the
+    /// configured bind DN and password, then unbinds. Error classification
+    /// (via [`Self::connect_and_bind`]) distinguishes a credential rejection
+    /// (`AppError::Authentication`) from connection-level failures
+    /// (`AppError::Internal`), and never includes the bind password.
+    pub async fn verify_bind(&self) -> Result<()> {
+        let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
+            (Some(dn), Some(pw)) if !dn.is_empty() => (dn.clone(), pw.clone()),
+            _ => {
+                return Err(AppError::Config(
+                    "LDAP bind credentials not configured".into(),
+                ))
+            }
+        };
+        let mut ldap = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.connect_and_bind(&bind_dn, &bind_pw),
+        )
+        .await
+        .map_err(|_| AppError::Internal("LDAP connection test timed out".into()))??;
+        ldap.unbind().await.ok();
+        Ok(())
+    }
+
     /// Probe LDAP connectivity by attempting a service-account bind.
     ///
     /// If a service account is configured, performs a real bind to verify
@@ -1955,5 +1985,136 @@ mod tests {
         let result = svc.check_health().await;
         // Should fail on empty URL check before attempting bind
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_bind (#2486): the admin test-connection flow must perform a real
+    // LDAP bind and report its true outcome, not just TCP reachability.
+    // -----------------------------------------------------------------------
+
+    /// LDAP resultCode for a bindResponse.
+    const LDAP_RC_SUCCESS: u8 = 0x00;
+    /// invalidCredentials (49).
+    const LDAP_RC_INVALID_CREDENTIALS: u8 = 0x31;
+
+    /// Spawn a minimal mock LDAP server on 127.0.0.1 that answers the first
+    /// request with a BER-encoded bindResponse (messageID 1) carrying the
+    /// given resultCode, then drains the connection. This is a server that is
+    /// perfectly REACHABLE over TCP — exactly the case where the old
+    /// TCP-probe-only test reported "Connection Successful" regardless of
+    /// whether the bind credentials were valid.
+    async fn spawn_mock_ldap_server(result_code: u8) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ldap listener");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                // Read the client's bindRequest (single small frame).
+                let _ = sock.read(&mut buf).await;
+                // SEQUENCE { messageID 1, [APPLICATION 1] bindResponse {
+                //   resultCode <rc>, matchedDN "", diagnosticMessage "" } }
+                let resp = [
+                    0x30,
+                    0x0c,
+                    0x02,
+                    0x01,
+                    0x01,
+                    0x61,
+                    0x07,
+                    0x0a,
+                    0x01,
+                    result_code,
+                    0x04,
+                    0x00,
+                    0x04,
+                    0x00,
+                ];
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.flush().await;
+                // Consume a possible unbindRequest before closing.
+                let _ = sock.read(&mut buf).await;
+            }
+        });
+        port
+    }
+
+    fn make_verify_bind_service(
+        port: u16,
+        bind_dn: Option<&str>,
+        bind_pw: Option<&str>,
+    ) -> LdapService {
+        let mut config = make_test_ldap_config();
+        config.url = format!("ldap://127.0.0.1:{port}");
+        config.bind_dn = bind_dn.map(String::from);
+        config.bind_password = bind_pw.map(String::from);
+        make_test_service(config)
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_rejected_credentials_reports_failure() {
+        // The server accepts the TCP connection but rejects the bind: the
+        // old reachability-only test reported success here (#2486); the
+        // real bind must surface an authentication failure.
+        let port = spawn_mock_ldap_server(LDAP_RC_INVALID_CREDENTIALS).await;
+        let svc = make_verify_bind_service(
+            port,
+            Some("cn=wrong,dc=example,dc=com"),
+            Some("bad-password"),
+        );
+
+        match svc.verify_bind().await {
+            Err(AppError::Authentication(msg)) => {
+                // The error must never leak the credentials being tested.
+                assert!(!msg.contains("bad-password"));
+                assert!(!msg.contains("cn=wrong"));
+            }
+            other => panic!("expected Authentication error for rejected bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_accepted_credentials_reports_success() {
+        let port = spawn_mock_ldap_server(LDAP_RC_SUCCESS).await;
+        let svc = make_verify_bind_service(
+            port,
+            Some("cn=admin,dc=example,dc=com"),
+            Some("correct-password"),
+        );
+
+        svc.verify_bind()
+            .await
+            .expect("bind accepted by server should verify");
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_unreachable_server_is_connection_error() {
+        // Reserve an ephemeral port, then drop the listener so the connect
+        // is refused: this must classify as a connection-level error, not a
+        // credential rejection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let svc =
+            make_verify_bind_service(port, Some("cn=admin,dc=example,dc=com"), Some("password"));
+
+        match svc.verify_bind().await {
+            Err(AppError::Internal(_)) => {}
+            other => panic!("expected Internal error for unreachable server, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_without_credentials_is_config_error() {
+        let svc = make_verify_bind_service(1, None, None);
+        match svc.verify_bind().await {
+            Err(AppError::Config(_)) => {}
+            other => panic!("expected Config error without credentials, got {other:?}"),
+        }
     }
 }
