@@ -746,10 +746,10 @@ async fn list_provider_versions(
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
 
-    // Get all versions with their platform info from metadata
+    // Get all stored packages with the inputs platform recovery needs.
     let artifacts = sqlx::query!(
         r#"
-        SELECT DISTINCT a.version, am.metadata as "metadata?"
+        SELECT DISTINCT a.version, a.path, am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -765,49 +765,12 @@ async fn list_provider_versions(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    // Group by version and collect platforms
-    let mut version_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
-        std::collections::BTreeMap::new();
-
-    for artifact in &artifacts {
-        let version = match &artifact.version {
-            Some(v) => v.clone(),
-            None => continue,
-        };
-
-        let platforms = version_map.entry(version).or_default();
-
-        if let Some(metadata) = &artifact.metadata {
-            let os = metadata
-                .get("os")
-                .and_then(|v| v.as_str())
-                .unwrap_or("linux");
-            let arch = metadata
-                .get("arch")
-                .and_then(|v| v.as_str())
-                .unwrap_or("amd64");
-
-            let platform = serde_json::json!({ "os": os, "arch": arch });
-            if !platforms.contains(&platform) {
-                platforms.push(platform);
-            }
-        }
-    }
-
-    let versions: Vec<serde_json::Value> = version_map
+    let rows: Vec<(String, Option<serde_json::Value>, String)> = artifacts
         .into_iter()
-        .map(|(version, platforms)| {
-            serde_json::json!({
-                "version": version,
-                "protocols": ["5.0"],
-                "platforms": if platforms.is_empty() {
-                    vec![serde_json::json!({"os": "linux", "arch": "amd64"})]
-                } else {
-                    platforms
-                },
-            })
-        })
+        .filter_map(|a| Some((a.version?, a.metadata, a.path)))
         .collect();
+
+    let versions = provider_versions_from_rows(&rows);
 
     if versions.is_empty() {
         return Err((
@@ -1482,6 +1445,41 @@ fn provider_platform_from(
         return None;
     }
     Some((os.to_string(), arch.to_string()))
+}
+
+/// Build the registry-protocol `versions` array from stored provider rows
+/// `(version, metadata, path)`. Each package's platform is recovered through
+/// [`provider_platform_from`] — the same rule the network mirror uses — so the
+/// `versions` route and the mirror advertise the same platforms. A package
+/// whose platform cannot be determined is omitted rather than advertised under
+/// a guessed one; a version whose packages are all unrecoverable is listed with
+/// an empty `platforms` array instead of a fabricated `linux`/`amd64` entry.
+fn provider_versions_from_rows(
+    rows: &[(String, Option<serde_json::Value>, String)],
+) -> Vec<serde_json::Value> {
+    let mut version_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+
+    for (version, metadata, path) in rows {
+        let platforms = version_map.entry(version.clone()).or_default();
+        if let Some((os, arch)) = provider_platform_from(metadata.as_ref(), path) {
+            let platform = serde_json::json!({ "os": os, "arch": arch });
+            if !platforms.contains(&platform) {
+                platforms.push(platform);
+            }
+        }
+    }
+
+    version_map
+        .into_iter()
+        .map(|(version, platforms)| {
+            serde_json::json!({
+                "version": version,
+                "protocols": ["5.0"],
+                "platforms": platforms,
+            })
+        })
+        .collect()
 }
 
 /// Split locally stored packages into the `(platforms, shasums)` pair
@@ -3358,6 +3356,106 @@ mod tests {
         );
         assert_eq!(provider_platform_from(None, "ns/type/1.0.0/_amd64"), None);
         assert_eq!(provider_platform_from(None, ""), None);
+    }
+
+    /// The `versions` route must advertise the platforms actually stored for
+    /// each version — recovered by the same rule as the mirror — not a guessed
+    /// `linux`/`amd64`. Fails against the old grouping, which defaulted missing
+    /// `os`/`arch` metadata keys to `linux`/`amd64`.
+    #[test]
+    fn test_provider_versions_from_rows_real_platforms() {
+        let rows = vec![
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({ "os": "darwin", "arch": "arm64" })),
+                "ns/type/1.0.0/darwin_arm64".to_string(),
+            ),
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({ "os": "linux", "arch": "amd64" })),
+                "ns/type/1.0.0/linux_amd64".to_string(),
+            ),
+            // Metadata row exists but has no os/arch keys: the platform must be
+            // recovered from the stored path (linux_arm64), not guessed.
+            (
+                "2.0.0".to_string(),
+                Some(serde_json::json!({ "kind": "provider" })),
+                "ns/type/2.0.0/linux_arm64".to_string(),
+            ),
+            // No metadata row at all: same path recovery.
+            (
+                "2.0.0".to_string(),
+                None,
+                "ns/type/2.0.0/darwin_amd64".to_string(),
+            ),
+        ];
+        assert_eq!(
+            provider_versions_from_rows(&rows),
+            vec![
+                serde_json::json!({
+                    "version": "1.0.0",
+                    "protocols": ["5.0"],
+                    "platforms": [
+                        { "os": "darwin", "arch": "arm64" },
+                        { "os": "linux", "arch": "amd64" },
+                    ],
+                }),
+                serde_json::json!({
+                    "version": "2.0.0",
+                    "protocols": ["5.0"],
+                    "platforms": [
+                        { "os": "linux", "arch": "arm64" },
+                        { "os": "darwin", "arch": "amd64" },
+                    ],
+                }),
+            ]
+        );
+    }
+
+    /// A version whose packages have no recoverable platform is still listed,
+    /// but with an empty `platforms` array — never a fabricated entry. Fails
+    /// against the old grouping, which emitted `linux`/`amd64` for it.
+    #[test]
+    fn test_provider_versions_from_rows_unrecoverable_platform_omitted() {
+        let rows = vec![(
+            "1.0.0".to_string(),
+            None,
+            "ns/type/1.0.0/noplatform".to_string(),
+        )];
+        assert_eq!(
+            provider_versions_from_rows(&rows),
+            vec![serde_json::json!({
+                "version": "1.0.0",
+                "protocols": ["5.0"],
+                "platforms": [],
+            })]
+        );
+    }
+
+    /// Duplicate rows for one platform (e.g. a metadata join fan-out) collapse
+    /// to a single platform entry.
+    #[test]
+    fn test_provider_versions_from_rows_dedupes_platforms() {
+        let rows = vec![
+            (
+                "1.0.0".to_string(),
+                Some(serde_json::json!({ "os": "linux", "arch": "amd64" })),
+                "ns/type/1.0.0/linux_amd64".to_string(),
+            ),
+            (
+                "1.0.0".to_string(),
+                None,
+                "ns/type/1.0.0/linux_amd64".to_string(),
+            ),
+        ];
+        assert_eq!(
+            provider_versions_from_rows(&rows),
+            vec![serde_json::json!({
+                "version": "1.0.0",
+                "protocols": ["5.0"],
+                "platforms": [{ "os": "linux", "arch": "amd64" }],
+            })]
+        );
     }
 
     #[test]
