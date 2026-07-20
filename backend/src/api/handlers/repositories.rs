@@ -3714,6 +3714,18 @@ pub struct ListArtifactsQuery {
     ///   referenced layer blobs.  The grouped rows are returned in the
     ///   `docker_tags` array.
     pub group_by: Option<String>,
+    /// Opaque keyset cursor for grouped listings (#2520). Pass the
+    /// `next_cursor` value from the previous response to fetch the next
+    /// page; `page` is ignored while a cursor is present. Supported by
+    /// `group_by=docker_tag` and by `group_by=maven_component` on remote
+    /// repositories; other listing modes ignore it.
+    pub cursor: Option<String>,
+    /// Total-count mode for grouped listings (#2520). `count=exact` runs a
+    /// dedicated COUNT query so `pagination.total` is exact; otherwise the
+    /// keyset-paged grouped listings report a cheap lower bound (rows seen
+    /// so far, +1 when another page exists) and `has_more` is the
+    /// authoritative "is there a next page" signal.
+    pub count: Option<String>,
 }
 
 /// `?version=` selector accepted by the artifact metadata/download routes on
@@ -3812,6 +3824,15 @@ pub struct ArtifactListResponse {
     /// Docker tag grouping.  Only present when `group_by=docker_tag`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_tags: Option<Vec<DockerTagResponse>>,
+    /// Opaque keyset cursor for the next page (#2520). Present on grouped
+    /// listings when another page exists; pass it back via `?cursor=`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether another page exists after this one (#2520). Only present on
+    /// keyset-paged grouped listings; authoritative regardless of the
+    /// `pagination.total` mode (exact vs lower bound).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
 }
 
 /// A Docker/OCI tag grouped by (image, tag).
@@ -3939,6 +3960,11 @@ pub async fn list_artifacts(
     let want_component_grouping =
         query.group_by.as_deref() == Some("maven_component") && is_maven_format;
 
+    // #2520: `count=exact` opts into a dedicated COUNT query on the grouped
+    // keyset-paged listings; everything else gets a cheap lower-bound total
+    // plus an authoritative `has_more`.
+    let count_exact = query.count.as_deref() == Some("exact");
+
     if want_component_grouping {
         return list_artifacts_grouped_by_maven_component(
             &artifact_service,
@@ -3947,6 +3973,8 @@ pub async fn list_artifacts(
             &key,
             query.path_prefix.as_deref(),
             query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
             page,
             per_page,
         )
@@ -3969,6 +3997,8 @@ pub async fn list_artifacts(
             &repo,
             &key,
             query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
             page,
             per_page,
         )
@@ -4100,6 +4130,8 @@ pub async fn list_artifacts(
         },
         components: None,
         docker_tags: None,
+        next_cursor: None,
+        has_more: None,
     }))
 }
 
@@ -4161,6 +4193,8 @@ async fn list_remote_cached_artifacts(
         },
         components: None,
         docker_tags: None,
+        next_cursor: None,
+        has_more: None,
     }))
 }
 
@@ -4591,10 +4625,21 @@ fn extract_secondary_files_from_metadata(
 
 /// Build a grouped-by-component response for Maven/Gradle repositories.
 ///
-/// Fetches all matching artifacts (up to 10 000), groups them by Maven GAV
-/// coordinates (groupId, artifactId, version), then paginates the resulting
-/// component list.  Files that cannot be parsed as Maven coordinates (e.g.
-/// top-level metadata) are silently skipped.
+/// Remote (proxy) repositories page the component list directly out of the
+/// package catalog with a `(name, version)` keyset (#2520) — no bounded
+/// in-memory materialization, so totals and page contents stay exact at any
+/// catalog size.
+///
+/// Hosted/local/virtual repositories still fetch a bounded batch (up to
+/// 10 000 files), group them by Maven GAV coordinates in memory, then
+/// paginate the resulting component list; above that bound totals and page
+/// contents truncate. Moving this path onto the catalog keyset as well is
+/// deferred (#2520): hosted `packages.name` rows are not reliably in the
+/// `groupId:artifactId` shape the catalog grouping requires (the generic
+/// upload/finalize paths write the bare artifact name, and version-less
+/// uploads produce no catalog row at all), so it first needs write-path
+/// normalization plus a data backfill. Files that cannot be parsed as Maven
+/// coordinates (e.g. top-level metadata) are silently skipped.
 #[allow(clippy::too_many_arguments)]
 async fn list_artifacts_grouped_by_maven_component(
     artifact_service: &ArtifactService,
@@ -4603,6 +4648,8 @@ async fn list_artifacts_grouped_by_maven_component(
     repo_key: &str,
     path_prefix: Option<&str>,
     search_query: Option<&str>,
+    cursor: Option<&str>,
+    count_exact: bool,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -4616,17 +4663,54 @@ async fn list_artifacts_grouped_by_maven_component(
     // Proxy-cached Maven artifacts ARE indexed into the package catalog
     // (`packages` / `package_versions`, written by
     // `ProxyService::index_cached_package`), so reconstruct the component list
-    // from there instead. Hosted/local/virtual grouping is unchanged below.
+    // from there instead, keyset-paged on `(name, version)` (#2520).
     if repo.repo_type == RepositoryType::Remote {
-        let components = maven_components_from_catalog(
+        let keyset = decode_cursor_param(cursor)?;
+        let offset = if keyset.is_some() {
+            0
+        } else {
+            i64::from(page - 1) * i64::from(per_page)
+        };
+        let format = format!("{:?}", repo.format).to_lowercase();
+        let mut components = maven_components_from_catalog(
             &state.db,
             repo.id,
             repo_key,
-            &format!("{:?}", repo.format).to_lowercase(),
+            &format,
             search_query,
+            keyset.as_ref(),
+            offset,
+            i64::from(per_page) + 1,
         )
         .await?;
-        return Ok(paginate_maven_components(components, page, per_page));
+        let has_more = components.len() > per_page as usize;
+        components.truncate(per_page as usize);
+        let next_cursor = if has_more {
+            components.last().map(|c| {
+                encode_keyset_cursor(&format!("{}:{}", c.group_id, c.artifact_id), &c.version)
+            })
+        } else {
+            None
+        };
+        let exact_total = if count_exact {
+            Some(count_maven_catalog_components(&state.db, repo.id, search_query).await?)
+        } else {
+            None
+        };
+        let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
+        return Ok(Json(ArtifactListResponse {
+            items: Vec::new(),
+            pagination: Pagination {
+                page,
+                per_page,
+                total,
+                total_pages: grouped_total_pages(total, per_page),
+            },
+            components: Some(components),
+            docker_tags: None,
+            next_cursor,
+            has_more: Some(has_more),
+        }));
     }
 
     let (artifacts, _total_files) = if repo.repo_type == RepositoryType::Virtual {
@@ -4688,43 +4772,147 @@ fn paginate_maven_components(
         },
         components: Some(page_components),
         docker_tags: None,
+        // The in-memory hosted/virtual path is still bounded by MAX_FETCH
+        // (#2520 defer note above); it does not advertise keyset paging.
+        next_cursor: None,
+        has_more: None,
     })
 }
 
-/// Build the Maven component list for a remote/proxy repository from the
-/// package catalog (#1999).
+/// Encode a two-part keyset cursor (#2520) as URL-safe base64 over a JSON
+/// pair, so arbitrary tag/name/version strings survive the round trip
+/// without a bespoke escaping scheme.
+fn encode_keyset_cursor(first: &str, second: &str) -> String {
+    use base64::Engine as _;
+    let payload = serde_json::json!([first, second]).to_string();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+}
+
+/// Decode a cursor produced by [`encode_keyset_cursor`]. Returns `None` for
+/// anything that is not URL-safe base64 over a JSON array of exactly two
+/// strings.
+fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let values: Vec<String> = serde_json::from_slice(&bytes).ok()?;
+    let mut it = values.into_iter();
+    match (it.next(), it.next(), it.next()) {
+        (Some(first), Some(second), None) => Some((first, second)),
+        _ => None,
+    }
+}
+
+/// Decode the optional `?cursor=` query parameter, mapping a malformed value
+/// to a 400-class validation error instead of silently restarting the walk
+/// from the beginning.
+fn decode_cursor_param(cursor: Option<&str>) -> Result<Option<(String, String)>> {
+    match cursor {
+        None => Ok(None),
+        Some(c) => decode_keyset_cursor(c).map(Some).ok_or_else(|| {
+            AppError::Validation(
+                "invalid `cursor` parameter: pass the `next_cursor` value from a previous response"
+                    .to_string(),
+            )
+        }),
+    }
+}
+
+/// `pagination.total` for a keyset-paged grouped listing (#2520): the exact
+/// COUNT when the client asked for it, otherwise a cheap lower bound (rows
+/// known so far, +1 when another page exists). `has_more` — not this value —
+/// is the authoritative next-page signal.
+fn grouped_listing_total(exact: Option<i64>, offset: i64, returned: usize, has_more: bool) -> i64 {
+    match exact {
+        Some(total) => total,
+        None => offset + returned as i64 + i64::from(has_more),
+    }
+}
+
+/// `total_pages` companion to [`grouped_listing_total`]; a lower bound
+/// whenever `total` is one.
+fn grouped_total_pages(total: i64, per_page: u32) -> u32 {
+    if total <= 0 {
+        0
+    } else {
+        ((total as f64) / (f64::from(per_page.max(1)))).ceil() as u32
+    }
+}
+
+/// SQL predicate matching catalog rows whose `name` splits into a non-empty
+/// `groupId:artifactId` pair on the FIRST `:` — exactly the rows
+/// [`split_maven_catalog_name`] accepts. Applied in both the page and the
+/// COUNT queries so exact totals agree with walkable page contents (#2520).
+const MAVEN_CATALOG_NAME_SHAPE_SQL: &str =
+    "POSITION(':' IN p.name) > 1 AND POSITION(':' IN p.name) < LENGTH(p.name)";
+
+/// Build one keyset page of the Maven component list for a remote/proxy
+/// repository from the package catalog (#1999, #2520).
 ///
 /// Proxy-cached Maven artifacts are indexed into `packages` /
 /// `package_versions` with `packages.name = "groupId:artifactId"` (see
 /// [`crate::services::proxy_service::maven_proxy_package_name`]). Each catalog
 /// row maps to one [`MavenComponentResponse`]; rows whose name does not split
-/// into `groupId:artifactId` are skipped defensively. Results are ordered by
-/// name for a stable, paginatable list.
+/// into `groupId:artifactId` are excluded in SQL (and re-checked defensively
+/// in Rust). Results are ordered by `(name, version)` — served by the
+/// `UNIQUE(repository_id, name, version)` index — and bounded by `limit`, so
+/// the previous unbounded `fetch_all` + in-memory pagination is gone: page
+/// contents stay exact at any catalog size. `keyset` takes precedence over
+/// `offset`; `offset` remains for shallow `page=`-style requests.
+#[allow(clippy::too_many_arguments)]
 async fn maven_components_from_catalog(
     db: &sqlx::PgPool,
     repository_id: Uuid,
     repo_key: &str,
     format: &str,
     search_query: Option<&str>,
+    keyset: Option<&(String, String)>,
+    offset: i64,
+    limit: i64,
 ) -> Result<Vec<MavenComponentResponse>> {
     use sqlx::Row;
 
     let search_pattern = search_query.map(|q| format!("%{}%", q));
 
-    let rows = sqlx::query(
-        r#"
-        SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at
-        FROM packages p
-        WHERE p.repository_id = $1
-          AND ($2::text IS NULL OR p.name ILIKE $2)
-        ORDER BY p.name ASC, p.version ASC
-        "#,
-    )
-    .bind(repository_id)
-    .bind(&search_pattern)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Internal(format!("Failed to list proxy package catalog: {e}")))?;
+    let mut sql = format!(
+        "SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at \
+         FROM packages p \
+         WHERE p.repository_id = $1 \
+           AND {MAVEN_CATALOG_NAME_SHAPE_SQL}"
+    );
+    let mut next_param = 2;
+    if search_pattern.is_some() {
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        next_param += 1;
+    }
+    if keyset.is_some() {
+        sql.push_str(&format!(
+            " AND (p.name, p.version) > (${}, ${})",
+            next_param,
+            next_param + 1
+        ));
+        next_param += 2;
+    }
+    sql.push_str(&format!(
+        " ORDER BY p.name ASC, p.version ASC LIMIT ${} OFFSET ${}",
+        next_param,
+        next_param + 1
+    ));
+
+    let mut query = sqlx::query(&sql).bind(repository_id);
+    if let Some(pattern) = &search_pattern {
+        query = query.bind(pattern);
+    }
+    if let Some((name, version)) = keyset {
+        query = query.bind(name.as_str()).bind(version.as_str());
+    }
+    let rows = query
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to list proxy package catalog: {e}")))?;
 
     let mut components = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4749,6 +4937,30 @@ async fn maven_components_from_catalog(
     }
 
     Ok(components)
+}
+
+/// Exact component count behind `?count=exact` for the remote-Maven grouped
+/// listing (#2520). Applies the same repository / name-shape / search filters
+/// as [`maven_components_from_catalog`] so the total always matches what a
+/// full cursor walk returns.
+async fn count_maven_catalog_components(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    search_query: Option<&str>,
+) -> Result<i64> {
+    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    let sql = format!(
+        "SELECT COUNT(*) FROM packages p \
+         WHERE p.repository_id = $1 \
+           AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
+           AND ($2::text IS NULL OR p.name ILIKE $2)"
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .bind(repository_id)
+        .bind(&search_pattern)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to count proxy package catalog: {e}")))
 }
 
 /// Split a proxy package-catalog name (`groupId:artifactId`) back into its
@@ -4870,25 +5082,51 @@ struct DockerTagRow {
 
 /// Build a grouped-by-tag response for Docker/OCI repositories.
 ///
-/// Fetches up to `MAX_FETCH` distinct (image, tag) rows from `oci_tags`,
-/// joined to the corresponding `artifacts` row to get the precomputed
-/// manifest+layers size. The grouped list is then paginated in memory.
+/// Pages directly on `oci_tags` with a `(name, tag)` keyset served by the
+/// `UNIQUE(repository_id, name, tag)` index (#2520): the previous
+/// implementation fetched up to 10 000 rows (running the per-row scan-status
+/// rollup for each) and then sorted/paged in memory, silently truncating
+/// totals and page contents above that bound. The artifacts-join and LATERAL
+/// scan rollup now only run for at most `per_page + 1` rows per request.
 ///
 /// Digest references (tags containing `:` such as `sha256:abc...`) are
 /// excluded, matching the OCI v2 `tags/list` filter.  An optional `q`
 /// substring is matched case-insensitively against the tag string so the
 /// web UI's tag-search input keeps working in grouped mode.
+#[allow(clippy::too_many_arguments)]
 async fn list_artifacts_grouped_by_docker_tag(
     state: &SharedState,
     repo: &crate::models::repository::Repository,
     repo_key: &str,
     search_query: Option<&str>,
+    cursor: Option<&str>,
+    count_exact: bool,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
-    const MAX_FETCH: i64 = 10_000;
+    let keyset = decode_cursor_param(cursor)?;
+    let offset = if keyset.is_some() {
+        0
+    } else {
+        i64::from(page - 1) * i64::from(per_page)
+    };
 
-    let rows = fetch_docker_tag_rows(&state.db, repo.id, search_query, MAX_FETCH).await?;
+    let mut rows = fetch_docker_tag_rows(
+        &state.db,
+        repo.id,
+        search_query,
+        keyset.as_ref(),
+        offset,
+        i64::from(per_page) + 1,
+    )
+    .await?;
+    let has_more = rows.len() > per_page as usize;
+    rows.truncate(per_page as usize);
+    let next_cursor = if has_more {
+        rows.last().map(|r| encode_keyset_cursor(&r.image, &r.tag))
+    } else {
+        None
+    };
 
     // For multi-arch image indexes, fold in each child manifest's size so
     // the surfaced number matches what `docker pull` actually downloads
@@ -4905,22 +5143,19 @@ async fn list_artifacts_grouped_by_docker_tag(
         fetch_index_child_sizes(&state.db, repo.id, &index_digests).await?
     };
 
-    let mut docker_tags: Vec<DockerTagResponse> = rows
+    // Rows arrive in (image, tag) order straight from the keyset index; no
+    // in-memory re-sort or slicing is needed.
+    let docker_tags: Vec<DockerTagResponse> = rows
         .into_iter()
         .map(|row| build_docker_tag_response(row, repo_key, &child_sizes))
         .collect();
 
-    // Stable lexical sort by (image, tag) for paging determinism.
-    docker_tags.sort_by(|a, b| (&a.image, &a.tag).cmp(&(&b.image, &b.tag)));
-
-    let total = docker_tags.len() as i64;
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
-    let offset = ((page - 1) * per_page) as usize;
-    let page_tags: Vec<DockerTagResponse> = docker_tags
-        .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .collect();
+    let exact_total = if count_exact {
+        Some(count_docker_tag_rows(&state.db, repo.id, search_query).await?)
+    } else {
+        None
+    };
+    let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
 
     Ok(Json(ArtifactListResponse {
         items: Vec::new(),
@@ -4928,10 +5163,12 @@ async fn list_artifacts_grouped_by_docker_tag(
             page,
             per_page,
             total,
-            total_pages,
+            total_pages: grouped_total_pages(total, per_page),
         },
         components: None,
-        docker_tags: Some(page_tags),
+        docker_tags: Some(docker_tags),
+        next_cursor,
+        has_more: Some(has_more),
     }))
 }
 
@@ -4995,39 +5232,57 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
     Some("partial".to_string())
 }
 
-/// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
-/// latest `scan_results` row. Returns at most `limit` rows.
+/// Shared FROM/JOIN + base WHERE for the docker-tag grouped listing, used by
+/// both the page and the COUNT queries so exact totals agree with walkable
+/// page contents (#2520).
 ///
-/// The join keys are deterministic strings produced by the OCI v2 push
-/// handler: every `oci_tags` row has a matching `artifacts` row at
-/// `path = v2/{image}/manifests/{tag}` (see `handle_put_manifest`).  We
-/// use `repository_id + path` so the join survives image renames.
+/// POSITION(':' IN tag) = 0 excludes digest references (sha256:...),
+/// matching the spec'd /v2/<name>/tags/list filter.
+///
+/// The artifacts join is by composed path because OCI artifact rows do
+/// not carry a back-reference to the oci_tags row; the push handler
+/// composes `v2/{image}/manifests/{tag}` deterministically. We use
+/// `repository_id + path` so the join survives image renames.
+const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
+            JOIN artifacts a
+              ON a.repository_id = t.repository_id
+             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
+             AND a.is_deleted = false"#;
+
+/// Base WHERE companion to [`DOCKER_TAG_ROWS_FROM_SQL`].
+const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
+              AND POSITION(':' IN t.tag) = 0"#;
+
+/// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
+/// latest `scan_results` rows. Returns at most `limit` rows, ordered by
+/// `(name, tag)`.
+///
+/// Paging is a `(name, tag)` keyset served by the
+/// `UNIQUE(repository_id, name, tag)` index (#2520); `keyset` takes
+/// precedence over `offset`, which remains for shallow `page=`-style
+/// requests. The LATERAL scan rollup therefore runs for at most `limit`
+/// rows instead of the whole repository.
+///
+/// Scan-status rollup (#1497): an artifact can have multiple scan_results
+/// rows, one per scan_type (grype, dependency-track, openscap, incus,
+/// ...). Returning only the most-recent row's status silently masked a
+/// failed format-native scanner whenever a generic scanner (e.g. grype)
+/// finished after it. We project per-scan-type latest rows and aggregate
+/// their statuses with `array_agg(DISTINCT ...)`; the Rust-side
+/// `rollup_scan_status` helper collapses the set into a single label
+/// (`completed`, `partial`, `failed`, `running`, `pending`) honoring the
+/// precedence in its doc comment.
 async fn fetch_docker_tag_rows(
     db: &sqlx::PgPool,
     repository_id: Uuid,
     search_query: Option<&str>,
+    keyset: Option<&(String, String)>,
+    offset: i64,
     limit: i64,
 ) -> Result<Vec<DockerTagRow>> {
     use sqlx::Row;
 
-    // POSITION(':' IN tag) = 0 excludes digest references (sha256:...),
-    // matching the spec'd /v2/<name>/tags/list filter.
-    //
-    // The artifacts join is by composed path because OCI artifact rows do
-    // not carry a back-reference to the oci_tags row; the push handler
-    // composes `v2/{image}/manifests/{tag}` deterministically.
-    //
-    // Scan-status rollup (#1497): an artifact can have multiple scan_results
-    // rows, one per scan_type (grype, dependency-track, openscap, incus,
-    // ...). Previously this query returned only the most-recent row's
-    // status via `ORDER BY created_at DESC LIMIT 1`, which silently masked
-    // a failed format-native scanner whenever a generic scanner (e.g.
-    // grype) finished after it. We now project per-scan-type latest rows
-    // and aggregate their statuses with `array_agg(DISTINCT ...)`; the
-    // Rust-side `rollup_scan_status` helper collapses the set into a
-    // single label (`completed`, `partial`, `failed`, `running`,
-    // `pending`) honoring the precedence in its doc comment.
-    let sql = if search_query.is_some() {
+    let mut sql = format!(
         r#"SELECT
                 a.id            AS artifact_id,
                 t.name          AS image,
@@ -5037,11 +5292,7 @@ async fn fetch_docker_tag_rows(
                 a.size_bytes    AS manifest_size_bytes,
                 t.updated_at    AS last_pushed_at,
                 s.statuses      AS scan_statuses
-            FROM oci_tags t
-            JOIN artifacts a
-              ON a.repository_id = t.repository_id
-             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
-             AND a.is_deleted = false
+            {DOCKER_TAG_ROWS_FROM_SQL}
             LEFT JOIN LATERAL (
                 SELECT array_agg(DISTINCT latest.status) AS statuses
                 FROM (
@@ -5052,58 +5303,42 @@ async fn fetch_docker_tag_rows(
                     ORDER BY sr.scan_type, sr.created_at DESC
                 ) latest
             ) s ON true
-            WHERE t.repository_id = $1
-              AND POSITION(':' IN t.tag) = 0
-              AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'
-            ORDER BY t.name, t.tag
-            LIMIT $3"#
-    } else {
-        r#"SELECT
-                a.id            AS artifact_id,
-                t.name          AS image,
-                t.tag           AS tag,
-                t.manifest_digest AS manifest_digest,
-                t.manifest_content_type AS manifest_content_type,
-                a.size_bytes    AS manifest_size_bytes,
-                t.updated_at    AS last_pushed_at,
-                s.statuses      AS scan_statuses
-            FROM oci_tags t
-            JOIN artifacts a
-              ON a.repository_id = t.repository_id
-             AND a.path = 'v2/' || t.name || '/manifests/' || t.tag
-             AND a.is_deleted = false
-            LEFT JOIN LATERAL (
-                SELECT array_agg(DISTINCT latest.status) AS statuses
-                FROM (
-                    SELECT DISTINCT ON (sr.scan_type)
-                        sr.status
-                    FROM scan_results sr
-                    WHERE sr.artifact_id = a.id
-                    ORDER BY sr.scan_type, sr.created_at DESC
-                ) latest
-            ) s ON true
-            WHERE t.repository_id = $1
-              AND POSITION(':' IN t.tag) = 0
-            ORDER BY t.name, t.tag
-            LIMIT $2"#
-    };
+            {DOCKER_TAG_ROWS_WHERE_SQL}"#
+    );
+    let mut next_param = 2;
+    if search_query.is_some() {
+        sql.push_str(&format!(
+            " AND LOWER(t.tag) LIKE '%' || LOWER(${next_param}) || '%'"
+        ));
+        next_param += 1;
+    }
+    if keyset.is_some() {
+        sql.push_str(&format!(
+            " AND (t.name, t.tag) > (${}, ${})",
+            next_param,
+            next_param + 1
+        ));
+        next_param += 2;
+    }
+    sql.push_str(&format!(
+        " ORDER BY t.name, t.tag LIMIT ${} OFFSET ${}",
+        next_param,
+        next_param + 1
+    ));
 
-    let rows = if let Some(q) = search_query {
-        sqlx::query(sql)
-            .bind(repository_id)
-            .bind(q)
-            .bind(limit)
-            .fetch_all(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-    } else {
-        sqlx::query(sql)
-            .bind(repository_id)
-            .bind(limit)
-            .fetch_all(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-    };
+    let mut query = sqlx::query(&sql).bind(repository_id);
+    if let Some(q) = search_query {
+        query = query.bind(q);
+    }
+    if let Some((name, tag)) = keyset {
+        query = query.bind(name.as_str()).bind(tag.as_str());
+    }
+    let rows = query
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
@@ -5140,6 +5375,29 @@ async fn fetch_docker_tag_rows(
         });
     }
     Ok(out)
+}
+
+/// Exact tag count behind `?count=exact` for the docker-tag grouped listing
+/// (#2520). Applies the same join + filters as [`fetch_docker_tag_rows`]
+/// (minus the scan rollup, which cannot change the row count) so the total
+/// always matches what a full cursor walk returns.
+async fn count_docker_tag_rows(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    search_query: Option<&str>,
+) -> Result<i64> {
+    let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
+    if search_query.is_some() {
+        sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
+    }
+    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    if let Some(q) = search_query {
+        query = query.bind(q);
+    }
+    query
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Sum the precomputed `artifacts.size_bytes` for each child manifest
@@ -8291,6 +8549,109 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Keyset cursor helpers for grouped listings (#2520)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keyset_cursor_round_trips_plain_values() {
+        let cursor = encode_keyset_cursor("library/postgres", "16-alpine");
+        assert_eq!(
+            decode_keyset_cursor(&cursor),
+            Some(("library/postgres".to_string(), "16-alpine".to_string()))
+        );
+    }
+
+    #[test]
+    fn keyset_cursor_round_trips_hostile_separator_values() {
+        // Values containing every plausible ad-hoc separator must survive:
+        // the cursor is JSON-under-base64, not a joined string.
+        let cursor = encode_keyset_cursor("com.example:artifact\"x", "1.0:beta,\n/2");
+        assert_eq!(
+            decode_keyset_cursor(&cursor),
+            Some((
+                "com.example:artifact\"x".to_string(),
+                "1.0:beta,\n/2".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn keyset_cursor_rejects_garbage() {
+        assert_eq!(decode_keyset_cursor("not base64!!"), None);
+        // Valid base64, not JSON.
+        use base64::Engine as _;
+        let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("hello");
+        assert_eq!(decode_keyset_cursor(&not_json), None);
+        // Valid JSON, wrong arity.
+        let one = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"["a"]"#);
+        assert_eq!(decode_keyset_cursor(&one), None);
+        let three = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"["a","b","c"]"#);
+        assert_eq!(decode_keyset_cursor(&three), None);
+    }
+
+    #[test]
+    fn decode_cursor_param_maps_none_and_errors() {
+        assert_eq!(decode_cursor_param(None).unwrap(), None);
+        let cursor = encode_keyset_cursor("app", "t000100");
+        assert_eq!(
+            decode_cursor_param(Some(&cursor)).unwrap(),
+            Some(("app".to_string(), "t000100".to_string()))
+        );
+        assert!(matches!(
+            decode_cursor_param(Some("@@@garbage@@@")),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn grouped_listing_total_prefers_exact_count() {
+        assert_eq!(grouped_listing_total(Some(10_001), 0, 100, true), 10_001);
+        // Exact wins even when the lower bound would differ.
+        assert_eq!(grouped_listing_total(Some(7), 500, 100, false), 7);
+    }
+
+    #[test]
+    fn grouped_listing_total_lower_bound_semantics() {
+        // Page mode: offset + rows on this page, +1 when another page exists.
+        assert_eq!(grouped_listing_total(None, 200, 100, true), 301);
+        // Final page: no +1.
+        assert_eq!(grouped_listing_total(None, 200, 42, false), 242);
+        // Cursor mode (offset 0, absolute position unknown): pure page bound.
+        assert_eq!(grouped_listing_total(None, 0, 100, true), 101);
+        // Empty listing.
+        assert_eq!(grouped_listing_total(None, 0, 0, false), 0);
+    }
+
+    #[test]
+    fn grouped_total_pages_rounds_up_and_handles_zero() {
+        assert_eq!(grouped_total_pages(0, 20), 0);
+        assert_eq!(grouped_total_pages(1, 20), 1);
+        assert_eq!(grouped_total_pages(20, 20), 1);
+        assert_eq!(grouped_total_pages(21, 20), 2);
+        assert_eq!(grouped_total_pages(10_001, 100), 101);
+    }
+
+    #[test]
+    fn artifact_list_response_serializes_keyset_fields_when_present() {
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 21,
+                total_pages: 2,
+            },
+            components: None,
+            docker_tags: Some(vec![]),
+            next_cursor: Some(encode_keyset_cursor("app", "t000020")),
+            has_more: Some(true),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"next_cursor\":"));
+        assert!(json.contains("\"has_more\":true"));
+    }
+
+    // -----------------------------------------------------------------------
     // HTTP Range parsing (#1785) — `Range: bytes=...` must produce 206 with the
     // correct window, 416 for out-of-bounds, and degrade to a full 200 for
     // multi-range / unparseable headers.
@@ -9854,6 +10215,8 @@ mod tests {
             },
             components: None,
             docker_tags: None,
+            next_cursor: None,
+            has_more: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         // components and docker_tags fields should be omitted when None
@@ -9885,6 +10248,8 @@ mod tests {
             },
             components: Some(vec![comp]),
             docker_tags: None,
+            next_cursor: None,
+            has_more: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"components\":["));
@@ -9915,6 +10280,8 @@ mod tests {
             },
             components: None,
             docker_tags: Some(vec![tag]),
+            next_cursor: None,
+            has_more: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"docker_tags\":["));
