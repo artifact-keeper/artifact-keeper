@@ -11,7 +11,9 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
-use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -1270,6 +1272,12 @@ async fn update_repo_security(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Scan configuration is a repository supply-chain control (scan_enabled /
+    // block_on_policy_violation / severity_threshold): disabling it must be
+    // repository administration, not artifact publishing. Same admin tier and
+    // fail-closed gate as the configuration subresources fixed in #2745
+    // (#2603 sibling, #2750).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
     let repo = repo.id;
 
     let svc = ScanConfigService::new(state.db.clone());
@@ -1442,6 +1450,13 @@ mod tests {
             body_of("update_repo_security").contains("require_repo_write_access("),
             "update_repo_security must call require_repo_write_access (xtenant)"
         );
+        assert!(
+            body_of("update_repo_security").contains("require_repo_admin("),
+            "update_repo_security must call require_repo_admin (#2750): scan \
+             configuration is a supply-chain control on the repository-admin \
+             tier; `write` (artifact publishing) must not suffice to disable \
+             scanning or the block-on-severity gate"
+        );
         for reader in ["get_repo_security", "list_repo_scans"] {
             assert!(
                 body_of(reader).contains("require_visible("),
@@ -1449,6 +1464,92 @@ mod tests {
                 reader
             );
         }
+    }
+
+    /// DB-backed (#2750, sibling of #2603): a non-admin member holding only
+    /// `write` (developer role via `grant_repo_access`, no fine-grained `admin`
+    /// grant) is DENIED `update_repo_security`, and the denied request must not
+    /// persist a scan config; granting the repository `admin` action lets it
+    /// through; a global admin always passes. Scan configuration gates the
+    /// vulnerability-scanning / block-on-severity supply chain, so write-level
+    /// access (artifact publishing) must not suffice to disable it.
+    #[tokio::test]
+    async fn update_repo_security_requires_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        // Write-level membership only (developer role): passes the tenant gate.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+
+        // The exploit shape: turn scanning and the block-on-severity gate off.
+        let body = || UpsertScanConfigRequest {
+            scan_enabled: Some(false),
+            block_on_policy_violation: Some(false),
+            ..Default::default()
+        };
+
+        // 1) Write-only member -> 403, and nothing persisted.
+        let denied = update_repo_security(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only member must be denied (403) update_repo_security: {denied:?}"
+        );
+        let persisted = ScanConfigService::new(pool.clone())
+            .get_config(repo_id)
+            .await
+            .expect("get_config");
+        assert!(
+            persisted.is_none(),
+            "denied update_repo_security must not persist a scan config"
+        );
+
+        // 2) Grant repository `admin` -> allowed. Rebuild state so the
+        // permission-service cache (which recorded the pre-grant deny above)
+        // is empty and the new grant is resolved from the database.
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = update_repo_security(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "repo-admin member must pass update_repo_security: {allowed:?}"
+        );
+
+        // 3) Global admin -> allowed.
+        let admin = tdh::admin_auth(Uuid::new_v4(), "root");
+        let admin_ok = update_repo_security(
+            State(state.clone()),
+            Extension(Some(admin)),
+            Path(key.clone()),
+            Json(UpsertScanConfigRequest {
+                scan_enabled: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            admin_ok.is_ok(),
+            "global admin must pass update_repo_security: {admin_ok:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Admin gate on the GLOBAL security-policy write handlers. The global

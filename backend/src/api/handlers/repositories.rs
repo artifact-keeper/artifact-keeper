@@ -220,7 +220,11 @@ async fn require_repo_fine_grained_action(
 /// fine-grained permission rules exist, matching the inline gate already used
 /// by `set_cache_ttl` / `set_npm_scope_policy` / `invalidate_cache`. Callers
 /// should invoke this AFTER [`require_repo_write_access`] (the tenant gate).
-async fn require_repo_admin(
+///
+/// `pub(crate)` so sibling handler modules with repository-configuration
+/// subresources (e.g. the per-repo scan/security config in `security.rs`,
+/// #2750) can apply the same gate instead of duplicating it.
+pub(crate) async fn require_repo_admin(
     auth: &AuthExtension,
     repo_id: Uuid,
     permission_service: &crate::services::permission_service::PermissionService,
