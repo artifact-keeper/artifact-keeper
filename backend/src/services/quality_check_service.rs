@@ -6,6 +6,8 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use sqlx::PgPool;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -22,6 +24,63 @@ const MAX_QUALITY_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const QUALITY_MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 const _: () = assert!(QUALITY_MMAP_THRESHOLD_BYTES < MAX_QUALITY_INPUT_BYTES);
+
+/// Default cap on how many artifact quality checks may run at once, across ALL
+/// trigger paths (upload auto-check, repo-wide re-check, admin re-check).
+///
+/// PF-006 (#2522): each `check_artifact` below stages the *whole* artifact body
+/// (heap, or spilled to an mmap-backed workspace file) and runs the checkers.
+/// A single large input is already bounded by [`MAX_QUALITY_INPUT_BYTES`] and
+/// the mmap spill, but the *number* of such checks in flight was not: upload
+/// finalization fire-and-forgets a detached `tokio::spawn` per artifact
+/// (`artifact_service.rs`), so a publish burst could start an unbounded number
+/// at once — multiplying storage reads, scratch bytes, and address space with
+/// no shared budget. This caps that count, making worst-case concurrent
+/// quality-check staging a deterministic `N × per-input-cap`. Mirrors the
+/// scanner's [`DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS`](crate::services::scanner_service)
+/// bound (#2540). A small default keeps the out-of-the-box worst case modest
+/// while still allowing parallel checks.
+const DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS: usize = 4;
+
+/// Env var overriding [`DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS`]. A blank,
+/// non-numeric, or zero value falls back to the default (a zero cap would wedge
+/// every check, so it is treated as "unset"; min effective 1).
+const MAX_CONCURRENT_QUALITY_CHECKS_ENV: &str = "MAX_CONCURRENT_QUALITY_CHECKS";
+
+/// Effective concurrent quality-check cap, honouring
+/// [`MAX_CONCURRENT_QUALITY_CHECKS_ENV`] over the default.
+fn max_concurrent_quality_checks() -> usize {
+    std::env::var(MAX_CONCURRENT_QUALITY_CHECKS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS)
+}
+
+/// Process-wide FIFO semaphore bounding concurrent quality checks. Seeded once
+/// from [`max_concurrent_quality_checks`]; every `check_artifact` holds one
+/// permit across the stage-and-check body. Never `close()`d — it lives for the
+/// process lifetime. Mirrors `scanner_service::scan_extraction_semaphore`.
+fn quality_check_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_quality_checks())))
+}
+
+/// Acquire one quality-check permit from `sem`, blocking (FIFO) until one frees.
+/// A legitimate check must *complete* — only serialized under load, never shed —
+/// so a closed semaphore falls through to `None` rather than erroring, matching
+/// the scanner extraction-permit contract. Factored to take its semaphore
+/// explicitly (the `_from` seam) so unit tests drive it with a local cap-N
+/// semaphore instead of the process static.
+async fn acquire_quality_check_permit_from(sem: Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    sem.acquire_owned().await.ok()
+}
+
+/// Process-wired entry point for [`acquire_quality_check_permit_from`], using
+/// the process-wide [`quality_check_semaphore`].
+async fn acquire_quality_check_permit() -> Option<OwnedSemaphorePermit> {
+    acquire_quality_check_permit_from(quality_check_semaphore().clone()).await
+}
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
@@ -130,6 +189,20 @@ impl QualityCheckService {
                         artifact.repository_id, e
                     ))
                 })?;
+
+        // PF-006 (#2522): bound total in-flight quality checks across ALL
+        // trigger paths before doing any heavy work. Everything from here on
+        // stages the full artifact body (heap or mmap spill) and runs the
+        // checkers; upload finalization fire-and-forgets one detached
+        // `tokio::spawn` per artifact, so a publish burst could otherwise start
+        // an unbounded number of these at once with no shared resource budget.
+        // The permit is held for the rest of the method, so peak concurrent
+        // checks are capped at `max_concurrent_quality_checks()`. A legitimate
+        // check is only serialized under load, never shed. Mirrors the
+        // scanner's #2540 extraction-permit bound. Acquired after the cheap
+        // metadata lookups so a queued check holds no storage handle while it
+        // waits.
+        let _qc_permit = acquire_quality_check_permit().await;
 
         // 4. Fetch artifact content from storage
         let content = self.fetch_artifact_content(&artifact).await?;
@@ -1450,6 +1523,93 @@ mod tests {
             .await
             .expect("empty staging");
         assert!(out.is_empty());
+    }
+
+    /// PF-006 (#2522): prove the quality-check concurrency semaphore actually
+    /// bounds peak in-flight checks. Drives the production
+    /// [`acquire_quality_check_permit_from`] seam with a *local* cap-N semaphore
+    /// (the process `OnceLock` reads env once per binary and cannot be resized
+    /// per test). Fire N+1 tasks against a cap-N semaphore; assert observed peak
+    /// concurrency never exceeds N and every task still completes (FIFO queue,
+    /// never shed). Mirrors `scanner_service`'s #2540 bound test.
+    #[tokio::test]
+    async fn test_quality_check_semaphore_bounds_peak_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 2;
+        const TASKS: usize = 5;
+
+        let sem = Arc::new(Semaphore::new(CAP));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let sem = sem.clone();
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            let done = done.clone();
+            handles.push(tokio::spawn(async move {
+                // Acquire through the real production seam, then hold the permit
+                // long enough for contention to be observable.
+                let _permit = acquire_quality_check_permit_from(sem).await;
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "peak concurrency {} exceeded cap {}",
+            peak.load(Ordering::SeqCst),
+            CAP
+        );
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            TASKS,
+            "every queued quality check must complete (FIFO queue, never shed)"
+        );
+    }
+
+    /// The concurrent-check cap honours a valid env override and falls back to
+    /// the default on a blank/zero/garbage value (a zero cap would wedge every
+    /// check). Single test owns the env var; save/restore keeps it correct
+    /// under a shared-process `cargo test` run too.
+    #[test]
+    fn test_max_concurrent_quality_checks_env_override() {
+        let saved = std::env::var(MAX_CONCURRENT_QUALITY_CHECKS_ENV).ok();
+
+        std::env::set_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV, "9");
+        assert_eq!(max_concurrent_quality_checks(), 9);
+
+        // Zero / blank / garbage all fall back to the default.
+        std::env::set_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV, "0");
+        assert_eq!(
+            max_concurrent_quality_checks(),
+            DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS
+        );
+        std::env::set_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV, "  ");
+        assert_eq!(
+            max_concurrent_quality_checks(),
+            DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS
+        );
+        std::env::remove_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV);
+        assert_eq!(
+            max_concurrent_quality_checks(),
+            DEFAULT_MAX_CONCURRENT_QUALITY_CHECKS
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV, v),
+            None => std::env::remove_var(MAX_CONCURRENT_QUALITY_CHECKS_ENV),
+        }
     }
 
     // -----------------------------------------------------------------------
