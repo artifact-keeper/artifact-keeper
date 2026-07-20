@@ -28,7 +28,6 @@ use crate::services::audit_service::{
 };
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
-use std::sync::atomic::Ordering;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
 /// issues never break the auth flow.
@@ -122,8 +121,13 @@ pub struct SetupStatusResponse {
     )
 )]
 pub async fn setup_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    // Re-check the DB when the local flag still says setup is pending: the
+    // password change may have completed on another replica, and this
+    // endpoint is what the web UI uses to decide whether to show the
+    // first-time-setup flow (#2492). `setup_still_required` latches the
+    // process-local flag to false once the DB confirms completion.
     Json(serde_json::json!({
-        "setup_required": state.setup_required.load(Ordering::Relaxed)
+        "setup_required": state.setup_still_required().await
     }))
 }
 

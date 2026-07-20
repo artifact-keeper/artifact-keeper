@@ -254,6 +254,55 @@ impl AppState {
         }
     }
 
+    /// Return whether initial setup (the forced admin password change) is
+    /// still required, re-checking the database when the process-local flag
+    /// says it is.
+    ///
+    /// `setup_required` is per-process state: it is seeded from the DB once
+    /// at startup and cleared by the change-password handler — but only on
+    /// the replica that served that request. In a multi-replica deployment
+    /// every OTHER replica kept blocking the API (and reporting setup mode)
+    /// until it was restarted (#2492). This method makes the DB row the
+    /// authority: while the local flag is still `true`, consult
+    /// `users.must_change_password` for the admin account and latch the flag
+    /// to `false` once the DB confirms setup completed. The flag never flips
+    /// back to `true` at runtime, so after the first confirmation no further
+    /// queries are issued.
+    ///
+    /// Fails closed: if the DB cannot be reached the setup lock is kept.
+    pub async fn setup_still_required(&self) -> bool {
+        if !self
+            .setup_required
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND must_change_password = true)",
+        )
+        .fetch_one(&self.db)
+        .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                self.setup_required
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "Setup completed (admin password was changed, possibly on another replica). \
+                     API unlocked without restart."
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not re-check setup state in the database; keeping the setup lock"
+                );
+                true
+            }
+        }
+    }
+
     /// Get the storage backend for a given repository.
     ///
     /// Delegates to the `StorageRegistry` which handles filesystem backends
