@@ -640,6 +640,8 @@ pub async fn ldap_login(
         bind_password.as_deref(),
         &row.user_base_dn,
         &row.user_filter,
+        row.group_base_dn.as_deref(),
+        row.group_filter.as_deref(),
         &row.username_attribute,
         &row.email_attribute,
         &row.display_name_attribute,
@@ -666,6 +668,12 @@ pub async fn ldap_login(
         }
     };
 
+    // Keep copies for the group sync below; the `ldap_user` fields move
+    // into FederatedCredentials.
+    let ldap_dn = ldap_user.dn.clone();
+    let ldap_username = ldap_user.username.clone();
+    let ldap_member_of = ldap_user.groups.clone();
+
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -684,6 +692,30 @@ pub async fn ldap_login(
             },
         )
         .await?;
+
+    // Issue #2468: when group sync is configured (group_base_dn and/or
+    // group_filter set), reflect the user's LDAP/AD groups as Artifact
+    // Keeper group memberships through the shared external-group
+    // reconciler (same mechanism as OIDC #1094 / SAML #2333): groups are
+    // auto-created tagged external_source = 'ldap', memberships upserted,
+    // and stale 'ldap'-managed memberships pruned per provider. Non-fatal:
+    // login still succeeds if the directory or DB hiccups.
+    if ldap_svc.group_sync_configured() {
+        let group_names = ldap_svc
+            .resolve_group_names(&ldap_dn, &ldap_username, &ldap_member_of)
+            .await;
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "ldap", &group_names)
+                .await
+        {
+            tracing::warn!(
+                user_id = %user.id,
+                provider_id = %id,
+                error = %e,
+                "Failed to sync LDAP groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     audit_federated_login(
         &state,
@@ -1221,10 +1253,10 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
             "#,
         )
         .bind(name)
-        .bind(if source == "saml" {
-            format!("Auto-created from SAML group attribute: {name}")
-        } else {
-            format!("Auto-created from OIDC group claim: {name}")
+        .bind(match source {
+            "saml" => format!("Auto-created from SAML group attribute: {name}"),
+            "ldap" => format!("Auto-created from LDAP group: {name}"),
+            _ => format!("Auto-created from OIDC group claim: {name}"),
         })
         .bind(source)
         .bind(provider_id)
@@ -3039,6 +3071,61 @@ mod tests {
             );
 
             cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // LDAP variant (#2468) — same reconciler via the "ldap" source from
+        // the ldap_login handler. Groups resolved from AD memberOf / group
+        // search are auto-created tagged external_source = 'ldap' and stale
+        // ldap-managed memberships are pruned on the next login.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_ldap_sync_creates_groups_tagged_ldap_and_prunes() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let devops = rand_group_name("ldap-devops");
+            let qa = rand_group_name("ldap-qa");
+
+            // First login: user is in both AD groups.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                &[devops.clone(), qa.clone()],
+            )
+            .await
+            .expect("first ldap sync");
+
+            let devops_id = group_id_by_name(&pool, &devops).await.expect("devops");
+            let qa_id = group_id_by_name(&pool, &qa).await.expect("qa");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(user_is_in_group(&pool, user_id, qa_id).await);
+            assert_eq!(
+                group_external_source(&pool, devops_id).await.as_deref(),
+                Some("ldap")
+            );
+
+            // Second login: dropped from qa in AD -> membership pruned,
+            // devops survives.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                std::slice::from_ref(&devops),
+            )
+            .await
+            .expect("second ldap sync");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(!user_is_in_group(&pool, user_id, qa_id).await);
+
+            cleanup_groups(&pool, &[devops_id, qa_id]).await;
             cleanup_user(&pool, user_id).await;
         }
 
