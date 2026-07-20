@@ -614,15 +614,68 @@ impl AzureBackend {
         }
     }
 
+    /// URI path of the configured custom endpoint, without a trailing slash.
+    ///
+    /// Empty for host-style endpoints where the account is in the hostname
+    /// (`https://{account}.blob.core.windows.net`, Azure Government/China).
+    /// Non-empty for path-style endpoints where the account lives in the URL
+    /// path instead, e.g. Azurite: `http://azurite:10000/devstoreaccount1`
+    /// yields `/devstoreaccount1`.
+    fn endpoint_uri_path(&self) -> String {
+        let Some(endpoint) = self.config.endpoint.as_deref() else {
+            return String::new();
+        };
+        let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
+        match after_scheme.split_once('/') {
+            Some((_, path)) => {
+                let path = path.trim_end_matches('/');
+                if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{}", path)
+                }
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Canonicalized resource for a Shared Key string-to-sign:
+    /// `/{account}` followed by the URI path of the request
+    /// (endpoint path + `/{container}/{key}`), per the Shared Key spec.
+    ///
+    /// Host-style (cloud) URLs have an empty endpoint path, giving the
+    /// familiar `/{account}/{container}/{key}`. Path-style endpoints
+    /// (Azurite, custom emulator hosts) carry the account in the URI path,
+    /// so the account segment appears twice:
+    /// `/{account}/{account}/{container}/{key}`. Signing the host-style
+    /// form against a path-style endpoint makes the server-side MAC
+    /// mismatch, so every request fails with 403 AuthorizationFailure.
+    fn shared_key_canonicalized_resource(&self, key: &str) -> String {
+        format!(
+            "/{}{}/{}/{}",
+            self.config.account_name,
+            self.endpoint_uri_path(),
+            self.config.container_name,
+            key
+        )
+    }
+
     /// String-to-sign for a single-shot Put Blob request in Shared Key mode.
     fn put_blob_string_to_sign(&self, content_length: u64, date_str: &str, key: &str) -> String {
         format!(
-            "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
+            "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n{}",
             Self::content_length_field(content_length),
             date_str,
-            self.config.account_name,
-            self.config.container_name,
-            key
+            self.shared_key_canonicalized_resource(key)
+        )
+    }
+
+    /// String-to-sign for a Delete Blob request in Shared Key mode.
+    fn delete_blob_string_to_sign(&self, date_str: &str, key: &str) -> String {
+        format!(
+            "DELETE\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2021-06-08\n{}",
+            date_str,
+            self.shared_key_canonicalized_resource(key)
         )
     }
 
@@ -857,10 +910,7 @@ impl AzureBackend {
 
         match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => {
-                let string_to_sign = format!(
-                    "DELETE\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
-                    date_str, self.config.account_name, self.config.container_name, key
-                );
+                let string_to_sign = self.delete_blob_string_to_sign(&date_str, key);
                 let auth_header =
                     Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
 
@@ -1683,6 +1733,25 @@ mod tests {
         AzureBackend::new(create_test_config()).await.unwrap()
     }
 
+    /// Shared Key backend against a custom endpoint (host-style or path-style).
+    async fn create_test_backend_with_endpoint(endpoint: &str) -> AzureBackend {
+        let mut config = create_test_config();
+        config.endpoint = Some(endpoint.to_string());
+        AzureBackend::new(config).await.unwrap()
+    }
+
+    /// Shared Key backend against a path-style Azurite endpoint using the
+    /// well-known Azurite dev account and key.
+    async fn create_azurite_backend() -> AzureBackend {
+        let mut config = create_test_config();
+        config.account_name = "devstoreaccount1".to_string();
+        config.access_key = Some(
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_string(),
+        );
+        config.endpoint = Some("http://azurite:10000/devstoreaccount1".to_string());
+        AzureBackend::new(config).await.unwrap()
+    }
+
     /// Create an RBAC backend directly without reading env vars.
     fn create_rbac_backend(credential: TokenCredentialSource) -> AzureBackend {
         let client = reqwest::Client::new();
@@ -1876,6 +1945,107 @@ mod tests {
         let fields: Vec<&str> = string_to_sign.split('\n').collect();
         assert_eq!(fields[3], "1234");
         assert!(string_to_sign.ends_with("/testaccount/testcontainer/test/blob"));
+    }
+
+    // ── Shared Key canonicalized resource: host-style vs path-style ──────
+
+    #[tokio::test]
+    async fn test_canonicalized_resource_default_host_style() {
+        let backend = create_test_backend().await;
+        assert_eq!(
+            backend.shared_key_canonicalized_resource("test/blob"),
+            "/testaccount/testcontainer/test/blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonicalized_resource_host_style_custom_endpoint() {
+        // Azure Government/China endpoints keep the account in the hostname;
+        // the endpoint URI path is empty, so the resource is unchanged.
+        let backend =
+            create_test_backend_with_endpoint("https://testaccount.blob.core.usgovcloudapi.net")
+                .await;
+        assert_eq!(
+            backend.shared_key_canonicalized_resource("test/blob"),
+            "/testaccount/testcontainer/test/blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonicalized_resource_path_style_endpoint() {
+        // Azurite-style endpoints carry the account in the URI path, so the
+        // canonicalized resource must repeat the account segment (#2649).
+        let backend = create_azurite_backend().await;
+        assert_eq!(
+            backend.shared_key_canonicalized_resource("test/blob"),
+            "/devstoreaccount1/devstoreaccount1/testcontainer/test/blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canonicalized_resource_path_style_endpoint_trailing_slash() {
+        let mut config = create_test_config();
+        config.account_name = "devstoreaccount1".to_string();
+        config.endpoint = Some("http://azurite:10000/devstoreaccount1/".to_string());
+        let backend = AzureBackend::new(config).await.unwrap();
+        assert_eq!(
+            backend.shared_key_canonicalized_resource("test/blob"),
+            "/devstoreaccount1/devstoreaccount1/testcontainer/test/blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_string_to_sign_path_style_endpoint() {
+        let backend = create_azurite_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(1234, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        assert!(
+            string_to_sign
+                .ends_with("\n/devstoreaccount1/devstoreaccount1/testcontainer/test/blob"),
+            "path-style canonicalized resource must repeat the account segment: {string_to_sign}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_string_to_sign_path_style_endpoint() {
+        let backend = create_azurite_backend().await;
+        let string_to_sign =
+            backend.delete_blob_string_to_sign("Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        assert!(string_to_sign.starts_with("DELETE\n"));
+        assert!(string_to_sign
+            .ends_with("\n/devstoreaccount1/devstoreaccount1/testcontainer/test/blob"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_string_to_sign_host_style_unchanged() {
+        let backend = create_test_backend().await;
+        let string_to_sign =
+            backend.delete_blob_string_to_sign("Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        assert!(string_to_sign.ends_with("\n/testaccount/testcontainer/test/blob"));
+    }
+
+    #[tokio::test]
+    async fn test_shared_key_signature_path_style_known_vector() {
+        // Known-answer test: HMAC-SHA256 of the path-style Put Blob
+        // string-to-sign under the well-known Azurite dev key, computed
+        // independently. This is the exact signature Azurite expects for
+        // this request; the pre-fix (host-style) string-to-sign yields
+        // p1gAk9qQO701vu30rw4M3ucFgCZ/101aIm5HGR8eN00= instead, which
+        // Azurite rejects with 403 AuthorizationFailure.
+        let backend = create_azurite_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(4, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        let decoded_key = match &backend.auth {
+            AzureAuthMode::SharedKey { decoded_key } => decoded_key.clone(),
+            _ => unreachable!("test backend uses Shared Key auth"),
+        };
+        let header =
+            AzureBackend::shared_key_auth(&decoded_key, "devstoreaccount1", &string_to_sign)
+                .unwrap();
+        assert_eq!(
+            header,
+            "SharedKey devstoreaccount1:b0RVKgjLFrvt4fqAuLLg3E+hGrJPhIU4Qr31NgdGlC8="
+        );
     }
 
     // ── SAS URL generation (Shared Key only) ─────────────────────────────
