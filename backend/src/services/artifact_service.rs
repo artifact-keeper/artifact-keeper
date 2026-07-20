@@ -1588,7 +1588,16 @@ impl ArtifactService {
         Ok(artifact)
     }
 
-    /// List artifacts in a repository with pagination and optional search
+    /// List artifacts in a repository with pagination and optional search.
+    ///
+    /// Legacy offset+exact-count entry point: still used by callers that
+    /// need `(page, total)` semantics over a bounded batch (e.g. the hosted
+    /// Maven component grouping's `MAX_FETCH` scan). The flat catalog
+    /// listing pages via [`list_page`] / [`count`] instead so it never pays
+    /// an exact COUNT per request (PF-001 / #2518).
+    ///
+    /// [`list_page`]: Self::list_page
+    /// [`count`]: Self::count
     pub async fn list(
         &self,
         repository_id: Uuid,
@@ -1597,11 +1606,48 @@ impl ArtifactService {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<Artifact>, i64)> {
+        let artifacts = self
+            .list_page(
+                repository_id,
+                path_prefix,
+                search_query,
+                None,
+                offset,
+                limit,
+            )
+            .await?;
+        let total = self.count(repository_id, path_prefix, search_query).await?;
+        Ok((artifacts, total))
+    }
+
+    /// One keyset page of a repository's artifact listing, ordered by `path`
+    /// and bounded to O(page) rows via the `(repository_id, path)` unique
+    /// index (PF-001 / #2518).
+    ///
+    /// `after_path` is the last `path` of the previous page (exclusive
+    /// keyset bound); `offset` supports legacy `page=N` addressing when no
+    /// cursor is supplied (pass 0 with a cursor). The caller passes
+    /// `limit = per_page + 1` and uses the extra row as the authoritative
+    /// `has_more` signal (#2520 pattern). No COUNT is performed; pair with
+    /// [`count`] behind an explicit `?count=exact` opt-in.
+    ///
+    /// Uses runtime query binding (`sqlx::query_as`) rather than the
+    /// compile-time macro so that no `.sqlx` offline cache entry is required.
+    ///
+    /// [`count`]: Self::count
+    pub async fn list_page(
+        &self,
+        repository_id: Uuid,
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        after_path: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Artifact>> {
         let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
-        let artifacts = sqlx::query_as!(
-            Artifact,
+        let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
             SELECT
                 id, repository_id, path, name, version, size_bytes,
@@ -1613,20 +1659,39 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2)
-              AND ($5::text IS NULL OR LOWER(name) LIKE $5 OR LOWER(path) LIKE $5)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($4::text IS NULL OR path > $4)
             ORDER BY path
-            OFFSET $3
-            LIMIT $4
+            LIMIT $5 OFFSET $6
             "#,
-            repository_id,
-            prefix_pattern,
-            offset,
-            limit,
-            search_pattern,
         )
+        .bind(repository_id)
+        .bind(&prefix_pattern)
+        .bind(&search_pattern)
+        .bind(after_path)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
+    }
+
+    /// Exact match count for [`list_page`]'s filters. Runs a full count over
+    /// every matching row, so callers keep it behind an explicit
+    /// `?count=exact` opt-in rather than paying it on every page (#2520
+    /// pattern).
+    ///
+    /// [`list_page`]: Self::list_page
+    pub async fn count(
+        &self,
+        repository_id: Uuid,
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+    ) -> Result<i64> {
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total = sqlx::query_scalar!(
             r#"
@@ -1645,7 +1710,7 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((artifacts, total))
+        Ok(total)
     }
 
     /// List artifacts across multiple repositories with pagination and optional search.
@@ -1666,6 +1731,42 @@ impl ArtifactService {
     ) -> Result<(Vec<Artifact>, i64)> {
         if repo_ids.is_empty() {
             return Ok((Vec::new(), 0));
+        }
+        let artifacts = self
+            .list_for_repos_page(repo_ids, path_prefix, search_query, None, offset, limit)
+            .await?;
+        let total = self
+            .count_for_repos(repo_ids, path_prefix, search_query)
+            .await?;
+        Ok((artifacts, total))
+    }
+
+    /// One keyset page of the virtual (multi-repository) artifact listing,
+    /// ordered by `path` (PF-001 / #2518).
+    ///
+    /// Same de-duplication contract as [`list_for_repos`]: `DISTINCT ON
+    /// (path)` with earlier `repo_ids` entries shadowing later ones. The
+    /// `after_path` keyset bound is applied INSIDE the de-duplication
+    /// subquery, so a deep page only de-duplicates/sorts member rows past
+    /// the cursor instead of re-materializing the whole union per request.
+    /// `offset` supports legacy `page=N` addressing when no cursor is
+    /// supplied (pass 0 with a cursor); the caller passes
+    /// `limit = per_page + 1` and uses the extra row as `has_more` (#2520
+    /// pattern). Pair with [`count_for_repos`] behind `?count=exact`.
+    ///
+    /// [`list_for_repos`]: Self::list_for_repos
+    /// [`count_for_repos`]: Self::count_for_repos
+    pub async fn list_for_repos_page(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        after_path: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Artifact>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
         let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
@@ -1696,6 +1797,7 @@ impl ArtifactService {
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2)
                   AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
+                  AND ($6::text IS NULL OR a.path > $6)
                 ORDER BY a.path, repo_priority
             ) sub
             ORDER BY path
@@ -1708,9 +1810,32 @@ impl ArtifactService {
         .bind(offset)
         .bind(limit)
         .bind(&search_pattern)
+        .bind(after_path)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
+    }
+
+    /// Exact de-duplicated match count for [`list_for_repos_page`]'s
+    /// filters. Repeats the whole-union de-duplication, so callers keep it
+    /// behind an explicit `?count=exact` opt-in rather than paying it on
+    /// every page (#2520 pattern).
+    ///
+    /// [`list_for_repos_page`]: Self::list_for_repos_page
+    pub async fn count_for_repos(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+    ) -> Result<i64> {
+        if repo_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total: i64 = sqlx::query_scalar(
             r#"
@@ -1733,7 +1858,7 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((artifacts, total))
+        Ok(total)
     }
 
     /// Soft-delete an artifact
