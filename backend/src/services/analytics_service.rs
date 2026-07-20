@@ -49,6 +49,14 @@ pub struct RepositoryStorageBreakdown {
     pub artifact_count: i64,
     pub storage_bytes: i64,
     pub download_count: i64,
+    /// Downloads served by this repository's remote pull-through proxy
+    /// (`proxy_download_statistics`, #2537/#2704). Proxy-cached objects carry
+    /// no `artifacts` row (#1280), so these serves are counted in a sibling
+    /// table and were previously not readable through any API. Kept separate
+    /// from `download_count` (hosted serves) so existing consumers are
+    /// unaffected; defaults to 0 when deserializing older payloads.
+    #[serde(default)]
+    pub proxy_download_count: i64,
     pub last_upload_at: Option<DateTime<Utc>>,
 }
 
@@ -86,6 +94,12 @@ pub struct GrowthSummary {
 pub struct DownloadTrend {
     pub date: NaiveDate,
     pub download_count: i64,
+    /// Proxy-served (pull-through) downloads for the day, from the sibling
+    /// `proxy_download_statistics` table (#2537/#2704). Additive: hosted
+    /// serves stay in `download_count` unchanged; defaults to 0 when
+    /// deserializing older payloads.
+    #[serde(default)]
+    pub proxy_download_count: i64,
 }
 
 impl AnalyticsService {
@@ -245,6 +259,9 @@ impl AnalyticsService {
                 (SELECT COUNT(*) FROM download_statistics ds
                  JOIN artifacts a2 ON a2.id = ds.artifact_id
                  WHERE a2.repository_id = r.id)::BIGINT as download_count,
+                (SELECT COUNT(*) FROM proxy_download_statistics pds
+                 JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id
+                 WHERE pca.repository_id = r.id)::BIGINT as proxy_download_count,
                 MAX(a.created_at) as last_upload_at
             FROM repositories r
             LEFT JOIN artifacts a ON a.repository_id = r.id AND a.is_deleted = false
@@ -379,6 +396,12 @@ impl AnalyticsService {
     }
 
     /// Get download trends (daily counts) for a date range.
+    ///
+    /// Hosted serves (`download_statistics`) and proxy pull-through serves
+    /// (`proxy_download_statistics`, #2537/#2704) are UNIONed by day — the
+    /// union `proxy_catalog::download_count_by_repo`'s docs anticipated —
+    /// and reported as separate fields so existing consumers of
+    /// `download_count` see unchanged values.
     pub async fn get_download_trends(
         &self,
         from: NaiveDate,
@@ -387,12 +410,20 @@ impl AnalyticsService {
         let trends = sqlx::query_as::<_, DownloadTrend>(
             r#"
             SELECT
-                downloaded_at::DATE as date,
-                COUNT(*) as download_count
-            FROM download_statistics
-            WHERE downloaded_at::DATE BETWEEN $1 AND $2
-            GROUP BY downloaded_at::DATE
-            ORDER BY downloaded_at::DATE ASC
+                u.date as date,
+                COALESCE(SUM(u.hosted), 0)::BIGINT as download_count,
+                COALESCE(SUM(u.proxied), 0)::BIGINT as proxy_download_count
+            FROM (
+                SELECT downloaded_at::DATE as date, 1 as hosted, 0 as proxied
+                FROM download_statistics
+                WHERE downloaded_at::DATE BETWEEN $1 AND $2
+                UNION ALL
+                SELECT downloaded_at::DATE as date, 0 as hosted, 1 as proxied
+                FROM proxy_download_statistics
+                WHERE downloaded_at::DATE BETWEEN $1 AND $2
+            ) u
+            GROUP BY u.date
+            ORDER BY u.date ASC
             "#,
         )
         .bind(from)
@@ -536,12 +567,17 @@ mod tests {
             artifact_count: 200,
             storage_bytes: 2_147_483_648,
             download_count: 10000,
+            proxy_download_count: 7,
             last_upload_at: Some(Utc::now()),
         };
         let json = serde_json::to_value(&breakdown).unwrap();
         assert_eq!(json["repository_key"], "maven-central");
         assert_eq!(json["format"], "maven");
         assert_eq!(json["artifact_count"], 200);
+        // #2704: the proxy serve count is an ADDITIVE sibling field; hosted
+        // `download_count` is unchanged.
+        assert_eq!(json["proxy_download_count"], 7);
+        assert_eq!(json["download_count"], 10000);
     }
 
     #[test]
@@ -554,6 +590,7 @@ mod tests {
             artifact_count: 0,
             storage_bytes: 0,
             download_count: 0,
+            proxy_download_count: 0,
             last_upload_at: None,
         };
         let json = serde_json::to_value(&breakdown).unwrap();
@@ -717,10 +754,13 @@ mod tests {
         let trend = DownloadTrend {
             date: NaiveDate::from_ymd_opt(2024, 6, 15).unwrap(),
             download_count: 42,
+            proxy_download_count: 3,
         };
         let json = serde_json::to_value(&trend).unwrap();
         assert_eq!(json["date"], "2024-06-15");
         assert_eq!(json["download_count"], 42);
+        // #2704: proxy serves surface as a separate additive field.
+        assert_eq!(json["proxy_download_count"], 3);
     }
 
     #[test]
@@ -729,5 +769,94 @@ mod tests {
         let trend: DownloadTrend = serde_json::from_str(json).unwrap();
         assert_eq!(trend.date, NaiveDate::from_ymd_opt(2024, 6, 15).unwrap());
         assert_eq!(trend.download_count, 100);
+        // Additive-compat: an older payload without the field defaults to 0.
+        assert_eq!(trend.proxy_download_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2704: proxy downloads are readable through the analytics read APIs
+    // (DB-backed; skips cleanly when DATABASE_URL is unset)
+    // -----------------------------------------------------------------------
+
+    /// A recorded proxy serve must be visible via BOTH analytics read
+    /// surfaces: the per-repo `storage/breakdown` `proxy_download_count`
+    /// (exactly 1 for a fresh repo) and the `downloads/trend` daily point.
+    /// Pre-#2704 neither field existed — `proxy_download_statistics` had no
+    /// HTTP-readable surface at all.
+    #[tokio::test]
+    async fn test_analytics_reads_surface_proxy_download_count_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "generic").await;
+
+        // Record one proxy serve through the canonical recorder (the same
+        // helper the serve paths call), which also ensures the catalog row.
+        crate::services::proxy_catalog::record_proxy_download(
+            &pool,
+            repo_id,
+            "files/obj.bin",
+            "proxy-cache/k/files/obj.bin/__content__",
+            "proxy-cache/k/files/obj.bin/__meta__",
+            None,
+            None,
+            Some("analytics-test"),
+        )
+        .await
+        .expect("record proxy download");
+
+        let service = AnalyticsService::new(pool.clone());
+
+        // Per-repo surface: the fresh repo reports exactly the one proxy
+        // serve, with zero hosted downloads.
+        let breakdown = service
+            .get_storage_breakdown()
+            .await
+            .expect("storage breakdown");
+        let row = breakdown
+            .iter()
+            .find(|b| b.repository_id == repo_id)
+            .expect("fresh repo present in breakdown");
+        let (proxy_count, hosted_count, row_key) = (
+            row.proxy_download_count,
+            row.download_count,
+            row.repository_key.clone(),
+        );
+
+        // Instance trend surface: today's point includes the proxy serve.
+        // (Shared test DB: other tests may add rows concurrently, so assert
+        // presence via >= 1, not an exact count.)
+        let today = chrono::Utc::now().date_naive();
+        let trends = service
+            .get_download_trends(today, today)
+            .await
+            .expect("download trends");
+        let today_proxy = trends
+            .iter()
+            .find(|t| t.date == today)
+            .map(|t| t.proxy_download_count)
+            .unwrap_or(0);
+
+        // Cleanup BEFORE asserting so a failure still leaves the DB clean
+        // (repo delete cascades the catalog + proxy stat rows).
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(row_key, repo_key);
+        assert_eq!(
+            proxy_count, 1,
+            "per-repo breakdown must surface the recorded proxy serve (#2704)"
+        );
+        assert_eq!(
+            hosted_count, 0,
+            "hosted download_count must be unchanged by proxy serves"
+        );
+        assert!(
+            today_proxy >= 1,
+            "downloads/trend must include today's proxy serve in proxy_download_count (#2704), got {today_proxy}"
+        );
     }
 }
