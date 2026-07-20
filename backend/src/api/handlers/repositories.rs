@@ -202,6 +202,44 @@ async fn require_repo_fine_grained_action(
     }
 }
 
+/// Require repository `admin` action (or global admin) for a repository
+/// administration / configuration subresource.
+///
+/// Repository configuration operations (upstream-auth credentials, upstream
+/// path-rewrite routing rules, PyPI `tracks` version-resolution declarations)
+/// are on the same administrative tier as `update_repository` /
+/// `delete_repository` / `set_cache_ttl` / `set_npm_scope_policy` /
+/// `invalidate_cache`, all of which already require the repository `admin`
+/// action. Holding only `write` (the ability to publish artifacts) must NOT
+/// confer the ability to reconfigure the repository's proxy/supply-chain
+/// behavior (#2603, area 3). Global admins bypass; every other caller must hold
+/// the `admin` action on the repository.
+///
+/// Unlike [`require_repo_fine_grained_action`], there is deliberately no
+/// rules-less fallthrough: configuration is admin-only regardless of whether
+/// fine-grained permission rules exist, matching the inline gate already used
+/// by `set_cache_ttl` / `set_npm_scope_policy` / `invalidate_cache`. Callers
+/// should invoke this AFTER [`require_repo_write_access`] (the tenant gate).
+async fn require_repo_admin(
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    permission_service: &crate::services::permission_service::PermissionService,
+) -> Result<()> {
+    if auth.is_admin {
+        return Ok(());
+    }
+    let has_admin = permission_service
+        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
+        .await?;
+    if has_admin {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Repository admin permission is required for this operation".to_string(),
+        ))
+    }
+}
+
 /// Ensure a repository is visible to the current user.
 ///
 /// Public repos are visible to everyone. Private repos require authentication
@@ -1956,6 +1994,10 @@ pub async fn put_pypi_track(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
+    // Declaring a PEP 708 `tracks` upstream changes cross-member version
+    // resolution — a repository configuration/supply-chain control that
+    // requires the repository `admin` action, not merely `write` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
     require_pypi_tracks_repo(&repo)?;
 
     let tracks_url = payload.tracks_url.trim().to_string();
@@ -2018,6 +2060,8 @@ pub async fn delete_pypi_track(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
+    // Same administrative tier as `put_pypi_track` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
     sqlx::query(
@@ -7948,6 +7992,10 @@ pub async fn set_upstream_auth(
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Configuring upstream proxy credentials is repository administration, not
+    // artifact publishing: require the `admin` action (or global admin), on the
+    // same tier as `update_repository` / `set_cache_ttl` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
@@ -8146,6 +8194,10 @@ pub async fn set_routing_rules(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
+    // Routing rules rewrite the upstream request path (a proxy supply-chain
+    // control on the same tier as cache TTL): require the repository `admin`
+    // action, not merely `write` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let value = serde_json::to_string(&payload.rules)
         .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
@@ -8197,6 +8249,8 @@ pub async fn delete_routing_rules(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
+    // Same administrative tier as `set_routing_rules` (#2603).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     sqlx::query(
         r#"
@@ -13510,6 +13564,178 @@ mod tests {
                 handler
             );
         }
+    }
+
+    /// Repository administration / configuration subresources (#2603, area 3):
+    ///
+    /// Reconfiguring a repository's proxy/supply-chain behavior (upstream-auth
+    /// credentials, upstream path-rewrite routing rules, PyPI `tracks`
+    /// version-resolution) is on the same administrative tier as
+    /// `update_repository` / `set_cache_ttl`, so holding only `write` (the
+    /// ability to publish artifacts) must NOT suffice. Every such handler must
+    /// call `require_repo_admin` in addition to the `require_repo_write_access`
+    /// tenant gate. String-grep so a future handler cannot silently downgrade a
+    /// configuration operation to write-level authorization.
+    #[test]
+    fn test_repo_config_handlers_require_repo_admin() {
+        let source = include_str!("repositories.rs");
+
+        for handler in [
+            "set_upstream_auth",
+            "set_routing_rules",
+            "delete_routing_rules",
+            "put_pypi_track",
+            "delete_pypi_track",
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found in repositories.rs", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("require_repo_admin("),
+                "handler `{}` does not call `require_repo_admin` (#2603, area 3). \
+                 Repository configuration is admin-tier: a `write`-only member \
+                 must not be able to reconfigure the repository. If you \
+                 intentionally restructured the authz model, update this test.",
+                handler
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // require_repo_admin (repository-configuration admin gate, #2603)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed: a non-admin member holding only `write` (developer role via
+    /// `grant_repo_access`, no fine-grained `admin` grant) is DENIED
+    /// `set_routing_rules`; granting the repository `admin` action lets it
+    /// through; a global admin always passes. Routing rules rewrite the
+    /// upstream request path, so write-level access must not suffice.
+    #[tokio::test]
+    async fn set_routing_rules_requires_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        // Write-level membership only (developer role): passes the tenant gate.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let rules = || SetRoutingRulesRequest {
+            rules: vec![RoutingRule {
+                path_pattern: "foo/(.*)".to_string(),
+                rewrite_to: "bar/$1".to_string(),
+            }],
+        };
+
+        // 1) Write-only member -> 403.
+        let denied = set_routing_rules(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(rules()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only member must be denied (403) set_routing_rules: {denied:?}"
+        );
+
+        // 2) Grant repository `admin` -> allowed. Rebuild state so the
+        // permission-service cache (which recorded the pre-grant deny above)
+        // is empty and the new grant is resolved from the database.
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_routing_rules(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(rules()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "repo-admin member must pass set_routing_rules: {allowed:?}"
+        );
+
+        // 3) Global admin -> allowed.
+        let admin = tdh::admin_auth(Uuid::new_v4(), "root");
+        let admin_ok = set_routing_rules(
+            State(state.clone()),
+            Extension(Some(admin)),
+            Path(key.clone()),
+            Json(rules()),
+        )
+        .await;
+        assert!(
+            admin_ok.is_ok(),
+            "global admin must pass set_routing_rules: {admin_ok:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DB-backed: PyPI `tracks` declaration is admin-tier. A write-only member
+    /// is denied `put_pypi_track`; a repo-admin (and a global admin) succeed.
+    #[tokio::test]
+    async fn put_pypi_track_requires_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let body = || PypiTrackRequest {
+            tracks_url: "https://pypi.org/simple/acme-sdk/".to_string(),
+        };
+
+        // 1) Write-only member -> 403 (before the pypi-repo-type validation).
+        let denied = put_pypi_track(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "acme-sdk".to_string())),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only member must be denied (403) put_pypi_track: {denied:?}"
+        );
+
+        // 2) Grant repository `admin` -> allowed. Rebuild state so the
+        // permission-service cache (which recorded the pre-grant deny above)
+        // is empty and the new grant is resolved from the database.
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = put_pypi_track(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "acme-sdk".to_string())),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "repo-admin member must pass put_pypi_track: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
