@@ -167,6 +167,27 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // (#2504, #2574 — the same ownership rule as the write guard). A database
     // error fails closed (404) rather than risking a foreign read.
     if !crate::storage::backend_is_repo_isolated(&location.backend) {
+        // Repo-scoped candidate first (#2624): row-less companions written
+        // under the scoped scheme live at `maven/{repo_id}/{path}`. The key
+        // embeds the requesting repository's id, so it is physically owned
+        // and needs no catalog attribution.
+        if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+            &location.backend,
+            "maven",
+            repo_id,
+            artifact_path,
+        ) {
+            let storage = state.storage_for_repo_or_500(location)?;
+            if let Ok(stream) = storage.get_stream(&scoped_key).await {
+                return Ok(StreamingFetchResult {
+                    body: stream,
+                    content_type: None,
+                    content_length: None,
+                    // Row-less companion object: not anchored to an artifact row.
+                    artifact_id: None,
+                });
+            }
+        }
         let flat_key = format!("maven/{}", artifact_path);
         let owned = crate::services::maven_flat_attribution::attributed_owner(
             db,

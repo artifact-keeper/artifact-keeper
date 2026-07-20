@@ -287,6 +287,75 @@ pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
     Arc::new(AppState::new(cfg(storage_path), pool, storage, registry))
 }
 
+/// Minimal in-memory [`crate::storage::StorageBackend`] double for tests that
+/// need a registered *cloud* backend (shared flat namespace) instead of the
+/// per-repo-rooted filesystem storage `build_state` provides. Missing keys
+/// return a "not found" storage error, matching how handlers detect misses.
+#[derive(Default)]
+pub struct MemStorage {
+    pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for MemStorage {
+    async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), content);
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| crate::error::AppError::Storage(format!("Key not found: {key}")))
+    }
+
+    async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+        Ok(self.objects.lock().unwrap().contains_key(key))
+    }
+
+    async fn delete(&self, key: &str) -> crate::error::Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        crate::storage::buffered_put_stream_fallback(self, key, stream).await
+    }
+}
+
+/// Like [`build_state`], but the registry carries an in-memory backend
+/// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
+/// namespace. Returns the state plus the backing [`MemStorage`] so tests can
+/// assert exactly which physical keys were written (#2624).
+pub fn build_state_with_cloud(pool: PgPool, backend_name: &str) -> (SharedState, Arc<MemStorage>) {
+    let mem = Arc::new(MemStorage::default());
+    let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
+        std::collections::HashMap::new();
+    backends.insert(backend_name.to_string(), mem.clone());
+    let registry = Arc::new(crate::storage::StorageRegistry::new(
+        backends,
+        backend_name.to_string(),
+    ));
+    let storage: Arc<dyn crate::storage::StorageBackend> = mem.clone();
+    let state = Arc::new(AppState::new(
+        cfg("/tmp/ak-cloud-test-unused"),
+        pool,
+        storage,
+        registry,
+    ));
+    (state, mem)
+}
+
 pub async fn create_user(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let username = format!("ph-test-u-{}", id);
