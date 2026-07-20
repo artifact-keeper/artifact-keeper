@@ -61,6 +61,12 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
 /// files have no row of their own), restricted to repositories on `$2`. LIMIT 2
 /// for the same ambiguity test.
+///
+/// The GAV-grouped upload handler serializes each `files[]` entry with a
+/// camelCase `"storageKey"` (matching every other reader of this array --
+/// `repositories.rs`'s `sizeBytes`/`extension`, `sbom.rs`'s `storageKey`), so
+/// the lookup keys on `storageKey` and falls back to the legacy snake_case
+/// `storage_key` only for any rows written in that spelling (#2706).
 const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      FROM artifact_metadata am \
      JOIN artifacts a ON a.id = am.artifact_id \
@@ -70,7 +76,7 @@ const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
        AND jsonb_typeof(am.metadata->'files') = 'array' \
        AND EXISTS ( \
          SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
-         WHERE f->>'storage_key' = $1) \
+         WHERE COALESCE(f->>'storageKey', f->>'storage_key') = $1) \
      LIMIT 2";
 
 /// The attribution table (backfilled legacy keys + write-time claims). The
@@ -429,6 +435,126 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed artifact");
+    }
+
+    /// Seed a live parent artifact in `repo_id` plus an `artifact_metadata` row
+    /// whose `files[]` array lists one row-less companion at `companion_key`,
+    /// shaped EXACTLY as the GAV-grouped upload handler writes it (camelCase
+    /// `"storageKey"`, #418).
+    async fn seed_metadata_files_camel(pool: &PgPool, repo_id: Uuid, companion_key: &str) {
+        let parent_path = format!("com/acme/meta/1.0/meta-1.0-{}.jar", Uuid::new_v4());
+        let parent_key = format!("maven/{parent_path}");
+        seed_artifact(pool, repo_id, &parent_path, &parent_key).await;
+        let (artifact_id,): (Uuid,) =
+            sqlx::query_as("SELECT id FROM artifacts WHERE storage_key = $1")
+                .bind(&parent_key)
+                .fetch_one(pool)
+                .await
+                .expect("fetch parent artifact id");
+        let metadata = serde_json::json!({
+            "files": [{
+                "path": "com/acme/meta/1.0/meta-1.0.pom",
+                "storageKey": companion_key,
+                "sizeBytes": 200,
+                "sha256": "0".repeat(64),
+                "extension": "pom"
+            }]
+        });
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'maven', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+        )
+        .bind(artifact_id)
+        .bind(&metadata)
+        .execute(pool)
+        .await
+        .expect("seed artifact_metadata");
+    }
+
+    /// #2706: a row-less GAV-grouped companion recorded in a live parent's
+    /// metadata `files[]` array resolves to the parent's repository. The upload
+    /// handler writes those entries with a camelCase `"storageKey"`; the layer-2
+    /// lookup keyed on snake_case `storage_key` never matched real data, so the
+    /// companion failed closed (404) for its genuine owner on cloud backends.
+    ///
+    /// This test seeds the array in the real (camelCase) shape and asserts the
+    /// owner now resolves. It FAILS against the pre-fix `f->>'storage_key'`
+    /// lookup (returns `None`) and PASSES against
+    /// `COALESCE(f->>'storageKey', f->>'storage_key')`.
+    #[tokio::test]
+    async fn test_attributed_owner_from_metadata_files_camelcase_2706() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
+        // The parent primary `.jar` has a live row; the `.pom` companion is
+        // row-less and only recorded in the parent's metadata `files[]`.
+        let parent_key = format!("maven/com/acme/meta/1.0/meta-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/meta/1.0/meta-1.0.jar", &parent_key).await;
+        let companion = format!("maven/com/acme/meta/1.0/meta-1.0-{}.pom", Uuid::new_v4());
+        seed_metadata_files_camel(&pool, repo_a, &companion).await;
+
+        // The companion has no row of its own (layer (a) misses), so this only
+        // resolves via the metadata `files[]` layer (b).
+        assert_eq!(
+            attributed_owner(&pool, "s3", &companion)
+                .await
+                .expect("query"),
+            Some(repo_a),
+            "camelCase storageKey companion must resolve to the parent's repository"
+        );
+        // And its genuine owner may read it on cloud.
+        assert!(flat_key_readable(&pool, repo_a, "s3", &companion).await);
+
+        tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
+    }
+
+    /// #2706 fail-closed guard: the casing fix must MATCH real data, not loosen
+    /// isolation. A companion listed (camelCase) in the metadata `files[]` of two
+    /// repositories on the SAME backend is ambiguous and stays UNATTRIBUTED (404
+    /// for both), and a foreign repository can never read another repo's
+    /// unambiguously-owned companion.
+    #[tokio::test]
+    async fn test_metadata_files_camelcase_still_fails_closed_2706() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo_a, "s3").await;
+        set_repo_backend(&pool, repo_b, "s3").await;
+
+        // Foreign case: a companion owned unambiguously by repo_b is NOT
+        // readable by repo_a (the #2504 hole stays closed).
+        let owned = format!("maven/com/acme/meta/1.0/owned-1.0-{}.pom", Uuid::new_v4());
+        seed_metadata_files_camel(&pool, repo_b, &owned).await;
+        assert_eq!(
+            attributed_owner(&pool, "s3", &owned).await.expect("query"),
+            Some(repo_b)
+        );
+        assert!(flat_key_readable(&pool, repo_b, "s3", &owned).await);
+        assert!(
+            !flat_key_readable(&pool, repo_a, "s3", &owned).await,
+            "a foreign repo must not read another repo's owned companion"
+        );
+
+        // Ambiguous case: the SAME companion key listed by two repos on the SAME
+        // backend resolves to neither -- fails closed for both tenants.
+        let shared = format!("maven/com/acme/meta/1.0/shared-1.0-{}.pom", Uuid::new_v4());
+        seed_metadata_files_camel(&pool, repo_a, &shared).await;
+        seed_metadata_files_camel(&pool, repo_b, &shared).await;
+        assert_eq!(
+            attributed_owner(&pool, "s3", &shared).await.expect("query"),
+            None,
+            "a companion listed by two same-backend repos is ambiguous -> unattributed"
+        );
+        assert!(!flat_key_readable(&pool, repo_a, "s3", &shared).await);
+        assert!(!flat_key_readable(&pool, repo_b, "s3", &shared).await);
+
+        tdh::cleanup(&pool, repo_b, Uuid::nil()).await;
+        tdh::cleanup(&pool, repo_a, Uuid::nil()).await;
     }
 
     #[test]
