@@ -149,6 +149,55 @@ pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     BlobGcSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`sso_provider_serial_lock`] (#2621).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the SSO-provider test cluster serializes only against itself.
+const SSO_PROVIDER_TEST_LOCK_KEY: i64 = 0x5350_2621; // "SP" + issue #2621
+
+/// Cross-process serialization guard for tests that seed *enabled* SSO
+/// providers (#2621).
+///
+/// `AuthConfigService::list_enabled_providers` answers a WHOLE-database
+/// question ("is any SSO provider enabled?") that both the local-login policy
+/// gate and the public system-config affordance consult. Under `cargo
+/// nextest`'s process-per-test parallelism, one test's freshly-seeded enabled
+/// provider flips a peer test's "no SSO configured" baseline mid-assert. A
+/// Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`] —
+/// makes every such test contend for one key, so only one runs its seed →
+/// assert → cleanup critical section at a time. The lock releases when the
+/// guard drops (connection closes), including on panic.
+pub struct SsoProviderSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide SSO-provider test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of any DB-backed test
+/// that seeds or asserts on enabled SSO providers and bind the result for the
+/// whole test body.
+pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return SsoProviderSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return SsoProviderSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SSO_PROVIDER_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return SsoProviderSerialGuard { _conn: None };
+    }
+    SsoProviderSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
@@ -277,6 +326,17 @@ fn cfg(storage_path: &str) -> Config {
 }
 
 pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+    build_state_with(pool, storage_path, |_| {})
+}
+
+/// Like [`build_state`], but lets the caller adjust the test `Config` before
+/// the state is built (e.g. toggling auth-policy flags such as
+/// `allow_local_admin_login`).
+pub fn build_state_with(
+    pool: PgPool,
+    storage_path: &str,
+    mutate: impl FnOnce(&mut Config),
+) -> SharedState {
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
@@ -284,7 +344,9 @@ pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         std::collections::HashMap::new(),
         "filesystem".to_string(),
     ));
-    Arc::new(AppState::new(cfg(storage_path), pool, storage, registry))
+    let mut config = cfg(storage_path);
+    mutate(&mut config);
+    Arc::new(AppState::new(config, pool, storage, registry))
 }
 
 /// Minimal in-memory [`crate::storage::StorageBackend`] double for tests that
