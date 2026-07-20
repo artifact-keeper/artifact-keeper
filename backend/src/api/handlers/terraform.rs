@@ -747,6 +747,12 @@ async fn list_provider_versions(
     let provider_name = format!("{}/{}", namespace, type_name);
 
     // Get all stored packages with the inputs platform recovery needs.
+    //
+    // Held packages are excluded (#2662): the download surface refuses them via
+    // `check_quarantine_row`, so listing them would advertise a version (and,
+    // downstream, its `zh:` hash) the download routes then 409/403. The
+    // predicate mirrors `quarantine_service::check_download_allowed`: a
+    // `quarantined` row becomes listable again once its hold window expires.
     let artifacts = sqlx::query!(
         r#"
         SELECT DISTINCT a.version, a.path, am.metadata as "metadata?"
@@ -756,6 +762,15 @@ async fn list_provider_versions(
           AND a.name = $2
           AND a.is_deleted = false
           AND a.version IS NOT NULL
+          AND (
+            a.quarantine_status IS NULL
+            OR a.quarantine_status NOT IN ('quarantined', 'rejected')
+            OR (
+              a.quarantine_status = 'quarantined'
+              AND a.quarantine_until IS NOT NULL
+              AND a.quarantine_until <= NOW()
+            )
+          )
         ORDER BY a.version
         "#,
         repo.id,
@@ -1514,6 +1529,9 @@ async fn local_provider_versions(
     type_name: &str,
 ) -> Result<Vec<String>, Response> {
     let provider_name = format!("{}/{}", namespace, type_name);
+    // Held packages are excluded (#2662): `mirror_download` refuses their
+    // bytes, so `index.json` must not advertise the version. Same predicate as
+    // `list_provider_versions` / `local_provider_packages`.
     let versions: Vec<Option<String>> = sqlx::query_scalar!(
         r#"
         SELECT DISTINCT version
@@ -1522,6 +1540,15 @@ async fn local_provider_versions(
           AND name = $2
           AND is_deleted = false
           AND version IS NOT NULL
+          AND (
+            quarantine_status IS NULL
+            OR quarantine_status NOT IN ('quarantined', 'rejected')
+            OR (
+              quarantine_status = 'quarantined'
+              AND quarantine_until IS NOT NULL
+              AND quarantine_until <= NOW()
+            )
+          )
         ORDER BY version
         "#,
         repo.id,
@@ -1544,6 +1571,9 @@ async fn local_provider_packages(
     version: &str,
 ) -> Result<Vec<LocalProviderPackage>, Response> {
     let provider_name = format!("{}/{}", namespace, type_name);
+    // Held packages are excluded (#2662): `<version>.json` would otherwise
+    // publish the exact `zh:` SHA-256 of a package whose bytes the mirror's
+    // download route refuses. Same predicate as `local_provider_versions`.
     let rows = sqlx::query!(
         r#"
         SELECT a.path, a.checksum_sha256, am.metadata as "metadata?"
@@ -1553,6 +1583,15 @@ async fn local_provider_packages(
           AND a.name = $2
           AND a.version = $3
           AND a.is_deleted = false
+          AND (
+            a.quarantine_status IS NULL
+            OR a.quarantine_status NOT IN ('quarantined', 'rejected')
+            OR (
+              a.quarantine_status = 'quarantined'
+              AND a.quarantine_until IS NOT NULL
+              AND a.quarantine_until <= NOW()
+            )
+          )
         ORDER BY a.path
         "#,
         repo.id,
@@ -3536,13 +3575,23 @@ mod tests {
         fx: &crate::api::handlers::test_db_helpers::Fixture,
         zip: &'static [u8],
     ) -> axum::http::StatusCode {
+        publish_provider_version(fx, "1.0.0", zip).await
+    }
+
+    /// Publish a `dtf/marker` provider package at an arbitrary version through
+    /// the real upload handler.
+    async fn publish_provider_version(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        version: &str,
+        zip: &'static [u8],
+    ) -> axum::http::StatusCode {
         use crate::api::handlers::test_db_helpers as tdh;
         let (status, _) = tdh::send(
             fx.router_with_auth(mounted_router()),
             tdh::put(
                 format!(
-                    "{}/{}/v1/providers/dtf/marker/1.0.0/linux/arm64",
-                    MOUNT_PREFIX, fx.repo_key
+                    "{}/{}/v1/providers/dtf/marker/{}/linux/arm64",
+                    MOUNT_PREFIX, fx.repo_key, version
                 ),
                 Bytes::from_static(zip),
             ),
@@ -3871,6 +3920,158 @@ mod tests {
         assert_eq!(index_status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(version_status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(archive_status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// A package under a quarantine hold must not appear in the metadata
+    /// surface — the registry `versions` list, the mirror `index.json`, or the
+    /// mirror `<version>.json` (which would publish its `zh:` SHA-256) — while
+    /// the clean version stays fully served. Once the hold window expires the
+    /// version is listable again (#2662).
+    ///
+    /// Regression guard: these listing queries filtered only on
+    /// `is_deleted = false`, so a held package was advertised (hash included)
+    /// even though the download routes refuse its bytes via
+    /// `check_quarantine_row` — `terraform init` selected the version and then
+    /// failed on the download instead of never seeing it.
+    #[tokio::test]
+    async fn test_held_provider_hidden_from_versions_and_mirror_2662() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let clean_zip: &[u8] = b"PK\x03\x04 clean provider archive";
+        let held_zip: &[u8] = b"PK\x03\x04 held provider archive";
+        let published_clean = publish_provider_version(&fx, "1.0.0", clean_zip).await;
+        let published_held = publish_provider_version(&fx, "2.0.0", held_zip).await;
+
+        // Put 2.0.0 under an active quarantine hold.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() + interval '1 hour' \
+             WHERE repository_id = $1 AND version = '2.0.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("hold 2.0.0");
+
+        let k = fx.repo_key.clone();
+        let m = MOUNT_PREFIX;
+
+        let (versions_status, versions_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/v1/providers/dtf/marker/versions")),
+        )
+        .await;
+        let versions_doc: serde_json::Value =
+            serde_json::from_slice(&versions_body).unwrap_or_default();
+
+        let (index_status, index_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/marker/index.json")),
+        )
+        .await;
+        let index: serde_json::Value = serde_json::from_slice(&index_body).unwrap_or_default();
+
+        let (held_doc_status, held_doc_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/marker/2.0.0.json")),
+        )
+        .await;
+
+        let (clean_doc_status, clean_doc_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/marker/1.0.0.json")),
+        )
+        .await;
+        let clean_doc: serde_json::Value =
+            serde_json::from_slice(&clean_doc_body).unwrap_or_default();
+
+        // Expire the hold: the version must become listable again without any
+        // status transition having run.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_until = NOW() - interval '1 minute' \
+             WHERE repository_id = $1 AND version = '2.0.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("expire hold on 2.0.0");
+
+        let (_, expired_index_body) = tdh::send(
+            fx.router_anon(mounted_router()),
+            tdh::get(format!("{m}/{k}/tf.dtf.local/dtf/marker/index.json")),
+        )
+        .await;
+        let expired_index: serde_json::Value =
+            serde_json::from_slice(&expired_index_body).unwrap_or_default();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            published_clean,
+            axum::http::StatusCode::CREATED,
+            "publish 1.0.0"
+        );
+        assert_eq!(
+            published_held,
+            axum::http::StatusCode::CREATED,
+            "publish 2.0.0"
+        );
+
+        assert_eq!(versions_status, axum::http::StatusCode::OK, "versions list");
+        let listed: Vec<&str> = versions_doc
+            .pointer("/versions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("version").and_then(|v| v.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            listed,
+            vec!["1.0.0"],
+            "the versions list must contain only the clean version, not the held one"
+        );
+
+        assert_eq!(
+            index_status,
+            axum::http::StatusCode::OK,
+            "mirror index.json"
+        );
+        assert_eq!(
+            index,
+            serde_json::json!({ "versions": { "1.0.0": {} } }),
+            "the mirror index must not advertise the held version"
+        );
+
+        assert_eq!(
+            held_doc_status,
+            axum::http::StatusCode::NOT_FOUND,
+            "the held version's mirror document must 404 rather than publish its \
+             zh: hash (body: {})",
+            String::from_utf8_lossy(&held_doc_body)
+        );
+
+        assert_eq!(
+            clean_doc_status,
+            axum::http::StatusCode::OK,
+            "the clean version's mirror document must still be served"
+        );
+        let expected_clean_sha = format!("{:x}", Sha256::digest(clean_zip));
+        assert_eq!(
+            clean_doc.pointer("/archives/linux_arm64/hashes"),
+            Some(&serde_json::json!([format!("zh:{expected_clean_sha}")])),
+            "the clean version keeps advertising its zh: hash"
+        );
+
+        assert_eq!(
+            expired_index,
+            serde_json::json!({ "versions": { "1.0.0": {}, "2.0.0": {} } }),
+            "an expired hold must be listable again, matching check_download_allowed"
+        );
     }
 }
 
