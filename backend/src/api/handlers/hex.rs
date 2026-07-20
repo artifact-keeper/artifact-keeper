@@ -423,12 +423,61 @@ async fn package_info(
     // Hosted: emit the real registry resource — gzipped, signed protobuf.
     // See `list_names` for why plain JSON is not consumable by `mix`.
     if is_hosted(&repo.repo_type) {
+        // The name the registry advertises for this package. The client
+        // pattern-matches this field against the name it asked for and rejects
+        // a mismatch (`bad_repo_name`), so it must be a spelling `/names`
+        // advertises. Derive it through the same fold — at the same
+        // whole-second precision — `/names` uses, rather than trusting the
+        // SQL ordering's first row: `ORDER BY created_at DESC` compares at
+        // microsecond precision, so it picks a different winner than the
+        // fold whenever two case variants land within the same second. See
+        // `fold_spelling_winner`.
+        let canonical_name =
+            canonical_hex_spelling(artifacts.iter().map(|a| (a.name.as_str(), a.created_at)))
+                .unwrap_or_else(|| name.clone());
+
+        // Reconcile the release list to ONE row per version (#2674). The
+        // case-insensitive name match above unions every case-variant row
+        // into this payload, so two rows `foo/1.0.0` and `Foo/1.0.0` would
+        // otherwise advertise the same version twice with two different
+        // `outer_checksum`s — while `/versions` dedupes to one entry.
+        //
+        // Winner per version: the row spelled exactly `canonical_name` when
+        // one exists (the winning spelling's own release is authoritative for
+        // its package), otherwise the first row in the query's `ORDER BY
+        // created_at DESC, name DESC` (the newest publish). `download_tarball`
+        // resolves the advertised `<canonical>-<version>.tar` through the same
+        // two-step rule — exact-spelling match first, then the case-insensitive
+        // fallback ordered by the identical `created_at DESC, name DESC`
+        // clause (`find_hosted_tarball_case_insensitive`) — so the row whose
+        // checksum is advertised here is the row the download serves.
+        let mut chosen: Vec<_> = Vec::new();
+        {
+            let mut slot_by_version: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for a in &artifacts {
+                let version = a.version.as_deref().unwrap_or_default();
+                match slot_by_version.entry(version) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(chosen.len());
+                        chosen.push(a);
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let slot = &mut chosen[*e.get()];
+                        if slot.name != canonical_name && a.name == canonical_name {
+                            *slot = a;
+                        }
+                    }
+                }
+            }
+        }
+
         // Advertise ascending by VERSION, matching `mix hex.registry build`,
         // which sorts releases by version rather than by publish time. Ordering
         // by `created_at` agrees with that only while versions happen to be
         // published in order; publishing 1.0.0 and then backporting 0.9.0 makes
         // the two diverge. `artifacts` arrives newest-first by `created_at`.
-        let mut ordered: Vec<_> = artifacts.iter().collect();
+        let mut ordered = chosen;
         ordered.sort_by(|a, b| {
             version_compare(
                 a.version.as_deref().unwrap_or_default(),
@@ -461,18 +510,6 @@ async fn package_info(
                 dependencies,
             });
         }
-        // The name the registry advertises for this package. The client
-        // pattern-matches this field against the name it asked for and rejects
-        // a mismatch (`bad_repo_name`), so it must be a spelling `/names`
-        // advertises. Derive it through the same fold — at the same
-        // whole-second precision — `/names` uses, rather than trusting the
-        // SQL ordering's first row: `ORDER BY created_at DESC` compares at
-        // microsecond precision, so it picks a different winner than the
-        // fold whenever two case variants land within the same second. See
-        // `fold_spelling_winner`.
-        let canonical_name =
-            canonical_hex_spelling(artifacts.iter().map(|a| (a.name.as_str(), a.created_at)))
-                .unwrap_or_else(|| name.clone());
         let payload = hex_registry::encode_package_payload(&repo_key, &canonical_name, &releases);
         return signed_registry_response(&state, repo.id, payload).await;
     }
@@ -524,9 +561,25 @@ async fn download_tarball(
 
     let filename = tarball_file.trim_start_matches('/');
 
-    let artifact = match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename)
-        .await?
-    {
+    let local_hit =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => Some(a),
+            // #2674: a hosted registry advertises every case-variant row's
+            // releases under the case-fold winner's spelling (`package_info`
+            // matches `LOWER(name)`), but a release contributed by a LOSING
+            // spelling is stored at that spelling's path — `Foo/2.0.0/
+            // Foo-2.0.0.tar` advertised as `foo-2.0.0.tar`. The exact-spelling
+            // lookup above is case-sensitive, so without this fallback the
+            // registry advertises a release the client cannot download. Retry
+            // case-insensitively, hosted only: Remote/Virtual misses must keep
+            // falling through to the upstream proxy fan-out unchanged.
+            None if is_hosted(&repo.repo_type) => {
+                find_hosted_tarball_case_insensitive(&state.db, repo.id, filename).await?
+            }
+            None => None,
+        };
+
+    let artifact = match local_hit {
         Some(a) => a,
         None => {
             let upstream_path = format!("tarballs/{}", filename);
@@ -587,6 +640,74 @@ async fn download_tarball(
         &ctx,
     )
     .await
+}
+
+/// Case-insensitive fallback lookup for a hosted hex tarball (#2674).
+///
+/// Runs ONLY after the exact-spelling lookup
+/// (`find_local_by_filename_suffix`) misses, so every request for a row
+/// stored exactly as spelled — the entire pre-#2674 working population —
+/// resolves through the same query it always did. This fallback exists for
+/// rows whose spelling differs from the advertised one only by case:
+/// legacy rows published before the `is_valid_hex_package_name` gate
+/// (#1217) and rows written through the generic chunked-upload path, which
+/// applies no hex name validation.
+///
+/// Winner agreement: `package_info` advertises one release per version —
+/// the `canonical_name`-spelled row when one exists, else the first row
+/// under `ORDER BY created_at DESC, name DESC`. The download resolves the
+/// same way: a canonical-spelled row is caught by the exact-spelling pass
+/// (its path embeds the canonical spelling the client requested), and this
+/// fallback only runs when no such row exists — where it picks the newest
+/// case-variant row under the IDENTICAL `created_at DESC, name DESC`
+/// clause, i.e. exactly the row whose `outer_checksum` the payload
+/// advertised. This is deliberately NOT the whole-second
+/// `fold_spelling_winner` rule: that fold arbitrates which *spelling* the
+/// registry echoes across `/names`/`/versions`/`/packages`; both ends of
+/// the per-version row selection consume the same SQL ordering, so no
+/// precision truncation is needed for them to agree.
+///
+/// The LIKE pattern mirrors `reverse_suffix_for_like` in `proxy_helpers`
+/// (reverse first, then escape — the escape char must land on the LEFT of
+/// the escaped char in the reversed string), applied to the lowercased
+/// suffix against `reverse(LOWER(path))`. The `LOWER(path) = $3` arm covers
+/// root-stored rows (generic uploads with no directory component), matching
+/// the exact-path fallback of the case-sensitive resolver.
+#[allow(clippy::result_large_err)]
+async fn find_hosted_tarball_case_insensitive(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    filename: &str,
+) -> Result<Option<proxy_helpers::LocalArtifactHit>, Response> {
+    use sqlx::Row as _;
+
+    let lowered = filename.to_lowercase();
+    let mut with_slash = String::with_capacity(lowered.len() + 1);
+    with_slash.push('/');
+    with_slash.push_str(&lowered);
+    let reversed: String = with_slash.chars().rev().collect();
+    let reversed_pattern = super::escape_like_literal(&reversed);
+
+    let row = sqlx::query(
+        "SELECT id, storage_key FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND (reverse(LOWER(path)) LIKE $2 || '%' ESCAPE '\\' \
+                OR LOWER(path) = $3) \
+         ORDER BY created_at DESC, name DESC \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(&reversed_pattern)
+    .bind(&lowered)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+
+    Ok(row.map(|r| proxy_helpers::LocalArtifactHit {
+        id: r.try_get("id").unwrap_or_default(),
+        storage_key: r.try_get("storage_key").unwrap_or_default(),
+    }))
 }
 
 /// Returns true if any non-Remote member of a virtual repo has an artifact
@@ -3337,6 +3458,256 @@ mod tests {
             pkg.name, "foo",
             "/packages/{{name}} must echo the /names winner, not the SQL first row \
              (microsecond-newer \"Foo\") — the client rejects a mismatch as bad_repo_name"
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Case-variant release reconciliation (#2674)
+    // -----------------------------------------------------------------------
+
+    /// Seed a hex release row at an explicit `path` — a real tarball in
+    /// storage plus a caller-chosen (valid 64-hex) outer checksum — the way
+    /// legacy / generic-upload rows exist in the wild: the row's spelling can
+    /// disagree in case with the fold-winner spelling the registry
+    /// advertises. Returns the artifact id and the stored tarball bytes.
+    async fn seed_release_at_path(
+        f: &tdh::Fixture,
+        name: &str,
+        version: &str,
+        path: &str,
+        checksum: &str,
+    ) -> (Uuid, Vec<u8>) {
+        let metadata =
+            format!("{{<<\"name\">>,<<\"{name}\">>}}.\n{{<<\"version\">>,<<\"{version}\">>}}.\n");
+        let tar = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let repo = f.repo_info("local", None);
+        let artifact_id = tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            path,
+            path,
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from(tar.clone()),
+            f.user_id,
+        )
+        .await;
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind(checksum)
+            .bind(artifact_id)
+            .execute(&f.pool)
+            .await
+            .expect("set checksum");
+        (artifact_id, tar)
+    }
+
+    /// Pin an artifact row's `created_at` to an exact instant so the tests
+    /// control the `ORDER BY created_at DESC` winner and the spelling fold.
+    async fn pin_created_at(f: &tdh::Fixture, artifact_id: Uuid, secs: i64, micros: u32) {
+        let stamp =
+            chrono::DateTime::from_timestamp(secs, micros * 1_000).expect("valid seed timestamp");
+        sqlx::query("UPDATE artifacts SET created_at = $1 WHERE id = $2")
+            .bind(stamp)
+            .bind(artifact_id)
+            .execute(&f.pool)
+            .await
+            .expect("pin created_at");
+    }
+
+    /// Gunzip a signed registry body and decode the `Package` payload.
+    fn decode_package_payload(body: &[u8]) -> hex_registry::pb::pkg::Package {
+        use prost::Message as _;
+        use std::io::Read as _;
+        let mut gz = flate2::read::GzDecoder::new(body);
+        let mut raw = Vec::new();
+        gz.read_to_end(&mut raw).expect("gunzip registry body");
+        let signed = hex_registry::pb::signed::Signed::decode(raw.as_slice())
+            .expect("decode Signed envelope");
+        hex_registry::pb::pkg::Package::decode(signed.payload.as_slice())
+            .expect("decode Package payload")
+    }
+
+    /// #2674 regression: a release contributed by a LOSING case-variant
+    /// spelling is advertised under the fold winner's name, but its artifact
+    /// is stored at the loser's path. Before the fix, `download_tarball`'s
+    /// case-sensitive path lookup missed it and the advertised URL 404'd —
+    /// the registry advertised a release the client could not download.
+    #[tokio::test]
+    async fn test_hex_case_variant_advertised_release_is_downloadable_db() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+
+        // Loser spelling "Foo" owns 2.0.0 (older row); winner spelling "foo"
+        // owns 1.0.0 on a strictly newer second, so the fold picks "foo".
+        let (foo2_id, foo2_tar) = seed_release_at_path(
+            &f,
+            "Foo",
+            "2.0.0",
+            "Foo/2.0.0/Foo-2.0.0.tar",
+            &"2".repeat(64),
+        )
+        .await;
+        let (foo1_id, foo1_tar) = seed_release_at_path(
+            &f,
+            "foo",
+            "1.0.0",
+            "foo/1.0.0/foo-1.0.0.tar",
+            &"1".repeat(64),
+        )
+        .await;
+        // Unrelated package: must keep resolving to its own bytes.
+        let (bar_id, bar_tar) = seed_release_at_path(
+            &f,
+            "bar",
+            "1.0.0",
+            "bar/1.0.0/bar-1.0.0.tar",
+            &"3".repeat(64),
+        )
+        .await;
+        pin_created_at(&f, foo2_id, 1_750_000_000, 0).await;
+        pin_created_at(&f, foo1_id, 1_750_000_010, 0).await;
+        pin_created_at(&f, bar_id, 1_750_000_020, 0).await;
+
+        // The registry advertises the loser-contributed 2.0.0 under "foo".
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/packages/foo", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "/packages/foo must serve");
+        let pkg = decode_package_payload(&body);
+        assert_eq!(pkg.name, "foo");
+        let versions: Vec<&str> = pkg.releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(
+            versions,
+            vec!["1.0.0", "2.0.0"],
+            "both spellings' releases are advertised under the winner"
+        );
+
+        // THE BUG: the advertised release must be downloadable.
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/foo-2.0.0.tar", f.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an advertised release must be downloadable at the advertised name"
+        );
+        assert_eq!(
+            &body[..],
+            &foo2_tar[..],
+            "the bytes must be the advertised row's tarball"
+        );
+
+        // Exact-spelling requests keep resolving to their own rows.
+        for (uri, expected) in [
+            (format!("/{}/tarballs/foo-1.0.0.tar", f.repo_key), &foo1_tar),
+            (format!("/{}/tarballs/Foo-2.0.0.tar", f.repo_key), &foo2_tar),
+            (format!("/{}/tarballs/bar-1.0.0.tar", f.repo_key), &bar_tar),
+        ] {
+            let app = f.router_anon(super::router());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must serve");
+            assert_eq!(&body[..], &expected[..], "{uri} must serve its own row");
+        }
+
+        // The case-insensitive fallback must not invent matches.
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/baz-1.0.0.tar", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown package stays 404");
+
+        f.teardown().await;
+    }
+
+    /// #2674: same-version case variants must collapse to ONE advertised
+    /// release whose checksum belongs to the row the download actually
+    /// serves. Before the fix the payload carried the version twice, with
+    /// two different `outer_checksum`s, while `/versions` deduped to one —
+    /// and the download could serve the row whose checksum was NOT
+    /// advertised.
+    #[tokio::test]
+    async fn test_hex_same_version_case_variants_advertise_one_downloadable_release_db() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+
+        // foo/1.0.0 (oldest), Foo/1.0.0 (newer), foo/2.0.0 (newest — so the
+        // fold winner stays "foo" even though the loser's 1.0.0 row is newer
+        // than the winner's). The canonical-spelling row must win version
+        // 1.0.0: it is the row the exact-spelling download for
+        // `foo-1.0.0.tar` resolves.
+        let (foo1_id, foo1_tar) = seed_release_at_path(
+            &f,
+            "foo",
+            "1.0.0",
+            "foo/1.0.0/foo-1.0.0.tar",
+            &"1".repeat(64),
+        )
+        .await;
+        let (big1_id, _) = seed_release_at_path(
+            &f,
+            "Foo",
+            "1.0.0",
+            "Foo/1.0.0/Foo-1.0.0.tar",
+            &"2".repeat(64),
+        )
+        .await;
+        let (foo2_id, _) = seed_release_at_path(
+            &f,
+            "foo",
+            "2.0.0",
+            "foo/2.0.0/foo-2.0.0.tar",
+            &"3".repeat(64),
+        )
+        .await;
+        pin_created_at(&f, foo1_id, 1_750_000_000, 0).await;
+        pin_created_at(&f, big1_id, 1_750_000_010, 0).await;
+        pin_created_at(&f, foo2_id, 1_750_000_020, 0).await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/packages/foo", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "/packages/foo must serve");
+        let pkg = decode_package_payload(&body);
+        assert_eq!(pkg.name, "foo");
+        let versions: Vec<&str> = pkg.releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(
+            versions,
+            vec!["1.0.0", "2.0.0"],
+            "one release per version — no duplicate same-version entries"
+        );
+        assert_eq!(
+            pkg.releases[0].outer_checksum,
+            Some(vec![0x11u8; 32]),
+            "the advertised 1.0.0 checksum must be the canonical-spelling row's"
+        );
+
+        // The download for the advertised name serves that same row, so the
+        // advertised checksum matches the served bytes.
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/foo-1.0.0.tar", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            &foo1_tar[..],
+            "the served bytes must belong to the row whose checksum was advertised"
         );
 
         f.teardown().await;
