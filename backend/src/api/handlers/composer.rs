@@ -903,7 +903,7 @@ async fn resolve_v1_provider_metadata(
     let package = composer_v1_base_name(full_name);
 
     // The upstream's own root index decides the protocol.
-    let Ok((root_bytes, _ct)) = proxy_helpers::proxy_fetch_capped(
+    let Ok((root_bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo_id,
         repo_key,
@@ -934,7 +934,7 @@ async fn resolve_v1_provider_metadata(
                 let Some(include_path) = v1_template_path(template, None, include_hash) else {
                     continue;
                 };
-                let Ok((bytes, _ct)) = proxy_helpers::proxy_fetch_capped(
+                let Ok((bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
                     proxy,
                     repo_id,
                     repo_key,
@@ -976,7 +976,7 @@ async fn resolve_v1_provider_metadata(
         return Ok(None);
     };
 
-    match proxy_helpers::proxy_fetch_capped(
+    match proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo_id,
         repo_key,
@@ -986,7 +986,7 @@ async fn resolve_v1_provider_metadata(
     )
     .await
     {
-        Ok(fetched) => Ok(Some(fetched)),
+        Ok((content, content_type, _budget_permit)) => Ok(Some((content, content_type))),
         Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
         Err(e) => Err(e),
     }
@@ -1005,7 +1005,7 @@ async fn fetch_remote_composer_metadata(
     upstream_path: &str,
     full_name: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    match proxy_helpers::proxy_fetch_capped(
+    match proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo_id,
         repo_key,
@@ -1015,7 +1015,7 @@ async fn fetch_remote_composer_metadata(
     )
     .await
     {
-        Ok(fetched) => Ok(fetched),
+        Ok((content, content_type, _budget_permit)) => Ok((content, content_type)),
         Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
             match resolve_v1_provider_metadata(proxy, repo_id, repo_key, upstream_url, full_name)
                 .await?

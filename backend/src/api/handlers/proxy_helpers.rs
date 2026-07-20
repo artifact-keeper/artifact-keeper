@@ -625,6 +625,67 @@ pub async fn proxy_fetch_capped_with_accept(
     .await
 }
 
+/// Budget-reserving sibling of [`proxy_fetch_capped`] (#2684).
+///
+/// Reserves `max` bytes of the process-wide [`proxy_metadata_budget`] BEFORE
+/// buffering the upstream/cached metadata document, then performs the same
+/// capped fetch and returns the held [`OwnedSemaphorePermit`] alongside the
+/// bytes. The caller keeps the reservation for the buffered document's whole
+/// resident lifetime (parse it, then let the permit drop; or ride it on the
+/// response body).
+///
+/// This extends the #2665 RPM bound uniformly to the other buffered-metadata
+/// proxy formats (debian/npm/composer/maven/pypi): the per-request cap already
+/// bounds ONE buffer at `max`, and reserving against the shared budget bounds
+/// the SUM of concurrent buffers process-wide, so N un-rate-limited requests
+/// (including cache hits, which re-buffer independently) can never drive
+/// resident metadata memory past the budget. The reservation is sized to the
+/// cap rather than the (not-yet-known) body length, matching the RPM path, so
+/// the bound holds during the buffering read itself and not only afterwards.
+pub async fn proxy_fetch_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let (content, content_type) =
+        proxy_fetch_capped(proxy_service, repo_id, repo_key, upstream_url, path, max).await?;
+    Ok((content, content_type, permit))
+}
+
+/// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
+/// (#2684). See [`proxy_fetch_capped_budgeted`] for the reservation semantics;
+/// used by the PyPI simple-index proxy, which negotiates the PEP 691 JSON
+/// representation under a format-qualified cache key.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let (content, content_type) = proxy_fetch_capped_with_cache_key_and_accept(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        accept,
+        max,
+    )
+    .await?;
+    Ok((content, content_type, permit))
+}
+
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
 /// body in memory (#895). Returns an axum [`Response`] whose body is a
 /// stream the framework drives directly from the upstream HTTP response,
@@ -9082,6 +9143,112 @@ mod tests {
         VERIFIED_STREAMING_CALL_TOKEN,
         "the remote pool `.deb` download (digest-gated cache commit, #2459)"
     );
+
+    // -------------------------------------------------------------------
+    // #2684: buffered-metadata proxy paths reserve against the shared byte
+    // budget.
+    //
+    // #2665 gave the RPM repodata proxy a process-wide byte budget so the
+    // SUM of concurrent buffered metadata is bounded regardless of request
+    // concurrency, but only the RPM path reserved. These pins assert that
+    // the other buffered-metadata formats route their capped metadata
+    // fetches through the BUDGETED helper (`proxy_fetch_capped_budgeted` /
+    // `proxy_fetch_capped_with_cache_key_and_accept_budgeted`), not the
+    // un-budgeted `proxy_fetch_capped(` — a revert would re-introduce the
+    // unbounded-total buffering closed by #2684. The `_budgeted(` token is
+    // NOT a substring of the un-budgeted `proxy_fetch_capped(` token (the
+    // char after `capped` is `_`, not `(`), so each half of the assertion
+    // is independent.
+    // -------------------------------------------------------------------
+
+    /// One pin per buffered-metadata format handler: it MUST call the
+    /// budgeted helper and MUST NOT retain any un-budgeted `proxy_fetch_capped(`
+    /// call. Kept as a macro so the near-identical bodies do not trip the 3%
+    /// duplication gate.
+    macro_rules! budget_pin_test {
+        ($name:ident, $module_file:literal) => {
+            #[test]
+            fn $name() {
+                let src = include_str!($module_file);
+                assert!(
+                    src.contains("proxy_fetch_capped_budgeted(")
+                        || src.contains("proxy_fetch_capped_with_cache_key_and_accept_budgeted("),
+                    "{} MUST route its buffered proxy-metadata fetch through a \
+                     `*_budgeted` helper so it reserves against the shared \
+                     process-wide byte budget (#2684).",
+                    $module_file,
+                );
+                assert!(
+                    !src.contains("proxy_fetch_capped("),
+                    "{} MUST NOT keep an un-budgeted `proxy_fetch_capped(` \
+                     metadata fetch — every buffered-metadata call site must \
+                     reserve against the shared byte budget (#2684).",
+                    $module_file,
+                );
+                assert!(
+                    !src.contains("proxy_fetch_capped_with_cache_key_and_accept("),
+                    "{} MUST NOT keep an un-budgeted \
+                     `proxy_fetch_capped_with_cache_key_and_accept(` metadata \
+                     fetch (#2684).",
+                    $module_file,
+                );
+            }
+        };
+    }
+
+    budget_pin_test!(test_npm_buffered_metadata_reserves_budget_2684, "npm.rs");
+    budget_pin_test!(
+        test_composer_buffered_metadata_reserves_budget_2684,
+        "composer.rs"
+    );
+    budget_pin_test!(
+        test_maven_buffered_metadata_reserves_budget_2684,
+        "maven.rs"
+    );
+    budget_pin_test!(test_pypi_buffered_metadata_reserves_budget_2684, "pypi.rs");
+
+    /// Debian buffers its index directly through `ProxyService` (it verifies
+    /// the bytes against the signed `Release`, so it cannot stream — #2684
+    /// constraint), so its pin asserts it reserves against the shared budget
+    /// via `proxy_metadata_budget()` rather than a `*_budgeted` helper.
+    #[test]
+    fn test_debian_buffered_metadata_reserves_budget_2684() {
+        let src = include_str!("debian.rs");
+        assert!(
+            src.contains("proxy_metadata_budget()"),
+            "debian.rs MUST reserve its buffered dists/Release index against \
+             the shared proxy-metadata byte budget via `proxy_metadata_budget()` \
+             (#2684); debian keeps buffering (signed-Release verification) but \
+             must be bounded like every other format."
+        );
+    }
+
+    /// The named-format buffered-metadata caps (all LARGE-tier) all draw from
+    /// the SAME process-wide budget, so the SUM of concurrent buffers across
+    /// formats — not just per-format — is bounded (#2684). Model that with a
+    /// budget sized to exactly two LARGE caps and prove the third buffer is
+    /// refused until one releases.
+    #[test]
+    fn shared_budget_bounds_sum_across_named_formats_2684() {
+        let cap = LARGE_METADATA_MAX_BYTES;
+        let budget = ProxyMetadataBudget::new(cap * 2);
+        // e.g. an npm packument + a composer packages.json buffering at once.
+        let npm = budget.try_reserve(cap).expect("1st format buffer admitted");
+        let composer = budget.try_reserve(cap).expect("2nd format buffer admitted");
+        // A third format (pypi/maven/debian) buffering concurrently exceeds the
+        // shared budget and is refused until one releases — before #2684 each
+        // format buffered independently with no shared ceiling.
+        assert!(
+            budget.try_reserve(cap).is_none(),
+            "a third concurrent format buffer must not exceed the shared budget"
+        );
+        drop(npm);
+        let pypi = budget
+            .try_reserve(cap)
+            .expect("slot freed for the next format once one releases");
+        drop((composer, pypi));
+        assert_eq!(budget.available_bytes(), cap * 2, "all budget returned");
+    }
 
     // -------------------------------------------------------------------
     // #1215: source-level pins for the remaining shared proxy paths.
