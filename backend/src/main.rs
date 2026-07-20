@@ -862,9 +862,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
-    // Fan out authorization-cache invalidations from other replicas via
-    // Postgres LISTEN/NOTIFY (migration 142 triggers +
-    // services/cache_invalidation.rs). Awaited so the initial LISTEN and the
+    // Fan out authorization-cache and npm computed-packument invalidations
+    // from other replicas via Postgres LISTEN/NOTIFY (migration 142 triggers
+    // + services/cache_invalidation.rs; the packument event is emitted
+    // application-side on local npm writes, #2490). Awaited so the initial LISTEN and the
     // conservative startup flush complete before requests are served; if the
     // connection fails the spawned task retries with backoff while requests
     // proceed under TTL-bound staleness.
@@ -874,6 +875,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         cache_invalidation::CacheInvalidationHandles {
             repo_cache: state.repo_cache.clone(),
             permission_service: state.permission_service.clone(),
+            npm_packument_cache: state.npm_packument_cache.clone(),
         },
         runtime_shutdown_token.clone(),
     )

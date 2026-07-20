@@ -200,6 +200,7 @@ fn fresh_handles(pool: &PgPool) -> CacheInvalidationHandles {
     CacheInvalidationHandles {
         repo_cache: Arc::new(RwLock::new(HashMap::new())),
         permission_service: Arc::new(PermissionService::new(pool.clone())),
+        npm_packument_cache: None,
     }
 }
 
