@@ -577,6 +577,7 @@ impl MigrationWorker {
                             sha1: expected_sha1.clone(),
                         },
                         conflict_resolution,
+                        package_type,
                     )
                     .await?;
 
@@ -722,6 +723,7 @@ impl MigrationWorker {
                 source_path,
                 &expected,
                 conflict_resolution,
+                package_type,
             )
             .await?;
 
@@ -904,7 +906,20 @@ impl MigrationWorker {
         Ok(item_id.0)
     }
 
-    /// Check if an artifact already exists with the same checksum
+    /// Check if an artifact already exists with the same checksum.
+    ///
+    /// #2596: for Docker/OCI manifest items a checksum match on the manifest
+    /// `artifacts` row alone is NOT sufficient to skip. A hollow repository
+    /// (manifests/tags imported but referenced blobs or child manifests never
+    /// transferred, e.g. a pre-#2582 partial migration) has every manifest row
+    /// present with a matching checksum, so a plain checksum skip turns the
+    /// documented remedy — "re-run the migration" — into a silent no-op: the
+    /// item never reaches `process_single_artifact`, the referenced-content
+    /// walker never runs, and the job reports a clean success while every
+    /// layer still 404s. A manifest therefore only counts as a duplicate when
+    /// its referenced content is complete; otherwise it falls through so the
+    /// walker can fetch the missing pieces (registered content is deduped, so
+    /// genuinely-complete items stay idempotent).
     async fn check_artifact_duplicate(
         &self,
         repo_key: &str,
@@ -912,6 +927,7 @@ impl MigrationWorker {
         legacy_source_path: &str,
         expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
+        package_type: &str,
     ) -> Result<bool, MigrationError> {
         // Match artifacts in the same repository by repository-relative path.
         // Keep a fallback for legacy rows where path was saved as repo-prefixed.
@@ -933,15 +949,121 @@ impl MigrationWorker {
         .fetch_optional(&self.db)
         .await?;
 
-        match existing {
-            None => Ok(false), // No duplicate
-            Some((existing_sha256, existing_sha1)) => Ok(decide_duplicate_match(
-                expected,
-                &existing_sha256,
-                existing_sha1.as_deref(),
-                conflict_resolution,
-            )),
+        let Some((existing_sha256, existing_sha1)) = existing else {
+            return Ok(false); // No duplicate
+        };
+
+        if !decide_duplicate_match(
+            expected,
+            &existing_sha256,
+            existing_sha1.as_deref(),
+            conflict_resolution,
+        ) {
+            return Ok(false);
         }
+
+        // #2596: the checksum matched, but for a Docker/OCI manifest that only
+        // proves the manifest BYTES were transferred — not that its referenced
+        // config/layer blobs and child manifests exist. Re-process hollow
+        // manifests so the referenced-content walk can complete them.
+        if is_oci_package_type(package_type)
+            && matches!(
+                classify_oci_source_artifact(artifact_path),
+                OciRole::Manifest { .. }
+            )
+        {
+            // `artifacts.checksum_sha256` is the digest of the stored manifest
+            // bytes, so `'sha256:' || checksum_sha256` is exactly the digest
+            // the OCI index tables key on (see oci_migration_reindex).
+            let manifest_digest = format!("sha256:{existing_sha256}");
+            if !self
+                .oci_manifest_content_complete(repo_key, &manifest_digest)
+                .await?
+            {
+                tracing::info!(
+                    repo = %repo_key,
+                    path = %artifact_path,
+                    digest = %manifest_digest,
+                    "Manifest already exists with matching checksum but its referenced \
+                     OCI content is incomplete; re-processing to repair the hollow image"
+                );
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Decide whether a migrated Docker/OCI manifest's referenced content is
+    /// fully present in this repository's OCI index (#2596).
+    ///
+    /// Complete means, over the manifest and (for an index) every descendant
+    /// manifest reachable through `oci_manifest_refs`:
+    /// - the manifest itself is registered (an `oci_tags` row carries its
+    ///   digest — the live push path and the migration both record child
+    ///   manifests this way),
+    /// - every referenced blob edge in `manifest_blob_refs` resolves to an
+    ///   `oci_blobs` row, and
+    /// - every index→child edge resolves to a registered child manifest.
+    ///
+    /// This mirrors the hollow-tag detection in
+    /// `oci_migration_reindex::reconcile_hollow_and_orphan_tags`, extended
+    /// recursively so a registered-but-hollow child also marks its parent
+    /// index incomplete. An unregistered manifest (no `oci_tags` row at all —
+    /// e.g. a pre-1.5.8 import where the startup reindex has not run) is
+    /// incomplete by definition: re-processing registers it and fetches its
+    /// content.
+    async fn oci_manifest_content_complete(
+        &self,
+        repo_key: &str,
+        manifest_digest: &str,
+    ) -> Result<bool, MigrationError> {
+        let (complete,): (bool,) = sqlx::query_as(
+            r#"
+            WITH RECURSIVE repo AS (
+                SELECT id FROM repositories WHERE key = $1
+            ),
+            closure AS (
+                SELECT $2::text AS digest
+                UNION
+                SELECT mr.child_digest
+                FROM oci_manifest_refs mr
+                JOIN closure c ON mr.parent_digest = c.digest
+                WHERE mr.repository_id IN (SELECT id FROM repo)
+            )
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM oci_tags ot
+                    WHERE ot.repository_id IN (SELECT id FROM repo)
+                      AND ot.manifest_digest = $2
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM manifest_blob_refs br
+                    WHERE br.repository_id IN (SELECT id FROM repo)
+                      AND br.manifest_digest IN (SELECT digest FROM closure)
+                      AND NOT EXISTS (
+                            SELECT 1 FROM oci_blobs ob
+                            WHERE ob.repository_id = br.repository_id
+                              AND ob.digest = br.blob_digest
+                      )
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM oci_manifest_refs mr
+                    WHERE mr.repository_id IN (SELECT id FROM repo)
+                      AND mr.parent_digest IN (SELECT digest FROM closure)
+                      AND NOT EXISTS (
+                            SELECT 1 FROM oci_tags ct
+                            WHERE ct.repository_id = mr.repository_id
+                              AND ct.manifest_digest = mr.child_digest
+                      )
+                )
+            "#,
+        )
+        .bind(repo_key)
+        .bind(manifest_digest)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(complete)
     }
 
     /// Transfer an artifact from Artifactory to Artifact Keeper.
@@ -5534,6 +5656,289 @@ mod tests {
             counts,
             (0, 0, 0),
             "fail-closed: the item transaction must roll back entirely"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// #2596: re-migration must REPAIR a hollow image, not skip it. A hollow
+    /// repo has the manifest `artifacts` row present with a matching checksum
+    /// but its referenced blobs missing (failed/partial first migration), so
+    /// pre-fix the checksum-only duplicate check skipped the manifest, the
+    /// referenced-content walker never ran, and the re-migration was a no-op.
+    #[tokio::test]
+    async fn test_remigration_repairs_hollow_manifest_missing_blobs() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2596-hollow", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-2596-hollow");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let layer_hex = sha256_hex_of(&layer_bytes);
+        let manifest_bytes =
+            bytes::Bytes::from(docker_image_manifest_json(&config_bytes, &layer_bytes));
+        let manifest_hex = sha256_hex_of(&manifest_bytes);
+
+        // Nexus tags-only layout: the source enumerates the tag manifest; the
+        // blobs are only reachable by digest through the walker (#2457 shape).
+        let tag_path = "v2/app/manifests/latest".to_string();
+        let source_path = build_source_path(&repo_key, &tag_path);
+        let mut files = std::collections::HashMap::new();
+        files.insert(tag_path.clone(), manifest_bytes.clone());
+        files.insert(
+            format!("v2/app/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        );
+        files.insert(
+            format!("v2/app/blobs/sha256:{layer_hex}"),
+            layer_bytes.clone(),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &tag_path)
+            .await
+            .expect("initial import must succeed");
+
+        // Simulate the hollow state from a failed/partial first migration:
+        // manifest row + tag + refs intact, referenced blobs gone (rows AND
+        // bytes) — exactly what the startup reindex flags for re-migration.
+        let blob_keys: Vec<(String,)> =
+            sqlx::query_as("SELECT storage_key FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_keys.len(), 2, "precondition: both blobs registered");
+        for (key,) in &blob_keys {
+            storage.delete(key).await.expect("delete blob bytes");
+        }
+        sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let expected = ExpectedChecksums {
+            sha256: Some(manifest_hex.clone()),
+            sha1: None,
+        };
+
+        // THE #2596 GATE: the manifest row matches by checksum, but the image
+        // is hollow — the duplicate check must NOT skip it. (Pre-fix this
+        // returned true and the re-migration silently did nothing.)
+        let skip = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &tag_path,
+                &source_path,
+                &expected,
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .expect("duplicate check");
+        assert!(
+            !skip,
+            "a hollow manifest must fall through to re-processing, not be skipped as a duplicate"
+        );
+
+        // Falling through re-runs the transfer + referenced-content walk:
+        // the missing blobs must be fetched and registered again.
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &tag_path)
+            .await
+            .expect("re-migration of the hollow manifest must succeed");
+
+        let blobs: Vec<(String, String)> =
+            sqlx::query_as("SELECT digest, storage_key FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blobs.len(), 2, "re-migration must restore both blobs");
+        for (digest, key) in &blobs {
+            assert!(
+                storage.exists(key).await.unwrap(),
+                "blob bytes for {digest} must be back at {key}"
+            );
+        }
+
+        // Repair must not duplicate rows for the manifest artifact.
+        let manifest_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(manifest_rows.0, 1, "exactly one live manifest artifact row");
+        let tag_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tag_rows.0, 1, "exactly one tag row after repair");
+
+        // And now that the image is complete, the SAME check skips again —
+        // idempotency for genuinely-complete records is preserved.
+        let skip_after = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &tag_path,
+                &source_path,
+                &expected,
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .expect("duplicate check after repair");
+        assert!(
+            skip_after,
+            "a complete manifest must still be skipped as a duplicate"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// #2596: the completeness gate must also catch a manifest that was
+    /// imported as a plain artifact but never registered in the OCI index at
+    /// all (pre-1.5.8 import, startup reindex not yet run), and an index
+    /// whose child manifest is missing. Blob items keep the plain checksum
+    /// skip — completeness only applies to manifests.
+    #[tokio::test]
+    async fn test_hollow_check_unregistered_manifest_and_missing_child() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2596-unreg", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let child = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"config\":{{\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[]}}",
+            config_bytes.len(),
+            config_hex
+        );
+        let child_bytes = bytes::Bytes::from(child);
+        let child_hex = sha256_hex_of(&child_bytes);
+        let index = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.index.v1+json\",\
+              \"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"size\":{},\"digest\":\"sha256:{}\",\
+              \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}",
+            child_bytes.len(),
+            child_hex
+        );
+        let index_bytes = bytes::Bytes::from(index);
+        let index_hex = sha256_hex_of(&index_bytes);
+
+        let index_path = "v2/multi/manifests/latest".to_string();
+        let index_source_path = build_source_path(&repo_key, &index_path);
+        let blob_path = format!("v2/multi/blobs/sha256:{config_hex}");
+        let blob_source_path = build_source_path(&repo_key, &blob_path);
+        let mut files = std::collections::HashMap::new();
+        files.insert(index_path.clone(), index_bytes.clone());
+        files.insert(
+            format!("v2/multi/manifests/sha256:{child_hex}"),
+            child_bytes.clone(),
+        );
+        files.insert(blob_path.clone(), config_bytes.clone());
+
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &index_path)
+            .await
+            .expect("index import must succeed");
+        // Import the blob as its own item too, so it has an artifacts row for
+        // the blob-side duplicate check below.
+        transfer_one(&worker, &storage, &files, &repo_key, "docker", &blob_path)
+            .await
+            .expect("blob import must succeed");
+
+        let index_expected = ExpectedChecksums {
+            sha256: Some(index_hex.clone()),
+            sha1: None,
+        };
+
+        // Missing child: drop the child manifest's registration only.
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2")
+            .bind(repo_id)
+            .bind(format!("sha256:{child_hex}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let skip = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &index_path,
+                &index_source_path,
+                &index_expected,
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !skip,
+            "an index whose child manifest is unregistered must be re-processed"
+        );
+
+        // Unregistered root: no oci_tags rows at all (pre-reindex state).
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let skip = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &index_path,
+                &index_source_path,
+                &index_expected,
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !skip,
+            "a manifest with no OCI registration at all must be re-processed"
+        );
+
+        // Blob items are untouched by the completeness gate: matching
+        // checksum still skips.
+        let skip_blob = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &blob_path,
+                &blob_source_path,
+                &ExpectedChecksums {
+                    sha256: Some(config_hex.clone()),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .unwrap();
+        assert!(
+            skip_blob,
+            "blob items keep the plain checksum duplicate skip"
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
