@@ -47,6 +47,18 @@ pub async fn setup_guard(
         return next.run(request).await;
     }
 
+    // This replica still believes setup is pending and would block the
+    // request. Re-check the authoritative DB state first: the password
+    // change may have been served by a DIFFERENT replica, which cleared
+    // only its own in-process flag. Without this re-check every other
+    // replica stayed locked (403 SETUP_REQUIRED) until it was restarted
+    // (#2492). `setup_still_required` latches the flag to false on
+    // confirmation, so the extra query happens at most until the first
+    // confirmation and never once setup is known to be complete.
+    if !state.setup_still_required().await {
+        return next.run(request).await;
+    }
+
     // Block everything else
     (
         StatusCode::FORBIDDEN,
