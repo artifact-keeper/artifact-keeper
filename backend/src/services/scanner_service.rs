@@ -1188,7 +1188,11 @@ async fn acquire_scan_extraction_permit_from(
     fair_share: usize,
 ) -> ScanExtractionPermit {
     // Register this scan against its tenant and fetch the tenant's semaphore.
-    let tenant_sem = {
+    // The RAII guard is constructed in the SAME no-await critical section as the
+    // refcount bump: if this future is dropped at a later `.await` (permit
+    // acquisition), the guard's `Drop` still decrements the refcount and prunes
+    // the entry, keeping acquire/release symmetric on every exit path (#2595).
+    let (tenant_sem, mut permit) = {
         let mut reg = registry.lock().expect("tenant registry mutex poisoned");
         let entry = reg
             .entry(repository_id)
@@ -1197,7 +1201,15 @@ async fn acquire_scan_extraction_permit_from(
                 refs: 0,
             });
         entry.refs += 1;
-        entry.sem.clone()
+        (
+            entry.sem.clone(),
+            ScanExtractionPermit {
+                repository_id,
+                registry: registry.clone(),
+                _global: None,
+                _tenant: None,
+            },
+        )
     };
 
     // Per-tenant FIRST, then global (consistent ordering => no deadlock).
@@ -1225,12 +1237,9 @@ async fn acquire_scan_extraction_permit_from(
         },
     };
 
-    ScanExtractionPermit {
-        repository_id,
-        registry,
-        _global: global_permit,
-        _tenant: tenant_permit,
-    }
+    permit._global = global_permit;
+    permit._tenant = tenant_permit;
+    permit
 }
 
 /// Process-wired entry point for [`acquire_scan_extraction_permit_from`], using
@@ -10405,6 +10414,64 @@ mod tests {
         assert!(
             registry.lock().unwrap().is_empty(),
             "idle per-tenant entries must be pruned on drop"
+        );
+    }
+
+    /// #2595: dropping the acquire future mid-`.await` (cancellation) must not
+    /// leak the tenant refcount. Before the fix, `refs += 1` ran before the RAII
+    /// guard existed, so a future dropped while parked on the global semaphore
+    /// left a permanent registry entry for the tenant.
+    #[tokio::test]
+    async fn test_scan_extraction_cancelled_acquire_does_not_leak_refcount() {
+        let global = Arc::new(Semaphore::new(1));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let fair = 1;
+        let blocker = Uuid::new_v4();
+        let victim = Uuid::new_v4();
+
+        // Saturate the global pool so the next acquire parks on the global await.
+        let held =
+            acquire_scan_extraction_permit_from(blocker, global.clone(), registry.clone(), fair)
+                .await;
+
+        // The victim is within its fair share (fresh tenant), so it reserves its
+        // tenant slot and then blocks at `global.acquire_owned().await`. The
+        // timeout drops the acquire future at exactly that cancellation point.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "victim acquire must still be parked on the global cap"
+        );
+
+        // The dropped future must have unwound its registration: entry pruned.
+        assert!(
+            !registry.lock().unwrap().contains_key(&victim),
+            "cancelled acquire leaked the tenant refcount/registry entry (#2595)"
+        );
+
+        // Normal acquire/release cycle stays symmetric after the cancellation.
+        drop(held);
+        let permit =
+            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair)
+                .await;
+        assert_eq!(
+            registry.lock().unwrap().get(&victim).map(|e| e.refs),
+            Some(1),
+            "in-flight scan must be registered with exactly one ref"
+        );
+        drop(permit);
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "normal acquire/release must prune the tenant entry"
+        );
+        assert_eq!(
+            global.available_permits(),
+            1,
+            "every global permit must be returned"
         );
     }
 
