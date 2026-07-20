@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO lfs_locks (repository_id, path, ref_name, owner_id, owner_name)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (repository_id, path) DO NOTHING\n        RETURNING id, locked_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "locked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4ae214e2eaaee22693e4e257955767e4139645a5f7cbef7e8211a66fb3b91c2a"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE peer_instances\n            SET status = 'offline'\n            WHERE status = 'online'\n              AND last_heartbeat_at < NOW() - make_interval(mins => $1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d9e55ee7285dd90f446308569571a6d93780ecf0bc9c2ba00ae54c01418e2d73"
+}

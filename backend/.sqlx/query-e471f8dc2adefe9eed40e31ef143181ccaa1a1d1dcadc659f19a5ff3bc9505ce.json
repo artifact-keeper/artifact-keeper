@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE peer_connections SET\n                shared_artifacts_count = (\n                    SELECT COUNT(DISTINCT ec1.artifact_id)\n                    FROM peer_cache_entries ec1\n                    JOIN peer_cache_entries ec2\n                        ON ec1.artifact_id = ec2.artifact_id\n                    WHERE ec1.peer_instance_id = $1 AND ec2.peer_instance_id = $2\n                ),\n                shared_chunks_count = (\n                    SELECT COALESCE(SUM(\n                        LEAST(ca1.available_chunks, ca2.available_chunks)\n                    ), 0)\n                    FROM chunk_availability ca1\n                    JOIN chunk_availability ca2\n                        ON ca1.artifact_id = ca2.artifact_id\n                    WHERE ca1.peer_instance_id = $1 AND ca2.peer_instance_id = $2\n                ),\n                updated_at = NOW()\n            WHERE source_peer_id = $1 AND target_peer_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e471f8dc2adefe9eed40e31ef143181ccaa1a1d1dcadc659f19a5ff3bc9505ce"
+}

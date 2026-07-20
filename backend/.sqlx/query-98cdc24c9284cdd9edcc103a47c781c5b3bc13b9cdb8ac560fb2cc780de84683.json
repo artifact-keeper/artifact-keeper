@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE plugins\n            SET version = $2, manifest = $3, capabilities = $4, resource_limits = $5, updated_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98cdc24c9284cdd9edcc103a47c781c5b3bc13b9cdb8ac560fb2cc780de84683"
+}

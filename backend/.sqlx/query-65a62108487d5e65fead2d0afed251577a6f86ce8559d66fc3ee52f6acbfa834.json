@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,\n                public_key_pem, private_key_enc, algorithm, is_active, created_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10)\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bytea",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "65a62108487d5e65fead2d0afed251577a6f86ce8559d66fc3ee52f6acbfa834"
+}

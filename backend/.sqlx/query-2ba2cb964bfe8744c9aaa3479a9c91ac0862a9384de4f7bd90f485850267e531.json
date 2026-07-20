@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as \"count!\"\n            FROM scan_results\n            WHERE ($1::uuid IS NULL OR repository_id = $1)\n              AND ($2::uuid IS NULL OR artifact_id = $2)\n              AND ($3::text IS NULL OR status = $3)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2ba2cb964bfe8744c9aaa3479a9c91ac0862a9384de4f7bd90f485850267e531"
+}

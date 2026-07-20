@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scan_findings (\n                scan_result_id, artifact_id, severity, title, description,\n                cve_id, affected_component, affected_version, fixed_version,\n                source, source_url\n            )\n            SELECT $1, $2, severity, title, description,\n                   cve_id, affected_component, affected_version, fixed_version,\n                   source, source_url\n            FROM scan_findings\n            WHERE scan_result_id = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c859fcdfed67c131ceb91c6d7b10a85c0a08aa14ed597cc7dfea51aa27ef6a1f"
+}

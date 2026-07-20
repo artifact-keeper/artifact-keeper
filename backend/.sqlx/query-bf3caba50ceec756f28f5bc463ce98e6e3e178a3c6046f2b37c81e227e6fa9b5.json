@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) as \"download_count!\",\n            MIN(downloaded_at) as first_downloaded,\n            MAX(downloaded_at) as last_downloaded\n        FROM download_statistics\n        WHERE artifact_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "download_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "first_downloaded",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "last_downloaded",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "bf3caba50ceec756f28f5bc463ce98e6e3e178a3c6046f2b37c81e227e6fa9b5"
+}

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO refresh_token_jti (jti, user_id, family_id, issued_at, expires_at)\n            VALUES ($1, $2, $3, $4, $5)\n            ON CONFLICT (jti) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "349800e968fcfc2205152be5af01b04616a6dc5fbbc849fcf3cc802b895dd69b"
+}

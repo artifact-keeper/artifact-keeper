@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id, peer_instance_id, repository_id, sync_enabled,\n                replication_mode::text as replication_mode,\n                replication_schedule,\n                replication_filter,\n                last_replicated_at,\n                created_at\n            FROM peer_repo_subscriptions\n            WHERE peer_instance_id = $1 AND repository_id = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "peer_instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "sync_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "replication_mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "replication_schedule",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "replication_filter",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_replicated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "1c87008a2b29a9ab431721210ec8e1650319798356f3f938d3a7447423a0964e"
+}

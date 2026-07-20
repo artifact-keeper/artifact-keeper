@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE age_gate_reviews r\n            SET status = 'approved', reviewed_by = NULL, reviewed_at = NOW(),\n                review_reason = $1\n            FROM repositories repo\n            WHERE r.repository_id = repo.id\n              AND r.status = 'pending'\n              AND repo.age_gate_enabled = true\n              AND r.upstream_published_at IS NOT NULL\n              AND NOW() - r.upstream_published_at >= make_interval(days => repo.age_gate_min_age_days)\n            RETURNING r.id AS \"id!\", r.repository_id AS \"repository_id!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "cbb7fc902dd898da8b804267796ee3b15d130b48c927712a6c1b85d40585453f"
+}

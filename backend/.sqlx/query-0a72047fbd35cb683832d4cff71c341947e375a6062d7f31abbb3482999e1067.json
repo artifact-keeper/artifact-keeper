@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*)::bigint\n            FROM age_gate_reviews r\n            INNER JOIN repositories repo ON repo.id = r.repository_id\n            WHERE ($1::text IS NULL OR repo.key = $1)\n              AND ($2::text[] IS NULL OR r.status = ANY($2))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0a72047fbd35cb683832d4cff71c341947e375a6062d7f31abbb3482999e1067"
+}
