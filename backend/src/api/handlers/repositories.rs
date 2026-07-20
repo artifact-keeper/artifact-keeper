@@ -3519,7 +3519,7 @@ async fn purge_repo_artifact_objects(
         }
     };
 
-    let keys: Vec<String> = sqlx::query_scalar(
+    let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
            AND a.storage_key NOT LIKE 'oci-manifests/%' \
@@ -3539,7 +3539,14 @@ async fn purge_repo_artifact_objects(
             "Failed to list artifact storage keys to purge before repository delete"
         );
         Vec::new()
-    });
+    })
+    .into_iter()
+    .collect();
+
+    keys.extend(collect_repo_maven_flat_keys(state, repo_id).await);
+    if location.backend == "filesystem" {
+        keys.extend(collect_repo_maven_derived_keys(state, repo_id).await);
+    }
 
     let total = keys.len();
     let mut failed = 0usize;
@@ -3565,6 +3572,116 @@ async fn purge_repo_artifact_objects(
             "Purged artifact storage objects for deleted repository"
         );
     }
+}
+
+/// Storage keys of this repository's *row-less* Maven flat objects — checksum
+/// sidecars, verbatim `maven-metadata.xml`, legacy GAV-grouped companions —
+/// recorded in the `maven_flat_object_owner` attribution table (#2668).
+///
+/// These objects have no `artifacts` row, so the artifacts-driven purge above
+/// never lists them; on shared cloud namespaces (S3/GCS/Azure) the attribution
+/// table is their only DB record, and it CASCADEs away with the repository
+/// row — after which the objects are permanently untrackable. They must
+/// therefore be collected (and purged) BEFORE the repository delete.
+///
+/// A key is excluded when any catalog layer attributes it to another
+/// repository on the same backend (a live artifact row, or a parent
+/// artifact's metadata `files[]` reference): deleting this repository must
+/// never destroy an object another tenant still serves. Best-effort: a DB
+/// error logs and returns the empty set.
+async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT o.storage_key \
+         FROM maven_flat_object_owner o \
+         WHERE o.repository_id = $1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifacts b \
+               JOIN repositories rb ON rb.id = b.repository_id \
+               WHERE b.storage_key = o.storage_key \
+                 AND b.repository_id <> $1 \
+                 AND rb.storage_backend = o.storage_backend \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM artifact_metadata am \
+               JOIN artifacts pa ON pa.id = am.artifact_id \
+               JOIN repositories pr ON pr.id = pa.repository_id \
+               WHERE pa.repository_id <> $1 \
+                 AND pr.storage_backend = o.storage_backend \
+                 AND jsonb_typeof(am.metadata->'files') = 'array' \
+                 AND EXISTS ( \
+                     SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
+                     WHERE f->>'storage_key' = o.storage_key \
+                 ) \
+           )",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to list Maven flat-object keys to purge before repository delete"
+        );
+        Vec::new()
+    })
+}
+
+/// Derived row-less Maven keys for a FILESYSTEM repository being deleted:
+/// checksum sidecars (`.md5`/`.sha1`/`.sha256`/`.sha512`) of every artifact
+/// key, plus the `maven-metadata.xml` documents (and their sidecars) at the
+/// version-, artifactId- and group-level directories of those keys (#2668).
+///
+/// Filesystem repositories keep an isolated key space (no
+/// `maven_flat_object_owner` rows are ever written for them), so their
+/// row-less objects can only be derived from the artifact keys. Derivation is
+/// safe precisely because the namespace is per-repository: no other tenant's
+/// object can live under this repository's `storage_path`. Cloud namespaces
+/// are shared, so this derivation must NOT run there — a derived group-level
+/// metadata key could name another tenant's object; cloud row-less keys are
+/// purged from the attribution table instead
+/// ([`collect_repo_maven_flat_keys`]).
+///
+/// Deletes of keys that never existed are tolerated by the caller
+/// (NotFound => success), so over-derivation is harmless. Best-effort: a DB
+/// error logs and returns the empty set.
+async fn collect_repo_maven_derived_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "WITH maven_keys AS ( \
+             SELECT DISTINCT storage_key \
+             FROM artifacts \
+             WHERE repository_id = $1 AND storage_key LIKE 'maven/%' \
+         ), \
+         dirs AS ( \
+             SELECT DISTINCT d.dir \
+             FROM maven_keys k, \
+             LATERAL (VALUES \
+                 (regexp_replace(k.storage_key, '/[^/]*$', '')), \
+                 (regexp_replace(k.storage_key, '/[^/]*/[^/]*$', '')), \
+                 (regexp_replace(k.storage_key, '/[^/]*/[^/]*/[^/]*$', '')) \
+             ) AS d(dir) \
+             WHERE d.dir LIKE 'maven/%' AND d.dir <> 'maven' \
+         ) \
+         SELECT k.storage_key || s.suffix \
+         FROM maven_keys k \
+         CROSS JOIN (VALUES ('.md5'), ('.sha1'), ('.sha256'), ('.sha512')) AS s(suffix) \
+         UNION \
+         SELECT d.dir || '/maven-metadata.xml' || s.suffix \
+         FROM dirs d \
+         CROSS JOIN (VALUES (''), ('.md5'), ('.sha1'), ('.sha256'), ('.sha512')) \
+             AS s(suffix)",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            error = %e,
+            "Failed to derive Maven sidecar/metadata keys to purge before repository delete"
+        );
+        Vec::new()
+    })
 }
 
 /// Delete repository
@@ -11342,6 +11459,110 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2668: deleting a repository left row-less Maven files — checksum
+    /// sidecars (`.md5`/`.sha1`) and `maven-metadata.xml` documents — on
+    /// storage, because the purge only listed `artifacts.storage_key`s. The
+    /// purge must now also remove the derived sidecar/metadata keys
+    /// (filesystem) and the attribution-table keys, while leaving objects
+    /// that were never part of the repository untouched.
+    #[tokio::test]
+    async fn purge_repo_removes_rowless_maven_files_2668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: dir.to_string_lossy().to_string(),
+        };
+        let storage = state
+            .storage_for_repo(&location)
+            .expect("filesystem backend");
+
+        // Row-backed artifact + its row-less companions, exactly as a
+        // `mvn deploy` leaves them.
+        let jar = "maven/com/example/lib/1.0/lib-1.0.jar".to_string();
+        let jar_sha1 = format!("{jar}.sha1");
+        let jar_md5 = format!("{jar}.md5");
+        let ga_meta = "maven/com/example/lib/maven-metadata.xml".to_string();
+        let ga_meta_sha1 = format!("{ga_meta}.sha1");
+        // A key recorded only in the attribution table (cloud-style record).
+        let claimed = "maven/com/example/lib/claimed-only.xml".to_string();
+        // An unrelated object that must survive the purge untouched.
+        let unrelated = "generic/other/unrelated.bin".to_string();
+
+        for key in [
+            &jar,
+            &jar_sha1,
+            &jar_md5,
+            &ga_meta,
+            &ga_meta_sha1,
+            &claimed,
+            &unrelated,
+        ] {
+            storage
+                .put(key, bytes::Bytes::from_static(b"x"))
+                .await
+                .expect("seed object");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, 'com/example/lib/1.0/lib-1.0.jar', 'lib', '1.0', 1,
+                    'cafe', 'application/java-archive', $3, $4)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(&jar)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert artifact row");
+
+        sqlx::query(
+            "INSERT INTO maven_flat_object_owner \
+                 (storage_backend, storage_key, repository_id, source) \
+             VALUES ('filesystem', $1, $2, 'write_claim')",
+        )
+        .bind(&claimed)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert attribution row");
+
+        purge_repo_artifact_objects(&state, repo_id, &location).await;
+
+        let mut left = Vec::new();
+        for key in [&jar, &jar_sha1, &jar_md5, &ga_meta, &ga_meta_sha1, &claimed] {
+            if storage.exists(key).await.unwrap_or(true) {
+                left.push(key.clone());
+            }
+        }
+        let unrelated_left = storage.exists(&unrelated).await.unwrap_or(false);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            left.is_empty(),
+            "repository purge must remove row-less Maven files too (#2668); left: {left:?}"
+        );
+        assert!(
+            unrelated_left,
+            "objects outside the repository's Maven tree must survive the purge"
+        );
     }
 
     /// #2237: a direct DELETE on a `promotion_only` release repository is
