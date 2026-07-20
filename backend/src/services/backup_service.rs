@@ -173,6 +173,41 @@ fn build_backup_tar(
     Ok(tar_buffer)
 }
 
+/// Normalize the operator-supplied backup key prefix (`BACKUP_S3_PREFIX`).
+///
+/// Splits on `/` and drops empty, `.`, and `..` segments — the storage key
+/// is joined into a filesystem path on the filesystem backend, so traversal
+/// segments must never survive — then rejoins. Returns `None` when nothing
+/// usable remains, so `BACKUP_S3_PREFIX=""` or `"/"` behaves like unset.
+fn normalize_backup_prefix(raw: &str) -> Option<String> {
+    let cleaned: Vec<&str> = raw
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join("/"))
+    }
+}
+
+/// Storage key for a new backup archive (#2508).
+///
+/// The relative key always keeps the `backups/` root; when a prefix is
+/// configured via `BACKUP_S3_PREFIX` it is prepended, mirroring how
+/// `S3_PREFIX` prepends to artifact keys:
+/// `{BACKUP_S3_PREFIX}/backups/YYYY/MM/DD/{uuid}.tar.gz`.
+///
+/// Back-compat: reads, restores, and deletes always resolve through the
+/// `backups.storage_path` recorded at creation time, so changing (or
+/// unsetting) the prefix later never strands existing archives.
+fn backup_storage_key(raw_prefix: Option<&str>, relative: &str) -> String {
+    match raw_prefix.and_then(normalize_backup_prefix) {
+        Some(prefix) => format!("{}/{}", prefix, relative),
+        None => relative.to_string(),
+    }
+}
+
 /// Count entries under the `artifacts/` prefix in a tar.gz archive.
 fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     let decoder = GzDecoder::new(tar_data);
@@ -206,10 +241,14 @@ impl BackupService {
 
     /// Create a new backup job
     pub async fn create(&self, req: CreateBackupRequest) -> Result<Backup> {
-        let storage_path = format!(
-            "backups/{}/{}.tar.gz",
-            Utc::now().format("%Y/%m/%d"),
-            Uuid::new_v4()
+        let prefix = std::env::var("BACKUP_S3_PREFIX").ok();
+        let storage_path = backup_storage_key(
+            prefix.as_deref(),
+            &format!(
+                "backups/{}/{}.tar.gz",
+                Utc::now().format("%Y/%m/%d"),
+                Uuid::new_v4()
+            ),
         );
 
         let backup = sqlx::query_as!(
@@ -799,6 +838,80 @@ mod tests {
     use flate2::Compression;
     #[allow(unused_imports)]
     use tar::Builder;
+
+    // -----------------------------------------------------------------------
+    // Backup storage key / BACKUP_S3_PREFIX tests (#2508)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backup_key_without_prefix_keeps_legacy_root() {
+        // Existing deployments (no BACKUP_S3_PREFIX) must keep writing the
+        // exact key shape they always have.
+        assert_eq!(
+            backup_storage_key(None, "backups/2026/07/20/abc.tar.gz"),
+            "backups/2026/07/20/abc.tar.gz"
+        );
+    }
+
+    #[test]
+    fn backup_key_prepends_configured_prefix() {
+        assert_eq!(
+            backup_storage_key(Some("team-a/registry"), "backups/2026/07/20/abc.tar.gz"),
+            "team-a/registry/backups/2026/07/20/abc.tar.gz"
+        );
+    }
+
+    #[test]
+    fn backup_prefix_is_normalized() {
+        // Leading/trailing/duplicate slashes collapse.
+        assert_eq!(
+            normalize_backup_prefix("/team-a//registry/").as_deref(),
+            Some("team-a/registry")
+        );
+        // Dot and traversal segments are dropped: the key is joined into a
+        // filesystem path on the filesystem backend, so `..` must not survive.
+        assert_eq!(
+            normalize_backup_prefix("../escape/./x").as_deref(),
+            Some("escape/x")
+        );
+    }
+
+    #[test]
+    fn empty_or_degenerate_prefix_behaves_like_unset() {
+        for raw in ["", "/", "//", ".", "..", "././.."] {
+            assert!(normalize_backup_prefix(raw).is_none(), "raw = {raw:?}");
+            assert_eq!(
+                backup_storage_key(Some(raw), "backups/x.tar.gz"),
+                "backups/x.tar.gz",
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_backup_key_cannot_collide_with_repo_scoped_artifact_keys() {
+        // #2624/#2728 artifact keys on shared cloud namespaces are
+        // `{format}/{repository_uuid}/{path}`. Even with an adversarial
+        // BACKUP_S3_PREFIX that mimics a format/repo segment, the backup key
+        // always continues with the `backups/` root plus a fresh UUIDv4
+        // archive name, so it can never equal a scoped artifact key for any
+        // artifact path an existing repository has recorded.
+        let repo = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let scoped = crate::storage::StorageKeyScheme::RepoScoped.write_key(
+            "s3",
+            "maven",
+            repo,
+            "backups/2026/07/20/abc.tar.gz",
+        );
+        let backup = backup_storage_key(
+            Some(&format!("maven/{repo}")),
+            &format!("backups/2026/07/20/{}.tar.gz", Uuid::new_v4()),
+        );
+        assert_ne!(scoped, backup);
+        // The repo-scoped segment stays intact in artifact keys regardless of
+        // any backup prefix configuration.
+        assert!(scoped.starts_with(&format!("maven/{repo}/")));
+    }
 
     // -----------------------------------------------------------------------
     // BackupStatus Display tests
