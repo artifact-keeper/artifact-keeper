@@ -1794,6 +1794,56 @@ async fn require_active_signing_key(
     require_signing_key(signing_svc.get_active_key_for_repo(repo_id).await)
 }
 
+/// Apply a Virtual repo member's own P2 dist/component/architecture filter to
+/// the requested `dists/` path, exactly as if the request had been served
+/// directly from that Remote member (#2727).
+///
+/// The direct-fetch gate (`load_debian_filter` + `gate_debian_dists`) lives
+/// behind `repo_remote_upstream`, which is `None` for a Virtual repo (a virtual
+/// repo has no upstream of its own; the upstream lives on its MEMBERS). Before
+/// this check the virtual paths enumerated their Remote members and fetched from
+/// each WITHOUT consulting that member's allowlist, letting a client pull a
+/// filtered-out distribution/component/architecture through the virtual repo.
+///
+/// Fail-closed for the member: an error loading the member's filter (DB error or
+/// unparseable config, per #2672/#2725) OR an allowlist that excludes the
+/// requested dist/component/arch (including the by-hash arch cross-check) marks
+/// the member as DENY, so the caller skips it. Skipping affects only that
+/// member: sibling members whose filter allows the path still aggregate
+/// normally, and a member's filter-load error never fails the whole virtual
+/// request open (skip-that-member is the safer default per #2727).
+async fn virtual_member_dists_allowed(
+    state: &SharedState,
+    proxy: &ProxyService,
+    member: &crate::models::repository::Repository,
+    upstream_url: &str,
+    distribution: &str,
+    dists_suffix: &str,
+) -> bool {
+    let filter = match load_debian_filter(&state.db, member.id).await {
+        Ok(f) => f,
+        // Fail closed for THIS member (do not fall open to allow-all, and do not
+        // 503 the whole virtual request over one member's config blip).
+        Err(_) => return false,
+    };
+    if gate_debian_dists(&filter, upstream_url, distribution, dists_suffix).is_err() {
+        return false;
+    }
+    // Cross-check the by-hash arch (arch encoded in the content hash, not the
+    // path) against the member's signed Release, mirroring the direct catch-all.
+    enforce_by_hash_arch(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        &filter,
+        distribution,
+        dists_suffix,
+    )
+    .await
+    .is_ok()
+}
+
 /// Iterate the virtual repo's Remote members for `upstream_path` and
 /// return the first successful response. Checks the release epoch for
 /// lazy invalidation before attempting the streaming fetch.
@@ -1821,11 +1871,37 @@ async fn try_virtual_dists(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    // The path after `dists/{distribution}/`, used to gate each member's filter
+    // (component/arch are derived from it). All callers build `upstream_path`
+    // as `dists/{distribution}/{suffix}`; a path not of that shape has nothing
+    // to serve here.
+    let Some(dists_suffix) = upstream_path.strip_prefix(&format!("dists/{distribution}/")) else {
+        return Ok(None);
+    };
     let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
+
+        // #2727: honor THIS member's own dist/component/arch allowlist before
+        // serving its content through the virtual repo. A member whose filter
+        // excludes the requested path (or whose filter cannot be loaded) is
+        // skipped — treated as deny — so a filtered-out dist/component/arch
+        // cannot be pulled via the virtual repo, while members that allow it
+        // still aggregate.
+        if !virtual_member_dists_allowed(
+            state,
+            proxy,
+            member,
+            upstream_url,
+            distribution,
+            dists_suffix,
+        )
+        .await
+        {
+            continue;
+        }
 
         // Epoch-based lazy invalidation for this member's cache entry
         maybe_invalidate_by_epoch(proxy, &member.key, distribution, upstream_path).await;
@@ -1923,11 +1999,33 @@ async fn try_virtual_dists_detecting_change(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    // The path after `dists/{distribution}/`, used to gate each member's filter.
+    let Some(dists_suffix) = upstream_path.strip_prefix(&format!("dists/{distribution}/")) else {
+        return Ok(None);
+    };
     let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
+
+        // #2727: honor THIS member's own dist/component/arch allowlist before
+        // revalidating/serving its Release/InRelease content through the virtual
+        // repo. A member that excludes the requested dist (or whose filter fails
+        // to load) is skipped — treated as deny.
+        if !virtual_member_dists_allowed(
+            state,
+            proxy,
+            member,
+            upstream_url,
+            distribution,
+            dists_suffix,
+        )
+        .await
+        {
+            continue;
+        }
+
         let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
         match proxy
             .fetch_dists_with_revalidation(
@@ -2594,13 +2692,41 @@ async fn pool_download(
 
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
+                // #2727: enforce EACH member's own pool (component/arch)
+                // allowlist before it can serve a `.deb` through the virtual
+                // repo. A Remote member whose filter excludes the requested pool
+                // path — or whose filter cannot be loaded — is dropped from the
+                // candidate set (treated as deny), exactly as a direct member
+                // fetch would 404, while members that DO allow the path still
+                // aggregate. Fail-closed per member: a filter-load error skips
+                // only that member, it does not fail the whole request open.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let mut allowed_members = Vec::with_capacity(members.len());
+                for member in members {
+                    match remote_member_upstream(&member) {
+                        Some(base) => {
+                            let filter = match load_debian_filter(&state.db, member.id).await {
+                                Ok(f) => f,
+                                Err(_) => continue,
+                            };
+                            if gate_debian_pool(&filter, base, &component, &path).is_ok() {
+                                allowed_members.push(member);
+                            }
+                        }
+                        // Non-Remote members (Local/Staging) serve hosted
+                        // content the proxy allowlist does not apply to —
+                        // matching the direct-repo path, which only gates repos
+                        // with a Remote upstream.
+                        None => allowed_members.push(member),
+                    }
+                }
+
                 let db = state.db.clone();
                 let upstream_path = format!("pool/{}/{}", component, path);
                 let artifact_path_clone = artifact_path.clone();
-                let result = proxy_helpers::resolve_virtual_download(
-                    &state.db,
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    allowed_members,
                     state.proxy_service.as_deref(),
-                    repo.id,
                     &upstream_path,
                     |member_id, location| {
                         let db = db.clone();
@@ -4559,14 +4685,12 @@ mod virtual_dists_cap_tests {
     const DIST: &str = "trixie";
     const PKG_PATH: &str = "dists/trixie/main/binary-amd64/Packages.xz";
 
-    /// Insert a Remote Debian repo pointing at `upstream_url` and enrol it as a
-    /// member of a fresh Virtual repo. Returns `(virtual_id, virtual_key,
-    /// member_id)`; callers clean up via [`cleanup`].
-    async fn virtual_with_remote_member(
+    /// Insert a Remote Debian repo pointing at `upstream_url`. Returns its id.
+    async fn insert_remote_debian_member(
         pool: &sqlx::PgPool,
         storage_path: &str,
         upstream_url: &str,
-    ) -> (Uuid, String, Uuid) {
+    ) -> Uuid {
         let member_id = Uuid::new_v4();
         let member_key = format!("dbg-mem-{}", member_id.simple());
         sqlx::query(
@@ -4581,7 +4705,16 @@ mod virtual_dists_cap_tests {
         .execute(pool)
         .await
         .expect("insert remote member");
+        member_id
+    }
 
+    /// Insert a Virtual Debian repo and enrol `members` (as `(id, priority)`).
+    /// Returns `(virtual_id, virtual_key)`.
+    async fn insert_virtual_debian(
+        pool: &sqlx::PgPool,
+        storage_path: &str,
+        members: &[(Uuid, i32)],
+    ) -> (Uuid, String) {
         let virtual_id = Uuid::new_v4();
         let virtual_key = format!("dbg-virt-{}", virtual_id.simple());
         sqlx::query(
@@ -4595,25 +4728,65 @@ mod virtual_dists_cap_tests {
         .execute(pool)
         .await
         .expect("insert virtual repo");
+        for (member_id, priority) in members {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(pool)
+            .await
+            .expect("insert virtual member");
+        }
+        (virtual_id, virtual_key)
+    }
+
+    /// Set a member's P2 Debian proxy filter (dist/component/arch allowlist).
+    async fn set_member_debian_filter(pool: &sqlx::PgPool, member_id: Uuid, json: &str) {
         sqlx::query(
-            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-             VALUES ($1, $2, 1)",
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
         )
-        .bind(virtual_id)
         .bind(member_id)
+        .bind(DEBIAN_CONFIG_KEY)
+        .bind(json)
         .execute(pool)
         .await
-        .expect("insert virtual member");
+        .expect("insert member debian filter");
+    }
+
+    /// Insert a Remote Debian repo pointing at `upstream_url` and enrol it as a
+    /// member of a fresh Virtual repo. Returns `(virtual_id, virtual_key,
+    /// member_id)`; callers clean up via [`cleanup`].
+    async fn virtual_with_remote_member(
+        pool: &sqlx::PgPool,
+        storage_path: &str,
+        upstream_url: &str,
+    ) -> (Uuid, String, Uuid) {
+        let member_id = insert_remote_debian_member(pool, storage_path, upstream_url).await;
+        let (virtual_id, virtual_key) =
+            insert_virtual_debian(pool, storage_path, &[(member_id, 1)]).await;
         (virtual_id, virtual_key, member_id)
     }
 
     async fn cleanup(pool: &sqlx::PgPool, virtual_id: Uuid, member_id: Uuid) {
+        cleanup_members(pool, virtual_id, &[member_id]).await;
+    }
+
+    async fn cleanup_members(pool: &sqlx::PgPool, virtual_id: Uuid, members: &[Uuid]) {
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = ANY($1)")
+            .bind(members)
+            .execute(pool)
+            .await;
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
             .bind(virtual_id)
             .execute(pool)
             .await;
+        let mut ids = members.to_vec();
+        ids.push(virtual_id);
         let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
-            .bind(vec![virtual_id, member_id])
+            .bind(ids)
             .execute(pool)
             .await;
     }
@@ -4860,6 +5033,99 @@ mod virtual_dists_cap_tests {
             matches!(out, Ok(None)),
             "a 404 member must fall through to Ok(None), got {:?}",
             out.map(|o| o.map(|r| r.status())),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2727 — a Virtual Debian repo must apply EACH member's own P2
+    // dist/component/arch allowlist before serving that member's content, so a
+    // filtered-out distribution cannot be pulled through the virtual repo.
+    // -----------------------------------------------------------------------
+
+    /// The higher-priority member's filter EXCLUDES the requested distribution,
+    /// while a lower-priority member allows it. The request must be served from
+    /// the ALLOWING member, and the excluded member must never be contacted.
+    ///
+    /// Before the fix the virtual path never consulted a member's filter, so the
+    /// higher-priority (excluded) member would serve the filtered-out dist:
+    /// `denying_hits == 1` and the body would be `DENYING-MEMBER-BODY`. After the
+    /// fix that member is skipped (deny) and the allowing member serves.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // to_bytes on a bounded in-memory test body
+    async fn virtual_member_filter_excludes_dist_skips_that_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Member A (priority 1, tried first): filter restricts to a DIFFERENT
+        // distribution, so the requested `trixie` is denied for this member.
+        let denying = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"DENYING-MEMBER-BODY".to_vec()),
+            )
+            .mount(&denying)
+            .await;
+
+        // Member B (priority 2): no filter (allow all), so it serves `trixie`.
+        let allowing = MockServer::start().await;
+        let allow_body = b"ALLOWING-MEMBER-BODY".to_vec();
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(allow_body.clone()))
+            .mount(&allowing)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-2727-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+
+        let member_a = insert_remote_debian_member(&pool, root, &denying.uri()).await;
+        let member_b = insert_remote_debian_member(&pool, root, &allowing.uri()).await;
+        // A is higher priority (1) than B (2), so A is tried first.
+        let (virtual_id, virtual_key) =
+            insert_virtual_debian(&pool, root, &[(member_a, 1), (member_b, 2)]).await;
+        // Member A's allowlist EXCLUDES the requested `trixie`.
+        set_member_debian_filter(&pool, member_a, r#"{"distribution_paths":["bookworm"]}"#).await;
+
+        let out = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        let denying_hits = denying.received_requests().await.unwrap().len();
+        let allowing_hits = allowing.received_requests().await.unwrap().len();
+
+        cleanup_members(&pool, virtual_id, &[member_a, member_b]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = out
+            .expect("must not error")
+            .expect("the allowing member must serve the request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            got.as_ref(),
+            allow_body.as_slice(),
+            "content must come from the member whose filter allows `trixie`, not the excluded one",
+        );
+        assert_eq!(
+            denying_hits, 0,
+            "the member whose filter EXCLUDES `trixie` must never be fetched (P2 bypass #2727)",
+        );
+        assert_eq!(
+            allowing_hits, 1,
+            "the allowing member must be fetched exactly once",
         );
     }
 
