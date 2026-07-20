@@ -1978,15 +1978,16 @@ async fn get_package_metadata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &encoded_name,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                )
-                .await?;
+                let (content, content_type, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &encoded_name,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
 
                 return rewrite_and_respond_with_age_gate(
                     state,
@@ -2067,7 +2068,7 @@ async fn get_package_metadata(
             };
 
             let encoded_name = encode_package_name_for_upstream(package_name);
-            let result = proxy_helpers::proxy_fetch_capped(
+            let result = proxy_helpers::proxy_fetch_capped_budgeted(
                 proxy,
                 member.id,
                 &member.key,
@@ -2078,7 +2079,7 @@ async fn get_package_metadata(
             .await;
 
             match result {
-                Ok((content, content_type)) => {
+                Ok((content, content_type, _budget_permit)) => {
                     let params =
                         crate::services::age_gate_service::AgeGateRepoParams::from_repository(
                             member,
@@ -2219,7 +2220,7 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+    let (content, _ct, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo.id,
         repo_key,
@@ -2310,7 +2311,7 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result = proxy_helpers::proxy_fetch_capped(
+        let result = proxy_helpers::proxy_fetch_capped_budgeted(
             proxy,
             member.id,
             &member.key,
@@ -2321,7 +2322,7 @@ async fn fetch_virtual_packument(
         .await;
 
         match result {
-            Ok((content, _ct)) => {
+            Ok((content, _ct, _budget_permit)) => {
                 let mut json: serde_json::Value =
                     serde_json::from_slice(&content).map_err(|e| {
                         AppError::Internal(format!("Invalid JSON from upstream: {}", e))
@@ -2455,7 +2456,7 @@ async fn npm_publish_time_for_version(
         // Capped like every other buffered packument read (#2181): this runs
         // on the tarball download path, where an unbounded upstream metadata
         // body must not be able to balloon memory.
-        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
+        if let Ok((content, _, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
             proxy,
             repo.id,
             &repo.key,

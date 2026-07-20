@@ -334,7 +334,7 @@ async fn fetch_remote_simple_root(
 
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "", &index_path);
-    let (content, _content_type) = match proxy_helpers::proxy_fetch_capped(
+    let (content, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo_id,
         repo_key,
@@ -344,7 +344,7 @@ async fn fetch_remote_simple_root(
     )
     .await
     {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(_) => return None,
     };
 
@@ -649,10 +649,10 @@ async fn simple_project(
                     &index_path,
                 );
 
-                let (content, content_type) = if wants_json {
+                let (content, content_type, _budget_permit) = if wants_json {
                     // Request the PEP 691 JSON form from upstream, cached under a
                     // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -664,7 +664,7 @@ async fn simple_project(
                     )
                     .await?
                 } else {
-                    proxy_helpers::proxy_fetch_capped(
+                    proxy_helpers::proxy_fetch_capped_budgeted(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -855,7 +855,7 @@ async fn simple_project(
                     &member_index_path,
                 );
                 let result = if wants_json {
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
                         proxy,
                         member.id,
                         &member.key,
@@ -867,7 +867,7 @@ async fn simple_project(
                     )
                     .await
                 } else {
-                    proxy_helpers::proxy_fetch_capped(
+                    proxy_helpers::proxy_fetch_capped_budgeted(
                         proxy,
                         member.id,
                         &member.key,
@@ -879,7 +879,7 @@ async fn simple_project(
                 };
 
                 match result {
-                    Ok((content, content_type)) => {
+                    Ok((content, content_type, _budget_permit)) => {
                         // #2066: apply THIS gated remote member's age gate to its
                         // own contribution before it is merged with local members
                         // below. Locals stay unfiltered (they are not gated);

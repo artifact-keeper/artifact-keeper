@@ -1047,15 +1047,16 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+                let (content, _content_type, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        &path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/plain")
@@ -1086,15 +1087,16 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            &path,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                        )
-                        .await
+                        if let Ok((content, _, _budget_permit)) =
+                            proxy_helpers::proxy_fetch_capped_budgeted(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            )
+                            .await
                         {
                             return Ok(Response::builder()
                                 .status(StatusCode::OK)
@@ -1146,7 +1148,7 @@ async fn fetch_remote_member_metadata(
     }
     let upstream_url = member.upstream_url.as_deref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let (content, _) = proxy_helpers::proxy_fetch_capped(
+    let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -1214,7 +1216,7 @@ async fn fetch_maven_metadata_bytes(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _) = proxy_helpers::proxy_fetch_capped(
+            let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
                 proxy,
                 repo.id,
                 repo_key,

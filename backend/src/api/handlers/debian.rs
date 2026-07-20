@@ -1301,6 +1301,16 @@ impl<'a> DebianProxy<'a> {
             upstream_url,
             RepositoryFormat::Debian,
         );
+        // #2684: reserve against the process-wide buffered-metadata byte budget
+        // BEFORE buffering the upstream/cached index. Debian must keep buffering
+        // (the index is verified byte-for-byte against the signed `Release`, so
+        // it cannot stream), but the buffer participates in the same shared
+        // bound as every other proxy-metadata format, so N concurrent index
+        // fetches can never drive resident memory past the budget. The permit is
+        // held for the whole fetch + signed-Release verification below.
+        let _budget_permit = proxy_helpers::proxy_metadata_budget()
+            .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+            .await;
         let (content, upstream_ct) = proxy
             .fetch_artifact_capped(
                 &proxy_repo,
@@ -1365,6 +1375,12 @@ impl<'a> DebianProxy<'a> {
         };
 
         let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, self.repo_key, upstream_url);
+        // #2684: bound the buffered Release/InRelease document against the shared
+        // proxy-metadata byte budget (see `dists`), held across the revalidation
+        // fetch and the signed-release cache update below.
+        let _budget_permit = proxy_helpers::proxy_metadata_budget()
+            .reserve(proxy_helpers::LARGE_METADATA_MAX_BYTES)
+            .await;
         let (content, upstream_ct, changed) = proxy
             .fetch_dists_with_revalidation(
                 &pseudo_repo,
