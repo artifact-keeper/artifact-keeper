@@ -15940,6 +15940,206 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Multipart staging helpers (#2517): the upload pipeline spools form-file
+    // fields to a bounded scratch file, computing SHA-256/SHA-1/MD5 in one
+    // pass, and never buffers the artifact in memory. These tests drive the
+    // extractors directly with hand-built multipart bodies.
+    // ---------------------------------------------------------------------
+
+    fn staging_test_state() -> crate::api::SharedState {
+        use std::sync::Arc;
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new("/tmp/test-repo-staging"),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(crate::api::AppState::new(
+            crate::config::Config::test_config(),
+            pool,
+            storage,
+            registry,
+        ))
+    }
+
+    /// Build a real `axum::extract::Multipart` from a raw multipart body, the
+    /// same way the framework would for an incoming request.
+    async fn multipart_from_body(boundary: &str, body: &str) -> Multipart {
+        use axum::extract::FromRequest;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        Multipart::from_request(req, &())
+            .await
+            .expect("multipart extractor")
+    }
+
+    #[tokio::test]
+    async fn test_stage_multipart_file_spools_to_scratch_with_digests() {
+        let state = staging_test_state();
+        let body = concat!(
+            "--XB\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"abc.bin\"\r\n",
+            "\r\n",
+            "abc\r\n",
+            "--XB--\r\n"
+        );
+        let mp = multipart_from_body("XB", body).await;
+
+        let (staged, digests, filename) = stage_multipart_file(&state, mp)
+            .await
+            .expect("staging should succeed");
+        assert_eq!(filename, "abc.bin");
+        assert_eq!(staged.size_bytes(), 3);
+        // Well-known digests of the ASCII string "abc": all three computed in
+        // the single spooling pass.
+        assert_eq!(
+            digests.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(digests.sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(digests.md5, "900150983cd24fb0d6963f7d28e17f72");
+        // The bytes live in the scratch file, ready to be re-streamed.
+        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        assert_eq!(on_disk, b"abc");
+    }
+
+    #[tokio::test]
+    async fn test_stage_multipart_file_requires_a_file_field() {
+        let state = staging_test_state();
+        let body = concat!(
+            "--XB\r\n",
+            "Content-Disposition: form-data; name=\"path\"\r\n",
+            "\r\n",
+            "just/a/path\r\n",
+            "--XB--\r\n"
+        );
+        let mp = multipart_from_body("XB", body).await;
+        let resp = match stage_multipart_file(&state, mp).await {
+            Ok(_) => panic!("form without a file field must be rejected"),
+            Err(resp) => resp,
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_stage_multipart_file_and_path_reads_fields_in_any_order() {
+        let state = staging_test_state();
+        // `path` arrives BEFORE the file field: order must not matter.
+        let body = concat!(
+            "--XB\r\n",
+            "Content-Disposition: form-data; name=\"path\"\r\n",
+            "\r\n",
+            "docs/dir/\r\n",
+            "--XB\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"guide.pdf\"\r\n",
+            "\r\n",
+            "pdfbytes\r\n",
+            "--XB--\r\n"
+        );
+        let mp = multipart_from_body("XB", body).await;
+        let (staged, digests, filename, custom_path) = stage_multipart_file_and_path(&state, mp)
+            .await
+            .expect("staging should succeed");
+        assert_eq!(filename, "guide.pdf");
+        assert_eq!(custom_path.as_deref(), Some("docs/dir/"));
+        assert_eq!(staged.size_bytes(), 8);
+        assert_eq!(digests.sha256.len(), 64);
+        let on_disk = tokio::fs::read(staged.path()).await.unwrap();
+        assert_eq!(on_disk, b"pdfbytes");
+    }
+
+    #[tokio::test]
+    async fn test_stage_multipart_file_and_path_requires_file() {
+        let state = staging_test_state();
+        let body = concat!(
+            "--XB\r\n",
+            "Content-Disposition: form-data; name=\"path\"\r\n",
+            "\r\n",
+            "docs/dir/\r\n",
+            "--XB--\r\n"
+        );
+        let mp = multipart_from_body("XB", body).await;
+        let resp = match stage_multipart_file_and_path(&state, mp).await {
+            Ok(_) => panic!("path-only form must be rejected"),
+            Err(resp) => resp,
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---------------------------------------------------------------------
+    // The multipart upload handlers gate on auth BEFORE reading the form:
+    // anonymous callers get 401 and read-scoped API tokens get 403. In
+    // neither case is the (lazily-connected, never-dialed) database touched,
+    // so these run without a live Postgres.
+    // ---------------------------------------------------------------------
+
+    /// Drive BOTH multipart upload handlers with the given auth and assert
+    /// they short-circuit with the expected status.
+    async fn assert_multipart_handlers_reject(auth: Option<AuthExtension>, want: StatusCode) {
+        let state = staging_test_state();
+        let form = "--XB\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\
+                    \r\n\
+                    x\r\n\
+                    --XB--\r\n";
+
+        let mp = multipart_from_body("XB", form).await;
+        let resp = upload_artifact_multipart(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path("generic-repo".to_string()),
+            HeaderMap::new(),
+            mp,
+        )
+        .await
+        .expect_err("multipart upload must be rejected");
+        assert_eq!(resp.status(), want, "upload_artifact_multipart");
+
+        let mp = multipart_from_body("XB", form).await;
+        let resp = upload_artifact_multipart_with_path(
+            State(state),
+            Extension(auth),
+            Path(("generic-repo".to_string(), "a/b.bin".to_string())),
+            HeaderMap::new(),
+            mp,
+        )
+        .await
+        .expect_err("multipart upload with path must be rejected");
+        assert_eq!(resp.status(), want, "upload_artifact_multipart_with_path");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_handlers_reject_anonymous() {
+        assert_multipart_handlers_reject(None, StatusCode::UNAUTHORIZED).await;
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_handlers_reject_read_scoped_token() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "reader".to_string(),
+            email: "reader@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        };
+        assert_multipart_handlers_reject(Some(auth), StatusCode::FORBIDDEN).await;
+    }
+
+    // ---------------------------------------------------------------------
     // Security: composed paths must be rejected by validate_artifact_path
     //
     // Regression for the gap found in #1322's security review:
