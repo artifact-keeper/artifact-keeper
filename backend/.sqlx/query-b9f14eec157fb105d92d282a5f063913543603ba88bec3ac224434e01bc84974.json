@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE peer_connections\n            SET status = 'unreachable', updated_at = NOW()\n            WHERE source_peer_id = $1 AND target_peer_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b9f14eec157fb105d92d282a5f063913543603ba88bec3ac224434e01bc84974"
+}

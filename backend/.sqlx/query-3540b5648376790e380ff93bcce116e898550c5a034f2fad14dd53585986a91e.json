@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH latest_scan AS (\n                SELECT DISTINCT ON (sr.artifact_id)\n                    sr.artifact_id, sr.id\n                FROM scan_results sr\n                JOIN artifacts a ON a.id = sr.artifact_id\n                WHERE sr.status = 'completed' AND NOT a.is_deleted\n                ORDER BY sr.artifact_id, sr.created_at DESC\n            )\n            SELECT artifact_id AS \"artifact_id!\"\n            FROM latest_scan ls\n            WHERE NOT EXISTS (\n                SELECT 1 FROM scan_packages sp WHERE sp.scan_result_id = ls.id\n            )\n            ORDER BY artifact_id\n            LIMIT $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "artifact_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3540b5648376790e380ff93bcce116e898550c5a034f2fad14dd53585986a91e"
+}

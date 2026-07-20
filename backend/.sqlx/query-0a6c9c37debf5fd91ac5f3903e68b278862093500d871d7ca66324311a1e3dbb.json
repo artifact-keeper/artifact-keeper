@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT logical_bytes, physical_bytes, unique_bytes, shared_bytes,\n               blob_count, dedup_scope, computed_at\n          FROM repository_storage_stats\n         WHERE repository_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "logical_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "physical_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "unique_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "shared_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "blob_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "dedup_scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "computed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0a6c9c37debf5fd91ac5f3903e68b278862093500d871d7ca66324311a1e3dbb"
+}

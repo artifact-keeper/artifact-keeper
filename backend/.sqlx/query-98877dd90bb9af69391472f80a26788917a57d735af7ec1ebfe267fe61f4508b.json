@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE peer_connections\n            SET transfer_success_count = transfer_success_count + 1,\n                bytes_transferred_total = bytes_transferred_total + $3,\n                last_transfer_at = NOW(), updated_at = NOW()\n            WHERE source_peer_id = $1 AND target_peer_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98877dd90bb9af69391472f80a26788917a57d735af7ec1ebfe267fe61f4508b"
+}

@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                r.id, r.repository_id, r.package_name, r.package_version,\n                r.upstream_published_at, r.status, r.requested_at,\n                r.reviewed_by, r.reviewed_at, r.review_reason,\n                r.request_count, r.last_requested_at,\n                repo.key as repository_key\n            FROM age_gate_reviews r\n            INNER JOIN repositories repo ON repo.id = r.repository_id\n            WHERE r.id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "package_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "package_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "upstream_published_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "reviewed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "reviewed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "review_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "request_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "repository_key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "082ec9783796fa69f09ebc10eeea985a5941e03f3253b5f724c6abc763fab640"
+}

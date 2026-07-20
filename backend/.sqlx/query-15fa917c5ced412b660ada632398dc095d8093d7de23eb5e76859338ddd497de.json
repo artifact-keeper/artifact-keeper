@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO proxy_cache_artifacts\n            (repository_id, path, storage_key, metadata_key, size_bytes,\n             checksum_sha256, content_type, upstream_url, cached_at, last_accessed_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())\n        ON CONFLICT (repository_id, path) DO UPDATE SET\n            storage_key      = EXCLUDED.storage_key,\n            metadata_key     = EXCLUDED.metadata_key,\n            size_bytes       = EXCLUDED.size_bytes,\n            checksum_sha256  = EXCLUDED.checksum_sha256,\n            content_type     = EXCLUDED.content_type,\n            upstream_url     = EXCLUDED.upstream_url,\n            cached_at        = now(),\n            last_accessed_at = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "15fa917c5ced412b660ada632398dc095d8093d7de23eb5e76859338ddd497de"
+}

@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO peer_repo_subscriptions\n                (peer_instance_id, repository_id, sync_enabled, replication_mode, replication_schedule, replication_filter)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (peer_instance_id, repository_id) DO UPDATE SET\n                sync_enabled = $3,\n                replication_mode = $4,\n                replication_schedule = $5,\n                replication_filter = $6\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool",
+        {
+          "Custom": {
+            "name": "replication_mode",
+            "kind": {
+              "Enum": [
+                "push",
+                "pull",
+                "mirror",
+                "none"
+              ]
+            }
+          }
+        },
+        "Varchar",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "158b3007a6c464a6bcee517846f23be5267da20fb6df95256ea45a89a0dcd4b7"
+}

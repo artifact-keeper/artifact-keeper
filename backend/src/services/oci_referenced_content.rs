@@ -49,8 +49,8 @@ use uuid::Uuid;
 
 use crate::api::handlers::oci_v2::{
     blob_storage_key, classify_manifest, extract_blob_refs, extract_child_digests,
-    manifest_storage_key, persist_tag_and_refs_in_tx, resolve_manifest_content_type,
-    stored_media_type_for, ManifestClass,
+    manifest_storage_key, manifest_total_size, persist_tag_and_refs_in_tx,
+    resolve_manifest_content_type, stored_media_type_for, upsert_manifest_artifact, ManifestClass,
 };
 use crate::services::migration_service::MigrationError;
 use crate::services::oci_manifest_refs_backfill::MAX_INDEX_MANIFEST_BYTES;
@@ -249,6 +249,28 @@ pub(crate) async fn walk_and_register_referenced_content(
             &content_type,
             &class,
             &body,
+        )
+        .await?;
+
+        // #2576: record the by-digest child manifest in `artifacts` too. A
+        // native `docker push` writes one `artifacts` row per manifest; the
+        // importer previously registered only the OCI index tables for these
+        // children, so GC / quota / scanning (which enumerate `artifacts`)
+        // under-counted the per-arch children of a migrated multi-arch index.
+        // Uses the SAME shared upsert as the live push path, keyed on
+        // (repository_id, path) so a re-migration upserts in place. `None`
+        // uploader: an imported manifest has no pushing user. Runs on the item
+        // transaction, so the row commits atomically with the tag/refs.
+        upsert_manifest_artifact(
+            &mut **tx,
+            repo_id,
+            image,
+            &digest,
+            &digest,
+            &content_type,
+            &manifest_storage_key(&digest),
+            manifest_total_size(&body),
+            None,
         )
         .await?;
 
@@ -914,6 +936,166 @@ mod tests {
             assert!(row.is_some(), "child {d} registered");
             assert!(storage.exists(&manifest_storage_key(&d)).await.unwrap());
         }
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// #2576: every by-digest child manifest of a migrated multi-arch index
+    /// gets an `artifacts` row (path `v2/<image>/manifests/<digest>`, checksum
+    /// = the manifest digest, size = config+layers) so GC / quota / scanning —
+    /// which enumerate the `artifacts` table — see the children, exactly as a
+    /// native `docker push` records one row per manifest.
+    #[tokio::test]
+    async fn walker_creates_artifacts_row_per_child_manifest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (storage, tmp, repo_id) = setup(&pool).await;
+
+        let cfg_a = bytes::Bytes::from_static(b"{\"arch\":\"amd64\"}");
+        let cfg_b = bytes::Bytes::from_static(b"{\"arch\":\"arm64\"}");
+        let layer = bytes::Bytes::from_static(b"shared-layer");
+        let child_a = image_manifest(&cfg_a, &[&layer]);
+        let child_b = image_manifest(&cfg_b, &[&layer]);
+        let index = index_manifest(&[&child_a, &child_b]);
+
+        let mut src = DigestSource::new();
+        for b in [&cfg_a, &cfg_b, &layer] {
+            src.blobs.insert(sha256_digest(b), b.clone());
+        }
+        for m in [&child_a, &child_b] {
+            src.manifests.insert(sha256_digest(m), m.clone());
+        }
+        let client: Arc<dyn SourceRegistry> = Arc::new(src);
+
+        let mut tx = pool.begin().await.unwrap();
+        walk_and_register_referenced_content(
+            &mut tx,
+            &storage,
+            &client,
+            tmp.path(),
+            repo_id,
+            "app",
+            "app",
+            &ManifestClass::Index,
+            &index,
+            &WalkCaps::default(),
+        )
+        .await
+        .expect("index walk");
+        tx.commit().await.unwrap();
+
+        // Both children now have an `artifacts` row keyed by the live-push path
+        // shape, with the digest as checksum and the config+layer size.
+        for (m, cfg) in [(&child_a, &cfg_a), (&child_b, &cfg_b)] {
+            let d = sha256_digest(m);
+            let checksum = d.strip_prefix("sha256:").unwrap();
+            let path = format!("v2/app/manifests/{d}");
+            let row: Option<(String, i64, String)> = sqlx::query_as(
+                "SELECT checksum_sha256, size_bytes, storage_key \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&path)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            let (got_checksum, got_size, got_key) = row.expect("child artifacts row exists");
+            assert_eq!(got_checksum, checksum, "checksum = manifest digest");
+            assert_eq!(
+                got_size,
+                (cfg.len() + layer.len()) as i64,
+                "size = config + layers"
+            );
+            assert_eq!(
+                got_key,
+                manifest_storage_key(&d),
+                "storage key = manifest key"
+            );
+        }
+
+        // The children are enumerable via `artifacts` (what GC/quota/scan scan).
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND path LIKE 'v2/app/manifests/sha256:%' AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 2, "one artifacts row per by-digest child manifest");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// #2576: re-migrating the same index must not duplicate the child
+    /// `artifacts` rows — the upsert is idempotent on (repository_id, path).
+    #[tokio::test]
+    async fn walker_child_artifacts_rows_are_idempotent_on_remigration() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (storage, tmp, repo_id) = setup(&pool).await;
+
+        let cfg = bytes::Bytes::from_static(b"{\"arch\":\"amd64\"}");
+        let layer = bytes::Bytes::from_static(b"a-layer");
+        let child = image_manifest(&cfg, &[&layer]);
+        let index = index_manifest(&[&child]);
+
+        let build_src = || {
+            let mut src = DigestSource::new();
+            for b in [&cfg, &layer] {
+                src.blobs.insert(sha256_digest(b), b.clone());
+            }
+            src.manifests.insert(sha256_digest(&child), child.clone());
+            Arc::new(src) as Arc<dyn SourceRegistry>
+        };
+
+        // Migrate twice, as a re-run would.
+        for _ in 0..2 {
+            let client = build_src();
+            let mut tx = pool.begin().await.unwrap();
+            walk_and_register_referenced_content(
+                &mut tx,
+                &storage,
+                &client,
+                tmp.path(),
+                repo_id,
+                "app",
+                "app",
+                &ManifestClass::Index,
+                &index,
+                &WalkCaps::default(),
+            )
+            .await
+            .expect("index walk");
+            tx.commit().await.unwrap();
+        }
+
+        let d = sha256_digest(&child);
+        let path = format!("v2/app/manifests/{d}");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo_id)
+                .bind(&path)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 1,
+            "re-migration upserts in place, no duplicate row"
+        );
+
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)

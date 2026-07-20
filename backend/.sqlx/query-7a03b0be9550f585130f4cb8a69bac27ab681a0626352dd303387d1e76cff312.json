@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scan_packages (scan_result_id, artifact_id, name,\n                version, purl, license, source_target)\n            SELECT $1, $2, name, version, purl, license, source_target\n            FROM UNNEST(\n                $3::text[],\n                $4::text[],\n                $5::text[],\n                $6::text[],\n                $7::text[]\n            ) AS t(name, version, purl, license, source_target)\n            ON CONFLICT (scan_result_id, name, COALESCE(version, ''))\n                DO UPDATE SET\n                    purl = COALESCE(scan_packages.purl, EXCLUDED.purl),\n                    license = COALESCE(scan_packages.license, EXCLUDED.license),\n                    source_target = COALESCE(scan_packages.source_target,\n                                             EXCLUDED.source_target)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a03b0be9550f585130f4cb8a69bac27ab681a0626352dd303387d1e76cff312"
+}

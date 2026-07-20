@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT version\n        FROM artifacts\n        WHERE repository_id = $1\n          AND name = $2\n          AND is_deleted = false\n          AND version IS NOT NULL\n        ORDER BY version\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "0eccf8d70761b01121cad2f5e9ebcb59abcfc07b8810c5f2ed0b2d5d4e3aa58e"
+}

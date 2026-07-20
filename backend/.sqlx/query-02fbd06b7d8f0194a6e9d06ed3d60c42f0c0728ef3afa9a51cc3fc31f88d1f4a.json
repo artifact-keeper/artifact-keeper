@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE api_tokens SET created_by_user_id = $1, description = $2 WHERE id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "02fbd06b7d8f0194a6e9d06ed3d60c42f0c0728ef3afa9a51cc3fc31f88d1f4a"
+}

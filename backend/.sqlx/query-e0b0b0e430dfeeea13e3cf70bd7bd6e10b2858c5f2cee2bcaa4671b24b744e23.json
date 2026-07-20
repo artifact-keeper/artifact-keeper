@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM proxy_cache_artifacts WHERE storage_key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e0b0b0e430dfeeea13e3cf70bd7bd6e10b2858c5f2cee2bcaa4671b24b744e23"
+}

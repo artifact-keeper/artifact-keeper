@@ -6993,6 +6993,71 @@ pub(crate) async fn index_child_artifact_size_sum(
     })
 }
 
+/// Upsert the `artifacts` row that makes a Docker/OCI manifest visible to the
+/// subsystems that enumerate the `artifacts` table (UI/download, GC, quota,
+/// scanning).
+///
+/// This is the single source of truth for a manifest's `artifacts` row. Two
+/// callers share it so a migrated manifest is enumerated identically to a
+/// natively-pushed one:
+///   * the live manifest-PUT path ([`handle_put_manifest`]) records the tag or
+///     by-digest manifest a client pushes;
+///   * the migration referenced-content walk
+///     ([`crate::services::oci_referenced_content`]) records the by-digest
+///     *child* manifests of a migrated multi-arch index. A native `docker push`
+///     writes one `artifacts` row per manifest, but the importer previously
+///     registered only the OCI index tables for those children, so GC / quota /
+///     scanning under-counted them (#2576).
+///
+/// The row is keyed on `(repository_id, path)` with `path =
+/// v2/<image>/manifests/<reference>` (the reference is the digest for a
+/// by-digest child), so a re-push / re-migration upserts in place instead of
+/// duplicating. Returns the artifact id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upsert_manifest_artifact<'e, E>(
+    executor: E,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    content_type: &str,
+    storage_key: &str,
+    total_size: i64,
+    uploaded_by: Option<Uuid>,
+) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let artifact_path = format!("v2/{}/manifests/{}", image, reference);
+    let artifact_name = format!("{}:{}", image, reference);
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    sqlx::query_scalar!(
+        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (repository_id, path) DO UPDATE SET
+             version = EXCLUDED.version,
+             size_bytes = EXCLUDED.size_bytes,
+             checksum_sha256 = EXCLUDED.checksum_sha256,
+             content_type = EXCLUDED.content_type,
+             storage_key = EXCLUDED.storage_key,
+             uploaded_by = EXCLUDED.uploaded_by,
+             is_deleted = false,
+             updated_at = NOW()
+           RETURNING id"#,
+        repo_id,
+        artifact_path,
+        artifact_name,
+        Some(reference),
+        total_size,
+        checksum,
+        content_type,
+        storage_key,
+        uploaded_by,
+    )
+    .fetch_one(executor)
+    .await
+}
+
 async fn handle_put_manifest(
     state: &SharedState,
     headers: &HeaderMap,
@@ -7140,45 +7205,41 @@ async fn handle_put_manifest(
     // Calculate total image size from manifest (config + layers)
     let total_size: i64 = manifest_total_size(&body);
 
-    // Also create an artifact record so it appears in the UI
+    // Also create an artifact record so it appears in the UI (and so GC /
+    // quota / scanning, which enumerate the `artifacts` table, see this
+    // manifest). Shared with the migration import path via
+    // `upsert_manifest_artifact` so a pushed and a migrated manifest are
+    // recorded identically.
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
-    let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
 
-    match sqlx::query_scalar!(
-        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-           ON CONFLICT (repository_id, path) DO UPDATE SET
-             version = EXCLUDED.version,
-             size_bytes = EXCLUDED.size_bytes,
-             checksum_sha256 = EXCLUDED.checksum_sha256,
-             content_type = EXCLUDED.content_type,
-             storage_key = EXCLUDED.storage_key,
-             uploaded_by = EXCLUDED.uploaded_by,
-             is_deleted = false,
-             updated_at = NOW()
-           RETURNING id"#,
+    match upsert_manifest_artifact(
+        &state.db,
         repo_id,
-        artifact_path,
-        artifact_name,
-        Some(reference),
+        &image,
+        reference,
+        &digest,
+        &content_type,
+        &manifest_key,
         total_size,
-        checksum,
-        content_type,
-        manifest_key,
         Some(claims.sub),
     )
-    .fetch_one(&state.db)
     .await
     {
         Ok(artifact_id) => {
             crate::services::quarantine_service::apply_upload_hold_hosted(
-                &state.db, repo_id, artifact_id,
+                &state.db,
+                repo_id,
+                artifact_id,
             )
             .await;
         }
         Err(e) => {
-            tracing::error!("Failed to upsert artifact record for {}: {}", artifact_path, e);
+            tracing::error!(
+                "Failed to upsert artifact record for {}: {}",
+                artifact_path,
+                e
+            );
         }
     }
 

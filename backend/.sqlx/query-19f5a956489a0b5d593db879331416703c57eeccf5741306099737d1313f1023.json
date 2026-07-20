@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                   block_on_policy_violation, severity_threshold, created_at, updated_at\n            FROM scan_configs\n            WHERE scan_enabled = true\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "scan_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_on_upload",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "scan_on_proxy",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "block_on_policy_violation",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "severity_threshold",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "19f5a956489a0b5d593db879331416703c57eeccf5741306099737d1313f1023"
+}

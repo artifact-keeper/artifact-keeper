@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0762236034cfc356a7406fc1bcf035656b4021f92a42a8afefdab802b4f5e565"
+}
