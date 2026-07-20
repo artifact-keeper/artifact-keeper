@@ -489,12 +489,18 @@ jobs:
           # backend-alpine digest output skipped while alpine builds are suspended.
 
       # --- Trivy CVE scanning ---
-      # --ignore-unfixed: only fail on CVEs with available patches.
-      # Unpatched UBI base image CVEs (Red Hat's responsibility) are still
-      # reported in SARIF for visibility but don't block the build.
-      # Trivy scans upload SARIF to GitHub Security tab for visibility.
-      # exit-code: 0 means scan results are informational — unfixed base image
-      # CVEs (Red Hat's responsibility) should not block image publishing.
+      # These scans ENFORCE (#2609): a CRITICAL or HIGH CVE with an available
+      # fix fails this job, and the merge-* jobs `need` this job, so no tag is
+      # published from a failing scan. The exception paths, in order:
+      #   * --ignore-unfixed: CVEs with no released fix (typically UBI base
+      #     image CVEs that are Red Hat's responsibility) are reported in
+      #     SARIF for visibility but do not block publication.
+      #   * .trivyignore: per-CVE accepted exceptions, each justified in that
+      #     file. This is the documented way to unblock a publish while a fix
+      #     is pending.
+      # All three scan steps run to completion (`if: always()` on the later
+      # ones) so a failing image never hides findings in the others, and the
+      # SARIF uploads below also run on failure.
       # NOTE: trivy binary extracted from official GHCR image because the
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
       - name: Install Trivy
@@ -515,7 +521,7 @@ jobs:
           # Suppress residual CVEs in the bundled trivy/grype CLI binaries that
           # have no fixed tool release yet (justified per-CVE in .trivyignore).
           trivyignores: '.trivyignore'
-          exit-code: '0'
+          exit-code: '1'
           skip-setup-trivy: true
 
       - name: Trivy scan - OpenSCAP
@@ -528,7 +534,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          exit-code: '0'
+          exit-code: '1'
           skip-setup-trivy: true
 
       - name: Trivy scan - Scanner Adapter
@@ -541,7 +547,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          exit-code: '0'
+          exit-code: '1'
           skip-setup-trivy: true
 
       # Alpine scan skipped while alpine builds are suspended.
@@ -555,7 +561,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          exit-code: '0'
+          exit-code: '1'
           skip-setup-trivy: true
 
       - name: Upload Backend Trivy SARIF
@@ -664,13 +670,12 @@ jobs:
           echo "## Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Trivy CVE Scan" >> $GITHUB_STEP_SUMMARY
-          # These scans run with `exit-code: 0`: they report, they do not gate.
-          # Findings land in code scanning and in the uploaded SARIF. Saying
-          # otherwise here would be the same kind of unearned claim this
-          # workflow's other guards exist to remove. Making the policy real is
-          # tracked separately.
+          # This claim is earned (#2609): the scan steps run with
+          # `exit-code: 1` and every merge-* job `needs` this job, so a
+          # CRITICAL/HIGH fixable finding fails the scan and no tag is
+          # published. Keep this text and that wiring in sync.
           echo "- **Scope**: CRITICAL and HIGH severity, fixed CVEs only (\`.trivyignore\` documents accepted exceptions)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Policy**: reporting only — findings are uploaded to code scanning and do NOT block publication" >> $GITHUB_STEP_SUMMARY
+          echo "- **Policy**: enforced — a CRITICAL/HIGH CVE with an available fix fails this job, and the merge jobs depend on it, so publication is blocked" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **Scanner Adapter**: $([ -f scanner-adapter-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
@@ -687,7 +692,11 @@ jobs:
   merge-backend:
     name: Backend Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [publish-preflight, build-backend]
+    # `scan-containers` is a real gate (#2609): a CRITICAL/HIGH fixable CVE in
+    # ANY of the three images blocks ALL tag publication, because the scan job
+    # scans them together. `.trivyignore` is the exception path if one image
+    # must ship while another is being fixed.
+    needs: [publish-preflight, build-backend, scan-containers]
     permissions:
       contents: read
       packages: write
@@ -831,7 +840,8 @@ jobs:
   merge-openscap:
     name: OpenSCAP Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [publish-preflight, build-openscap]
+    # Gated on the container scan; see merge-backend (#2609).
+    needs: [publish-preflight, build-openscap, scan-containers]
     permissions:
       contents: read
       packages: write
@@ -955,7 +965,8 @@ jobs:
   merge-scanner-adapter:
     name: Scanner Adapter Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [publish-preflight, build-scanner-adapter]
+    # Gated on the container scan; see merge-backend (#2609).
+    needs: [publish-preflight, build-scanner-adapter, scan-containers]
     permissions:
       contents: read
       packages: write
@@ -1204,7 +1215,8 @@ jobs:
     # Alpine builds suspended; the multi-arch manifest job follows them.
     if: false
     runs-on: ubuntu-latest
-    needs: [publish-preflight, build-backend-alpine]
+    # Gated on the container scan; see merge-backend (#2609).
+    needs: [publish-preflight, build-backend-alpine, scan-containers]
     permissions:
       contents: read
       packages: write
