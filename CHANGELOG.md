@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - TBD
+
+A patch release for the 1.6.0 line, driven by early-adopter field reports. It fixes SSO group mapping and LDAPS trust configuration, three Nexus-migration correctness gaps (group→virtual-repo correlation, Go/APT repositories, and the empty Packages tab), virtual-repository storage accounting and editability, CI/CD authentication with service-account tokens, backup retention cleanup, and NuGet/PyPI/Maven registry handling. No schema-breaking changes; in-place upgrade from 1.6.0 is a drop-in image swap. The release date is stamped at cut.
+
+### Security
+
+- **Bundled Grype vulnerability database updated to v0.116.0** to clear CVE-2026-56852 flagged by the container scan (#2749).
+
+### Fixed
+
+**SSO & identity**
+
+- **OIDC group sync now populates the Groups admin** when "Map OIDC groups to local groups" is enabled: a `groups` claim delivered as a delimited string (not just a JSON array) is parsed, and mapped groups are reconciled into the namespace with an ownership guard that refuses to hijack groups owned by another provider (#2781).
+- **LDAPS trust is configurable per provider again** (regressed since 1.2.0): each LDAP provider can supply a custom CA certificate or, for lab/self-signed environments, opt into skipping certificate verification — secure-by-default, opt-in only (#2782).
+- **OIDC-generated service accounts can authenticate CI/CD pipelines using their token as the HTTP Basic password** (any username), matching the `pip`/Artifactory `token:<api_token>` convention. Applies to format endpoints only, never to `/api/v1/*` (#2786).
+
+**Migration from Nexus**
+
+- **Nexus `group` repositories now correlate to Artifact Keeper virtual repositories**, with member repositories linked in order and absent members skipped rather than dangling (#2783).
+- **Nexus Go and APT repositories migrate successfully** — `apt`→`debian` and `golang`→`go` mapping, a Go module-proxy parser, and OpenSearch indexing so migrated Go dependencies appear under Artifacts, Packages, and search (#2784).
+- **The Packages tab is populated after migration** (previously empty for docker/helm/nuget and others): imported artifacts are written to the packages catalog and indexed (#2676).
+
+**Repositories & storage**
+
+- **Virtual-repository reported total now matches the sum of its child repositories** (deduplicated leaf union), and a virtual repository can be edited after creation to change its member set (repo-admin gated) (#2785).
+- **Deleting a large Maven virtual repository no longer times out**: storage cleanup is deferred off the request path (#2776).
+- **Backup retention cleanup reclaims archive storage** instead of deleting only the database row and leaking the `.tar.gz` object (#2787).
+
+**Registry format handling**
+
+- **NuGet and Chocolatey remote (pull-through) proxying works** end-to-end (#2775).
+- **PyPI simple-index responses now support HTTP caching** (ETag / Cache-Control / 304), eliminating redundant full-index transfers on every metadata request (e.g. a single `uv` lock previously issued hundreds of 200s) (#2773).
+
 ## [1.6.0] - TBD
 
 A security- and correctness-hardening release closing the 1.6.0 milestone: 24 security fixes, 9 features and enhancements, and 47 bug fixes, spanning multi-tenant isolation, supply-chain signing, ingestion/scan resource limits, native-client format fidelity across a dozen ecosystems, proxy/cache accounting, and SSO group mapping. It also folds in the cross-repository Maven flat-key attribution hardening and the npm replication-feed and webhook cluster-safety fixes carried over from the 1.5.x hotfix line. In-place upgrade from 1.5.x is automatic — a startup migration-ledger reconciliation resolves the history divergence with no operator action (#2686). The release date is stamped at cut.
