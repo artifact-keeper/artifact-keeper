@@ -32,6 +32,7 @@ A patch release for the 1.6.0 line, driven by early-adopter field reports. It fi
 - **Virtual-repository reported total now matches the sum of its child repositories** (deduplicated leaf union), and a virtual repository can be edited after creation to change its member set (repo-admin gated) (#2785).
 - **Deleting a large Maven virtual repository no longer times out**: storage cleanup is deferred off the request path (#2776).
 - **Backup retention cleanup reclaims archive storage** instead of deleting only the database row and leaking the `.tar.gz` object (#2787).
+- **Legacy row-less Maven GAV-grouped companions are served again on cloud backends**: the flat-key attribution added in 1.6.0 matched `files[]` entries by snake_case `storage_key`, but the upload handler has always written them as camelCase `storageKey` — so the metadata-files owner layer never matched real data and every legacy `.pom`/`.module`/`-sources.jar` companion failed closed (404) on cloud storage despite being legitimately owned. The read-time lookup now accepts both spellings, and a follow-up backfill re-attributes the affected keys idempotently, preserving the same single-owner-per-backend isolation semantics (#2706).
 
 **Registry format handling**
 
