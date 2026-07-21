@@ -715,8 +715,11 @@ async fn simple_project(
                     }
                 }
 
-                // Rewrite absolute download URLs to route through our proxy
-                let body_bytes: Vec<u8> = if ct.contains("text/html") {
+                // Rewrite absolute download URLs to route through our proxy.
+                // Keep the passthrough branch zero-copy: `content` is a
+                // refcounted `Bytes`, so move it into the response instead of
+                // cloning the whole index payload.
+                let body: Bytes = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                     let rewritten = filter_pypi_simple_html_response(
@@ -727,12 +730,12 @@ async fn simple_project(
                         rewritten,
                     )
                     .await;
-                    rewritten.into_bytes()
+                    Bytes::from(rewritten.into_bytes())
                 } else {
-                    content.to_vec()
+                    content
                 };
 
-                return Ok(cache_headers::cacheable_response(body_bytes, &ct, &headers));
+                return Ok(cache_headers::cacheable_response(body, &ct, &headers));
             }
         }
         // For virtual repos, iterate through ALL members and union their
@@ -981,7 +984,7 @@ async fn simple_project(
                         }
                     }
 
-                    let body_bytes: Vec<u8> = if ct.contains("text/html") {
+                    let body: Bytes = if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                         let merged = merge_local_into_remote_simple_html(
@@ -991,12 +994,12 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         );
-                        merged.into_bytes()
+                        Bytes::from(merged.into_bytes())
                     } else {
-                        content.to_vec()
+                        content
                     };
 
-                    return Ok(cache_headers::cacheable_response(body_bytes, &ct, &headers));
+                    return Ok(cache_headers::cacheable_response(body, &ct, &headers));
                 }
             }
         }

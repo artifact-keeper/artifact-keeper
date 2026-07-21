@@ -62,20 +62,31 @@ pub fn check_conditional_request(headers: &HeaderMap, etag: &str) -> Option<Resp
 /// `content_type` is the response MIME type (e.g. `"text/xml"` for Maven
 /// metadata, `"application/json"` for Conda repodata). `headers` must be the
 /// request's `HeaderMap` so `If-None-Match` can be inspected.
-pub fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) -> Response {
-    let etag = compute_etag(&body);
+///
+/// `body` is generic over `Into<Body> + AsRef<[u8]>` so callers holding a
+/// `bytes::Bytes` (e.g. a proxied upstream index) can pass it directly: the
+/// ETag is hashed from `body.as_ref()` and the body is moved into the response
+/// without an intermediate `Vec` copy. `Vec<u8>` and `String` callers keep
+/// working unchanged.
+pub fn cacheable_response(
+    body: impl Into<Body> + AsRef<[u8]>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let etag = compute_etag(body.as_ref());
 
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
         return not_modified;
     }
 
+    let content_length = body.as_ref().len();
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(CONTENT_LENGTH, content_length.to_string())
         .header(ETAG, &etag)
         .header(CACHE_CONTROL, DEFAULT_CACHE_CONTROL)
-        .body(Body::from(body))
+        .body(body.into())
         .unwrap()
 }
 
