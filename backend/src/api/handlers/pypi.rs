@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, VARY};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -532,6 +532,7 @@ fn build_simple_root_response(
             serde_json::to_vec(&json).unwrap(),
             "application/vnd.pypi.simple.v1+json",
             headers,
+            Some("Accept"),
         ));
     }
 
@@ -553,7 +554,9 @@ fn build_simple_root_response(
     // nosniff guarantees would be lost if we delegated to it here. Reuse the
     // shared ETag/conditional helpers and re-emit everything on the 200 path.
     let etag = cache_headers::compute_etag(html.as_bytes());
-    if let Some(not_modified) = cache_headers::check_conditional_request(headers, &etag) {
+    if let Some(not_modified) =
+        cache_headers::check_conditional_request(headers, &etag, Some("Accept"))
+    {
         return Ok(not_modified);
     }
 
@@ -563,6 +566,9 @@ fn build_simple_root_response(
         .header(CONTENT_LENGTH, html.len().to_string())
         .header(ETAG, &etag)
         .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+        // Both this HTML page and the PEP 691 JSON variant are selected by the
+        // request Accept header; Vary keeps shared caches from crossing them.
+        .header(VARY, "Accept")
         // pip/uv only consume the link list; deny everything else so a
         // hypothetical injection cannot exfiltrate cookies or load images.
         .header(
@@ -711,6 +717,7 @@ async fn simple_project(
                             json.into_bytes(),
                             PEP691_JSON_CONTENT_TYPE,
                             &headers,
+                            Some("Accept"),
                         ));
                     }
                 }
@@ -735,7 +742,12 @@ async fn simple_project(
                     content
                 };
 
-                return Ok(cache_headers::cacheable_response(body, &ct, &headers));
+                return Ok(cache_headers::cacheable_response(
+                    body,
+                    &ct,
+                    &headers,
+                    Some("Accept"),
+                ));
             }
         }
         // For virtual repos, iterate through ALL members and union their
@@ -980,6 +992,7 @@ async fn simple_project(
                                 json.into_bytes(),
                                 PEP691_JSON_CONTENT_TYPE,
                                 &headers,
+                                Some("Accept"),
                             ));
                         }
                     }
@@ -999,7 +1012,12 @@ async fn simple_project(
                         content
                     };
 
-                    return Ok(cache_headers::cacheable_response(body, &ct, &headers));
+                    return Ok(cache_headers::cacheable_response(
+                        body,
+                        &ct,
+                        &headers,
+                        Some("Accept"),
+                    ));
                 }
             }
         }
@@ -1095,6 +1113,7 @@ fn build_simple_project_response(
             serde_json::to_vec(&json).unwrap(),
             "application/vnd.pypi.simple.v1+json",
             headers,
+            Some("Accept"),
         ));
     }
 
@@ -1149,6 +1168,7 @@ fn build_simple_project_response(
         html.into_bytes(),
         "text/html; charset=utf-8",
         headers,
+        Some("Accept"),
     ))
 }
 
@@ -7375,6 +7395,7 @@ mod tests {
             first.headers().get("X-Content-Type-Options").unwrap(),
             "nosniff"
         );
+        assert_eq!(first.headers().get(VARY).unwrap(), "Accept");
         let etag = etag_of(&first);
 
         let mut h = headers_accept("");
@@ -7384,5 +7405,6 @@ mod tests {
         );
         let second = build_simple_root_response(&h, "pypi", &packages).unwrap();
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get(VARY).unwrap(), "Accept");
     }
 }

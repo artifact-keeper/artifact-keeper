@@ -411,7 +411,7 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
 
     let etag = compute_etag(&body);
 
-    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+    if let Some(not_modified) = check_conditional_request(headers, &etag, None) {
         return not_modified;
     }
 
@@ -1742,7 +1742,7 @@ async fn repodata_json_jlap(
     let etag = compute_etag(&jlap_body);
 
     // Check for conditional request
-    if let Some(not_modified) = check_conditional_request(&headers, &etag) {
+    if let Some(not_modified) = check_conditional_request(&headers, &etag, None) {
         return Ok(not_modified);
     }
 
@@ -5891,7 +5891,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
 
-        let result = check_conditional_request(&headers, &etag);
+        let result = check_conditional_request(&headers, &etag, None);
         assert!(result.is_some(), "Matching ETag should return 304");
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
@@ -5903,7 +5903,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, "W/\"different\"".parse().unwrap());
 
-        let result = check_conditional_request(&headers, &etag);
+        let result = check_conditional_request(&headers, &etag, None);
         assert!(result.is_none(), "Non-matching ETag should return None");
     }
 
@@ -5913,7 +5913,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, "*".parse().unwrap());
 
-        let result = check_conditional_request(&headers, &etag);
+        let result = check_conditional_request(&headers, &etag, None);
         assert!(result.is_some(), "Wildcard should match any ETag");
     }
 
@@ -5922,7 +5922,7 @@ mod tests {
         let etag = compute_etag(b"test body");
         let headers = HeaderMap::new();
 
-        let result = check_conditional_request(&headers, &etag);
+        let result = check_conditional_request(&headers, &etag, None);
         assert!(
             result.is_none(),
             "No If-None-Match header should return None"
@@ -5978,7 +5978,7 @@ mod tests {
         let header_val = format!("W/\"old\", {}, W/\"other\"", etag);
         headers.insert(IF_NONE_MATCH, header_val.parse().unwrap());
 
-        let result = check_conditional_request(&headers, &etag);
+        let result = check_conditional_request(&headers, &etag, None);
         assert!(
             result.is_some(),
             "ETag in comma-separated list should match"

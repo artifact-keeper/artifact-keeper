@@ -922,6 +922,7 @@ async fn download(
             content.to_vec(),
             "text/xml",
             &headers,
+            None,
         ));
     }
 
