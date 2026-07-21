@@ -9,7 +9,9 @@
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
-use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
+use crate::services::migration_service::{
+    ConflictType, MigrationError, MigrationService, RepositoryType,
+};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::source_registry::SourceRegistry;
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
@@ -398,7 +400,20 @@ impl MigrationWorker {
         // process_repository_artifacts so the INSERT can populate name+version
         // using format-aware filename parsing (see artifact_metadata module).
         let mut repos_to_process: Vec<(String, String)> = Vec::with_capacity(plan.resolved.len());
+        // Virtual (Nexus `group`) repos whose membership still needs to be
+        // correlated to the migrated AK members. Collected here and wired up
+        // *after* the whole provisioning loop so every possible member repo
+        // already exists, regardless of source ordering (issue #2783).
+        let mut virtual_members_to_wire: Vec<(String, Vec<String>)> = Vec::new();
         for migration_config in plan.resolved {
+            if migration_config.repo_type == RepositoryType::Virtual
+                && !migration_config.members.is_empty()
+            {
+                virtual_members_to_wire.push((
+                    migration_config.target_key.clone(),
+                    migration_config.members.clone(),
+                ));
+            }
             // Skip if a repo with the same key already exists with a
             // compatible type+format; recreate would be ambiguous and
             // potentially destructive. Surface incompatible matches as an
@@ -473,6 +488,46 @@ impl MigrationWorker {
             }
 
             repos_to_process.push((migration_config.target_key, migration_config.package_type));
+        }
+
+        // Correlate virtual (Nexus `group`) repository membership now that every
+        // destination repo has been provisioned. Each source member name is
+        // resolved to the migrated AK repo and written into `virtual_repo_members`
+        // in source order; members that never migrated are skipped (not written as
+        // dangling references). Without this the migrated virtual repo has zero
+        // members and both the API and the UI error out over it (issue #2783).
+        for (virtual_key, member_names) in &virtual_members_to_wire {
+            match self
+                .migration_service
+                .correlate_virtual_repo_members(virtual_key, member_names)
+                .await
+            {
+                Ok(outcome) => {
+                    if outcome.skipped.is_empty() {
+                        tracing::info!(
+                            job_id = %job_id, repo = %virtual_key,
+                            correlated = outcome.correlated,
+                            "Correlated virtual repository members",
+                        );
+                    } else {
+                        tracing::warn!(
+                            job_id = %job_id, repo = %virtual_key,
+                            correlated = outcome.correlated,
+                            skipped = ?outcome.skipped,
+                            "Correlated virtual repository members; some source members \
+                             were not migrated and were skipped",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        job_id = %job_id, repo = %virtual_key, error = %e,
+                        "Failed to correlate virtual repository members; the migrated \
+                         virtual repo may have no members",
+                    );
+                    total_failed += 1;
+                }
+            }
         }
 
         // Surface the no-op case explicitly. Without this, a job that ended
@@ -4334,6 +4389,7 @@ mod tests {
             package_type: package_type.into(),
             url: None,
             description: None,
+            members: vec![],
         }
     }
 

@@ -118,6 +118,20 @@ pub struct RepositoryMigrationConfig {
     pub members: Vec<String>,
 }
 
+/// Outcome of correlating a source group/virtual repo's members to the
+/// migrated Artifact Keeper repositories (issue #2783).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMemberCorrelation {
+    /// The AK repository id of the virtual repo whose membership was written.
+    pub virtual_id: Uuid,
+    /// Number of source members successfully correlated and persisted.
+    pub correlated: usize,
+    /// Source member names that could not be correlated (not migrated, or a
+    /// self-reference) and were therefore skipped rather than written as a
+    /// dangling reference.
+    pub skipped: Vec<String>,
+}
+
 /// Conflict detection result
 #[derive(Debug, Clone)]
 pub struct ConflictCheck {
@@ -324,7 +338,12 @@ impl MigrationService {
             description: repo.description.clone(),
             format_compatibility,
             upstream_url: None, // Will be set from repo_config for remote repos
-            members: vec![],    // Will be set from repo_config for virtual repos
+            // Carry the source-side member keys (Nexus `group.memberNames` /
+            // Artifactory virtual `repositories`) through so virtual/group repos
+            // can be correlated to their migrated AK members later. Previously
+            // hard-coded to `vec![]`, which is why migrated Nexus groups ended up
+            // with zero members and broke the UI/backend (issue #2783).
+            members: repo.members.clone(),
         })
     }
 
@@ -491,6 +510,131 @@ impl MigrationService {
         }
 
         Ok(member_ids)
+    }
+
+    /// Correlate a source group/virtual repository's ordered member names to
+    /// the Artifact Keeper repositories they were migrated into, then persist
+    /// the membership so the resulting virtual repo is valid.
+    ///
+    /// This is the fix for issue #2783: a Nexus `group` (≡ AK `virtual`) repo
+    /// carries a list of member *names* from the source. Those names have to be
+    /// resolved to the `repositories.id` of the already-migrated members and
+    /// written into `virtual_repo_members` — otherwise the migrated virtual repo
+    /// has zero (or, if written blindly, dangling) members and both the API and
+    /// the UI error out when they try to aggregate over it.
+    ///
+    /// Contract:
+    /// * Source member *order* is preserved via the `priority` column
+    ///   (`get_virtual_members` orders by `priority` ascending), so member
+    ///   precedence survives the migration.
+    /// * A member name that does not resolve to a migrated AK repo is **skipped
+    ///   and reported**, never written — the `virtual_repo_members.member_repo_id`
+    ///   foreign key would reject it anyway, and a dangling reference is exactly
+    ///   what breaks the frontend. The returned `skipped` list lets the caller
+    ///   surface a partial-migration warning.
+    /// * The write is idempotent: existing rows for this virtual repo are
+    ///   cleared first, so re-running a migration reconciles rather than
+    ///   duplicating (the `UNIQUE(virtual_repo_id, member_repo_id)` constraint
+    ///   is respected regardless).
+    pub async fn correlate_virtual_repo_members(
+        &self,
+        virtual_key: &str,
+        member_names: &[String],
+    ) -> Result<VirtualMemberCorrelation, MigrationError> {
+        // Resolve the virtual repository itself.
+        let virtual_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'",
+        )
+        .bind(virtual_key)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| {
+            MigrationError::ConfigError(format!(
+                "Virtual repository '{}' not found while correlating members",
+                virtual_key
+            ))
+        })?
+        .0;
+
+        // Resolve each source member name to a migrated AK repo id, preserving
+        // source order and recording names that never migrated (dangling).
+        let mut resolved: Vec<(Uuid, i32)> = Vec::with_capacity(member_names.len());
+        let mut skipped: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+        for member_key in member_names {
+            let member_id: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                    .bind(member_key)
+                    .fetch_optional(&self.db)
+                    .await?;
+
+            match member_id {
+                Some((id,)) if id == virtual_id => {
+                    // A group listing itself is a source-side cycle; drop it so
+                    // aggregation can't recurse into the virtual repo itself.
+                    tracing::warn!(
+                        "Virtual repository '{}' lists itself as a member; skipping",
+                        virtual_key
+                    );
+                    skipped.push(member_key.clone());
+                }
+                Some((id,)) if !seen.insert(id) => {
+                    // Duplicate member name in the source group — keep the first
+                    // occurrence's priority, ignore the rest.
+                    tracing::debug!(
+                        "Virtual repository '{}' lists member '{}' more than once; keeping first",
+                        virtual_key,
+                        member_key
+                    );
+                }
+                Some((id,)) => {
+                    // Priority is 1-based and increases with source order so
+                    // `ORDER BY priority` reproduces the group's member order.
+                    resolved.push((id, (resolved.len() as i32) + 1));
+                }
+                None => {
+                    tracing::warn!(
+                        "Virtual repository '{}' references member '{}' that was not \
+                         migrated; skipping to avoid a dangling reference",
+                        virtual_key,
+                        member_key
+                    );
+                    skipped.push(member_key.clone());
+                }
+            }
+        }
+
+        // Persist atomically: clear the current membership, then insert the
+        // correlated members. Done in one transaction so a concurrent reader
+        // never observes a half-written membership.
+        let mut tx = self.db.begin().await?;
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&mut *tx)
+            .await?;
+        for (member_id, priority) in &resolved {
+            sqlx::query(
+                r#"
+                INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (virtual_repo_id, member_repo_id)
+                DO UPDATE SET priority = EXCLUDED.priority
+                "#,
+            )
+            .bind(virtual_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(VirtualMemberCorrelation {
+            virtual_id,
+            correlated: resolved.len(),
+            skipped,
+        })
     }
 
     /// Get list of repositories to migrate, ordered by dependency
@@ -1229,6 +1373,127 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Nexus `group` → AK `virtual` member correlation (issue #2783)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed proof for #2783: a migrated Nexus `group` repo's member names
+    /// are correlated to the migrated AK repositories, written in source order,
+    /// with genuinely-absent members skipped (never left dangling).
+    ///
+    /// Fails-before: prior to the fix nothing ever populated
+    /// `virtual_repo_members` during migration, so the query below returned an
+    /// empty set for every migrated virtual repo. Passes-after: the members are
+    /// correlated and persisted with order preserved.
+    ///
+    /// No-ops when `DATABASE_URL` is unset so it skips cleanly off-CI.
+    #[tokio::test]
+    async fn test_group_members_correlate_to_migrated_repos_2783() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        async fn insert_repo(pool: &PgPool, key: &str, repo_type: &str) -> Uuid {
+            let row: (Uuid,) = sqlx::query_as(
+                r#"
+                INSERT INTO repositories
+                    (key, name, format, repo_type, storage_path, storage_backend)
+                VALUES ($1, $1, 'generic'::repository_format, $2::repository_type, $1, 'filesystem')
+                RETURNING id
+                "#,
+            )
+            .bind(key)
+            .bind(repo_type)
+            .fetch_one(pool)
+            .await
+            .expect("insert repo");
+            row.0
+        }
+
+        let svc = MigrationService::new(pool.clone());
+        let sfx = uuid::Uuid::new_v4().simple().to_string();
+        let vkey = format!("grp-{sfx}");
+        let m1 = format!("m1-{sfx}");
+        let m2 = format!("m2-{sfx}");
+        let m3_absent = format!("m3-{sfx}"); // referenced but never migrated
+
+        let vid = insert_repo(&pool, &vkey, "virtual").await;
+        let id1 = insert_repo(&pool, &m1, "local").await;
+        let id2 = insert_repo(&pool, &m2, "local").await;
+
+        // Source group lists members in the order [m2, m1, m3]; m3 was not
+        // migrated. Ordering must be preserved and m3 must be skipped.
+        let outcome = svc
+            .correlate_virtual_repo_members(&vkey, &[m2.clone(), m1.clone(), m3_absent.clone()])
+            .await
+            .expect("correlate members");
+
+        assert_eq!(outcome.virtual_id, vid);
+        assert_eq!(outcome.correlated, 2, "two members migrated + correlated");
+        assert_eq!(
+            outcome.skipped,
+            vec![m3_absent.clone()],
+            "the un-migrated member is reported as skipped, not written"
+        );
+
+        // Persisted membership: exactly the two resolvable members, in source
+        // order (m2 before m1), with no dangling references.
+        let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+            "SELECT member_repo_id, priority FROM virtual_repo_members \
+             WHERE virtual_repo_id = $1 ORDER BY priority",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .expect("read members");
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![id2, id1],
+            "members correlate to migrated AK repos in source order"
+        );
+
+        // Every persisted member points at a real repository (no dangling).
+        let dangling: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM virtual_repo_members vrm \
+             LEFT JOIN repositories r ON r.id = vrm.member_repo_id \
+             WHERE vrm.virtual_repo_id = $1 AND r.id IS NULL",
+        )
+        .bind(vid)
+        .fetch_one(&pool)
+        .await
+        .expect("dangling check");
+        assert_eq!(dangling.0, 0, "no dangling member references");
+
+        // Re-running reconciles (idempotent) rather than duplicating.
+        let outcome2 = svc
+            .correlate_virtual_repo_members(&vkey, std::slice::from_ref(&m1))
+            .await
+            .expect("re-correlate");
+        assert_eq!(outcome2.correlated, 1);
+        let rows2: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT member_repo_id FROM virtual_repo_members WHERE virtual_repo_id = $1",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .expect("read members after reconcile");
+        assert_eq!(
+            rows2,
+            vec![(id1,)],
+            "membership reconciled to exactly {{m1}}"
+        );
+
+        for id in [vid, id1, id2] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // storage_path convention for auto-provisioned repos (#2336, #2025)
     // -----------------------------------------------------------------------
 
@@ -1453,6 +1718,7 @@ mod tests {
             package_type: "apt".to_string(),
             url: None,
             description: None,
+            members: vec![],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "debian");
@@ -1475,6 +1741,7 @@ mod tests {
             package_type: "maven2".to_string(),
             url: None,
             description: None,
+            members: vec![],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "maven");
@@ -1489,6 +1756,7 @@ mod tests {
             package_type: "yum".to_string(),
             url: None,
             description: None,
+            members: vec![],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "rpm");
@@ -1503,6 +1771,7 @@ mod tests {
             package_type: "raw".to_string(),
             url: None,
             description: None,
+            members: vec![],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "generic");
@@ -1519,6 +1788,7 @@ mod tests {
             package_type: "maven2".to_string(),
             url: Some("https://repo1.maven.org/maven2/".to_string()),
             description: None,
+            members: vec![],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.repo_type, RepositoryType::Remote);
@@ -1535,9 +1805,16 @@ mod tests {
             package_type: "maven2".to_string(),
             url: None,
             description: None,
+            members: vec!["maven-releases".to_string(), "maven-central".to_string()],
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.repo_type, RepositoryType::Virtual);
+        // Nexus `group` member names must survive into the migration config so
+        // they can be correlated to migrated AK repos later (issue #2783).
+        assert_eq!(
+            config.members,
+            vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
         assert_eq!(config.package_type, "maven");
     }
 
@@ -2170,6 +2447,7 @@ mod tests {
             package_type: "maven".to_string(),
             description: Some("Maven releases".to_string()),
             url: Some("http://artifactory/libs-release-local".to_string()),
+            members: vec![],
         };
 
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
@@ -2193,6 +2471,7 @@ mod tests {
             package_type: "conan".to_string(),
             description: None,
             url: Some("http://artifactory/conan-local".to_string()),
+            members: vec![],
         };
 
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
@@ -2209,6 +2488,7 @@ mod tests {
             package_type: "maven".to_string(),
             description: None,
             url: Some("http://artifactory/unknown-repo".to_string()),
+            members: vec![],
         };
 
         let result = MigrationService::prepare_repository_migration(&repo, None);

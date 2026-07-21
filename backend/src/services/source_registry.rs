@@ -267,6 +267,7 @@ mod tests {
                 package_type: "maven".to_string(),
                 url: Some("http://localhost/libs-release".to_string()),
                 description: Some("Release repo".to_string()),
+                members: vec![],
             }])
         }
 
