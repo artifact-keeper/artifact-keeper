@@ -411,7 +411,13 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
 
     let etag = compute_etag(&body);
 
-    if let Some(not_modified) = check_conditional_request(headers, &etag, None) {
+    // JSON repodata is content-negotiated on Accept-Encoding (gzip vs
+    // identity below), so every representation — including the early 304 and
+    // the identity 200 — must carry the same `Vary` as the gzip 200, or a
+    // shared cache could cross the variants.
+    let vary = (content_type == "application/json").then_some("Accept-Encoding");
+
+    if let Some(not_modified) = check_conditional_request(headers, &etag, vary) {
         return not_modified;
     }
 
@@ -432,14 +438,16 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
             .unwrap();
     }
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.len().to_string())
         .header(ETAG, &etag)
-        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
-        .body(Body::from(body))
-        .unwrap()
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
+    if let Some(vary) = vary {
+        builder = builder.header("Vary", vary);
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
