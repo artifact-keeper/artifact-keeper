@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,6 +27,9 @@ use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
 
+use crate::api::handlers::cache_headers::{
+    cacheable_response, check_conditional_request, compute_etag, DEFAULT_CACHE_CONTROL,
+};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -527,11 +530,14 @@ fn build_simple_root_response(
                 serde_json::json!({ "name": p })
             }).collect::<Vec<_>>()
         });
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/vnd.pypi.simple.v1+json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+        // HTTP caching (#2773): serve the JSON root index through the shared
+        // cacheable_response helper so it carries an ETag + Cache-Control and
+        // honors If-None-Match (-> 304), matching conda/maven.
+        return Ok(cacheable_response(
+            serde_json::to_vec(&json).unwrap(),
+            "application/vnd.pypi.simple.v1+json",
+            headers,
+        ));
     }
 
     // HTML response (default).
@@ -546,6 +552,15 @@ fn build_simple_root_response(
     // anchor-rendering rules have pure unit coverage (B8).
     let html = PypiHandler::render_simple_root_html(repo_key, packages);
 
+    // HTTP caching (#2773): compute a strong ETag over the rendered body and
+    // honor If-None-Match here (rather than via the shared cacheable_response)
+    // so the PEP 503 security headers below are preserved on the 200 path.
+    let body = html.into_bytes();
+    let etag = compute_etag(&body);
+    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+        return Ok(not_modified);
+    }
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
@@ -556,7 +571,9 @@ fn build_simple_root_response(
             "default-src 'none'; style-src 'unsafe-inline'",
         )
         .header("X-Content-Type-Options", "nosniff")
-        .body(Body::from(html))
+        .header(ETAG, &etag)
+        .header(CACHE_CONTROL, DEFAULT_CACHE_CONTROL)
+        .body(Body::from(body))
         .unwrap())
 }
 
@@ -693,16 +710,17 @@ async fn simple_project(
                             json,
                         )
                         .await;
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
-                            .body(Body::from(json))
-                            .unwrap());
+                        // HTTP caching (#2773): ETag + Cache-Control + 304.
+                        return Ok(cacheable_response(
+                            json.into_bytes(),
+                            PEP691_JSON_CONTENT_TYPE,
+                            &headers,
+                        ));
                     }
                 }
 
                 // Rewrite absolute download URLs to route through our proxy
-                let body = if ct.contains("text/html") {
+                let body_bytes: Vec<u8> = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                     let rewritten = filter_pypi_simple_html_response(
@@ -713,16 +731,13 @@ async fn simple_project(
                         rewritten,
                     )
                     .await;
-                    Body::from(rewritten)
+                    rewritten.into_bytes()
                 } else {
-                    Body::from(content)
+                    content.to_vec()
                 };
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .body(body)
-                    .unwrap());
+                // HTTP caching (#2773): ETag + Cache-Control + 304.
+                return Ok(cacheable_response(body_bytes, &ct, &headers));
             }
         }
         // For virtual repos, iterate through ALL members and union their
@@ -963,15 +978,16 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         ) {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
-                                .body(Body::from(json))
-                                .unwrap());
+                            // HTTP caching (#2773): ETag + Cache-Control + 304.
+                            return Ok(cacheable_response(
+                                json.into_bytes(),
+                                PEP691_JSON_CONTENT_TYPE,
+                                &headers,
+                            ));
                         }
                     }
 
-                    let body = if ct.contains("text/html") {
+                    let body_bytes: Vec<u8> = if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                         let merged = merge_local_into_remote_simple_html(
@@ -981,16 +997,13 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         );
-                        Body::from(merged)
+                        merged.into_bytes()
                     } else {
-                        Body::from(content)
+                        content.to_vec()
                     };
 
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .body(body)
-                        .unwrap());
+                    // HTTP caching (#2773): ETag + Cache-Control + 304.
+                    return Ok(cacheable_response(body_bytes, &ct, &headers));
                 }
             }
         }
@@ -1082,11 +1095,13 @@ fn build_simple_project_response(
             "files": files,
         });
 
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/vnd.pypi.simple.v1+json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+        // HTTP caching (#2773): ETag + Cache-Control + 304, via the shared
+        // helper used by conda/maven.
+        return Ok(cacheable_response(
+            serde_json::to_vec(&json).unwrap(),
+            "application/vnd.pypi.simple.v1+json",
+            headers,
+        ));
     }
 
     // HTML response
@@ -1136,11 +1151,13 @@ fn build_simple_project_response(
 
     html.push_str("</body>\n</html>\n");
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(html))
-        .unwrap())
+    // HTTP caching (#2773): ETag + Cache-Control + 304. This HTML variant
+    // carries no extra security headers, so the shared helper suffices.
+    Ok(cacheable_response(
+        html.into_bytes(),
+        "text/html; charset=utf-8",
+        headers,
+    ))
 }
 
 /// Splice local-member entries into a remote-member PEP 503 HTML response so
@@ -6506,6 +6523,219 @@ mod tests {
         assert!(!html.contains("<script>"));
         assert!(!html.contains("</script>"));
         assert!(!html.contains("onerror="));
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP caching on the simple-index responses (#2773): ETag +
+    // Cache-Control + If-None-Match -> 304, for both HTML and JSON variants,
+    // with a changed package set invalidating the ETag.
+    // -----------------------------------------------------------------------
+
+    fn body_string(response: Response) -> String {
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn project_artifact(filename: &str, sha: &str) -> SimpleProjectArtifact {
+        SimpleProjectArtifact {
+            path: format!("pkg/{}", filename),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 100,
+            checksum_sha256: sha.to_string(),
+            metadata: None,
+            upload_time: None,
+        }
+    }
+
+    fn json_accept_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn test_project_html_carries_etag_and_cache_control() {
+        let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+        let response =
+            build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &artifacts, &[])
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ETAG).is_some(), "ETag missing");
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEFAULT_CACHE_CONTROL
+        );
+    }
+
+    #[test]
+    fn test_project_json_carries_etag_and_cache_control() {
+        let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+        let response =
+            build_simple_project_response(&json_accept_headers(), "repo", "pkg", &artifacts, &[])
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response.headers().get(CONTENT_TYPE).unwrap();
+        assert_eq!(ct, "application/vnd.pypi.simple.v1+json");
+        assert!(response.headers().get(ETAG).is_some(), "ETag missing");
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEFAULT_CACHE_CONTROL
+        );
+    }
+
+    #[test]
+    fn test_root_html_carries_etag_and_preserves_security_headers() {
+        let packages = vec!["flask".to_string(), "requests".to_string()];
+        let response = build_simple_root_response(&HeaderMap::new(), "repo", &packages).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ETAG).is_some(), "ETag missing");
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEFAULT_CACHE_CONTROL
+        );
+        // The PEP 503 hardening headers must survive the caching change.
+        assert!(response.headers().get("Content-Security-Policy").is_some());
+        assert_eq!(
+            response.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[test]
+    fn test_root_json_carries_etag_and_cache_control() {
+        let packages = vec!["flask".to_string()];
+        let response =
+            build_simple_root_response(&json_accept_headers(), "repo", &packages).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ETAG).is_some(), "ETag missing");
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEFAULT_CACHE_CONTROL
+        );
+    }
+
+    #[test]
+    fn test_project_conditional_get_returns_304_no_body() {
+        let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+        // First request: capture the served ETag.
+        let first =
+            build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &artifacts, &[])
+                .unwrap();
+        let etag = first
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Conditional request with the matching If-None-Match -> 304, empty body.
+        let mut cond = HeaderMap::new();
+        cond.insert(axum::http::header::IF_NONE_MATCH, etag.parse().unwrap());
+        let response =
+            build_simple_project_response(&cond, "repo", "pkg", &artifacts, &[]).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(ETAG).unwrap().to_str().unwrap(),
+            etag
+        );
+        assert!(body_string(response).is_empty(), "304 must have no body");
+    }
+
+    #[test]
+    fn test_root_conditional_get_returns_304() {
+        let packages = vec!["flask".to_string()];
+        let first = build_simple_root_response(&HeaderMap::new(), "repo", &packages).unwrap();
+        let etag = first
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let mut cond = HeaderMap::new();
+        cond.insert(axum::http::header::IF_NONE_MATCH, etag.parse().unwrap());
+        let response = build_simple_root_response(&cond, "repo", &packages).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_string(response).is_empty(), "304 must have no body");
+    }
+
+    #[test]
+    fn test_project_etag_changes_when_package_set_changes_and_stale_conditional_is_200() {
+        let before = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
+        let first =
+            build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &before, &[]).unwrap();
+        let etag_before = first
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // A new distribution is added to the project.
+        let after = vec![
+            project_artifact("pkg-1.0.0.tar.gz", "aaa"),
+            project_artifact("pkg-2.0.0.tar.gz", "bbb"),
+        ];
+        let second =
+            build_simple_project_response(&HeaderMap::new(), "repo", "pkg", &after, &[]).unwrap();
+        let etag_after = second
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            etag_before, etag_after,
+            "a changed package set must invalidate the ETag"
+        );
+
+        // The client's stale If-None-Match must NOT short-circuit to 304 now.
+        let mut stale = HeaderMap::new();
+        stale.insert(
+            axum::http::header::IF_NONE_MATCH,
+            etag_before.parse().unwrap(),
+        );
+        let response = build_simple_project_response(&stale, "repo", "pkg", &after, &[]).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_string(response).contains("pkg-2.0.0.tar.gz"),
+            "the fresh 200 must carry the new distribution"
+        );
+    }
+
+    #[test]
+    fn test_root_etag_changes_when_package_set_changes() {
+        let before = vec!["flask".to_string()];
+        let after = vec!["flask".to_string(), "requests".to_string()];
+        let e_before = build_simple_root_response(&HeaderMap::new(), "repo", &before)
+            .unwrap()
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let e_after = build_simple_root_response(&HeaderMap::new(), "repo", &after)
+            .unwrap()
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(e_before, e_after, "root ETag must track the package set");
     }
 
     // -----------------------------------------------------------------------
