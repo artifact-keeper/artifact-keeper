@@ -601,9 +601,34 @@ pub async fn auth_middleware(
                         // Basic-auth password. `From<Claims>` stamps `iat_ms` so
                         // credential-change invalidation can exempt the calling
                         // session.
-                        match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => Ok(AuthExtension::from(claims)),
-                            Err(_) => Err("Invalid credentials"),
+                        if let Ok(claims) =
+                            auth_service.validate_access_token_async(&password).await
+                        {
+                            Ok(AuthExtension::from(claims))
+                        } else {
+                            // Finally, treat the password as an API token. This
+                            // lets service accounts — including OIDC-provisioned
+                            // ones that have NO local password (so bcrypt
+                            // `authenticate()` above can never succeed) —
+                            // authenticate CI/CD tooling with
+                            // `username:<api_token>` Basic auth on the generic
+                            // API, consistent with the Docker `/v2/token`
+                            // handler (#593) and the optional-auth path
+                            // (`try_resolve_auth_outcome`). Validation still
+                            // enforces token expiry, revocation, owner
+                            // deactivation, and (downstream, per-handler) scope,
+                            // so an invalid/expired token is still rejected and a
+                            // real password still authenticates via the branch
+                            // above. See #2786.
+                            match validate_api_token_with_scopes(&auth_service, &password).await {
+                                Ok(ext) => Ok(ext),
+                                // Saturated bcrypt cap -> retryable 503, never a
+                                // 401 (mirrors the ApiKey/Bearer branches).
+                                Err(TokenAuthError::Overloaded) => {
+                                    return service_unavailable_response();
+                                }
+                                Err(TokenAuthError::Invalid) => Err("Invalid credentials"),
+                            }
                         }
                     }
                 }
@@ -4118,6 +4143,269 @@ mod tests {
             }
             other => panic!("expected jwt fallback to authenticate basic password, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2786: API-token-as-password Basic auth on the generic API middleware.
+    //
+    // These DB-backed tests wire `auth_middleware` to a real pool-backed
+    // `AuthService` (NOT `make_test_auth_service`, whose lazy pool surfaces a
+    // transient overload on the token-validation path) so the token fallback
+    // is exercised deterministically. Each returns early when `DATABASE_URL`
+    // is unset, matching the rest of the DB-backed suite.
+    // -----------------------------------------------------------------------
+
+    /// Run `request` through `auth_middleware` backed by `auth_service`.
+    async fn run_auth_middleware_with_service(
+        auth_service: Arc<AuthService>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                any(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                auth_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    fn basic_get(username: &str, password: &str) -> axum::http::Request<axum::body::Body> {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+        axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Basic {}", encoded))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Insert an OIDC-provisioned service account with NO local password and
+    /// return its id + username. Mirrors how OIDC provisioning creates SAs.
+    async fn insert_oidc_service_account(pool: &sqlx::PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let username = format!("ph-oidc-sa-{}", id);
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, NULL, 'oidc', false, true, true)"#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .execute(pool)
+        .await
+        .expect("insert oidc service account");
+        (id, username)
+    }
+
+    #[tokio::test]
+    async fn test_2786_oidc_sa_api_token_as_basic_password_authenticates() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, &token)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        // Before #2786 the generic-API Basic branch only tried bcrypt then
+        // JWT-as-password; an OIDC SA (no local password) got a 401. It must
+        // now authenticate via the API-token fallback.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "OIDC service-account API token as Basic password must authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_sa_token_preserves_scopes_for_downstream_gating() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        // Bare "read" scope is what the write gates
+        // (require_scope_response(_, "write")) compare against.
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read".into()], None)
+            .await
+            .expect("generate api token");
+
+        // Resolve the credential the middleware's password-position fallback
+        // uses and confirm the AuthExtension carries the token's scopes +
+        // is_api_token flag, so per-handler write/scope gates
+        // (require_scope_response) still apply — token-as-password does NOT
+        // elevate a read token to write. `username` is unused here because the
+        // fallback keys purely on the token in the password position.
+        let _ = &username;
+        let ext = validate_api_token_with_scopes(&auth_service, &token)
+            .await
+            .expect("token validates");
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert!(ext.is_api_token, "resolved principal must be a token");
+        assert!(
+            ext.has_scope("read"),
+            "read-scoped token must retain its read scope"
+        );
+        assert!(
+            !ext.has_scope("write"),
+            "read-only token must NOT gain write scope via token-as-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_invalid_token_as_basic_password_is_rejected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        // A syntactically token-shaped but non-existent secret (>= 8 chars so
+        // it reaches the DB-prefix lookup rather than the short-circuit).
+        let resp = run_auth_middleware_with_service(
+            auth_service,
+            basic_get(&username, "deadbeef_not_a_real_token_value"),
+        )
+        .await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an invalid API token in the password position must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_expired_token_as_basic_password_is_rejected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let (token, token_id) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], Some(1))
+            .await
+            .expect("generate api token");
+        // Force the token to be expired.
+        sqlx::query("UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("expire token");
+
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, &token)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an expired API token in the password position must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_local_password_basic_auth_still_works() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Local user with a real bcrypt password: the token fallback must not
+        // regress ordinary username/password Basic auth.
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-local-{}", user_id);
+        let password = "correct horse battery staple";
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash password");
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, password)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a real local password must still authenticate via Basic auth"
+        );
     }
 
     async fn run_through_auth_middleware(
