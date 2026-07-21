@@ -109,7 +109,7 @@ pub struct SystemVersionResponse {
     pub license: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RepositoryListItem {
     pub key: String,
     #[serde(rename = "type")]
@@ -118,6 +118,14 @@ pub struct RepositoryListItem {
     pub package_type: String,
     pub url: Option<String>,
     pub description: Option<String>,
+    /// For virtual/group repositories: the ordered list of *source-side* member
+    /// repository keys (Nexus `group.memberNames`, Artifactory virtual
+    /// `repositories`). Empty for local/remote repos and for sources that do not
+    /// report membership. These are source names that must be correlated to the
+    /// migrated Artifact Keeper repositories before a virtual repo can be wired
+    /// up (issue #2783).
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
