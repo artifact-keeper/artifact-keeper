@@ -918,11 +918,10 @@ async fn download(
     if MavenHandler::is_metadata(&path) {
         let content =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
+        // `content` is a refcounted `Bytes`; hand it to the (generic) helper
+        // directly so the metadata payload is moved, not cloned.
         return Ok(cache_headers::cacheable_response(
-            content.to_vec(),
-            "text/xml",
-            &headers,
-            None,
+            content, "text/xml", &headers, None,
         ));
     }
 
