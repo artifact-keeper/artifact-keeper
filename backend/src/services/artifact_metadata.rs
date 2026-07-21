@@ -43,6 +43,7 @@ pub fn parse_name_and_version(
         "npm" | "yarn" | "pnpm" | "bower" => parse_npm(filename, artifact_path),
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
         "nuget" => parse_nuget(filename, artifact_path),
+        "go" | "golang" => parse_go(artifact_path, filename),
         _ => fallback(filename),
     }
 }
@@ -234,6 +235,65 @@ fn parse_helm(filename: &str) -> ParsedArtifact {
         };
     }
     fallback(filename)
+}
+
+// ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+
+/// Go module-proxy parser (#2784). Go repositories (in Nexus and the GOPROXY
+/// protocol) lay artifacts out as `<module>/@v/<version>.{zip,mod,info}`,
+/// e.g. `github.com/gorilla/mux/@v/v1.8.0.zip`. The module path is the
+/// portion before `/@v/` and the version is the file stem after it. Module
+/// paths encode uppercase letters as `!` followed by the lowercase letter
+/// (e.g. `!azure` == `Azure`), so the recovered name is un-escaped back to
+/// the canonical, human-readable module path the Go tooling and the Packages
+/// tab display.
+///
+/// Non-versioned proxy files (`@v/list`, `@latest`, `@v/<v>.lock`) don't
+/// carry a parseable version and fall through to the filename-as-name
+/// behaviour (no catalog row), matching how other formats treat their index
+/// files.
+fn parse_go(artifact_path: &str, filename: &str) -> ParsedArtifact {
+    if let Some((module_enc, ver_file)) = artifact_path.split_once("/@v/") {
+        if !module_enc.is_empty() {
+            let version = ver_file
+                .strip_suffix(".zip")
+                .or_else(|| ver_file.strip_suffix(".info"))
+                .or_else(|| ver_file.strip_suffix(".mod"))
+                .filter(|v| !v.is_empty())
+                .map(go_unescape_module_path);
+            if version.is_some() {
+                return ParsedArtifact {
+                    name: go_unescape_module_path(module_enc),
+                    version,
+                };
+            }
+        }
+    }
+    fallback(filename)
+}
+
+/// Decode the Go module-proxy case-encoding: an uppercase ASCII letter is
+/// stored as `!` followed by its lowercase form. Any other `!` is preserved
+/// verbatim so malformed input round-trips without panicking.
+fn go_unescape_module_path(encoded: &str) -> String {
+    if !encoded.contains('!') {
+        return encoded.to_string();
+    }
+    let mut out = String::with_capacity(encoded.len());
+    let mut chars = encoded.chars();
+    while let Some(c) = chars.next() {
+        if c == '!' {
+            match chars.next() {
+                Some(next) => out.push(next.to_ascii_uppercase()),
+                None => out.push('!'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +755,89 @@ mod tests {
         );
         assert_eq!(p.name, "MyPackage");
         assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Go (#2784)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn go_zip_recovers_module_and_version() {
+        let p = parse_name_and_version("go", "v1.8.0.zip", "github.com/gorilla/mux/@v/v1.8.0.zip");
+        assert_eq!(p.name, "github.com/gorilla/mux");
+        assert_eq!(p.version.as_deref(), Some("v1.8.0"));
+    }
+
+    #[test]
+    fn go_mod_and_info_sidecars_recover_the_same_identity() {
+        let m = parse_name_and_version("go", "v1.8.0.mod", "github.com/gorilla/mux/@v/v1.8.0.mod");
+        let i =
+            parse_name_and_version("go", "v1.8.0.info", "github.com/gorilla/mux/@v/v1.8.0.info");
+        assert_eq!(m.name, "github.com/gorilla/mux");
+        assert_eq!(m.version.as_deref(), Some("v1.8.0"));
+        assert_eq!(i.name, "github.com/gorilla/mux");
+        assert_eq!(i.version.as_deref(), Some("v1.8.0"));
+    }
+
+    #[test]
+    fn go_pseudo_version_is_preserved() {
+        let p = parse_name_and_version(
+            "go",
+            "v0.0.0-20210101000000-abcdef123456.zip",
+            "example.com/x/y/@v/v0.0.0-20210101000000-abcdef123456.zip",
+        );
+        assert_eq!(p.name, "example.com/x/y");
+        assert_eq!(
+            p.version.as_deref(),
+            Some("v0.0.0-20210101000000-abcdef123456")
+        );
+    }
+
+    #[test]
+    fn go_case_escaped_module_path_is_decoded() {
+        // `!azure` decodes to `Azure` per the GOPROXY case-encoding.
+        let p = parse_name_and_version(
+            "go",
+            "v68.0.0.zip",
+            "github.com/!azure/azure-sdk-for-go/@v/v68.0.0.zip",
+        );
+        assert_eq!(p.name, "github.com/Azure/azure-sdk-for-go");
+        assert_eq!(p.version.as_deref(), Some("v68.0.0"));
+    }
+
+    #[test]
+    fn go_golang_alias_uses_the_same_parser() {
+        let p = parse_name_and_version("golang", "v1.0.0.mod", "rsc.io/quote/@v/v1.0.0.mod");
+        assert_eq!(p.name, "rsc.io/quote");
+        assert_eq!(p.version.as_deref(), Some("v1.0.0"));
+    }
+
+    #[test]
+    fn go_index_files_have_no_version() {
+        // `list` and `@latest` are proxy index files, not releases.
+        let list = parse_name_and_version("go", "list", "github.com/gorilla/mux/@v/list");
+        assert_eq!(list.version, None);
+        let latest = parse_name_and_version("go", "@latest", "github.com/gorilla/mux/@latest");
+        assert_eq!(latest.version, None);
+    }
+
+    #[test]
+    fn go_non_proxy_path_falls_back_to_filename() {
+        let p = parse_name_and_version("go", "weird.bin", "weird.bin");
+        assert_eq!(p.name, "weird.bin");
+        assert_eq!(p.version, None);
+    }
+
+    #[test]
+    fn go_unescape_module_path_cases() {
+        assert_eq!(
+            go_unescape_module_path("github.com/gorilla/mux"),
+            "github.com/gorilla/mux"
+        );
+        assert_eq!(go_unescape_module_path("!azure"), "Azure");
+        assert_eq!(go_unescape_module_path("!a!b!c"), "ABC");
+        // Trailing bang round-trips without panicking.
+        assert_eq!(go_unescape_module_path("foo!"), "foo!");
     }
 
     #[test]
