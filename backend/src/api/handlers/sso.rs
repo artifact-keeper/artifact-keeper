@@ -1173,16 +1173,48 @@ pub(crate) fn resolve_oidc_claim_name<'a>(
         .unwrap_or(default)
 }
 
+/// Delimiters used to split a scalar (string) OIDC groups claim into
+/// individual group names. IdPs that flatten a multi-valued claim into one
+/// string use comma / semicolon / whitespace; splitting on all of them covers
+/// the common shapes without needing per-provider configuration. Group names
+/// that legitimately contain a delimiter are only affected when the IdP emits
+/// them as a scalar string — the array form (below) preserves them verbatim.
+const OIDC_GROUP_CLAIM_DELIMS: &[char] = &[',', ';', ' ', '\t', '\n', '\r'];
+
 /// Extract user groups from JWT claims using the configured groups claim name.
+///
+/// Handles the two shapes IdPs emit the groups claim in (issue #2781):
+/// - a JSON **array** of names — the standard form (Keycloak/Okta/Azure with a
+///   groups mapper). Only string elements are kept, verbatim.
+/// - a single JSON **string** — some IdPs/claim-mappers emit the groups claim
+///   as one scalar value, either a lone group name (`"admins"`) or a delimited
+///   list (`"admins,developers"` / `"admins developers"`). Previously this
+///   shape was silently dropped, so those users had zero groups synced even
+///   with "Map OIDC groups to local groups" enabled. It is now split on the
+///   usual list delimiters.
+///
+/// Blank entries are discarded and each name is trimmed. Non-string / absent
+/// claims yield no groups. The result is passed straight into the shared,
+/// namespace-scoped reconciler, so this never over-grants: names only ever
+/// auto-create or attach within this provider's `external_source='oidc'`
+/// namespace and can never bind to an operator-managed group (#2759).
 pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str) -> Vec<String> {
-    claims[groups_claim]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    match &claims[groups_claim] {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        serde_json::Value::String(s) => s
+            .split(OIDC_GROUP_CLAIM_DELIMS)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Reconcile an OIDC user's group memberships against the `groups` table.
@@ -2479,10 +2511,49 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_groups_non_array_claim() {
+    fn test_extract_groups_single_string_claim() {
+        // Some IdPs emit a lone group as a bare string, not a 1-element array.
+        // This must sync as a single group, not be dropped (#2781).
         let claims = serde_json::json!({ "groups": "admin" });
         let groups = extract_oidc_groups(&claims, "groups");
-        assert!(groups.is_empty()); // string is not an array
+        assert_eq!(groups, vec!["admin"]);
+    }
+
+    #[test]
+    fn test_extract_groups_comma_delimited_string() {
+        let claims = serde_json::json!({ "groups": "admin,developers,users" });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_space_delimited_string() {
+        let claims = serde_json::json!({ "groups": "admin developers users" });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_delimited_string_trims_and_drops_blanks() {
+        // Mixed delimiters + stray whitespace must not yield empty entries.
+        let claims = serde_json::json!({ "groups": " admin, ,developers;  users " });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_array_trims_whitespace() {
+        let claims = serde_json::json!({ "groups": [" admin ", "developers", "  "] });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert_eq!(groups, vec!["admin", "developers"]);
+    }
+
+    #[test]
+    fn test_extract_groups_non_string_scalar_claim() {
+        // A numeric/boolean claim is still not a valid groups value.
+        let claims = serde_json::json!({ "groups": 42 });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -2711,7 +2782,8 @@ mod tests {
 
     mod sync_db {
         use super::super::{
-            sync_federated_groups_to_local_groups, sync_oidc_groups_to_local_groups,
+            extract_oidc_groups, sync_federated_groups_to_local_groups,
+            sync_oidc_groups_to_local_groups,
         };
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
@@ -2826,6 +2898,45 @@ mod tests {
             );
             assert_eq!(
                 group_external_source(&pool, g2_id).await.as_deref(),
+                Some("oidc")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// End-to-end proof for #2781: an OIDC id_token whose groups claim is
+        /// a delimited *string* (not an array) must still create + attach
+        /// admin-visible groups. Before the extract fix this list was empty
+        /// and no groups were created; the group lookups below would fail.
+        #[tokio::test]
+        async fn test_string_groups_claim_creates_admin_visible_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("eng");
+            let g2 = rand_group_name("ops");
+
+            // Simulate an IdP that emits the groups claim as a single
+            // comma-delimited string rather than a JSON array.
+            let claims = serde_json::json!({ "groups": format!("{g1},{g2}") });
+            let groups = extract_oidc_groups(&claims, "groups");
+            assert_eq!(groups, vec![g1.clone(), g2.clone()]);
+
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &groups)
+                .await
+                .expect("sync");
+
+            // The Groups admin list selects straight from `groups` with no
+            // external_source filter, so a created+tagged row is admin-visible.
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
                 Some("oidc")
             );
 
