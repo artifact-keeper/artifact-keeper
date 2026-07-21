@@ -4,7 +4,7 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.115.0, backend images)
+#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.116.0, backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/aquasecurity/trivy:0.72.0,
 #       scanner-adapter image only — the backend images do NOT bundle trivy)
 #   Both are short-lived CLI subprocesses the services shell out to. They are
@@ -23,7 +23,7 @@
 #   every build), or in the UBI/Alpine base OS packages. Only
 #   vendored-scanner-binary CVEs that have no fixed *tool release* are listed.
 #
-# * Both tools are pinned to the latest upstream release (grype v0.115.0,
+# * Both tools are pinned to the latest upstream release (grype v0.116.0,
 #   trivy 0.72.0, bumped for #2391). For the CVEs below the dependency fix
 #   exists upstream but no tagged tool release has been rebuilt against it
 #   yet (or, where noted, no upstream fix exists at all). They drop off
@@ -39,8 +39,8 @@
 # Trivy tracker: ghcr.io/aquasecurity/trivy tags (GitHub repo has no releases)
 
 # ---------------------------------------------------------------------------
-# grype v0.115.0 binary — Go stdlib @ go1.26.3
-# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.115.0 (latest) is
+# grype v0.116.0 binary — Go stdlib @ go1.26.3
+# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.116.0 (latest) is
 # still built with go1.26.3. Drops off when grype ships a release built on
 # Go >= 1.26.5. (CVE-2026-39822 / CVE-2026-42505 also cover the trivy 0.72.0
 # binary, which is built with go1.26.4.)
@@ -51,10 +51,10 @@ CVE-2026-42505
 CVE-2026-42507
 
 # ---------------------------------------------------------------------------
-# grype v0.115.0 binary — github.com/docker/docker @ v28.5.2+incompatible
+# grype v0.116.0 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
-# grype v0.115.0 (latest) has not rebuilt against it. Code path: grype's
+# grype v0.116.0 (latest) has not rebuilt against it. Code path: grype's
 # Docker engine client for `docker:` image sources; the backend invokes grype
 # against on-disk artifacts/SBOMs, not the Docker daemon.
 CVE-2026-33997
