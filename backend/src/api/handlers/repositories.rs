@@ -3552,23 +3552,40 @@ async fn purge_oci_upload_temp_objects(
 ///
 /// Never blocks the delete: storage-resolution and per-object failures are
 /// logged and swallowed.
+///
+/// Convenience wrapper combining [`collect_repo_artifact_object_keys`] and
+/// [`purge_storage_object_keys`] in one synchronous call. The repository delete
+/// path no longer uses it — it collects keys before the DB delete and defers
+/// the purge to a background task (#2776) — so it is retained for tests that
+/// exercise the collect+purge behaviour end-to-end.
+#[cfg(test)]
 async fn purge_repo_artifact_objects(
     state: &SharedState,
     repo_id: Uuid,
     location: &crate::storage::StorageLocation,
 ) {
-    let storage = match state.storage_for_repo(location) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                repo_id = %repo_id,
-                error = %e,
-                "Could not resolve storage to purge artifact objects before repository delete"
-            );
-            return;
-        }
-    };
+    let keys = collect_repo_artifact_object_keys(state, repo_id, location).await;
+    purge_storage_object_keys(state, repo_id, location, keys).await;
+}
 
+/// Collect the set of committed artifact-object storage keys owned
+/// *exclusively* by this repository, to be purged from the storage backend.
+///
+/// Must run BEFORE the repository row (and its cascading `artifacts` /
+/// `maven_flat_object_owner` rows) are deleted: once those rows CASCADE away
+/// the owning keys are no longer derivable. The actual object deletion is
+/// performed separately by [`purge_storage_object_keys`], which the delete
+/// path defers to a background task so that deleting a LARGE repository does
+/// not run O(objects) synchronous storage round-trips inside the request and
+/// trip the global request-timeout backstop (#2776).
+///
+/// The exclusivity and OCI-exclusion rules are documented on
+/// [`purge_repo_artifact_objects`].
+async fn collect_repo_artifact_object_keys(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+) -> std::collections::BTreeSet<String> {
     let mut keys: std::collections::BTreeSet<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.storage_key FROM artifacts a \
          WHERE a.repository_id = $1 \
@@ -3597,6 +3614,37 @@ async fn purge_repo_artifact_objects(
     if location.backend == "filesystem" {
         keys.extend(collect_repo_maven_derived_keys(state, repo_id).await);
     }
+    keys
+}
+
+/// Best-effort deletion of the given committed artifact-object storage keys
+/// from a repository's storage backend, given the keys previously gathered by
+/// [`collect_repo_artifact_object_keys`].
+///
+/// Split out from collection so the delete path can defer this (potentially
+/// O(objects)) work to a background task AFTER a successful DB delete, keeping
+/// the request path bounded (#2776). Never blocks the delete: storage
+/// resolution and per-object failures are logged and swallowed.
+async fn purge_storage_object_keys(
+    state: &SharedState,
+    repo_id: Uuid,
+    location: &crate::storage::StorageLocation,
+    keys: std::collections::BTreeSet<String>,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let storage = match state.storage_for_repo(location) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Could not resolve storage to purge artifact objects for repository delete"
+            );
+            return;
+        }
+    };
 
     let total = keys.len();
     let mut failed = 0usize;
@@ -3609,7 +3657,7 @@ async fn purge_repo_artifact_objects(
                     repo_id = %repo_id,
                     storage_key = %key,
                     error = %e,
-                    "Failed to purge artifact object before repository delete"
+                    "Failed to purge artifact object for repository delete"
                 );
             }
         }
@@ -3783,49 +3831,62 @@ pub async fn delete_repository(
     // repository may still retry (#1533 GC-LOW-2). Best-effort throughout.
     let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
 
-    // Purge this repo's committed artifact objects from storage BEFORE the
-    // repository row is deleted (the artifacts rows CASCADE away with it). The
-    // DB delete alone left every stored object orphaned on S3/filesystem
-    // (#1551). Best-effort: never blocks the delete.
-    purge_repo_artifact_objects(&state, repo.id, &repo.storage_location()).await;
-
-    // Purge this repo's proxy-cache subtree from the global default storage
-    // backend. Proxy-cached blobs are keyed by the repo KEY and are not tracked
-    // in `artifacts` (#1278), so the purge above never reaches them; left
-    // behind, a new repository created with the same key would serve the deleted
-    // repo's stale upstream content (#2047). Best-effort: never blocks the
-    // delete. Hosted repos have no proxy cache, so this is a no-op for them.
-    if let Some(proxy) = state.proxy_service.as_ref() {
-        match proxy.purge_repo_cache(&repo.key).await {
-            Ok(purged) if purged > 0 => tracing::info!(
-                repo_id = %repo.id,
-                repo_key = %repo.key,
-                purged,
-                "Purged proxy-cache storage objects for deleted repository"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                repo_id = %repo.id,
-                repo_key = %repo.key,
-                error = %e,
-                "Failed to list proxy-cache objects to purge before repository delete"
-            ),
-        }
-    }
+    // Collect the storage keys of this repo's committed artifact objects BEFORE
+    // the repository row is deleted (the `artifacts` / `maven_flat_object_owner`
+    // rows CASCADE away with it, after which the owning keys are no longer
+    // derivable — #1551/#2668). Collection is a handful of SELECTs; the actual
+    // object deletion is deferred below.
+    let location = repo.storage_location();
+    let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
 
     service.delete(repo.id).await?;
 
-    // The repository row is now gone (and its OCI upload journal/session/part
-    // rows CASCADED away). Only now purge the temp objects gathered above from
-    // storage: had the delete failed, this is skipped and the objects survive
-    // to be retried (#1533 GC-LOW-2). Best-effort: never blocks.
-    purge_oci_upload_temp_objects(
-        &state,
-        repo.id,
-        &repo.storage_location(),
-        oci_upload_temp_keys,
-    )
-    .await;
+    // Storage cleanup is best-effort and O(objects), so it runs OFF the request
+    // path in a background task (#2776): a LARGE repository (many thousands of
+    // stored objects) would otherwise drive O(objects) synchronous storage
+    // round-trips inside the DELETE request and trip the global request-timeout
+    // backstop with a 503 "server overloaded". The task is spawned only after a
+    // *successful* DB delete, preserving the invariant that a failed delete
+    // never destroys objects a surviving repository may still serve or retry
+    // (#1533 GC-LOW-2 / #1551 / #2047). All failures are logged and swallowed.
+    {
+        let state = state.clone();
+        let repo_id = repo.id;
+        let repo_key = repo.key.clone();
+        tokio::spawn(async move {
+            // Committed artifact objects (keys gathered before the delete).
+            purge_storage_object_keys(&state, repo_id, &location, artifact_object_keys).await;
+
+            // In-flight / abandoned OCI upload temp objects (keys gathered
+            // before the delete; the journal/session/part rows have CASCADED
+            // away with the repository row).
+            purge_oci_upload_temp_objects(&state, repo_id, &location, oci_upload_temp_keys).await;
+
+            // Proxy-cache subtree, keyed by the repo KEY and not tracked in
+            // `artifacts` (#1278); left behind, a new repository created with
+            // the same key would serve the deleted repo's stale upstream
+            // content (#2047). The key space is derived from the repo key (not
+            // from now-deleted rows), so purging here — after the DB delete —
+            // is safe. Hosted repos have no proxy cache, so this is a no-op.
+            if let Some(proxy) = state.proxy_service.as_ref() {
+                match proxy.purge_repo_cache(&repo_key).await {
+                    Ok(purged) if purged > 0 => tracing::info!(
+                        repo_id = %repo_id,
+                        repo_key = %repo_key,
+                        purged,
+                        "Purged proxy-cache storage objects for deleted repository"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        repo_id = %repo_id,
+                        repo_key = %repo_key,
+                        error = %e,
+                        "Failed to list proxy-cache objects to purge after repository delete"
+                    ),
+                }
+            }
+        });
+    }
 
     // Remove the deleted repo from the in-memory cache.
     {
@@ -16383,6 +16444,10 @@ mod tests {
     /// purges the repo's in-flight OCI upload temp objects from storage — even
     /// though the journal rows CASCADE away with the repo row, because the keys
     /// are collected *before* the delete and purged *after* it commits.
+    ///
+    /// The purge now runs in a background task (#2776 — so a large repository's
+    /// O(objects) storage cleanup does not block the request), so this asserts
+    /// the object *eventually* disappears rather than synchronously.
     #[tokio::test]
     async fn delete_repository_success_purges_oci_upload_temp_objects() {
         let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
@@ -16415,12 +16480,23 @@ mod tests {
         .await
         .expect("repository delete must succeed");
 
-        assert!(
-            !storage
+        // Storage cleanup is deferred to a background task (#2776); poll briefly
+        // for the temp object to disappear rather than asserting synchronously.
+        let mut purged = false;
+        for _ in 0..100 {
+            if !storage
                 .exists(&temp_key)
                 .await
-                .expect("exists after delete"),
-            "a successful repository delete must purge the OCI upload temp object"
+                .expect("exists after delete")
+            {
+                purged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            purged,
+            "a successful repository delete must purge the OCI upload temp object (background cleanup)"
         );
 
         fx.teardown().await;
@@ -16618,6 +16694,192 @@ mod tests {
             .execute(&fx.pool)
             .await
             .expect("delete other repo");
+        fx.teardown().await;
+    }
+
+    /// #2776: deleting a LARGE Maven virtual repository must not run its
+    /// O(objects) storage purge synchronously in the request path (which tripped
+    /// the 120 s global request-timeout backstop with a 503 "server overloaded").
+    ///
+    /// The delete path now (a) collects the owned storage keys BEFORE the DB
+    /// delete cascades their attribution rows away, (b) performs the fast DB
+    /// delete, then (c) defers the object purge to a background task. This test
+    /// pins the correctness of that split at scale:
+    ///   * every key owned by the virtual repo (cached merged `maven-metadata`
+    ///     flat objects) is collectable BEFORE the delete, so the background
+    ///     purge has the full set;
+    ///   * a member repository's own flat object is NOT collected (no
+    ///     over-delete of another repo's data);
+    ///   * the DB delete removes the virtual repo AND cascades its
+    ///     `virtual_repo_members` / `maven_flat_object_owner` rows, while the
+    ///     member repositories survive;
+    ///   * running the deferred purge afterwards removes exactly the collected
+    ///     objects and leaves the member's object in place.
+    #[tokio::test]
+    async fn delete_large_maven_virtual_repo_collects_before_delete_and_cascades() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = state.storage_for_repo(&location).expect("resolve storage");
+        let vrepo_id = fx.repo_id;
+
+        // A realistically LARGE aggregation: several member repositories, each
+        // wired into the virtual repo, plus many cached row-less Maven flat
+        // objects attributed to the virtual repo (merged `maven-metadata.xml`
+        // and its checksum sidecars produced while serving the group).
+        const MEMBERS: usize = 6;
+        const VREPO_FLAT_OBJECTS: usize = 40;
+
+        let mut member_ids: Vec<Uuid> = Vec::with_capacity(MEMBERS);
+        for i in 0..MEMBERS {
+            let (member_id, _key, _dir) = tdh::create_repo(&fx.pool, "local", "maven").await;
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(vrepo_id)
+            .bind(member_id)
+            .bind(i as i32)
+            .execute(&fx.pool)
+            .await
+            .expect("insert virtual member");
+            member_ids.push(member_id);
+        }
+
+        // Row-less flat objects OWNED by the virtual repo. Each has a stored
+        // object and an attribution row (source='metadata_merge') that CASCADEs
+        // with the virtual repo on delete.
+        let mut vrepo_keys: Vec<String> = Vec::with_capacity(VREPO_FLAT_OBJECTS);
+        for i in 0..VREPO_FLAT_OBJECTS {
+            let key = format!("maven/com/example/lib{i}/maven-metadata.xml");
+            storage
+                .put(&key, bytes::Bytes::from_static(b"<metadata/>"))
+                .await
+                .expect("put vrepo flat object");
+            sqlx::query(
+                "INSERT INTO maven_flat_object_owner \
+                 (storage_key, repository_id, source, storage_backend) \
+                 VALUES ($1, $2, 'metadata_merge', 'filesystem')",
+            )
+            .bind(&key)
+            .bind(vrepo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("attribute vrepo flat object");
+            vrepo_keys.push(key);
+        }
+
+        // A flat object owned by a MEMBER repository (not the virtual repo):
+        // deleting the virtual repo must never collect or purge it.
+        let member_key = "maven/com/example/member-only/maven-metadata.xml".to_string();
+        storage
+            .put(&member_key, bytes::Bytes::from_static(b"<member/>"))
+            .await
+            .expect("put member flat object");
+        sqlx::query(
+            "INSERT INTO maven_flat_object_owner \
+             (storage_key, repository_id, source, storage_backend) \
+             VALUES ($1, $2, 'primary_row', 'filesystem')",
+        )
+        .bind(&member_key)
+        .bind(member_ids[0])
+        .execute(&fx.pool)
+        .await
+        .expect("attribute member flat object");
+
+        // (a) Collect BEFORE the delete — this is what the request path now does
+        // synchronously (a handful of SELECTs), handing the set to the
+        // background purge. Must contain every virtual-repo-owned key and NOT
+        // the member's key.
+        let collected = collect_repo_artifact_object_keys(&state, vrepo_id, &location).await;
+        for key in &vrepo_keys {
+            assert!(
+                collected.contains(key),
+                "virtual-repo-owned flat key {key} must be collected before delete"
+            );
+        }
+        assert!(
+            !collected.contains(&member_key),
+            "a member repository's flat object must not be collected for the virtual repo delete"
+        );
+
+        // (b) The fast DB delete (authoritative "deleted" signal for the UI).
+        state
+            .create_repository_service()
+            .delete(vrepo_id)
+            .await
+            .expect("virtual repo DB delete must succeed");
+
+        // The virtual repo row is gone; its membership + attribution rows
+        // CASCADED away; the member repositories survive.
+        let vrepo_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE id = $1")
+                .bind(vrepo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count vrepo");
+        assert_eq!(vrepo_exists, 0, "virtual repo row must be deleted");
+
+        let member_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM virtual_repo_members WHERE virtual_repo_id = $1",
+        )
+        .bind(vrepo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count membership rows");
+        assert_eq!(
+            member_rows, 0,
+            "membership rows must cascade with the vrepo"
+        );
+
+        let vrepo_attr: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM maven_flat_object_owner WHERE repository_id = $1",
+        )
+        .bind(vrepo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count vrepo attribution rows");
+        assert_eq!(vrepo_attr, 0, "vrepo attribution rows must cascade");
+
+        for member_id in &member_ids {
+            let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE id = $1")
+                .bind(member_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count member repo");
+            assert_eq!(alive, 1, "member repository {member_id} must survive");
+        }
+
+        // (c) The deferred purge removes exactly the collected objects; the
+        // member's object is untouched.
+        purge_storage_object_keys(&state, vrepo_id, &location, collected).await;
+        for key in &vrepo_keys {
+            assert!(
+                !storage.exists(key).await.expect("check vrepo object"),
+                "vrepo-owned object {key} must be purged by the deferred cleanup"
+            );
+        }
+        assert!(
+            storage
+                .exists(&member_key)
+                .await
+                .expect("check member object"),
+            "the member repository's object must survive the vrepo delete"
+        );
+
+        // Clean up surviving member repositories.
+        for member_id in &member_ids {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await
+                .expect("delete member repo");
+        }
         fx.teardown().await;
     }
 
