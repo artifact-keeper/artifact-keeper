@@ -648,6 +648,8 @@ pub async fn ldap_login(
         &row.groups_attribute,
         row.admin_group_dn.as_deref(),
         row.use_starttls,
+        row.insecure_skip_verify,
+        row.ca_certificate.as_deref(),
     );
 
     // Authenticate against LDAP. A bind/credential failure is the LDAP
