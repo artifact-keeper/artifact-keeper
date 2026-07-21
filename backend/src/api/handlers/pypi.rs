@@ -7407,4 +7407,31 @@ mod tests {
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(second.headers().get(VARY).unwrap(), "Accept");
     }
+
+    #[test]
+    fn simple_root_json_response_is_cacheable() {
+        let packages = ["flask".to_string()];
+        let json_accept = "application/vnd.pypi.simple.v1+json";
+
+        let first =
+            build_simple_root_response(&headers_accept(json_accept), "pypi", &packages).unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers().get(CONTENT_TYPE).unwrap(), json_accept);
+        assert!(first.headers().get(ETAG).is_some());
+        assert_eq!(
+            first.headers().get(CACHE_CONTROL).unwrap(),
+            cache_headers::DEFAULT_CACHE_CONTROL
+        );
+        assert_eq!(first.headers().get(VARY).unwrap(), "Accept");
+        let etag = etag_of(&first);
+
+        let mut h = headers_accept(json_accept);
+        h.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_str(&etag).unwrap(),
+        );
+        let second = build_simple_root_response(&h, "pypi", &packages).unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get(VARY).unwrap(), "Accept");
+    }
 }
