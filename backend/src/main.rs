@@ -1699,6 +1699,11 @@ fn build_ldap_request_from_values(
         groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
         admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
         use_starttls: Some(use_starttls),
+        // TLS trust for the env-bootstrapped provider stays governed by the
+        // global LDAP_INSECURE_TLS / LDAP_CA_CERT_PATH env fallback (#2782);
+        // the per-provider overrides are set via the admin SSO API.
+        insecure_skip_verify: None,
+        ca_certificate: None,
         is_enabled: Some(true),
         priority: Some(0),
     })
