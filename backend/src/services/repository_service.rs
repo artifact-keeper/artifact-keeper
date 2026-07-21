@@ -1516,6 +1516,170 @@ impl RepositoryService {
         Ok(usage)
     }
 
+    /// Storage figure to DISPLAY for `repo` (issue #2785).
+    ///
+    /// A virtual repository owns no `artifacts` / `proxy_cache_artifacts` /
+    /// `oci_blobs` rows of its own — its content is whatever resolves through
+    /// its members. A plain `get_storage_usage(virtual_id)` therefore reports
+    /// the virtual's *own* rows (effectively zero) even though browsing the
+    /// virtual surfaces real member data, so the detail view showed a total
+    /// that did not match the combined total of its child repos. For a virtual
+    /// repo we instead sum over the union of its resolvable member contents;
+    /// every other repo type keeps the existing per-repo figure unchanged.
+    pub async fn get_display_storage_usage(&self, repo: &Repository) -> Result<i64> {
+        if repo.repo_type == RepositoryType::Virtual {
+            self.get_virtual_storage_usage(repo.id).await
+        } else {
+            self.get_storage_usage(repo.id).await
+        }
+    }
+
+    /// Combined storage figure for a virtual repository: the union of the
+    /// contents of every non-virtual member reachable through the membership
+    /// graph (issue #2785).
+    ///
+    /// The membership graph is walked with a recursive CTE bounded by
+    /// [`MAX_VIRTUAL_DEPTH`] so a nested virtual member contributes its own
+    /// leaves. Leaf (non-virtual) repositories are collected DISTINCT, so a
+    /// repository reachable through two different members is counted once
+    /// (union semantics) rather than double-counted. The per-leaf sum reuses
+    /// the same three components as [`Self::get_storage_usage`]
+    /// (`artifacts` + `proxy_cache_artifacts` + `oci_blobs`), keeping the
+    /// virtual total consistent with the sum of what each member reports on
+    /// its own.
+    ///
+    /// Uses the dynamic query API (not the `query!` macro) so this path does
+    /// not depend on an updated offline SQLx cache, matching the convention
+    /// used by the cycle-detection walk.
+    pub async fn get_virtual_storage_usage(&self, virtual_repo_id: Uuid) -> Result<i64> {
+        let usage: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE reachable(repo_id, depth) AS (
+                SELECT vrm.member_repo_id, 1
+                  FROM virtual_repo_members vrm
+                 WHERE vrm.virtual_repo_id = $1
+              UNION
+                SELECT vrm.member_repo_id, reachable.depth + 1
+                  FROM reachable
+                  JOIN repositories parent
+                    ON parent.id = reachable.repo_id
+                   AND parent.repo_type = 'virtual'
+                  JOIN virtual_repo_members vrm
+                    ON vrm.virtual_repo_id = reachable.repo_id
+                 WHERE reachable.depth < $2
+            ),
+            leaves AS (
+                SELECT DISTINCT reachable.repo_id AS id
+                  FROM reachable
+                  JOIN repositories leaf ON leaf.id = reachable.repo_id
+                 WHERE leaf.repo_type <> 'virtual'
+            )
+            SELECT COALESCE(SUM(bytes), 0)::BIGINT
+            FROM (
+                SELECT size_bytes AS bytes
+                  FROM artifacts
+                 WHERE repository_id IN (SELECT id FROM leaves)
+                   AND is_deleted = false
+                   AND storage_key NOT LIKE 'proxy-cache/%'
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM proxy_cache_artifacts
+                 WHERE repository_id IN (SELECT id FROM leaves)
+                UNION ALL
+                SELECT size_bytes AS bytes
+                  FROM oci_blobs
+                 WHERE repository_id IN (SELECT id FROM leaves)
+            ) t
+            "#,
+        )
+        .bind(virtual_repo_id)
+        .bind(MAX_VIRTUAL_DEPTH as i32)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(usage)
+    }
+
+    /// Reconcile the FULL member set of a virtual repository to exactly
+    /// `desired` (issue #2785 defect B).
+    ///
+    /// Editing a virtual repository after creation must be able to add and
+    /// remove members, not merely reorder the ones added at create time. This
+    /// replaces the membership with exactly the `(member_repo_id, priority)`
+    /// pairs in `desired`, in a single transaction guarded by the same
+    /// process-wide member-graph advisory lock that `add_virtual_member` and
+    /// `update_virtual_member_priorities` take (so it never contends with a
+    /// concurrent membership mutation):
+    ///
+    ///   * members not present in `desired` are removed;
+    ///   * members already present have their priority updated;
+    ///   * new members are inserted.
+    ///
+    /// An empty `desired` removes every member. Caller-side authorization
+    /// (repo-admin on the virtual parent + token-scope / cycle / format checks
+    /// per member) is enforced by the handler before this runs.
+    pub async fn set_virtual_members(
+        &self,
+        virtual_repo_id: Uuid,
+        desired: &[(Uuid, i32)],
+    ) -> Result<()> {
+        let member_ids: Vec<Uuid> = desired.iter().map(|(id, _)| *id).collect();
+        let priorities: Vec<i32> = desired.iter().map(|(_, p)| *p).collect();
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(VIRTUAL_MEMBER_GRAPH_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Remove members that are no longer in the desired set. `<> ALL($2)`
+        // over an empty array is TRUE for every row, so an empty desired set
+        // clears the membership.
+        sqlx::query(
+            r#"
+            DELETE FROM virtual_repo_members
+             WHERE virtual_repo_id = $1
+               AND member_repo_id <> ALL($2::uuid[])
+            "#,
+        )
+        .bind(virtual_repo_id)
+        .bind(&member_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Upsert the desired members: insert the new ones, refresh the
+        // priority of the ones that already existed.
+        sqlx::query(
+            r#"
+            INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
+            SELECT $1, m.member_repo_id, m.priority
+              FROM UNNEST($2::uuid[], $3::int4[]) AS m(member_repo_id, priority)
+            ON CONFLICT (virtual_repo_id, member_repo_id)
+            DO UPDATE SET priority = EXCLUDED.priority
+            "#,
+        )
+        .bind(virtual_repo_id)
+        .bind(&member_ids)
+        .bind(&priorities)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Check if an upload of `additional_bytes` would be permitted under the
     /// repository's storage quota.
     ///
@@ -3913,6 +4077,292 @@ mod tests {
             assert_eq!(usage, 3_500, "artifacts + proxy catalog only");
 
             cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Build a `create` request for a VIRTUAL repository of the given
+        /// format (the shared `make_create_req` builds a Local repo).
+        fn make_virtual_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
+            CreateRepositoryRequest {
+                repo_type: RepositoryType::Virtual,
+                ..make_create_req(suffix, format)
+            }
+        }
+
+        /// #2785 defect A: a virtual repository's displayed storage total must
+        /// equal the combined total of its member (child) repositories. The
+        /// pre-fix per-repo figure is computed from the virtual's OWN rows,
+        /// which are empty, so it reported 0 while the members held real data.
+        #[tokio::test]
+        async fn test_virtual_storage_usage_sums_members_2785() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let virt = service
+                .create(make_virtual_req(
+                    &format!("{suffix}v"),
+                    RepositoryFormat::Docker,
+                ))
+                .await
+                .expect("create virtual");
+            let m1 = service
+                .create(make_create_req(
+                    &format!("{suffix}m1"),
+                    RepositoryFormat::Docker,
+                ))
+                .await
+                .expect("create m1");
+            let m2 = service
+                .create(make_create_req(
+                    &format!("{suffix}m2"),
+                    RepositoryFormat::Docker,
+                ))
+                .await
+                .expect("create m2");
+
+            // m1: a manifest artifact (700) + a 500k layer. m2: a 250k layer.
+            insert_artifact(
+                &pool,
+                m1.id,
+                "img/manifests/1.0",
+                "oci-manifests/sha256:aa",
+                700,
+            )
+            .await;
+            insert_oci_blob(
+                &pool,
+                m1.id,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                500_000,
+            )
+            .await;
+            insert_oci_blob(
+                &pool,
+                m2.id,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                250_000,
+            )
+            .await;
+
+            service
+                .add_virtual_member(virt.id, m1.id, Some(1))
+                .await
+                .expect("add m1");
+            service
+                .add_virtual_member(virt.id, m2.id, Some(2))
+                .await
+                .expect("add m2");
+
+            let m1_usage = service.get_storage_usage(m1.id).await.expect("m1 usage");
+            let m2_usage = service.get_storage_usage(m2.id).await.expect("m2 usage");
+            assert_eq!(m1_usage, 500_700);
+            assert_eq!(m2_usage, 250_000);
+
+            // Pre-fix behaviour the customer saw: the virtual owns no artifact
+            // rows, so the plain per-repo figure is 0 despite the members
+            // holding 750,700 bytes of resolvable content.
+            assert_eq!(
+                service.get_storage_usage(virt.id).await.expect("virt own"),
+                0,
+                "virtual repo owns no artifact/blob rows of its own"
+            );
+
+            // Fix: the combined figure equals the sum of the members, and the
+            // display helper routes a virtual repo through that union.
+            let combined = service
+                .get_virtual_storage_usage(virt.id)
+                .await
+                .expect("virtual combined");
+            assert_eq!(
+                combined,
+                m1_usage + m2_usage,
+                "virtual total = sum of members"
+            );
+            assert_eq!(
+                service
+                    .get_display_storage_usage(&virt)
+                    .await
+                    .expect("display"),
+                combined,
+                "display helper unions members for a virtual repo"
+            );
+            // A non-virtual repo keeps its own per-repo figure via the helper.
+            assert_eq!(
+                service
+                    .get_display_storage_usage(&m1)
+                    .await
+                    .expect("display m1"),
+                m1_usage
+            );
+
+            cleanup_repo(&pool, virt.id).await;
+            cleanup_repo(&pool, m1.id).await;
+            cleanup_repo(&pool, m2.id).await;
+        }
+
+        /// #2785 defect A (union semantics): a leaf repository reachable through
+        /// more than one path in a nested membership graph is counted ONCE, and
+        /// nested virtual members contribute their own leaves.
+        #[tokio::test]
+        async fn test_virtual_storage_usage_dedups_diamond_2785() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            // leaf B holds 1000 bytes; A is a virtual containing B; V is a
+            // virtual containing BOTH A and B (a diamond: V -> A -> B, V -> B).
+            let leaf = service
+                .create(make_create_req(
+                    &format!("{suffix}b"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf");
+            let a = service
+                .create(make_virtual_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let v = service
+                .create(make_virtual_req(
+                    &format!("{suffix}v"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create v");
+
+            insert_artifact(
+                &pool,
+                leaf.id,
+                "pkg/1",
+                &format!("cas/ab/cd/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+
+            service
+                .add_virtual_member(a.id, leaf.id, Some(1))
+                .await
+                .expect("a->b");
+            service
+                .add_virtual_member(v.id, a.id, Some(1))
+                .await
+                .expect("v->a");
+            service
+                .add_virtual_member(v.id, leaf.id, Some(2))
+                .await
+                .expect("v->b");
+
+            // B counted once despite two reachable paths.
+            assert_eq!(
+                service
+                    .get_virtual_storage_usage(v.id)
+                    .await
+                    .expect("v combined"),
+                1_000,
+                "leaf reachable via two paths counts once (union)"
+            );
+
+            cleanup_repo(&pool, v.id).await;
+            cleanup_repo(&pool, a.id).await;
+            cleanup_repo(&pool, leaf.id).await;
+        }
+
+        /// #2785 defect B: a virtual repository's member list is editable after
+        /// creation — `set_virtual_members` adds, removes, and reorders members
+        /// to match exactly the supplied set (the pre-fix PUT endpoint only
+        /// reordered members that already existed).
+        #[tokio::test]
+        async fn test_set_virtual_members_edits_after_create_2785() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let virt = service
+                .create(make_virtual_req(
+                    &format!("{suffix}v"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create virtual");
+            let a = service
+                .create(make_create_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let b = service
+                .create(make_create_req(
+                    &format!("{suffix}b"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create b");
+            let c = service
+                .create(make_create_req(
+                    &format!("{suffix}c"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create c");
+
+            // Created with member A only.
+            service
+                .add_virtual_member(virt.id, a.id, Some(1))
+                .await
+                .expect("add a");
+
+            let ids = |repos: &[Repository]| repos.iter().map(|r| r.id).collect::<Vec<_>>();
+
+            // Edit: add B and reprioritise A. get_virtual_members orders by priority.
+            service
+                .set_virtual_members(virt.id, &[(a.id, 5), (b.id, 2)])
+                .await
+                .expect("reconcile add");
+            assert_eq!(
+                ids(&service.get_virtual_members(virt.id).await.expect("list")),
+                vec![b.id, a.id],
+                "B (prio 2) then A (prio 5) after add + reprioritise"
+            );
+
+            // Edit: replace the whole set with C only (removes A and B).
+            service
+                .set_virtual_members(virt.id, &[(c.id, 1)])
+                .await
+                .expect("reconcile replace");
+            assert_eq!(
+                ids(&service.get_virtual_members(virt.id).await.expect("list")),
+                vec![c.id],
+                "membership replaced with exactly {{C}}"
+            );
+
+            // Edit: empty set clears every member.
+            service
+                .set_virtual_members(virt.id, &[])
+                .await
+                .expect("reconcile empty");
+            assert!(
+                service
+                    .get_virtual_members(virt.id)
+                    .await
+                    .expect("list")
+                    .is_empty(),
+                "empty desired set clears membership"
+            );
+
+            cleanup_repo(&pool, virt.id).await;
+            cleanup_repo(&pool, a.id).await;
+            cleanup_repo(&pool, b.id).await;
+            cleanup_repo(&pool, c.id).await;
         }
     }
 }
