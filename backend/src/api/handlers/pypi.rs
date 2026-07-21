@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,6 +27,7 @@ use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
 
+use crate::api::handlers::cache_headers;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -527,11 +528,11 @@ fn build_simple_root_response(
                 serde_json::json!({ "name": p })
             }).collect::<Vec<_>>()
         });
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/vnd.pypi.simple.v1+json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+        return Ok(cache_headers::cacheable_response(
+            serde_json::to_vec(&json).unwrap(),
+            "application/vnd.pypi.simple.v1+json",
+            headers,
+        ));
     }
 
     // HTML response (default).
@@ -546,9 +547,22 @@ fn build_simple_root_response(
     // anchor-rendering rules have pure unit coverage (B8).
     let html = PypiHandler::render_simple_root_html(repo_key, packages);
 
+    // Serve with ETag + Cache-Control so clients can revalidate cheaply, but
+    // keep the security headers this endpoint sets — `cacheable_response`
+    // builds a fresh response with only the cache headers, so the CSP and
+    // nosniff guarantees would be lost if we delegated to it here. Reuse the
+    // shared ETag/conditional helpers and re-emit everything on the 200 path.
+    let etag = cache_headers::compute_etag(html.as_bytes());
+    if let Some(not_modified) = cache_headers::check_conditional_request(headers, &etag) {
+        return Ok(not_modified);
+    }
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(CONTENT_LENGTH, html.len().to_string())
+        .header(ETAG, &etag)
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
         // pip/uv only consume the link list; deny everything else so a
         // hypothetical injection cannot exfiltrate cookies or load images.
         .header(
@@ -693,16 +707,16 @@ async fn simple_project(
                             json,
                         )
                         .await;
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
-                            .body(Body::from(json))
-                            .unwrap());
+                        return Ok(cache_headers::cacheable_response(
+                            json.into_bytes(),
+                            PEP691_JSON_CONTENT_TYPE,
+                            &headers,
+                        ));
                     }
                 }
 
                 // Rewrite absolute download URLs to route through our proxy
-                let body = if ct.contains("text/html") {
+                let body_bytes: Vec<u8> = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                     let rewritten = filter_pypi_simple_html_response(
@@ -713,16 +727,12 @@ async fn simple_project(
                         rewritten,
                     )
                     .await;
-                    Body::from(rewritten)
+                    rewritten.into_bytes()
                 } else {
-                    Body::from(content)
+                    content.to_vec()
                 };
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .body(body)
-                    .unwrap());
+                return Ok(cache_headers::cacheable_response(body_bytes, &ct, &headers));
             }
         }
         // For virtual repos, iterate through ALL members and union their
@@ -963,15 +973,15 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         ) {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
-                                .body(Body::from(json))
-                                .unwrap());
+                            return Ok(cache_headers::cacheable_response(
+                                json.into_bytes(),
+                                PEP691_JSON_CONTENT_TYPE,
+                                &headers,
+                            ));
                         }
                     }
 
-                    let body = if ct.contains("text/html") {
+                    let body_bytes: Vec<u8> = if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                         let merged = merge_local_into_remote_simple_html(
@@ -981,16 +991,12 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         );
-                        Body::from(merged)
+                        merged.into_bytes()
                     } else {
-                        Body::from(content)
+                        content.to_vec()
                     };
 
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, ct)
-                        .body(body)
-                        .unwrap());
+                    return Ok(cache_headers::cacheable_response(body_bytes, &ct, &headers));
                 }
             }
         }
@@ -1082,11 +1088,11 @@ fn build_simple_project_response(
             "files": files,
         });
 
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/vnd.pypi.simple.v1+json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+        return Ok(cache_headers::cacheable_response(
+            serde_json::to_vec(&json).unwrap(),
+            "application/vnd.pypi.simple.v1+json",
+            headers,
+        ));
     }
 
     // HTML response
@@ -1136,11 +1142,11 @@ fn build_simple_project_response(
 
     html.push_str("</body>\n</html>\n");
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(html))
-        .unwrap())
+    Ok(cache_headers::cacheable_response(
+        html.into_bytes(),
+        "text/html; charset=utf-8",
+        headers,
+    ))
 }
 
 /// Splice local-member entries into a remote-member PEP 503 HTML response so
@@ -7282,5 +7288,98 @@ mod tests {
             result.is_none(),
             "cache miss must yield None, not Some(result)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP caching on the simple index (ETag + If-None-Match -> 304)
+    // -----------------------------------------------------------------------
+
+    fn sample_artifact() -> SimpleProjectArtifact {
+        SimpleProjectArtifact {
+            path: "flask/3.0.0/flask-3.0.0-py3-none-any.whl".to_string(),
+            version: Some("3.0.0".to_string()),
+            size_bytes: 123,
+            checksum_sha256: "abc123".to_string(),
+            metadata: None,
+            upload_time: None,
+        }
+    }
+
+    fn headers_accept(accept: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("accept", axum::http::HeaderValue::from_str(accept).unwrap());
+        h
+    }
+
+    fn etag_of(resp: &Response) -> String {
+        resp.headers()
+            .get(ETAG)
+            .expect("index response must carry an ETag")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn simple_project_response_emits_etag_and_cache_control() {
+        for accept in ["", "application/vnd.pypi.simple.v1+json"] {
+            let arts = [sample_artifact()];
+            let resp =
+                build_simple_project_response(&headers_accept(accept), "pypi", "flask", &arts, &[])
+                    .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "accept={accept:?}");
+            assert!(resp.headers().get(ETAG).is_some(), "accept={accept:?}");
+            assert_eq!(
+                resp.headers().get(CACHE_CONTROL).unwrap(),
+                cache_headers::DEFAULT_CACHE_CONTROL,
+                "accept={accept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_project_response_304_on_matching_if_none_match() {
+        for accept in ["", "application/vnd.pypi.simple.v1+json"] {
+            let arts = [sample_artifact()];
+            let first =
+                build_simple_project_response(&headers_accept(accept), "pypi", "flask", &arts, &[])
+                    .unwrap();
+            let etag = etag_of(&first);
+
+            let mut h = headers_accept(accept);
+            h.insert(
+                axum::http::header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_str(&etag).unwrap(),
+            );
+            let second = build_simple_project_response(&h, "pypi", "flask", &arts, &[]).unwrap();
+            assert_eq!(
+                second.status(),
+                StatusCode::NOT_MODIFIED,
+                "accept={accept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_root_response_304_on_match_and_keeps_csp() {
+        let packages = ["flask".to_string(), "requests".to_string()];
+
+        // 200 path re-emits the CSP / nosniff guarantees alongside the ETag.
+        let first = build_simple_root_response(&headers_accept(""), "pypi", &packages).unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get("Content-Security-Policy").is_some());
+        assert_eq!(
+            first.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+        let etag = etag_of(&first);
+
+        let mut h = headers_accept("");
+        h.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_str(&etag).unwrap(),
+        );
+        let second = build_simple_root_response(&h, "pypi", &packages).unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
     }
 }
