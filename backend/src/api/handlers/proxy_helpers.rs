@@ -7475,6 +7475,7 @@ mod tests {
                 demo_mode: false,
                 guest_access_enabled: true,
                 expose_detailed_health: false,
+                setup_password_hint: None,
                 grpc_reflection_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
