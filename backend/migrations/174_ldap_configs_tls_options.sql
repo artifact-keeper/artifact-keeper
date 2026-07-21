@@ -21,9 +21,6 @@
 -- `insecure_skip_verify OR LDAP_INSECURE_TLS`, and the inline `ca_certificate`
 -- takes precedence over the env-configured CA path when both are present.
 --
--- NOTE: on `main` this migration is numbered 174; on the release/1.6.x line it
--- is renumbered to 169 (the next contiguous number after 168) — same DDL.
---
 -- Reversible: DROP COLUMN restores the pre-#2782 shape.
 ALTER TABLE ldap_configs
     ADD COLUMN IF NOT EXISTS insecure_skip_verify BOOLEAN NOT NULL DEFAULT false,
