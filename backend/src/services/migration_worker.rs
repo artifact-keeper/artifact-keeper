@@ -4512,6 +4512,7 @@ mod tests {
             url: None,
             description: None,
             members: vec![],
+            upstream_url: None,
         }
     }
 

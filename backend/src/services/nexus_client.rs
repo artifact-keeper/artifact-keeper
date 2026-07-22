@@ -75,6 +75,10 @@ pub struct NexusRepositorySettings {
     pub name: String,
     #[serde(default)]
     pub group: Option<NexusGroupAttributes>,
+    /// The `proxy` attributes block of a Nexus `proxy`-type repository, which
+    /// carries the upstream `remoteUrl` this repo proxies (issue #2822).
+    #[serde(default)]
+    pub proxy: Option<NexusProxyAttributes>,
 }
 
 /// The `group` attributes block of a Nexus `group`-type repository.
@@ -83,6 +87,15 @@ pub struct NexusGroupAttributes {
     /// Ordered member repository names aggregated by this group.
     #[serde(rename = "memberNames", default)]
     pub member_names: Vec<String>,
+}
+
+/// The `proxy` attributes block of a Nexus `proxy`-type repository.
+#[derive(Debug, Deserialize)]
+pub struct NexusProxyAttributes {
+    /// Upstream URL that this proxy repository mirrors. Maps onto the migrated
+    /// Artifact Keeper repo's `upstream_url` (issue #2822).
+    #[serde(rename = "remoteUrl", default)]
+    pub remote_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,25 +229,36 @@ impl NexusClient {
                 url: r.url,
                 description: None,
                 members: vec![],
+                upstream_url: None,
             })
             .collect();
 
-        // The browse list above does not carry group membership, so `group`
-        // repos would migrate to Artifact Keeper `virtual` repos with zero
-        // members. Enrich them from the settings endpoint, which reports each
-        // group's ordered `memberNames` (issue #2783). Best-effort: if the
+        // The browse list above does not carry group membership or a proxy
+        // repo's upstream URL, so `group` repos would migrate to Artifact Keeper
+        // `virtual` repos with zero members (issue #2783) and `proxy` repos
+        // (≡ AK `remote`) would migrate with a NULL `upstream_url` and be
+        // rejected by the `check_upstream_url` constraint (issue #2822). Enrich
+        // both from the settings endpoint, which reports each group's ordered
+        // `memberNames` and each proxy's `proxy.remoteUrl`. Best-effort: if the
         // settings endpoint is unavailable (older Nexus, restricted token), we
-        // fall back to no members rather than failing the whole listing.
-        if items.iter().any(|i| i.repo_type == "group") {
+        // fall back to no enrichment rather than failing the whole listing.
+        if items
+            .iter()
+            .any(|i| i.repo_type == "group" || i.repo_type == "proxy")
+        {
             match self
                 .get::<Vec<NexusRepositorySettings>>("/service/rest/v1/repositorySettings")
                 .await
             {
-                Ok(settings) => Self::apply_group_members(&mut items, settings),
+                Ok(settings) => {
+                    Self::apply_group_members(&mut items, &settings);
+                    Self::apply_proxy_upstreams(&mut items, &settings);
+                }
                 Err(e) => {
                     tracing::warn!(
-                        "Could not fetch Nexus repository settings to resolve group members; \
-                         migrated virtual repos may have no members: {}",
+                        "Could not fetch Nexus repository settings to resolve group members / \
+                         proxy upstreams; migrated virtual repos may have no members and \
+                         migrated proxy repos may be skipped: {}",
                         e
                     );
                 }
@@ -247,20 +271,45 @@ impl NexusClient {
     /// Copy each Nexus `group` repo's ordered `memberNames` onto the matching
     /// `RepositoryListItem`. Factored out (pure, no I/O) so the group→member
     /// correlation can be unit-tested without a live Nexus (issue #2783).
-    fn apply_group_members(
-        items: &mut [RepositoryListItem],
-        settings: Vec<NexusRepositorySettings>,
-    ) {
+    fn apply_group_members(items: &mut [RepositoryListItem], settings: &[NexusRepositorySettings]) {
         use std::collections::HashMap;
-        let mut members_by_name: HashMap<String, Vec<String>> = settings
-            .into_iter()
-            .filter_map(|s| s.group.map(|g| (s.name, g.member_names)))
+        let members_by_name: HashMap<&str, &Vec<String>> = settings
+            .iter()
+            .filter_map(|s| s.group.as_ref().map(|g| (s.name.as_str(), &g.member_names)))
             .collect();
 
         for item in items.iter_mut() {
             if item.repo_type == "group" {
-                if let Some(members) = members_by_name.remove(&item.key) {
-                    item.members = members;
+                if let Some(members) = members_by_name.get(item.key.as_str()) {
+                    item.members = (*members).clone();
+                }
+            }
+        }
+    }
+
+    /// Copy each Nexus `proxy` repo's `proxy.remoteUrl` onto the matching
+    /// `RepositoryListItem`'s `upstream_url`. Mirrors `apply_group_members`
+    /// (pure, no I/O) so the correlation can be unit-tested without a live
+    /// Nexus (issue #2822).
+    fn apply_proxy_upstreams(
+        items: &mut [RepositoryListItem],
+        settings: &[NexusRepositorySettings],
+    ) {
+        use std::collections::HashMap;
+        let upstreams_by_name: HashMap<&str, &str> = settings
+            .iter()
+            .filter_map(|s| {
+                s.proxy
+                    .as_ref()
+                    .and_then(|p| p.remote_url.as_deref())
+                    .map(|u| (s.name.as_str(), u))
+            })
+            .collect();
+
+        for item in items.iter_mut() {
+            if item.repo_type == "proxy" {
+                if let Some(url) = upstreams_by_name.get(item.key.as_str()) {
+                    item.upstream_url = Some((*url).to_string());
                 }
             }
         }
@@ -588,6 +637,7 @@ mod tests {
                 url: None,
                 description: None,
                 members: vec![],
+                upstream_url: None,
             },
             RepositoryListItem {
                 key: "maven-public".into(),
@@ -596,6 +646,7 @@ mod tests {
                 url: None,
                 description: None,
                 members: vec![],
+                upstream_url: None,
             },
         ];
 
@@ -609,7 +660,7 @@ mod tests {
         )
         .unwrap();
 
-        NexusClient::apply_group_members(&mut items, settings);
+        NexusClient::apply_group_members(&mut items, &settings);
 
         // The hosted repo is untouched; the group repo carries its members in
         // the source-declared order (which becomes virtual-member priority).
@@ -617,6 +668,91 @@ mod tests {
         assert_eq!(
             items[1].members,
             vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_nexus_repository_settings_deserializes_proxy_remote_url_2822() {
+        // A `proxy` repo's settings carry the upstream at `proxy.remoteUrl`.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-central","format":"maven2","type":"proxy",
+                 "proxy":{"remoteUrl":"https://repo1.maven.org/maven2/"}}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(
+            settings[0]
+                .proxy
+                .as_ref()
+                .and_then(|p| p.remote_url.as_deref()),
+            Some("https://repo1.maven.org/maven2/"),
+        );
+        // The new optional `proxy` field must not disturb group parsing.
+        assert!(settings[0].group.is_none());
+    }
+
+    #[test]
+    fn test_group_parsing_unaffected_by_new_proxy_field_2822() {
+        // A group repo (no `proxy` block) still deserializes and its
+        // memberNames are parsed as before.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-public","format":"maven2","type":"group",
+                 "group":{"memberNames":["maven-releases","maven-central"]}}
+            ]"#,
+        )
+        .unwrap();
+        assert!(settings[0].proxy.is_none());
+        assert_eq!(
+            settings[0].group.as_ref().unwrap().member_names,
+            vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_apply_proxy_upstreams_copies_remote_url_onto_proxy_repos_2822() {
+        // Proxy repos get their `proxy.remoteUrl` as `upstream_url`; non-proxy
+        // repos and proxies absent from settings keep a `None` upstream.
+        let mut items = vec![
+            RepositoryListItem {
+                key: "maven-releases".into(),
+                repo_type: "hosted".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+            RepositoryListItem {
+                key: "maven-central".into(),
+                repo_type: "proxy".into(),
+                package_type: "maven2".into(),
+                // The browse `url` is the repo's own Nexus URL, NOT the upstream.
+                url: Some("https://nexus.example.com/repository/maven-central/".into()),
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+        ];
+
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-releases","format":"maven2","type":"hosted"},
+                {"name":"maven-central","format":"maven2","type":"proxy",
+                 "proxy":{"remoteUrl":"https://repo1.maven.org/maven2/"}}
+            ]"#,
+        )
+        .unwrap();
+
+        NexusClient::apply_proxy_upstreams(&mut items, &settings);
+
+        // The hosted repo is untouched; the proxy repo carries the upstream.
+        assert!(items[0].upstream_url.is_none());
+        assert_eq!(
+            items[1].upstream_url,
+            Some("https://repo1.maven.org/maven2/".to_string()),
         );
     }
 
