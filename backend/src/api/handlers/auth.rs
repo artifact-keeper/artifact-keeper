@@ -108,6 +108,12 @@ pub fn setup_router() -> Router<SharedState> {
 pub struct SetupStatusResponse {
     /// Whether the initial admin password change is still required.
     pub setup_required: bool,
+    /// Optional deployment-aware instruction for retrieving the generated
+    /// initial admin password, sourced from the `SETUP_PASSWORD_HINT` env var.
+    /// Present only when an operator has configured it; when absent, the web UI
+    /// falls back to its built-in Docker Compose instruction (#2802).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_password_hint: Option<String>,
 }
 
 /// Returns whether initial setup (password change) is required.
@@ -126,9 +132,15 @@ pub async fn setup_status(State(state): State<SharedState>) -> Json<serde_json::
     // endpoint is what the web UI uses to decide whether to show the
     // first-time-setup flow (#2492). `setup_still_required` latches the
     // process-local flag to false once the DB confirms completion.
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "setup_required": state.setup_still_required().await
-    }))
+    });
+    // Surface the operator-configured retrieval hint only when set, so the
+    // absent case leaves the web UI on its built-in default text (#2802).
+    if let Some(hint) = &state.config.setup_password_hint {
+        body["setup_password_hint"] = serde_json::Value::String(hint.clone());
+    }
+    Json(body)
 }
 
 /// Create protected auth routes (auth required)
@@ -1307,18 +1319,41 @@ mod tests {
     fn test_setup_status_response_serialize() {
         let resp = SetupStatusResponse {
             setup_required: true,
+            setup_password_hint: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["setup_required"], true);
+        // When no hint is configured the field is omitted entirely, so the web
+        // UI falls back to its built-in default instruction (#2802).
+        assert!(json.get("setup_password_hint").is_none());
     }
 
     #[test]
     fn test_setup_status_response_serialize_not_required() {
         let resp = SetupStatusResponse {
             setup_required: false,
+            setup_password_hint: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["setup_required"], false);
+    }
+
+    #[test]
+    fn test_setup_status_response_serialize_with_hint() {
+        // Issue #2802: an operator-configured hint is serialized verbatim so
+        // the setup screen can render a deployment-appropriate instruction.
+        let resp = SetupStatusResponse {
+            setup_required: true,
+            setup_password_hint: Some(
+                "kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password".into(),
+            ),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["setup_required"], true);
+        assert_eq!(
+            json["setup_password_hint"],
+            "kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password"
+        );
     }
 
     // -----------------------------------------------------------------------

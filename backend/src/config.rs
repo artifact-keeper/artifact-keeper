@@ -275,6 +275,15 @@ pub struct Config {
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
 
+    /// Optional operator-supplied instruction for retrieving the generated
+    /// initial admin password, shown on the first-time-setup login screen. The
+    /// default screen text assumes a Docker Compose deployment
+    /// (`docker exec ... cat .../admin.password`), which is wrong for
+    /// Kubernetes and packaged installs. When set, the web UI renders this
+    /// string in place of the default instruction; when unset (the default),
+    /// the existing built-in text is shown unchanged. Env `SETUP_PASSWORD_HINT`.
+    pub setup_password_hint: Option<String>,
+
     /// When true, the gRPC server registers the tonic server-reflection
     /// service, which lets clients enumerate the full service catalog, every
     /// RPC method, and message schemas without authentication. Reflection is
@@ -743,6 +752,7 @@ redacted_debug!(Config {
     show demo_mode,
     show guest_access_enabled,
     show expose_detailed_health,
+    show setup_password_hint,
     show grpc_reflection_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
@@ -854,6 +864,7 @@ impl Default for Config {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -1014,6 +1025,14 @@ impl Config {
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
             ),
+            // Deployment-aware first-run instruction (#2802): the default
+            // setup screen text assumes Docker Compose. Operators on
+            // Kubernetes or packaged installs can override it here. Empty or
+            // unset leaves the built-in default in place.
+            setup_password_hint: env::var("SETUP_PASSWORD_HINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             // Info-disclosure hardening (#2226): gRPC server reflection exposes
             // the whole service catalog + schemas to unauthenticated peers, so
             // it is OFF unless explicitly enabled (dev/CI grpcurl tooling).
@@ -2267,6 +2286,55 @@ mod tests {
             env::set_var("AK_GUEST_ACCESS_ENABLED", v);
         } else {
             env::remove_var("AK_GUEST_ACCESS_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_config_setup_password_hint() {
+        // Issue #2802: the first-run password retrieval hint is opt-in. Unset
+        // (and blank/whitespace-only) values must leave it as None so the web
+        // UI keeps its built-in default text; a real value is trimmed and
+        // passed through verbatim.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_hint = env::var("SETUP_PASSWORD_HINT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Unset -> None (default behavior unchanged).
+        env::remove_var("SETUP_PASSWORD_HINT");
+        assert_eq!(Config::from_env().unwrap().setup_password_hint, None);
+
+        // Blank / whitespace-only -> None.
+        env::set_var("SETUP_PASSWORD_HINT", "   ");
+        assert_eq!(Config::from_env().unwrap().setup_password_hint, None);
+
+        // Real value -> Some, trimmed.
+        env::set_var(
+            "SETUP_PASSWORD_HINT",
+            "  kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password  ",
+        );
+        assert_eq!(
+            Config::from_env().unwrap().setup_password_hint.as_deref(),
+            Some("kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password"),
+        );
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_hint {
+            env::set_var("SETUP_PASSWORD_HINT", v);
+        } else {
+            env::remove_var("SETUP_PASSWORD_HINT");
         }
     }
 

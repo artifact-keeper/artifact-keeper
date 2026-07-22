@@ -49,6 +49,7 @@ A security- and correctness-hardening release closing the 1.6.0 milestone: 24 se
 - **Structured audit-log export with a published, versioned schema for SIEM ingestion** (#2413).
 - **Proxy-cache downloads are now counted correctly on first serve** (#2537).
 - **Scanner UX** — not-applicable image-family rows are collapsed in results, and `TRIVY_ADAPTER_URL` is documented in the base compose (#2471).
+- **Configurable first-run setup password hint** (#2802): the first-time-setup login screen previously hardcoded a `docker exec` instruction for retrieving the generated admin password, which is wrong on Kubernetes and packaged installs. A new optional `SETUP_PASSWORD_HINT` env var overrides that instruction, and the public `/api/v1/setup/status` response now carries the operator-supplied hint. Unset leaves the existing Docker Compose default in place.
 
 ### Fixed
 
