@@ -121,6 +121,22 @@ pub(crate) fn should_fetch_next_page(page_len: usize, limit: i64) -> bool {
     page_len >= limit_usize
 }
 
+/// Whether a resolved destination repository should have its member artifacts
+/// physically transferred from the source.
+///
+/// A virtual repository (Nexus `group`) only *aggregates* its members — it owns
+/// no bytes of its own. When the source is Nexus, the group endpoint serves the
+/// aggregated member components, so transferring against a virtual repo would
+/// download those member bytes and duplicate them into the virtual repo's
+/// storage (issue #2821, a regression of the #2783 member-correlation work).
+/// Local/Remote destinations own their artifacts and must still be transferred.
+///
+/// The repo is still provisioned and its membership still correlated; only the
+/// artifact transfer is gated.
+pub(crate) fn should_transfer_artifacts(repo_type: RepositoryType) -> bool {
+    repo_type != RepositoryType::Virtual
+}
+
 /// Conflict resolution strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictResolution {
@@ -405,6 +421,11 @@ impl MigrationWorker {
         // *after* the whole provisioning loop so every possible member repo
         // already exists, regardless of source ordering (issue #2783).
         let mut virtual_members_to_wire: Vec<(String, Vec<String>)> = Vec::new();
+        // Count repos that were successfully provisioned (reused or created),
+        // including virtual repos that are provisioned but never transferred.
+        // A group-only job therefore does not trip the "nothing to process"
+        // warning below (issue #2821).
+        let mut provisioned_repos: usize = 0;
         for migration_config in plan.resolved {
             if migration_config.repo_type == RepositoryType::Virtual
                 && !migration_config.members.is_empty()
@@ -429,6 +450,7 @@ impl MigrationWorker {
             if conflict.has_conflict {
                 match conflict.conflict_type {
                     Some(ConflictType::SameKey) => {
+                        provisioned_repos += 1;
                         tracing::info!(
                             job_id = %job_id, repo = %migration_config.target_key,
                             "Destination repository already exists with matching type+format; reusing",
@@ -469,6 +491,7 @@ impl MigrationWorker {
                     .await
                 {
                     Ok(_) => {
+                        provisioned_repos += 1;
                         tracing::info!(
                             job_id = %job_id, repo = %migration_config.target_key,
                             format = %migration_config.package_type,
@@ -487,7 +510,15 @@ impl MigrationWorker {
                 }
             }
 
-            repos_to_process.push((migration_config.target_key, migration_config.package_type));
+            // Virtual (Nexus `group`) repos aggregate their members and own no
+            // bytes; transferring against them would download the aggregated
+            // member components from the source and duplicate them into the
+            // virtual repo's storage (issue #2821). The repo has already been
+            // provisioned above and its membership is correlated below, so only
+            // the artifact transfer is skipped here.
+            if should_transfer_artifacts(migration_config.repo_type) {
+                repos_to_process.push((migration_config.target_key, migration_config.package_type));
+            }
         }
 
         // Correlate virtual (Nexus `group`) repository membership now that every
@@ -537,7 +568,7 @@ impl MigrationWorker {
         // exact UX gap reported in issue #1901 before the `include_repos: []`
         // semantics were fixed. We still let the job finish normally so the
         // existing UI/state-machine contracts hold.
-        if repos_to_process.is_empty() {
+        if repos_to_process.is_empty() && provisioned_repos == 0 {
             tracing::warn!(
                 job_id = %job_id,
                 requested = repos.len(),
@@ -2959,6 +2990,57 @@ mod tests {
         // Defensive: if the server returns more rows than requested,
         // treat it as a full page (continue fetching)
         assert!(should_fetch_next_page(200, 100));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_transfer_artifacts (#2821 virtual-repo no-transfer gate)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_transfer_artifacts_virtual_is_skipped() {
+        // A virtual (Nexus `group`) repo only aggregates its members and owns
+        // no bytes; it must never have artifacts physically transferred into
+        // it (issue #2821).
+        assert!(!should_transfer_artifacts(RepositoryType::Virtual));
+    }
+
+    #[test]
+    fn test_should_transfer_artifacts_local_and_remote_are_transferred() {
+        // Local (hosted) and Remote (proxy) destinations own their artifacts
+        // and must still be transferred.
+        assert!(should_transfer_artifacts(RepositoryType::Local));
+        assert!(should_transfer_artifacts(RepositoryType::Remote));
+    }
+
+    #[test]
+    fn test_transfer_gate_excludes_only_virtual_from_processing() {
+        // Mirror the enqueue decision in process_job: every resolved repo is
+        // provisioned, but only non-virtual repos are pushed onto the
+        // artifact-transfer worklist. A group-only job must yield an empty
+        // worklist even though its virtual repo was provisioned (issue #2821).
+        let resolved = [
+            ("local-libs", RepositoryType::Local),
+            ("remote-proxy", RepositoryType::Remote),
+            ("group-all", RepositoryType::Virtual),
+        ];
+
+        let to_process: Vec<&str> = resolved
+            .iter()
+            .filter(|(_, ty)| should_transfer_artifacts(*ty))
+            .map(|(key, _)| *key)
+            .collect();
+
+        assert_eq!(to_process, vec!["local-libs", "remote-proxy"]);
+        assert!(!to_process.contains(&"group-all"));
+
+        // A source with only a virtual (group) repo transfers nothing.
+        let group_only = [("group-all", RepositoryType::Virtual)];
+        let group_only_process: Vec<&str> = group_only
+            .iter()
+            .filter(|(_, ty)| should_transfer_artifacts(*ty))
+            .map(|(key, _)| *key)
+            .collect();
+        assert!(group_only_process.is_empty());
     }
 
     #[test]
