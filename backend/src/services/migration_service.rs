@@ -337,7 +337,13 @@ impl MigrationService {
             package_type: normalized_package_type,
             description: repo.description.clone(),
             format_compatibility,
-            upstream_url: None, // Will be set from repo_config for remote repos
+            // Thread the source-reported upstream URL through so remote/proxy
+            // repos migrate with a non-NULL `upstream_url`. Populated by the
+            // source clients (Artifactory remote-config `url` / Nexus
+            // `proxy.remoteUrl`); previously hard-coded to `None`, which made
+            // every remote repo fail the AK `check_upstream_url` constraint and
+            // get skipped (issue #2822).
+            upstream_url: repo.upstream_url.clone(),
             // Carry the source-side member keys (Nexus `group.memberNames` /
             // Artifactory virtual `repositories`) through so virtual/group repos
             // can be correlated to their migrated AK members later. Previously
@@ -455,6 +461,17 @@ impl MigrationService {
 
         let repo_type = config.repo_type.to_artifact_keeper();
 
+        // A remote repo with no resolvable upstream URL cannot satisfy the
+        // `check_upstream_url` constraint (repo_type='remote' requires a
+        // NOT-NULL upstream_url). Surface a clear config error here instead of
+        // letting the raw SQLSTATE 23514 bubble up from the INSERT (issue #2822).
+        if config.repo_type == RepositoryType::Remote && config.upstream_url.is_none() {
+            return Err(MigrationError::ConfigError(format!(
+                "remote repo {}: source did not report an upstream URL",
+                config.source_key
+            )));
+        }
+
         // The repositories table schema has no `metadata`, `display_name`, or
         // `repository_type` columns. The corresponding columns are `name` and
         // `repo_type`, and `storage_path` is NOT NULL — so the INSERT must
@@ -464,8 +481,8 @@ impl MigrationService {
             Self::build_storage_path(storage_backend, storage_base, &config.target_key);
         let repo_id: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO repositories (key, name, description, format, repo_type, storage_path, storage_backend)
-            VALUES ($1, $2, $3, $4::repository_format, $5::repository_type, $6, $7)
+            INSERT INTO repositories (key, name, description, format, repo_type, storage_path, storage_backend, upstream_url)
+            VALUES ($1, $2, $3, $4::repository_format, $5::repository_type, $6, $7, $8)
             RETURNING id
             "#,
         )
@@ -476,6 +493,7 @@ impl MigrationService {
         .bind(repo_type)
         .bind(&storage_path)
         .bind(storage_backend)
+        .bind(&config.upstream_url)
         .fetch_one(&self.db)
         .await?;
 
@@ -1494,6 +1512,113 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Remote/proxy upstream_url persistence on create_repository (issue #2822)
+    // -----------------------------------------------------------------------
+
+    /// DB-backed proof for #2822: `create_repository` persists a remote repo's
+    /// `upstream_url` (satisfying the `check_upstream_url` constraint), rejects a
+    /// remote repo with no upstream via a clear `ConfigError` (NOT a raw SQLSTATE
+    /// 23514), and still accepts a Local repo with a NULL `upstream_url`.
+    ///
+    /// Fails-before: prior to the fix the INSERT omitted `upstream_url`, so every
+    /// remote repo hit the constraint and was skipped.
+    ///
+    /// No-ops when `DATABASE_URL` is unset so it skips cleanly off-CI.
+    #[tokio::test]
+    async fn test_create_repository_persists_remote_upstream_url_2822() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = MigrationService::new(pool.clone());
+        let sfx = uuid::Uuid::new_v4().simple().to_string();
+
+        // Remote repo WITH an upstream URL: created, and the row carries it.
+        let rkey = format!("remote-{sfx}");
+        let cfg = RepositoryMigrationConfig {
+            source_key: rkey.clone(),
+            target_key: rkey.clone(),
+            repo_type: RepositoryType::Remote,
+            package_type: "maven".to_string(),
+            description: None,
+            format_compatibility: FormatCompatibility::Full,
+            upstream_url: Some("https://repo1.maven.org/maven2/".to_string()),
+            members: vec![],
+        };
+        let id = svc
+            .create_repository(&cfg, "/staging", "filesystem")
+            .await
+            .expect("remote repo with upstream_url should be created");
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT upstream_url FROM repositories WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read upstream_url");
+        assert_eq!(row.0, Some("https://repo1.maven.org/maven2/".to_string()));
+
+        // Remote repo WITHOUT an upstream URL: a clear ConfigError, not a 23514.
+        let rkey_bad = format!("remote-bad-{sfx}");
+        let cfg_bad = RepositoryMigrationConfig {
+            source_key: rkey_bad.clone(),
+            target_key: rkey_bad.clone(),
+            repo_type: RepositoryType::Remote,
+            package_type: "maven".to_string(),
+            description: None,
+            format_compatibility: FormatCompatibility::Full,
+            upstream_url: None,
+            members: vec![],
+        };
+        let err = svc
+            .create_repository(&cfg_bad, "/staging", "filesystem")
+            .await
+            .expect_err("remote repo without upstream_url must be rejected");
+        match err {
+            MigrationError::ConfigError(msg) => {
+                assert!(msg.contains(&rkey_bad), "error names the repo: {msg}");
+                assert!(
+                    msg.contains("upstream URL"),
+                    "error explains the cause: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&rkey_bad)
+            .fetch_one(&pool)
+            .await
+            .expect("count bad repo");
+        assert_eq!(count.0, 0, "rejected remote repo is not persisted");
+
+        // A Local repo with a NULL upstream_url remains constraint-legal.
+        let lkey = format!("local-{sfx}");
+        let cfg_local = RepositoryMigrationConfig {
+            source_key: lkey.clone(),
+            target_key: lkey.clone(),
+            repo_type: RepositoryType::Local,
+            package_type: "maven".to_string(),
+            description: None,
+            format_compatibility: FormatCompatibility::Full,
+            upstream_url: None,
+            members: vec![],
+        };
+        let lid = svc
+            .create_repository(&cfg_local, "/staging", "filesystem")
+            .await
+            .expect("local repo with NULL upstream_url should be created");
+
+        for id in [id, lid] {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // storage_path convention for auto-provisioned repos (#2336, #2025)
     // -----------------------------------------------------------------------
 
@@ -1719,6 +1844,7 @@ mod tests {
             url: None,
             description: None,
             members: vec![],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "debian");
@@ -1742,6 +1868,7 @@ mod tests {
             url: None,
             description: None,
             members: vec![],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "maven");
@@ -1757,6 +1884,7 @@ mod tests {
             url: None,
             description: None,
             members: vec![],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "rpm");
@@ -1772,6 +1900,7 @@ mod tests {
             url: None,
             description: None,
             members: vec![],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "generic");
@@ -1789,10 +1918,34 @@ mod tests {
             url: Some("https://repo1.maven.org/maven2/".to_string()),
             description: None,
             members: vec![],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.repo_type, RepositoryType::Remote);
         assert_eq!(config.package_type, "maven");
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_threads_upstream_url_2822() {
+        // A remote/proxy source repo's `upstream_url` must be threaded into the
+        // migration config so `create_repository` can persist it and satisfy the
+        // `check_upstream_url` constraint (issue #2822). Previously the field was
+        // hard-coded to `None`, so every remote repo was skipped.
+        let repo = RepositoryListItem {
+            key: "docker-proxy".to_string(),
+            repo_type: "proxy".to_string(),
+            package_type: "docker".to_string(),
+            url: Some("https://nexus.example.com/repository/docker-proxy/".to_string()),
+            description: None,
+            members: vec![],
+            upstream_url: Some("https://registry-1.docker.io/".to_string()),
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.repo_type, RepositoryType::Remote);
+        assert_eq!(
+            config.upstream_url,
+            Some("https://registry-1.docker.io/".to_string()),
+        );
     }
 
     #[test]
@@ -1806,6 +1959,7 @@ mod tests {
             url: None,
             description: None,
             members: vec!["maven-releases".to_string(), "maven-central".to_string()],
+            upstream_url: None,
         };
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.repo_type, RepositoryType::Virtual);
@@ -2448,6 +2602,7 @@ mod tests {
             description: Some("Maven releases".to_string()),
             url: Some("http://artifactory/libs-release-local".to_string()),
             members: vec![],
+            upstream_url: None,
         };
 
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
@@ -2472,6 +2627,7 @@ mod tests {
             description: None,
             url: Some("http://artifactory/conan-local".to_string()),
             members: vec![],
+            upstream_url: None,
         };
 
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
@@ -2489,6 +2645,7 @@ mod tests {
             description: None,
             url: Some("http://artifactory/unknown-repo".to_string()),
             members: vec![],
+            upstream_url: None,
         };
 
         let result = MigrationService::prepare_repository_migration(&repo, None);

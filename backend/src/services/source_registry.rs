@@ -268,6 +268,7 @@ mod tests {
                 url: Some("http://localhost/libs-release".to_string()),
                 description: Some("Release repo".to_string()),
                 members: vec![],
+                upstream_url: None,
             }])
         }
 
