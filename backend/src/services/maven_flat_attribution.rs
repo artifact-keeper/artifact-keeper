@@ -61,6 +61,12 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
 /// `files[]` array lists this key (legacy GAV-grouped uploads whose companion
 /// files have no row of their own), restricted to repositories on `$2`. LIMIT 2
 /// for the same ambiguity test.
+///
+/// The GAV-grouped upload handler has always serialized `files[]` entries with
+/// camelCase keys (`"storageKey"`, since #418) -- matching on snake_case
+/// `storage_key` alone never hits real data, which silently disabled this
+/// whole layer (and migration 163's `metadata_files` backfill). COALESCE
+/// accepts both spellings so any hand-repaired snake_case rows keep working.
 const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      FROM artifact_metadata am \
      JOIN artifacts a ON a.id = am.artifact_id \
@@ -70,7 +76,7 @@ const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
        AND jsonb_typeof(am.metadata->'files') = 'array' \
        AND EXISTS ( \
          SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
-         WHERE f->>'storage_key' = $1) \
+         WHERE COALESCE(f->>'storageKey', f->>'storage_key') = $1) \
      LIMIT 2";
 
 /// The attribution table (backfilled legacy keys + write-time claims). The
@@ -903,5 +909,131 @@ mod tests {
                 .await
                 .ok();
         }
+    }
+
+    /// Seed a parent artifact plus an `artifact_metadata` row whose `files[]`
+    /// lists a row-less companion under the given JSON key spelling.
+    async fn seed_parent_with_files_entry(
+        pool: &PgPool,
+        repo_id: Uuid,
+        parent_path: &str,
+        parent_key: &str,
+        json_key_name: &str,
+        companion_key: &str,
+    ) {
+        let parent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(parent_path)
+        .bind(parent_path)
+        .bind("0".repeat(64))
+        .bind(parent_key)
+        .fetch_one(pool)
+        .await
+        .expect("seed parent artifact");
+        let files = serde_json::json!([{ json_key_name: companion_key }]);
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'maven', jsonb_build_object('files', $2::jsonb))",
+        )
+        .bind(parent_id)
+        .bind(files)
+        .execute(pool)
+        .await
+        .expect("seed artifact_metadata");
+    }
+
+    /// Regression for the `files[]` key-casing mismatch: the GAV-grouped upload
+    /// handler has always written camelCase `"storageKey"` entries (#418), but
+    /// the metadata-files owner lookup matched snake_case `'storage_key'` only
+    /// -- so the layer NEVER matched real data and every legacy row-less
+    /// companion (`.pom`/`.module`/`-sources.jar` of a GAV-grouped upload)
+    /// failed closed on cloud backends.
+    ///
+    /// This test FAILS on the pre-fix SQL (attributed_owner returns None for a
+    /// camelCase entry) and PASSES with the COALESCE fix.
+    #[tokio::test]
+    async fn test_attributed_owner_from_metadata_files_camelcase() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo, "s3").await;
+        let gav = Uuid::new_v4();
+        let parent_key = format!("maven/com/acme/camel/{gav}/camel-1.0.jar");
+        let companion_key = format!("maven/com/acme/camel/{gav}/camel-1.0.pom");
+        seed_parent_with_files_entry(
+            &pool,
+            repo,
+            "com/acme/camel/1.0/camel-1.0.jar",
+            &parent_key,
+            "storageKey", // what the upload handler actually writes
+            &companion_key,
+        )
+        .await;
+
+        // The row-less companion attributes to the parent's repository...
+        assert_eq!(
+            attributed_owner(&pool, "s3", &companion_key)
+                .await
+                .expect("query"),
+            Some(repo),
+            "camelCase files[] entry must attribute the companion to its parent's repo"
+        );
+        // ...and is readable by that repository (this is what 404'd pre-fix).
+        assert!(
+            flat_key_readable(&pool, repo, "s3", &companion_key).await,
+            "owner must read its own row-less companion"
+        );
+        // Derived checksum sidecars inherit the companion's owner.
+        assert_eq!(
+            attributed_owner(&pool, "s3", &format!("{companion_key}.sha1"))
+                .await
+                .expect("query"),
+            Some(repo)
+        );
+        // A foreign repository still cannot read it (isolation unchanged).
+        let (foreign, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, foreign, "s3").await;
+        assert!(!flat_key_readable(&pool, foreign, "s3", &companion_key).await);
+
+        tdh::cleanup(&pool, foreign, Uuid::nil()).await;
+        tdh::cleanup(&pool, repo, Uuid::nil()).await;
+    }
+
+    /// Snake_case entries (hand-repaired rows, or data written by an external
+    /// importer following the migration's spelling) keep working -- COALESCE
+    /// accepts both spellings.
+    #[tokio::test]
+    async fn test_attributed_owner_from_metadata_files_snake_case() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        set_repo_backend(&pool, repo, "s3").await;
+        let gav = Uuid::new_v4();
+        let parent_key = format!("maven/com/acme/snake/{gav}/snake-1.0.jar");
+        let companion_key = format!("maven/com/acme/snake/{gav}/snake-1.0.pom");
+        seed_parent_with_files_entry(
+            &pool,
+            repo,
+            "com/acme/snake/1.0/snake-1.0.jar",
+            &parent_key,
+            "storage_key",
+            &companion_key,
+        )
+        .await;
+        assert_eq!(
+            attributed_owner(&pool, "s3", &companion_key)
+                .await
+                .expect("query"),
+            Some(repo),
+            "snake_case files[] entry must keep attributing after the fix"
+        );
+        tdh::cleanup(&pool, repo, Uuid::nil()).await;
     }
 }
