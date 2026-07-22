@@ -20,8 +20,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1978,35 +1976,103 @@ fn write_admin_password_file(
         # Do NOT use this password directly in API calls -- you must login first.\n",
         password
     );
-    std::fs::write(password_file, &file_contents)?;
-    #[cfg(unix)]
-    if let Err(e) = std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
-    {
-        tracing::warn!("Failed to set permissions on admin password file: {}", e);
-    }
+    write_file_private(password_file, file_contents.as_bytes())?;
     tracing::info!("Admin password written to: {}", password_file.display());
     Ok(())
 }
 
-/// Log the setup banner with instructions for the admin user.
+/// Write `contents` to `path` so that the file is never observable at
+/// world-readable permissions.
 ///
-/// When `password` is `Some`, the banner echoes the plaintext into logs in
-/// addition to pointing at the file. This trades a small disclosure risk for
-/// onboarding friction: the password is single-use anyway (the API is locked
-/// behind `must_change_password = true` and the first login forces a rotation),
-/// and operators are otherwise stuck spelunking inside the container to find
-/// the file (issue #1009). Set `ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true` to
-/// suppress the plaintext echo while keeping the file path hint, which is
-/// useful for shared log aggregators.
-fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
-    let hide_password = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+/// The bytes go to a freshly created sibling temp file (same directory, so the
+/// final `rename` is atomic), which on unix is opened with mode 0o600 via
+/// `O_CREAT | O_EXCL`. Only after the data is flushed to disk is the temp file
+/// renamed over the target. This closes the TOCTOU window that a
+/// `write()`-then-`set_permissions()` sequence leaves open, during which the
+/// file exists at the process umask (typically world-readable) before the
+/// follow-up chmod. The temp file is removed if any step fails.
+fn write_file_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    // A random suffix keeps the temp name unpredictable (so a co-tenant can't
+    // pre-create it) and avoids collisions with a leftover temp from a crash.
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}.{:016x}",
+        file_name,
+        std::process::id(),
+        rand::rng().random::<u64>(),
+    ));
+
+    let mut file = open_private_new(&tmp)?;
+    let result = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Create a brand-new file for writing, private to the owner where the platform
+/// supports it. `create_new` (O_EXCL) guarantees we are not following a symlink
+/// or clobbering an attacker-planted file.
+#[cfg(unix)]
+fn open_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // Non-unix build (e.g. the Windows service): there is no umask/0o600, so
+    // fall back to a plain exclusive create. The temp+rename still avoids the
+    // partially-written-file window; file ACLs inherit from the parent dir.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Build the banner's password line.
+///
+/// By default the plaintext is NOT echoed to logs -- only a pointer to the file
+/// is shown -- so the initial admin password does not leak into log
+/// aggregators. Operators who want the old behaviour can opt in explicitly with
+/// `ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true`.
+fn admin_banner_password_line(password_file: &std::path::Path, password: Option<&str>) -> String {
+    let log_password = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true");
 
-    let password_line = match (password, hide_password) {
-        (Some(pw), false) => format!("  Password:  {}\n", pw),
+    match (password, log_password) {
+        (Some(pw), true) => format!("  Password:  {}\n", pw),
         _ => format!("  Password:  see file {}\n", password_file.display()),
-    };
+    }
+}
+
+/// Log the setup banner with instructions for the admin user.
+///
+/// The banner points operators at the password file rather than echoing the
+/// plaintext: the file is written 0o600 and the password is single-use anyway
+/// (the API is locked behind `must_change_password = true` and the first login
+/// forces a rotation). Set `ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true` to also
+/// echo the plaintext into logs (not recommended on shared log aggregators;
+/// issue #1009).
+fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
+    let password_line = admin_banner_password_line(password_file, password);
 
     tracing::info!(
         "\n\
@@ -2027,8 +2093,9 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
           the forced-change-password screen. Alternatively call\n\
           POST /api/v1/auth/login then POST /api/v1/users/<id>/password.\n\
         \n\
-          Set ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true to hide the\n\
-          password from logs (file is still written).\n\
+          The password is written only to the file above and is NOT\n\
+          logged. Rotate it on first login. Set\n\
+          ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true to also echo it here.\n\
         \n\
         ===========================================================",
         password_line,
@@ -2495,25 +2562,123 @@ mod tests {
     // tested manually via `--install` / `--uninstall` / `--service` flags.
 
     // -----------------------------------------------------------------------
-    // Regression: issue #1009 -- admin password is echoed to logs by default
-    // and hidden when ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD is set.
+    // GHSA-8523 -- the initial admin password must NOT be echoed to logs by
+    // default (it lands in log aggregators); operators opt IN explicitly.
     // -----------------------------------------------------------------------
 
+    // These two tests mutate the same process-wide env var; serialize them so
+    // parallel execution can't observe each other's toggle.
+    static LOG_PW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn admin_setup_banner_echoes_password_by_default() {
-        // We can't capture tracing output without a subscriber setup, so we
-        // exercise the path the banner takes and verify the env-toggle
-        // contract directly. The actual format is asserted by
-        // `admin_setup_banner_password_line_format`.
-        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
-        std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
-        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap_or_default()
-            .eq_ignore_ascii_case("true");
-        assert!(!hidden, "default state must NOT hide the password");
+    fn admin_banner_hides_password_by_default() {
+        let _guard = LOG_PW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD").ok();
+        std::env::remove_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD");
+
+        let secret = "S3cr3t-Plaintext-Pw!";
+        let line =
+            admin_banner_password_line(std::path::Path::new("/data/admin.password"), Some(secret));
+        assert!(
+            !line.contains(secret),
+            "default banner must NOT contain the plaintext password, got: {line:?}"
+        );
+        assert!(
+            line.contains("see file"),
+            "default banner should point at the file instead"
+        );
+
         if let Some(v) = saved {
-            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+            std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", v);
         }
+    }
+
+    #[test]
+    fn admin_banner_echoes_password_when_opted_in() {
+        let _guard = LOG_PW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD").ok();
+        std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", "true");
+
+        let secret = "S3cr3t-Plaintext-Pw!";
+        let line =
+            admin_banner_password_line(std::path::Path::new("/data/admin.password"), Some(secret));
+        assert!(
+            line.contains(secret),
+            "opt-in banner must echo the plaintext password, got: {line:?}"
+        );
+        // Case-insensitive toggle, matching the other env flags.
+        std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", "TRUE");
+        assert!(admin_banner_password_line(
+            std::path::Path::new("/data/admin.password"),
+            Some(secret)
+        )
+        .contains(secret));
+
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", v);
+        } else {
+            std::env::remove_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-8523 -- the admin password file is created private (0o600) with no
+    // world-readable TOCTOU window (atomic temp-create + rename).
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_password_file_is_written_private_and_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("admin.password");
+        let secret = "unit-test-generated-pw";
+
+        write_admin_password_file(&target, secret).unwrap();
+
+        // Final file exists at exactly mode 0o600 -- never world/group readable.
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "admin password file must be 0o600, got {mode:o}"
+        );
+
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert!(contents.contains(secret), "file must contain the password");
+        assert!(
+            contents.contains("ONE-TIME SETUP"),
+            "file must keep the setup instructions"
+        );
+
+        // The temp file was renamed (not left behind): the only entry is target.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("admin.password")],
+            "no leftover temp file should remain in the directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_private_replaces_existing_target_at_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        // Seed a pre-existing, world-readable file at the target path.
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file_private(&target, b"new-private-bytes").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "replacement must be 0o600, got {mode:o}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-private-bytes");
     }
 
     // -----------------------------------------------------------------------
@@ -2548,26 +2713,6 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
-    }
-
-    #[test]
-    fn admin_setup_banner_hides_password_when_env_set() {
-        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
-        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "true");
-        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap_or_default()
-            .eq_ignore_ascii_case("true");
-        assert!(hidden);
-        // TRUE / True / 1-style toggles
-        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "TRUE");
-        assert!(std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap()
-            .eq_ignore_ascii_case("true"));
-        if let Some(v) = saved {
-            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
-        } else {
-            std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
-        }
     }
 
     // -----------------------------------------------------------------------
