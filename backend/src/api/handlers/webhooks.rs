@@ -242,11 +242,16 @@ pub struct WebhookSecretCreatedResponse {
 }
 
 /// Response returned by the rotate-secret endpoint.
+///
+/// GHSA-qcmj: the raw signing secret is intentionally NOT returned here. A
+/// rotation only reports success and non-reversible metadata (the display
+/// `secret_digest` and the previous-secret expiry); the new raw secret is
+/// retained only in encrypted form and delivered/consumed out-of-band, so it
+/// cannot be disclosed via this response body or logs.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RotateWebhookSecretResponse {
     pub id: Uuid,
-    /// Raw signing secret produced by this rotation. Shown exactly once.
-    pub secret: String,
+    /// Short, non-reversible identifier for the newly active signing secret.
     pub secret_digest: String,
     /// When the previously active secret stops being accepted.
     pub previous_secret_expires_at: chrono::DateTime<chrono::Utc>,
@@ -667,7 +672,10 @@ pub async fn delete_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: deleting a webhook is a management action, not a read.
+    // Require admin (scope-aware via GHSA-vvc3) rather than the softer
+    // creator/repo-access gate, matching the contract `create_webhook` uses.
+    auth.require_admin()?;
 
     let result = sqlx::query!("DELETE FROM webhooks WHERE id = $1", id)
         .execute(&state.db)
@@ -717,7 +725,8 @@ pub async fn enable_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: enabling a webhook is a management action -> admin only.
+    auth.require_admin()?;
     set_webhook_enabled(&state, id, true).await
 }
 
@@ -741,7 +750,8 @@ pub async fn disable_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: disabling a webhook is a management action -> admin only.
+    auth.require_admin()?;
     set_webhook_enabled(&state, id, false).await
 }
 
@@ -773,7 +783,9 @@ pub async fn test_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestWebhookResponse>> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: firing a test delivery is a management/egress-triggering
+    // action, not a read -> require admin (scope-aware via GHSA-vvc3).
+    auth.require_admin()?;
 
     use sqlx::Row;
 
@@ -989,7 +1001,10 @@ pub async fn redeliver(
     Extension(auth): Extension<AuthExtension>,
     Path((webhook_id, delivery_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeliveryResponse>> {
-    authorize_webhook_access(&state, &auth, webhook_id).await?;
+    // GHSA-qcmj: re-sending a delivery triggers outbound egress, the same
+    // management/egress class as `test` -> require admin (scope-aware via
+    // GHSA-vvc3). Read-only delivery LISTing stays on the visibility gate.
+    auth.require_admin()?;
 
     // Get original delivery
     let delivery = sqlx::query!(
@@ -1129,8 +1144,11 @@ fn rotation_guard_allows(
 ///
 /// Generates a new raw secret, encrypts it, moves the existing
 /// `secret_encrypted` into `secret_previous_encrypted`, and stamps an
-/// expiry 24 hours in the future. The new raw secret is returned in the
-/// response body **once**. The HMAC signing path (added in a later ticket)
+/// expiry 24 hours in the future. GHSA-qcmj: the new raw secret is NOT
+/// returned in the response body — only success and non-reversible
+/// metadata (`secret_digest`, previous-secret expiry). The new secret is
+/// retained encrypted at rest and consumed out-of-band. The HMAC signing
+/// path (added in a later ticket)
 /// signs deliveries with both secrets while the previous one is within
 /// its expiry window so consumers can rotate without dropped events.
 ///
@@ -1149,7 +1167,7 @@ fn rotation_guard_allows(
         ("id" = Uuid, Path, description = "Webhook ID")
     ),
     responses(
-        (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once.", body = RotateWebhookSecretResponse),
+        (status = 200, description = "Secret rotated. Body reports success and metadata only; the raw secret is not returned.", body = RotateWebhookSecretResponse),
         (status = 404, description = "Webhook not found"),
         (status = 409, description = "A previous rotation overlap window is still active"),
         (status = 500, description = "Encryption key not configured")
@@ -1163,7 +1181,9 @@ pub async fn rotate_webhook_secret(
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
 
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: rotating the signing secret is a management action -> admin
+    // only (scope-aware via GHSA-vvc3), matching `create_webhook`.
+    auth.require_admin()?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1242,9 +1262,11 @@ pub async fn rotate_webhook_secret(
         };
     }
 
+    // GHSA-qcmj: return success + non-reversible metadata only. The raw
+    // `new_secret` is never echoed in the response body; it is stored
+    // encrypted and delivered out-of-band.
     Ok(Json(RotateWebhookSecretResponse {
         id,
-        secret: new_secret,
         secret_digest: new_digest,
         previous_secret_expires_at: previous_expires_at,
     })
@@ -3393,6 +3415,12 @@ mod tests {
             matches!(r, Err(AppError::NotFound(_)))
         }
 
+        /// A 403 Forbidden — the deny a management verb emits for a non-admin
+        /// caller after the GHSA-qcmj hardening.
+        fn is_forbidden<T: std::fmt::Debug>(r: &Result<T>) -> bool {
+            matches!(r, Err(AppError::Authorization(_)))
+        }
+
         async fn cleanup(pool: &PgPool, repos: &[Uuid], users: &[Uuid]) {
             for u in users {
                 sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
@@ -3545,8 +3573,9 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied: 404 AND the row survives.
-            assert!(is_not_found(
+            // GHSA-qcmj: delete is a management verb -> admin only. A non-admin
+            // stranger is denied with 403 AND the row survives.
+            assert!(is_forbidden(
                 &delete_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3559,26 +3588,30 @@ mod tests {
                 "denied delete must not remove the row"
             );
 
-            // Owner can delete their own.
+            // The non-admin CREATOR is also denied now (the pre-fix soft gate
+            // let the creator delete their own webhook; management is admin-only).
+            assert!(is_forbidden(
+                &delete_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                webhook_exists(&pool, wh).await,
+                "non-admin creator delete must not remove the row"
+            );
+
+            // Admin can delete.
             assert!(delete_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
             .is_ok());
             assert!(!webhook_exists(&pool, wh).await);
-
-            // Admin can delete another principal's webhook.
-            let wh2 = insert_webhook(&pool, Some(owner), None).await;
-            assert!(delete_webhook(
-                axum::extract::State(state.clone()),
-                axum::Extension(auth_for(admin, true)),
-                axum::extract::Path(wh2),
-            )
-            .await
-            .is_ok());
-            assert!(!webhook_exists(&pool, wh2).await);
 
             cleanup(&pool, &[], &[owner, stranger, admin]).await;
         }
@@ -3594,12 +3627,14 @@ mod tests {
             };
             let owner = create_user(&pool, false).await;
             let stranger = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
             let state = tdh::build_state(pool.clone(), "/tmp");
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied on disable -> 404, state unchanged (still enabled).
-            assert!(is_not_found(
+            // GHSA-qcmj: enable/disable are management verbs -> admin only.
+            // Non-admin stranger denied on disable -> 403, state unchanged.
+            assert!(is_forbidden(
                 &disable_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3612,10 +3647,25 @@ mod tests {
                 "denied disable must not change state"
             );
 
-            // Owner can disable then enable.
+            // The non-admin CREATOR is also denied now (pre-fix, the creator
+            // could toggle their own webhook).
+            assert!(is_forbidden(
+                &disable_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                is_enabled(&pool, wh).await,
+                "non-admin creator disable must not change state"
+            );
+
+            // Admin can disable then enable.
             assert!(disable_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
@@ -3624,15 +3674,15 @@ mod tests {
 
             assert!(enable_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
             .is_ok());
             assert!(is_enabled(&pool, wh).await);
 
-            // Stranger denied on enable too.
-            assert!(is_not_found(
+            // Non-admin stranger denied on enable too.
+            assert!(is_forbidden(
                 &enable_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3641,7 +3691,7 @@ mod tests {
                 .await
             ));
 
-            cleanup(&pool, &[], &[owner, stranger]).await;
+            cleanup(&pool, &[], &[owner, stranger, admin]).await;
         }
 
         // ===================================================================
@@ -3659,12 +3709,23 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied -> 404 (authz runs before the delivery attempt, so
-            // no outbound request is made for another principal's endpoint).
-            assert!(is_not_found(
+            // GHSA-qcmj: `test` fires an outbound delivery -> management verb,
+            // admin only. A non-admin stranger is denied -> 403, before any
+            // outbound request is made for another principal's endpoint.
+            assert!(is_forbidden(
                 &test_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            // The non-admin CREATOR is also denied (pre-fix soft gate allowed it).
+            assert!(is_forbidden(
+                &test_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
                     axum::extract::Path(wh),
                 )
                 .await
@@ -3736,12 +3797,23 @@ mod tests {
             let wh = insert_webhook(&pool, Some(owner), None).await;
             let delivery_id = Uuid::new_v4();
 
-            // Stranger denied -> 404 from the webhook authz gate, before the
-            // delivery row is ever looked up or re-sent.
-            assert!(is_not_found(
+            // GHSA-qcmj: redeliver re-sends (egress) -> management verb, admin
+            // only. Non-admin stranger denied -> 403, before the delivery row is
+            // ever looked up or re-sent.
+            assert!(is_forbidden(
                 &redeliver(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path((wh, delivery_id)),
+                )
+                .await
+            ));
+
+            // The non-admin CREATOR is also denied.
+            assert!(is_forbidden(
+                &redeliver(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
                     axum::extract::Path((wh, delivery_id)),
                 )
                 .await
@@ -3766,8 +3838,9 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied -> 404.
-            assert!(is_not_found(
+            // GHSA-qcmj: rotate-secret is a management verb -> admin only.
+            // Non-admin stranger denied -> 403.
+            assert!(is_forbidden(
                 &rotate_webhook_secret(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3776,25 +3849,23 @@ mod tests {
                 .await
             ));
 
-            // Owner passes the authz gate (the rotation may still fail later if
+            // The non-admin CREATOR is also denied now (pre-fix the creator
+            // could rotate — and thus mint — a signing secret for their webhook).
+            assert!(is_forbidden(
+                &rotate_webhook_secret(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            // Admin passes the authz gate (the rotation may still fail later if
             // the deployment has no `AK_WEBHOOK_SECRET_KEY` configured for
             // encryption — that is orthogonal to authorization, so we only
-            // assert it is NOT the existence-hiding 404 the gate emits).
+            // assert it is NOT the authz 403 the gate emits).
             assert!(
-                !is_not_found(
-                    &rotate_webhook_secret(
-                        axum::extract::State(state.clone()),
-                        axum::Extension(auth_for(owner, false)),
-                        axum::extract::Path(wh),
-                    )
-                    .await
-                ),
-                "owner must pass the rotate authz gate"
-            );
-
-            // Admin passes the authz gate on another principal's webhook.
-            assert!(
-                !is_not_found(
+                !is_forbidden(
                     &rotate_webhook_secret(
                         axum::extract::State(state.clone()),
                         axum::Extension(auth_for(admin, true)),
@@ -3806,6 +3877,35 @@ mod tests {
             );
 
             cleanup(&pool, &[], &[owner, stranger, admin]).await;
+        }
+
+        // ===================================================================
+        // rotate_webhook_secret — secret non-disclosure (GHSA-qcmj)
+        // ===================================================================
+
+        /// The rotate-secret response body must not carry the raw signing
+        /// secret. This is a pure serialization guard (no DB): before the fix
+        /// the response embedded the raw `secret`; after it, only the
+        /// non-reversible `secret_digest` and expiry metadata are present.
+        #[test]
+        fn rotate_response_omits_raw_secret() {
+            let resp = RotateWebhookSecretResponse {
+                id: Uuid::new_v4(),
+                secret_digest: "whsec_pub_abcdef".to_string(),
+                previous_secret_expires_at: chrono::Utc::now(),
+            };
+            let v = serde_json::to_value(&resp).expect("serialize rotate response");
+            let obj = v.as_object().expect("rotate response is a JSON object");
+            assert!(
+                !obj.contains_key("secret"),
+                "rotate response must not carry the raw signing secret, got: {v}"
+            );
+            // The non-reversible digest is still surfaced so callers can
+            // identify the newly active secret.
+            assert!(
+                obj.contains_key("secret_digest"),
+                "rotate response should still expose the display digest"
+            );
         }
 
         // ===================================================================
