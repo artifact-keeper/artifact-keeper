@@ -601,34 +601,20 @@ pub async fn auth_middleware(
                         // Basic-auth password. `From<Claims>` stamps `iat_ms` so
                         // credential-change invalidation can exempt the calling
                         // session.
-                        if let Ok(claims) =
-                            auth_service.validate_access_token_async(&password).await
-                        {
-                            Ok(AuthExtension::from(claims))
-                        } else {
-                            // Finally, treat the password as an API token. This
-                            // lets service accounts — including OIDC-provisioned
-                            // ones that have NO local password (so bcrypt
-                            // `authenticate()` above can never succeed) —
-                            // authenticate CI/CD tooling with
-                            // `username:<api_token>` Basic auth on the generic
-                            // API, consistent with the Docker `/v2/token`
-                            // handler (#593) and the optional-auth path
-                            // (`try_resolve_auth_outcome`). Validation still
-                            // enforces token expiry, revocation, owner
-                            // deactivation, and (downstream, per-handler) scope,
-                            // so an invalid/expired token is still rejected and a
-                            // real password still authenticates via the branch
-                            // above. See #2786.
-                            match validate_api_token_with_scopes(&auth_service, &password).await {
-                                Ok(ext) => Ok(ext),
-                                // Saturated bcrypt cap -> retryable 503, never a
-                                // 401 (mirrors the ApiKey/Bearer branches).
-                                Err(TokenAuthError::Overloaded) => {
-                                    return service_unavailable_response();
-                                }
-                                Err(TokenAuthError::Invalid) => Err("Invalid credentials"),
-                            }
+                        //
+                        // An API token is deliberately NOT accepted as the Basic
+                        // password here: this is the hard-auth middleware for the
+                        // management API (/api/v1/auth, /profile, /signing, …).
+                        // Per the openapi.rs contract, an API token is only ever
+                        // valid as a `Bearer`/`X-Api-Key` credential or the Basic
+                        // password on the FORMAT/registry endpoints (handled by
+                        // `repo_visibility_middleware` → `try_resolve_auth_outcome`
+                        // with `allow_basic_api_token=true`). Accepting it here
+                        // (added by #2798) over-reached the #2786 need; #2806
+                        // restores the /api/v1 Basic-auth boundary.
+                        match auth_service.validate_access_token_async(&password).await {
+                            Ok(claims) => Ok(AuthExtension::from(claims)),
+                            Err(_) => Err("Invalid credentials"),
                         }
                     }
                 }
@@ -836,9 +822,26 @@ pub(crate) enum AuthOutcome {
 ///   * `ExtractedToken::Bearer` / `ApiKey` / `Basic` ->
 ///     - `Resolved(ext)` on any successful path
 ///     - `InvalidCredential` if every validation attempt failed
+///
+/// `allow_basic_api_token` controls the ONE difference between the format/registry
+/// callers and the management-API (/api/v1) callers: whether an API token is
+/// accepted as the HTTP Basic *password*.
+///   * `true`  — `repo_visibility_middleware` (npm/maven/pypi/v2/… format
+///     endpoints): pip-netrc / Artifactory-style `username:<api_token>` Basic
+///     auth resolves to the token owner (the #2786 customer need).
+///   * `false` — `optional_auth_middleware` / `admin_middleware` (/api/v1/*):
+///     a Basic password is ONLY ever a bcrypt `username:password`. An API token
+///     is refused as the Basic password, enforcing the openapi.rs contract that
+///     API tokens never authenticate as Basic on the management API (#2806).
+///
+/// Bearer `<api_token>`, `X-Api-Key`, JWT-as-password, and real bcrypt
+/// `username:password` logins are unaffected in BOTH modes. The discrimination is
+/// per-middleware (structural), never request-path string matching — axum's
+/// nest-prefix stripping makes path matching unreliable here.
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
@@ -907,7 +910,18 @@ pub(crate) async fn try_resolve_auth_outcome(
                 return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
-            // pip netrc / Artifactory-style `token:<api_token>` credential format
+            // pip netrc / Artifactory-style `token:<api_token>` credential format.
+            //
+            // Only the format/registry endpoints (`repo_visibility_middleware`)
+            // opt into this via `allow_basic_api_token=true`. The /api/v1
+            // management callers (`optional_auth_middleware`, `admin_middleware`)
+            // pass `false`, so an API token presented as a Basic password there is
+            // refused (falls through to `InvalidCredential`), honouring the
+            // openapi.rs contract (#2806). Bearer/X-Api-Key token auth and
+            // bcrypt/JWT Basic auth above are unaffected.
+            if !allow_basic_api_token {
+                return AuthOutcome::InvalidCredential;
+            }
             match validate_api_token_with_scopes(auth_service, &password).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
                 // The token fallback also burns a bcrypt verify under the
@@ -1156,7 +1170,10 @@ pub async fn optional_auth_middleware(
     next: Next,
 ) -> Response {
     let extracted = extract_token(&request);
-    let outcome = try_resolve_auth_outcome(&auth_service, extracted).await;
+    // /api/v1 optional-auth route: an API token is NOT accepted as the Basic
+    // password (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary
+    // (#2806). Bearer/X-Api-Key token auth and bcrypt/JWT Basic auth still work.
+    let outcome = try_resolve_auth_outcome(&auth_service, extracted, false).await;
     // A transient bcrypt-capacity shed surfaces here as `Overloaded`. Return a
     // retryable 503 immediately rather than silently dropping to anonymous and
     // letting a downstream `require_auth_basic*` turn it into a misleading 401
@@ -1222,7 +1239,10 @@ pub async fn admin_middleware(
     // as the Basic-auth password). Use the tri-state outcome so a transient
     // bcrypt-cap or pool-acquire shed surfaces as a retryable 503, never a
     // spurious 401 (#2101/#2125). Admin privilege is enforced below.
-    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted).await {
+    //
+    // /api/v1 admin route: an API token is NOT accepted as the Basic password
+    // (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary (#2806).
+    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
@@ -1632,7 +1652,9 @@ pub async fn repo_visibility_middleware(
     // `optional_auth_middleware` and prioritise honouring the deactivation.
     let Some(repo) = repo else {
         let extracted = extract_visibility_token(&request);
-        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+        // Format/registry endpoint: preserve pip-netrc / Artifactory-style
+        // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
+        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
         // Transient bcrypt-capacity shed -> retryable 503 (see
         // `AuthOutcome::Overloaded`), never a 401.
         if matches!(outcome, AuthOutcome::Overloaded) {
@@ -1675,7 +1697,9 @@ pub async fn repo_visibility_middleware(
     // token channels carry the credential in the URL path, so fall back to it
     // when no header/cookie credential is present.
     let extracted = extract_visibility_token(&request);
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+    // Format/registry endpoint: preserve pip-netrc / Artifactory-style
+    // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
+    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
@@ -4127,7 +4151,8 @@ mod tests {
         let jwt = mint_access_jwt(secret, user_id, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
-        let resolved = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic)).await;
+        let resolved =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -4206,7 +4231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_2786_oidc_sa_api_token_as_basic_password_authenticates() {
+    async fn test_2786_oidc_sa_api_token_as_basic_password_rejected_on_generic_api() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -4216,6 +4241,10 @@ mod tests {
             pool.clone(),
             Arc::new(crate::config::Config::default()),
         ));
+        // A genuinely VALID, unexpired, read-scoped API token for the SA. The
+        // point of this test is that a valid token is refused as the Basic
+        // password on the /api/v1 management API — not merely that a bad token
+        // is rejected (that is covered separately below).
         let (token, _tid) = auth_service
             .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
             .await
@@ -4231,59 +4260,16 @@ mod tests {
             .await
             .ok();
 
-        // Before #2786 the generic-API Basic branch only tried bcrypt then
-        // JWT-as-password; an OIDC SA (no local password) got a 401. It must
-        // now authenticate via the API-token fallback.
+        // #2806: an API token must NOT authenticate as the HTTP Basic password
+        // on the management API (`auth_middleware`). The #2798 fallback that
+        // accepted it here over-reached the #2786 need (which only covers the
+        // format/registry endpoints, handled by `repo_visibility_middleware`).
+        // The token still works as a `Bearer`/`X-Api-Key` credential and on the
+        // format endpoints; here it must be refused with 401.
         assert_eq!(
             status,
-            StatusCode::OK,
-            "OIDC service-account API token as Basic password must authenticate"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_2786_sa_token_preserves_scopes_for_downstream_gating() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let (user_id, username) = insert_oidc_service_account(&pool).await;
-        let auth_service = Arc::new(AuthService::new(
-            pool.clone(),
-            Arc::new(crate::config::Config::default()),
-        ));
-        // Bare "read" scope is what the write gates
-        // (require_scope_response(_, "write")) compare against.
-        let (token, _tid) = auth_service
-            .generate_api_token(user_id, "ci", vec!["read".into()], None)
-            .await
-            .expect("generate api token");
-
-        // Resolve the credential the middleware's password-position fallback
-        // uses and confirm the AuthExtension carries the token's scopes +
-        // is_api_token flag, so per-handler write/scope gates
-        // (require_scope_response) still apply — token-as-password does NOT
-        // elevate a read token to write. `username` is unused here because the
-        // fallback keys purely on the token in the password position.
-        let _ = &username;
-        let ext = validate_api_token_with_scopes(&auth_service, &token)
-            .await
-            .expect("token validates");
-
-        sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .ok();
-
-        assert!(ext.is_api_token, "resolved principal must be a token");
-        assert!(
-            ext.has_scope("read"),
-            "read-scoped token must retain its read scope"
-        );
-        assert!(
-            !ext.has_scope("write"),
-            "read-only token must NOT gain write scope via token-as-password"
+            StatusCode::UNAUTHORIZED,
+            "a valid API token as the Basic password must be refused on /api/v1"
         );
     }
 
@@ -4405,6 +4391,78 @@ mod tests {
             status,
             StatusCode::OK,
             "a real local password must still authenticate via Basic auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_basic_api_token_resolves_when_allowed_format_path() {
+        // Format/registry path (`allow_basic_api_token=true`): a valid API
+        // token presented as the Basic password resolves to the token owner.
+        // This is the #2786 customer need that `repo_visibility_middleware`
+        // preserves; it MUST keep working after the /api/v1 boundary fix.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
+
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(
+                ext.is_api_token,
+                "format path must resolve the api-token-as-Basic-password to the token owner"
+            ),
+            other => panic!("expected Resolved(is_api_token) on the format path, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_2786_basic_api_token_refused_when_disallowed_api_v1_boundary() {
+        // /api/v1 optional/admin path (`allow_basic_api_token=false`): the SAME
+        // valid API token as the Basic password is NOT resolved as a token — the
+        // resolver falls through to InvalidCredential (bcrypt fails: SA has no
+        // local password; JWT fails: not a JWT; api-token branch is skipped).
+        // This is the management-API Basic-auth boundary (#2806).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
+
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "api-token-as-Basic-password must NOT resolve on /api/v1, got: {outcome:?}"
         );
     }
 
@@ -4793,7 +4851,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_no_credential_for_none() {
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None, false).await;
         assert!(matches!(outcome, AuthOutcome::NoCredential));
     }
 
@@ -4870,7 +4928,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_invalid_for_garbage_scheme() {
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid, false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4884,7 +4942,7 @@ mod tests {
         // genuine-invalid case from the pool-timeout -> Overloaded case (#2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok")).await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok"), false).await;
         assert!(
             matches!(outcome, AuthOutcome::InvalidCredential),
             "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
@@ -4899,7 +4957,7 @@ mod tests {
         // (the pool-timeout -> Overloaded case is covered separately, #2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok")).await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok"), false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4909,9 +4967,12 @@ mod tests {
         // Invalid, not NoCredential. The client tried to authenticate; we
         // owe them a 401.
         let auth_service = make_test_auth_service();
-        let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic("not-base64-at-all"))
-                .await;
+        let outcome = try_resolve_auth_outcome(
+            &auth_service,
+            ExtractedToken::Basic("not-base64-at-all"),
+            false,
+        )
+        .await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4926,7 +4987,8 @@ mod tests {
         // `InvalidCredential` (see the tests above).
         let creds = base64::engine::general_purpose::STANDARD.encode("alice:secret");
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds)).await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds), false).await;
         assert!(
             matches!(outcome, AuthOutcome::Overloaded),
             "pool-timeout during Basic auth pre-check must be Overloaded, got: {:?}",
