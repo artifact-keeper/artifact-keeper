@@ -65,6 +65,26 @@ pub struct NexusRepository {
     pub url: Option<String>,
 }
 
+/// A repository entry from the Nexus repository-settings endpoint
+/// (`/service/rest/v1/repositorySettings`). Unlike the browse
+/// `/service/rest/v1/repositories` list, this carries the full config,
+/// including the `group.memberNames` of `group`-type repositories — the member
+/// list that must be correlated to migrated Artifact Keeper repos (issue #2783).
+#[derive(Debug, Deserialize)]
+pub struct NexusRepositorySettings {
+    pub name: String,
+    #[serde(default)]
+    pub group: Option<NexusGroupAttributes>,
+}
+
+/// The `group` attributes block of a Nexus `group`-type repository.
+#[derive(Debug, Deserialize)]
+pub struct NexusGroupAttributes {
+    /// Ordered member repository names aggregated by this group.
+    #[serde(rename = "memberNames", default)]
+    pub member_names: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NexusComponentsResponse {
     pub items: Vec<NexusComponent>,
@@ -187,7 +207,7 @@ impl NexusClient {
     pub async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
         let repos: Vec<NexusRepository> = self.get("/service/rest/v1/repositories").await?;
 
-        Ok(repos
+        let mut items: Vec<RepositoryListItem> = repos
             .into_iter()
             .map(|r| RepositoryListItem {
                 key: r.name,
@@ -195,8 +215,55 @@ impl NexusClient {
                 package_type: r.format,
                 url: r.url,
                 description: None,
+                members: vec![],
             })
-            .collect())
+            .collect();
+
+        // The browse list above does not carry group membership, so `group`
+        // repos would migrate to Artifact Keeper `virtual` repos with zero
+        // members. Enrich them from the settings endpoint, which reports each
+        // group's ordered `memberNames` (issue #2783). Best-effort: if the
+        // settings endpoint is unavailable (older Nexus, restricted token), we
+        // fall back to no members rather than failing the whole listing.
+        if items.iter().any(|i| i.repo_type == "group") {
+            match self
+                .get::<Vec<NexusRepositorySettings>>("/service/rest/v1/repositorySettings")
+                .await
+            {
+                Ok(settings) => Self::apply_group_members(&mut items, settings),
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not fetch Nexus repository settings to resolve group members; \
+                         migrated virtual repos may have no members: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Copy each Nexus `group` repo's ordered `memberNames` onto the matching
+    /// `RepositoryListItem`. Factored out (pure, no I/O) so the group→member
+    /// correlation can be unit-tested without a live Nexus (issue #2783).
+    fn apply_group_members(
+        items: &mut [RepositoryListItem],
+        settings: Vec<NexusRepositorySettings>,
+    ) {
+        use std::collections::HashMap;
+        let mut members_by_name: HashMap<String, Vec<String>> = settings
+            .into_iter()
+            .filter_map(|s| s.group.map(|g| (s.name, g.member_names)))
+            .collect();
+
+        for item in items.iter_mut() {
+            if item.repo_type == "group" {
+                if let Some(members) = members_by_name.remove(&item.key) {
+                    item.members = members;
+                }
+            }
+        }
     }
 
     /// List artifacts (components + assets) with pagination.
@@ -507,6 +574,50 @@ mod tests {
         let repo: NexusRepository = serde_json::from_str(json).unwrap();
         assert_eq!(repo.name, "npm-proxy");
         assert!(repo.url.is_none());
+    }
+
+    #[test]
+    fn test_apply_group_members_correlates_group_repos_2783() {
+        // Group repos get their ordered `memberNames`; non-group repos and
+        // groups absent from settings keep an empty member list.
+        let mut items = vec![
+            RepositoryListItem {
+                key: "maven-releases".into(),
+                repo_type: "hosted".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+            },
+            RepositoryListItem {
+                key: "maven-public".into(),
+                repo_type: "group".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+            },
+        ];
+
+        // Settings endpoint reports the group's ordered members.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-releases","format":"maven2","type":"hosted"},
+                {"name":"maven-public","format":"maven2","type":"group",
+                 "group":{"memberNames":["maven-releases","maven-central"]}}
+            ]"#,
+        )
+        .unwrap();
+
+        NexusClient::apply_group_members(&mut items, settings);
+
+        // The hosted repo is untouched; the group repo carries its members in
+        // the source-declared order (which becomes virtual-member priority).
+        assert!(items[0].members.is_empty());
+        assert_eq!(
+            items[1].members,
+            vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
     }
 
     #[test]
