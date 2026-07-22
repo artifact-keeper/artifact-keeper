@@ -1,0 +1,21 @@
+-- GHSA-qxxr: make refresh-token consume-and-rotate atomic.
+--
+-- The rotation critical section in auth_service.rs now runs the consume and the
+-- successor mint inside ONE transaction, gated by a conditional
+-- `UPDATE refresh_token_jti SET consumed_at = NOW()
+--     WHERE jti = $1 AND consumed_at IS NULL AND revoked_at IS NULL RETURNING ...`.
+-- Exactly one of two concurrent refreshes of the same jti can flip the row, so
+-- the lost-update race that let both mint a successor family is closed.
+--
+-- `superseded_by` records the jti of the successor the winning rotation minted.
+-- It lets a later presentation of an already-consumed token be classified
+-- without guessing: a GENUINE replay (successor missing / already
+-- consumed/revoked, or the parent consumed longer than the benign grace ago)
+-- revokes the whole family, while a BENIGN in-flight double-submit (successor
+-- still live and parent consumed within the grace) is rejected with a plain 401
+-- and leaves the family intact.
+--
+-- Nullable, no FK, no default: existing rows stay NULL, so back-compat holds and
+-- older consumed rows (which have no recorded live successor) classify as
+-- genuine replay exactly as the pre-fix code did.
+ALTER TABLE refresh_token_jti ADD COLUMN IF NOT EXISTS superseded_by UUID;

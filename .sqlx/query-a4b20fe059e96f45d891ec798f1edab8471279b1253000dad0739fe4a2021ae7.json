@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.name AS name, a.version AS \"version?\", a.size_bytes AS size_bytes,\n               a.checksum_sha256 AS \"checksum_sha256?\",\n               am.metadata AS \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = ANY($1::uuid[])\n          AND a.is_deleted = false\n          AND a.version IS NOT NULL\n          AND ($2::text IS NULL OR LOWER(a.name) = $2)\n          AND ($3::text IS NULL OR a.version = $3)\n        ORDER BY a.name ASC, a.created_at ASC\n        LIMIT 500\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "version?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "checksum_sha256?",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "metadata?",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a4b20fe059e96f45d891ec798f1edab8471279b1253000dad0739fe4a2021ae7"
+}
