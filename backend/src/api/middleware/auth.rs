@@ -149,6 +149,26 @@ impl AuthExtension {
         }
     }
 
+    /// Fold the effective-admin decision at construction time so every
+    /// downstream `is_admin` read (both `require_admin` and the ~34 raw
+    /// `if !auth.is_admin` handler checks) inherits scope awareness from a
+    /// single place.
+    ///
+    /// A principal is an *effective* admin only when it is BOTH owned by an
+    /// admin user AND presenting a credential whose scope ceiling grants the
+    /// `admin` scope. `has_scope` treats `None` (interactive login / basic
+    /// auth) as unrestricted, so this is a no-op for those principals and
+    /// preserves their admin. For a scope-restricted credential (an API token
+    /// or a JWT exchanged from one), `Some(list)` only grants `admin` when the
+    /// list carries `admin` or `*` — both of which live on `ADMIN_ONLY_SCOPES`
+    /// and cannot be minted by a non-admin. This closes GHSA-vvc3: an
+    /// admin-owned but narrow-scoped token (e.g. `read:artifacts`) no longer
+    /// inherits unconditional admin.
+    fn with_scope_gated_admin(mut self) -> Self {
+        self.is_admin = self.is_admin && self.has_scope("admin");
+        self
+    }
+
     /// Return a 403 Forbidden error if the caller is not an admin.
     pub fn require_admin(&self) -> crate::error::Result<()> {
         if self.is_admin {
@@ -202,6 +222,9 @@ impl From<Claims> for AuthExtension {
             allowed_repo_ids: AccessScope::from(claims.allowed_repo_ids),
             iat_ms,
         }
+        // No-op for interactive/CI JWTs (`scopes = None`); demotes an
+        // exchanged JWT that inherited a narrow token ceiling (GHSA-vvc3).
+        .with_scope_gated_admin()
     }
 }
 
@@ -770,7 +793,11 @@ async fn validate_api_token_with_scopes(
         allowed_repo_ids: validation.allowed_repo_ids,
         // API tokens are not JWTs and carry no `iat`.
         iat_ms: None,
-    })
+    }
+    // An admin-owned token only wields admin when its scope ceiling grants
+    // the `admin` scope (or `*`); a narrow-scoped token is demoted to a
+    // non-admin principal here (GHSA-vvc3).
+    .with_scope_gated_admin())
 }
 
 /// Outcome of resolving an authentication credential.
@@ -2348,6 +2375,150 @@ mod tests {
         let ext = AuthExtension::from(claims);
         assert!(!ext.is_admin);
         assert!(!ext.is_api_token);
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-vvc3: effective-admin is scope-gated at construction
+    //
+    // A principal is an *effective* admin only when it is BOTH owned by an
+    // admin user AND presenting a credential whose scope ceiling grants the
+    // `admin` scope. `with_scope_gated_admin` folds that decision at the two
+    // construction points (`From<Claims>` and `validate_api_token_with_scopes`)
+    // so every downstream `is_admin` read inherits it. These tests are pure
+    // (no DB) and fail before the fold was added.
+    // -----------------------------------------------------------------------
+
+    /// Mirror the `AuthExtension` that `validate_api_token_with_scopes`
+    /// produces for a token owned by an ADMIN user with the given scopes, then
+    /// apply the same construction-time fold the production path applies.
+    fn admin_owned_token_ext(scopes: Vec<String>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "adminowner".to_string(),
+            email: "adminowner@example.com".to_string(),
+            is_admin: true,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(scopes),
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+        .with_scope_gated_admin()
+    }
+
+    fn claims_with(is_admin: bool, scopes: Option<Vec<String>>) -> Claims {
+        Claims {
+            sub: Uuid::new_v4(),
+            username: "principal".to_string(),
+            email: "principal@example.com".to_string(),
+            is_admin,
+            allowed_repo_ids: None,
+            iat: 1000,
+            iat_ms: None,
+            exp: 2000,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+            scopes,
+        }
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_is_not_effective_admin() {
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(!ext.is_admin);
+        assert!(ext.require_admin().is_err());
+    }
+
+    #[test]
+    fn test_scoped_admin_token_with_admin_scope_is_admin() {
+        let ext = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_scoped_admin_token_with_wildcard_scope_is_admin() {
+        let ext = admin_owned_token_ext(vec!["*".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_interactive_admin_jwt_preserves_admin() {
+        // scopes = None (interactive login) is unrestricted: admin preserved.
+        let ext = AuthExtension::from(claims_with(true, None));
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_non_admin_scoped_token_is_not_admin() {
+        // Owner is a non-admin: the fold is a no-op (already `false`).
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "user".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            allowed_repo_ids: AccessScope::Restricted(vec![]),
+            iat_ms: None,
+        }
+        .with_scope_gated_admin();
+        assert!(!ext.is_admin);
+    }
+
+    #[test]
+    fn test_exchanged_jwt_from_read_token_cannot_launder_admin() {
+        // A JWT exchanged from a read-scoped API token carries
+        // `is_api_token = false` but inherits the token's `Some(scopes)`
+        // ceiling. The `From<Claims>` fold must still demote it.
+        let ext = AuthExtension::from(claims_with(true, Some(vec!["read:artifacts".to_string()])));
+        assert!(!ext.is_api_token);
+        assert!(!ext.is_admin);
+        assert!(ext.require_admin().is_err());
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_denied_self_or_admin_on_other_user() {
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        let other = Uuid::new_v4();
+        // Acting on ANOTHER user's resource is denied (no effective admin).
+        assert!(ext.require_self_or_admin(other, "denied").is_err());
+        // Acting on its OWN resource is still allowed.
+        assert!(ext.require_self_or_admin(ext.user_id, "denied").is_ok());
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_cannot_mint_admin_only_scopes() {
+        // The mint-escalation gate keys on the *effective* admin flag: a
+        // read-scoped admin-owned token is treated as a non-admin caller and
+        // may not grant `admin`.
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(crate::services::token_service::enforce_admin_only_scopes(
+            &["admin".to_string()],
+            ext.is_admin,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_route_level_admin_gate_403_for_scoped_read_token_2xx_for_admin_scope() {
+        // Route-level shape: admin handlers gate on `require_admin()`, whose
+        // `Authorization` error maps to HTTP 403. A read-scoped admin-owned
+        // token (previously bypassable) is now forbidden; an admin-scoped one
+        // passes the gate.
+        let read_tok = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        let err = read_tok
+            .require_admin()
+            .expect_err("read token must be denied");
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+
+        let admin_tok = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(admin_tok.require_admin().is_ok());
     }
 
     // -----------------------------------------------------------------------
