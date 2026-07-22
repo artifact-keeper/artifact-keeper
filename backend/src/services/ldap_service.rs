@@ -51,6 +51,10 @@ pub struct LdapConfig {
     pub use_starttls: bool,
     /// Path to a PEM file with custom CA certificates for LDAPS/STARTTLS
     pub ca_cert_path: Option<String>,
+    /// Inline PEM CA certificate(s) trusted for this provider's LDAPS/STARTTLS
+    /// handshake (per-provider config, issue #2782). Takes precedence over
+    /// `ca_cert_path` when set.
+    pub ca_cert_pem: Option<String>,
     /// Skip TLS certificate verification (development only)
     pub no_tls_verify: bool,
 }
@@ -129,6 +133,7 @@ impl LdapConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             ca_cert_path,
+            ca_cert_pem: None,
             no_tls_verify,
         })
     }
@@ -201,7 +206,7 @@ impl LdapService {
     #[allow(clippy::too_many_arguments)]
     pub fn from_db_config(
         db: PgPool,
-        _name: &str,
+        name: &str,
         server_url: &str,
         bind_dn: Option<&str>,
         bind_password: Option<&str>,
@@ -215,8 +220,29 @@ impl LdapService {
         groups_attr: &str,
         admin_group_dn: Option<&str>,
         use_starttls: bool,
+        insecure_skip_verify: bool,
+        ca_cert_pem: Option<&str>,
     ) -> Self {
-        let (ca_cert_path, no_tls_verify) = LdapConfig::tls_from_env();
+        // Environment variables remain a deployment-wide fallback: the
+        // effective skip-verify is the per-provider toggle OR the env flag,
+        // and an inline per-provider CA (#2782) takes precedence over the
+        // env-configured CA file path.
+        let (env_ca_cert_path, env_no_tls_verify) = LdapConfig::tls_from_env();
+        let no_tls_verify = insecure_skip_verify || env_no_tls_verify;
+        let ca_cert_pem = ca_cert_pem.filter(|v| !v.is_empty()).map(String::from);
+        let ca_cert_path = if ca_cert_pem.is_some() {
+            None
+        } else {
+            env_ca_cert_path
+        };
+        if no_tls_verify {
+            tracing::warn!(
+                provider = %name,
+                "LDAP TLS certificate verification is DISABLED for this provider \
+                 (insecure skip-verify). Connections are vulnerable to \
+                 man-in-the-middle attacks; do not use in production."
+            );
+        }
         let config = LdapConfig {
             url: server_url.to_string(),
             base_dn: user_base_dn.to_string(),
@@ -233,6 +259,7 @@ impl LdapService {
             admin_group_dn: admin_group_dn.map(String::from),
             use_starttls,
             ca_cert_path,
+            ca_cert_pem,
             no_tls_verify,
         };
         Self {
@@ -496,9 +523,12 @@ impl LdapService {
 
     /// Build LDAP connection settings with TLS configuration.
     ///
-    /// Supports custom CA certificates via `LDAP_CA_CERT_PATH` (or the shared
-    /// `CUSTOM_CA_CERT_PATH` as fallback) and `LDAP_INSECURE_TLS=true` to skip
-    /// certificate verification for development environments.
+    /// Custom CA certificates come from either an inline per-provider PEM
+    /// (`ca_cert_pem`, #2782) or the `LDAP_CA_CERT_PATH` (or shared
+    /// `CUSTOM_CA_CERT_PATH`) environment fallback; the inline value takes
+    /// precedence. `no_tls_verify` (per-provider skip-verify OR
+    /// `LDAP_INSECURE_TLS=true`) skips certificate verification for
+    /// development environments.
     fn build_conn_settings(&self) -> Result<ldap3::LdapConnSettings> {
         use std::time::Duration;
 
@@ -507,12 +537,23 @@ impl LdapService {
             .set_starttls(self.config.use_starttls)
             .set_no_tls_verify(self.config.no_tls_verify);
 
-        if let Some(ca_path) = &self.config.ca_cert_path {
+        // Inline per-provider PEM wins over the env-configured CA file path.
+        let ca_source: Option<(Vec<u8>, String)> = if let Some(pem) = &self.config.ca_cert_pem {
+            Some((
+                pem.as_bytes().to_vec(),
+                "inline provider configuration".to_string(),
+            ))
+        } else if let Some(ca_path) = &self.config.ca_cert_path {
             let pem_bytes = std::fs::read(ca_path).map_err(|e| {
                 AppError::Config(format!("Failed to read LDAP CA cert at {ca_path}: {e}"))
             })?;
+            Some((pem_bytes, ca_path.clone()))
+        } else {
+            None
+        };
 
-            let certs = Self::parse_pem_certificates(&pem_bytes, ca_path)?;
+        if let Some((pem_bytes, source)) = ca_source {
+            let certs = Self::parse_pem_certificates(&pem_bytes, &source)?;
             let mut builder = native_tls::TlsConnector::builder();
             for cert in &certs {
                 builder.add_root_certificate(cert.clone());
@@ -525,7 +566,7 @@ impl LdapService {
                 .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
             settings = settings.set_connector(connector);
             tracing::info!(
-                path = %ca_path,
+                source = %source,
                 count = certs.len(),
                 "Loaded custom CA certificate(s) for LDAP"
             );
@@ -1056,6 +1097,7 @@ mod tests {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -1156,6 +1198,7 @@ mod tests {
             admin_group_dn: Some("cn=admins,ou=groups,dc=example,dc=com".to_string()),
             use_starttls: false,
             ca_cert_path: None,
+            ca_cert_pem: None,
             no_tls_verify: false,
         }
     }
@@ -1536,6 +1579,8 @@ mod tests {
             "memberOf",
             Some("cn=admins,dc=example,dc=com"),
             false,
+            false,
+            None,
         );
         assert!(!svc.config.no_tls_verify || std::env::var("LDAP_INSECURE_TLS").is_ok());
         assert_eq!(svc.config.url, "ldaps://ad.example.com:636");
@@ -1544,6 +1589,75 @@ mod tests {
             svc.config.admin_group_dn.as_deref(),
             Some("cn=admins,dc=example,dc=com")
         );
+    }
+
+    /// #2782: the per-provider skip-verify toggle must relax verification on
+    /// the resulting connector even when the `LDAP_INSECURE_TLS` env var is
+    /// unset, and a per-provider inline CA must be carried through.
+    #[tokio::test]
+    async fn test_from_db_config_per_provider_skip_verify_and_inline_ca() {
+        const TEST_CA_PEM: &str = include_str!("../../tests/fixtures/test-ca.pem");
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            Some("cn=svc,dc=example,dc=com"),
+            Some("password"),
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            None,
+            None,
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            None,
+            false,
+            true,
+            Some(TEST_CA_PEM),
+        );
+        // Per-provider toggle relaxes verification regardless of the env var.
+        assert!(svc.config.no_tls_verify);
+        // Inline PEM is carried and the env file-path fallback is suppressed.
+        assert_eq!(svc.config.ca_cert_pem.as_deref(), Some(TEST_CA_PEM));
+        assert!(svc.config.ca_cert_path.is_none());
+        // The connector builder honours both (parses the inline PEM +
+        // accepts-invalid), i.e. no error is returned.
+        svc.build_conn_settings()
+            .expect("inline CA + skip-verify should build a connector");
+    }
+
+    /// #2782: with the per-provider toggle OFF and no env override, the
+    /// connector must keep verifying certificates (secure-by-default).
+    #[tokio::test]
+    async fn test_from_db_config_default_keeps_verification() {
+        // Only meaningful when the env override is not set in this process.
+        if std::env::var("LDAP_INSECURE_TLS").is_ok() {
+            return;
+        }
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            None,
+            None,
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            None,
+            None,
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(!svc.config.no_tls_verify);
+        assert!(svc.config.ca_cert_pem.is_none());
     }
 
     #[tokio::test]

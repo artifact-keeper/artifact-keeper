@@ -265,6 +265,15 @@ impl MigrationService {
             "raw" => "generic".to_string(),
             // Nexus uses `yum`, Artifact Keeper's equivalent is `rpm`
             "yum" => "rpm".to_string(),
+            // Nexus uses `apt` for Debian/APT repositories; Artifact Keeper's
+            // equivalent format is `debian`. Without this mapping an `apt`
+            // repository normalized to the unknown name `apt`, which
+            // `get_format_compatibility` classifies as `Unsupported`, so the
+            // whole repository failed to migrate (#2784).
+            "apt" => "debian".to_string(),
+            // Some tools report Go module repositories as `golang`; Artifact
+            // Keeper's canonical format is `go`.
+            "golang" => "go".to_string(),
             // RubyGems is sometimes reported as `gems` or `rubygems`
             "gems" => "rubygems".to_string(),
             _ => lower,
@@ -1674,6 +1683,46 @@ mod tests {
             MigrationService::get_format_compatibility("yum"),
             FormatCompatibility::Partial
         );
+
+        // #2784: Nexus `apt` repositories map to AK's `debian` (partial
+        // support, migrated as generic). Before the mapping, `apt`
+        // normalized to the unknown name `apt` and was classified
+        // Unsupported, so the whole repository failed to migrate.
+        assert_eq!(MigrationService::normalize_package_type("apt"), "debian");
+        assert_eq!(
+            MigrationService::get_format_compatibility("apt"),
+            FormatCompatibility::Partial
+        );
+
+        // #2784: `golang` is an alias for AK's `go` (full support).
+        assert_eq!(MigrationService::normalize_package_type("golang"), "go");
+        assert_eq!(
+            MigrationService::get_format_compatibility("golang"),
+            FormatCompatibility::Full
+        );
+        // `go` itself is already the canonical, fully-supported name.
+        assert_eq!(
+            MigrationService::get_format_compatibility("go"),
+            FormatCompatibility::Full
+        );
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_normalizes_nexus_apt() {
+        // #2784: a Nexus `apt` repository must prepare as `debian` with
+        // Partial compatibility so it migrates (as generic) instead of being
+        // rejected as an unsupported format.
+        let repo = RepositoryListItem {
+            key: "apt-hosted".to_string(),
+            repo_type: "hosted".to_string(),
+            package_type: "apt".to_string(),
+            url: None,
+            description: None,
+            members: vec![],
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.package_type, "debian");
+        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
     }
 
     #[test]

@@ -785,12 +785,20 @@ impl BackupService {
         Ok(())
     }
 
-    /// Clean up old backups based on retention policy
+    /// Clean up old backups based on retention policy.
+    ///
+    /// Removes the backup archive from storage in addition to the database row.
+    /// Selecting the eligible rows first (rather than issuing a bare `DELETE`)
+    /// is deliberate: once the row is gone its `storage_path` — the only handle
+    /// to the archive — is lost, so a row-only delete would strand the
+    /// `.tar.gz` in object storage forever, the opposite of what a
+    /// space-reclaiming retention job should do (#2787).
     pub async fn cleanup(&self, keep_count: i32, keep_days: i32) -> Result<u64> {
-        // Keep the most recent N backups
-        let result = sqlx::query(
+        // Keep the most recent N completed backups; among the rest, remove those
+        // older than the retention window.
+        let doomed: Vec<(Uuid, Option<String>)> = sqlx::query_as(
             r#"
-            DELETE FROM backups
+            SELECT id, storage_path FROM backups
             WHERE id NOT IN (
                 SELECT id FROM backups
                 WHERE status = 'completed'
@@ -803,11 +811,50 @@ impl BackupService {
         )
         .bind(keep_count as i64)
         .bind(keep_days)
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(result.rows_affected())
+        let mut deleted = 0u64;
+        for (id, storage_path) in doomed {
+            // Best-effort delete the archive before dropping the row. If storage
+            // removal fails, keep the row so a later retention run retries
+            // rather than silently orphaning the archive.
+            if let Some(path) = storage_path.as_deref() {
+                match self.storage.exists(path).await {
+                    Ok(true) => {
+                        if let Err(e) = self.storage.delete(path).await {
+                            tracing::warn!(
+                                backup_id = %id,
+                                storage_path = path,
+                                "backup retention: failed to delete archive, retaining row for retry: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            backup_id = %id,
+                            storage_path = path,
+                            "backup retention: failed to stat archive, retaining row for retry: {}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            sqlx::query("DELETE FROM backups WHERE id = $1")
+                .bind(id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
     }
 }
 

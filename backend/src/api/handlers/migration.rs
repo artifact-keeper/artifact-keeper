@@ -565,10 +565,12 @@ fn spawn_migration_worker(
 
     let db = state.db.clone();
     let storage_registry = state.storage_registry.clone();
+    let search_service = state.search_service.clone();
     let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token)
+            .with_search_service(search_service);
         let outcome = if resume {
             worker
                 .resume_job(job_id, client, conflict_resolution, None)

@@ -12,6 +12,7 @@ use crate::services::artifactory_client::ArtifactoryClient;
 use crate::services::migration_service::{
     ConflictType, MigrationError, MigrationService, RepositoryType,
 };
+use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::source_registry::SourceRegistry;
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 use sha1::Sha1;
@@ -162,6 +163,12 @@ pub struct MigrationWorker {
     storage_registry: Arc<StorageRegistry>,
     config: WorkerConfig,
     cancel_token: CancellationToken,
+    /// Optional search backend. When present, every imported artifact is
+    /// indexed into OpenSearch as it commits so migrated content is
+    /// searchable/visible without waiting for a manual or startup reindex
+    /// (#2784). Best-effort by contract: indexing failures are logged and
+    /// never fail a migration item.
+    search_service: Option<Arc<OpenSearchService>>,
 }
 
 impl MigrationWorker {
@@ -179,6 +186,95 @@ impl MigrationWorker {
             storage_registry,
             config,
             cancel_token,
+            search_service: None,
+        }
+    }
+
+    /// Attach an OpenSearch service so imported artifacts are indexed for
+    /// full-text search as they are migrated (#2784). Returns `self` for
+    /// builder-style chaining at the call site; passing `None` is a no-op and
+    /// leaves migration behaving exactly as before (e.g. when the deployment
+    /// has no OpenSearch configured).
+    pub fn with_search_service(mut self, search_service: Option<Arc<OpenSearchService>>) -> Self {
+        self.search_service = search_service;
+        self
+    }
+
+    /// Best-effort index of a just-committed migrated artifact into
+    /// OpenSearch (#2784).
+    ///
+    /// No-op when no search backend is attached. Loads the artifact's live
+    /// row joined with its repository (matching the fields the live index
+    /// path and `full_reindex_artifacts` use, including the repository's
+    /// canonical `format`) and upserts the document. Any failure — the row
+    /// having been concurrently removed, or the search cluster being
+    /// unavailable — is logged and swallowed so migration never fails an
+    /// item whose content already committed.
+    async fn index_migrated_artifact(&self, repository_id: Uuid, path: &str) {
+        let Some(search) = self.search_service.clone() else {
+            return;
+        };
+
+        let row: Result<Option<MigratedArtifactIndexRow>, _> = sqlx::query_as(
+            r#"
+            SELECT
+                a.id,
+                a.name,
+                a.path,
+                a.version,
+                a.content_type,
+                a.size_bytes,
+                a.created_at,
+                r.key AS repository_key,
+                r.name AS repository_name,
+                r.format::text AS format,
+                r.is_public
+            FROM artifacts a
+            INNER JOIN repositories r ON a.repository_id = r.id
+            WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false
+            LIMIT 1
+            "#,
+        )
+        .bind(repository_id)
+        .bind(path)
+        .fetch_optional(&self.db)
+        .await;
+
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    repository_id = %repository_id,
+                    path = %path,
+                    error = %e,
+                    "Failed to load migrated artifact for OpenSearch indexing"
+                );
+                return;
+            }
+        };
+
+        let doc = ArtifactDocument {
+            id: row.id.to_string(),
+            name: row.name,
+            path: row.path,
+            version: row.version,
+            format: row.format,
+            repository_id: repository_id.to_string(),
+            repository_key: row.repository_key,
+            repository_name: row.repository_name,
+            content_type: row.content_type,
+            size_bytes: row.size_bytes,
+            download_count: 0,
+            is_public: row.is_public,
+            created_at: row.created_at.timestamp(),
+        };
+
+        if let Err(e) = search.index_artifact(&doc).await {
+            tracing::warn!(
+                artifact_id = %doc.id,
+                "Failed to index migrated artifact in OpenSearch: {e}"
+            );
         }
     }
 
@@ -1709,6 +1805,15 @@ impl MigrationWorker {
                         )
                         .await;
                 }
+
+                // #2784: index the freshly-imported artifact into OpenSearch
+                // so migrated content is searchable/visible immediately. The
+                // live upload paths index via `artifact_service`, but the
+                // importer writes `artifacts` directly, so without this a
+                // migrated repository stayed invisible to search until a
+                // manual or startup reindex. Best-effort: a search failure
+                // must never fail an item whose content already committed.
+                self.index_migrated_artifact(repository_id, &path_str).await;
             }
         }
 
@@ -2417,6 +2522,23 @@ fn migration_artifact_path(
             _ => format!("{}/{}", repo_key, artifact_path),
         },
     }
+}
+
+/// Row shape for loading a just-committed migrated artifact (joined with its
+/// repository) to build an OpenSearch [`ArtifactDocument`] (#2784).
+#[derive(Debug, sqlx::FromRow)]
+struct MigratedArtifactIndexRow {
+    id: Uuid,
+    name: String,
+    path: String,
+    version: Option<String>,
+    content_type: String,
+    size_bytes: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    repository_key: String,
+    repository_name: String,
+    format: String,
+    is_public: bool,
 }
 
 /// The `packages`-catalog identity of a migrated artifact, or `None` when
@@ -6295,6 +6417,18 @@ mod tests {
             migration_catalog_entry("gradle", &OciRole::NotOci, &parsed),
             None
         );
+
+        // #2784: Go modules are non-OCI and carry a version, so they get a
+        // catalog row under the recovered `(module, version)` identity.
+        let go_parsed = crate::services::artifact_metadata::ParsedArtifact {
+            name: "github.com/gorilla/mux".to_string(),
+            version: Some("v1.8.0".to_string()),
+        };
+        let go_entry = migration_catalog_entry("go", &OciRole::NotOci, &go_parsed)
+            .expect("versioned go module must produce a catalog entry");
+        assert_eq!(go_entry.name, "github.com/gorilla/mux");
+        assert_eq!(go_entry.version, "v1.8.0");
+        assert_eq!(go_entry.format, "go");
     }
 
     // -----------------------------------------------------------------------
@@ -6479,6 +6613,117 @@ mod tests {
         // Exactly one catalog row: the walked-in blobs and the digest child
         // content must not surface as packages.
         assert_eq!(catalog_counts(&pool, repo_id).await, (1, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #2784: a migrated Go module must recover its `(module, version)`
+    /// identity from the GOPROXY `<module>/@v/<version>.zip` layout, land in
+    /// `artifacts` under the canonical module path (not the raw filename),
+    /// AND appear in `packages`/`package_versions` so the Packages tab shows
+    /// it. Pre-fix, Go fell through to the filename-as-name/no-version
+    /// fallback, so no catalog row was ever written. Re-import stays at one
+    /// row (idempotency).
+    #[tokio::test]
+    async fn test_go_import_populates_package_catalog() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2784-go", "go").await;
+
+        // The `.zip` is the module payload; the module path carries slashes
+        // and a case-escaped segment (`!azure` == `Azure`).
+        let path = "github.com/!azure/azure-sdk-for-go/@v/v1.8.0.zip";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            path.to_string(),
+            bytes::Bytes::from_static(b"fake go module zip bytes"),
+        );
+
+        transfer_one(&worker, &storage, &files, &repo_key, "go", path)
+            .await
+            .expect("go module transfer must succeed");
+
+        // Catalog row uses the decoded module path + version.
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some((
+                "github.com/Azure/azure-sdk-for-go".to_string(),
+                "v1.8.0".to_string()
+            )),
+            "migrated go module must appear in the packages catalog"
+        );
+
+        // Artifact row is stored under the canonical module identity, not the
+        // raw `v1.8.0.zip` filename.
+        let artifact: (String, Option<String>) = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query artifact");
+        assert_eq!(artifact.0, "github.com/Azure/azure-sdk-for-go");
+        assert_eq!(artifact.1, Some("v1.8.0".to_string()));
+
+        // Re-import (migration re-run) must be idempotent: same single row.
+        transfer_one(&worker, &storage, &files, &repo_key, "go", path)
+            .await
+            .expect("go re-import must succeed");
+        assert_eq!(
+            catalog_counts(&pool, repo_id).await,
+            (1, 1),
+            "re-running the migration must not duplicate catalog rows"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #2784: the `.mod` and `.info` sidecars of a Go module share the same
+    /// `(module, version)`, so they upsert onto the same catalog row rather
+    /// than each creating their own — mirroring how a real GOPROXY module is
+    /// a single logical release across its three files.
+    #[tokio::test]
+    async fn test_go_import_sidecars_share_one_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig2784-gomod", "go").await;
+
+        let base = "example.com/foo/bar/@v/v0.1.0";
+        let mut files = std::collections::HashMap::new();
+        for ext in ["zip", "mod", "info"] {
+            files.insert(
+                format!("{base}.{ext}"),
+                bytes::Bytes::from(format!("payload-{ext}")),
+            );
+        }
+        for ext in ["zip", "mod", "info"] {
+            transfer_one(
+                &worker,
+                &storage,
+                &files,
+                &repo_key,
+                "go",
+                &format!("{base}.{ext}"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("go {ext} transfer failed: {e}"));
+        }
+
+        assert_eq!(
+            single_catalog_row(&pool, repo_id).await,
+            Some(("example.com/foo/bar".to_string(), "v0.1.0".to_string())),
+        );
+        assert_eq!(
+            catalog_counts(&pool, repo_id).await,
+            (1, 1),
+            "the three sidecar files of one Go release must share one catalog row"
+        );
 
         cleanup_repo(&pool, repo_id).await;
     }
