@@ -188,6 +188,14 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Response, Response> {
+    // Token action-scope ceiling (GHSA-5f2q). Opening a chunked-upload session is
+    // a write, so it must require the `write` scope BEFORE the repo-RBAC gate
+    // below — matching the direct-write path (`repositories::upload_artifact`).
+    // Defense-in-depth: this is IN ADDITION to `require_repo_write_access`; a
+    // read-scoped token whose owner holds repo write must still be rejected here.
+    auth.require_scope("write")
+        .map_err(IntoResponse::into_response)?;
+
     let user_id = auth.user_id;
 
     // Validate artifact path before doing anything else
@@ -451,6 +459,11 @@ async fn upload_chunk(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
+    // Token action-scope ceiling (GHSA-5f2q). Appending a chunk is a write and
+    // must require the `write` scope, matching the direct-write path.
+    auth.require_scope("write")
+        .map_err(IntoResponse::into_response)?;
+
     let user_id = auth.user_id;
 
     // Parse Content-Range header
@@ -600,6 +613,12 @@ async fn complete(
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
+    // Token action-scope ceiling (GHSA-5f2q). Finalizing a session commits the
+    // artifact (a write) and must require the `write` scope, matching the
+    // direct-write path.
+    auth.require_scope("write")
+        .map_err(IntoResponse::into_response)?;
+
     let user_id = auth.user_id;
     let is_replication_request = super::is_replication_request(&headers);
 
@@ -754,6 +773,12 @@ async fn cancel(
     Extension(auth): Extension<AuthExtension>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
+    // Token action-scope ceiling (GHSA-5f2q). Aborting an in-flight upload is a
+    // destructive action; require the `delete` scope, matching the direct
+    // artifact-delete path (`repositories::delete_artifact`).
+    auth.require_scope("delete")
+        .map_err(IntoResponse::into_response)?;
+
     let user_id = auth.user_id;
 
     // C3: Verify user owns this session
@@ -1162,6 +1187,110 @@ mod tests {
             rest[..end].contains("require_repo_write_access("),
             "create_session must call require_repo_write_access independent of \
              fine-grained rule existence (xtenant)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Token action-scope ceiling on the chunked-upload verbs (GHSA-5f2q).
+    //
+    // The chunked-upload router runs under auth_middleware only, so the token's
+    // action-scope (`scopes`) was never enforced on these write verbs — a
+    // read-scoped token whose OWNER holds repo RBAC write could push artifacts
+    // via /uploads/*, sidestepping the token's action ceiling. Each verb must
+    // call `require_scope` with the same scope its direct-path twin uses:
+    //   create_session / upload_chunk / complete -> "write"
+    //   cancel                                    -> "delete"
+    // The handlers need a real DB to execute, so these are string-grep gates
+    // (mirroring `test_create_session_enforces_tenant_gate`), plus a behavioral
+    // unit test of the underlying scope decision below.
+    // -----------------------------------------------------------------------
+
+    /// Return the source of a single `async fn <name>(...)` body from this file.
+    fn handler_body(name: &str) -> &'static str {
+        let source = include_str!("upload.rs");
+        let needle = format!("async fn {}(", name);
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{} not found", name));
+        let rest = &source[start..];
+        let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn create_session_requires_write_scope() {
+        assert!(
+            handler_body("create_session").contains("require_scope(\"write\")"),
+            "create_session must enforce the token `write` action-scope (GHSA-5f2q)"
+        );
+    }
+
+    #[test]
+    fn upload_chunk_requires_write_scope() {
+        assert!(
+            handler_body("upload_chunk").contains("require_scope(\"write\")"),
+            "upload_chunk must enforce the token `write` action-scope (GHSA-5f2q)"
+        );
+    }
+
+    #[test]
+    fn complete_requires_write_scope() {
+        assert!(
+            handler_body("complete").contains("require_scope(\"write\")"),
+            "complete must enforce the token `write` action-scope (GHSA-5f2q)"
+        );
+    }
+
+    #[test]
+    fn cancel_requires_delete_scope() {
+        assert!(
+            handler_body("cancel").contains("require_scope(\"delete\")"),
+            "cancel must enforce the token `delete` action-scope (GHSA-5f2q)"
+        );
+    }
+
+    /// Behavioral contract of the gate the handlers now call: a read-scoped
+    /// token is denied `write`/`delete` (the exploit path -> 403), while a
+    /// write-scoped token is allowed `write` (legit path unchanged). This is the
+    /// exact decision `require_scope` returns; `AppError::Authorization` maps to
+    /// HTTP 403.
+    fn auth_with_scopes(scopes: Vec<&str>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@example.test".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::from(None::<Vec<Uuid>>),
+            iat_ms: None,
+        }
+    }
+
+    #[test]
+    fn read_scoped_token_denied_upload_write_and_delete() {
+        // Read-scoped token (its owner may hold repo write) -> the upload verbs'
+        // scope gate denies both write and delete -> 403.
+        let read = auth_with_scopes(vec!["read"]);
+        assert!(
+            read.require_scope("write").is_err(),
+            "read-scoped token must be denied the upload write scope"
+        );
+        assert!(
+            read.require_scope("delete").is_err(),
+            "read-scoped token must be denied the cancel delete scope"
+        );
+    }
+
+    #[test]
+    fn write_scoped_token_allowed_upload_write() {
+        // Properly write-scoped token -> the write verbs remain 2xx (unchanged).
+        let write = auth_with_scopes(vec!["write"]);
+        assert!(
+            write.require_scope("write").is_ok(),
+            "write-scoped token must retain upload access (no behavior change)"
         );
     }
 
