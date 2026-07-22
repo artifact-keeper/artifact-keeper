@@ -94,6 +94,19 @@ pub struct RoleMapping {
 ///     marker is rejected there too.
 pub(crate) const REGISTRY_REFRESH_TOKEN_TYPE: &str = "registry_refresh";
 
+/// Grace window (seconds) during which a second presentation of an
+/// already-consumed refresh `jti` is treated as a benign in-flight
+/// double-submit (e.g. two tabs / a retried request racing the same rotation)
+/// rather than a genuine token-theft replay.
+///
+/// Inside the grace, and only while the winner's freshly-minted successor is
+/// still live, the loser is rejected with a plain 401 and the family is left
+/// intact. Outside the grace — or once the successor has itself been
+/// consumed/revoked — a repeat presentation is a genuine replay and revokes the
+/// whole family per RFC 9700 §2.2.2. All comparisons are evaluated in the DB
+/// (`NOW()` vs `consumed_at`) so replica clock skew cannot flip the verdict.
+const REFRESH_REPLAY_BENIGN_GRACE_SECS: i64 = 30;
+
 /// Result of API token validation: the user plus the token's constraints.
 #[derive(Debug, Clone)]
 pub struct ApiTokenValidation {
@@ -1561,35 +1574,187 @@ impl AuthService {
         // landed does; older tokens predating the migration skip this
         // path and continue to rotate normally).
         if let (Some(jti), Some(family_id)) = (token_data.claims.jti, token_data.claims.family_id) {
+            // Consume-and-rotate is a single READ COMMITTED transaction so two
+            // concurrent refreshes of the SAME jti can no longer both read
+            // `consumed_at IS NULL`, both mark it consumed, and both mint a
+            // successor family (the lost-update race, GHSA-qxxr). The atomic
+            // conditional `UPDATE ... RETURNING` is the gate: exactly one
+            // caller flips the row from unconsumed to consumed and receives a
+            // row back; every other concurrent caller receives zero rows and is
+            // classified out of band below.
+            let mut tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            let consumed = sqlx::query!(
+                r#"
+                UPDATE refresh_token_jti
+                SET consumed_at = NOW()
+                WHERE jti = $1 AND consumed_at IS NULL AND revoked_at IS NULL
+                RETURNING family_id
+                "#,
+                jti,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if consumed.is_some() {
+                // WINNER: this call atomically consumed the presented jti.
+                // Mint the successor in the SAME family, preserving the
+                // presenting token's action-scope ceiling and repo allow-list
+                // so a refresh can never widen the grant of a token minted from
+                // a scoped API token (#2430, defense-in-depth). The successor
+                // row insert and the parent's `superseded_by` link both run on
+                // the transaction, so the consume and the mint commit as one
+                // unit — a crash mid-rotation leaves the parent unconsumed.
+                let user = self.load_active_user(token_data.claims.sub).await?;
+                let tokens = self.generate_tokens_with_family_and_scope(
+                    &user,
+                    family_id,
+                    token_data.claims.allowed_repo_ids.clone(),
+                    token_data.claims.scopes.clone(),
+                )?;
+
+                // Decode the successor jti from the freshly-minted refresh JWT
+                // (same source of truth as persist_refresh_jti_from_pair) and
+                // record its row on the tx, then link the parent to it.
+                let succ = self.decode_token(&tokens.refresh_token)?;
+                if let (Some(succ_jti), Some(succ_family)) =
+                    (succ.claims.jti, succ.claims.family_id)
+                {
+                    let issued_at = DateTime::<Utc>::from_timestamp(succ.claims.iat, 0)
+                        .ok_or_else(|| {
+                            AppError::Internal("Invalid iat in minted refresh token".to_string())
+                        })?;
+                    let expires_at = DateTime::<Utc>::from_timestamp(succ.claims.exp, 0)
+                        .ok_or_else(|| {
+                            AppError::Internal("Invalid exp in minted refresh token".to_string())
+                        })?;
+                    sqlx::query!(
+                        r#"
+                        INSERT INTO refresh_token_jti
+                            (jti, user_id, family_id, issued_at, expires_at)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (jti) DO NOTHING
+                        "#,
+                        succ_jti,
+                        user.id,
+                        succ_family,
+                        issued_at,
+                        expires_at,
+                    )
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+
+                    sqlx::query!(
+                        r#"
+                        UPDATE refresh_token_jti
+                        SET superseded_by = $2
+                        WHERE jti = $1
+                        "#,
+                        jti,
+                        succ_jti,
+                    )
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+
+                tx.commit()
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                return Ok((user, tokens));
+            }
+
+            // LOSER: the presented jti was NOT flipped by us — it was already
+            // consumed or revoked (or no row exists). Write nothing: roll the
+            // empty transaction back, then run ONE classifying read of the
+            // presented row (joined to its recorded successor) to decide the
+            // outcome. All time comparisons happen in the DB (NOW() vs
+            // consumed_at) so replica clock skew cannot flip the verdict.
+            drop(tx);
+
             let row = sqlx::query!(
                 r#"
-                SELECT consumed_at, revoked_at, family_id
-                FROM refresh_token_jti
-                WHERE jti = $1
+                SELECT
+                    r.consumed_at,
+                    r.revoked_at,
+                    r.family_id,
+                    (r.consumed_at IS NOT NULL
+                        AND r.consumed_at < NOW() - ($2::bigint * INTERVAL '1 second'))
+                        AS "consumed_past_grace!",
+                    (s.jti IS NOT NULL) AS "successor_exists!",
+                    s.consumed_at AS successor_consumed_at,
+                    s.revoked_at AS successor_revoked_at
+                FROM refresh_token_jti r
+                LEFT JOIN refresh_token_jti s ON s.jti = r.superseded_by
+                WHERE r.jti = $1
                 "#,
-                jti
+                jti,
+                REFRESH_REPLAY_BENIGN_GRACE_SECS,
             )
             .fetch_optional(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-            if let Some(row) = row {
-                if row.revoked_at.is_some() {
-                    tracing::warn!(
-                        user_id = %token_data.claims.sub,
-                        jti = %jti,
-                        family_id = %row.family_id,
-                        "Refresh token rejected: family revoked",
-                    );
-                    return Err(AppError::Authentication(
-                        "Refresh token has been revoked".to_string(),
-                    ));
-                }
-                if row.consumed_at.is_some() {
-                    // Reuse detected. Revoke the entire family so neither
-                    // the attacker nor the legitimate user can refresh
-                    // again with any sibling token. Both sides are forced
-                    // back to a full re-auth.
+            let Some(row) = row else {
+                // (a) Row missing -> token predates the jti table (issued before
+                // #1174) or its family row was pruned. Rotate normally in the
+                // presented family and record a fresh row so any future replay
+                // of the NEW token IS detected. Behaviour unchanged from the
+                // pre-fix legacy branch.
+                let user = self.load_active_user(token_data.claims.sub).await?;
+                let tokens = self.generate_tokens_with_family_and_scope(
+                    &user,
+                    family_id,
+                    token_data.claims.allowed_repo_ids.clone(),
+                    token_data.claims.scopes.clone(),
+                )?;
+                self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
+                return Ok((user, tokens));
+            };
+
+            // (b) Explicitly revoked (logout, deactivation sweep, admin family
+            // revocation) -> reject, unchanged.
+            if row.revoked_at.is_some() {
+                tracing::warn!(
+                    user_id = %token_data.claims.sub,
+                    jti = %jti,
+                    family_id = %row.family_id,
+                    "Refresh token rejected: family revoked",
+                );
+                return Err(AppError::Authentication(
+                    "Refresh token has been revoked".to_string(),
+                ));
+            }
+
+            // (c) Already consumed. Distinguish a genuine token-theft replay
+            // from a benign in-flight double-submit:
+            //
+            //   * GENUINE REPLAY (revoke the whole family) iff the recorded
+            //     successor is missing or itself already consumed/revoked, OR
+            //     the parent was consumed longer than the benign grace ago. In
+            //     all these cases a live rotation chain has already moved past
+            //     this token, so a fresh presentation is reuse.
+            //   * BENIGN RACE (reject with a plain 401, DO NOT revoke) iff the
+            //     successor still exists and is live AND the parent was consumed
+            //     within the grace — i.e. two requests raced the same rotation
+            //     and this one simply lost.
+            if row.consumed_at.is_some() {
+                let successor_spent =
+                    row.successor_consumed_at.is_some() || row.successor_revoked_at.is_some();
+                let genuine_replay =
+                    row.consumed_past_grace || !row.successor_exists || successor_spent;
+
+                if genuine_replay {
+                    // Reuse detected. Revoke the entire family so neither the
+                    // attacker nor the legitimate user can refresh again with
+                    // any sibling token; both sides are forced back to a full
+                    // re-auth.
                     sqlx::query!(
                         r#"
                         UPDATE refresh_token_jti
@@ -1614,37 +1779,24 @@ impl AuthService {
                     ));
                 }
 
-                // Mark consumed (single-use rotation).
-                sqlx::query!(
-                    r#"
-                    UPDATE refresh_token_jti
-                    SET consumed_at = NOW()
-                    WHERE jti = $1 AND consumed_at IS NULL
-                    "#,
-                    jti,
-                )
-                .execute(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+                // Benign concurrent double-submit: the winner is still live.
+                tracing::debug!(
+                    user_id = %token_data.claims.sub,
+                    jti = %jti,
+                    family_id = %row.family_id,
+                    "Refresh token already consumed by an in-flight rotation; rejecting the loser without revoking the family",
+                );
+                return Err(AppError::Authentication(
+                    "Refresh token already used".to_string(),
+                ));
             }
-            // (Else: row missing -> token predates the table; we record a
-            // fresh row for the rotated jti below so any future replay of
-            // the new token IS detected.)
 
-            // Fetch fresh user data.
-            let user = self.load_active_user(token_data.claims.sub).await?;
-            // Preserve the presenting token's action-scope ceiling and repo
-            // allow-list across rotation so a refresh can never widen the
-            // grant of a token minted from a scoped API token (#2430,
-            // defense-in-depth).
-            let tokens = self.generate_tokens_with_family_and_scope(
-                &user,
-                family_id,
-                token_data.claims.allowed_repo_ids.clone(),
-                token_data.claims.scopes.clone(),
-            )?;
-            self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
-            return Ok((user, tokens));
+            // Neither consumed nor revoked yet a conditional UPDATE matched no
+            // row: a concurrent writer touched the row between our UPDATE and
+            // this read. Treat as an in-flight race — reject without revoking.
+            return Err(AppError::Authentication(
+                "Refresh token already used".to_string(),
+            ));
         }
 
         // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
@@ -6951,17 +7103,163 @@ mod tests {
             .await
             .expect("legit rotation succeeds");
 
+        // Advance the chain once more so token A's recorded successor (token B)
+        // is itself consumed. A replay of token A is now unambiguously reuse of
+        // a token whose live successor has already moved on — not an in-flight
+        // double-submit racing the same rotation.
+        let (_, token_c) = service
+            .refresh_tokens(&token_b.refresh_token)
+            .await
+            .expect("second legit rotation succeeds");
+
         // Replay token A's refresh token: must reject AND revoke the family
-        // (which means token B's jti is now flagged revoked too).
+        // (which means token C's jti is now flagged revoked too).
         let replay = service.refresh_tokens(&token_a.refresh_token).await;
         assert!(replay.is_err(), "replay must be rejected");
 
-        // Attempt to use the rotated token B now — also rejected because the
-        // whole family is revoked.
-        let after_replay = service.refresh_tokens(&token_b.refresh_token).await;
+        // Attempt to use the still-live rotated token C now — also rejected
+        // because the whole family is revoked.
+        let after_replay = service.refresh_tokens(&token_c.refresh_token).await;
         assert!(
             after_replay.is_err(),
             "sibling token from revoked family must be rejected"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// GHSA-qxxr: two concurrent refreshes of the SAME token must yield exactly
+    /// one winner (a rotated pair) and one loser (401), and must NOT revoke the
+    /// family — the loser is a benign in-flight double-submit, and the winner's
+    /// freshly-minted successor stays live and refreshable.
+    #[tokio::test]
+    async fn test_refresh_concurrent_race_single_winner() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // Two INDEPENDENT pools/services so the two refreshes contend at the DB
+        // exactly as two concurrent API requests (possibly on different pods)
+        // would — the atomicity guarantee cannot rely on a shared in-process
+        // pool serialising them.
+        let pool_a = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let pool_b = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service_a = AuthService::new(pool_a.clone(), cfg.clone());
+        let service_b = AuthService::new(pool_b.clone(), cfg.clone());
+
+        let username = format!("race_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool_a, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        // Mint + persist T0.
+        let t0 = service_a.generate_tokens(&user).expect("t0");
+        service_a
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+
+        // Fire two concurrent refreshes of T0 on the two independent pools.
+        let (r_a, r_b) = tokio::join!(
+            service_a.refresh_tokens(&t0.refresh_token),
+            service_b.refresh_tokens(&t0.refresh_token),
+        );
+
+        let ok_count = [&r_a, &r_b].iter().filter(|r| r.is_ok()).count();
+        let err_count = [&r_a, &r_b].iter().filter(|r| r.is_err()).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent refresh must succeed (got {ok_count} Ok)"
+        );
+        assert_eq!(
+            err_count, 1,
+            "exactly one concurrent refresh must be rejected (got {err_count} Err)"
+        );
+
+        // The loser is rejected as an already-used token, NOT as a replay, and
+        // the family is left intact: the winner's successor still refreshes.
+        let winner_refresh = match (&r_a, &r_b) {
+            (Ok((_, pair)), _) => pair.refresh_token.clone(),
+            (_, Ok((_, pair))) => pair.refresh_token.clone(),
+            _ => unreachable!("exactly one winner asserted above"),
+        };
+        let follow_up = service_a.refresh_tokens(&winner_refresh).await;
+        assert!(
+            follow_up.is_ok(),
+            "family must NOT be revoked by a benign concurrent double-submit; \
+             winner's successor must still refresh"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool_a)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool_a)
+            .await;
+    }
+
+    /// GHSA-qxxr: a benign double-submit of the SAME token within the grace
+    /// window — the winner's successor still live — rejects the second call
+    /// with 401 but must NOT revoke the family (distinct from a genuine replay).
+    #[tokio::test]
+    async fn test_refresh_benign_double_submit_does_not_revoke_family() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("benign_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let t0 = service.generate_tokens(&user).expect("t0");
+        service
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+
+        // First rotation: T0 -> T1 (winner). T1 is live.
+        let (_, t1) = service
+            .refresh_tokens(&t0.refresh_token)
+            .await
+            .expect("t0 -> t1");
+
+        // Immediate second submit of T0 (well within the benign grace, T1 still
+        // live) must be rejected but must NOT revoke the family.
+        let second = service.refresh_tokens(&t0.refresh_token).await;
+        assert!(
+            second.is_err(),
+            "second submit of an already-consumed token must be rejected"
+        );
+
+        // Proof the family survived: the live successor T1 still refreshes.
+        let after = service.refresh_tokens(&t1.refresh_token).await;
+        assert!(
+            after.is_ok(),
+            "benign double-submit must NOT revoke the family; T1 must still refresh"
         );
 
         // Cleanup.
