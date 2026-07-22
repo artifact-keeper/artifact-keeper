@@ -61,6 +61,7 @@ pub fn test_config() -> Config {
             .to_string_lossy()
             .into_owned(),
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        setup_password_hint: None,
         ..Default::default()
     }
 }
