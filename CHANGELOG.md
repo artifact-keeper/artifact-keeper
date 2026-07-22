@@ -7,13 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.1] - TBD
 
-A patch release for the 1.6.0 line, driven by early-adopter field reports. It fixes SSO group mapping and LDAPS trust configuration, three Nexus-migration correctness gaps (group→virtual-repo correlation, Go/APT repositories, and the empty Packages tab), virtual-repository storage accounting and editability, CI/CD authentication with service-account tokens, backup retention cleanup, and NuGet/PyPI/Maven registry handling. No schema-breaking changes; in-place upgrade from 1.6.0 is a drop-in image swap. The release date is stamped at cut.
+A patch release for the 1.6.0 line combining early-adopter field fixes with a focused round of security hardening. On the correctness side it fixes SSO group mapping and LDAPS trust configuration, three Nexus-migration gaps (group→virtual-repo correlation, Go/APT repositories, and the empty Packages tab), virtual-repository storage accounting and editability, CI/CD authentication with service-account tokens, backup retention cleanup, and NuGet/PyPI/Maven registry handling. On the security side it closes an authorization and hardening cluster — most notably a systemic scoped-admin token bypass (GHSA-vvc3) and a refresh-token rotation race (GHSA-qxxr) — see **Security** below. In-place upgrade from 1.6.0 is a drop-in image swap (one additive migration); there is **one behavioral breaking change** for admins that authenticate to admin endpoints with narrow-scoped API tokens — see **Upgrade notes**. The release date is stamped at cut.
 
 ### Security
 
 - **Bundled Grype vulnerability database updated to v0.116.0** to clear CVE-2026-56852 flagged by the container scan (#2749).
 - **The API-token-as-Basic-password fallback is strictly confined to format/registry endpoints**: the `/api/v1` management API now refuses an API token supplied in the Basic-auth password position (callers use `Authorization: Bearer <token>`), enforcing the documented boundary across the hard-auth, optional-auth, and admin surfaces. bcrypt username/password and Bearer tokens are unchanged, and token-as-Basic on package-manager endpoints is preserved (#2806).
 - **PyPI simple-index proxy responses are content-sniffed instead of trusting the upstream `Content-Type`**: an upstream (or intermediary proxy) that returns a simple-index body labeled with a non-standard content type no longer causes Artifact Keeper to serve the raw upstream bytes with un-rewritten offsite download URLs. The body is classified and its download URLs are rewritten through the repository; unrecognizable bodies return `502` (#2801).
+
+This release also closes a set of authorization and hardening advisories:
+
+- **Effective admin now requires an admin-scoped credential, not just an admin owner** (GHSA-vvc3): API tokens and login-exchanged JWTs no longer inherit unconditional admin from the owner's account flag. Admin authorization is granted only when the principal is an admin **and** the presented credential carries the `admin` (or `*`) scope. This closes a systemic bypass in which a narrow/read-scoped Personal Access Token owned by an admin passed every admin gate, and it retroactively hardens the plugin-install, signing-key, and webhook management surfaces. **Breaking — see Upgrade notes.**
+- **Refresh-token rotation is atomic under concurrency** (GHSA-qxxr): two simultaneous refreshes of the same refresh token can no longer both succeed and mint successor token families. A single atomic consume elects exactly one winner; a benign near-simultaneous double-submit is rejected without revoking the legitimate family, while a genuine replay still revokes the whole family.
+- **Chunked uploads enforce the token action-scope** (GHSA-5f2q): the `/api/v1/uploads/*` verbs now require the token's `write` (and `delete` for cancel) scope, matching the direct upload path — a read-scoped token can no longer push through the chunked path.
+- **Peer data-plane management requires admin** (GHSA-f7qf): the peer transfer, chunk, and connection mutation routes now require admin authorization instead of authentication alone.
+- **Webhook management requires admin and no longer discloses the rotated secret** (GHSA-qcmj): delete, enable, disable, test, rotate-secret, and redeliver now require admin; secret rotation returns only a digest and expiry, never the raw signing secret.
+- **Peer-announcement writes are atomic** (GHSA-gw36): the endpoint/credential UPSERT and its connection record are committed in one transaction, eliminating a partial-write window.
+- **The initial admin password file is written atomically at `0o600` and is no longer logged by default** (GHSA-8523): the file is created with restrictive permissions from the first byte (no world-readable window), and the generated password is not echoed to logs unless explicitly opted in. **See Upgrade notes.**
+
+### Upgrade notes
+
+- **In-place upgrade from 1.6.0 is a drop-in image swap.** A single additive, non-breaking migration is applied on boot (adds a nullable `superseded_by` column to the refresh-token table for the GHSA-qxxr fix); no operator action is required.
+- **Breaking (admin tokens) — GHSA-vvc3:** if any admin automation authenticated to `/api/v1` **admin** endpoints using an API token minted with a **narrow/read** scope, those calls now return `403`. Remediation: mint a replacement token carrying the `admin` (or `*`) scope. Interactive admin logins (Bearer JWT) and tokens already minted with an admin/`*` scope are unaffected.
+- **Admin password logging — GHSA-8523:** the generated initial admin password is no longer written to logs by default. The previous `ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD` variable is removed; to intentionally echo the generated password to startup logs (not recommended), set `ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true`. The password is always available in the `0o600` admin password file.
 
 ### Fixed
 
