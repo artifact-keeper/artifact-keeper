@@ -1031,6 +1031,7 @@ mod tests {
             pkce_enabled: true,
             map_groups_to_groups: false,
             allow_legacy_rsa_keys: false,
+            trust_group_names: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1042,6 +1043,7 @@ mod tests {
         assert!(!json["auto_create_users"].as_bool().unwrap());
         assert!(json["pkce_enabled"].as_bool().unwrap());
         assert!(!json["map_groups_to_groups"].as_bool().unwrap());
+        assert!(!json["trust_group_names"].as_bool().unwrap());
     }
 
     #[test]

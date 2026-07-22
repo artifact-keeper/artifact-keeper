@@ -551,8 +551,15 @@ async fn oidc_callback_inner(
     //     Auto-create groups (tagged with external_source = 'oidc') on first
     //     sight and reconcile membership so removed groups drop their members.
     if row.map_groups_to_groups {
-        if let Err(e) =
-            sync_oidc_groups_to_local_groups(&state.db, user.id, provider_id, &groups).await
+        if let Err(e) = sync_federated_groups_to_local_groups(
+            &state.db,
+            user.id,
+            provider_id,
+            "oidc",
+            &groups,
+            row.trust_group_names,
+        )
+        .await
         {
             tracing::warn!(
                 error = %e,
@@ -706,9 +713,15 @@ pub async fn ldap_login(
         let group_names = ldap_svc
             .resolve_group_names(&ldap_dn, &ldap_username, &ldap_member_of)
             .await;
-        if let Err(e) =
-            sync_federated_groups_to_local_groups(&state.db, user.id, id, "ldap", &group_names)
-                .await
+        if let Err(e) = sync_federated_groups_to_local_groups(
+            &state.db,
+            user.id,
+            id,
+            "ldap",
+            &group_names,
+            false,
+        )
+        .await
         {
             tracing::warn!(
                 user_id = %user.id,
@@ -981,9 +994,15 @@ pub async fn saml_acs(
     // removed groups drop their members. Non-fatal: login still succeeds if
     // the sync fails.
     if row.map_groups_to_groups {
-        if let Err(e) =
-            sync_federated_groups_to_local_groups(&state.db, user.id, id, "saml", &saml_groups)
-                .await
+        if let Err(e) = sync_federated_groups_to_local_groups(
+            &state.db,
+            user.id,
+            id,
+            "saml",
+            &saml_groups,
+            false,
+        )
+        .await
         {
             tracing::warn!(
                 error = %e,
@@ -1221,15 +1240,27 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
 
 /// Reconcile an OIDC user's group memberships against the `groups` table.
 /// Thin wrapper over [`sync_federated_groups_to_local_groups`] with the
-/// `oidc` source tag, preserved so the #1094 call site and tests stay
-/// unchanged.
+/// `oidc` source tag, preserved so its existing test callers stay unchanged.
+///
+/// This is the **guarded** (trust-off) entrypoint: it forwards
+/// `trust_group_names = false`, so the #2759 ownership guard is always in
+/// force here and operator-managed groups are never attached by name. The
+/// trusted path (Fix C, #2823) is invoked by the OIDC login handler calling
+/// [`sync_federated_groups_to_local_groups`] directly with the provider's
+/// `trust_group_names` flag.
+// The OIDC login handler now calls the core fn directly (to pass the
+// per-provider trust flag), so in a non-test build this guarded wrapper is
+// only referenced by its unit tests; keep it as the documented trust-off
+// entrypoint without tripping the lib-target dead-code lint.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn sync_oidc_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
     provider_id: Uuid,
     oidc_groups: &[String],
 ) -> Result<()> {
-    sync_federated_groups_to_local_groups(pool, user_id, provider_id, "oidc", oidc_groups).await
+    sync_federated_groups_to_local_groups(pool, user_id, provider_id, "oidc", oidc_groups, false)
+        .await
 }
 
 /// Reconcile a federated user's group memberships against the `groups` table.
@@ -1262,6 +1293,7 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
     provider_id: Uuid,
     source: &str,
     idp_groups: &[String],
+    trust_group_names: bool,
 ) -> Result<()> {
     let mut tx = pool
         .begin()
@@ -1273,6 +1305,39 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
     for name in idp_groups {
         if name.trim().is_empty() {
             continue;
+        }
+
+        // Fix C (#2823): when this provider is operator-trusted, a claim may
+        // attach the user to an EXISTING operator-managed group
+        // (external_source IS NULL) matching by name, WITHOUT rewriting the
+        // group's ownership. The SELECT's `external_source IS NULL` predicate
+        // means another provider's oidc-owned groups (non-NULL source) are
+        // never matched here, and we only INSERT a membership row — the groups
+        // row is never mutated — so #2759's protection stays fully intact for
+        // every untrusted provider.
+        if trust_group_names {
+            let operator_group: Option<(Uuid,)> = sqlx::query_as(
+                r#"SELECT id FROM groups WHERE name = $1 AND external_source IS NULL"#,
+            )
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if let Some((group_id,)) = operator_group {
+                sqlx::query(
+                    r#"INSERT INTO user_group_members (user_id, group_id)
+                       VALUES ($1, $2)
+                       ON CONFLICT (user_id, group_id) DO NOTHING"#,
+                )
+                .bind(user_id)
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+                current_group_ids.push(group_id);
+                continue; // operator group stays operator-owned; skip the guarded upsert
+            }
         }
 
         // Find-or-create the group atomically, scoped to THIS provider's
@@ -2870,6 +2935,29 @@ mod tests {
                 .await;
         }
 
+        /// Insert an operator-managed group: `external_source` /
+        /// `external_provider_id` are left NULL (not owned by any IdP).
+        async fn make_operator_group(pool: &PgPool, name: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(id)
+                .bind(name)
+                .execute(pool)
+                .await
+                .expect("insert operator group");
+            id
+        }
+
+        async fn group_external_provider_id(pool: &PgPool, group_id: Uuid) -> Option<Uuid> {
+            let row: Option<(Option<Uuid>,)> =
+                sqlx::query_as("SELECT external_provider_id FROM groups WHERE id = $1")
+                    .bind(group_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("group provider lookup");
+            row.and_then(|(p,)| p)
+        }
+
         #[tokio::test]
         async fn test_sync_creates_groups_and_membership() {
             let Some(pool) = db_helpers::try_pool().await else {
@@ -3059,6 +3147,7 @@ mod tests {
                 provider_id,
                 "ldap",
                 &[privileged.clone(), legit.clone()],
+                false,
             )
             .await
             .expect("sync succeeds; colliding name is skipped, not fatal");
@@ -3113,6 +3202,7 @@ mod tests {
                 provider_id,
                 "ldap",
                 std::slice::from_ref(&name),
+                false,
             )
             .await
             .expect("sync succeeds; foreign-source collision is skipped");
@@ -3306,6 +3396,7 @@ mod tests {
                 provider_id,
                 "saml",
                 &[g1.clone(), g2.clone()],
+                false,
             )
             .await
             .expect("saml sync");
@@ -3352,6 +3443,7 @@ mod tests {
                 provider_id,
                 "ldap",
                 &[devops.clone(), qa.clone()],
+                false,
             )
             .await
             .expect("first ldap sync");
@@ -3373,6 +3465,7 @@ mod tests {
                 provider_id,
                 "ldap",
                 std::slice::from_ref(&devops),
+                false,
             )
             .await
             .expect("second ldap sync");
@@ -3399,6 +3492,7 @@ mod tests {
                 provider_id,
                 "saml",
                 &[eng.clone(), ops.clone()],
+                false,
             )
             .await
             .expect("first saml sync");
@@ -3413,6 +3507,7 @@ mod tests {
                 provider_id,
                 "saml",
                 std::slice::from_ref(&eng),
+                false,
             )
             .await
             .expect("second saml sync");
@@ -3479,6 +3574,7 @@ mod tests {
                 provider_id,
                 "saml",
                 std::slice::from_ref(&saml_name),
+                false,
             )
             .await
             .expect("saml sync");
@@ -3515,6 +3611,7 @@ mod tests {
                 provider_id,
                 "saml",
                 std::slice::from_ref(&saml_name),
+                false,
             )
             .await
             .expect("saml sync");
@@ -3555,6 +3652,7 @@ mod tests {
                     "\t".to_string(),
                     real.clone(),
                 ],
+                false,
             )
             .await
             .expect("saml sync");
@@ -3565,6 +3663,198 @@ mod tests {
             assert!(group_id_by_name(&pool, "   ").await.is_none());
 
             cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // Fix C (#2823): trust_group_names per-provider opt-in.
+        // ===================================================================
+
+        /// (a) trust OFF: an OIDC claim naming an existing operator-managed
+        /// group must NOT attach the user (the #2759 guard holds), and the
+        /// operator group's `external_source` stays NULL.
+        #[tokio::test]
+        async fn test_trust_off_operator_group_not_attached() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("ops-team");
+            let group_id = make_operator_group(&pool, &name).await;
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "oidc",
+                std::slice::from_ref(&name),
+                false,
+            )
+            .await
+            .expect("sync succeeds; operator group is skipped under the guard");
+
+            assert!(
+                !user_is_in_group(&pool, user_id, group_id).await,
+                "trust OFF: user must not be attached to the operator group"
+            );
+            assert_eq!(
+                group_external_source(&pool, group_id).await,
+                None,
+                "operator group must stay NULL-source"
+            );
+
+            cleanup_groups(&pool, &[group_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// (b) trust ON: an OIDC claim naming an existing operator-managed
+        /// group attaches the user (membership row only), and the group stays
+        /// operator-owned — `external_source` and `external_provider_id` both
+        /// remain NULL.
+        #[tokio::test]
+        async fn test_trust_on_operator_group_attached_owner_unchanged() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("ops-team");
+            let group_id = make_operator_group(&pool, &name).await;
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "oidc",
+                std::slice::from_ref(&name),
+                true,
+            )
+            .await
+            .expect("sync succeeds; trusted operator-group attach");
+
+            assert!(
+                user_is_in_group(&pool, user_id, group_id).await,
+                "trust ON: user must be attached to the operator group"
+            );
+            assert_eq!(
+                group_external_source(&pool, group_id).await,
+                None,
+                "operator group must stay NULL-source (not adopted into OIDC namespace)"
+            );
+            assert_eq!(
+                group_external_provider_id(&pool, group_id).await,
+                None,
+                "operator group's external_provider_id must stay NULL"
+            );
+
+            cleanup_groups(&pool, &[group_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// (c) cross-provider isolation: provider B first auto-creates an
+        /// oidc-owned group `H` (source='oidc', provider=B). Provider A with
+        /// trust ON claiming `H` must NOT attach A's user, and `H`'s owner is
+        /// unchanged (still provider B). Trust only relaxes the NULL-source
+        /// operator case, never a foreign provider's oidc-owned group.
+        #[tokio::test]
+        async fn test_trust_on_cross_provider_oidc_group_not_attached() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_b = make_user(&pool).await;
+            let user_a = make_user(&pool).await;
+            let provider_b = Uuid::new_v4();
+            let provider_a = Uuid::new_v4();
+            let name = rand_group_name("shared");
+
+            // Provider B auto-creates the oidc-owned group.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_b,
+                provider_b,
+                "oidc",
+                std::slice::from_ref(&name),
+                false,
+            )
+            .await
+            .expect("provider B first sync auto-creates its oidc group");
+            let group_id = group_id_by_name(&pool, &name).await.expect("B's group");
+
+            // Provider A, trust ON, claims the same name.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_a,
+                provider_a,
+                "oidc",
+                std::slice::from_ref(&name),
+                true,
+            )
+            .await
+            .expect("provider A sync succeeds; foreign oidc group is refused");
+
+            assert!(
+                !user_is_in_group(&pool, user_a, group_id).await,
+                "trust ON must NOT attach A's user to B's oidc-owned group"
+            );
+            assert_eq!(
+                group_external_source(&pool, group_id).await.as_deref(),
+                Some("oidc"),
+                "B's group stays oidc-owned"
+            );
+            assert_eq!(
+                group_external_provider_id(&pool, group_id).await,
+                Some(provider_b),
+                "B's group's external_provider_id must stay provider B"
+            );
+
+            cleanup_groups(&pool, &[group_id]).await;
+            cleanup_user(&pool, user_a).await;
+            cleanup_user(&pool, user_b).await;
+        }
+
+        /// (d) trust ON, brand-new name: no group exists, so the guarded
+        /// auto-create path still runs — the group is created oidc-owned and
+        /// the user attached. Proves trust does not break the create path.
+        #[tokio::test]
+        async fn test_trust_on_new_name_auto_creates_oidc_group() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("brand-new");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "oidc",
+                std::slice::from_ref(&name),
+                true,
+            )
+            .await
+            .expect("trusted sync of a brand-new name auto-creates + attaches");
+
+            let group_id = group_id_by_name(&pool, &name)
+                .await
+                .expect("group auto-created");
+            assert!(
+                user_is_in_group(&pool, user_id, group_id).await,
+                "user must be attached to the auto-created group"
+            );
+            assert_eq!(
+                group_external_source(&pool, group_id).await.as_deref(),
+                Some("oidc"),
+                "auto-created group is oidc-owned"
+            );
+            assert_eq!(
+                group_external_provider_id(&pool, group_id).await,
+                Some(provider_id),
+                "auto-created group owned by this provider"
+            );
+
+            cleanup_groups(&pool, &[group_id]).await;
             cleanup_user(&pool, user_id).await;
         }
     }

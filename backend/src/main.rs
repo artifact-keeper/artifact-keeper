@@ -1564,6 +1564,7 @@ fn build_oidc_request_from_values(
         pkce_enabled: None,
         map_groups_to_groups: None,
         allow_legacy_rsa_keys: None,
+        trust_group_names: None,
     })
 }
 
