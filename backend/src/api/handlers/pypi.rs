@@ -719,8 +719,8 @@ async fn simple_project(
                     }
                 }
 
-                // Rewrite absolute download URLs to route through our proxy
-                let body_bytes: Vec<u8> = if ct.contains("text/html") {
+                // Rewrite absolute download URLs to route through our proxy.
+                if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                     let rewritten = filter_pypi_simple_html_response(
@@ -731,13 +731,56 @@ async fn simple_project(
                         rewritten,
                     )
                     .await;
-                    rewritten.into_bytes()
-                } else {
-                    content.to_vec()
-                };
+                    // HTTP caching (#2773): ETag + Cache-Control + 304.
+                    return Ok(cacheable_response(rewritten.into_bytes(), &ct, &headers));
+                }
 
-                // HTTP caching (#2773): ETag + Cache-Control + 304.
-                return Ok(cacheable_response(body_bytes, &ct, &headers));
+                // #2801: the upstream Content-Type is neither JSON (handled
+                // above) nor `text/html` — a corporate proxy / quirky mirror
+                // may have mislabeled the body (e.g. `application/octet-stream`).
+                // Sniff the body instead of trusting the label and run it
+                // through the SAME rewrite path; never serve the raw upstream
+                // bytes, which carry un-rewritten offsite download URLs.
+                return match sniff_simple_index(&content) {
+                    SniffedSimpleIndex::Json => {
+                        match rewrite_upstream_simple_json(&content, &repo_key, &normalized) {
+                            Some(json) => {
+                                let json = filter_pypi_simple_json_response(
+                                    &state,
+                                    &repo,
+                                    &effective_upstream,
+                                    &project,
+                                    json,
+                                )
+                                .await;
+                                Ok(cacheable_response(
+                                    json.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                            None => Ok(bad_upstream_simple_index()),
+                        }
+                    }
+                    SniffedSimpleIndex::Html => {
+                        let html = String::from_utf8_lossy(&content);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let rewritten = filter_pypi_simple_html_response(
+                            &state,
+                            &repo,
+                            &effective_upstream,
+                            &project,
+                            rewritten,
+                        )
+                        .await;
+                        Ok(cacheable_response(
+                            rewritten.into_bytes(),
+                            "text/html; charset=utf-8",
+                            &headers,
+                        ))
+                    }
+                    SniffedSimpleIndex::Binary => Ok(bad_upstream_simple_index()),
+                };
             }
         }
         // For virtual repos, iterate through ALL members and union their
@@ -987,7 +1030,7 @@ async fn simple_project(
                         }
                     }
 
-                    let body_bytes: Vec<u8> = if ct.contains("text/html") {
+                    if ct.contains("text/html") {
                         let html = String::from_utf8_lossy(&content);
                         let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
                         let merged = merge_local_into_remote_simple_html(
@@ -997,13 +1040,51 @@ async fn simple_project(
                             &local_artifacts,
                             &tracks,
                         );
-                        merged.into_bytes()
-                    } else {
-                        content.to_vec()
-                    };
+                        // HTTP caching (#2773): ETag + Cache-Control + 304.
+                        return Ok(cacheable_response(merged.into_bytes(), &ct, &headers));
+                    }
 
-                    // HTTP caching (#2773): ETag + Cache-Control + 304.
-                    return Ok(cacheable_response(body_bytes, &ct, &headers));
+                    // #2801: the upstream Content-Type is neither JSON (handled
+                    // above) nor `text/html` — a proxy / quirky mirror may have
+                    // mislabeled the body (e.g. `application/octet-stream`).
+                    // Sniff the body and run it through the SAME merge path
+                    // (splicing local members) instead of serving raw upstream
+                    // bytes with un-rewritten offsite download URLs.
+                    return match sniff_simple_index(&content) {
+                        SniffedSimpleIndex::Json => {
+                            match merge_local_into_remote_simple_json(
+                                &content,
+                                &repo_key,
+                                &normalized,
+                                &local_artifacts,
+                                &tracks,
+                            ) {
+                                Some(json) => Ok(cacheable_response(
+                                    json.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                )),
+                                None => Ok(bad_upstream_simple_index()),
+                            }
+                        }
+                        SniffedSimpleIndex::Html => {
+                            let html = String::from_utf8_lossy(&content);
+                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                            let merged = merge_local_into_remote_simple_html(
+                                &rewritten,
+                                &repo_key,
+                                &normalized,
+                                &local_artifacts,
+                                &tracks,
+                            );
+                            Ok(cacheable_response(
+                                merged.into_bytes(),
+                                "text/html; charset=utf-8",
+                                &headers,
+                            ))
+                        }
+                        SniffedSimpleIndex::Binary => Ok(bad_upstream_simple_index()),
+                    };
                 }
             }
         }
@@ -2773,6 +2854,63 @@ fn find_upstream_url_for_file(
 /// Keeping these attributes would cause pip to request a `.metadata` URL that
 /// returns 404, which pip treats as a hard error since the index promised the
 /// metadata was available.
+/// Classification of a proxied PyPI simple-index body sniffed from its
+/// content, used when the upstream `Content-Type` is neither PEP 691 JSON nor
+/// PEP 503 HTML. See #2801: corporate outbound proxies / quirky mirrors
+/// sometimes rewrite the simple-index Content-Type (e.g. to
+/// `application/octet-stream`). Trusting that label made the handler serve the
+/// raw upstream body — leaking un-rewritten offsite `files.pythonhosted.*`
+/// download URLs (fatal in air-gapped / NO_PROXY installs) and tripping uv's
+/// `Unsupported Content-Type` check. We sniff the body instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SniffedSimpleIndex {
+    /// Body looks like PEP 691 JSON (first non-whitespace byte is `{` or `[`).
+    Json,
+    /// Body looks like PEP 503 HTML (`<a `, `<!doctype`, or `<html`).
+    Html,
+    /// Unrecognizable / binary — must NOT be served raw.
+    Binary,
+}
+
+/// Sniff a proxied simple-index body by content. Only invoked from the render
+/// fallthrough, i.e. when the upstream `Content-Type` was neither JSON nor
+/// `text/html`, so the conformant happy path is never reclassified. PEP 691
+/// JSON is detected by a leading `{`/`[`; PEP 503 HTML by an anchor tag or an
+/// HTML doctype/root element within a bounded prefix. Anything else is
+/// [`SniffedSimpleIndex::Binary`] and the caller returns 502 rather than serve
+/// raw upstream bytes (#2801).
+fn sniff_simple_index(body: &[u8]) -> SniffedSimpleIndex {
+    // Skip a UTF-8 BOM and any leading ASCII whitespace.
+    let body = body.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(body);
+    let start = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let trimmed = &body[start..];
+    match trimmed.first() {
+        Some(b'{') | Some(b'[') => SniffedSimpleIndex::Json,
+        _ => {
+            // Inspect only a bounded prefix for HTML markers.
+            let head_len = trimmed.len().min(4096);
+            let head = String::from_utf8_lossy(&trimmed[..head_len]).to_ascii_lowercase();
+            if head.contains("<a ") || head.contains("<!doctype") || head.contains("<html") {
+                SniffedSimpleIndex::Html
+            } else {
+                SniffedSimpleIndex::Binary
+            }
+        }
+    }
+}
+
+/// 502 for a proxied simple index whose upstream body cannot be rendered as a
+/// PEP 503/691 document. Shared by the direct-remote and virtual render
+/// fallthroughs so neither ever serves raw upstream bytes / offsite download
+/// URLs to the client (#2801).
+fn bad_upstream_simple_index() -> Response {
+    AppError::BadGateway("upstream returned a non-simple-index response".to_string())
+        .into_response()
+}
+
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
@@ -3691,6 +3829,115 @@ mod tests {
     #[test]
     fn test_rewrite_upstream_simple_json_returns_none_for_non_json() {
         assert!(rewrite_upstream_simple_json(b"<!DOCTYPE html><html></html>", "r", "p").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #2801: content-sniffing hardening for the simple-index proxy. When an
+    // upstream / corporate proxy mislabels the simple-index Content-Type (e.g.
+    // `application/octet-stream`), the render fallthrough must sniff the body
+    // and rewrite it through the proxy, never serve raw offsite URLs, and 502
+    // on a genuinely unrecognizable body.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sniff_simple_index_classifies_json_html_and_binary() {
+        // Leading `{` / `[` (with leading whitespace + BOM) => JSON.
+        assert_eq!(
+            sniff_simple_index(b"  \n  {\"meta\":{}}"),
+            SniffedSimpleIndex::Json
+        );
+        assert_eq!(sniff_simple_index(b"[1,2,3]"), SniffedSimpleIndex::Json);
+        assert_eq!(
+            sniff_simple_index(b"\xEF\xBB\xBF{\"files\":[]}"),
+            SniffedSimpleIndex::Json
+        );
+
+        // PEP 503 markers => HTML.
+        assert_eq!(
+            sniff_simple_index(b"<!DOCTYPE html><html><body></body></html>"),
+            SniffedSimpleIndex::Html
+        );
+        assert_eq!(
+            sniff_simple_index(b"<a href=\"x-1.0.tar.gz\">x-1.0.tar.gz</a>"),
+            SniffedSimpleIndex::Html
+        );
+
+        // Anything else => Binary.
+        assert_eq!(
+            sniff_simple_index(&[0x00, 0x01, 0x02, 0xff, 0xfe]),
+            SniffedSimpleIndex::Binary
+        );
+        assert_eq!(sniff_simple_index(b""), SniffedSimpleIndex::Binary);
+        assert_eq!(
+            sniff_simple_index(b"just some plain text, not an index"),
+            SniffedSimpleIndex::Binary
+        );
+    }
+
+    #[test]
+    fn test_sniff_then_rewrite_json_body_mislabeled_octet_stream() {
+        // (a) A PEP 691 JSON body that upstream labeled `application/octet-stream`.
+        // The fix sniffs it as JSON, then rewrites files[].url through the repo
+        // and serves the JSON simple-index media type — no offsite URL survives.
+        let upstream = r#"{
+            "meta": {"api-version": "1.1"},
+            "name": "jsonpkg",
+            "versions": ["1.0.0"],
+            "files": [
+                {
+                    "filename": "jsonpkg-1.0.0-py3-none-any.whl",
+                    "url": "https://files.pythonhosted.org/packages/aa/bb/jsonpkg-1.0.0-py3-none-any.whl",
+                    "hashes": {"sha256": "deadbeef"}
+                }
+            ]
+        }"#;
+
+        assert_eq!(
+            sniff_simple_index(upstream.as_bytes()),
+            SniffedSimpleIndex::Json
+        );
+
+        let out =
+            rewrite_upstream_simple_json(upstream.as_bytes(), "bgd-htmlv", "jsonpkg").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            json["files"][0]["url"],
+            "/pypi/bgd-htmlv/simple/jsonpkg/jsonpkg-1.0.0-py3-none-any.whl"
+        );
+        // No offsite download URL leaks into the rendered body.
+        assert!(!out.contains("files.pythonhosted"));
+    }
+
+    #[test]
+    fn test_sniff_then_rewrite_html_body_mislabeled_octet_stream() {
+        // (b) A PEP 503 HTML body labeled `application/octet-stream`. Sniffed as
+        // HTML, then the anchor href is rewritten through the repo.
+        let upstream = r#"<!DOCTYPE html><html><body>
+<a href="https://files.pythonhosted.org/packages/ab/cd/htmlpkg-2.0.0.tar.gz#sha256=abc123">htmlpkg-2.0.0.tar.gz</a>
+</body></html>"#;
+
+        assert_eq!(
+            sniff_simple_index(upstream.as_bytes()),
+            SniffedSimpleIndex::Html
+        );
+
+        let out = rewrite_upstream_urls(upstream, "bgd-htmlv", "htmlpkg");
+        assert!(out.contains(
+            "href=\"/pypi/bgd-htmlv/simple/htmlpkg/htmlpkg-2.0.0.tar.gz#sha256=abc123\""
+        ));
+        // No offsite download URL leaks into the rendered body.
+        assert!(!out.contains("files.pythonhosted"));
+    }
+
+    #[test]
+    fn test_binary_body_yields_502_and_no_offsite_urls() {
+        // (c) Unrecognizable / binary upstream body => 502 Bad Gateway, and we
+        // never render the raw bytes. The classifier refuses it up front.
+        let garbage: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(sniff_simple_index(garbage), SniffedSimpleIndex::Binary);
+
+        let resp = bad_upstream_simple_index();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
