@@ -395,6 +395,16 @@ impl PeerService {
         local_peer_id: Uuid,
         announcement: PeerAnnouncement,
     ) -> Result<()> {
+        // Apply both UPSERTs atomically: the peer-instance overwrite of
+        // endpoint_url/api_key and the connection entry must either both land or
+        // both roll back. Without a shared transaction a failure of the second
+        // statement would leave a partially-applied (torn) write behind.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         // UPSERT the announcing peer into peer_instances
         sqlx::query!(
             r#"
@@ -408,7 +418,7 @@ impl PeerService {
             announcement.endpoint_url,
             announcement.api_key,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -422,9 +432,13 @@ impl PeerService {
             local_peer_id,
             announcement.peer_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -782,6 +796,144 @@ mod tests {
                 AppError::Database(_) => {}
                 other => panic!("unrelated database error must map to Database, got {other:?}"),
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_peer_announcement atomicity (GHSA-gw36)
+    //
+    // The two UPSERTs (peer_instances endpoint_url/api_key overwrite +
+    // peer_connections entry) share ONE transaction, so a failure of the
+    // second statement must roll the first back rather than leaving a
+    // partially-applied (torn) write.
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`), matching
+    // the in-`src` DB-test convention used across this crate.
+    // -----------------------------------------------------------------------
+    mod handle_peer_announcement_atomic_db {
+        use super::super::{PeerAnnouncement, PeerService};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// Read back a peer's current endpoint_url/api_key by name.
+        async fn endpoint_and_key(pool: &PgPool, name: &str) -> (String, String) {
+            let row: (String, String) =
+                sqlx::query_as("SELECT endpoint_url, api_key FROM peer_instances WHERE name = $1")
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await
+                    .expect("peer row should exist");
+            row
+        }
+
+        async fn peer_name(pool: &PgPool, id: Uuid) -> String {
+            sqlx::query_scalar::<_, String>("SELECT name FROM peer_instances WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("peer row should exist")
+        }
+
+        /// A failure of the SECOND statement (connection UPSERT) must roll back
+        /// the FIRST (the endpoint_url/api_key overwrite). We force the second
+        /// statement to fail by announcing with a `local_peer_id` that does not
+        /// exist, which trips the `source_peer_id` foreign key on
+        /// `peer_connections`.
+        #[tokio::test]
+        async fn test_second_statement_failure_rolls_back_overwrite() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // Existing peer with its original endpoint/api_key.
+            let peer_id = tdh::register_test_peer(&pool, "gw36-torn", "a").await;
+            let name = peer_name(&pool, peer_id).await;
+            let (orig_endpoint, orig_key) = endpoint_and_key(&pool, &name).await;
+
+            let svc = PeerService::new(pool.clone());
+            // Non-existent source => peer_connections source FK (23503) fails on
+            // the second statement, after the first has already run in the tx.
+            let missing_local = Uuid::new_v4();
+            let result = svc
+                .handle_peer_announcement(
+                    missing_local,
+                    PeerAnnouncement {
+                        peer_id,
+                        name: name.clone(),
+                        endpoint_url: "https://attacker.example.invalid".to_string(),
+                        api_key: "OVERWRITTEN-KEY".to_string(),
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "announcement with an invalid source peer must fail"
+            );
+
+            // The overwrite must have rolled back: endpoint_url/api_key unchanged.
+            let (endpoint_after, key_after) = endpoint_and_key(&pool, &name).await;
+            assert_eq!(
+                endpoint_after, orig_endpoint,
+                "endpoint_url must be unchanged after a rolled-back announcement"
+            );
+            assert_eq!(
+                key_after, orig_key,
+                "api_key must be unchanged after a rolled-back announcement"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&pool)
+                .await;
+        }
+
+        /// A fully-successful announcement applies BOTH writes: the peer's
+        /// endpoint_url/api_key are overwritten and the connection row exists.
+        #[tokio::test]
+        async fn test_successful_announcement_applies_both_writes() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let local_peer_id = tdh::register_test_peer(&pool, "gw36-local", "a").await;
+            let remote_peer_id = tdh::register_test_peer(&pool, "gw36-remote", "a").await;
+            let remote_name = peer_name(&pool, remote_peer_id).await;
+
+            let svc = PeerService::new(pool.clone());
+            svc.handle_peer_announcement(
+                local_peer_id,
+                PeerAnnouncement {
+                    peer_id: remote_peer_id,
+                    name: remote_name.clone(),
+                    endpoint_url: "https://remote.example.test/new".to_string(),
+                    api_key: "new-key".to_string(),
+                },
+            )
+            .await
+            .expect("valid announcement should succeed");
+
+            let (endpoint_after, key_after) = endpoint_and_key(&pool, &remote_name).await;
+            assert_eq!(endpoint_after, "https://remote.example.test/new");
+            assert_eq!(key_after, "new-key");
+
+            let connection_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM peer_connections \
+                 WHERE source_peer_id = $1 AND target_peer_id = $2",
+            )
+            .bind(local_peer_id)
+            .bind(remote_peer_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count connections");
+            assert_eq!(connection_count, 1, "connection row must have been created");
+
+            let _ = sqlx::query("DELETE FROM peer_connections WHERE source_peer_id = $1")
+                .bind(local_peer_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
+                .bind(vec![local_peer_id, remote_peer_id])
+                .execute(&pool)
+                .await;
         }
     }
 }
