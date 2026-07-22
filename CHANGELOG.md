@@ -12,6 +12,8 @@ A patch release for the 1.6.0 line, driven by early-adopter field reports. It fi
 ### Security
 
 - **Bundled Grype vulnerability database updated to v0.116.0** to clear CVE-2026-56852 flagged by the container scan (#2749).
+- **The API-token-as-Basic-password fallback is strictly confined to format/registry endpoints**: the `/api/v1` management API now refuses an API token supplied in the Basic-auth password position (callers use `Authorization: Bearer <token>`), enforcing the documented boundary across the hard-auth, optional-auth, and admin surfaces. bcrypt username/password and Bearer tokens are unchanged, and token-as-Basic on package-manager endpoints is preserved (#2806).
+- **PyPI simple-index proxy responses are content-sniffed instead of trusting the upstream `Content-Type`**: an upstream (or intermediary proxy) that returns a simple-index body labeled with a non-standard content type no longer causes Artifact Keeper to serve the raw upstream bytes with un-rewritten offsite download URLs. The body is classified and its download URLs are rewritten through the repository; unrecognizable bodies return `502` (#2801).
 
 ### Fixed
 
