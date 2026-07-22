@@ -173,7 +173,15 @@ pub async fn guest_access_guard(
     // Inner middlewares re-resolve and populate request extensions for handlers
     // on requests that pass the guard.
     let extracted = extract_visibility_token(&request);
-    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted).await;
+    // Pass `allow_basic_api_token=true`: this global guard runs BEFORE the inner
+    // middlewares and only decides pass/block for the anonymous-disabled policy,
+    // mirroring the format extractor above. A package client pulling a format
+    // endpoint with `-u any:<api_token>` must clear this gate exactly as it did
+    // before the #2806 boundary fix. It does NOT grant /api/v1 access: the inner
+    // `optional_auth_middleware` / `admin_middleware` re-resolve with
+    // `allow_basic_api_token=false` and still refuse an API token as the Basic
+    // password on the management API.
+    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true).await;
     match guard_short_circuit(&outcome) {
         Some(response) => response,
         None => next.run(request).await,
