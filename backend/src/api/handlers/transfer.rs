@@ -1,7 +1,7 @@
 //! Chunked transfer API handlers for swarm-based artifact distribution.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     routing::{get, post},
     Json, Router,
 };
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::transfer_service::{InitTransferRequest, TransferService};
@@ -93,9 +94,11 @@ pub struct FailBody {
 )]
 async fn init_transfer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Json(body): Json<InitTransferBody>,
 ) -> Result<Json<TransferSessionResponse>> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
 
     let session = service
@@ -213,9 +216,11 @@ async fn get_session(
 )]
 async fn complete_chunk(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
     Json(body): Json<CompleteChunkBody>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service
         .complete_chunk(session_id, chunk_index, &body.checksum, body.source_peer_id)
@@ -241,9 +246,11 @@ async fn complete_chunk(
 )]
 async fn fail_chunk(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
     Json(body): Json<FailBody>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service
         .fail_chunk(session_id, chunk_index, &body.error)
@@ -268,8 +275,10 @@ async fn fail_chunk(
 )]
 async fn retry_chunk(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service.retry_chunk(session_id, chunk_index).await
 }
@@ -291,8 +300,10 @@ async fn retry_chunk(
 )]
 async fn complete_session(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service.complete_session(session_id).await
 }
@@ -315,9 +326,11 @@ async fn complete_session(
 )]
 async fn fail_session(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<FailBody>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service.fail_session(session_id, &body.error).await
 }
@@ -650,5 +663,104 @@ mod tests {
             format!("{:?}", TransferStatus::Failed).to_lowercase(),
             "failed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization tests for the transfer data-plane routes (GHSA-f7qf).
+    //
+    // init_transfer (and its sibling chunk/session mutators) drive federation
+    // transfer sessions and are admin-only, mirroring `peers::register_peer`. A
+    // non-admin authenticated caller must be rejected with 403 FORBIDDEN before
+    // any session is created; an admin passes the gate. Before the guard a
+    // non-admin was let straight through to the service layer.
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`).
+    // -----------------------------------------------------------------------
+    mod authz {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use axum::body::Bytes;
+        use axum::http::StatusCode;
+        use axum::Router;
+        use uuid::Uuid;
+
+        fn admin() -> AuthExtension {
+            let mut a = tdh::make_auth(Uuid::new_v4(), "fed.admin");
+            a.is_admin = true;
+            a
+        }
+
+        fn non_admin() -> AuthExtension {
+            tdh::make_auth(Uuid::new_v4(), "low.priv")
+        }
+
+        fn transfer_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+            // Mirror the production mount point: transfer::router() lives under
+            // /:id/transfer.
+            let router = Router::new().nest("/:id/transfer", super::super::router());
+            tdh::router_with_auth_ext(router, state, auth)
+        }
+
+        fn init_req(peer: Uuid) -> axum::http::Request<axum::body::Body> {
+            tdh::post(
+                format!("/{}/transfer/init", peer),
+                "application/json",
+                Bytes::from(format!("{{\"artifact_id\":\"{}\"}}", Uuid::new_v4()).into_bytes()),
+            )
+        }
+
+        #[tokio::test]
+        async fn non_admin_cannot_init_transfer() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-transfer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-init", "deny").await;
+
+            let (status, _) = tdh::send(transfer_app(state, non_admin()), init_req(peer)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a non-admin must be denied (403) on init_transfer, before any \
+                 transfer session is created"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn admin_passes_init_transfer_gate() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-transfer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-init", "allow").await;
+
+            // An admin clears the authorization gate and reaches the service
+            // layer; with a random artifact id the service returns 404
+            // "Artifact not found" — crucially NOT a 403. This proves the guard
+            // does not over-block legitimate admin callers.
+            let (status, _) = tdh::send(transfer_app(state, admin()), init_req(peer)).await;
+
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an admin must clear the authorization gate on init_transfer"
+            );
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "admin reaches the service layer; unknown artifact -> 404"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
     }
 }

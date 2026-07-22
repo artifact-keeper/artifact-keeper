@@ -1,7 +1,7 @@
 //! Mesh peer discovery and management API handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     routing::{get, post, put},
     Json, Router,
 };
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::peer_service::{PeerService, PeerStatus, ProbeResult};
@@ -285,8 +286,10 @@ async fn probe_peer(
 )]
 async fn mark_unreachable(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, target_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = PeerService::new(state.db.clone());
     service.mark_unreachable(peer_id, target_id).await
 }
@@ -352,9 +355,11 @@ async fn get_chunk_availability(
 )]
 async fn update_chunk_availability(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateChunkAvailabilityBody>,
 ) -> Result<()> {
+    auth.require_admin()?;
     let service = TransferService::new(state.db.clone());
     service
         .update_chunk_availability(peer_id, artifact_id, &body.chunk_bitmap, body.total_chunks)
@@ -453,9 +458,11 @@ async fn get_scored_peers(
 )]
 async fn update_network_profile(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(peer_id): Path<Uuid>,
     Json(body): Json<NetworkProfileBody>,
 ) -> Result<()> {
+    auth.require_admin()?;
     // Parse time strings if provided
     let window_start = body
         .sync_window_start
@@ -1081,6 +1088,173 @@ mod tests {
 
             let _ = sqlx::query("DELETE FROM peer_instances WHERE id = ANY($1)")
                 .bind(vec![src, dst])
+                .execute(&pool)
+                .await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization tests for the peer data-plane management routes (GHSA-f7qf).
+    //
+    // The mutating peer routes (update_network_profile, update_chunk_availability,
+    // mark_unreachable) manage federation-wide transfer / chunk / network state
+    // and are admin-only, mirroring `peers::register_peer`. A non-admin
+    // authenticated caller must be rejected with 403 FORBIDDEN before any state
+    // change; an admin still succeeds. Before the guard these returned 2xx (or a
+    // service-level error) for a non-admin — never a 403.
+    //
+    // Runtime-skips when no `DATABASE_URL` is set (NOT `#[ignore]`).
+    // -----------------------------------------------------------------------
+    mod authz {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use axum::body::Bytes;
+        use axum::http::StatusCode;
+        use axum::Router;
+        use uuid::Uuid;
+
+        fn admin() -> AuthExtension {
+            let mut a = tdh::make_auth(Uuid::new_v4(), "fed.admin");
+            a.is_admin = true;
+            a
+        }
+
+        fn non_admin() -> AuthExtension {
+            // make_auth defaults to is_admin: false — a plain authenticated user.
+            tdh::make_auth(Uuid::new_v4(), "low.priv")
+        }
+
+        fn profile_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+            // network_profile_router()'s handler extracts Path<Uuid>, so mount it
+            // behind a `/:id` prefix to supply the peer id.
+            let router = Router::new().nest("/:id", super::super::network_profile_router());
+            tdh::router_with_auth_ext(router, state, auth)
+        }
+
+        fn chunk_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+            let router = Router::new().nest("/:id/chunks", super::super::chunk_router());
+            tdh::router_with_auth_ext(router, state, auth)
+        }
+
+        fn conn_app(state: crate::api::SharedState, auth: AuthExtension) -> Router {
+            let router = Router::new().nest("/:id/connections", super::super::peer_router());
+            tdh::router_with_auth_ext(router, state, auth)
+        }
+
+        #[tokio::test]
+        async fn non_admin_cannot_update_network_profile() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-np", "deny").await;
+
+            let (status, _) = tdh::send(
+                profile_app(state, non_admin()),
+                tdh::put_json(
+                    format!("/{}/network-profile", peer),
+                    Bytes::from_static(b"{}"),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a non-admin must be denied (403) on update_network_profile"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn admin_can_update_network_profile() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-np", "allow").await;
+
+            let (status, _) = tdh::send(
+                profile_app(state, admin()),
+                tdh::put_json(
+                    format!("/{}/network-profile", peer),
+                    Bytes::from_static(b"{\"max_bandwidth_bps\":1000}"),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an admin must still be able to update a peer network profile"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn non_admin_cannot_update_chunk_availability() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-chunk", "deny").await;
+
+            let (status, _) = tdh::send(
+                chunk_app(state, non_admin()),
+                tdh::put_json(
+                    format!("/{}/chunks/{}", peer, Uuid::new_v4()),
+                    Bytes::from_static(b"{\"chunk_bitmap\":[1],\"total_chunks\":1}"),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a non-admin must be denied (403) on update_chunk_availability, \
+                 before any chunk-availability row is written"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn non_admin_cannot_mark_unreachable() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = tdh::build_state(pool.clone(), "/tmp/ph-peer-authz");
+            let peer = tdh::register_test_peer(&pool, "authz-unreach", "deny").await;
+
+            let (status, _) = tdh::send(
+                conn_app(state, non_admin()),
+                tdh::post(
+                    format!("/{}/connections/{}/unreachable", peer, Uuid::new_v4()),
+                    "application/json",
+                    Bytes::new(),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a non-admin must be denied (403) on mark_unreachable"
+            );
+
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
                 .execute(&pool)
                 .await;
         }
