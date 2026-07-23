@@ -1,0 +1,69 @@
+# Curated release announcements → Discord #announcements
+#
+# Install: copy to .github/workflows/release-announce.yml in the artifact-keeper
+# (backend) repo. Create a webhook on the Discord #announcements channel
+# (Edit Channel → Integrations → Webhooks → New Webhook → Copy URL) and store it
+# as the repo secret DISCORD_RELEASE_WEBHOOK.
+#
+# Fires when a GitHub Release is published. Posts a clean embed with a human
+# title and a link to the full notes, instead of dumping raw release events.
+
+name: Announce release on Discord
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post release embed to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          TAG: ${{ github.event.release.tag_name }}
+          NAME: ${{ github.event.release.name }}
+          URL: ${{ github.event.release.html_url }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "DISCORD_RELEASE_WEBHOOK not set; skipping."
+            exit 0
+          fi
+
+          TITLE="Artifact Keeper ${NAME:-$TAG} released"
+          if [ "${PRERELEASE}" = "true" ]; then
+            TITLE="Artifact Keeper ${NAME:-$TAG} (pre-release) is out"
+            COLOR=16763904   # amber
+          else
+            COLOR=4177711    # brand green (#3FB950)
+          fi
+
+          DESCRIPTION="A new ${PRERELEASE:+pre-}release is available. Read the full notes and upgrade instructions below.\n\n[Release notes and changelog](${URL})"
+
+          # Build payload with jq so release text is safely escaped.
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg desc "$DESCRIPTION" \
+            --arg url "$URL" \
+            --argjson color "$COLOR" \
+            '{
+              username: "Artifact Keeper",
+              embeds: [ {
+                title: $title,
+                description: $desc,
+                url: $url,
+                color: $color,
+                footer: { text: "artifactkeeper.com" }
+              } ]
+            }')
+
+          curl -sfSL -X POST -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$WEBHOOK"
+
+          echo "Announced ${TAG} to Discord."
