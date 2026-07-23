@@ -35,6 +35,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -371,9 +372,36 @@ struct RpmArtifact {
 /// repodata must never describe those as packages (#2590). Delta RPMs
 /// (`.drpm`) are also excluded — they belong in `prestodelta` metadata,
 /// which we do not generate, not in `primary.xml`.
-async fn list_rpm_artifacts(
+/// The repositories a repodata response for `repo` describes: the repo
+/// itself for Hosted (Local/Staging) repos, or the member repo ids for
+/// Virtual repos — otherwise `repomd.xml`/`primary.xml.gz` advertise
+/// `packages="0"` and `dnf` treats the aggregate repo as empty even though
+/// the members hold packages (#1780).
+///
+/// Sorted so the id set is canonical: `fetch_virtual_members` orders by
+/// `vrm.priority`, which is not a total order, and both the fingerprint
+/// comparison (#2521) and the render must not depend on member visit order
+/// for the output (and therefore the detached signature) to be reproducible
+/// (#2636).
+async fn repodata_repo_ids(
     db: &sqlx::PgPool,
-    repo_id: uuid::Uuid,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let mut ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Collect the RPM artifacts a repodata response should describe, in a
+/// deterministic total order (`ORDER BY name, version, path, id`) so
+/// unchanged state always renders byte-identical documents (#2636).
+async fn collect_repodata_artifacts(
+    db: &sqlx::PgPool,
+    repo_ids: &[uuid::Uuid],
 ) -> Result<Vec<RpmArtifact>, Response> {
     let rows = sqlx::query!(
         r#"
@@ -381,11 +409,11 @@ async fn list_rpm_artifacts(
                a.storage_key, a.updated_at, am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1 AND a.is_deleted = false
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
           AND a.path LIKE '%.rpm'
         ORDER BY a.name, a.version, a.path, a.id
         "#,
-        repo_id
+        repo_ids
     )
     .fetch_all(db)
     .await
@@ -407,45 +435,82 @@ async fn list_rpm_artifacts(
         .collect())
 }
 
-/// Collect the RPM artifacts a repodata response should describe.
+/// The current [`RepodataFingerprint`] for `repo_ids`: one aggregate query
+/// (count + latest `updated_at` over the live `.rpm` rows — an index scan
+/// with no row transfer and no metadata join), revalidated on every repodata
+/// request so a publish/delete/promotion is visible on the very next read.
 ///
-/// For Hosted (Local/Staging) repos this is just the repo's own artifacts.
-/// For Virtual repos the metadata must reflect the union of every member
-/// repo's packages — otherwise `repomd.xml`/`primary.xml.gz` advertise
-/// `packages="0"` and `dnf` treats the aggregate repo as empty even though
-/// the members hold packages (#1780). We resolve the member repo IDs via
-/// `fetch_virtual_members` and concatenate each member's artifact list.
-///
-/// The result is sorted into the same deterministic total order
-/// `list_rpm_artifacts` returns. Concatenating per-member lists inherits
-/// `fetch_virtual_members`' `ORDER BY vrm.priority`, which is not a total
-/// order — members sharing a priority can be visited in either order — so the
-/// merged list needed its own ordering for the render (and therefore the
-/// detached signature) to be reproducible (#2636).
-async fn collect_repodata_artifacts(
+/// The `.rpm` scoping matches `collect_repodata_artifacts` exactly: the
+/// fingerprint must move if and only if the rendered row set can change.
+async fn repodata_fingerprint(
     db: &sqlx::PgPool,
-    repo: &RepoInfo,
-) -> Result<Vec<RpmArtifact>, Response> {
-    if repo.repo_type != RepositoryType::Virtual {
-        return list_rpm_artifacts(db, repo.id).await;
-    }
+    repo_ids: Vec<uuid::Uuid>,
+) -> Result<RepodataFingerprint, Response> {
+    let row = sqlx::query!(
+        r#"
+        SELECT COUNT(*) AS "live_rpm_count!", MAX(a.updated_at) AS latest_update
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+        "#,
+        &repo_ids
+    )
+    .fetch_one(db)
+    .await
+    .map_err(super::db_err)?;
 
-    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
-    let mut artifacts = Vec::new();
-    for member in &members {
-        artifacts.extend(list_rpm_artifacts(db, member.id).await?);
-    }
-    artifacts.sort_by(|a, b| {
-        (&a.name, &a.version, &a.path, &a.id).cmp(&(&b.name, &b.version, &b.path, &b.id))
-    });
-    Ok(artifacts)
+    Ok(RepodataFingerprint {
+        repo_ids,
+        live_rpm_count: row.live_rpm_count,
+        latest_update: row.latest_update,
+    })
+}
+
+/// Serve the rendered repodata set for `repo` through the fingerprint-
+/// validated cache (#2521): a warm request costs the fingerprint query plus
+/// a refcount clone of the prebuilt bytes; a state change re-renders exactly
+/// once (concurrent misses coalesce on a per-repo single-flight lock). The
+/// O(repo) generation itself runs on the blocking pool so large renders do
+/// not stall the async runtime.
+async fn cached_repodata(
+    state: &SharedState,
+    repo: &RepoInfo,
+) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
+    let repo_ids = repodata_repo_ids(&state.db, repo).await?;
+    // Captured BEFORE the artifact rows are fetched: a write racing the
+    // render can only make the stored entry look older than its content, so
+    // the next request re-renders — never serves stale bytes as fresh.
+    let fingerprint = repodata_fingerprint(&state.db, repo_ids).await?;
+    let db = state.db.clone();
+    let ids = fingerprint.repo_ids.clone();
+    state
+        .rpm_repodata_cache
+        .get_or_render(repo.id, fingerprint, || async move {
+            let artifacts = collect_repodata_artifacts(&db, &ids).await?;
+            tokio::task::spawn_blocking(move || render_repodata(&artifacts))
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "RPM repodata render task failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to render repository metadata",
+                    )
+                        .into_response()
+                })
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
-// Shared repomd.xml generation
+// Shared repodata rendering
 // ---------------------------------------------------------------------------
 
-fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
+/// Render the complete repodata set for one repository state: `repomd.xml`
+/// plus every compressed index document its checksums describe. Rendering
+/// them together (instead of per endpoint, per request) is what lets the
+/// cache serve coherent, immutable bytes for the whole set (#2521) — and the
+/// gzipped siblings are byproducts `repomd.xml` had to build anyway.
+fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
     // Generate primary.xml content and compute both the compressed (gzipped)
     // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
     // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
@@ -484,7 +549,7 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
     // the same defect (#2652).
     let timestamp = metadata_epoch(artifacts.iter().map(|a| a.updated_at)).timestamp();
 
-    format!(
+    let repomd_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
   <revision>{timestamp}</revision>
@@ -539,7 +604,22 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
         other_open_size = other_open_size,
         updateinfo_size = updateinfo_gz.len(),
         updateinfo_open_size = updateinfo_open_size,
-    )
+    );
+
+    RenderedRepodata {
+        repomd_xml: Bytes::from(repomd_xml),
+        primary_gz: Bytes::from(primary_gz),
+        filelists_gz: Bytes::from(filelists_gz),
+        other_gz: Bytes::from(other_gz),
+    }
+}
+
+/// Test-facing shim retaining the original `repomd.xml`-only signature; the
+/// handlers serve [`render_repodata`] output through the cache.
+#[cfg(test)]
+fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
+    String::from_utf8(render_repodata(artifacts).repomd_xml.to_vec())
+        .expect("repomd.xml is valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -560,13 +640,12 @@ async fn repomd_xml(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-    let xml = generate_repomd_xml_content(&artifacts);
+    let rendered = cached_repodata(&state, &repo).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")
-        .body(Body::from(xml))
+        .body(Body::from(rendered.repomd_xml.clone()))
         .unwrap())
 }
 
@@ -592,8 +671,12 @@ async fn repomd_xml_asc(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-    let repomd_content = generate_repomd_xml_content(&artifacts);
+    // Sign the same cached bytes `repomd.xml` serves: the signature and the
+    // document are two requests, and both must render identically from
+    // unchanged state (#2636). The shared cache entry makes that literal —
+    // one render, one byte sequence, two endpoints.
+    let rendered = cached_repodata(&state, &repo).await?;
+    let repomd_content = rendered.repomd_xml.clone();
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     // #2636: this endpoint must emit a real detached OpenPGP signature — the
@@ -617,7 +700,7 @@ async fn repomd_xml_asc(
         resp
     })?;
     let armored = signing_svc
-        .sign_openpgp_detached_with_key(&key, repomd_content.as_bytes())
+        .sign_openpgp_detached_with_key(&key, &repomd_content)
         .await
         .map_err(|e| {
             // A key that cannot sign is a server-side failure, not a missing
@@ -736,10 +819,8 @@ async fn primary_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let primary_xml = generate_primary_xml(&artifacts);
-    let gz = gzip_bytes(primary_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.primary_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -770,10 +851,8 @@ async fn filelists_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let filelists_xml = generate_filelists_xml(&artifacts);
-    let gz = gzip_bytes(filelists_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.filelists_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -799,10 +878,8 @@ async fn other_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let other_xml = generate_other_xml(&artifacts);
-    let gz = gzip_bytes(other_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.other_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -3247,9 +3324,9 @@ mod tests {
         insert_repo_object(&f, "test.repo", "test-repo").await;
 
         // The query helper itself must only return the package rows.
-        let listed = super::list_rpm_artifacts(&f.pool, f.repo_id)
+        let listed = super::collect_repodata_artifacts(&f.pool, &[f.repo_id])
             .await
-            .expect("list_rpm_artifacts");
+            .expect("collect_repodata_artifacts");
         let paths: Vec<&str> = listed.iter().map(|a| a.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -3257,7 +3334,7 @@ mod tests {
                 "packages/realpkg-1.0-1.x86_64.rpm",
                 "packages/realpkg-1.0-1.src.rpm",
             ],
-            "list_rpm_artifacts must return only .rpm package objects"
+            "collect_repodata_artifacts must return only .rpm package objects"
         );
 
         // End to end: primary.xml must describe exactly the two packages.
@@ -3350,6 +3427,87 @@ mod tests {
         .execute(&f.pool)
         .await
         .expect("insert rpm artifact");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2521 (PF-004): repodata requests must serve a prebuilt cached render.
+    // Before the fix every /repodata/* request refetched all live .rpm rows
+    // and regenerated + regzipped the whole document set in the request path
+    // (repomd.xml built primary/filelists/other/updateinfo just to hash
+    // them), so one dnf refresh cost O(repo) work five times over.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_repodata_warm_requests_serve_one_cached_render() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        insert_rpm_artifact(&f, "alpha").await;
+        insert_rpm_artifact(&f, "beta").await;
+
+        let renders_before = f.state.rpm_repodata_cache.renders();
+
+        // A full dnf-style refresh (manifest + all three indexes) plus a
+        // repeat of the manifest: five requests against unchanged state.
+        let (st, repomd) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, primary) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _filelists) = get_repodata(&f, "filelists.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _other) = get_repodata(&f, "other.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, repomd_again) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(st, StatusCode::OK);
+
+        assert_eq!(
+            f.state.rpm_repodata_cache.renders() - renders_before,
+            1,
+            "five repodata requests against unchanged state must cost exactly \
+             one O(repo) render"
+        );
+        assert_eq!(repomd, repomd_again, "warm manifest must be byte-identical");
+
+        // Coherence across the set: the checksum repomd.xml advertises for
+        // primary.xml.gz must be the checksum of the bytes the sibling
+        // endpoint actually served — they come from the same render.
+        let repomd_text = String::from_utf8(repomd.to_vec()).expect("repomd utf8");
+        let primary_sha = super::sha256_hex(&primary);
+        assert!(
+            repomd_text.contains(&primary_sha),
+            "repomd.xml must advertise the checksum of the served primary.xml.gz \
+             (expected {primary_sha} in: {repomd_text})"
+        );
+
+        // A one-artifact mutation rotates the fingerprint: exactly one new
+        // render, and the served metadata reflects the change immediately
+        // (no TTL window — the fingerprint is revalidated per request).
+        insert_rpm_artifact(&f, "gamma").await;
+        let (st, primary_after) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            f.state.rpm_repodata_cache.renders() - renders_before,
+            2,
+            "one artifact mutation must cause exactly one re-render"
+        );
+        let mut decoder = GzDecoder::new(&primary_after[..]);
+        let mut primary_xml = String::new();
+        decoder
+            .read_to_string(&mut primary_xml)
+            .expect("decompress primary.xml.gz");
+        assert!(
+            primary_xml.contains("<name>gamma</name>"),
+            "post-mutation metadata must include the new package: {primary_xml}"
+        );
+        assert!(
+            primary_xml.contains("packages=\"3\""),
+            "post-mutation metadata must count all three packages: {primary_xml}"
+        );
+
+        f.teardown().await;
     }
 
     /// The end-to-end contract `dnf repo_gpgcheck=1` enforces: the signature
