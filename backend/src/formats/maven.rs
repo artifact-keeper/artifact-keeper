@@ -214,6 +214,22 @@ impl MavenHandler {
         path.ends_with("maven-metadata.xml")
     }
 
+    /// Normalize a catalog `packages.name` for a Maven/Gradle artifact to the
+    /// grouped `groupId:artifactId` form that hosted/virtual grouped listings
+    /// key on (#2723).
+    ///
+    /// The dedicated Maven upload handler already records this form. The
+    /// generic finalize/chunked write paths otherwise persist the bare
+    /// artifactId (or filename), which splits a single component across
+    /// multiple grouped rows. Falls back to `bare_name` when `path` is not a
+    /// parseable Maven GAV layout, so non-Maven-shaped keys are left untouched.
+    pub fn grouped_package_name(path: &str, bare_name: &str) -> String {
+        match Self::parse_coordinates(path) {
+            Ok(coords) => format!("{}:{}", coords.group_id, coords.artifact_id),
+            Err(_) => bare_name.to_string(),
+        }
+    }
+
     /// Parse POM file
     pub fn parse_pom(content: &[u8]) -> Result<PomProject> {
         let content_str = std::str::from_utf8(content)
@@ -601,6 +617,29 @@ mod tests {
         assert_eq!(coords.version, "3.8.1");
         assert_eq!(coords.classifier, None);
         assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_grouped_package_name_normalizes_gav_path() {
+        // #2723: a Maven GAV path normalizes to `groupId:artifactId`,
+        // matching what the dedicated upload handler records.
+        assert_eq!(
+            MavenHandler::grouped_package_name(
+                "org/apache/maven/maven-core/3.8.1/maven-core-3.8.1.jar",
+                "maven-core-3.8.1.jar",
+            ),
+            "org.apache.maven:maven-core"
+        );
+    }
+
+    #[test]
+    fn test_grouped_package_name_falls_back_on_non_gav_path() {
+        // A path that is not a parseable Maven GAV layout keeps the bare name,
+        // so non-Maven-shaped keys are never mangled.
+        assert_eq!(
+            MavenHandler::grouped_package_name("not-a-gav.bin", "not-a-gav.bin"),
+            "not-a-gav.bin"
+        );
     }
 
     #[test]
