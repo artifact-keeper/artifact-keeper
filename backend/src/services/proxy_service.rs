@@ -2636,7 +2636,9 @@ impl ProxyService {
                 Ok(cached)
             },
             || async {
-                let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+                let full_url = self
+                    .nuget_aware_upstream_url(repo, upstream_url, fetch_path)
+                    .await?;
                 let upstream_result = self
                     .fetch_from_upstream_with_accept(&full_url, repo.id, accept, max)
                     .await;
@@ -3220,7 +3222,9 @@ impl ProxyService {
         }
 
         let upstream_url = Self::remote_target(repo)?;
-        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
+        let full_url = self
+            .nuget_aware_upstream_url(repo, upstream_url, fetch_path)
+            .await?;
         let upstream = match self.fetch_from_upstream_streaming(&full_url, repo.id).await {
             Ok(upstream) => upstream,
             Err(err) => {
@@ -4245,6 +4249,62 @@ impl ProxyService {
         let base = base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
         format!("{}/{}", base, path)
+    }
+
+    /// NuGet-aware upstream URL resolution.
+    ///
+    /// The generic [`Self::build_upstream_url`] appends the request path to the
+    /// configured `upstream_url`. That is correct for uniform formats (Maven,
+    /// generic) but wrong for NuGet v3: the configured `upstream_url` is the
+    /// *service index*, and the real `PackageBaseAddress` / `RegistrationsBaseUrl`
+    /// bases live inside it and differ per feed (nuget.org: `/v3-flatcontainer/`,
+    /// `/v3/registration5-*/`). A naive append yields
+    /// `.../v3/index.json/v3/flatcontainer/...` → upstream 400 → 502.
+    ///
+    /// For NuGet-family repos this fetches the upstream service index and maps
+    /// the AK-normalized path onto the upstream's resource bases (see
+    /// [`crate::formats::nuget::NugetHandler::resolve_upstream_url`]). All other
+    /// formats fall through to the generic join unchanged.
+    ///
+    /// NOTE: the service index is fetched per request. nuget.org's index is
+    /// small and CDN-cached, so this is acceptable for correctness; caching the
+    /// parsed index per repo is a worthwhile follow-up.
+    async fn nuget_aware_upstream_url(
+        &self,
+        repo: &Repository,
+        upstream_url: &str,
+        fetch_path: &str,
+    ) -> Result<String> {
+        if !matches!(
+            repo.format,
+            RepositoryFormat::Nuget | RepositoryFormat::Chocolatey | RepositoryFormat::Powershell
+        ) {
+            return Ok(Self::build_upstream_url(upstream_url, fetch_path));
+        }
+
+        let path = fetch_path.trim_start_matches('/');
+        // The service index itself is served from the configured upstream URL.
+        if path == "v3/index.json" || path == "index.json" {
+            return Ok(upstream_url.to_string());
+        }
+
+        // The service index is small metadata; bound it with the metadata ceiling.
+        let resp = self
+            .fetch_from_upstream_with_accept(
+                upstream_url,
+                repo.id,
+                None,
+                DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
+        let index: crate::formats::nuget::ServiceIndex = serde_json::from_slice(&resp.content)
+            .map_err(|e| {
+                AppError::BadGateway(format!(
+                    "failed to parse upstream NuGet service index at {}: {}",
+                    upstream_url, e
+                ))
+            })?;
+        crate::formats::nuget::NugetHandler::resolve_upstream_url(&index, upstream_url, fetch_path)
     }
 
     /// Generate storage key for cached artifact content.

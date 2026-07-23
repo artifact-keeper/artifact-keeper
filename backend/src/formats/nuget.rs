@@ -170,6 +170,83 @@ impl NugetHandler {
         id.to_lowercase()
     }
 
+    /// Map an AK-normalized NuGet v3 request path to the **upstream** URL, using
+    /// the upstream feed's own service index to discover its resource base URLs.
+    ///
+    /// NuGet v3 is non-uniform: the configured `upstream_url` is the *service
+    /// index*, and the real `PackageBaseAddress` (flat-container) and
+    /// `RegistrationsBaseUrl` bases are listed *inside* it and differ per feed
+    /// (e.g. nuget.org serves flat-container at `/v3-flatcontainer/` and
+    /// registration at `/v3/registration5-*/`). Naively appending the request
+    /// path to `upstream_url` produces `.../v3/index.json/v3/flatcontainer/...`
+    /// which the upstream rejects with 400 (surfaced to the client as 502).
+    /// Resolving the bases from the service index fixes it for any conformant
+    /// v3 feed instead of hard-coding nuget.org's layout.
+    pub fn resolve_upstream_url(
+        service_index: &ServiceIndex,
+        upstream_url: &str,
+        ak_path: &str,
+    ) -> Result<String> {
+        let path = ak_path.trim_start_matches('/');
+
+        // The service index itself is fetched from the configured upstream URL.
+        if path == "v3/index.json" || path == "index.json" {
+            return Ok(upstream_url.to_string());
+        }
+
+        // Flat-container: package versions listing + package content (.nupkg).
+        for prefix in ["v3/flatcontainer/", "v3-flatcontainer/", "flatcontainer/"] {
+            if let Some(rest) = path.strip_prefix(prefix) {
+                let base =
+                    Self::resource_base(service_index, "PackageBaseAddress").ok_or_else(|| {
+                        AppError::BadGateway(
+                            "upstream NuGet service index has no PackageBaseAddress resource"
+                                .to_string(),
+                        )
+                    })?;
+                return Ok(format!("{}/{}", base.trim_end_matches('/'), rest));
+            }
+        }
+
+        // Registration: package + version registration.
+        for prefix in ["v3/registration/", "registration/"] {
+            if let Some(rest) = path.strip_prefix(prefix) {
+                let base = Self::resource_base(service_index, "RegistrationsBaseUrl").ok_or_else(
+                    || {
+                        AppError::BadGateway(
+                            "upstream NuGet service index has no RegistrationsBaseUrl resource"
+                                .to_string(),
+                        )
+                    },
+                )?;
+                return Ok(format!("{}/{}", base.trim_end_matches('/'), rest));
+            }
+        }
+
+        // Unknown path shape: fall back to joining against the feed root (the
+        // configured URL with a trailing `index.json` stripped).
+        let root = upstream_url
+            .trim_end_matches('/')
+            .trim_end_matches("index.json")
+            .trim_end_matches('/');
+        Ok(format!("{}/{}", root, path))
+    }
+
+    /// Base URL of the service-index resource whose `@type` starts with
+    /// `type_prefix`, preferring the plainest variant (no gzip / SemVer2, checked
+    /// across both `@type` and `@id`) for the widest client compatibility.
+    fn resource_base<'a>(index: &'a ServiceIndex, type_prefix: &str) -> Option<&'a str> {
+        index
+            .resources
+            .iter()
+            .filter(|r| r.resource_type.starts_with(type_prefix))
+            .min_by_key(|r| {
+                let s = format!("{} {}", r.resource_type, r.id).to_lowercase();
+                (s.contains("gz") as u8, s.contains("semver2") as u8)
+            })
+            .map(|r| r.id.as_str())
+    }
+
     /// Extract nuspec from nupkg file
     pub fn extract_nuspec(content: &[u8]) -> Result<NuSpec> {
         let cursor = std::io::Cursor::new(content);
@@ -529,6 +606,93 @@ pub struct CatalogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- resolve_upstream_url (remote-proxy v3 resolution) ----
+
+    fn nuget_org_index() -> ServiceIndex {
+        ServiceIndex {
+            version: "3.0.0".to_string(),
+            resources: vec![
+                ServiceResource {
+                    id: "https://api.nuget.org/v3-flatcontainer/".to_string(),
+                    resource_type: "PackageBaseAddress/3.0.0".to_string(),
+                    comment: None,
+                },
+                ServiceResource {
+                    id: "https://api.nuget.org/v3/registration5-semver1/".to_string(),
+                    resource_type: "RegistrationsBaseUrl".to_string(),
+                    comment: None,
+                },
+                ServiceResource {
+                    id: "https://api.nuget.org/v3/registration5-gz-semver2/".to_string(),
+                    resource_type: "RegistrationsBaseUrl/3.6.0".to_string(),
+                    comment: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_flatcontainer() {
+        let idx = nuget_org_index();
+        let up = "https://api.nuget.org/v3/index.json";
+        assert_eq!(
+            NugetHandler::resolve_upstream_url(
+                &idx,
+                up,
+                "v3/flatcontainer/newtonsoft.json/index.json"
+            )
+            .unwrap(),
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json"
+        );
+        assert_eq!(
+            NugetHandler::resolve_upstream_url(
+                &idx,
+                up,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+            )
+            .unwrap(),
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_registration_prefers_plain() {
+        let idx = nuget_org_index();
+        let up = "https://api.nuget.org/v3/index.json";
+        // Prefer the non-gzip / non-SemVer2 registration base for compatibility.
+        assert_eq!(
+            NugetHandler::resolve_upstream_url(
+                &idx,
+                up,
+                "v3/registration/newtonsoft.json/index.json"
+            )
+            .unwrap(),
+            "https://api.nuget.org/v3/registration5-semver1/newtonsoft.json/index.json"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_service_index_passthrough() {
+        let idx = nuget_org_index();
+        let up = "https://api.nuget.org/v3/index.json";
+        assert_eq!(
+            NugetHandler::resolve_upstream_url(&idx, up, "v3/index.json").unwrap(),
+            up
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_missing_resource_is_bad_gateway() {
+        let idx = ServiceIndex {
+            version: "3.0.0".to_string(),
+            resources: vec![],
+        };
+        let up = "https://api.nuget.org/v3/index.json";
+        assert!(
+            NugetHandler::resolve_upstream_url(&idx, up, "v3/flatcontainer/x/index.json").is_err()
+        );
+    }
 
     // ---- NugetHandler::new / Default ----
 
