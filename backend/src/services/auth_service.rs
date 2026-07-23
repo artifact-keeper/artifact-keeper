@@ -1465,6 +1465,13 @@ impl AuthService {
         &self.db
     }
 
+    /// Borrow the effective application configuration. Used by middleware that
+    /// needs to consult policy toggles (e.g. the TOTP enrollment gate) on the
+    /// request path through the same config the auth service was built with.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Validate an access JWT.
     ///
     /// Synchronous fast-path: only consults the in-memory invalidation map.
@@ -3577,6 +3584,7 @@ mod tests {
 
     fn make_test_config() -> Arc<Config> {
         Arc::new(Config {
+            totp_policy: crate::config::TotpPolicy::Disabled,
             database_url: "postgresql://unused".to_string(),
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),

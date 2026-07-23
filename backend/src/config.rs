@@ -136,6 +136,77 @@ fn default_auth_max_concurrency() -> usize {
     std::cmp::max(32, cores.saturating_mul(8))
 }
 
+/// System-wide two-factor (TOTP) enrollment policy.
+///
+/// Controls whether local users are forced to enroll a TOTP authenticator
+/// before their interactive login can do anything beyond enrolling. Parsed from
+/// the `TOTP_POLICY` env var. The default (`Disabled`) preserves the historical
+/// opt-in behaviour: existing deployments are unchanged.
+///
+/// The enrollment requirement is scoped to interactive local logins:
+/// SSO-authenticated users (LDAP / SAML / OIDC / CI) are exempt because their
+/// identity provider owns MFA, and non-interactive principals (API tokens,
+/// service accounts) are exempt because they are not interactive logins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpPolicy {
+    /// No enrollment is forced. TOTP stays strictly opt-in per user. Default.
+    Disabled,
+    /// Local admin users must enroll TOTP before completing an interactive
+    /// login. Non-admin local users are unaffected.
+    RequiredForAdmins,
+    /// Every local user must enroll TOTP before completing an interactive login.
+    RequiredForAll,
+}
+
+impl TotpPolicy {
+    /// Parse the `TOTP_POLICY` env value. Unknown, empty, or missing values fall
+    /// back to `Disabled` (matching-value comparison is case-insensitive and
+    /// surrounding whitespace is trimmed). An unrecognised non-empty value logs
+    /// a warning so a typo does not silently weaken the intended posture.
+    pub fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("") | None => TotpPolicy::Disabled,
+            Some("disabled") => TotpPolicy::Disabled,
+            Some("required_for_admins") => TotpPolicy::RequiredForAdmins,
+            Some("required_for_all") => TotpPolicy::RequiredForAll,
+            Some(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "Unrecognised TOTP_POLICY value; defaulting to 'disabled'"
+                );
+                TotpPolicy::Disabled
+            }
+        }
+    }
+
+    /// Whether an interactive **local** user with the given admin flag and
+    /// current enrollment state must enroll TOTP before their login can proceed
+    /// under this policy. This is the single source of truth shared by the login
+    /// handler and the request-path enrollment gate.
+    ///
+    /// - `is_local`: the user authenticated with a local credential
+    ///   (`auth_provider = local`). SSO users are never gated here.
+    /// - `is_interactive`: the principal is a human interactive login, not an
+    ///   API token or service account.
+    /// - `totp_enabled`: the user has already enrolled TOTP (never re-gated).
+    pub fn requires_enrollment(
+        self,
+        is_admin: bool,
+        is_local: bool,
+        is_interactive: bool,
+        totp_enabled: bool,
+    ) -> bool {
+        if !is_local || !is_interactive || totp_enabled {
+            return false;
+        }
+        match self {
+            TotpPolicy::Disabled => false,
+            TotpPolicy::RequiredForAdmins => is_admin,
+            TotpPolicy::RequiredForAll => true,
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -406,6 +477,13 @@ pub struct Config {
     /// `false`, preserving the historical break-glass behaviour so existing
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
+
+    /// System-wide TOTP (2FA) enrollment policy for interactive local logins.
+    /// Env var: `TOTP_POLICY` (`disabled` | `required_for_admins` |
+    /// `required_for_all`). Defaults to `Disabled`, which keeps 2FA strictly
+    /// opt-in per user. SSO-authenticated users and non-interactive principals
+    /// (API tokens, service accounts) are always exempt. See [`TotpPolicy`].
+    pub totp_policy: TotpPolicy,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -774,6 +852,7 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show totp_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -886,6 +965,7 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            totp_policy: crate::config::TotpPolicy::Disabled,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1112,6 +1192,7 @@ impl Config {
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
             ),
+            totp_policy: TotpPolicy::from_env_value(env::var("TOTP_POLICY").ok().as_deref()),
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
                     Ok(port) => Some(port),
@@ -2670,6 +2751,108 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
+    }
+
+    #[test]
+    fn test_totp_policy_from_env_value_parsing() {
+        // Missing / empty / whitespace-only -> Disabled (unchanged behaviour).
+        assert_eq!(TotpPolicy::from_env_value(None), TotpPolicy::Disabled);
+        assert_eq!(TotpPolicy::from_env_value(Some("")), TotpPolicy::Disabled);
+        assert_eq!(
+            TotpPolicy::from_env_value(Some("   ")),
+            TotpPolicy::Disabled
+        );
+
+        // Recognised values, case-insensitive and whitespace-tolerant.
+        assert_eq!(
+            TotpPolicy::from_env_value(Some("disabled")),
+            TotpPolicy::Disabled
+        );
+        assert_eq!(
+            TotpPolicy::from_env_value(Some("required_for_admins")),
+            TotpPolicy::RequiredForAdmins
+        );
+        assert_eq!(
+            TotpPolicy::from_env_value(Some("  Required_For_All ")),
+            TotpPolicy::RequiredForAll
+        );
+
+        // Unrecognised value -> Disabled (fail-safe to current behaviour).
+        assert_eq!(
+            TotpPolicy::from_env_value(Some("required")),
+            TotpPolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn test_config_totp_policy_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("TOTP_POLICY").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default (unset) preserves the opt-in behaviour.
+        env::remove_var("TOTP_POLICY");
+        assert_eq!(
+            Config::from_env().unwrap().totp_policy,
+            TotpPolicy::Disabled
+        );
+
+        env::set_var("TOTP_POLICY", "required_for_admins");
+        assert_eq!(
+            Config::from_env().unwrap().totp_policy,
+            TotpPolicy::RequiredForAdmins
+        );
+
+        env::set_var("TOTP_POLICY", "required_for_all");
+        assert_eq!(
+            Config::from_env().unwrap().totp_policy,
+            TotpPolicy::RequiredForAll
+        );
+
+        // Garbage falls back to Disabled.
+        env::set_var("TOTP_POLICY", "nonsense");
+        assert_eq!(
+            Config::from_env().unwrap().totp_policy,
+            TotpPolicy::Disabled
+        );
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("TOTP_POLICY", saved_flag);
+    }
+
+    #[test]
+    fn test_totp_policy_requires_enrollment_matrix() {
+        use TotpPolicy::*;
+
+        // Disabled never requires enrollment, regardless of the other axes.
+        for &is_admin in &[true, false] {
+            for &enrolled in &[true, false] {
+                assert!(!Disabled.requires_enrollment(is_admin, true, true, enrolled));
+            }
+        }
+
+        // required_for_admins: only unenrolled local interactive ADMINS are gated.
+        assert!(RequiredForAdmins.requires_enrollment(true, true, true, false));
+        assert!(!RequiredForAdmins.requires_enrollment(false, true, true, false)); // non-admin
+        assert!(!RequiredForAdmins.requires_enrollment(true, true, true, true)); // already enrolled
+
+        // required_for_all: every unenrolled local interactive user is gated.
+        assert!(RequiredForAll.requires_enrollment(true, true, true, false));
+        assert!(RequiredForAll.requires_enrollment(false, true, true, false));
+        assert!(!RequiredForAll.requires_enrollment(false, true, true, true)); // already enrolled
+
+        // Exemptions apply under the strictest policy:
+        // - SSO users (not local) are never gated.
+        assert!(!RequiredForAll.requires_enrollment(true, false, true, false));
+        assert!(!RequiredForAdmins.requires_enrollment(true, false, true, false));
+        // - Non-interactive principals (API tokens / service accounts) exempt.
+        assert!(!RequiredForAll.requires_enrollment(true, true, false, false));
+        assert!(!RequiredForAdmins.requires_enrollment(true, true, false, false));
     }
 
     #[test]

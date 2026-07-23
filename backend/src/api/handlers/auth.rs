@@ -56,6 +56,7 @@ async fn audit_auth<T: serde::Serialize>(
 fn login_response(
     tokens: &crate::services::auth_service::TokenPair,
     must_change_password: bool,
+    must_enroll_totp: bool,
     client_is_https: bool,
 ) -> Response {
     let body = LoginResponse {
@@ -66,6 +67,9 @@ fn login_response(
         must_change_password,
         totp_required: None,
         totp_token: None,
+        // Omitted (None) unless the enrollment policy applies, so a default
+        // deployment's login response is unchanged.
+        must_enroll_totp: must_enroll_totp.then_some(true),
     };
     let mut response = Json(body).into_response();
     set_auth_cookies(
@@ -169,6 +173,16 @@ pub struct LoginResponse {
     pub totp_required: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totp_token: Option<String>,
+    /// Set to `true` when the system TOTP enrollment policy (`TOTP_POLICY`)
+    /// requires this local user to enroll a TOTP authenticator before their
+    /// session can be used for anything other than enrollment. The tokens in
+    /// this response are real, but the request-path enrollment gate rejects
+    /// every non-enrollment route with `428` until the user completes
+    /// `POST /auth/totp/setup` + `POST /auth/totp/enable` (same shape as
+    /// `must_change_password`). Omitted when enrollment is not required, so the
+    /// default (`TOTP_POLICY=disabled`) response is byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub must_enroll_totp: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -340,7 +354,9 @@ pub async fn login(
         );
     }
 
-    // If TOTP is enabled, return a pending token instead of real tokens
+    // If TOTP is enabled, return a pending token instead of real tokens. An
+    // already-enrolled user is never subject to the enrollment gate, so
+    // `must_enroll_totp` does not apply on this branch.
     if user.totp_enabled {
         let totp_token = auth_service.generate_totp_pending_token(&user)?;
         let body = LoginResponse {
@@ -351,9 +367,24 @@ pub async fn login(
             must_change_password: user.must_change_password,
             totp_required: Some(true),
             totp_token: Some(totp_token),
+            must_enroll_totp: None,
         };
         return Ok(Json(body).into_response());
     }
+
+    // System TOTP enrollment policy (`TOTP_POLICY`). When the policy applies to
+    // this interactive local user and they have not enrolled, we still issue a
+    // real session (mirroring `must_change_password`) but flag it so the client
+    // routes into enrollment; the request-path gate in `auth_middleware` refuses
+    // every non-enrollment route with 428 until `POST /auth/totp/enable`
+    // completes. SSO users and non-interactive principals are exempt inside
+    // `requires_enrollment`. `user.totp_enabled` is false on this path.
+    let must_enroll_totp = state.config.totp_policy.requires_enrollment(
+        user.is_admin,
+        user.auth_provider == crate::models::user::AuthProvider::Local,
+        !user.is_service_account,
+        user.totp_enabled,
+    );
 
     let mut login_details = serde_json::json!({ "username": user.username });
     if sso_enabled {
@@ -373,6 +404,7 @@ pub async fn login(
     Ok(login_response(
         &tokens,
         user.must_change_password,
+        must_enroll_totp,
         client_is_https,
     ))
 }
@@ -467,9 +499,14 @@ pub async fn refresh_token(
     )
     .await;
 
+    // Refresh does not re-signal enrollment (`must_enroll_totp: false`): the
+    // request-path gate in `auth_middleware` independently enforces the policy
+    // on every request, so a refreshed session stays gated until enrollment
+    // completes without needing the hint echoed here.
     Ok(login_response(
         &tokens,
         user.must_change_password,
+        false,
         request_scheme_is_https(&headers),
     ))
 }
@@ -1161,6 +1198,7 @@ mod tests {
             must_change_password: false,
             totp_required: None,
             totp_token: None,
+            must_enroll_totp: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["access_token"], "access123");
@@ -1168,9 +1206,11 @@ mod tests {
         assert_eq!(json["expires_in"], 3600);
         assert_eq!(json["token_type"], "Bearer");
         assert_eq!(json["must_change_password"], false);
-        // totp_required and totp_token should be absent (skip_serializing_if)
+        // totp_required, totp_token, and must_enroll_totp are absent
+        // (skip_serializing_if) so the default response is unchanged.
         assert!(json.get("totp_required").is_none());
         assert!(json.get("totp_token").is_none());
+        assert!(json.get("must_enroll_totp").is_none());
     }
 
     #[test]
@@ -1183,10 +1223,29 @@ mod tests {
             must_change_password: false,
             totp_required: Some(true),
             totp_token: Some("pending-token-123".to_string()),
+            must_enroll_totp: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["totp_required"], true);
         assert_eq!(json["totp_token"], "pending-token-123");
+    }
+
+    #[test]
+    fn test_login_response_serialize_with_must_enroll_totp() {
+        let resp = LoginResponse {
+            access_token: "access123".to_string(),
+            refresh_token: "refresh456".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            must_change_password: false,
+            totp_required: None,
+            totp_token: None,
+            must_enroll_totp: Some(true),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        // A real session is issued (tokens present) alongside the enrollment flag.
+        assert_eq!(json["access_token"], "access123");
+        assert_eq!(json["must_enroll_totp"], true);
     }
 
     #[test]
@@ -1199,6 +1258,7 @@ mod tests {
             must_change_password: true,
             totp_required: Some(false),
             totp_token: None,
+            must_enroll_totp: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["must_change_password"], true);

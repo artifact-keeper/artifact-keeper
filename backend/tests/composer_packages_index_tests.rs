@@ -53,6 +53,7 @@ fn test_config(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
         setup_password_hint: None,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,

@@ -41,6 +41,7 @@ fn test_config(storage_path: &str) -> Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         storage_path: storage_path.into(),
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
         setup_password_hint: None,
         ..Default::default()
     }

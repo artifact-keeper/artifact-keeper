@@ -53,6 +53,7 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         storage_path: storage_path.into(),
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
         setup_password_hint: None,
         ..Default::default()
     };

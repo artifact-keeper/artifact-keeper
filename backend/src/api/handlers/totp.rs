@@ -547,6 +547,9 @@ pub async fn verify_totp(
         must_change_password: user.must_change_password,
         totp_required: None,
         totp_token: None,
+        // A completed TOTP verify means the user is enrolled and has satisfied
+        // 2FA for this login, so the enrollment gate never applies here.
+        must_enroll_totp: None,
     };
 
     let mut response = Json(body).into_response();

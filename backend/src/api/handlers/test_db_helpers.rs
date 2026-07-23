@@ -222,6 +222,7 @@ fn cfg(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        totp_policy: crate::config::TotpPolicy::Disabled,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,
         jwt_refresh_token_expiry_days: 7,

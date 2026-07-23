@@ -515,6 +515,7 @@ mod qc_metadata_leak_2437 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
             setup_password_hint: None,
             ..Default::default()
         };
@@ -764,6 +765,7 @@ mod scan_sbom_leak_2439 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
             setup_password_hint: None,
             ..Default::default()
         };
@@ -1175,6 +1177,7 @@ mod xrepo_authz_2443 {
             database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
             storage_path: storage_path.into(),
             jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            totp_policy: artifact_keeper_backend::config::TotpPolicy::Disabled,
             setup_password_hint: None,
             ..Default::default()
         };

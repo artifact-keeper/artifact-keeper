@@ -10143,6 +10143,7 @@ mod tests {
     fn test_state_with_secret(secret: &str) -> SharedState {
         let config = crate::config::Config {
             jwt_secret: secret.to_string(),
+            totp_policy: crate::config::TotpPolicy::Disabled,
             ..crate::config::Config::default()
         };
 
@@ -10152,6 +10153,7 @@ mod tests {
     fn test_state_with_secret_and_pool(secret: &str, pool: sqlx::PgPool) -> SharedState {
         let config = crate::config::Config {
             jwt_secret: secret.to_string(),
+            totp_policy: crate::config::TotpPolicy::Disabled,
             ..crate::config::Config::default()
         };
 

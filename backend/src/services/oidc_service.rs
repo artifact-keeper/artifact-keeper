@@ -848,6 +848,7 @@ mod tests {
     #[test]
     fn test_oidc_config_from_env() {
         let config = Config {
+            totp_policy: crate::config::TotpPolicy::Disabled,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),
@@ -971,6 +972,7 @@ mod tests {
 
     fn make_test_config() -> Config {
         Config {
+            totp_policy: crate::config::TotpPolicy::Disabled,
             database_url: "postgres://localhost/test".into(),
             bind_address: "0.0.0.0:8080".into(),
             log_level: "info".into(),

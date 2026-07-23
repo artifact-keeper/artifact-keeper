@@ -531,6 +531,83 @@ async fn principal_must_change_password(db: &sqlx::PgPool, user_id: Uuid) -> boo
     .unwrap_or(false)
 }
 
+/// Whether `path` is reachable by a principal that must still enroll TOTP under
+/// the system enrollment policy (`TOTP_POLICY`).
+///
+/// Mirrors [`path_exempt_from_password_change`] and additionally exempts the two
+/// TOTP enrollment endpoints so a gated user can always complete enrollment
+/// in-flow (`/auth/totp/setup` -> `/auth/totp/enable`) and self-recover
+/// (`/auth/me`, self password change, `/auth/logout`) without being locked out.
+/// Every other state-changing route stays gated until enrollment clears the
+/// requirement. Matching is by suffix of the FULL, un-stripped request path for
+/// the same reasons documented on [`path_exempt_from_password_change`].
+fn path_exempt_from_totp_enrollment(path: &str) -> bool {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path_exempt_from_password_change(path)
+        || path.ends_with("/auth/totp/setup")
+        || path.ends_with("/auth/totp/enable")
+}
+
+/// 428 Precondition Required: the principal must enroll a TOTP authenticator
+/// before any further (non-enrollment) request is honoured. Distinct message
+/// from the password-rotation gate so a client can tell the two forced actions
+/// apart, and distinct from 401 so it is not confused with "log in again".
+fn must_enroll_totp_response() -> Response {
+    (
+        StatusCode::PRECONDITION_REQUIRED,
+        "TOTP enrollment required: enroll a two-factor authenticator before continuing",
+    )
+        .into_response()
+}
+
+/// Whether the authenticated principal must enroll TOTP before proceeding, under
+/// the deployment's `TOTP_POLICY`.
+///
+/// Fast-paths the default policy (`Disabled`) so a standard deployment pays no
+/// extra DB read and behaves exactly as before. Non-interactive principals (API
+/// tokens, service accounts) are exempt because they are not interactive logins;
+/// SSO-authenticated users are exempt because their identity provider owns MFA.
+/// An already-enrolled, unknown, or inactive user is not gated. The live
+/// `auth_provider` + `totp_enabled` are read with a runtime query (no offline
+/// SQLx cache) exactly like the password-change watermark; a query error is
+/// treated as "not gated" so a transient DB hiccup can never turn a normal
+/// request into a lockout. The policy decision itself is delegated to
+/// [`crate::config::TotpPolicy::requires_enrollment`], the shared source of
+/// truth with the login handler.
+async fn principal_must_enroll_totp(
+    config: &crate::config::Config,
+    db: &sqlx::PgPool,
+    ext: &AuthExtension,
+) -> bool {
+    if config.totp_policy == crate::config::TotpPolicy::Disabled {
+        return false;
+    }
+    if ext.is_api_token || ext.is_service_account {
+        return false;
+    }
+    // `auth_provider::text` renders the enum as its stored lowercase name
+    // ('local', 'ldap', 'saml', 'oidc', 'ci'), so a plain string comparison
+    // avoids needing the sqlx enum decode or an offline cache entry here.
+    let row: Option<(bool, String, bool)> = sqlx::query_as(
+        "SELECT is_admin, auth_provider::text, totp_enabled \
+         FROM users WHERE id = $1 AND is_active = true",
+    )
+    .bind(ext.user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((is_admin, provider, totp_enabled)) => config.totp_policy.requires_enrollment(
+            is_admin,
+            provider == "local",
+            true,
+            totp_enabled,
+        ),
+        None => false,
+    }
+}
+
 /// Authentication middleware function - requires valid token
 ///
 /// Supports multiple authentication schemes:
@@ -679,6 +756,19 @@ pub async fn auth_middleware(
                 && principal_must_change_password(auth_service.db(), ext.user_id).await
             {
                 return must_change_password_response();
+            }
+            // Enforce the system TOTP enrollment policy (`TOTP_POLICY`). Checked
+            // after the password-rotation gate so a user owing both first
+            // rotates their password, then enrolls. The enrollment endpoints,
+            // self-lookup, self password change, and logout are exempt so a
+            // gated user can always complete enrollment and recover in-flow
+            // (same shape as the forced-rotation gate). The default policy is
+            // fast-pathed inside `principal_must_enroll_totp`, so a standard
+            // deployment pays nothing extra here.
+            if !path_exempt_from_totp_enrollment(&gate_path)
+                && principal_must_enroll_totp(auth_service.config(), auth_service.db(), &ext).await
+            {
+                return must_enroll_totp_response();
             }
             // Insert BOTH shapes so handlers behind this middleware can
             // extract either `Extension<AuthExtension>` or
@@ -5638,6 +5728,144 @@ mod tests {
         // Stripped forms the middleware actually sees for token management.
         assert!(!path_exempt_from_password_change("/tokens"));
         assert!(!path_exempt_from_password_change("/tokens/abc"));
+    }
+
+    #[test]
+    fn test_path_exempt_from_totp_enrollment_allowlist() {
+        // The enrollment endpoints themselves must be reachable so a gated user
+        // can complete setup -> enable without being locked out.
+        assert!(path_exempt_from_totp_enrollment("/api/v1/auth/totp/setup"));
+        assert!(path_exempt_from_totp_enrollment("/api/v1/auth/totp/enable"));
+        assert!(path_exempt_from_totp_enrollment(
+            "/api/v1/auth/totp/enable/"
+        ));
+
+        // It inherits the password-change recovery allowlist so self-lookup,
+        // self password change, and logout stay reachable too.
+        assert!(path_exempt_from_totp_enrollment("/api/v1/auth/me"));
+        assert!(path_exempt_from_totp_enrollment(
+            "/api/v1/users/abc/password"
+        ));
+        assert!(path_exempt_from_totp_enrollment("/api/v1/auth/logout"));
+
+        // The login-time TOTP verify endpoint is NOT an enrollment endpoint and
+        // is unauthenticated anyway; a user with no secret cannot use it, so it
+        // stays gated for a half-authenticated enrollment session.
+        assert!(!path_exempt_from_totp_enrollment(
+            "/api/v1/auth/totp/verify"
+        ));
+        assert!(!path_exempt_from_totp_enrollment(
+            "/api/v1/auth/totp/disable"
+        ));
+
+        // Every other route stays gated until enrollment clears the flag.
+        assert!(!path_exempt_from_totp_enrollment("/api/v1/repositories"));
+        assert!(!path_exempt_from_totp_enrollment("/api/v1/auth/tokens"));
+        assert!(!path_exempt_from_totp_enrollment("/me"));
+    }
+
+    /// DB-backed matrix for `principal_must_enroll_totp`: the request-path gate
+    /// decision under each `TOTP_POLICY` for an interactive local user, an
+    /// already-enrolled user, and a non-interactive (API-token) principal.
+    /// No-ops when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn test_principal_must_enroll_totp_policy_matrix() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::config::{Config, TotpPolicy};
+        use crate::models::access_scope::AccessScope;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // A fresh local, non-admin, TOTP-unenrolled user (create_user default).
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let make_ext =
+            |is_admin: bool, is_api_token: bool, is_service_account: bool| AuthExtension {
+                user_id,
+                username: username.clone(),
+                email: format!("{}@test.local", username),
+                is_admin,
+                is_api_token,
+                is_service_account,
+                scopes: None,
+                allowed_repo_ids: AccessScope::Admin,
+                iat_ms: None,
+            };
+        let cfg = |policy: TotpPolicy| Config {
+            totp_policy: policy,
+            ..Config::default()
+        };
+
+        let interactive = make_ext(false, false, false);
+
+        // Disabled: never gated (fast path, exact historical behaviour).
+        assert!(!principal_must_enroll_totp(&cfg(TotpPolicy::Disabled), &pool, &interactive).await);
+
+        // required_for_admins: a non-admin local user is not gated...
+        assert!(
+            !principal_must_enroll_totp(&cfg(TotpPolicy::RequiredForAdmins), &pool, &interactive)
+                .await
+        );
+        // ...but an admin local user is.
+        assert!(
+            principal_must_enroll_totp(
+                &cfg(TotpPolicy::RequiredForAdmins),
+                &pool,
+                &make_ext(true, false, false)
+            )
+            .await
+        );
+
+        // required_for_all: every unenrolled interactive local user is gated.
+        assert!(
+            principal_must_enroll_totp(&cfg(TotpPolicy::RequiredForAll), &pool, &interactive).await
+        );
+
+        // A non-interactive principal (API token) is exempt even under the
+        // strictest policy: tokens are not interactive logins.
+        assert!(
+            !principal_must_enroll_totp(
+                &cfg(TotpPolicy::RequiredForAll),
+                &pool,
+                &make_ext(false, true, false)
+            )
+            .await
+        );
+
+        // An SSO-authenticated user (auth_provider != local) is exempt: their
+        // identity provider owns MFA. Flip the provider and re-check.
+        sqlx::query("UPDATE users SET auth_provider = 'oidc' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("set oidc provider");
+        assert!(
+            !principal_must_enroll_totp(&cfg(TotpPolicy::RequiredForAll), &pool, &interactive)
+                .await
+        );
+        sqlx::query("UPDATE users SET auth_provider = 'local' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("restore local provider");
+
+        // Once the user has enrolled, the gate lifts under every policy.
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("enable totp");
+        assert!(
+            !principal_must_enroll_totp(&cfg(TotpPolicy::RequiredForAll), &pool, &interactive)
+                .await
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 
     /// Build a flagged/unflagged non-admin `User` row and mint a real JWT for it
