@@ -511,6 +511,7 @@ pub struct SignArtifactResponse {
 #[utoipa::path(
     post,
     path = "/api/v1/signing/artifacts/{artifact_id}/sign",
+    tag = "signing",
     params(
         ("artifact_id" = Uuid, Path, description = "Artifact ID")
     ),
@@ -846,6 +847,40 @@ mod tests {
                 signing_handler_body(name).contains("require_signing_admin"),
                 "{name} MUST call require_signing_admin (admin gate) — CWE-862 regression guard"
             );
+        }
+    }
+
+    #[test]
+    fn test_openapi_paths_all_have_non_empty_tags() {
+        // #2721: the exported OpenAPI operation for POST
+        // /signing/artifacts/{id}/sign must carry a non-empty `tags` array.
+        // Spectral's error-severity `operation-tags` rule fails the SDK
+        // generation pipeline on any operation with `tags: []`, so every path
+        // in this doc must be tagged — pin the whole surface, not just the one
+        // handler that regressed, so a future untagged sibling also trips here.
+        let doc = serde_json::to_value(SigningApiDoc::openapi())
+            .expect("SigningApiDoc serializes to JSON");
+        let paths = doc["paths"]
+            .as_object()
+            .expect("openapi doc has a paths object");
+        assert!(
+            !paths.is_empty(),
+            "signing doc must expose at least one path"
+        );
+        for (path, item) in paths {
+            let operations = item.as_object().expect("path item is an object");
+            for method in ["get", "post", "put", "delete", "patch", "head", "options"] {
+                let Some(op) = operations.get(method) else {
+                    continue;
+                };
+                let tags = op["tags"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{method} {path} must declare a tags array"));
+                assert!(
+                    !tags.is_empty(),
+                    "{method} {path} must have a non-empty tags array (#2721)"
+                );
+            }
         }
     }
 
