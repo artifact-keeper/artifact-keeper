@@ -396,31 +396,65 @@ async fn upload_package(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Derive the `(package, version)` coordinates a CRAN client reconstructs the
+/// download filename from, preferring the artifact's **actual stored filename**.
+///
+/// R's `install.packages()` turns each PACKAGES `Package`/`Version` pair back
+/// into `{package}_{version}.tar.gz` and GETs it from `src/contrib/`, which the
+/// download route resolves by filename suffix. Packages published natively are
+/// stored at `{name}/{version}/{name}_{version}.tar.gz`, whose basename already
+/// parses back to the same coordinates — so this is **byte-identical** for them.
+/// But a package pushed through the generic chunked-upload flow is stored at its
+/// bare filename with the whole basename as `name` and a `sha256-<prefix>`
+/// fallback `version` (see `upload.rs::completed_format_artifact_version`), so
+/// emitting the stored columns would advertise `{basename}_{sha256-…}.tar.gz`, a
+/// path the suffix-resolving route can never serve. Re-deriving from the stored
+/// filename keeps the index coherent with the served route for both upload
+/// flows — the CRAN analogue of the helm `index.yaml` fix (#2753 / #2589).
+///
+/// Falls back to the stored `name`/`version` when the basename does not follow
+/// the `{name}_{version}.tar.gz` convention (an arbitrary bare-path object that
+/// no reconstruction could resolve anyway).
+fn source_index_coordinates(path: &str, name: &str, version: &str) -> (String, String) {
+    path.rsplit('/')
+        .next()
+        .filter(|f| !f.is_empty())
+        .and_then(|filename| CranHandler::parse_path(&format!("src/contrib/{}", filename)).ok())
+        .and_then(|info| Some((info.name?, info.version?)))
+        .unwrap_or_else(|| (name.to_string(), version.to_string()))
+}
+
 /// Build PACKAGES index in CRAN DCF text format for source packages.
 async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, Response> {
-    let artifacts = sqlx::query!(
+    use sqlx::Row;
+    // Runtime query (not the `query!` macro) so the added `a.path` column does
+    // not require regenerating the offline sqlx data for the `Check Rust` gate,
+    // mirroring the helm index builder.
+    let rows = sqlx::query(
         r#"
-        SELECT a.name, a.version, am.metadata as "metadata?"
+        SELECT a.name, a.version, a.path, am.metadata
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
         ORDER BY a.name, a.created_at DESC
         "#,
-        repo_id
     )
+    .bind(repo_id)
     .fetch_all(db)
     .await
     .map_err(super::db_err)?;
 
     let mut index = String::new();
-    for a in &artifacts {
-        write_dcf_record(
-            &mut index,
-            &a.name,
-            a.version.as_deref().unwrap_or_default(),
-            a.metadata.as_ref(),
-        );
+    for row in &rows {
+        let name: String = row.get("name");
+        let version: Option<String> = row.get("version");
+        let path: String = row.get("path");
+        let metadata: Option<serde_json::Value> = row.get("metadata");
+
+        let (pkg, ver) =
+            source_index_coordinates(&path, &name, version.as_deref().unwrap_or_default());
+        write_dcf_record(&mut index, &pkg, &ver, metadata.as_ref());
     }
 
     Ok(index)
@@ -660,6 +694,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // source_index_coordinates — advertise coordinates the download route can
+    // resolve for both native and bare-path (generic) uploads (#2754).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_source_index_coordinates_native_path_is_byte_identical() {
+        // Native upload path: `{name}/{version}/{name}_{version}.tar.gz`.
+        // The stored columns already match the basename, so the advertised
+        // coordinates are unchanged.
+        let (pkg, ver) =
+            source_index_coordinates("ggplot2/3.4.0/ggplot2_3.4.0.tar.gz", "ggplot2", "3.4.0");
+        assert_eq!(pkg, "ggplot2");
+        assert_eq!(ver, "3.4.0");
+    }
+
+    #[test]
+    fn test_source_index_coordinates_bare_path_uses_filename() {
+        // Bare-path generic upload: stored `name` is the whole basename and
+        // `version` is the `sha256-<prefix>` fallback. The advertised
+        // coordinates must come from the filename so the R client reconstructs
+        // `dplyr_1.1.0.tar.gz` (which the suffix route serves), NOT
+        // `dplyr_1.1.0.tar.gz_sha256-abcdef012345.tar.gz`.
+        let (pkg, ver) = source_index_coordinates(
+            "dplyr_1.1.0.tar.gz",
+            "dplyr_1.1.0.tar.gz",
+            "sha256-abcdef012345",
+        );
+        assert_eq!(pkg, "dplyr");
+        assert_eq!(ver, "1.1.0");
+        // Guard against a regression back to the broken reconstruction.
+        assert_ne!(ver, "sha256-abcdef012345");
+    }
+
+    #[test]
+    fn test_source_index_coordinates_non_cran_basename_falls_back() {
+        // A bare-path object that is not a CRAN source package name falls back
+        // to the stored columns (nothing could make it resolvable).
+        let (pkg, ver) = source_index_coordinates("data.zip", "data.zip", "sha256-deadbeef");
+        assert_eq!(pkg, "data.zip");
+        assert_eq!(ver, "sha256-deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
     // DB-backed router tests for download_package, upload_package, and
     // build_source_index. Use the shared `test_db_helpers::Fixture` so this
     // file does not duplicate the per-test scaffolding.
@@ -855,6 +932,48 @@ mod tests {
         assert!(text.contains("Package: ggplot2"));
         assert!(text.contains("Version: 3.4.0"));
         assert!(text.contains("Depends: R (>= 3.5.0)"));
+        f.teardown().await;
+    }
+
+    /// #2754: a bare-path generic upload (path == filename, `name` == whole
+    /// basename, `version` == `sha256-<prefix>` fallback) must be advertised in
+    /// PACKAGES with the coordinates the R client reconstructs the *resolvable*
+    /// `{name}_{version}.tar.gz` download from — not the raw sha256 fallback
+    /// (which yields `…tar.gz_sha256-….tar.gz` → 404). Fails on `main`.
+    #[tokio::test]
+    async fn test_cran_index_coords_resolve_for_bare_path_generic_upload() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/mypkg_1.0.0.tar.gz",
+            "mypkg_1.0.0.tar.gz",
+            "mypkg_1.0.0.tar.gz",
+            "sha256-abcdef012345",
+            "application/x-gzip",
+            Bytes::from_static(b"fake-r-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Package: mypkg"), "index was: {text}");
+        assert!(text.contains("Version: 1.0.0"), "index was: {text}");
+        assert!(
+            !text.contains("sha256-abcdef012345"),
+            "index still advertises the unresolvable sha256 fallback: {text}"
+        );
         f.teardown().await;
     }
 }
