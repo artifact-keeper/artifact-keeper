@@ -2616,35 +2616,26 @@ impl AuthService {
     /// # Returns
     /// * `RoleMapping` - The mapped roles and admin status
     pub fn map_groups_to_roles(
-        &self,
         groups: &[String],
         required_admin_group: Option<&str>,
     ) -> RoleMapping {
         let mut mapping = RoleMapping::default();
 
-        // Normalize groups to lowercase for case-insensitive matching
+        // Normalize groups to lowercase for case-insensitive role matching below.
         let normalized_groups: Vec<String> = groups.iter().map(|g| g.to_lowercase()).collect();
 
-        // Check for admin groups: if admin_group is explicitly configured, use
-        // exact match only; otherwise fall back to built-in pattern matching.
+        // Admin is granted ONLY when a provider has an explicit admin group
+        // configured and a claim matches it by exact, case-insensitive
+        // equality. There is deliberately no implicit pattern-based fallback:
+        // when no admin group is configured, `mapping.is_admin` stays `None`,
+        // which the COALESCE-based apply preserves any operator-set is_admin
+        // and never grants admin from a self-asserted group claim.
         if let Some(ag) = required_admin_group {
-            let ag_lower = ag.to_lowercase();
-            if normalized_groups.contains(&ag_lower) {
+            if groups.iter().any(|g| g.eq_ignore_ascii_case(ag)) {
                 mapping.is_admin = Some(true);
                 mapping.roles.push("admin".to_string());
             } else {
                 mapping.is_admin = Some(false);
-            }
-        } else {
-            let admin_patterns = ["admin", "administrators", "superusers", "artifact-admins"];
-            for group in &normalized_groups {
-                for pattern in &admin_patterns {
-                    if group.contains(pattern) {
-                        mapping.is_admin = Some(true);
-                        mapping.roles.push("admin".to_string());
-                        break;
-                    }
-                }
             }
         }
 
@@ -2816,7 +2807,7 @@ impl AuthService {
         credentials: &FederatedCredentials,
     ) -> Result<User> {
         // Map groups to roles
-        let role_mapping = self.map_groups_to_roles(
+        let role_mapping = Self::map_groups_to_roles(
             &credentials.groups,
             credentials.required_admin_group.as_deref(),
         );
@@ -4288,8 +4279,9 @@ mod tests {
     // Since it does not use self.db or self.config, we just need any instance.
     // We'll test using the same approach: direct key construction.
 
-    // Reimplement map_groups_to_roles locally since AuthService requires PgPool
-    // and we cannot create one without a real database connection.
+    // map_groups_to_roles is an associated fn (no self / PgPool needed), so these
+    // wrappers call the REAL AuthService::map_groups_to_roles and the unit tests
+    // exercise the production logic rather than a divergence-prone reimplementation.
     fn test_map_groups_to_roles(groups: &[String]) -> RoleMapping {
         test_map_groups_to_roles_with_admin(groups, None)
     }
@@ -4298,81 +4290,64 @@ mod tests {
         groups: &[String],
         required_admin_group: Option<&str>,
     ) -> RoleMapping {
-        let mut mapping = RoleMapping::default();
-        let normalized_groups: Vec<String> = groups.iter().map(|g| g.to_lowercase()).collect();
-
-        if let Some(ag) = required_admin_group {
-            let ag_lower = ag.to_lowercase();
-            if normalized_groups.contains(&ag_lower) {
-                mapping.is_admin = Some(true);
-                mapping.roles.push("admin".to_string());
-            } else {
-                mapping.is_admin = Some(false);
-            }
-        } else {
-            let admin_patterns = ["admin", "administrators", "superusers", "artifact-admins"];
-            for group in &normalized_groups {
-                for pattern in &admin_patterns {
-                    if group.contains(pattern) {
-                        mapping.is_admin = Some(true);
-                        mapping.roles.push("admin".to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        let role_mappings = [
-            ("developers", "developer"),
-            ("readonly", "reader"),
-            ("deployers", "deployer"),
-            ("artifact-publishers", "publisher"),
-        ];
-
-        for group in &normalized_groups {
-            for (pattern, role) in &role_mappings {
-                if group.contains(pattern) && !mapping.roles.contains(&role.to_string()) {
-                    mapping.roles.push(role.to_string());
-                }
-            }
-        }
-
-        if !mapping.roles.contains(&"user".to_string()) {
-            mapping.roles.push("user".to_string());
-        }
-
-        mapping
+        AuthService::map_groups_to_roles(groups, required_admin_group)
     }
 
+    // Without an explicitly-configured admin group, a self-asserted group claim
+    // can NEVER grant admin -- there is no implicit pattern-based fallback. All
+    // of these previously granted admin via substring matching; they now assert
+    // the hardened default (is_admin stays None, so the COALESCE apply preserves
+    // whatever is_admin the user already had).
     #[test]
     fn test_map_groups_admin_group() {
         let mapping = test_map_groups_to_roles(&["team-admin".to_string()]);
-        assert_eq!(mapping.is_admin, Some(true));
-        assert!(mapping.roles.contains(&"admin".to_string()));
+        assert!(mapping.is_admin.is_none());
+        assert!(!mapping.roles.contains(&"admin".to_string()));
     }
 
     #[test]
     fn test_map_groups_administrators_group() {
         let mapping = test_map_groups_to_roles(&["CN=Administrators,DC=corp".to_string()]);
-        assert_eq!(mapping.is_admin, Some(true));
+        assert!(mapping.is_admin.is_none());
     }
 
     #[test]
     fn test_map_groups_superusers_group() {
         let mapping = test_map_groups_to_roles(&["superusers".to_string()]);
-        assert_eq!(mapping.is_admin, Some(true));
+        assert!(mapping.is_admin.is_none());
     }
 
     #[test]
     fn test_map_groups_artifact_admins_group() {
         let mapping = test_map_groups_to_roles(&["artifact-admins".to_string()]);
-        assert_eq!(mapping.is_admin, Some(true));
+        assert!(mapping.is_admin.is_none());
     }
 
     #[test]
     fn test_map_groups_case_insensitive_admin() {
+        // "ADMIN-TEAM" no longer grants admin without a configured admin group.
         let mapping = test_map_groups_to_roles(&["ADMIN-TEAM".to_string()]);
-        assert_eq!(mapping.is_admin, Some(true));
+        assert!(mapping.is_admin.is_none());
+    }
+
+    #[test]
+    fn test_map_groups_no_admin_group_backend_admins_denied() {
+        // Substring "admin" claim without a configured admin group -> no admin.
+        let mapping = test_map_groups_to_roles(&["backend-admins".to_string()]);
+        assert!(mapping.is_admin.is_none());
+        assert!(!mapping.roles.contains(&"admin".to_string()));
+    }
+
+    #[test]
+    fn test_map_groups_no_admin_group_nonadmin_users_denied() {
+        let mapping = test_map_groups_to_roles(&["nonadmin-users".to_string()]);
+        assert!(mapping.is_admin.is_none());
+    }
+
+    #[test]
+    fn test_map_groups_no_admin_group_administrative_staff_denied() {
+        let mapping = test_map_groups_to_roles(&["administrative-staff".to_string()]);
+        assert!(mapping.is_admin.is_none());
     }
 
     #[test]
@@ -4426,7 +4401,12 @@ mod tests {
 
     #[test]
     fn test_map_groups_admin_plus_developer() {
-        let mapping = test_map_groups_to_roles(&["admin".to_string(), "developers".to_string()]);
+        // With an explicit admin group configured and an exact-matching claim,
+        // the user gets admin AND the developer role from the non-admin map.
+        let mapping = test_map_groups_to_roles_with_admin(
+            &["admin".to_string(), "developers".to_string()],
+            Some("admin"),
+        );
         assert_eq!(mapping.is_admin, Some(true));
         assert!(mapping.roles.contains(&"admin".to_string()));
         assert!(mapping.roles.contains(&"developer".to_string()));
@@ -4480,6 +4460,47 @@ mod tests {
         // "company-admin-team" contains "admin" but should NOT match required "admin"
         let mapping =
             test_map_groups_to_roles_with_admin(&["company-admin-team".to_string()], Some("admin"));
+        assert_eq!(mapping.is_admin, Some(false));
+    }
+
+    #[test]
+    fn test_required_admin_group_exact_grants_admin() {
+        let mapping = test_map_groups_to_roles_with_admin(
+            &["platform-admins".to_string()],
+            Some("platform-admins"),
+        );
+        assert_eq!(mapping.is_admin, Some(true));
+        assert!(mapping.roles.contains(&"admin".to_string()));
+    }
+
+    #[test]
+    fn test_required_admin_group_case_insensitive_exact_grants_admin() {
+        // Case-insensitive exact equality (aligns with SamlService/LdapService
+        // is_admin_from_groups): a case-differing exact claim still grants.
+        let mapping = test_map_groups_to_roles_with_admin(
+            &["Platform-Admins".to_string()],
+            Some("platform-admins"),
+        );
+        assert_eq!(mapping.is_admin, Some(true));
+    }
+
+    #[test]
+    fn test_required_admin_group_suffix_does_not_match() {
+        // "platform-admins-x" must NOT match required "platform-admins" (exact only).
+        let mapping = test_map_groups_to_roles_with_admin(
+            &["platform-admins-x".to_string()],
+            Some("platform-admins"),
+        );
+        assert_eq!(mapping.is_admin, Some(false));
+    }
+
+    #[test]
+    fn test_required_admin_group_prefix_does_not_match() {
+        // "platform-admin" (short) must NOT match required "platform-admins".
+        let mapping = test_map_groups_to_roles_with_admin(
+            &["platform-admin".to_string()],
+            Some("platform-admins"),
+        );
         assert_eq!(mapping.is_admin, Some(false));
     }
 
