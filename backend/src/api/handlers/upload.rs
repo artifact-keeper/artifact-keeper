@@ -748,7 +748,9 @@ async fn complete(
         }
     }
 
-    if let Some((package_name, package_version)) = completed_package_catalog_entry(&session) {
+    if let Some((package_name, package_version)) =
+        completed_package_catalog_entry(&session, &repo.format)
+    {
         PackageService::new(state.db.clone())
             .try_create_or_update_from_artifact(
                 session.repository_id,
@@ -1091,14 +1093,39 @@ fn maven_package_metadata_from_artifact_metadata(
     Some(catalog)
 }
 
-fn completed_package_catalog_entry(
-    session: &upload_service::UploadSession,
-) -> Option<(String, &str)> {
+fn completed_package_catalog_entry<'a>(
+    session: &'a upload_service::UploadSession,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Option<(String, &'a str)> {
     let version = completed_artifact_version(session)?;
+    // #2723: Maven/Gradle grouped listings key the catalog `packages` row on
+    // `groupId:artifactId`. Prefer the replicated POM metadata's coordinates;
+    // otherwise, for a Maven/Gradle repo, derive the grouped name from the
+    // artifact path so a generically-pushed asset joins the same component
+    // instead of landing under a bare artifactId/filename.
     let name = replicated_maven_artifact_metadata(session)
         .and_then(maven_package_name_from_metadata)
+        .or_else(|| maven_grouped_name_for_format(session, format))
         .unwrap_or_else(|| completed_artifact_name(session).to_string());
     Some((name, version))
+}
+
+/// Derive the grouped `groupId:artifactId` catalog name from the completed
+/// upload's path for Maven/Gradle repositories (#2723). Returns `None` for
+/// other formats or when the path is not a parseable Maven GAV layout, leaving
+/// the caller's bare-name fallback in place.
+fn maven_grouped_name_for_format(
+    session: &upload_service::UploadSession,
+    format: &crate::models::repository::RepositoryFormat,
+) -> Option<String> {
+    use crate::models::repository::RepositoryFormat;
+    if !matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle) {
+        return None;
+    }
+    match crate::formats::maven::MavenHandler::parse_coordinates(&session.artifact_path) {
+        Ok(coords) => Some(format!("{}:{}", coords.group_id, coords.artifact_id)),
+        Err(_) => None,
+    }
 }
 
 fn completed_package_description(session: &upload_service::UploadSession) -> Option<&str> {
@@ -1659,8 +1686,30 @@ mod tests {
         );
 
         assert_eq!(
-            completed_package_catalog_entry(&session),
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
             Some(("large-check".to_string(), "20260603T082854Z"))
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_derives_grouped_name_for_maven_repo() {
+        // #2723: a generically-pushed Maven asset (no replicated POM metadata)
+        // must still land under the grouped `groupId:artifactId` catalog name
+        // derived from its GAV path, not the bare artifactId/filename.
+        let session = test_upload_session(
+            "org/example/ak/maven/ak-core/1.0.0/ak-core-1.0.0.jar",
+            None,
+            Some("1.0.0"),
+        );
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+        );
+        // A non-Maven repo keeps the bare artifact name.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0"))
         );
     }
 
@@ -1685,7 +1734,7 @@ mod tests {
         }));
 
         assert_eq!(
-            completed_package_catalog_entry(&session),
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
             Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
         );
         assert_eq!(
@@ -1717,7 +1766,7 @@ mod tests {
         }));
 
         assert_eq!(
-            completed_package_catalog_entry(&session),
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
             Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
         );
         assert_eq!(completed_package_description(&session), None);
@@ -1729,7 +1778,10 @@ mod tests {
         let session =
             test_upload_session("large-check/20260603T082854Z/large-160m.bin", None, None);
 
-        assert_eq!(completed_package_catalog_entry(&session), None);
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            None
+        );
     }
 
     // -----------------------------------------------------------------------

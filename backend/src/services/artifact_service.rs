@@ -916,11 +916,31 @@ impl ArtifactService {
 
         // Populate packages / package_versions tables (non-blocking)
         if let Some(ref ver) = artifact.version {
+            // #2723: Maven/Gradle grouped listings key the catalog `packages`
+            // row on `groupId:artifactId`. The dedicated Maven upload handler
+            // already records that form; normalize this generic finalize path
+            // (replication / migration / generic push) to match instead of
+            // persisting the bare artifactId or filename, which would split a
+            // single component across multiple grouped rows.
+            let package_name = match self.repo_service.get_by_id(artifact.repository_id).await {
+                Ok(repo)
+                    if matches!(
+                        repo.format,
+                        RepositoryFormat::Maven | RepositoryFormat::Gradle
+                    ) =>
+                {
+                    crate::formats::maven::MavenHandler::grouped_package_name(
+                        &artifact.path,
+                        &artifact.name,
+                    )
+                }
+                _ => artifact.name.clone(),
+            };
             let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
                     artifact.repository_id,
-                    &artifact.name,
+                    &package_name,
                     ver,
                     artifact.size_bytes,
                     &artifact.checksum_sha256,
