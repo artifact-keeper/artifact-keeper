@@ -151,8 +151,12 @@ async fn module_info(
             "version": current_version,
             "slug": format!("{}-{}-{}", owner, name, current_version),
             "file_uri": format!(
-                "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-                repo_key, owner, name, current_version
+                "/puppet/{}/v3/files/{}",
+                repo_key,
+                proxy_helpers::served_download_filename(
+                    &artifact.path,
+                    &format!("{}-{}-{}.tar.gz", owner, name, current_version)
+                )
             ),
         },
         "releases": [],
@@ -187,8 +191,12 @@ async fn release_list(
                 "slug": format!("{}-{}-{}", owner, name, version),
                 "version": version,
                 "file_uri": format!(
-                    "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-                    repo_key, owner, name, version
+                    "/puppet/{}/v3/files/{}",
+                    repo_key,
+                    proxy_helpers::served_download_filename(
+                        &a.path,
+                        &format!("{}-{}-{}.tar.gz", owner, name, version)
+                    )
                 ),
                 "file_size": a.size_bytes,
                 "file_sha256": a.checksum_sha256,
@@ -249,8 +257,12 @@ async fn release_info(
             "owner": { "slug": owner, "username": owner },
         },
         "file_uri": format!(
-            "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-            repo_key, owner, name, version
+            "/puppet/{}/v3/files/{}",
+            repo_key,
+            proxy_helpers::served_download_filename(
+                &artifact.path,
+                &format!("{}-{}-{}.tar.gz", owner, name, version)
+            )
         ),
         "file_size": artifact.size_bytes,
         "file_sha256": artifact.checksum_sha256,

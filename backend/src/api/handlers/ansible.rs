@@ -232,8 +232,12 @@ async fn collection_info(
             repo_key, namespace, name
         ),
         "download_url": format!(
-            "/ansible/{}/download/{}-{}-{}.tar.gz",
-            repo_key, namespace, name, latest_version
+            "/ansible/{}/download/{}",
+            repo_key,
+            proxy_helpers::served_download_filename(
+                &artifact.path,
+                &format!("{}-{}-{}.tar.gz", namespace, name, latest_version)
+            )
         ),
     });
 
@@ -322,16 +326,20 @@ async fn version_info(
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
+    // Advertise the stored basename so the suffix-matching download route
+    // resolves the object for bare-path (generic) uploads as well as native
+    // ones (#2589); byte-identical to the reconstruction for native uploads.
+    let served_filename = proxy_helpers::served_download_filename(
+        &artifact.path,
+        &format!("{}-{}-{}.tar.gz", namespace, name, version),
+    );
     let json = serde_json::json!({
         "namespace": namespace,
         "name": name,
         "version": version,
-        "download_url": format!(
-            "/ansible/{}/download/{}-{}-{}.tar.gz",
-            repo_key, namespace, name, version
-        ),
+        "download_url": format!("/ansible/{}/download/{}", repo_key, served_filename),
         "artifact": {
-            "filename": format!("{}-{}-{}.tar.gz", namespace, name, version),
+            "filename": served_filename,
             "size": artifact.size_bytes,
             "sha256": artifact.checksum_sha256,
         },
