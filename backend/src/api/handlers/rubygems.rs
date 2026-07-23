@@ -108,7 +108,10 @@ async fn gem_info(
             .unwrap_or("")
             .to_string();
 
-        let gem_filename = format!("{}-{}.gem", gem_name, version);
+        let gem_filename = proxy_helpers::served_download_filename(
+            &artifact.path,
+            &format!("{}-{}.gem", gem_name, version),
+        );
         let gem_uri = format!("/gems/{}/gems/{}", repo_key, gem_filename);
 
         let json = serde_json::json!({
@@ -177,7 +180,10 @@ async fn gem_versions(
                 .unwrap_or("")
                 .to_string();
 
-            let gem_filename = format!("{}-{}.gem", gem_name, version);
+            let gem_filename = proxy_helpers::served_download_filename(
+                &a.path,
+                &format!("{}-{}.gem", gem_name, version),
+            );
 
             serde_json::json!({
                 "number": version,

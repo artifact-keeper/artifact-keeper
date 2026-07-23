@@ -3792,16 +3792,47 @@ pub async fn try_remote_or_virtual_download(
 }
 
 /// Artifact row exposing the columns most metadata endpoints need:
-/// id, version, size, checksum, and the raw `artifact_metadata.metadata`
-/// JSON. Returned by [`find_artifact_by_name_lowercase`] and
+/// id, the stored object `path`, version, size, checksum, and the raw
+/// `artifact_metadata.metadata` JSON. Returned by
+/// [`find_artifact_by_name_lowercase`] and
 /// [`list_artifacts_by_name_lowercase`].
+///
+/// `path` is the raw stored object path. Metadata endpoints advertise a
+/// download URL from its basename (via [`served_download_filename`]) so the
+/// URL resolves through the suffix-matching download route for bare-path
+/// (generically-uploaded) artifacts as well as natively-published ones.
 pub struct ArtifactWithMetadata {
     pub id: Uuid,
+    pub path: String,
     pub name: String,
     pub version: Option<String>,
     pub size_bytes: Option<i64>,
     pub checksum_sha256: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// The filename a suffix-matching download route (`find_local_by_filename_suffix`
+/// and friends) will resolve for a stored artifact `path`: the basename of the
+/// stored object when present, otherwise `fallback` (the format's reconstructed
+/// `{name}-{version}.<ext>`).
+///
+/// For a natively-published artifact stored at `{name}/{version}/{file}` the
+/// basename already equals the reconstructed filename, so the advertised URL is
+/// byte-identical. But an artifact pushed through the generic chunked-upload
+/// flow is stored at its bare filename with generically-derived `name`/`version`
+/// (an empty version falls back to `sha256-<prefix>`; see
+/// `upload.rs::completed_format_artifact_version`), so a reconstructed
+/// `{name}-{version}.<ext>` would advertise a path the download route cannot
+/// resolve. Preferring the real stored basename keeps every format's on-demand
+/// metadata coherent with its served route for both upload flows — the same fix
+/// applied to rpm `primary.xml`, helm `index.yaml`, cran `PACKAGES` and the
+/// rubygems spec index (#2587 / #2589).
+#[must_use]
+pub fn served_download_filename(path: &str, fallback: &str) -> String {
+    match path.rsplit('/').next() {
+        Some(basename) if !basename.is_empty() => basename.to_string(),
+        _ => fallback.to_string(),
+    }
 }
 
 /// Look up an artifact by case-insensitive name AND exact version.
@@ -3815,7 +3846,7 @@ pub async fn find_artifact_by_name_version(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3834,6 +3865,7 @@ pub async fn find_artifact_by_name_version(
 
     Ok(row.map(|r| ArtifactWithMetadata {
         id: r.try_get("id").unwrap_or_default(),
+        path: r.try_get("path").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
         size_bytes: r.try_get("size_bytes").ok(),
@@ -3856,7 +3888,7 @@ pub async fn find_artifact_by_name_lowercase(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3874,6 +3906,7 @@ pub async fn find_artifact_by_name_lowercase(
 
     Ok(row.map(|r| ArtifactWithMetadata {
         id: r.try_get("id").unwrap_or_default(),
+        path: r.try_get("path").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
         size_bytes: r.try_get("size_bytes").ok(),
@@ -3896,7 +3929,7 @@ pub async fn list_artifacts_by_name_lowercase(
 ) -> Result<Vec<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3915,6 +3948,7 @@ pub async fn list_artifacts_by_name_lowercase(
         .into_iter()
         .map(|r| ArtifactWithMetadata {
             id: r.try_get("id").unwrap_or_default(),
+            path: r.try_get("path").unwrap_or_default(),
             name: r.try_get("name").unwrap_or_default(),
             version: r.try_get("version").ok(),
             size_bytes: r.try_get("size_bytes").ok(),
@@ -7099,6 +7133,7 @@ mod tests {
         let id = Uuid::new_v4();
         let m = ArtifactWithMetadata {
             id,
+            path: "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz".to_string(),
             name: "ggplot2".to_string(),
             version: Some("3.4.0".to_string()),
             size_bytes: Some(1024),
@@ -7106,6 +7141,7 @@ mod tests {
             metadata: Some(serde_json::json!({"depends": "R (>= 3.5.0)"})),
         };
         assert_eq!(m.id, id);
+        assert_eq!(m.path, "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz");
         assert_eq!(m.name, "ggplot2");
         assert_eq!(m.version.as_deref(), Some("3.4.0"));
         assert_eq!(m.size_bytes, Some(1024));
@@ -7117,6 +7153,7 @@ mod tests {
     fn test_artifact_with_metadata_all_none_optional() {
         let m = ArtifactWithMetadata {
             id: Uuid::new_v4(),
+            path: "lonely.gem".to_string(),
             name: "lonely".to_string(),
             version: None,
             size_bytes: None,
@@ -7128,6 +7165,48 @@ mod tests {
         assert!(m.checksum_sha256.is_none());
         assert!(m.metadata.is_none());
         assert_eq!(m.name, "lonely");
+    }
+
+    #[test]
+    fn test_served_download_filename_native_path_is_byte_identical() {
+        // Natively-published layout `{name}/{version}/{file}`: the basename
+        // already equals the reconstructed `{name}-{version}.<ext>`, so the
+        // advertised URL is unchanged for native uploads.
+        assert_eq!(
+            served_download_filename("ns-coll/1.0.0/ns-coll-1.0.0.tar.gz", "ns-coll-1.0.0.tar.gz"),
+            "ns-coll-1.0.0.tar.gz"
+        );
+        assert_eq!(
+            served_download_filename("foo/1.0.0/foo-1.0.0.gem", "foo-1.0.0.gem"),
+            "foo-1.0.0.gem"
+        );
+    }
+
+    #[test]
+    fn test_served_download_filename_bare_path_prefers_stored_basename() {
+        // Generic bare-path upload: `name`/`version` are derived (version falls
+        // back to `sha256-<prefix>`), so the reconstructed fallback would 404.
+        // The stored basename is what the suffix-matching route resolves.
+        assert_eq!(
+            served_download_filename(
+                "ns-coll-1.0.0.tar.gz",
+                "ns-coll-1.0.0.tar.gz-sha256-deadbeef.tar.gz"
+            ),
+            "ns-coll-1.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_served_download_filename_empty_path_falls_back() {
+        assert_eq!(
+            served_download_filename("", "owner-mod-1.0.0.tar.gz"),
+            "owner-mod-1.0.0.tar.gz"
+        );
+        // A path with a trailing slash has no basename; fall back.
+        assert_eq!(
+            served_download_filename("dir/", "owner-mod-1.0.0.tar.gz"),
+            "owner-mod-1.0.0.tar.gz"
+        );
     }
 
     // ── DownloadResponseOpts / VirtualLookup tests ──────────────────────
