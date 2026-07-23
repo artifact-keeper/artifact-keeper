@@ -326,7 +326,7 @@ impl SearchService {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
-                  AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
+                  AND ($1::text IS NULL OR a.search_vector @@ to_tsquery('english', $1))
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3)
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
@@ -363,7 +363,7 @@ impl SearchService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
-              AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
+              AND ($1::text IS NULL OR a.search_vector @@ to_tsquery('english', $1))
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3)
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
