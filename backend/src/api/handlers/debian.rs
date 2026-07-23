@@ -294,6 +294,17 @@ fn decode_to_fixpoint(raw: &str) -> Option<String> {
     None
 }
 
+/// True when `s` contains a percent-encoded path separator — `%2f`/`%2F` (`/`)
+/// or `%5c`/`%5C` (`\`), in any case. See [`normalized_debian_relpath`] for how
+/// this is used as a defense-in-depth belt (#2562).
+fn contains_encoded_separator(s: &str) -> bool {
+    s.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && ((w[1].eq_ignore_ascii_case(&b'2') && w[2].eq_ignore_ascii_case(&b'f'))
+                || (w[1].eq_ignore_ascii_case(&b'5') && w[2].eq_ignore_ascii_case(&b'c')))
+    })
+}
+
 /// The upstream base URL to gate against, or `None` for repositories the P2
 /// filter does not apply to (hosted/virtual, or a remote with no upstream).
 fn repo_remote_upstream(repo: &RepoInfo) -> Option<&str> {
@@ -317,9 +328,21 @@ fn repo_remote_upstream(repo: &RepoInfo) -> Option<&str> {
 /// (already once-decoded) request path is refused outright rather than left to
 /// be silently stripped. Escapes above the base (scheme/host/port/prefix
 /// change) are refused too.
+///
+/// Defense-in-depth (#2562): a percent-encoded path separator — `%2f`/`%2F`
+/// (`/`) or `%5c`/`%5C` (`\`) — is also refused outright. A standard APT origin
+/// never decodes these as separators (Apache `AllowEncodedSlashes` defaults
+/// Off), and no legitimate Debian path segment (distribution, component, or
+/// `.deb` filename) contains an encoded slash or backslash, so a request
+/// carrying one is a normalization/traversal probe, not a real fetch. Refusing
+/// it here keeps gate/fetch parity from ever depending on how a nonstandard
+/// upstream chooses to decode the sequence.
 #[allow(clippy::result_large_err)]
 fn normalized_debian_relpath(base_url: &str, relative: &str) -> Result<String, Response> {
     if relative.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(debian_filter_denied("path", relative));
+    }
+    if contains_encoded_separator(relative) {
         return Err(debian_filter_denied("path", relative));
     }
     let base = reqwest::Url::parse(base_url).map_err(|_| debian_filter_denied("path", relative))?;
@@ -3387,6 +3410,88 @@ mod tests {
         }
         // Escape above the base path is refused.
         assert!(normalized_debian_relpath(TEST_BASE, "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_contains_encoded_separator() {
+        // Encoded slash / backslash, both cases, are detected.
+        for bad in [
+            "dists/bookworm/main%2f..%2fcontrib",
+            "dists/bookworm/main%2F..%2Fcontrib",
+            "pool/main/a%5c..%5cb",
+            "pool/main/a%5C..%5Cb",
+            // Mixed case within the escape.
+            "dists/bookworm/main%2Fcontrib",
+        ] {
+            assert!(
+                contains_encoded_separator(bad),
+                "should flag encoded separator: {bad:?}"
+            );
+        }
+        // Legitimate paths — including a percent-encoded epoch colon and an
+        // encoded `.deb` extension — are NOT flagged.
+        for ok in [
+            "dists/bookworm/main/binary-amd64/Packages.gz",
+            "pool/main/g/gcc/gcc_4%3a10.2.1-1_amd64.deb",
+            "pool/main/0/0ad/0ad_1_arm64%2edeb",
+            // A bare `%2` or `%5` that is not a separator escape.
+            "pool/main/foo%20bar",
+        ] {
+            assert!(
+                !contains_encoded_separator(ok),
+                "should NOT flag legit path: {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalized_relpath_rejects_encoded_separators() {
+        // Encoded `/` and `\` in the proxy path are refused as defense-in-depth
+        // (#2562), while the equivalent legitimate path resolves normally.
+        for bad in [
+            "dists/bookworm/main%2f..%2fcontrib/binary-amd64/Packages.gz",
+            "dists/bookworm/main%2F..%2Fcontrib/binary-amd64/Packages.gz",
+            "pool/main/m/mypkg%5c..%5cevil_1_amd64.deb",
+            "pool/main/m/mypkg%5C..%5Cevil_1_amd64.deb",
+        ] {
+            assert!(
+                normalized_debian_relpath(TEST_BASE, bad).is_err(),
+                "should reject encoded separator: {bad:?}"
+            );
+        }
+        // Legitimate request with real separators still resolves.
+        assert_eq!(
+            normalized_debian_relpath(TEST_BASE, "dists/bookworm/main/binary-amd64/Packages.gz")
+                .unwrap(),
+            "dists/bookworm/main/binary-amd64/Packages.gz"
+        );
+    }
+
+    #[test]
+    fn test_gate_dists_blocks_encoded_separator() {
+        let filter = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Allowed request passes.
+        assert!(gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/binary-amd64/Packages.gz"
+        )
+        .is_ok());
+        // Encoded-slash traversal toward a non-allowlisted component is refused.
+        let resp = gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main%2f..%2fcontrib/binary-amd64/Packages.gz",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
