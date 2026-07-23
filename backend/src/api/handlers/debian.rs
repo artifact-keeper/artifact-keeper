@@ -178,6 +178,57 @@ fn debian_filter_denied(dimension: &str, value: &str) -> Response {
     (StatusCode::NOT_FOUND, "Not found").into_response()
 }
 
+/// Response for a request refused by the #2562 encoded-separator guard. Unlike
+/// a filter miss (404, which hides mirror contents), an encoded path separator
+/// is a malformed request regardless of what the mirror holds, so it is
+/// answered with an explicit 400 that names the reason.
+fn debian_encoded_separator_rejected(path: &str) -> Response {
+    tracing::debug!(
+        path = path,
+        "debian proxy request rejected: encoded path separator (#2562)"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        "Encoded path separators (%2f/%5c) are not permitted in Debian proxy paths",
+    )
+        .into_response()
+}
+
+/// Detect a percent-encoded path separator (`%2f` = `/`, `%5c` = `\`) anywhere
+/// in a proxy request path, at any percent-decoding layer up to a fixpoint (so
+/// a singly- OR multiply-encoded separator is caught). APT never
+/// percent-encodes path separators, so a hit here is always a path-confusion or
+/// traversal probe rather than a legitimate request. Note this deliberately
+/// does NOT flag other encoded bytes (e.g. an epoch `%3a`), which are legal in
+/// Debian filenames.
+fn has_encoded_path_separator(raw: &str) -> bool {
+    let mut cur = raw.to_string();
+    for _ in 0..8 {
+        let lower = cur.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return true;
+        }
+        if !cur.contains('%') {
+            return false;
+        }
+        match urlencoding::decode(&cur) {
+            Ok(decoded) => {
+                let decoded = decoded.into_owned();
+                if decoded == cur {
+                    // A `%` that is not part of a valid escape — no separator.
+                    return false;
+                }
+                cur = decoded;
+            }
+            // Invalid UTF-8 in an escape: not a decodable separator.
+            Err(_) => return false,
+        }
+    }
+    // Pathological over-encoding: treat as suspicious and let the caller decide
+    // via the normal reject path below (return true so it is refused).
+    true
+}
+
 /// Pre-fetch allow/deny decision for a Debian proxy request. Each dimension is
 /// checked only when supplied (`Some`); an empty allowlist for a dimension
 /// permits everything. Returns a 404 [`Response`] as `Err` when any supplied
@@ -318,7 +369,19 @@ fn repo_remote_upstream(repo: &RepoInfo) -> Option<&str> {
 /// be silently stripped. Escapes above the base (scheme/host/port/prefix
 /// change) are refused too.
 #[allow(clippy::result_large_err)]
-fn normalized_debian_relpath(base_url: &str, relative: &str) -> Result<String, Response> {
+fn normalized_debian_relpath(
+    base_url: &str,
+    relative: &str,
+    allow_encoded_separators: bool,
+) -> Result<String, Response> {
+    // #2562 defense-in-depth: reject an encoded path separator (%2f/%5c) before
+    // it can be forwarded opaquely upstream. reqwest keeps `%2f` encoded (it is
+    // NOT split into a segment), so such a request is gated as one opaque
+    // segment yet a nonstandard upstream that decodes it could still traverse.
+    // APT never encodes separators, so this never blocks a legitimate path.
+    if !allow_encoded_separators && has_encoded_path_separator(relative) {
+        return Err(debian_encoded_separator_rejected(relative));
+    }
     if relative.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(debian_filter_denied("path", relative));
     }
@@ -356,9 +419,10 @@ fn normalized_dists_parts(
     base_url: &str,
     distribution: &str,
     raw_suffix: &str,
+    allow_encoded_separators: bool,
 ) -> Result<(String, String), Response> {
     let relative = format!("dists/{}/{}", distribution, raw_suffix);
-    let norm = normalized_debian_relpath(base_url, &relative)?;
+    let norm = normalized_debian_relpath(base_url, &relative, allow_encoded_separators)?;
     let mut it = norm.splitn(3, '/');
     match it.next() {
         Some("dists") => {}
@@ -384,7 +448,12 @@ fn gate_debian_dists(
     distribution: &str,
     raw_suffix: &str,
 ) -> Result<(), Response> {
-    let (dist, suffix) = normalized_dists_parts(base_url, distribution, raw_suffix)?;
+    let (dist, suffix) = normalized_dists_parts(
+        base_url,
+        distribution,
+        raw_suffix,
+        filter.allow_encoded_separators,
+    )?;
     debian_filter_decision(
         filter,
         Some(&dist),
@@ -405,7 +474,7 @@ fn gate_debian_pool(
     path: &str,
 ) -> Result<(), Response> {
     let relative = format!("pool/{}/{}", component, path);
-    let norm = normalized_debian_relpath(base_url, &relative)?;
+    let norm = normalized_debian_relpath(base_url, &relative, filter.allow_encoded_separators)?;
     let mut it = norm.splitn(3, '/');
     match it.next() {
         Some("pool") => {}
@@ -448,7 +517,12 @@ async fn enforce_by_hash_arch(
     if filter.architectures.is_empty() {
         return Ok(());
     }
-    let (ndist, suffix) = normalized_dists_parts(upstream_url, distribution, raw_suffix)?;
+    let (ndist, suffix) = normalized_dists_parts(
+        upstream_url,
+        distribution,
+        raw_suffix,
+        filter.allow_encoded_separators,
+    )?;
     if !suffix.contains("by-hash/") {
         return Ok(());
     }
@@ -3320,10 +3394,10 @@ mod tests {
                 .to_string();
             // A control byte is refused up front (belt); otherwise parity holds.
             if raw.bytes().any(|b| b <= 0x20 || b == 0x7f) {
-                assert!(normalized_debian_relpath(TEST_BASE, raw).is_err());
+                assert!(normalized_debian_relpath(TEST_BASE, raw, false).is_err());
             } else {
                 assert_eq!(
-                    normalized_debian_relpath(TEST_BASE, raw).unwrap(),
+                    normalized_debian_relpath(TEST_BASE, raw, false).unwrap(),
                     expected,
                     "gate input must equal reqwest fetch path for: {raw:?}"
                 );
@@ -3377,16 +3451,98 @@ mod tests {
     }
 
     #[test]
+    fn test_has_encoded_path_separator() {
+        // Encoded forward slash / backslash, any case, any decode layer.
+        assert!(has_encoded_path_separator("main%2f..%2fcontrib"));
+        assert!(has_encoded_path_separator("main%2F..%2Fcontrib"));
+        assert!(has_encoded_path_separator("a%5cb"));
+        assert!(has_encoded_path_separator("a%5Cb"));
+        // Double-encoded (axum decodes once -> %2f reaches the fixpoint scan).
+        assert!(has_encoded_path_separator("main%252f..%252fcontrib"));
+        // Legitimate Debian paths: real separators and an epoch colon are fine.
+        assert!(!has_encoded_path_separator("main/binary-amd64/Packages.gz"));
+        assert!(!has_encoded_path_separator("gcc_4%3a10.2.1-1_amd64.deb"));
+        assert!(!has_encoded_path_separator("0ad_1_arm64%252edeb"));
+        assert!(!has_encoded_path_separator("Release"));
+    }
+
+    #[test]
+    fn test_gate_dists_rejects_encoded_separator_with_400() {
+        // Default filter (allow_encoded_separators = false) rejects an encoded
+        // separator in the dists path with a clear 400 (#2562).
+        let filter = DebianRepositoryConfig::default();
+        let resp = gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main%2f..%2fcontrib/binary-amd64/Packages.gz",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // An encoded separator smuggled through the distribution segment is also
+        // caught (the whole relative path is scanned).
+        let resp = gate_debian_dists(&filter, TEST_BASE, "book%2f..worm", "Release").unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // A legitimate path (real separators, epoch colon) still passes.
+        assert!(gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main/binary-amd64/Packages.gz"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_gate_dists_encoded_separator_opt_out() {
+        // With the per-repo opt-out on, the encoded separator is no longer
+        // rejected by the #2562 guard (it then flows to the normal gate, which
+        // for an empty allowlist permits it).
+        let filter = DebianRepositoryConfig {
+            allow_encoded_separators: true,
+            ..Default::default()
+        };
+        assert!(gate_debian_dists(
+            &filter,
+            TEST_BASE,
+            "bookworm",
+            "main%2f..%2fcontrib/binary-amd64/Packages.gz",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_gate_pool_rejects_encoded_separator_with_400() {
+        let filter = DebianRepositoryConfig::default();
+        let resp = gate_debian_pool(
+            &filter,
+            TEST_BASE,
+            "main",
+            "0/0ad/..%2f..%2f..%2fetc%2fpasswd",
+        )
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Legitimate pool path with an epoch-colon filename still passes.
+        assert!(gate_debian_pool(
+            &filter,
+            TEST_BASE,
+            "main",
+            "g/gcc/gcc_4%3a10.2.1-1_amd64.deb"
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_normalized_relpath_rejects_control_bytes_and_escape() {
         // Raw control byte (tab/LF/CR/space) refused up front.
         for bad in ["main/\t/Packages", "main/\n/Packages", "main/ /Packages"] {
             assert!(
-                normalized_debian_relpath(TEST_BASE, bad).is_err(),
+                normalized_debian_relpath(TEST_BASE, bad, false).is_err(),
                 "should reject control/ws: {bad:?}"
             );
         }
         // Escape above the base path is refused.
-        assert!(normalized_debian_relpath(TEST_BASE, "../../etc/passwd").is_err());
+        assert!(normalized_debian_relpath(TEST_BASE, "../../etc/passwd", false).is_err());
     }
 
     #[test]
