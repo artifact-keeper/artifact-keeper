@@ -615,6 +615,25 @@ pub(crate) fn package_name_from_gem_filename(filename: &str) -> Option<String> {
     None
 }
 
+/// Split a stored gem filename (`<name>-<version>(-<platform>)?.gem`) into the
+/// `(name, version)` a spec-index client reconstructs the download filename
+/// from. Returns `None` when the basename does not follow the gem naming
+/// convention (an arbitrary bare-path object), so callers can fall back to the
+/// stored coordinate columns.
+///
+/// The spec indices carry `[name, version, platform]` and `gem install`
+/// reconstructs `{name}-{version}.gem`, which the download route resolves by
+/// filename suffix. Native pushes store `{name}/{version}/{name}-{version}.gem`,
+/// whose basename parses back to the same coordinates (byte-identical); a
+/// generic bare-path upload stores the whole basename as `name` and a
+/// `sha256-<prefix>` fallback `version`, so re-deriving from the filename keeps
+/// the advertised coordinate coherent with what the route can serve.
+pub(crate) fn coordinates_from_gem_filename(filename: &str) -> Option<(String, String)> {
+    RubygemsHandler::parse_gem_filename(filename)
+        .ok()
+        .map(|(name, version, _platform)| (name, version))
+}
+
 /// Validate a gem name. RubyGems names match `[A-Za-z0-9._-]+` and may
 /// not start with `.` or `-`. The shadowing guard lowercases via Postgres
 /// `LOWER()`, so we restrict to ASCII to avoid homoglyph attacks where
@@ -1885,6 +1904,33 @@ summary: A summary
             package_name_from_gem_filename("aws-sdk-s3-1.140.0.gem"),
             Some("aws-sdk-s3".to_string())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // coordinates_from_gem_filename — spec-index download-URL coherence
+    // for bare-path generic uploads (#2754)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_coordinates_from_gem_filename_simple() {
+        assert_eq!(
+            coordinates_from_gem_filename("rails-7.0.8.gem"),
+            Some(("rails".to_string(), "7.0.8".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_coordinates_from_gem_filename_hyphenated_name() {
+        assert_eq!(
+            coordinates_from_gem_filename("aws-sdk-s3-1.140.0.gem"),
+            Some(("aws-sdk-s3".to_string(), "1.140.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_coordinates_from_gem_filename_not_a_gem() {
+        // Arbitrary bare-path object → no coordinates to derive.
+        assert_eq!(coordinates_from_gem_filename("archive.tar.gz"), None);
     }
 
     #[test]

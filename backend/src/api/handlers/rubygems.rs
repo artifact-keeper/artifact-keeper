@@ -385,7 +385,7 @@ async fn push_gem(
 }
 
 const SPECS_QUERY: &str = r#"
-    SELECT name, version
+    SELECT name, version, path
     FROM artifacts
     WHERE repository_id = $1
       AND is_deleted = false
@@ -393,7 +393,7 @@ const SPECS_QUERY: &str = r#"
 "#;
 
 const LATEST_SPECS_QUERY: &str = r#"
-    SELECT DISTINCT ON (LOWER(name)) name, version
+    SELECT DISTINCT ON (LOWER(name)) name, version, path
     FROM artifacts
     WHERE repository_id = $1
       AND is_deleted = false
@@ -404,7 +404,7 @@ const LATEST_SPECS_QUERY: &str = r#"
 // letter (e.g. `1.0.0.beta`, `2.1.0.rc1`). `specs.4.8.gz` carries releases;
 // `prerelease_specs.4.8.gz` carries these.
 const PRERELEASE_SPECS_QUERY: &str = r#"
-    SELECT name, version
+    SELECT name, version, path
     FROM artifacts
     WHERE repository_id = $1
       AND is_deleted = false
@@ -429,9 +429,28 @@ async fn query_gem_specs(
         .map(|r| {
             let name: String = r.get("name");
             let version: Option<String> = r.get("version");
-            serde_json::json!([name, version.unwrap_or_default(), "ruby"])
+            let path: String = r.get("path");
+            // Advertise coordinates derived from the actual stored filename so a
+            // bare-path generic upload (whole basename as `name` + `sha256-…`
+            // fallback `version`) yields a `{name}-{version}.gem` the download
+            // route can serve, instead of a client-reconstructed 404 (#2754).
+            let (name, version) = spec_index_coordinates(&path, name, version.unwrap_or_default());
+            serde_json::json!([name, version, "ruby"])
         })
         .collect())
+}
+
+/// Resolve the `(name, version)` a spec-index client will reconstruct the gem
+/// download filename from, preferring the artifact's actual stored filename over
+/// the stored coordinate columns. Byte-identical for natively published gems;
+/// corrects bare-path generic uploads. See
+/// [`crate::formats::rubygems::coordinates_from_gem_filename`].
+fn spec_index_coordinates(path: &str, name: String, version: String) -> (String, String) {
+    path.rsplit('/')
+        .next()
+        .filter(|f| !f.is_empty())
+        .and_then(crate::formats::rubygems::coordinates_from_gem_filename)
+        .unwrap_or((name, version))
 }
 
 /// Query gem specs from all local (non-remote) virtual members.
@@ -931,6 +950,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // spec_index_coordinates — advertise coordinates the download route can
+    // resolve for both native and bare-path (generic) uploads (#2754).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spec_index_coordinates_native_path_is_byte_identical() {
+        // Native push path: `{name}/{version}/{name}-{version}.gem`.
+        let (name, version) = spec_index_coordinates(
+            "rails/7.0.8/rails-7.0.8.gem",
+            "rails".to_string(),
+            "7.0.8".to_string(),
+        );
+        assert_eq!(name, "rails");
+        assert_eq!(version, "7.0.8");
+    }
+
+    #[test]
+    fn test_spec_index_coordinates_bare_path_uses_filename() {
+        // Bare-path generic upload: stored `name` is the whole basename and
+        // `version` is the `sha256-<prefix>` fallback. The advertised
+        // coordinates must come from the filename so `gem install` reconstructs
+        // `rails-7.0.8.gem` (which the suffix route serves).
+        let (name, version) = spec_index_coordinates(
+            "rails-7.0.8.gem",
+            "rails-7.0.8.gem".to_string(),
+            "sha256-abcdef012345".to_string(),
+        );
+        assert_eq!(name, "rails");
+        assert_eq!(version, "7.0.8");
+        assert_ne!(version, "sha256-abcdef012345");
+    }
+
+    #[test]
+    fn test_spec_index_coordinates_non_gem_basename_falls_back() {
+        let (name, version) = spec_index_coordinates(
+            "archive.tar.gz",
+            "archive.tar.gz".to_string(),
+            "sha256-deadbeef".to_string(),
+        );
+        assert_eq!(name, "archive.tar.gz");
+        assert_eq!(version, "sha256-deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
     // DependencyQuery deserialization
     // -----------------------------------------------------------------------
 
@@ -1320,6 +1383,58 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        f.teardown().await;
+    }
+
+    /// #2754: a bare-path generic upload (path == filename, `name` == whole
+    /// basename, `version` == `sha256-<prefix>` fallback) must appear in the
+    /// spec index with the coordinates `gem install` reconstructs the
+    /// *resolvable* `{name}-{version}.gem` download from — not the raw sha256
+    /// fallback (which yields `rails-7.0.8.gem-sha256-….gem` → 404). Fails on
+    /// `main`.
+    #[tokio::test]
+    async fn test_rubygems_specs_coords_resolve_for_bare_path_generic_upload() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rubygems/rails-7.0.8.gem",
+            "rails-7.0.8.gem",
+            "rails-7.0.8.gem",
+            "sha256-abcdef012345",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"gem-data"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/specs.4.8.gz", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut specs = Vec::new();
+        GzDecoder::new(&body[..])
+            .read_to_end(&mut specs)
+            .expect("gunzip specs");
+        assert!(
+            specs.windows(5).any(|w| w == b"rails"),
+            "specs must advertise the gem name"
+        );
+        assert!(
+            specs.windows(5).any(|w| w == b"7.0.8"),
+            "specs must advertise the resolvable version"
+        );
+        assert!(
+            !specs.windows(20).any(|w| w == b"sha256-abcdef012345"),
+            "specs still advertise the unresolvable sha256 fallback version"
+        );
         f.teardown().await;
     }
 
