@@ -17967,6 +17967,62 @@ mod tests {
         );
     }
 
+    // Regression: a built-in format that shares a core handler (docker -> oci)
+    // must gate on that handler, so disabling `oci` rejects a `docker` repo.
+    // Fails on main, where the gate looked up "docker" and missed the "oci" row.
+    #[tokio::test]
+    async fn test_create_docker_repo_rejected_when_oci_handler_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("pk-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Disable the seeded `oci` handler (governs the whole OCI/Docker family).
+        sqlx::query("UPDATE format_handlers SET is_enabled = false WHERE format_key = 'oci'")
+            .execute(&pool)
+            .await
+            .expect("disable oci handler");
+
+        let key = format!("docker-repo-{}", Uuid::new_v4().simple());
+        let payload = make_create_request(&key, "Docker repo", "docker", serde_json::json!({}));
+
+        let result = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            payload,
+        )
+        .await;
+
+        sqlx::query("UPDATE format_handlers SET is_enabled = true WHERE format_key = 'oci'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let err =
+            result.expect_err("docker repo must be rejected when the oci handler is disabled");
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("disabled")),
+            "expected a Validation error mentioning 'disabled', got {err:?}",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // custom_user_agent: handler plumbing (create / update / get round-trips)
     // -----------------------------------------------------------------------

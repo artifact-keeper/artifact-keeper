@@ -292,6 +292,26 @@ pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
     .to_string()
 }
 
+/// Handler key a format gates on; aliases collapse to their core handler (mirrors get_handler_for_format).
+pub(crate) fn format_handler_key(format: &RepositoryFormat) -> String {
+    let key = match format {
+        RepositoryFormat::Gradle => "maven",
+        RepositoryFormat::Yarn | RepositoryFormat::Bower | RepositoryFormat::Pnpm => "npm",
+        RepositoryFormat::Poetry | RepositoryFormat::Conda => "pypi",
+        RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => "nuget",
+        RepositoryFormat::Docker
+        | RepositoryFormat::Podman
+        | RepositoryFormat::Buildx
+        | RepositoryFormat::Oras
+        | RepositoryFormat::WasmOci
+        | RepositoryFormat::HelmOci => "oci",
+        RepositoryFormat::Opentofu => "terraform",
+        RepositoryFormat::Lxc => "incus",
+        other => return derive_format_key(other),
+    };
+    key.to_string()
+}
+
 /// Build a SQL LIKE search pattern from a user query string.
 pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
     query.map(|q| format!("%{}%", q.to_lowercase()))
@@ -714,7 +734,7 @@ impl RepositoryService {
         let format_key = req
             .format_key
             .clone()
-            .unwrap_or_else(|| derive_format_key(&req.format));
+            .unwrap_or_else(|| format_handler_key(&req.format));
         let format_enabled: Option<bool> =
             sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
                 .bind(&format_key)
@@ -2645,6 +2665,36 @@ mod tests {
         ];
         for (format, expected) in cases {
             assert_eq!(derive_format_key(&format), expected, "Format {:?}", format);
+        }
+    }
+
+    #[test]
+    fn test_format_handler_key_collapses_aliases_to_core_handler() {
+        // Aliases gate on their core handler's key (see get_handler_for_format).
+        let cases = [
+            (RepositoryFormat::Docker, "oci"),
+            (RepositoryFormat::Podman, "oci"),
+            (RepositoryFormat::Oras, "oci"),
+            (RepositoryFormat::WasmOci, "oci"),
+            (RepositoryFormat::HelmOci, "oci"),
+            (RepositoryFormat::Gradle, "maven"),
+            (RepositoryFormat::Yarn, "npm"),
+            (RepositoryFormat::Bower, "npm"),
+            (RepositoryFormat::Pnpm, "npm"),
+            (RepositoryFormat::Poetry, "pypi"),
+            (RepositoryFormat::Conda, "pypi"),
+            (RepositoryFormat::Chocolatey, "nuget"),
+            (RepositoryFormat::Powershell, "nuget"),
+            (RepositoryFormat::Opentofu, "terraform"),
+            (RepositoryFormat::Lxc, "incus"),
+            // 1:1 formats gate on their own key.
+            (RepositoryFormat::Maven, "maven"),
+            (RepositoryFormat::Npm, "npm"),
+            (RepositoryFormat::Pypi, "pypi"),
+            (RepositoryFormat::Generic, "generic"),
+        ];
+        for (f, expected) in cases {
+            assert_eq!(format_handler_key(&f), expected, "{:?}", f);
         }
     }
 
