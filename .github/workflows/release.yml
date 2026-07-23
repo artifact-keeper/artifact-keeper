@@ -89,7 +89,7 @@ jobs:
   # half-published image set. web is a decoupled SDK consumer and is no
   # longer part of the backend release's version set (issue #2708).
   #
-  # Ordering (A5): preflight -> resolve (blocks <=35 min on the publish) ->
+  # Ordering (A5): preflight -> resolve (blocks <=120 min on the publish) ->
   # release-gate/mesh -> build-binaries -> verify-images-published -> release.
   # The GitHub Release object still publishes strictly last; this job only
   # moves the gate's START to after the candidate bytes exist.
@@ -99,10 +99,12 @@ jobs:
     name: Resolve candidate image digest
     needs: [release-preflight]
     runs-on: ubuntu-latest
-    # docker-publish's multi-arch build + cosign + provenance takes 15-25 min
-    # (see verify-images-published comment below); poll with a 35-min internal
-    # deadline inside a 40-min job timeout.
-    timeout-minutes: 40
+    # docker-publish's multi-arch build + cosign + provenance can take 60-90 min
+    # when the amd64 self-hosted runner has a cold buildcache (issue #2711);
+    # (see verify-images-published comment below); poll with a 120-min internal
+    # deadline inside a 125-min job timeout so a slow-but-normal amd64 build is
+    # not declared a spurious failure.
+    timeout-minutes: 125
     permissions:
       packages: read
     outputs:
@@ -150,9 +152,11 @@ jobs:
             printf '%s' "${digest}"
           }
 
-          # Poll for up to 35 minutes; a dead docker-publish must fail this job
+          # Poll for up to 120 minutes; a dead docker-publish must fail this job
           # RED (exit 1) rather than let a skipped gate slip the release through.
-          DEADLINE=$(($(date +%s) + 35*60))
+          # The deadline must exceed the worst-case multi-arch build (cold amd64
+          # self-hosted buildcache runs 60-90 min -- issue #2711).
+          DEADLINE=$(($(date +%s) + 120*60))
 
           BACKEND_DIGEST=""
           echo ""
@@ -164,7 +168,7 @@ jobs:
               break
             fi
             if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-              echo "::error title=Candidate not published::backend:${VERSION} not on ghcr.io after 35m -- docker-publish.yml did not finish. Release blocked."
+              echo "::error title=Candidate not published::backend:${VERSION} not on ghcr.io after 120m -- docker-publish.yml did not finish. Release blocked."
               exit 1
             fi
             echo "  not yet present, waiting 30s..."
@@ -185,7 +189,7 @@ jobs:
                 break
               fi
               if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-                echo "::error title=Candidate not published::${extra}:${VERSION} not on ghcr.io after 35m. Release blocked."
+                echo "::error title=Candidate not published::${extra}:${VERSION} not on ghcr.io after 120m. Release blocked."
                 exit 1
               fi
               echo "  not yet present, waiting 30s..."
