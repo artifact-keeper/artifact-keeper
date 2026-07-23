@@ -74,6 +74,15 @@ const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.full_control
 /// Default GCS JSON API base URL.
 const GCS_BASE_URL: &str = "https://storage.googleapis.com";
 
+/// Static bearer token used in emulator mode (custom endpoint, no credentials).
+///
+/// Local GCS emulators (fake-gcs-server / the GCS emulator) do not perform
+/// OAuth2 token exchange and do not validate bearer tokens, so any non-empty
+/// value works. A fixed placeholder lets emulator mode skip token acquisition
+/// entirely (no Google token endpoint, no metadata server) while still sending
+/// a well-formed `Authorization: Bearer` header.
+const GCS_EMULATOR_TOKEN: &str = "emulator-anonymous-token";
+
 /// OAuth2 token response from Google token endpoint or GCE metadata server.
 #[derive(serde::Deserialize)]
 struct TokenResponse {
@@ -247,6 +256,10 @@ enum TokenSource {
     /// (production: [`GCP_METADATA_TOKEN_URL`]) so tests can point the fetch
     /// at a mock metadata server by hostname.
     MetadataServer { token_url: String },
+    /// A fixed, pre-set token (emulator mode). Returned as-is with no network
+    /// fetch, since a local GCS emulator neither exchanges tokens nor validates
+    /// them.
+    Static { token: String },
 }
 
 /// Token provider with RwLock cache, mirroring Azure's `TokenCredentialProvider`.
@@ -293,6 +306,9 @@ impl GcsTokenProvider {
             TokenSource::MetadataServer { token_url } => {
                 self.fetch_metadata_token(token_url).await?
             }
+            // Emulator mode: hand back the static token with a long TTL. No
+            // network call is made; the (re)cache is effectively a no-op.
+            TokenSource::Static { token } => (token.clone(), 3600),
         };
 
         *cache = Some(CachedToken {
@@ -448,6 +464,27 @@ pub struct GcsConfig {
     pub signed_url_expiry: Duration,
     /// Storage path format (native, artifactory, or migration).
     pub path_format: StoragePathFormat,
+    /// Optional custom API endpoint (base URL) for a local GCS emulator such as
+    /// fake-gcs-server. Mirrors `S3_ENDPOINT` (MinIO) and
+    /// `AZURE_STORAGE_ENDPOINT` (Azurite). `None` = real Google GCS.
+    pub endpoint: Option<String>,
+}
+
+/// Normalize a configured GCS endpoint into a scheme-qualified base URL with no
+/// trailing slash. `GCS_ENDPOINT` is expected to be a full URL (like
+/// `S3_ENDPOINT`), while the conventional `STORAGE_EMULATOR_HOST` may omit the
+/// scheme (`localhost:4443`), in which case `http://` is assumed for the local
+/// emulator. Returns `None` for an empty/whitespace-only value.
+fn normalize_gcs_endpoint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("http://{}", trimmed))
+    }
 }
 
 impl GcsConfig {
@@ -507,6 +544,14 @@ impl GcsConfig {
 
         let path_format = StoragePathFormat::from_env();
 
+        // Custom endpoint for emulator-based E2E (fake-gcs-server). `GCS_ENDPOINT`
+        // takes precedence; the conventional `STORAGE_EMULATOR_HOST` is honored as
+        // a fallback. Unset = real Google GCS (no behavior change).
+        let endpoint = std::env::var("GCS_ENDPOINT")
+            .ok()
+            .or_else(|| std::env::var("STORAGE_EMULATOR_HOST").ok())
+            .and_then(|v| normalize_gcs_endpoint(&v));
+
         Ok(Self {
             bucket,
             project_id,
@@ -515,6 +560,7 @@ impl GcsConfig {
             redirect_downloads,
             signed_url_expiry,
             path_format,
+            endpoint,
         })
     }
 
@@ -557,7 +603,8 @@ pub struct GcsBackend {
     stream_client: reqwest::Client,
     auth: GcsAuthMode,
     path_format: StoragePathFormat,
-    /// API base URL (overridable in tests via `with_base_url`).
+    /// API base URL. Defaults to [`GCS_BASE_URL`]; set to a custom endpoint
+    /// (`GCS_ENDPOINT` / `STORAGE_EMULATOR_HOST`) for emulator-based E2E.
     base_url: String,
     /// Ceiling on GCS rewrite continuations in [`copy`](Self::copy). Defaults to
     /// [`GCS_MAX_REWRITE_ITERATIONS`]; overridable (via
@@ -612,6 +659,20 @@ impl GcsBackend {
                 signing_key: Box::new(signing_key),
                 provider,
             }
+        } else if config.endpoint.is_some() {
+            // Emulator mode: a custom endpoint with no service-account key means
+            // a local GCS emulator (fake-gcs-server), which performs no OAuth2
+            // token exchange and exposes no metadata server. Use a static bearer
+            // token so no real Google endpoint is ever contacted. Like ADC, this
+            // mode has no RSA key, so V4 signed URLs / redirect downloads stay
+            // unavailable — the same credential-gated split as Azurite.
+            let provider = GcsTokenProvider::new(
+                TokenSource::Static {
+                    token: GCS_EMULATOR_TOKEN.to_string(),
+                },
+                client.clone(),
+            );
+            GcsAuthMode::Adc { provider }
         } else {
             // ADC / Workload Identity: token fetches go to the GCE metadata
             // server, whose link-local address the shared SSRF-guarded
@@ -635,13 +696,20 @@ impl GcsBackend {
             );
         }
 
+        // Route all JSON/XML API URL construction at the custom endpoint when
+        // configured (emulator), else the real Google GCS base URL.
+        let base_url = config
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| GCS_BASE_URL.to_string());
+
         Ok(Self {
             config,
             client,
             stream_client,
             auth,
             path_format,
-            base_url: GCS_BASE_URL.to_string(),
+            base_url,
             max_rewrite_iterations: GCS_MAX_REWRITE_ITERATIONS,
         })
     }
@@ -1873,6 +1941,7 @@ mod tests {
             redirect_downloads: true,
             signed_url_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            endpoint: None,
         }
     }
 
@@ -2287,6 +2356,7 @@ mod tests {
             redirect_downloads: true,
             signed_url_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            endpoint: None,
         };
         let backend = GcsBackend::new(config).await.unwrap();
         assert!(
@@ -2314,6 +2384,7 @@ mod tests {
             redirect_downloads: true,
             signed_url_expiry: Duration::from_secs(3600),
             path_format: StoragePathFormat::Native,
+            endpoint: None,
         };
         let backend = GcsBackend::new(config).await.unwrap();
         let result = backend
@@ -2617,6 +2688,157 @@ mod tests {
         );
     }
 
+    // ---- Custom endpoint / emulator support (#2646) ----
+
+    #[test]
+    fn test_normalize_gcs_endpoint() {
+        // Full URLs pass through unchanged (aside from trailing-slash trim).
+        assert_eq!(
+            normalize_gcs_endpoint("https://storage.googleapis.com"),
+            Some("https://storage.googleapis.com".to_string())
+        );
+        assert_eq!(
+            normalize_gcs_endpoint("http://fake-gcs:4443/"),
+            Some("http://fake-gcs:4443".to_string())
+        );
+        // Scheme-less values (STORAGE_EMULATOR_HOST convention) default to http.
+        assert_eq!(
+            normalize_gcs_endpoint("localhost:4443"),
+            Some("http://localhost:4443".to_string())
+        );
+        // Whitespace is trimmed; empty/whitespace-only yields None.
+        assert_eq!(
+            normalize_gcs_endpoint("  http://emu:4443  "),
+            Some("http://emu:4443".to_string())
+        );
+        assert_eq!(normalize_gcs_endpoint(""), None);
+        assert_eq!(normalize_gcs_endpoint("   "), None);
+    }
+
+    #[test]
+    fn test_from_env_reads_gcs_endpoint() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("STORAGE_EMULATOR_HOST");
+        std::env::set_var("GCS_BUCKET", "emu-bucket");
+        std::env::set_var("GCS_ENDPOINT", "http://fake-gcs-server:4443");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_ENDPOINT");
+
+        let config = result.expect("emulator config should build");
+        assert_eq!(
+            config.endpoint,
+            Some("http://fake-gcs-server:4443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_from_env_storage_emulator_host_fallback() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_ENDPOINT");
+        std::env::set_var("GCS_BUCKET", "emu-bucket");
+        // Scheme-less, per the STORAGE_EMULATOR_HOST convention.
+        std::env::set_var("STORAGE_EMULATOR_HOST", "localhost:4443");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("STORAGE_EMULATOR_HOST");
+
+        let config = result.expect("emulator config should build");
+        assert_eq!(config.endpoint, Some("http://localhost:4443".to_string()));
+    }
+
+    #[test]
+    fn test_from_env_gcs_endpoint_takes_precedence() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::set_var("GCS_BUCKET", "emu-bucket");
+        std::env::set_var("GCS_ENDPOINT", "http://primary:4443");
+        std::env::set_var("STORAGE_EMULATOR_HOST", "http://fallback:4443");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_ENDPOINT");
+        std::env::remove_var("STORAGE_EMULATOR_HOST");
+
+        let config = result.expect("config should build");
+        assert_eq!(config.endpoint, Some("http://primary:4443".to_string()));
+    }
+
+    #[test]
+    fn test_from_env_no_endpoint_defaults_none() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_ENDPOINT");
+        std::env::remove_var("STORAGE_EMULATOR_HOST");
+        std::env::set_var("GCS_BUCKET", "real-bucket");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+
+        let config = result.expect("config should build");
+        assert!(
+            config.endpoint.is_none(),
+            "endpoint must be None when neither var is set (real Google GCS)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emulator_backend_uses_custom_base_url() {
+        // Custom endpoint, no service-account key => emulator mode.
+        let config = GcsConfig {
+            bucket: "test-bucket".to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: true,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+            endpoint: Some("http://fake-gcs-server:4443".to_string()),
+        };
+        let backend = GcsBackend::new(config).await.unwrap();
+
+        // All API URLs must be built against the custom endpoint.
+        assert_eq!(backend.base_url, "http://fake-gcs-server:4443");
+        assert!(backend
+            .object_download_url("obj")
+            .starts_with("http://fake-gcs-server:4443/storage/v1/b/"));
+        // Emulator mode carries no RSA key: signed URLs / redirects unavailable.
+        assert!(
+            !backend.supports_redirect(),
+            "emulator mode must not offer redirect downloads"
+        );
+        assert!(
+            backend
+                .get_presigned_url("obj", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none(),
+            "emulator mode must not generate presigned URLs"
+        );
+        // The static token is served without any network fetch.
+        assert_eq!(
+            backend.get_bearer_token().await.unwrap(),
+            GCS_EMULATOR_TOKEN
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_backend_uses_google_base_url() {
+        // No endpoint => the real Google GCS base URL, unchanged behavior.
+        let mut config = create_test_config();
+        config.endpoint = None;
+        let backend = GcsBackend::new(config).await.unwrap();
+        assert_eq!(backend.base_url, GCS_BASE_URL);
+    }
+
     // ---- require_success helper (tested via wiremock) ----
 
     #[tokio::test]
@@ -2767,6 +2989,7 @@ mod tests {
             redirect_downloads: false,
             signed_url_expiry: Duration::from_secs(3600),
             path_format,
+            endpoint: None,
         };
         let client = reqwest::Client::new();
         let provider = GcsTokenProvider::new(
