@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3] - 2026-07-23
+
+A security patch for the 1.6.0 line. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
+
+### Security
+
+- **Startup admin provisioning no longer merges a federated (SSO) identity into the built-in local admin** (#2875): when a federated OIDC/SAML/LDAP user held the username `admin` — which occurs under `SKIP_ADMIN_PROVISIONING` (SSO-managed admin) or when the identity provider's username claim is `admin` — a backend restart would convert that user's account to a local login and stamp the built-in admin password onto it, collapsing the two identities into a single administrator account (cross-identity privilege escalation / account takeover). Startup provisioning now refuses to cross the local/federated boundary and never mutates a federated account.
+
+  **Am I affected?** Only deployments using federated SSO where a federated user has, or previously had, the username `admin`. On startup the backend now logs a `SECURITY (#2875)` warning if it detects an already-merged account (a local account that still carries a federated `external_id`); operators of such installs should verify each flagged account's true owner and reset the built-in admin credential. See the advisory (GHSA, pending).
+
 ## [1.6.2] - 2026-07-23
 
 A patch release for the 1.6.0 line resolving three customer-reported migration and OIDC issues from a 1.6.1 field deployment, plus a security fix for federated admin-group mapping. In-place upgrade from 1.6.1 is a drop-in image swap with no database migration. There is **one behavioral breaking change** for federated (OIDC/SAML/LDAP) SSO deployments that rely on implicit admin-group name matching — see **Upgrade notes**.
