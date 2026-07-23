@@ -12970,9 +12970,15 @@ mod tests {
 
         // The rows landed in repository_config under the documented keys.
         let stored: Vec<(String, String)> = sqlx::query_as(
+            // `ORDER BY key COLLATE "C"` pins byte-order sorting so the asserted
+            // row order is deterministic regardless of the database's default
+            // collation. A locale-aware default (e.g. en_US.UTF-8) treats the
+            // underscore as ignorable punctuation and would order
+            // `npm_allowed_scopes` before `npm_allow_unscoped`, flipping the
+            // expected vec under a throwaway-Postgres locale (#2758).
             "SELECT key, value FROM repository_config \
              WHERE repository_id = $1 AND key IN ('npm_allowed_scopes', 'npm_allow_unscoped') \
-             ORDER BY key",
+             ORDER BY key COLLATE \"C\"",
         )
         .bind(repo_id)
         .fetch_all(&pool)
