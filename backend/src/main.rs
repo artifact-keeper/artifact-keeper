@@ -1882,10 +1882,10 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                     )
                     .bind(&password_hash)
                     .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            artifact_keeper_backend::error::AppError::Database(e.to_string())
-                        })?;
+                    .await
+                    .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
                     log_admin_setup_banner(&password_file, Some(&password));
                 }
             }
