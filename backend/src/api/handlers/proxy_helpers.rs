@@ -9730,11 +9730,18 @@ mod tests {
             .expect("connect_lazy should not fail");
         let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
 
+        // Unique coordinate per test: `proxy_fetch_or_redirect` gates on
+        // `cache_quarantine_gate`, which reads through the process-global
+        // `PROXY_METADATA_LRU` keyed by `proxy-cache/<repo_key>/<path>/…`. A shared
+        // literal coordinate lets the held/not-held siblings poison each other's
+        // LRU entry under in-process `cargo test` parallelism; a per-test key
+        // isolates it (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         let err = super::proxy_fetch_or_redirect(
             &proxy,
             &state,
             Uuid::nil(),
-            "npm-proxy",
+            &repo_key,
             "https://upstream.example.test",
             "lodash",
         )
@@ -9765,11 +9772,13 @@ mod tests {
             .expect("connect_lazy should not fail");
         let state = db_helpers::build_state_presigned(pool, "s3-test", registry_storage.clone());
 
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         let resp = super::proxy_fetch_or_redirect(
             &proxy,
             &state,
             Uuid::nil(),
-            "npm-proxy",
+            &repo_key,
             "https://upstream.example.test",
             "lodash",
         )

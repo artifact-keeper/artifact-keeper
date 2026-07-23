@@ -7244,8 +7244,16 @@ mod tests {
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
+        // Unique coordinate per test: `cache_quarantine_gate` reads through the
+        // process-global `PROXY_METADATA_LRU`, keyed by the derived metadata key
+        // (`proxy-cache/<repo_key>/<path>/__cache_meta__.json`). A shared literal
+        // coordinate lets one quarantine-gate test's cached sidecar poison a peer
+        // running concurrently in the same process (in-process `cargo test`
+        // parallelism); a per-test key isolates the LRU entry (#2758). Mirrors the
+        // `format!("maven-central-{}", Uuid::new_v4())` pattern used elsewhere.
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         let err = service
-            .cache_quarantine_gate("npm-proxy", "lodash")
+            .cache_quarantine_gate(&repo_key, "lodash")
             .await
             .expect_err("an active hold must block the redirect fast path");
         match err {
@@ -7263,9 +7271,11 @@ mod tests {
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate(&repo_key, "lodash")
                 .await
                 .is_ok(),
             "an elapsed hold must not block the redirect"
@@ -7280,9 +7290,11 @@ mod tests {
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate(&repo_key, "lodash")
                 .await
                 .is_ok(),
             "a sidecar with no hold must not block the redirect"
@@ -7294,9 +7306,11 @@ mod tests {
         let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
         let service = build_proxy_service_with_storage(mock.clone());
 
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate(&repo_key, "lodash")
                 .await
                 .is_ok(),
             "a missing sidecar means no hold known -> allow"
@@ -7314,9 +7328,11 @@ mod tests {
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
+        // Per-test coordinate isolates the process-global metadata LRU (#2758).
+        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
         assert!(
             service
-                .cache_quarantine_gate("npm-proxy", "lodash")
+                .cache_quarantine_gate(&repo_key, "lodash")
                 .await
                 .is_ok(),
             "a sidecar read/parse error must be treated as no hold known"
