@@ -88,6 +88,12 @@ pub struct CreateBackupRequest {
     pub backup_type: BackupType,
     pub repository_ids: Option<Vec<Uuid>>,
     pub created_by: Option<Uuid>,
+    /// Optional operator-supplied name/label for the archive (#2790).
+    ///
+    /// When set it becomes the identifying part of the archive filename;
+    /// when `None` the historical `{uuid}` name is used, so existing
+    /// deployments are unaffected.
+    pub name: Option<String>,
 }
 
 /// Backup service
@@ -208,6 +214,58 @@ fn backup_storage_key(raw_prefix: Option<&str>, relative: &str) -> String {
     }
 }
 
+/// Maximum length of an operator-supplied backup name (before extension).
+const MAX_BACKUP_NAME_LEN: usize = 128;
+
+/// Resolve the base filename (including the `.tar.gz` extension) for a new
+/// backup archive (#2790).
+///
+/// When an operator supplies a custom `name` it is sanitized and used as the
+/// archive's identifying label, with a short unique suffix derived from
+/// `file_id` appended so two backups sharing a name can never resolve to the
+/// same storage key (which would silently overwrite the older archive). When
+/// no name is given the historical `{uuid}.tar.gz` name is preserved, so
+/// existing deployments are unaffected.
+///
+/// The custom name is restricted to `[A-Za-z0-9._-]`; anything containing a
+/// path separator, `..`, whitespace, or any other character is rejected
+/// rather than silently rewritten, so the name can never escape the
+/// `backups/` prefix or smuggle in a traversal sequence.
+fn resolve_backup_filename(name: Option<&str>, file_id: Uuid) -> Result<String> {
+    let Some(raw) = name else {
+        return Ok(format!("{}.tar.gz", file_id));
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "Backup name must not be empty".to_string(),
+        ));
+    }
+    if trimmed.len() > MAX_BACKUP_NAME_LEN {
+        return Err(AppError::Validation(format!(
+            "Backup name must be at most {} characters",
+            MAX_BACKUP_NAME_LEN
+        )));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(AppError::Validation(
+            "Backup name must not be '.' or '..'".to_string(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(AppError::Validation(
+            "Backup name may only contain letters, digits, '.', '_', and '-'".to_string(),
+        ));
+    }
+
+    let suffix = file_id.simple().to_string();
+    Ok(format!("{}-{}.tar.gz", trimmed, &suffix[..8]))
+}
+
 /// Count entries under the `artifacts/` prefix in a tar.gz archive.
 fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     let decoder = GzDecoder::new(tar_data);
@@ -242,13 +300,11 @@ impl BackupService {
     /// Create a new backup job
     pub async fn create(&self, req: CreateBackupRequest) -> Result<Backup> {
         let prefix = std::env::var("BACKUP_S3_PREFIX").ok();
+        let file_id = Uuid::new_v4();
+        let filename = resolve_backup_filename(req.name.as_deref(), file_id)?;
         let storage_path = backup_storage_key(
             prefix.as_deref(),
-            &format!(
-                "backups/{}/{}.tar.gz",
-                Utc::now().format("%Y/%m/%d"),
-                Uuid::new_v4()
-            ),
+            &format!("backups/{}/{}", Utc::now().format("%Y/%m/%d"), filename),
         );
 
         let backup = sqlx::query_as!(
@@ -268,6 +324,7 @@ impl BackupService {
             req.created_by,
             serde_json::json!({
                 "repository_ids": req.repository_ids,
+                "name": req.name,
             })
         )
         .fetch_one(&self.db)
@@ -1438,6 +1495,7 @@ mod tests {
             backup_type: BackupType::Full,
             repository_ids: Some(vec![Uuid::new_v4()]),
             created_by: Some(Uuid::new_v4()),
+            name: None,
         };
         assert_eq!(req.backup_type, BackupType::Full);
         assert!(req.repository_ids.is_some());
@@ -1450,10 +1508,91 @@ mod tests {
             backup_type: BackupType::Metadata,
             repository_ids: None,
             created_by: None,
+            name: None,
         };
         assert_eq!(req.backup_type, BackupType::Metadata);
         assert!(req.repository_ids.is_none());
         assert!(req.created_by.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_backup_filename tests (#2790)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_backup_filename_default_preserves_uuid_name() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(None, id).unwrap();
+        // Default (no custom name) preserves the historical `{uuid}.tar.gz`.
+        assert_eq!(name, format!("{}.tar.gz", id));
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_custom_name_honored() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(Some("nightly-prod"), id).unwrap();
+        assert!(
+            name.starts_with("nightly-prod-"),
+            "custom label should lead the filename: {name}"
+        );
+        assert!(name.ends_with(".tar.gz"), "must keep the extension: {name}");
+        // A unique suffix is appended so distinct backups never collide.
+        let suffix = id.simple().to_string();
+        assert_eq!(name, format!("nightly-prod-{}.tar.gz", &suffix[..8]));
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_trims_whitespace() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(Some("  release  "), id).unwrap();
+        assert!(name.starts_with("release-"), "should be trimmed: {name}");
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_unique_per_id() {
+        let a = resolve_backup_filename(Some("weekly"), Uuid::new_v4()).unwrap();
+        let b = resolve_backup_filename(Some("weekly"), Uuid::new_v4()).unwrap();
+        assert_ne!(a, b, "same label + different id must not collide");
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_path_separator() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some("a/b"), id).is_err());
+        assert!(resolve_backup_filename(Some("a\\b"), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_traversal() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some(".."), id).is_err());
+        assert!(resolve_backup_filename(Some("../etc/passwd"), id).is_err());
+        assert!(resolve_backup_filename(Some("."), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_empty_and_blank() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some(""), id).is_err());
+        assert!(resolve_backup_filename(Some("   "), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_unsafe_chars() {
+        let id = Uuid::new_v4();
+        // Spaces, control chars, and shell/path metacharacters are rejected.
+        assert!(resolve_backup_filename(Some("my backup"), id).is_err());
+        assert!(resolve_backup_filename(Some("name;rm -rf"), id).is_err());
+        assert!(resolve_backup_filename(Some("null\0byte"), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_overlong() {
+        let id = Uuid::new_v4();
+        let long = "a".repeat(MAX_BACKUP_NAME_LEN + 1);
+        assert!(resolve_backup_filename(Some(&long), id).is_err());
+        let ok = "a".repeat(MAX_BACKUP_NAME_LEN);
+        assert!(resolve_backup_filename(Some(&ok), id).is_ok());
     }
 
     // -----------------------------------------------------------------------

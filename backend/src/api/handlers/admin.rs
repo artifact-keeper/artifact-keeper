@@ -238,6 +238,12 @@ pub struct CreateBackupRequest {
     #[serde(rename = "type")]
     pub backup_type: Option<String>,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Optional custom name/label for the backup archive (#2790).
+    ///
+    /// When provided it becomes the identifying part of the archive
+    /// filename. Restricted to letters, digits, `.`, `_`, and `-`; when
+    /// omitted the archive keeps its default `{uuid}` name.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -406,6 +412,7 @@ pub async fn create_backup(
             backup_type,
             repository_ids: payload.repository_ids,
             created_by: Some(auth.user_id),
+            name: payload.name,
         })
         .await?;
 
@@ -1766,6 +1773,20 @@ mod tests {
         let req: CreateBackupRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.backup_type, Some("incremental".to_string()));
         assert_eq!(req.repository_ids.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_create_backup_request_custom_name() {
+        let json = r#"{"type": "full", "name": "nightly-prod"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("nightly-prod".to_string()));
+    }
+
+    #[test]
+    fn test_create_backup_request_name_defaults_none() {
+        let json = r#"{"type": "full"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert!(req.name.is_none());
     }
 
     #[test]

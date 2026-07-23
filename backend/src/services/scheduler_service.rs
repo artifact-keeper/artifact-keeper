@@ -905,6 +905,7 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
                 backup_type: schedule_row.backup_type,
                 repository_ids: schedule_row.include_repositories.clone(),
                 created_by: None, // system-initiated
+                name: None,       // scheduled backups keep the default {uuid} name
             })
             .await;
 
