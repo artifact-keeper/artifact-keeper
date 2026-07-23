@@ -1497,6 +1497,9 @@ struct OidcEnvVars {
     redirect_uri: Option<String>,
     username_claim: Option<String>,
     email_claim: Option<String>,
+    map_groups_to_groups: Option<String>,
+    auto_create_users: Option<String>,
+    pkce_enabled: Option<String>,
 }
 
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
@@ -1513,6 +1516,9 @@ fn build_oidc_bootstrap_request(
         redirect_uri: std::env::var("OIDC_REDIRECT_URI").ok(),
         username_claim: std::env::var("OIDC_USERNAME_CLAIM").ok(),
         email_claim: std::env::var("OIDC_EMAIL_CLAIM").ok(),
+        map_groups_to_groups: std::env::var("OIDC_MAP_GROUPS_TO_GROUPS").ok(),
+        auto_create_users: std::env::var("OIDC_AUTO_CREATE_USERS").ok(),
+        pkce_enabled: std::env::var("OIDC_PKCE_ENABLED").ok(),
     })
 }
 
@@ -1554,6 +1560,17 @@ fn build_oidc_request_from_values(
         attr_map.insert("email_claim".into(), serde_json::Value::String(claim));
     }
 
+    // Provider toggles configurable via env for GitOps/disconnected deploys
+    // (#2792). Absent vars preserve the prior bootstrap defaults so existing
+    // deployments are unaffected: `auto_create_users` stays on, while
+    // `map_groups_to_groups` (#1879, pairs with #2781) and `pkce_enabled` fall
+    // through to the service-layer create defaults (false / true respectively).
+    // Accepts "true"/"1" (case-sensitive, mirroring the LDAP bootstrap).
+    let env_flag = |v: String| v == "true" || v == "1";
+    let map_groups_to_groups = env.map_groups_to_groups.map(env_flag);
+    let pkce_enabled = env.pkce_enabled.map(env_flag);
+    let auto_create_users = Some(env.auto_create_users.map(env_flag).unwrap_or(true));
+
     Some(CreateOidcConfigRequest {
         name,
         issuer_url: issuer,
@@ -1562,9 +1579,9 @@ fn build_oidc_request_from_values(
         scopes,
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
-        auto_create_users: Some(true),
-        pkce_enabled: None,
-        map_groups_to_groups: None,
+        auto_create_users,
+        pkce_enabled,
+        map_groups_to_groups,
         allow_legacy_rsa_keys: None,
     })
 }
@@ -2382,6 +2399,115 @@ mod tests {
     }
 
     #[test]
+    fn test_bootstrap_request_default_toggles() {
+        // With none of the toggle env vars set, the bootstrap request preserves
+        // the historical defaults: auto_create_users forced on, and
+        // map_groups_to_groups / pkce_enabled left to the service-layer create
+        // defaults (None -> false / true respectively) (#2792).
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        assert_eq!(req.auto_create_users, Some(true));
+        assert_eq!(req.map_groups_to_groups, None);
+        assert_eq!(req.pkce_enabled, None);
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_enabled() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("true".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_numeric_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("1".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_disabled() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_auto_create_users_override() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.auto_create_users = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.auto_create_users, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_auto_create_users_explicit_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.auto_create_users = Some("1".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.auto_create_users, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_pkce_enabled_override() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.pkce_enabled = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.pkce_enabled, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_pkce_enabled_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.pkce_enabled = Some("true".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.pkce_enabled, Some(true));
+    }
+
+    #[test]
     fn test_bootstrap_request_all_optional_fields() {
         let req = build_oidc_request_from_values(OidcEnvVars {
             name: Some("Corporate OIDC".into()),
@@ -2393,6 +2519,7 @@ mod tests {
             redirect_uri: Some("https://app.corp.com/sso/callback".into()),
             username_claim: Some("samaccountname".into()),
             email_claim: Some("mail".into()),
+            ..Default::default()
         })
         .unwrap();
 
