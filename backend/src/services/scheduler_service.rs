@@ -904,6 +904,9 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             .create(CreateBackupRequest {
                 backup_type: schedule_row.backup_type,
                 repository_ids: schedule_row.include_repositories.clone(),
+                // Per-schedule exclusion is not yet modeled in backup_schedules;
+                // scheduled backups exclude nothing (#2772 covers manual/API runs).
+                exclude_repository_ids: None,
                 created_by: None, // system-initiated
                 name: None,       // scheduled backups keep the default {uuid} name
             })
