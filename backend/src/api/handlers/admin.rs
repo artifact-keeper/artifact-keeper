@@ -238,6 +238,14 @@ pub struct CreateBackupRequest {
     #[serde(rename = "type")]
     pub backup_type: Option<String>,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Optional list of repository IDs to exclude from the backup (#2772).
+    ///
+    /// Artifacts belonging to these repositories are skipped, letting
+    /// airgapped/low-bandwidth deployments leave large or non-critical
+    /// repositories out of a backup. Omitting the field (or sending an empty
+    /// list) excludes nothing, preserving existing behavior. A repository may
+    /// not appear in both `repository_ids` and `exclude_repository_ids`.
+    pub exclude_repository_ids: Option<Vec<Uuid>>,
     /// Optional custom name/label for the backup archive (#2790).
     ///
     /// When provided it becomes the identifying part of the archive
@@ -411,6 +419,7 @@ pub async fn create_backup(
         .create(ServiceCreateBackup {
             backup_type,
             repository_ids: payload.repository_ids,
+            exclude_repository_ids: payload.exclude_repository_ids,
             created_by: Some(auth.user_id),
             name: payload.name,
         })

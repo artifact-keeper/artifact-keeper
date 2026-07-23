@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT storage_key FROM artifacts\n            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))\n              AND ($2::uuid[] IS NULL OR repository_id <> ALL($2))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "storage_key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "84577dd778679ab0cb30a5e7d68e4fb42469648db6bed07ac1402c2fe8fbbea6"
+}

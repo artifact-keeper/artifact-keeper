@@ -87,6 +87,13 @@ pub struct BackupManifest {
 pub struct CreateBackupRequest {
     pub backup_type: BackupType,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Optional list of repository IDs to exclude from the backup (#2772).
+    ///
+    /// When set, artifacts belonging to these repositories are skipped, so
+    /// airgapped/low-bandwidth deployments can leave large or non-critical
+    /// repositories out of a Full or Incremental backup. An empty or absent
+    /// list means "exclude nothing", so existing deployments are unaffected.
+    pub exclude_repository_ids: Option<Vec<Uuid>>,
     pub created_by: Option<Uuid>,
     /// Optional operator-supplied name/label for the archive (#2790).
     ///
@@ -94,6 +101,37 @@ pub struct CreateBackupRequest {
     /// when `None` the historical `{uuid}` name is used, so existing
     /// deployments are unaffected.
     pub name: Option<String>,
+}
+
+/// Normalize and validate the repository selection for a backup (#2772).
+///
+/// Both the include list (`repository_ids`) and the exclude list
+/// (`exclude_repository_ids`) are optional. Empty lists are treated as absent
+/// so callers can send `[]` to mean "no restriction" without changing
+/// behavior. A repository that appears in *both* lists is a contradiction
+/// (it is simultaneously the only thing to back up and something to skip), so
+/// it is rejected rather than silently resolved one way or the other.
+///
+/// Returns the normalized `(include, exclude)` pair with empty lists collapsed
+/// to `None`.
+#[allow(clippy::type_complexity)]
+fn normalize_repository_selection(
+    include: Option<Vec<Uuid>>,
+    exclude: Option<Vec<Uuid>>,
+) -> Result<(Option<Vec<Uuid>>, Option<Vec<Uuid>>)> {
+    let include = include.filter(|v| !v.is_empty());
+    let exclude = exclude.filter(|v| !v.is_empty());
+
+    if let (Some(inc), Some(exc)) = (&include, &exclude) {
+        if let Some(conflict) = inc.iter().find(|id| exc.contains(id)) {
+            return Err(AppError::Validation(format!(
+                "Repository {} cannot be both included and excluded from a backup",
+                conflict
+            )));
+        }
+    }
+
+    Ok((include, exclude))
 }
 
 /// Backup service
@@ -299,6 +337,9 @@ impl BackupService {
 
     /// Create a new backup job
     pub async fn create(&self, req: CreateBackupRequest) -> Result<Backup> {
+        let (repository_ids, exclude_repository_ids) =
+            normalize_repository_selection(req.repository_ids, req.exclude_repository_ids)?;
+
         let prefix = std::env::var("BACKUP_S3_PREFIX").ok();
         let file_id = Uuid::new_v4();
         let filename = resolve_backup_filename(req.name.as_deref(), file_id)?;
@@ -323,7 +364,8 @@ impl BackupService {
             storage_path,
             req.created_by,
             serde_json::json!({
-                "repository_ids": req.repository_ids,
+                "repository_ids": repository_ids,
+                "exclude_repository_ids": exclude_repository_ids,
                 "name": req.name,
             })
         )
@@ -551,22 +593,29 @@ impl BackupService {
     ) -> Result<Vec<String>> {
         let repository_filter: Option<Vec<Uuid>> = metadata
             .and_then(|m| m.get("repository_ids"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .filter(|v: &Vec<Uuid>| !v.is_empty());
 
-        let keys: Vec<String> = if let Some(repo_ids) = repository_filter {
-            sqlx::query_scalar!(
-                "SELECT storage_key FROM artifacts WHERE repository_id = ANY($1)",
-                &repo_ids
-            )
-            .fetch_all(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        } else {
-            sqlx::query_scalar!("SELECT storage_key FROM artifacts")
-                .fetch_all(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
-        };
+        let exclude_filter: Option<Vec<Uuid>> = metadata
+            .and_then(|m| m.get("exclude_repository_ids"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .filter(|v: &Vec<Uuid>| !v.is_empty());
+
+        // A single guarded query covers all four include/exclude combinations:
+        // a NULL array disables that clause, so an absent include list backs up
+        // every repository and an absent exclude list skips none.
+        let keys: Vec<String> = sqlx::query_scalar!(
+            r#"
+            SELECT storage_key FROM artifacts
+            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))
+              AND ($2::uuid[] IS NULL OR repository_id <> ALL($2))
+            "#,
+            repository_filter.as_deref(),
+            exclude_filter.as_deref(),
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(keys)
     }
@@ -1494,6 +1543,7 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Full,
             repository_ids: Some(vec![Uuid::new_v4()]),
+            exclude_repository_ids: None,
             created_by: Some(Uuid::new_v4()),
             name: None,
         };
@@ -1507,12 +1557,64 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Metadata,
             repository_ids: None,
+            exclude_repository_ids: None,
             created_by: None,
             name: None,
         };
         assert_eq!(req.backup_type, BackupType::Metadata);
         assert!(req.repository_ids.is_none());
         assert!(req.created_by.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Repository exclusion selection tests (#2772)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_selection_default_is_backup_everything() {
+        // Absent include + absent exclude == no restriction at all.
+        let (inc, exc) = normalize_repository_selection(None, None).unwrap();
+        assert!(inc.is_none());
+        assert!(exc.is_none());
+    }
+
+    #[test]
+    fn test_normalize_selection_empty_lists_collapse_to_none() {
+        // An explicit empty exclude list means "exclude nothing" and must not
+        // change behavior for existing callers that send `[]`.
+        let (inc, exc) = normalize_repository_selection(Some(vec![]), Some(vec![])).unwrap();
+        assert!(inc.is_none(), "empty include should collapse to None");
+        assert!(exc.is_none(), "empty exclude should collapse to None");
+    }
+
+    #[test]
+    fn test_normalize_selection_exclusion_is_honored() {
+        let skip = Uuid::new_v4();
+        let (inc, exc) = normalize_repository_selection(None, Some(vec![skip])).unwrap();
+        assert!(inc.is_none());
+        assert_eq!(exc, Some(vec![skip]));
+    }
+
+    #[test]
+    fn test_normalize_selection_include_and_exclude_disjoint_ok() {
+        let keep = Uuid::new_v4();
+        let skip = Uuid::new_v4();
+        let (inc, exc) =
+            normalize_repository_selection(Some(vec![keep]), Some(vec![skip])).unwrap();
+        assert_eq!(inc, Some(vec![keep]));
+        assert_eq!(exc, Some(vec![skip]));
+    }
+
+    #[test]
+    fn test_normalize_selection_rejects_overlap() {
+        // The same repository cannot be both the only thing to keep and a thing
+        // to skip; this contradictory input is rejected rather than guessed.
+        let both = Uuid::new_v4();
+        let err = normalize_repository_selection(Some(vec![both]), Some(vec![both])).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "overlapping include/exclude must be a validation error, got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
