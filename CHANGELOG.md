@@ -5,7 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.1] - TBD
+## [1.6.2] - 2026-07-23
+
+A patch release for the 1.6.0 line resolving three customer-reported migration and OIDC issues from a 1.6.1 field deployment, plus a security fix for federated admin-group mapping. In-place upgrade from 1.6.1 is a drop-in image swap with no database migration. There is **one behavioral breaking change** for federated (OIDC/SAML/LDAP) SSO deployments that rely on implicit admin-group name matching — see **Upgrade notes**.
+
+### Security
+
+- **Federated admin-group mapping now requires an explicitly configured, exact-match admin group** (#2829): OIDC/SAML/LDAP login no longer infers administrator from a fuzzy substring match against built-in patterns (`admin`, `administrators`, `superusers`, `artifact-admins`). Previously, when a provider had no admin group configured, any asserted group name merely *containing* one of those substrings — even a benign group such as `nonadmin-users` — elevated the user to administrator. Administrator is now granted only when an admin group is explicitly configured and matched exactly (case-insensitive). **Breaking — see Upgrade notes.**
+
+### Fixed
+
+- **Virtual (Nexus group) repositories no longer copy member artifact data during migration** (#2821): migrating a Nexus group repository provisioned the virtual repository correctly but then physically transferred the aggregated member components into it. Virtual repositories are now provisioned and member-correlated without transferring bytes. (Regression introduced in 1.6.0.)
+- **Proxy and remote repository migrations now capture the upstream URL** (#2822): migrating a Nexus proxy or Artifactory remote repository did not record the upstream URL, so the destination violated the upstream-URL constraint and was silently skipped. The source upstream URL is now captured (Nexus `proxy.remoteUrl`, Artifactory remote `url`), and a clear configuration error is returned when a remote has none.
+- **OIDC group synchronization now works out of the box for GitLab and resolves inherited subgroups** (#2831): group memberships were read only from an id_token claim literally named `groups`. GitLab publishes direct memberships under `groups_direct`, and the full effective set including inherited subgroups only at the OIDC UserInfo endpoint. Group resolution now checks a candidate claim list (`groups`, `groups_direct`, `roles`) and additionally fetches UserInfo (SSRF-guarded, non-fatal) to obtain the complete effective group set, preserving full group paths. An explicit `groups_claim` mapping still takes precedence, and the UserInfo fetch can be disabled per provider via `attribute_mapping.fetch_userinfo_groups=false`.
+
+### Upgrade notes
+
+In-place upgrade from 1.6.1 is a drop-in image swap; no database migration is required.
+
+**Breaking (federated admin mapping, #2829):** if you relied on Artifact Keeper inferring administrator access from group names that merely contain `admin` (etc.) without configuring an admin group, those users will no longer receive admin on login. To restore admin for a federated provider, configure an explicit admin group — OIDC `attribute_mapping.admin_group` or `OIDC_ADMIN_GROUP`, SAML `admin_group`, LDAP `admin_group_dn` — matching the exact group name your identity provider asserts.
+
+**OIDC groups (#2831):** GitLab and other providers that publish memberships under `groups_direct` now synchronize with no configuration change. If you previously worked around this by setting a custom `groups_claim`, that setting still takes precedence and continues to work.
+
+## [1.6.1] - 2026-07-22
 
 A patch release for the 1.6.0 line combining early-adopter field fixes with a focused round of security hardening. On the correctness side it fixes SSO group mapping and LDAPS trust configuration, three Nexus-migration gaps (group→virtual-repo correlation, Go/APT repositories, and the empty Packages tab), virtual-repository storage accounting and editability, CI/CD authentication with service-account tokens, backup retention cleanup, and NuGet/PyPI/Maven registry handling. On the security side it closes an authorization and hardening cluster — most notably a systemic scoped-admin token bypass (GHSA-vvc3) and a refresh-token rotation race (GHSA-qxxr) — see **Security** below. In-place upgrade from 1.6.0 is a drop-in image swap (one additive migration); there is **one behavioral breaking change** for admins that authenticate to admin endpoints with narrow-scoped API tokens — see **Upgrade notes**. The release date is stamped at cut.
 
