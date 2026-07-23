@@ -78,9 +78,11 @@ jobs:
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
   # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. Nothing
   # connects the two workflows except this poll of the registry. Once
-  # merge-backend has pushed the tag, `assert-stable-tag-free` in
-  # docker-publish.yml guarantees it can never be re-pointed, so the
-  # tag->digest binding is stable the moment it first resolves.
+  # merge-backend has pushed the tag, the digest-aware republish guard
+  # (`assert-version-digest-consistent`) in docker-publish.yml guarantees it can
+  # never be re-pointed to DIFFERENT content -- only re-applied to the same
+  # digest, a no-op -- so the tag->digest binding is stable the moment it first
+  # resolves.
   #
   # This job blocks the release gate until that manifest list exists and
   # captures its digest, so the gate deploys and tests the EXACT bytes that
@@ -539,7 +541,8 @@ jobs:
       # ── Candidate-digest tripwire (issue #2696) ─────────────────────────────
       # Re-resolve the published ghcr backend:${VERSION} digest and assert it
       # EQUALS the digest resolve-candidate-digest handed the gate. With
-      # docker-publish's `assert-stable-tag-free` in place a mismatch should be
+      # docker-publish's digest-aware republish guard
+      # (`assert-version-digest-consistent`) in place a mismatch should be
       # impossible; this step makes "bytes tested == bytes published" observable
       # and RED per release -- the direct "prove it" artifact for the bar. Paste
       # this line, the gate's pod-imageID assertion, and resolve's output into
