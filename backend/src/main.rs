@@ -1787,12 +1787,50 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+    // #2875: detect installs already affected by the pre-fix collision. A row
+    // that is `auth_provider = 'local'` yet still carries a federated
+    // `external_id` is the fingerprint of a federated identity that a prior
+    // build merged into the built-in local admin. We cannot safely un-merge it
+    // automatically (the original local-admin credentials were overwritten and
+    // the federated user's original username is lost), so surface it loudly for
+    // manual remediation. Read-only; never mutates.
+    let collided: Option<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM users WHERE auth_provider = 'local' AND external_id IS NOT NULL",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    if let Some((n,)) = collided {
+        if n > 0 {
+            tracing::error!(
+                collided_accounts = n,
+                "SECURITY (#2875): {n} local account(s) still carry a federated external_id -- the \
+                 fingerprint of an SSO identity merged into a local account by a pre-fix build. \
+                 Review these rows: an operator should verify each account's true owner, reset the \
+                 built-in admin credential, and clear the stray external_id on any account that \
+                 should remain local. See the v1.6.3 advisory.",
+            );
+        }
+    }
+
     // Re-check admin existence while holding the lock (double-check pattern).
-    let admin_row: Option<(bool,)> =
-        sqlx::query_as("SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1")
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    //
+    // #2875: only a NON-FEDERATED admin counts as "the built-in admin exists".
+    // A federated (SSO) principal always carries `external_id`; if such a user
+    // happens to be admin (e.g. an OIDC user named `admin` under
+    // SKIP_ADMIN_PROVISIONING, or granted admin then demoted), it must NOT be
+    // mistaken for the built-in local admin here -- otherwise the maintenance
+    // branch below would flip its `auth_provider` to 'local' and stamp the
+    // built-in admin password onto it, merging the two identities. Excluding
+    // `external_id IS NOT NULL` routes that case to the create branch, whose
+    // upsert is itself guarded against clobbering a federated row.
+    let admin_row: Option<(bool,)> = sqlx::query_as(
+        "SELECT must_change_password FROM users \
+         WHERE is_admin = true AND external_id IS NULL LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
@@ -1802,7 +1840,8 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         // already correct but fixes installs that ended up with a wrong value.
         sqlx::query(
             "UPDATE users SET auth_provider = 'local' \
-             WHERE username = 'admin' AND auth_provider != 'local'",
+             WHERE username = 'admin' AND auth_provider != 'local' \
+               AND external_id IS NULL",
         )
         .execute(&mut *tx)
         .await
@@ -1856,9 +1895,16 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                 } else {
                     // File written successfully, now update the DB hash to match.
                     let password_hash = AuthService::hash_password(&password).await?;
-                    sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
-                        .bind(&password_hash)
-                        .execute(&mut *tx)
+                    // #2875: never write the built-in admin password onto a
+                    // federated row; scope strictly to the local, non-federated
+                    // built-in admin.
+                    sqlx::query(
+                        "UPDATE users SET password_hash = $1 \
+                         WHERE username = 'admin' AND auth_provider = 'local' \
+                           AND external_id IS NULL",
+                    )
+                    .bind(&password_hash)
+                    .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             artifact_keeper_backend::error::AppError::Database(e.to_string())
@@ -1921,7 +1967,15 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     let password_hash = AuthService::hash_password(&password).await?;
 
-    sqlx::query(
+    // #2875: the built-in admin is keyed on username='admin'. If a FEDERATED
+    // (SSO) user already holds that username, the ON CONFLICT upsert must NOT
+    // clobber it -- doing so would stamp the built-in admin password onto the
+    // federated account and flip it to a local login, merging the two
+    // identities into one admin account. The WHERE on DO UPDATE restricts the
+    // update to a genuine local, non-federated row; when the conflicting row is
+    // federated the update is skipped (rows_affected == 0) and we refuse to
+    // provision rather than hijack the identity.
+    let provisioned = sqlx::query(
         r#"
         INSERT INTO users (username, email, password_hash, is_admin, must_change_password, auth_provider)
         VALUES ('admin', 'admin@localhost', $1, true, $2, 'local')
@@ -1929,6 +1983,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             SET password_hash = EXCLUDED.password_hash,
                 must_change_password = EXCLUDED.must_change_password,
                 auth_provider = 'local'
+            WHERE users.auth_provider = 'local' AND users.external_id IS NULL
         "#,
     )
     .bind(&password_hash)
@@ -1936,6 +1991,24 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     .execute(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    if provisioned.rows_affected() == 0 {
+        // The 'admin' username is held by a federated (external_id IS NOT NULL)
+        // account. Refuse to overwrite it. Do NOT abort startup (the federated
+        // account may legitimately be the SSO-managed admin); log loudly and
+        // continue without a built-in local admin.
+        tx.rollback()
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        tracing::error!(
+            "Refusing to provision the built-in 'admin' user: the username 'admin' is already held \
+             by a federated (SSO) account. Overwriting it would merge that identity with the local \
+             admin (#2875). Rename or remove the federated account, or set \
+             SKIP_ADMIN_PROVISIONING=true to let SSO manage admin access. Continuing without a \
+             built-in local admin."
+        );
+        return Ok(false);
+    }
 
     tx.commit()
         .await
