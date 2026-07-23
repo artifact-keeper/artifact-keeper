@@ -1529,13 +1529,15 @@ fn build_oidc_request_from_values(
         .scopes
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
 
-    let groups_claim_val = env.groups_claim.unwrap_or_else(|| "groups".to_string());
-
     let mut attr_map = serde_json::Map::new();
-    attr_map.insert(
-        "groups_claim".into(),
-        serde_json::Value::String(groups_claim_val),
-    );
+    // Insert groups_claim ONLY when explicitly configured (mirrors
+    // username_claim/email_claim below). Leaving it absent lets the OIDC
+    // callback's multi-name candidate resolution engage, so an env-bootstrapped
+    // GitLab provider (which publishes under `groups_direct`) syncs groups
+    // without the operator having to set OIDC_GROUPS_CLAIM (#2831).
+    if let Some(claim) = env.groups_claim.filter(|v| !v.is_empty()) {
+        attr_map.insert("groups_claim".into(), serde_json::Value::String(claim));
+    }
     if let Some(uri) = env.redirect_uri {
         attr_map.insert("redirect_uri".into(), serde_json::Value::String(uri));
     }
@@ -2261,7 +2263,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_request_default_groups_claim() {
+    fn test_bootstrap_request_default_groups_claim_absent() {
+        // When OIDC_GROUPS_CLAIM is unset, groups_claim must NOT be persisted,
+        // so the OIDC callback's multi-name candidate fallback can engage for
+        // env-bootstrapped GitLab providers (#2831).
         let req = build_oidc_request_from_values(env(
             Some("https://idp.example.com"),
             Some("client"),
@@ -2270,7 +2275,7 @@ mod tests {
         .unwrap();
 
         let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["groups_claim"], "groups");
+        assert!(attr.as_object().unwrap().get("groups_claim").is_none());
     }
 
     #[test]
@@ -2409,9 +2414,10 @@ mod tests {
 
         let attr = req.attribute_mapping.unwrap();
         let obj = attr.as_object().unwrap();
-        // Only groups_claim should be present (it always has a default)
-        assert_eq!(obj.len(), 1);
-        assert!(obj.contains_key("groups_claim"));
+        // With no optional claims set, the attribute_mapping is empty:
+        // groups_claim is now only inserted when explicitly configured (#2831).
+        assert!(obj.is_empty());
+        assert!(!obj.contains_key("groups_claim"));
         assert!(!obj.contains_key("redirect_uri"));
         assert!(!obj.contains_key("username_claim"));
         assert!(!obj.contains_key("email_claim"));
