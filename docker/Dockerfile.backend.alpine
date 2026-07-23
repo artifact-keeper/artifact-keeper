@@ -59,7 +59,7 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # v0.114.0), but still bundles Go 1.26.3 stdlib and docker v28.5.2; those
 # residual CVEs have no fixed grype release yet and are documented/suppressed
 # in /.trivyignore rather than "bumped away". Re-evaluate on every bump (#2391).
-FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.116.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
