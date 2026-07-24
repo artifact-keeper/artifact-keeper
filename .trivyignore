@@ -64,6 +64,17 @@ CVE-2026-41568
 CVE-2026-42306
 
 # ---------------------------------------------------------------------------
+# grype v0.116.0 binary — google.golang.org/grpc @ v1.80.0
+# GHSA-hrxh-6v49-42gf (gRPC-Go: xDS RBAC and HTTP/2 vulnerabilities): fixed in
+# grpc-go v1.82.1, but grype v0.116.0 (latest) has not rebuilt against it.
+# Neither affected path is reachable in how AK drives grype: it is not an
+# xDS/service-mesh client (the RBAC authz path is dead code), and it runs as a
+# short-lived local CLI over on-disk artifacts/SBOMs with a pre-seeded offline
+# DB — it exposes no HTTP/2 server surface to untrusted peers. Drops off when
+# grype ships a release built on grpc-go >= 1.82.1. Re-evaluate on bump (#2391).
+GHSA-hrxh-6v49-42gf
+
+# ---------------------------------------------------------------------------
 # trivy 0.72.0 binary (scanner-adapter image) — oras.land/oras-go/v2 @ v2.6.0
 # Fixed in oras-go 2.6.1; trivy 0.72.0 (latest) has not rebuilt against it.
 # Code path: ORAS OCI-artifact client used for trivy's own DB/plugin
