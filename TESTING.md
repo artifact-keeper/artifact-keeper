@@ -102,7 +102,7 @@ Run fully automated E2E tests without any manual setup:
 |---------|-------|---------|
 | `postgres` | postgres:17-alpine | Test database (tmpfs for speed) |
 | `backend` | Custom (Rust) | API server |
-| `pypi-test` | python:3.12-slim | PyPI native client test |
+| `pypi-test` | python:3.13-slim | PyPI native client test |
 | `npm-test` | node:20-slim | NPM native client test |
 | `cargo-test` | rust:1.75-slim | Cargo native client test |
 

@@ -146,7 +146,7 @@ services:
   # ==========================================================================
 
   pypi-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.13-slim
     container_name: e2e-test-pypi
     depends_on:
       setup:
@@ -469,7 +469,7 @@ services:
   # ==========================================================================
 
   tag-replication-test:
-    image: python:3.12-slim
+    image: python:3.13-slim
     container_name: e2e-test-tag-replication
     depends_on:
       setup:
@@ -614,7 +614,7 @@ services:
       - e2e-test-network
 
   virtual-resolution-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.13-slim
     container_name: e2e-test-virtual-resolution
     profiles: ["cache-correctness"]
     depends_on:
