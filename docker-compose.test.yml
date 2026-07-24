@@ -280,7 +280,7 @@ services:
     profiles: ["rpm", "all"]
 
   deb-test:
-    image: debian:bookworm-slim
+    image: debian:trixie-slim
     container_name: e2e-test-deb
     depends_on:
       setup:

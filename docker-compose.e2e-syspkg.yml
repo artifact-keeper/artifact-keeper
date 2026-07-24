@@ -12,7 +12,7 @@
 
 services:
   debian-e2e:
-    image: debian:bookworm-slim
+    image: debian:trixie-slim
     container_name: e2e-syspkg-debian
     environment:
       BACKEND_URL: http://artifact-keeper-backend:8080
