@@ -75,7 +75,7 @@ services:
   # with proper backups, replication, and connection pooling.
   # Default credentials below are for local evaluation only.
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: artifact-keeper-db
     depends_on:
       pg-certs:

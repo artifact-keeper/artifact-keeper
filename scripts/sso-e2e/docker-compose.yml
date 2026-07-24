@@ -46,7 +46,7 @@ services:
 
   # PostgreSQL for Artifact Keeper
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: sso-test-db
     environment:
       POSTGRES_USER: registry

@@ -19,7 +19,7 @@ services:
       - "8180:8080"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: oidc-boot-db
     environment:
       POSTGRES_USER: registry

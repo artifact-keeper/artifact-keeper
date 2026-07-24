@@ -30,7 +30,7 @@ services:
   # ==========================================================================
 
   postgres:
-    image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:17-alpine
     container_name: e2e-test-db
     environment:
       POSTGRES_USER: registry
