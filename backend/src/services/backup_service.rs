@@ -87,6 +87,15 @@ pub struct BackupManifest {
 pub struct CreateBackupRequest {
     pub backup_type: BackupType,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Optional list of repository ids to exclude from the backup (#2772).
+    ///
+    /// Airgapped/bandwidth-limited deployments use this to keep specific
+    /// repositories out of full and incremental backups. When `None` or
+    /// empty no repositories are excluded, so existing behavior is unchanged.
+    /// When an explicit include list is also supplied the excluded ids are
+    /// removed from it; otherwise every repository except the excluded ones
+    /// is backed up.
+    pub exclude_repository_ids: Option<Vec<Uuid>>,
     pub created_by: Option<Uuid>,
     /// Optional operator-supplied name/label for the archive (#2790).
     ///
@@ -288,6 +297,50 @@ fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     Ok(count)
 }
 
+/// Resolve the effective set of repository ids to back up given an optional
+/// include-list and an optional exclude-list (#2772).
+///
+/// Returns `None` to mean "every repository" (no row filtering), matching the
+/// historical default when neither list is supplied. This keeps the default
+/// backup path byte-for-byte identical to before the exclude feature.
+///
+/// Semantics:
+/// * No exclude list (or an empty one): the include list is returned as-is.
+/// * Include + exclude: excluded ids are removed from the include list.
+/// * Exclude only: every repository in `all_repository_ids` except the
+///   excluded ones is returned.
+fn resolve_effective_repository_ids(
+    include: Option<Vec<Uuid>>,
+    exclude: Option<Vec<Uuid>>,
+    all_repository_ids: &[Uuid],
+) -> Option<Vec<Uuid>> {
+    // An empty exclude list is a no-op, indistinguishable from "no exclusions".
+    let exclude = exclude.filter(|ex| !ex.is_empty());
+
+    match (include, exclude) {
+        (include, None) => include,
+        (Some(include), Some(exclude)) => {
+            let excluded: std::collections::HashSet<Uuid> = exclude.into_iter().collect();
+            Some(
+                include
+                    .into_iter()
+                    .filter(|id| !excluded.contains(id))
+                    .collect(),
+            )
+        }
+        (None, Some(exclude)) => {
+            let excluded: std::collections::HashSet<Uuid> = exclude.into_iter().collect();
+            Some(
+                all_repository_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !excluded.contains(id))
+                    .collect(),
+            )
+        }
+    }
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         Self {
@@ -324,6 +377,7 @@ impl BackupService {
             req.created_by,
             serde_json::json!({
                 "repository_ids": req.repository_ids,
+                "exclude_repository_ids": req.exclude_repository_ids,
                 "name": req.name,
             })
         )
@@ -462,16 +516,29 @@ impl BackupService {
             "permission_grants",
         ];
 
+        // Resolve which repositories this backup covers (#2772). `None` means
+        // "every repository" and preserves the historical, unfiltered dump.
+        let repository_filter = self
+            .effective_repository_filter(backup.metadata.as_ref())
+            .await?;
+
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
-            let json_data = self.export_table(table).await?;
+            // The `artifacts` table is the only per-repository table exported,
+            // so when a repository filter is in effect an excluded repository's
+            // artifact rows are kept out of the dump too (not just its bytes).
+            let json_data = if *table == "artifacts" {
+                self.export_artifacts(repository_filter.as_deref()).await?
+            } else {
+                self.export_table(table).await?
+            };
             let json_bytes = serde_json::to_vec_pretty(&json_data)?;
             table_data.push((table.to_string(), json_bytes));
         }
 
         // Fetch artifact storage keys and content
         let storage_keys = self
-            .get_artifact_storage_keys(backup.metadata.as_ref())
+            .artifact_storage_keys(repository_filter.as_deref())
             .await?;
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
         for key in storage_keys {
@@ -545,18 +612,56 @@ impl BackupService {
         Ok(serde_json::Value::Array(rows))
     }
 
-    async fn get_artifact_storage_keys(
+    /// Resolve the effective set of repository ids covered by a backup from its
+    /// stored metadata (#2772).
+    ///
+    /// Reads the optional `repository_ids` (include) and `exclude_repository_ids`
+    /// (exclude) lists and combines them via [`resolve_effective_repository_ids`].
+    /// Returns `None` when no filtering applies (no include list and no
+    /// exclusions), so full backups keep dumping every repository exactly as
+    /// before. The complete repository set is only queried for the exclude-only
+    /// case, where it is needed to compute "everything except the excluded ids".
+    async fn effective_repository_filter(
         &self,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<Vec<String>> {
-        let repository_filter: Option<Vec<Uuid>> = metadata
+    ) -> Result<Option<Vec<Uuid>>> {
+        let include_filter: Option<Vec<Uuid>> = metadata
             .and_then(|m| m.get("repository_ids"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let exclude_filter: Option<Vec<Uuid>> = metadata
+            .and_then(|m| m.get("exclude_repository_ids"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+        let needs_all_repositories = include_filter.is_none()
+            && exclude_filter
+                .as_ref()
+                .is_some_and(|ex: &Vec<Uuid>| !ex.is_empty());
+        let all_repository_ids: Vec<Uuid> = if needs_all_repositories {
+            sqlx::query_scalar("SELECT id FROM repositories")
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+
+        Ok(resolve_effective_repository_ids(
+            include_filter,
+            exclude_filter,
+            &all_repository_ids,
+        ))
+    }
+
+    /// List the artifact storage keys to include in a backup, honoring the
+    /// resolved repository filter (`None` => every artifact).
+    async fn artifact_storage_keys(
+        &self,
+        repository_filter: Option<&[Uuid]>,
+    ) -> Result<Vec<String>> {
         let keys: Vec<String> = if let Some(repo_ids) = repository_filter {
             sqlx::query_scalar!(
                 "SELECT storage_key FROM artifacts WHERE repository_id = ANY($1)",
-                &repo_ids
+                repo_ids
             )
             .fetch_all(&self.db)
             .await
@@ -569,6 +674,32 @@ impl BackupService {
         };
 
         Ok(keys)
+    }
+
+    /// Export the `artifacts` table as a JSON array, honoring the resolved
+    /// repository filter (#2772).
+    ///
+    /// When `repository_filter` is `None` this is identical to
+    /// `export_table("artifacts")`, so unfiltered backups are unchanged. When a
+    /// filter is present only the covered repositories' artifact rows are
+    /// dumped, keeping an excluded repository entirely out of the archive.
+    async fn export_artifacts(
+        &self,
+        repository_filter: Option<&[Uuid]>,
+    ) -> Result<serde_json::Value> {
+        let Some(repo_ids) = repository_filter else {
+            return self.export_table("artifacts").await;
+        };
+
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT row_to_json(t) FROM artifacts t WHERE repository_id = ANY($1)",
+        )
+        .bind(repo_ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(serde_json::Value::Array(rows))
     }
 
     async fn update_status(
@@ -1494,6 +1625,7 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Full,
             repository_ids: Some(vec![Uuid::new_v4()]),
+            exclude_repository_ids: None,
             created_by: Some(Uuid::new_v4()),
             name: None,
         };
@@ -1507,6 +1639,7 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Metadata,
             repository_ids: None,
+            exclude_repository_ids: None,
             created_by: None,
             name: None,
         };
@@ -1678,6 +1811,86 @@ mod tests {
             !ALLOWED_EXPORT_TABLES.contains(&"repository_permissions"),
             "ALLOWED_EXPORT_TABLES must not reference 'repository_permissions' (non-existent table)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_effective_repository_ids tests (#2772 exclude repositories)
+    // -----------------------------------------------------------------------
+
+    /// Sort a repository-id vec so set comparisons are order-independent.
+    fn sorted(mut v: Vec<Uuid>) -> Vec<Uuid> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_effective_repos_default_is_none() {
+        // No include and no exclude: back up everything (None => no filter),
+        // identical to pre-#2772 behavior.
+        assert!(resolve_effective_repository_ids(None, None, &[]).is_none());
+    }
+
+    #[test]
+    fn test_effective_repos_empty_exclude_is_noop() {
+        // An empty exclude list must behave exactly like "no exclusions".
+        let all = vec![Uuid::new_v4(), Uuid::new_v4()];
+        assert!(resolve_effective_repository_ids(None, Some(vec![]), &all).is_none());
+
+        let include = vec![all[0]];
+        let out = resolve_effective_repository_ids(Some(include.clone()), Some(vec![]), &all);
+        assert_eq!(out, Some(include));
+    }
+
+    #[test]
+    fn test_effective_repos_include_only_passthrough() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let out = resolve_effective_repository_ids(Some(vec![a, b]), None, &[]);
+        assert_eq!(out, Some(vec![a, b]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_only_removes_from_all() {
+        let keep = Uuid::new_v4();
+        let drop = Uuid::new_v4();
+        let all = vec![keep, drop];
+        let out = resolve_effective_repository_ids(None, Some(vec![drop]), &all);
+        // The excluded repo is absent, the other repo is present.
+        assert_eq!(out, Some(vec![keep]));
+        let out = out.unwrap();
+        assert!(!out.contains(&drop));
+        assert!(out.contains(&keep));
+    }
+
+    #[test]
+    fn test_effective_repos_include_minus_exclude() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        // Explicit include of {a,b,c}, exclude {b}: result is {a,c}.
+        let out = resolve_effective_repository_ids(Some(vec![a, b, c]), Some(vec![b]), &[]);
+        assert_eq!(sorted(out.unwrap()), sorted(vec![a, c]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_non_member_is_noop() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        // Excluding an id that is not in the include list changes nothing.
+        let out = resolve_effective_repository_ids(Some(vec![a, b]), Some(vec![stranger]), &[]);
+        assert_eq!(sorted(out.unwrap()), sorted(vec![a, b]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_all_yields_empty_set() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let all = vec![a, b];
+        // Excluding every repository yields an explicit empty set (Some([]))
+        // -> the `= ANY(empty)` query backs up no artifacts, NOT all of them.
+        let out = resolve_effective_repository_ids(None, Some(all.clone()), &all);
+        assert_eq!(out, Some(vec![]));
     }
 
     /// Verify every table in ALLOWED_EXPORT_TABLES is a known migration table.

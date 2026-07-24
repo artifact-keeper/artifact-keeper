@@ -237,7 +237,19 @@ pub struct ListBackupsQuery {
 pub struct CreateBackupRequest {
     #[serde(rename = "type")]
     pub backup_type: Option<String>,
+    /// Explicit allow-list of repository ids to include in the backup.
+    ///
+    /// When omitted every repository is backed up (subject to
+    /// `exclude_repositories`).
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Repository ids to exclude from a full or incremental backup (#2772).
+    ///
+    /// Airgapped or bandwidth-limited deployments use this to keep specific
+    /// repositories out of the backup. When omitted or empty nothing is
+    /// excluded, so existing behavior is unchanged. If `repository_ids` is
+    /// also supplied the excluded ids are removed from that include list;
+    /// otherwise every repository except the excluded ones is backed up.
+    pub exclude_repositories: Option<Vec<Uuid>>,
     /// Optional custom name/label for the backup archive (#2790).
     ///
     /// When provided it becomes the identifying part of the archive
@@ -411,6 +423,7 @@ pub async fn create_backup(
         .create(ServiceCreateBackup {
             backup_type,
             repository_ids: payload.repository_ids,
+            exclude_repository_ids: payload.exclude_repositories,
             created_by: Some(auth.user_id),
             name: payload.name,
         })
