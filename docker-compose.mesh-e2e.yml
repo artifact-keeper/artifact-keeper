@@ -130,7 +130,7 @@ services:
   # ==========================================================================
 
   mesh-test:
-    image: docker.io/alpine:3.19
+    image: docker.io/alpine:3.24
     container_name: mesh-e2e-test
     depends_on:
       backend-peer-a:

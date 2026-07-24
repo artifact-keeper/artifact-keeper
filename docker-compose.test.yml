@@ -86,7 +86,7 @@ services:
 
   # Bootstrap: create test repositories after backend is healthy
   setup:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-setup
     depends_on:
       backend:
@@ -109,7 +109,7 @@ services:
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-pki
     command: >
       sh -c "
@@ -366,7 +366,7 @@ services:
   # ==========================================================================
 
   protobuf-test:
-    image: docker.io/alpine:3.19
+    image: docker.io/alpine:3.24
     container_name: e2e-test-protobuf
     depends_on:
       setup:
@@ -381,7 +381,7 @@ services:
     profiles: ["protobuf", "all"]
 
   hex-test:
-    image: docker.io/alpine:3.19
+    image: docker.io/alpine:3.24
     container_name: e2e-test-hex
     depends_on:
       setup:
@@ -448,7 +448,7 @@ services:
     profiles: ["proxy", "smoke", "all"]
 
   docker-proxy-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-docker-proxy
     depends_on:
       setup:
@@ -490,7 +490,7 @@ services:
   # ==========================================================================
 
   storage-gc-test:
-    image: alpine:3.19
+    image: alpine:3.24
     container_name: e2e-test-storage-gc
     depends_on:
       backend:
@@ -560,7 +560,7 @@ services:
       - e2e-test-network
 
   curation-test:
-    image: alpine:3.19
+    image: alpine:3.24
     container_name: e2e-test-curation
     profiles: ["curation"]
     depends_on:
@@ -634,7 +634,7 @@ services:
       - e2e-test-network
 
   cache-correctness-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-cache-correctness
     profiles: ["cache-correctness"]
     depends_on:

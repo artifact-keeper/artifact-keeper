@@ -32,7 +32,7 @@ services:
     profiles: ["rpm", "all"]
 
   alpine-e2e:
-    image: alpine:3.19
+    image: alpine:3.24
     container_name: e2e-syspkg-alpine
     environment:
       BACKEND_URL: http://artifact-keeper-backend:8080

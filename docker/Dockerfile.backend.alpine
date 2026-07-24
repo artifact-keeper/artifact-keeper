@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
+ARG ALPINE_VERSION=3.24
+
 # ---------- Base: Rust toolchain on Alpine ----------
-FROM rust:1.97-alpine3.21 AS rust-alpine-base
+FROM rust:1.97-alpine${ALPINE_VERSION} AS rust-alpine-base
 RUN apk add --no-cache \
     build-base pkgconfig perl openssl-dev openssl-libs-static \
     zlib-dev zlib-static xz-dev xz-static \
@@ -68,7 +70,7 @@ FROM ghcr.io/anchore/grype:v0.116.0 AS grype-bin
 # Populates the Grype DB at build time so the image works on egress-restricted
 # networks (e.g. ARC runner pods) without a first-scan network fetch from
 # grype.anchore.io. See artifact-keeper#1001.
-FROM alpine:3.24 AS grype-db-seed
+FROM alpine:${ALPINE_VERSION} AS grype-db-seed
 RUN apk add --no-cache ca-certificates
 COPY --from=grype-bin /grype /usr/local/bin/grype
 ENV GRYPE_DB_CACHE_DIR=/grype-db
@@ -79,7 +81,7 @@ RUN mkdir -p /grype-db && grype db update && grype db status
 # if/when the suspended alpine publish job is re-enabled; see
 # docker-publish.yml. Without that, the registry build cache can serve the
 # `apk upgrade` layer stale and ship months-old errata (#2391).
-FROM alpine:3.24 AS runtime
+FROM alpine:${ALPINE_VERSION} AS runtime
 
 # Refresh the whole base first so the alpine:3.24 layer picks up the latest
 # APK security errata, then install the runtime deps (no libssl needed -

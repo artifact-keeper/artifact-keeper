@@ -33,7 +33,7 @@ services:
   # In production, replace this with certs issued by your internal CA or use a
   # managed database service that handles TLS for you.
   pg-certs:
-    image: alpine:3.23
+    image: alpine:3.24
     container_name: artifact-keeper-pg-certs
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -115,7 +115,7 @@ services:
   # shell-free) while providing sh + curl + jq. Mirrors the pg-certs init
   # container's `apk add` pattern above.
   dtrack-init:
-    image: alpine:3.23
+    image: alpine:3.24
     container_name: artifact-keeper-dtrack-init
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -156,7 +156,7 @@ services:
   # (issue #1563). This one-shot root init container chowns the volume to
   # 1001:0 before the backend starts. Mirrors the pg-certs init pattern above.
   scan-workspace-init:
-    image: alpine:3.23
+    image: alpine:3.24
     container_name: artifact-keeper-scan-ws-init
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
