@@ -190,7 +190,7 @@ services:
     profiles: ["npm", "smoke", "all"]
 
   cargo-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/rust:1.75-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/rust:1.97-slim
     container_name: e2e-test-cargo
     depends_on:
       setup:

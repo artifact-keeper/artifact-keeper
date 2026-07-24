@@ -104,7 +104,7 @@ Run fully automated E2E tests without any manual setup:
 | `backend` | Custom (Rust) | API server |
 | `pypi-test` | python:3.13-slim | PyPI native client test |
 | `npm-test` | node:24-slim | NPM native client test |
-| `cargo-test` | rust:1.75-slim | Cargo native client test |
+| `cargo-test` | rust:1.97-slim | Cargo native client test |
 
 ## CI/CD Integration
 
