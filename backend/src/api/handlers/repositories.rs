@@ -5174,7 +5174,7 @@ async fn list_artifacts_grouped_by_maven_component(
     // SQL-keyset-paged out of the package catalog (#2723), replacing the prior
     // bounded (MAX_FETCH) `fetch-everything-then-group-in-memory` path. The
     // catalog `packages.name` is `groupId:artifactId` (write-path normalization
-    // + backfill migration 176), so the ordered, keyset-paged component keys
+    // + backfill migration 177), so the ordered, keyset-paged component keys
     // `(name, version)` come straight from `packages ⋈ package_versions` -- the
     // same catalog-keyset mechanism the remote branch above uses. Per-file
     // details (aggregate size, download totals, and the `artifact_files` list
