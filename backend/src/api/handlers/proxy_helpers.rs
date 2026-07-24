@@ -3799,9 +3799,38 @@ pub struct ArtifactWithMetadata {
     pub id: Uuid,
     pub name: String,
     pub version: Option<String>,
+    /// The artifact's actual stored `path`. Index/metadata generators advertise
+    /// its basename as the download filename so the advertised URL resolves to
+    /// the same object the download route serves (#2587 / #2589).
+    pub path: String,
     pub size_bytes: Option<i64>,
     pub checksum_sha256: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// The filename to advertise in a generated index/metadata document so a client
+/// that follows the advertised download URL resolves the same object the
+/// download route serves.
+///
+/// Format download routes resolve a hosted artifact by its trailing filename
+/// suffix, with an exact-path fallback for artifacts stored at their bare (root)
+/// path (see [`resolve_local_artifact_by_suffix`], #2587). An index that
+/// reconstructs `{name}-{version}.<ext>` from coordinates therefore advertises a
+/// path the download route cannot resolve whenever the artifact was pushed
+/// through the generic upload flow and stored at a bare/arbitrary path with
+/// generically-derived coordinates. Preferring the artifact's real stored
+/// basename keeps the advertised URL coherent with the served route for both
+/// upload flows — the generalisation of the RPM `primary.xml` `<location>` fix
+/// (#2587) to other suffix-resolved formats (#2589).
+///
+/// `reconstructed` is used only when `path` has no usable basename (e.g. a
+/// remote upstream entry with no local stored object).
+pub fn advertised_download_filename(path: &str, reconstructed: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| reconstructed.to_string())
 }
 
 /// Look up an artifact by case-insensitive name AND exact version.
@@ -3815,7 +3844,7 @@ pub async fn find_artifact_by_name_version(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3836,6 +3865,7 @@ pub async fn find_artifact_by_name_version(
         id: r.try_get("id").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
+        path: r.try_get("path").unwrap_or_default(),
         size_bytes: r.try_get("size_bytes").ok(),
         checksum_sha256: r.try_get("checksum_sha256").ok(),
         metadata: r.try_get("metadata").ok(),
@@ -3856,7 +3886,7 @@ pub async fn find_artifact_by_name_lowercase(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3876,6 +3906,7 @@ pub async fn find_artifact_by_name_lowercase(
         id: r.try_get("id").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
+        path: r.try_get("path").unwrap_or_default(),
         size_bytes: r.try_get("size_bytes").ok(),
         checksum_sha256: r.try_get("checksum_sha256").ok(),
         metadata: r.try_get("metadata").ok(),
@@ -3896,7 +3927,7 @@ pub async fn list_artifacts_by_name_lowercase(
 ) -> Result<Vec<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3917,6 +3948,7 @@ pub async fn list_artifacts_by_name_lowercase(
             id: r.try_get("id").unwrap_or_default(),
             name: r.try_get("name").unwrap_or_default(),
             version: r.try_get("version").ok(),
+            path: r.try_get("path").unwrap_or_default(),
             size_bytes: r.try_get("size_bytes").ok(),
             checksum_sha256: r.try_get("checksum_sha256").ok(),
             metadata: r.try_get("metadata").ok(),
@@ -7101,12 +7133,14 @@ mod tests {
             id,
             name: "ggplot2".to_string(),
             version: Some("3.4.0".to_string()),
+            path: "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz".to_string(),
             size_bytes: Some(1024),
             checksum_sha256: Some("def".to_string()),
             metadata: Some(serde_json::json!({"depends": "R (>= 3.5.0)"})),
         };
         assert_eq!(m.id, id);
         assert_eq!(m.name, "ggplot2");
+        assert_eq!(m.path, "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz");
         assert_eq!(m.version.as_deref(), Some("3.4.0"));
         assert_eq!(m.size_bytes, Some(1024));
         assert_eq!(m.checksum_sha256.as_deref(), Some("def"));
@@ -7119,6 +7153,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "lonely".to_string(),
             version: None,
+            path: "lonely.tar.gz".to_string(),
             size_bytes: None,
             checksum_sha256: None,
             metadata: None,
@@ -7128,6 +7163,34 @@ mod tests {
         assert!(m.checksum_sha256.is_none());
         assert!(m.metadata.is_none());
         assert_eq!(m.name, "lonely");
+    }
+
+    #[test]
+    fn test_advertised_download_filename_prefers_stored_basename() {
+        // Native layout: basename already equals the reconstructed filename.
+        assert_eq!(
+            advertised_download_filename("rails/7.0.0/rails-7.0.0.gem", "rails-7.0.0.gem"),
+            "rails-7.0.0.gem"
+        );
+        // Bare/arbitrary generic-upload path: advertise the real basename, NOT
+        // the reconstructed coordinates the download route could not resolve.
+        assert_eq!(
+            advertised_download_filename("blob.gem", "rails-7.0.0.gem"),
+            "blob.gem"
+        );
+        assert_eq!(
+            advertised_download_filename("uploads/2026/x.tar.gz", "acme-mod-1.0.0.tar.gz"),
+            "x.tar.gz"
+        );
+        // No usable basename (empty / trailing slash) -> reconstructed fallback.
+        assert_eq!(
+            advertised_download_filename("", "acme-mod-1.0.0.tar.gz"),
+            "acme-mod-1.0.0.tar.gz"
+        );
+        assert_eq!(
+            advertised_download_filename("dir/", "acme-mod-1.0.0.tar.gz"),
+            "acme-mod-1.0.0.tar.gz"
+        );
     }
 
     // ── DownloadResponseOpts / VirtualLookup tests ──────────────────────
