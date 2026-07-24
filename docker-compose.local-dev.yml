@@ -45,7 +45,7 @@ services:
     restart: unless-stopped
 
   opensearch:
-    image: opensearchproject/opensearch:2.19.1
+    image: opensearchproject/opensearch:2.19.6
     container_name: artifact-keeper-dev-opensearch
     environment:
       discovery.type: single-node

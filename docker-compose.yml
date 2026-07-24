@@ -311,7 +311,7 @@ services:
   # ---------------------------------------------------------------------------
   # Powers artifact and package search in the UI and API.
   opensearch:
-    image: opensearchproject/opensearch:2.19.1
+    image: opensearchproject/opensearch:2.19.6
     container_name: artifact-keeper-opensearch
     environment:
       discovery.type: single-node
