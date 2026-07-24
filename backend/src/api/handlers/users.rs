@@ -3762,8 +3762,10 @@ mod password_audit_tests {
         )
         .await;
 
-        let changed = tdh::audit_count(&pool, user_id, "PASSWORD_CHANGED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let changed = tdh::audit_count_eventually(&pool, user_id, "PASSWORD_CHANGED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         let by_admin = by_admin_flag(&pool, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
 
@@ -3796,7 +3798,8 @@ mod password_audit_tests {
 
         let res = reset_password(State(state.clone()), Extension(auth), Path(target_id)).await;
 
-        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for it.
+        let changed = tdh::audit_count_eventually(&pool, target_id, "PASSWORD_CHANGED", 1).await;
         let by_admin = by_admin_flag(&pool, target_id).await;
         tdh::cleanup_user(&pool, target_id).await;
         tdh::cleanup_user(&pool, admin_id).await;
@@ -3827,7 +3830,11 @@ mod password_audit_tests {
         let res =
             force_password_change(State(state.clone()), Extension(auth), Path(target_id)).await;
 
-        let invalidated = tdh::audit_count(&pool, target_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for the
+        // positive event; once it has landed the (never-emitted) negative event
+        // is safely read directly.
+        let invalidated =
+            tdh::audit_count_eventually(&pool, target_id, "SESSIONS_INVALIDATED", 1).await;
         // No password actually changed, so PASSWORD_CHANGED must NOT be emitted.
         let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
         tdh::cleanup_user(&pool, target_id).await;

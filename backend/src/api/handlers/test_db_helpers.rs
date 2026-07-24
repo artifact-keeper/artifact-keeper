@@ -792,6 +792,59 @@ pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 
     .expect("audit_log count query")
 }
 
+/// Poll [`audit_count`] until it reaches `expected` (or a bounded ~2s budget is
+/// exhausted), returning the last observed value.
+///
+/// Since #2522 the fire-and-forget audit emitters (`audit_fire_and_forget`)
+/// SPAWN their INSERT instead of awaiting it, so a test that acts and then reads
+/// the audit trail must tolerate the detached task's async timing. Use this for
+/// the "an event was emitted" (count reaches N) assertions; a subsequent
+/// "not emitted" (count stays 0) assertion can then read [`audit_count`]
+/// directly, since the spawned writes for this resource have already drained.
+pub async fn audit_count_eventually(
+    pool: &PgPool,
+    resource_id: Uuid,
+    action: &str,
+    expected: i64,
+) -> i64 {
+    let mut last = -1;
+    for _ in 0..100 {
+        last = audit_count(pool, resource_id, action).await;
+        if last >= expected {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    last
+}
+
+/// Count `download_statistics` rows for `artifact_id`.
+pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("download_statistics count query")
+}
+
+/// Poll [`download_count`] until it reaches `expected` (or a bounded ~2s budget
+/// is exhausted), returning the last observed value.
+///
+/// Since #2522 `record_download` SPAWNS the `download_statistics` INSERT off the
+/// synchronous download hot path, so a test that serves a body and then reads
+/// the count must tolerate the detached write's async timing.
+pub async fn download_count_eventually(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+    let mut last = -1;
+    for _ in 0..100 {
+        last = download_count(pool, artifact_id).await;
+        if last >= expected {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    last
+}
+
 /// Delete a test user plus the auth-related rows the audit/2FA test modules
 /// create for it (audit_log, refresh/pending jti, password history). Shared
 /// teardown so the identical cleanup block isn't copy-pasted across the #386

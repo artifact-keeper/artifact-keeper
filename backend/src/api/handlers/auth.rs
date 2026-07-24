@@ -2048,17 +2048,6 @@ mod admin_scope_policy_tests {
 
     // ── #1617 Phase 1: token-lifecycle audit coverage ───────────────────
 
-    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
-        )
-        .bind(token_id)
-        .bind(action)
-        .fetch_one(pool)
-        .await
-        .expect("audit_log count query")
-    }
-
     /// Minting an API token must emit an `API_TOKEN_CREATED` audit event
     /// attributed to the acting user, carrying the token id (never the secret).
     #[tokio::test]
@@ -2091,8 +2080,9 @@ mod admin_scope_policy_tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
 
+        // #2522: audit write is fire-and-forget (spawned) — poll for the row.
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_CREATED", 1).await,
             1,
             "mint MUST write exactly one API_TOKEN_CREATED audit row"
         );
@@ -2136,7 +2126,7 @@ mod admin_scope_policy_tests {
         assert!(status.is_success(), "revoke should succeed, got {status}");
 
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_REVOKED", 1).await,
             1,
             "revoke MUST write exactly one API_TOKEN_REVOKED audit row"
         );

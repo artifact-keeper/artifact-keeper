@@ -2324,19 +2324,33 @@ pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadConte
     if ctx.is_head {
         return;
     }
-    if let Err(e) = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(artifact_id)
-    .bind(ctx.user_id)
-    .bind(ctx.client_ip.map(|ip| ip.to_string()))
-    .bind(ctx.user_agent.as_deref())
-    .execute(db)
-    .await
-    {
-        warn!(%artifact_id, error = %e, "failed to record download statistics");
-    }
+    // Move the statistics INSERT OFF the synchronous download hot path (#2522).
+    // Historically this awaited the write on the catalog pool before the byte
+    // stream could return, coupling byte-plane latency/availability to DB-pool
+    // pressure. Spawn a detached best-effort task instead: the caller returns
+    // immediately (no await on the write), the row is still eventually written,
+    // and a failure is logged at `warn` and swallowed exactly as before —
+    // statistics must never block or fail the download itself. The `is_head`
+    // "no body ⇒ no row" contract is preserved (checked synchronously above).
+    let db = db.clone();
+    let user_id = ctx.user_id;
+    let ip_address = ctx.client_ip.map(|ip| ip.to_string());
+    let user_agent = ctx.user_agent.clone();
+    tokio::spawn(async move {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(artifact_id)
+        .bind(user_id)
+        .bind(ip_address)
+        .bind(user_agent)
+        .execute(&db)
+        .await
+        {
+            warn!(%artifact_id, error = %e, "failed to record download statistics");
+        }
+    });
 }
 
 /// URL fields commonly found in package metadata across all formats.
@@ -3455,9 +3469,32 @@ mod tests {
     /// by the shared service-layer choke points (`finalize_upload`,
     /// `finish_download`, `delete_with_sync_options`). The download event also
     /// carries the client IP and acting user. Skips without `DATABASE_URL`.
+    ///
+    /// Since #2522 the audit writes are fire-and-forget (spawned, not awaited),
+    /// so each event count is polled with a short bounded retry rather than
+    /// asserted synchronously.
     #[tokio::test]
     async fn test_artifact_lifecycle_emits_audit_events_db() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        /// Poll `audit_count` for `(artifact_id, action)` until it reaches
+        /// `expected` or the bounded budget is exhausted (#2522 async audit).
+        async fn poll_audit_count(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            action: &str,
+            expected: i64,
+        ) -> i64 {
+            let mut last = -1;
+            for _ in 0..50 {
+                last = tdh::audit_count(pool, artifact_id, action).await;
+                if last >= expected {
+                    return last;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            last
+        }
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -3470,8 +3507,9 @@ mod tests {
         );
         let svc = ArtifactService::new(pool.clone(), storage);
 
-        // Upload -> ARTIFACT_UPLOADED (audit write is awaited inside
-        // finalize_upload, so it has landed by the time upload() returns).
+        // Upload -> ARTIFACT_UPLOADED. The audit write is spawned fire-and-forget
+        // inside finalize_upload (#2522), so poll for it rather than assert it
+        // has already landed by the time upload() returns.
         let artifact = svc
             .upload(
                 repo_id,
@@ -3485,7 +3523,7 @@ mod tests {
             .await
             .expect("upload succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED", 1).await,
             1,
             "upload emits exactly one ARTIFACT_UPLOADED event"
         );
@@ -3502,7 +3540,7 @@ mod tests {
             .await
             .expect("download succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED", 1).await,
             1,
             "download emits exactly one ARTIFACT_DOWNLOADED event"
         );
@@ -3510,7 +3548,7 @@ mod tests {
         // Delete -> ARTIFACT_DELETED.
         svc.delete(artifact.id).await.expect("delete succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DELETED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DELETED", 1).await,
             1,
             "delete emits exactly one ARTIFACT_DELETED event"
         );
@@ -3979,5 +4017,104 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -- #2522 download-statistics write moved OFF the synchronous hot path -----
+    // `record_download` now SPAWNS the `download_statistics` INSERT instead of
+    // awaiting it, so the byte stream returns without blocking on the catalog
+    // pool. These tests assert the eventual-write contract (poll with a bounded
+    // retry, matching the async-timing caveat) and that the HEAD "no body ⇒ no
+    // row" guard still holds synchronously.
+
+    /// Seed a live artifact row and return its id (self-contained, `RETURNING`).
+    #[cfg(test)]
+    async fn seed_dl_artifact(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+        let key = format!("dl/{}", Uuid::new_v4());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, $3, 'application/octet-stream', $4) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind("0".repeat(64))
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact returning id")
+    }
+
+    /// Poll `download_statistics` for `artifact_id` until it reaches `expected`
+    /// or the bounded retry budget is exhausted; returns the last observed count.
+    #[cfg(test)]
+    async fn poll_dl_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..50 {
+            last = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn test_record_download_eventually_writes_row_off_hot_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/dl-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: "203.0.113.7".parse().ok(),
+            user_id: None,
+            user_agent: Some("unit-test/1.0".to_string()),
+            is_head: false,
+        };
+        // Returns without awaiting the INSERT (spawned); the row lands shortly
+        // after. The count must still reach 1 — the eventual-write contract.
+        record_download(&pool, artifact_id, &ctx).await;
+        let count = poll_dl_count(&pool, artifact_id, 1).await;
+        assert_eq!(
+            count, 1,
+            "spawned download_statistics write must eventually land"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_download_head_writes_no_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/head-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: true,
+        };
+        record_download(&pool, artifact_id, &ctx).await;
+        // Give any (erroneous) spawned write time to land, then assert none did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count download_statistics");
+        assert_eq!(count, 0, "a HEAD serves no body and must never write a row");
     }
 }

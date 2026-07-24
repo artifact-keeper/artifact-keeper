@@ -756,9 +756,17 @@ impl AuditService {
 /// a side effect, never a gate. Mirrors the `audit_auth` fire-and-forget
 /// contract already used on the local-password login path.
 pub async fn audit_fire_and_forget(db: PgPool, entry: AuditEntry) {
-    if let Err(e) = AuditService::new(db).log(entry).await {
-        tracing::warn!(error = %e, "audit log write failed; ignored (fire-and-forget)");
-    }
+    // Actually fire-and-forget (#2522): spawn a detached task so the caller
+    // returns WITHOUT awaiting the audit INSERT. On the download hot path this
+    // write previously blocked the byte stream on the catalog pool; the emitter
+    // must return immediately while the trail is still eventually written. A
+    // failure stays swallowed — logged at `warn`, never propagated — so an
+    // audit-table outage can never fail (or slow) the originating request.
+    tokio::spawn(async move {
+        if let Err(e) = AuditService::new(db).log(entry).await {
+            tracing::warn!(error = %e, "audit log write failed; ignored (fire-and-forget)");
+        }
+    });
 }
 
 /// Fire-and-forget `PermissionDenied` audit for a HANDLER-level admin gate
@@ -2139,6 +2147,50 @@ mod tests {
         let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
             .bind(resource_id)
             .execute(&service.db)
+            .await;
+    }
+
+    // -- #2522 audit_fire_and_forget is now truly non-blocking -----------------
+
+    /// The emitter must SPAWN the audit INSERT (not await it) so a caller on the
+    /// download hot path returns without blocking on the catalog pool, while the
+    /// trail is still eventually written. Poll with a bounded retry to account
+    /// for the detached task's async timing.
+    #[tokio::test]
+    async fn test_audit_fire_and_forget_eventually_writes_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let resource_id = Uuid::new_v4();
+        let entry = AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
+            .resource(resource_id);
+
+        // Returns immediately: the write is spawned, not awaited.
+        audit_fire_and_forget(pool.clone(), entry).await;
+
+        let mut count = 0i64;
+        for _ in 0..50 {
+            count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1",
+            )
+            .bind(resource_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit_log rows");
+            if count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            count, 1,
+            "spawned fire-and-forget audit write must eventually land"
+        );
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
             .await;
     }
 }

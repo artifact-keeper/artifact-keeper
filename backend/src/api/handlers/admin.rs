@@ -1978,6 +1978,12 @@ mod tests {
         };
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
+        // #2522: the two INSERTs are now spawned off the hot path — wait for
+        // both rows to land before asserting on them.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 2).await,
+            2
+        );
 
         // Filter by artifact: both rows.
         let by_artifact = query_downloads(
@@ -2080,6 +2086,11 @@ mod tests {
 
         crate::services::artifact_service::record_download(&pool, artifact_id, &Default::default())
             .await;
+        // #2522: the INSERT is now spawned — wait for the row before reading it.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 1).await,
+            1
+        );
 
         let (ip, uid): (Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT ip_address, user_id FROM download_statistics WHERE artifact_id = $1",

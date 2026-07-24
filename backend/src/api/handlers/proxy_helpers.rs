@@ -8179,6 +8179,12 @@ mod tests {
         let cd = resp.headers().get("Content-Disposition").unwrap();
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
 
+        // #2522: the stats INSERT is now spawned off the hot path — wait for it.
+        assert_eq!(
+            crate::api::handlers::test_db_helpers::download_count_eventually(&pool, artifact_id, 1)
+                .await,
+            1
+        );
         // #2365: the download must be attributed to the real client, not the
         // historical '0.0.0.0' sentinel with no user.
         let (ip, ua, uid): (Option<String>, Option<String>, Option<Uuid>) = sqlx::query_as(
@@ -9982,6 +9988,22 @@ mod tests {
         .expect("count download_statistics rows")
     }
 
+    /// Poll [`download_stats_count_for_repo`] until it reaches `expected` (or a
+    /// bounded ~2s budget is exhausted). Since #2522 `record_download` SPAWNS the
+    /// `download_statistics` INSERT off the hot path, so these repo-scoped count
+    /// assertions must tolerate the detached write's async timing.
+    async fn poll_repo_download_count(pool: &PgPool, repo_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = download_stats_count_for_repo(pool, repo_id).await;
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     /// #2260: a HOSTED (non-proxy-cache) local artifact served through
     /// `local_fetch_or_redirect` on a filesystem backend (streaming fallback,
     /// no presign) records exactly ONE download-statistics row — and a second
@@ -10043,7 +10065,8 @@ mod tests {
         )
         .await
         .expect("first hosted fetch must succeed");
-        let after_one = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        // #2522: the stats INSERT is spawned off the hot path — wait for it.
+        let after_one = poll_repo_download_count(&fx.pool, fx.repo_id, 1).await;
 
         super::local_fetch_or_redirect(
             &fx.pool,
@@ -10055,7 +10078,7 @@ mod tests {
         )
         .await
         .expect("second hosted fetch must succeed");
-        let after_two = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        let after_two = poll_repo_download_count(&fx.pool, fx.repo_id, 2).await;
 
         fx.teardown().await;
 
@@ -10148,7 +10171,8 @@ mod tests {
         )
         .await
         .expect("GET serve must succeed");
-        let after_get = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        // #2522: the GET's stats INSERT is spawned off the hot path — wait for it.
+        let after_get = poll_repo_download_count(&fx.pool, fx.repo_id, 1).await;
 
         fx.teardown().await;
 
@@ -10240,7 +10264,9 @@ mod tests {
         )
         .await;
 
-        let recorded = download_stats_count_for_repo(&pool, member_id).await;
+        // #2522: the stats INSERT is spawned off the hot path — wait for it
+        // before cleanup deletes the rows.
+        let recorded = poll_repo_download_count(&pool, member_id, 1).await;
 
         db_helpers::cleanup(&pool, member_id, user_id).await;
         db_helpers::cleanup(&pool, virtual_id, user_id).await;
@@ -10545,6 +10571,22 @@ mod tests {
             .expect("count download_statistics")
     }
 
+    /// Poll [`download_stat_count`] until it reaches `expected` (or a bounded
+    /// ~2s budget is exhausted). Since #2522 `record_download` SPAWNS the
+    /// `download_statistics` INSERT off the hot path, so these artifact-scoped
+    /// count assertions must tolerate the detached write's async timing.
+    async fn poll_artifact_download_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = download_stat_count(pool, artifact_id).await;
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     fn ctx_for(
         user_id: Uuid,
         is_head: bool,
@@ -10593,7 +10635,8 @@ mod tests {
         )
         .await;
 
-        let after_get = download_stat_count(&pool, artifact_id).await;
+        // #2522: the GET's stats INSERT is spawned off the hot path — wait for it.
+        let after_get = poll_artifact_download_count(&pool, artifact_id, 1).await;
 
         // HEAD on the same redirect-eligible .jar: still 302 (headers only) but
         // records +0 — the canonical record_download honours ctx.is_head

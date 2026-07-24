@@ -9086,6 +9086,12 @@ mod tests {
             Some("redirect-stats-test-agent/1.0"),
         )
         .await;
+        // #2522: the stats INSERT is now spawned off the hot path — wait for it.
+        assert_eq!(
+            crate::api::handlers::test_db_helpers::download_count_eventually(&pool, artifact_id, 1)
+                .await,
+            1
+        );
 
         let row: Option<(Option<String>, Option<String>, Option<Uuid>)> = sqlx::query_as(
             "SELECT ip_address, user_agent, user_id FROM download_statistics \
@@ -16076,6 +16082,12 @@ mod tests {
             "virtual /artifacts/ GET must serve the member's content bytes"
         );
 
+        // #2522: the stats INSERT is spawned off the hot path — wait for it
+        // (also pins ordering: the authed row commits before the anon serve).
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 1).await,
+            1
+        );
         let rows = telemetry_rows(&fx.pool, artifact_id).await;
         assert_eq!(
             rows.len(),
@@ -16103,6 +16115,11 @@ mod tests {
         let (anon_status, _) = tdh::send(fx.router_anon(router()), anon_req).await;
         assert_eq!(anon_status, axum::http::StatusCode::OK);
 
+        // #2522: the anon serve's stats INSERT is spawned too — wait for it.
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 2).await,
+            2
+        );
         let rows = telemetry_rows(&fx.pool, artifact_id).await;
         assert_eq!(rows.len(), 2, "anonymous serve must also record");
         assert_eq!(rows[1].0, None, "anonymous must record a NULL user");
@@ -16296,6 +16313,11 @@ mod tests {
             "virtual /download/ GET must serve the member's content bytes"
         );
 
+        // #2522: the stats INSERT is now spawned off the hot path — wait for it.
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 1).await,
+            1
+        );
         let rows = telemetry_rows(&fx.pool, artifact_id).await;
         assert_eq!(
             rows.len(),
@@ -16324,6 +16346,11 @@ mod tests {
         let (anon_status, _) = tdh::send(fx.router_anon(download_router()), anon_req).await;
         assert_eq!(anon_status, axum::http::StatusCode::OK);
 
+        // #2522: the anon serve's stats INSERT is spawned too — wait for it.
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 2).await,
+            2
+        );
         let rows = telemetry_rows(&fx.pool, artifact_id).await;
         assert_eq!(rows.len(), 2, "anonymous serve must also record");
         assert_eq!(rows[1].0, None, "anonymous must record a NULL user");
