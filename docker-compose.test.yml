@@ -401,7 +401,7 @@ services:
   # ==========================================================================
 
   terraform-mirror-test:
-    image: hashicorp/terraform:1.13.0
+    image: hashicorp/terraform:1.15.8
     container_name: e2e-test-terraform-mirror
     depends_on:
       setup:
