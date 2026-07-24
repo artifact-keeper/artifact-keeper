@@ -1895,7 +1895,16 @@ pub async fn repo_visibility_middleware(
         }
     }
 
-    next.run(request).await
+    // #2598: attribute every downstream ingestion/serve archive decode to this
+    // repository so the per-tenant fairness sub-limit applies. This is the
+    // single seam that resolves the repo id for all format routes, so scoping
+    // here gives every extractor call site per-tenant fairness without any
+    // per-handler plumbing.
+    crate::util::bounded_archive::run_with_tenant_scope(
+        crate::util::bounded_archive::TenantKey::Repo(repo.id),
+        next.run(request),
+    )
+    .await
 }
 
 #[allow(clippy::disallowed_methods)]
