@@ -153,7 +153,7 @@ jobs:
       # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
       # so they actually run (#1409 review).
       postgres:
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:17-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -287,7 +287,7 @@ jobs:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
         # to avoid Docker Hub anonymous-pull rate limits, which were aborting
         # the coverage job before tests could compile.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:17-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -690,7 +690,7 @@ jobs:
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:17-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry

@@ -4,7 +4,7 @@
 
 services:
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:26.7
     container_name: oidc-boot-keycloak
     environment:
       KEYCLOAK_ADMIN: admin
@@ -19,7 +19,7 @@ services:
       - "8180:8080"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: oidc-boot-db
     environment:
       POSTGRES_USER: registry

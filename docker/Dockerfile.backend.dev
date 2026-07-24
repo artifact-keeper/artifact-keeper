@@ -1,15 +1,18 @@
 # Development Dockerfile for backend with cargo-watch hot-reload
-FROM rust:1.97-bookworm
+
+ARG RUST_VERSION=1.97
+
+FROM rust:${RUST_VERSION}-trixie
 
 # Install build dependencies, cargo-watch, and sccache
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
     liblzma-dev \
     libssl-dev \
     pkg-config \
     protobuf-compiler \
     zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/* \
+    && find /var/cache/apt/archives/ /var/lib/apt/lists/ -mindepth 1 -delete \
     && cargo install cargo-watch@8.5.3 --locked \
     && cargo install sccache --locked
 
