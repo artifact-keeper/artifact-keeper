@@ -3617,8 +3617,12 @@ mod tests {
         }
         // Legitimate request with real separators still resolves.
         assert_eq!(
-            normalized_debian_relpath(TEST_BASE, "dists/bookworm/main/binary-amd64/Packages.gz", false)
-                .unwrap(),
+            normalized_debian_relpath(
+                TEST_BASE,
+                "dists/bookworm/main/binary-amd64/Packages.gz",
+                false,
+            )
+            .unwrap(),
             "dists/bookworm/main/binary-amd64/Packages.gz"
         );
     }
