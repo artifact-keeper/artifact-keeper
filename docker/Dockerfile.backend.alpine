@@ -54,12 +54,15 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # binary's HIGH-severity Go-dependency CVEs and image size with no functional
 # loss. See issue #1544.
 #
-# Grype is pinned to v0.115.0, the latest upstream release. It is rebuilt
+# Grype is pinned to v0.116.0, the latest upstream release. It is rebuilt
 # against fixed containerd/go-git/x-crypto versions (clearing those CVEs from
-# v0.114.0), but still bundles Go 1.26.3 stdlib and docker v28.5.2; those
-# residual CVEs have no fixed grype release yet and are documented/suppressed
-# in /.trivyignore rather than "bumped away". Re-evaluate on every bump (#2391).
-FROM ghcr.io/anchore/grype:v0.115.0 AS grype-bin
+# v0.114.0) and bumps golang.org/x/text to v0.39.0, clearing CVE-2026-56852
+# (infinite loop in norm.Iter on invalid UTF-8) that the v0.115.0 binary
+# carried via x/text v0.38.0 (#2749). It still bundles Go 1.26.3 stdlib and
+# docker v28.5.2; those residual CVEs have no fixed grype release yet and are
+# documented/suppressed in /.trivyignore rather than "bumped away".
+# Re-evaluate on every bump (#2391).
+FROM ghcr.io/anchore/grype:v0.116.0 AS grype-bin
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
