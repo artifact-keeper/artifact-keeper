@@ -3611,14 +3611,18 @@ mod tests {
             "pool/main/m/mypkg%5C..%5Cevil_1_amd64.deb",
         ] {
             assert!(
-                normalized_debian_relpath(TEST_BASE, bad).is_err(),
+                normalized_debian_relpath(TEST_BASE, bad, false).is_err(),
                 "should reject encoded separator: {bad:?}"
             );
         }
         // Legitimate request with real separators still resolves.
         assert_eq!(
-            normalized_debian_relpath(TEST_BASE, "dists/bookworm/main/binary-amd64/Packages.gz")
-                .unwrap(),
+            normalized_debian_relpath(
+                TEST_BASE,
+                "dists/bookworm/main/binary-amd64/Packages.gz",
+                false
+            )
+            .unwrap(),
             "dists/bookworm/main/binary-amd64/Packages.gz"
         );
     }
