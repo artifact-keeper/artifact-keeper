@@ -30,7 +30,7 @@ services:
 
   # Keycloak for OIDC and SAML testing
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:26.7
     container_name: sso-test-keycloak
     environment:
       KEYCLOAK_ADMIN: admin
