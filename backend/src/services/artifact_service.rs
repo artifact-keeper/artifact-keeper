@@ -1881,6 +1881,65 @@ impl ArtifactService {
         Ok(total)
     }
 
+    /// Fetch the artifacts whose `path` starts with any of `path_prefixes`
+    /// across one or more repositories, de-duplicated by `path` (#2723).
+    ///
+    /// Used to fill in the per-file details of ONE page of Maven grouped
+    /// components: the caller passes the `<groupId>/<artifactId>/<version>/`
+    /// directory prefix for each component on the keyset page (O(per_page)
+    /// prefixes), so the fetch stays bounded regardless of catalog size.
+    /// `DISTINCT ON (path)` collapses the same object cached in multiple
+    /// members of a virtual repository, matching the virtual listing's
+    /// de-duplication contract.
+    ///
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards (the same
+    /// convention as [`list_page`]'s `path_prefix`); an over-broad match is
+    /// harmless because the grouped caller re-parses each artifact's GAV from
+    /// its path and discards rows outside the requested component keys.
+    ///
+    /// Uses runtime query binding (`sqlx::query_as`) so no `.sqlx` offline
+    /// cache entry is required.
+    ///
+    /// [`list_page`]: Self::list_page
+    pub async fn list_by_path_prefixes(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefixes: &[String],
+    ) -> Result<Vec<Artifact>> {
+        if repo_ids.is_empty() || path_prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+
+        let artifacts: Vec<Artifact> = sqlx::query_as(
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM (
+                SELECT DISTINCT ON (a.path) a.*
+                FROM artifacts a
+                WHERE a.repository_id = ANY($1)
+                  AND a.is_deleted = false
+                  AND a.path LIKE ANY($2)
+                ORDER BY a.path, array_position($1::uuid[], a.repository_id)
+            ) sub
+            ORDER BY path
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(&patterns[..])
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
+    }
+
     /// Soft-delete an artifact
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         self.delete_with_sync_options(id, true).await

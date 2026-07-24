@@ -5114,10 +5114,6 @@ async fn list_artifacts_grouped_by_maven_component(
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
-    // Fetch a large batch so we can group in-memory.  10 000 individual files
-    // is generous; most Maven repos have far fewer cached artifacts.
-    const MAX_FETCH: i64 = 10_000;
-
     // Remote (proxy) repositories do NOT record cached items in the `artifacts`
     // table (#1278 / #1280), so `artifact_service.list` returns nothing for them
     // and component grouping came back empty (#1999, regression in 1.2.1).
@@ -5174,70 +5170,285 @@ async fn list_artifacts_grouped_by_maven_component(
         }));
     }
 
-    let (artifacts, _total_files) = if repo.repo_type == RepositoryType::Virtual {
+    // Hosted (local/staging) and virtual repositories: grouped listings are now
+    // SQL-keyset-paged out of the package catalog (#2723), replacing the prior
+    // bounded (MAX_FETCH) `fetch-everything-then-group-in-memory` path. The
+    // catalog `packages.name` is `groupId:artifactId` (write-path normalization
+    // + backfill migration 176), so the ordered, keyset-paged component keys
+    // `(name, version)` come straight from `packages ⋈ package_versions` -- the
+    // same catalog-keyset mechanism the remote branch above uses. Per-file
+    // details (aggregate size, download totals, and the `artifact_files` list
+    // clients already see) are then filled in for ONLY this page's components
+    // from the `artifacts` table, so memory stays bounded to O(per_page)
+    // regardless of catalog size. Ordering/output shape are preserved: keys are
+    // returned in `(name, version)` order and each component is assembled from
+    // its real files exactly as the in-memory path did.
+    //
+    // Like the remote grouped path, an explicit `path_prefix` is not applied to
+    // the grouped view (grouped filtering is driven by `q`); a bare-name catalog
+    // row (no `groupId:artifactId`) is excluded by the shared name-shape filter.
+    let _ = path_prefix;
+    let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
             .map_err(|_| {
                 AppError::Internal("Failed to resolve virtual repository members".to_string())
             })?;
-        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        artifact_service
-            .list_for_repos(&member_ids, path_prefix, search_query, 0, MAX_FETCH)
-            .await?
+        members.iter().map(|m| m.id).collect()
     } else {
-        artifact_service
-            .list(repo.id, path_prefix, search_query, 0, MAX_FETCH)
-            .await?
+        vec![repo.id]
     };
 
+    let keyset = decode_cursor_param(cursor)?;
+    let offset = if keyset.is_some() {
+        0
+    } else {
+        i64::from(page - 1) * i64::from(per_page)
+    };
+
+    let mut keys = maven_component_keys_from_catalog(
+        &state.db,
+        &repo_ids,
+        search_query,
+        keyset.as_ref(),
+        offset,
+        i64::from(per_page) + 1,
+    )
+    .await?;
+    let has_more = keys.len() > per_page as usize;
+    keys.truncate(per_page as usize);
+    let next_cursor = if has_more {
+        keys.last()
+            .map(|(name, version)| encode_keyset_cursor(name, version))
+    } else {
+        None
+    };
+    let exact_total = if count_exact {
+        Some(count_maven_catalog_component_keys(&state.db, &repo_ids, search_query).await?)
+    } else {
+        None
+    };
+    let total = grouped_listing_total(exact_total, offset, keys.len(), has_more);
+
+    let components = build_maven_components_for_keys(
+        artifact_service,
+        &repo_ids,
+        repo_key,
+        &format!("{:?}", repo.format).to_lowercase(),
+        &keys,
+    )
+    .await?;
+
+    Ok(Json(ArtifactListResponse {
+        items: Vec::new(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages: grouped_total_pages(total, per_page),
+        },
+        components: Some(components),
+        docker_tags: None,
+        next_cursor,
+        has_more: Some(has_more),
+    }))
+}
+
+/// One keyset page of the hosted/virtual Maven grouped component KEYS
+/// (`(groupId:artifactId, version)`) from the package catalog (#2723).
+///
+/// The catalog holds one `packages` row per `(repository_id, name)` and its
+/// versions in `package_versions`, so a component per `(name, version)` is the
+/// `packages ⋈ package_versions` product. Rows whose `name` is not a
+/// `groupId:artifactId` pair are excluded in SQL (shared name-shape filter);
+/// results are ordered by `(name, version)` and bounded by `limit`. `DISTINCT`
+/// collapses the same GAV that appears in multiple members of a virtual repo
+/// into a single key. `keyset` (the previous page's last `(name, version)`)
+/// takes precedence over `offset`; `offset` supports legacy `page=` requests.
+///
+/// Uses runtime query binding (`sqlx::query`) so no `.sqlx` offline cache
+/// entry is required.
+async fn maven_component_keys_from_catalog(
+    db: &sqlx::PgPool,
+    repository_ids: &[Uuid],
+    search_query: Option<&str>,
+    keyset: Option<&(String, String)>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    use sqlx::Row;
+
+    if repository_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
+
+    let mut query = sqlx::query(&sql).bind(repository_ids);
+    if let Some(pattern) = &search_pattern {
+        query = query.bind(pattern);
+    }
+    if let Some((name, version)) = keyset {
+        query = query.bind(name.as_str()).bind(version.as_str());
+    }
+    let rows = query
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to list Maven component keys: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("name"),
+                row.get::<String, _>("version"),
+            )
+        })
+        .collect())
+}
+
+/// Build the parameterized SQL for [`maven_component_keys_from_catalog`].
+/// Extracted so the `$N` placeholder wiring is unit-testable without a DB.
+fn maven_component_keys_sql(has_search: bool, has_keyset: bool) -> String {
+    let mut sql = format!(
+        "SELECT DISTINCT p.name AS name, pv.version AS version \
+         FROM packages p \
+         JOIN package_versions pv ON pv.package_id = p.id \
+         WHERE p.repository_id = ANY($1) \
+           AND {MAVEN_CATALOG_NAME_SHAPE_SQL}"
+    );
+    let mut next_param = 2;
+    if has_search {
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        next_param += 1;
+    }
+    if has_keyset {
+        sql.push_str(&format!(
+            " AND (p.name, pv.version) > (${}, ${})",
+            next_param,
+            next_param + 1
+        ));
+        next_param += 2;
+    }
+    sql.push_str(&format!(
+        " ORDER BY name ASC, version ASC LIMIT ${} OFFSET ${}",
+        next_param,
+        next_param + 1
+    ));
+    sql
+}
+
+/// Exact distinct component-key count behind `?count=exact` for the
+/// hosted/virtual Maven grouped listing (#2723). Applies the same repository /
+/// name-shape / search filters as [`maven_component_keys_from_catalog`] so the
+/// total matches a full cursor walk.
+async fn count_maven_catalog_component_keys(
+    db: &sqlx::PgPool,
+    repository_ids: &[Uuid],
+    search_query: Option<&str>,
+) -> Result<i64> {
+    if repository_ids.is_empty() {
+        return Ok(0);
+    }
+    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    let sql = format!(
+        "SELECT COUNT(*) FROM ( \
+           SELECT DISTINCT p.name, pv.version \
+           FROM packages p \
+           JOIN package_versions pv ON pv.package_id = p.id \
+           WHERE p.repository_id = ANY($1) \
+             AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
+             AND ($2::text IS NULL OR p.name ILIKE $2) \
+         ) t"
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .bind(repository_ids)
+        .bind(&search_pattern)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to count Maven components: {e}")))
+}
+
+/// Derive the `artifacts.path` directory prefix for a grouped Maven component
+/// key. `name` is `groupId:artifactId`; the on-disk layout is
+/// `<groupId-as-path>/<artifactId>/<version>/`, so the groupId's `.` separators
+/// become `/`. Returns `None` for a name that is not a `groupId:artifactId`
+/// pair (defensive; such keys are already filtered out in SQL).
+fn maven_component_path_prefix(name: &str, version: &str) -> Option<String> {
+    let (group_id, artifact_id) = split_maven_catalog_name(name)?;
+    Some(format!(
+        "{}/{}/{}/",
+        group_id.replace('.', "/"),
+        artifact_id,
+        version
+    ))
+}
+
+/// Fill in the per-component file details for one keyset page of grouped Maven
+/// component keys (#2723).
+///
+/// Fetches only the artifacts under this page's component path prefixes
+/// (O(per_page) prefixes), groups them by GAV exactly as the legacy in-memory
+/// path did (so aggregate size, summed downloads, earliest `created_at`, and
+/// the `artifact_files` list are identical), then emits one component per key
+/// IN KEY ORDER. Keys with no surviving files (a stale catalog row) are
+/// dropped; artifacts pulled in by an over-broad prefix match are discarded by
+/// the key filter, so the page contents stay exactly the catalog page.
+async fn build_maven_components_for_keys(
+    artifact_service: &ArtifactService,
+    repo_ids: &[Uuid],
+    repo_key: &str,
+    format: &str,
+    keys: &[(String, String)],
+) -> Result<Vec<MavenComponentResponse>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let prefixes: Vec<String> = keys
+        .iter()
+        .filter_map(|(name, version)| maven_component_path_prefix(name, version))
+        .collect();
+
+    let artifacts = artifact_service
+        .list_by_path_prefixes(repo_ids, &prefixes)
+        .await?;
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
     let download_counts = artifact_service
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
-    let components = group_maven_artifacts(
-        &artifacts,
-        &download_counts,
-        repo_key,
-        &format!("{:?}", repo.format).to_lowercase(),
-    );
-
-    Ok(paginate_maven_components(components, page, per_page))
+    let grouped = group_maven_artifacts(&artifacts, &download_counts, repo_key, format);
+    Ok(order_components_by_keys(grouped, keys))
 }
 
-/// Paginate a fully-built list of Maven components into an
-/// [`ArtifactListResponse`]. Shared by the hosted/local (artifacts-table) and
-/// the remote/proxy (package-catalog) grouping paths so pagination math lives
-/// in exactly one place.
-fn paginate_maven_components(
-    components: Vec<MavenComponentResponse>,
-    page: u32,
-    per_page: u32,
-) -> Json<ArtifactListResponse> {
-    let total_components = components.len() as i64;
-    let total_pages = ((total_components as f64) / (per_page as f64)).ceil() as u32;
-    let offset = ((page - 1) * per_page) as usize;
-    let page_components: Vec<MavenComponentResponse> = components
+/// Reorder/assemble grouped Maven components to match a keyset page's ordered
+/// `(groupId:artifactId, version)` keys (#2723). A component whose GAV is not
+/// in `keys` (pulled in by an over-broad path-prefix match) is dropped, and a
+/// key with no built component (stale catalog row) is skipped, so the returned
+/// list is exactly the page's components in `keys` order. Pure (no I/O) so the
+/// ordering/filtering contract is unit-testable.
+fn order_components_by_keys(
+    grouped: Vec<MavenComponentResponse>,
+    keys: &[(String, String)],
+) -> Vec<MavenComponentResponse> {
+    let mut by_key: std::collections::HashMap<(String, String), MavenComponentResponse> = grouped
         .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
+        .map(|c| {
+            (
+                (
+                    format!("{}:{}", c.group_id, c.artifact_id),
+                    c.version.clone(),
+                ),
+                c,
+            )
+        })
         .collect();
 
-    Json(ArtifactListResponse {
-        items: Vec::new(),
-        pagination: Pagination {
-            page,
-            per_page,
-            total: total_components,
-            total_pages,
-        },
-        components: Some(page_components),
-        docker_tags: None,
-        // The in-memory hosted/virtual path is still bounded by MAX_FETCH
-        // (#2520 defer note above); it does not advertise keyset paging.
-        next_cursor: None,
-        has_more: None,
-    })
+    keys.iter().filter_map(|key| by_key.remove(key)).collect()
 }
 
 /// Encode a two-part keyset cursor (#2520) as URL-safe base64 over a JSON
@@ -8958,13 +9169,13 @@ mod tests {
         );
     }
 
-    fn maven_component(group: &str, artifact: &str) -> MavenComponentResponse {
+    fn maven_component(group: &str, artifact: &str, version: &str) -> MavenComponentResponse {
         MavenComponentResponse {
             id: Uuid::new_v4(),
             group_id: group.to_string(),
             artifact_id: artifact.to_string(),
-            version: "1.0.0".to_string(),
-            repository_key: "maven-proxy".to_string(),
+            version: version.to_string(),
+            repository_key: "maven-hosted".to_string(),
             format: "maven".to_string(),
             size_bytes: 10,
             download_count: 0,
@@ -8973,39 +9184,104 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Hosted/virtual Maven grouped keyset paging (#2723)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn paginate_maven_components_reports_total_and_page() {
-        let comps = vec![
-            maven_component("g", "a"),
-            maven_component("g", "b"),
-            maven_component("g", "c"),
-        ];
-        let resp = paginate_maven_components(comps, 1, 2).0;
-        assert_eq!(resp.pagination.total, 3);
-        assert_eq!(resp.pagination.total_pages, 2);
-        assert_eq!(resp.components.as_ref().unwrap().len(), 2);
-        assert!(resp.items.is_empty());
-        assert!(resp.docker_tags.is_none());
+    fn maven_component_path_prefix_maps_gav_to_directory() {
+        // groupId dots become path separators; the prefix ends at the version
+        // directory so file matching cannot bleed into a sibling version.
+        assert_eq!(
+            maven_component_path_prefix("com.example:mylib", "1.0.0").as_deref(),
+            Some("com/example/mylib/1.0.0/")
+        );
+        // A single-segment groupId still yields a valid prefix.
+        assert_eq!(
+            maven_component_path_prefix("org:tool", "2.1").as_deref(),
+            Some("org/tool/2.1/")
+        );
     }
 
     #[test]
-    fn paginate_maven_components_second_page_has_remainder() {
-        let comps = vec![
-            maven_component("g", "a"),
-            maven_component("g", "b"),
-            maven_component("g", "c"),
-        ];
-        let resp = paginate_maven_components(comps, 2, 2).0;
-        assert_eq!(resp.components.as_ref().unwrap().len(), 1);
-        assert_eq!(resp.components.as_ref().unwrap()[0].artifact_id, "c");
+    fn maven_component_path_prefix_rejects_non_grouped_name() {
+        // A bare artifactId (no `:`) is not a grouped key and has no prefix.
+        assert_eq!(maven_component_path_prefix("mylib", "1.0.0"), None);
     }
 
     #[test]
-    fn paginate_maven_components_empty_catalog() {
-        let resp = paginate_maven_components(Vec::new(), 1, 20).0;
-        assert_eq!(resp.pagination.total, 0);
-        assert_eq!(resp.pagination.total_pages, 0);
-        assert!(resp.components.as_ref().unwrap().is_empty());
+    fn order_components_by_keys_preserves_key_order() {
+        // group_maven_artifacts returns GAV-sorted components; the assembled
+        // page must follow the catalog KEY order (which may interleave
+        // versions of the same component) exactly.
+        let grouped = vec![
+            maven_component("com.example", "alpha", "1.0.0"),
+            maven_component("com.example", "beta", "2.0.0"),
+        ];
+        let keys = vec![
+            ("com.example:beta".to_string(), "2.0.0".to_string()),
+            ("com.example:alpha".to_string(), "1.0.0".to_string()),
+        ];
+        let ordered = order_components_by_keys(grouped, &keys);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].artifact_id, "beta");
+        assert_eq!(ordered[1].artifact_id, "alpha");
+    }
+
+    #[test]
+    fn order_components_by_keys_drops_overmatch_and_missing() {
+        // An extra grouped component not in `keys` (pulled in by an over-broad
+        // path-prefix match) is discarded; a key with no built component (a
+        // stale catalog row) is skipped. The result is exactly the intersection
+        // in key order.
+        let grouped = vec![
+            maven_component("com.example", "alpha", "1.0.0"),
+            maven_component("com.example", "overmatch", "9.9.9"),
+        ];
+        let keys = vec![
+            ("com.example:alpha".to_string(), "1.0.0".to_string()),
+            ("com.example:missing".to_string(), "3.0.0".to_string()),
+        ];
+        let ordered = order_components_by_keys(grouped, &keys);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].artifact_id, "alpha");
+    }
+
+    #[test]
+    fn maven_component_path_prefix_distinguishes_versions() {
+        // Two versions of the same component produce distinct, non-overlapping
+        // prefixes so keyset paging can walk them as separate rows.
+        let p1 = maven_component_path_prefix("com.example:lib", "1.0.0").unwrap();
+        let p2 = maven_component_path_prefix("com.example:lib", "1.0.10").unwrap();
+        assert_ne!(p1, p2);
+        assert!(!p2.starts_with(&p1));
+    }
+
+    #[test]
+    fn maven_component_keys_sql_wires_optional_predicates() {
+        // No search / no cursor: repo-array + name-shape only, LIMIT/OFFSET at
+        // $2/$3.
+        let base = maven_component_keys_sql(false, false);
+        assert!(base.contains("p.repository_id = ANY($1)"));
+        assert!(!base.contains("ILIKE"));
+        assert!(!base.contains("(p.name, pv.version) >"));
+        assert!(base.contains("LIMIT $2 OFFSET $3"));
+
+        // Search only: ILIKE at $2, LIMIT/OFFSET shift to $3/$4.
+        let searched = maven_component_keys_sql(true, false);
+        assert!(searched.contains("p.name ILIKE $2"));
+        assert!(searched.contains("LIMIT $3 OFFSET $4"));
+
+        // Search + keyset: ILIKE $2, tuple compare $3/$4, LIMIT/OFFSET $5/$6.
+        let full = maven_component_keys_sql(true, true);
+        assert!(full.contains("p.name ILIKE $2"));
+        assert!(full.contains("(p.name, pv.version) > ($3, $4)"));
+        assert!(full.contains("LIMIT $5 OFFSET $6"));
+
+        // Keyset without search: tuple compare at $2/$3.
+        let keyset_only = maven_component_keys_sql(false, true);
+        assert!(keyset_only.contains("(p.name, pv.version) > ($2, $3)"));
+        assert!(keyset_only.contains("LIMIT $4 OFFSET $5"));
     }
 
     // -----------------------------------------------------------------------
