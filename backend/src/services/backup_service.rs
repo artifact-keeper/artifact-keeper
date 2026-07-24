@@ -108,7 +108,15 @@ pub struct CreateBackupRequest {
 /// Backup service
 pub struct BackupService {
     db: PgPool,
+    /// Primary storage: where source artifacts are read from during a backup
+    /// and restored to during a restore. Always the deployment's main storage
+    /// bucket.
     storage: Arc<StorageService>,
+    /// Storage for backup **archives** (`.tar.gz`). Defaults to `storage`, but
+    /// points at a separate bucket when `BACKUP_S3_BUCKET` is configured
+    /// (#2507). Only the archive read/write path uses this handle, so a
+    /// dedicated backup bucket never changes where artifacts live.
+    archive_storage: Arc<StorageService>,
     active_backup: Arc<Mutex<Option<Uuid>>>,
 }
 
@@ -343,9 +351,34 @@ fn resolve_effective_repository_ids(
 
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+        // Default: backup archives live in the same bucket as artifacts, so
+        // the archive handle is just a clone of primary storage. This keeps
+        // behavior byte-identical when `BACKUP_S3_BUCKET` is unset (#2507).
+        let archive_storage = storage.clone();
         Self {
             db,
             storage,
+            archive_storage,
+            active_backup: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct a backup service whose **archives** are read from/written to a
+    /// dedicated storage handle, separate from the artifact storage (#2507).
+    ///
+    /// Callers resolve `archive_storage` via
+    /// [`StorageService::backup_archive_from_config`]; when `BACKUP_S3_BUCKET`
+    /// is unset it is a clone of `storage`, so this is equivalent to
+    /// [`BackupService::new`].
+    pub fn with_archive_storage(
+        db: PgPool,
+        storage: Arc<StorageService>,
+        archive_storage: Arc<StorageService>,
+    ) -> Self {
+        Self {
+            db,
+            storage,
+            archive_storage,
             active_backup: Arc::new(Mutex::new(None)),
         }
     }
@@ -576,7 +609,9 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        self.storage
+        // The archive itself is written to the (optionally separate) backup
+        // bucket; the source artifacts read above stay on primary storage.
+        self.archive_storage
             .put(storage_path, Bytes::from(tar_buffer.clone()))
             .await?;
 
@@ -764,7 +799,8 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        let tar_data = self.storage.get(storage_path).await?;
+        // Read the archive back from the (optionally separate) backup bucket.
+        let tar_data = self.archive_storage.get(storage_path).await?;
 
         // Phase 1: Extract all entries synchronously (tar::Archive is !Send)
         let entries = Self::extract_entries(&tar_data)?;
@@ -933,10 +969,10 @@ impl BackupService {
     pub async fn delete(&self, backup_id: Uuid) -> Result<()> {
         let backup = self.get_by_id(backup_id).await?;
 
-        // Delete from storage if path exists
+        // Delete the archive from the (optionally separate) backup bucket.
         if let Some(storage_path) = &backup.storage_path {
-            if self.storage.exists(storage_path).await? {
-                self.storage.delete(storage_path).await?;
+            if self.archive_storage.exists(storage_path).await? {
+                self.archive_storage.delete(storage_path).await?;
             }
         }
 
@@ -1009,9 +1045,9 @@ impl BackupService {
             // removal fails, keep the row so a later retention run retries
             // rather than silently orphaning the archive.
             if let Some(path) = storage_path.as_deref() {
-                match self.storage.exists(path).await {
+                match self.archive_storage.exists(path).await {
                     Ok(true) => {
-                        if let Err(e) = self.storage.delete(path).await {
+                        if let Err(e) = self.archive_storage.delete(path).await {
                             tracing::warn!(
                                 backup_id = %id,
                                 storage_path = path,

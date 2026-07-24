@@ -3584,6 +3584,7 @@ mod tests {
             environment: "development".to_string(),
             storage_path: "/tmp/test".to_string(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,

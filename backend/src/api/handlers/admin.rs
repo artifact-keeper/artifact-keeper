@@ -466,7 +466,9 @@ pub async fn execute_backup(
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let backup = service.execute(id).await?;
 
@@ -526,7 +528,9 @@ pub async fn restore_backup(
             .await
             .map_err(|e: AppError| e)?,
     );
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
@@ -594,7 +598,9 @@ pub async fn delete_backup(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     service.delete(id).await?;
     Ok(())
@@ -1125,7 +1131,10 @@ pub async fn run_cleanup(
 
     if request.cleanup_old_backups.unwrap_or(false) {
         let storage = Arc::new(StorageService::from_config(&state.config).await?);
-        let backup_service = BackupService::new(state.db.clone(), storage);
+        let archive_storage =
+            StorageService::backup_archive_from_config(&state.config, &storage).await?;
+        let backup_service =
+            BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
         result.backups_deleted = backup_service
             .cleanup(settings.backup_retention_count, settings.retention_days)
             .await? as i64;

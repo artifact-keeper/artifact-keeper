@@ -890,6 +890,19 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         }
     };
 
+    // Route backup archives to a dedicated bucket when BACKUP_S3_BUCKET is set
+    // (#2507); otherwise this is a clone of the primary storage handle.
+    let archive_storage = match StorageService::backup_archive_from_config(config, &storage).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "Failed to create backup archive storage for scheduled backups: {}",
+                e
+            );
+            return Err(e);
+        }
+    };
+
     for schedule_row in &due_schedules {
         tracing::info!(
             "Executing scheduled backup '{}' (type: {:?})",
@@ -897,7 +910,11 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             schedule_row.backup_type
         );
 
-        let service = BackupService::new(db.clone(), storage.clone());
+        let service = BackupService::with_archive_storage(
+            db.clone(),
+            storage.clone(),
+            archive_storage.clone(),
+        );
 
         // Create and execute the backup
         let create_result = service

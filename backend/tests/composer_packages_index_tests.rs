@@ -49,6 +49,7 @@ fn test_config(storage_path: &str) -> Config {
         environment: "development".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,
+        backup_s3_bucket: None,
         gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,
