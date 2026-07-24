@@ -125,6 +125,25 @@ fn sanitize_tsquery_lexeme(token: &str) -> String {
         .collect()
 }
 
+/// SQL boolean predicate for the free-text `q` filter, shared verbatim by the
+/// item query (`execute_search`) and the pagination COUNT (`count_results`) so
+/// the two can never diverge.
+///
+/// It matches the stored, GIN-indexed `artifacts.search_vector` column (added
+/// in migration 176) against the bound tsquery in `$1`. When `$1` is NULL (no
+/// free-text term) the predicate short-circuits to TRUE and the query browses
+/// by the other filters.
+///
+/// Referencing the stored column -- instead of the old inline
+/// `to_tsvector('english', name || ' ' || path || ' ' || COALESCE(version,''))`
+/// -- is what lets the planner satisfy the predicate with a Bitmap Index Scan
+/// over the partial GIN index instead of recomputing `to_tsvector` for every
+/// live row on a Parallel Seq Scan (#2871). The stored vector is byte-for-byte
+/// the vector the inline predicate used to compute, so match semantics and
+/// result ordering are unchanged.
+pub(crate) const SEARCH_VECTOR_MATCH: &str =
+    "($1::text IS NULL OR a.search_vector @@ to_tsquery('english', $1))";
+
 /// Convert a user-facing wildcard name filter (using `*`) to a SQL ILIKE
 /// pattern (using `%`).  Returns None if the input is None.
 pub(crate) fn build_name_filter(name: Option<&str>) -> Option<String> {
@@ -326,7 +345,7 @@ impl SearchService {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
-                  AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
+                  AND {q_match}
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3)
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
@@ -335,6 +354,7 @@ impl SearchService {
                 OFFSET $4
                 LIMIT $5
                 "#,
+            q_match = SEARCH_VECTOR_MATCH,
             order_by = order_by,
         );
 
@@ -357,27 +377,33 @@ impl SearchService {
         let q_filter = build_tsquery_filter(query.q.as_deref());
         let name_filter = build_name_filter(query.name.as_deref());
 
-        let count: (i64,) = sqlx::query_as(
+        // Same free-text predicate as execute_search (shared constant) so the
+        // count can never diverge from the item query. Index-backed Bitmap
+        // Index Scan replaces the old second full Seq Scan (#2871).
+        let sql = format!(
             r#"
             SELECT COUNT(*)::BIGINT
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
-              AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
+              AND {q_match}
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3)
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
               AND ($4 = false OR r.is_public = true)
             "#,
-        )
-        .bind(&q_filter)
-        .bind(&query.format)
-        .bind(&name_filter)
-        .bind(query.public_only)
-        .bind(&query.accessible_repo_ids)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            q_match = SEARCH_VECTOR_MATCH,
+        );
+
+        let count: (i64,) = sqlx::query_as(&sql)
+            .bind(&q_filter)
+            .bind(&query.format)
+            .bind(&name_filter)
+            .bind(query.public_only)
+            .bind(&query.accessible_repo_ids)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(count.0)
     }
@@ -1350,6 +1376,63 @@ mod tests {
         let clause = build_order_by_clause(q.sort_by.as_deref(), q.sort_order.as_deref()).unwrap();
         assert!(clause.contains("a.size_bytes"));
         assert!(clause.contains("ASC"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEARCH_VECTOR_MATCH -- #2871 (PF-009). The free-text predicate must
+    // filter on the stored, GIN-indexed `search_vector` column so the planner
+    // uses a Bitmap Index Scan, NOT recompute `to_tsvector(...)` per row on a
+    // Seq Scan. These tests pin that contract and the shared-$1/short-circuit
+    // shape so the item query and the COUNT can never silently diverge from
+    // the migration-176 stored column.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_vector_match_targets_stored_column_not_inline_tsvector() {
+        // The whole point of #2871: must reference the stored column and must
+        // NOT recompute to_tsvector(...) inline (that was the Seq-Scan bug).
+        assert!(
+            SEARCH_VECTOR_MATCH.contains("a.search_vector @@ to_tsquery('english', $1)"),
+            "predicate must match the stored search_vector column, got {SEARCH_VECTOR_MATCH}"
+        );
+        assert!(
+            !SEARCH_VECTOR_MATCH.contains("to_tsvector"),
+            "predicate must not recompute to_tsvector per row, got {SEARCH_VECTOR_MATCH}"
+        );
+    }
+
+    #[test]
+    fn test_search_vector_match_short_circuits_on_null_query() {
+        // When no free-text term is bound ($1 IS NULL) the predicate must
+        // short-circuit to TRUE so a browse-all (filters-only) request still
+        // returns every visible row, exactly as before.
+        assert!(
+            SEARCH_VECTOR_MATCH.starts_with("($1::text IS NULL OR "),
+            "predicate must short-circuit when $1 is NULL, got {SEARCH_VECTOR_MATCH}"
+        );
+    }
+
+    #[test]
+    fn test_search_vector_match_uses_first_bind_parameter() {
+        // Both execute_search and count_results bind q_filter first, so the
+        // shared predicate must reference $1 (and only $1) for the term.
+        assert!(SEARCH_VECTOR_MATCH.contains("$1"));
+        for p in ["$2", "$3", "$4", "$5", "$6", "$7"] {
+            assert!(
+                !SEARCH_VECTOR_MATCH.contains(p),
+                "shared free-text predicate must only reference $1, found {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_vector_match_is_balanced_and_uses_english_config() {
+        // Balanced parens (it is spliced into a larger WHERE) and the same
+        // 'english' text-search config the stored column was built with.
+        let opens = SEARCH_VECTOR_MATCH.matches('(').count();
+        let closes = SEARCH_VECTOR_MATCH.matches(')').count();
+        assert_eq!(opens, closes, "unbalanced parens: {SEARCH_VECTOR_MATCH}");
+        assert!(SEARCH_VECTOR_MATCH.contains("'english'"));
     }
 
     #[test]
