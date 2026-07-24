@@ -1,0 +1,10 @@
+# actionlint configuration.
+# Declare the self-hosted runner labels used by this repo's workflows so
+# actionlint does not flag them as unknown runners. These map to the ARC
+# (Actions Runner Controller) scale sets on the self-hosted Kubernetes cluster.
+self-hosted-runner:
+  labels:
+    - ak-ci-runners
+    - ak-e2e-runners
+    - ak-beefy-runners
+    - ak-docker-runners

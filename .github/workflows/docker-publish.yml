@@ -158,7 +158,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -196,6 +196,26 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+
+      # The backend image compiles Rust inside Docker, which can exhaust the
+      # ~14GB free disk on a stock hosted amd64 runner. Reclaim the large
+      # preinstalled toolchains we do not use before building. amd64 only:
+      # the arm64 runner layout differs and its build is unaffected. If the
+      # hosted disk still proves insufficient, the fallback per the CI
+      # reliability plan is a dedicated image-builder scale set, not a return
+      # to the shared Rust runner path.
+      - name: Free disk space
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          echo "Disk after cleanup:"
+          df -h /
 
       - name: Build and push by digest
         id: build
@@ -253,7 +273,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -335,7 +355,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
