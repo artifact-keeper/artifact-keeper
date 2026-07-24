@@ -237,7 +237,7 @@ services:
     profiles: ["maven", "all"]
 
   go-test:
-    image: golang:1.22-alpine
+    image: golang:1.26-alpine
     container_name: e2e-test-go
     depends_on:
       setup:
