@@ -311,6 +311,16 @@ pub enum TenantKey {
 /// available to other tenants.
 pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT: usize = 4;
 
+// Compile-time invariant: the per-tenant sub-limit must be strictly below the
+// global cap, or one tenant could take the whole global budget and the fairness
+// layer would be a no-op. Enforced at compile time so a future edit to either
+// default that breaks the relationship fails the build.
+const _: () = assert!(
+    DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT
+        < DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS,
+    "the per-tenant ingest sub-limit default must be strictly below the global cap default"
+);
+
 /// Env var overriding [`DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT`].
 /// Same blank/non-numeric/zero fallback rules as the global cap; additionally
 /// clamped to at most the effective global ceiling (see
@@ -1505,17 +1515,6 @@ mod tests {
         assert_eq!(effective_per_tenant_cap(usize::MAX, 8), 8);
         // Floor of 1 keeps the sub-limit usable even at a degenerate 0.
         assert_eq!(effective_per_tenant_cap(0, 8), 1);
-    }
-
-    #[test]
-    fn default_per_tenant_cap_is_below_the_global_default() {
-        // The whole point of the sub-limit: one tenant cannot take the whole
-        // global budget, so some of it always remains for other tenants.
-        assert!(
-            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT
-                < DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS,
-            "the per-tenant sub-limit must be strictly below the global cap"
-        );
     }
 
     /// A single tenant cannot exceed its sub-limit even while the GLOBAL ceiling
