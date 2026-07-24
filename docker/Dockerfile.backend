@@ -1,7 +1,7 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
-ENV RUST_VERSION=1.93.1
+ENV RUST_VERSION=1.97.1
 ENV PROTOC_VERSION=29.6
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
