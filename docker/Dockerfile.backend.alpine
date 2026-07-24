@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 
 ARG ALPINE_VERSION=3.24
+ARG RUST_VERSION=1.97
 
 # ---------- Base: Rust toolchain on Alpine ----------
-FROM rust:1.97-alpine${ALPINE_VERSION} AS rust-alpine-base
+FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS rust-alpine-base
 RUN apk add --no-cache \
     build-base pkgconfig perl openssl-dev openssl-libs-static \
     zlib-dev zlib-static xz-dev xz-static \

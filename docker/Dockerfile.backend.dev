@@ -1,5 +1,8 @@
 # Development Dockerfile for backend with cargo-watch hot-reload
-FROM rust:1.97-trixie
+
+ARG RUST_VERSION=1.97
+
+FROM rust:${RUST_VERSION}-trixie
 
 # Install build dependencies, cargo-watch, and sccache
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
