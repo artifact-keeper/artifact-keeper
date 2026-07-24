@@ -168,7 +168,7 @@ services:
     profiles: ["pypi", "smoke", "all"]
 
   npm-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/node:24-slim
     container_name: e2e-test-npm
     depends_on:
       setup:
@@ -431,7 +431,7 @@ services:
   # ==========================================================================
 
   proxy-virtual-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/node:24-slim
     container_name: e2e-test-proxy-virtual
     depends_on:
       setup:
