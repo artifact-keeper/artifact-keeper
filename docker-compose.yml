@@ -403,7 +403,7 @@ services:
   #   docker compose --profile dtrack --profile dtrack-ui up
   # https://dependencytrack.org/
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.14.2
+    image: dependencytrack/apiserver:4.14.3
     container_name: artifact-keeper-dtrack-api
     profiles:
       - dtrack  # Only starts with: docker compose --profile dtrack up
@@ -443,7 +443,7 @@ services:
   # apiserver). Run with:
   #   docker compose --profile dtrack --profile dtrack-ui up
   dependency-track-frontend:
-    image: dependencytrack/frontend:4.14.2
+    image: dependencytrack/frontend:4.14.3
     container_name: artifact-keeper-dtrack-frontend
     profiles:
       - dtrack-ui  # Requires the `dtrack` profile too; see comment above.
