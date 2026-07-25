@@ -2575,6 +2575,7 @@ pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Respons
     crate::services::quarantine_service::check_download_allowed(
         row.quarantine_status.as_deref(),
         row.quarantine_until,
+        None,
         chrono::Utc::now(),
     )
     .map_err(|e| e.into_response())

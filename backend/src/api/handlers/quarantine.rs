@@ -95,7 +95,7 @@ pub async fn get_quarantine_status(
 
     let now = chrono::Utc::now();
     let is_blocked =
-        quarantine_service::check_download_allowed(status.as_deref(), until, now).is_err();
+        quarantine_service::check_download_allowed(status.as_deref(), until, None, now).is_err();
 
     Ok(Json(QuarantineStatusResponse {
         artifact_id,

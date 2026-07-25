@@ -153,6 +153,7 @@ pub fn quarantine_until_from_release(
 pub fn check_download_allowed(
     quarantine_status: Option<&str>,
     quarantine_until_ts: Option<DateTime<Utc>>,
+    reason: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     match quarantine_status {
@@ -165,13 +166,17 @@ pub fn check_download_allowed(
                     return Ok(());
                 }
             }
-            Err(AppError::Conflict(
-                "Artifact is quarantined and pending security review".to_string(),
-            ))
+            Err(AppError::Conflict(match reason {
+                Some(reason) => {
+                    format!("Artifact is quarantined and pending security review: {reason}")
+                }
+                None => "Artifact is quarantined and pending security review".to_string(),
+            }))
         }
-        Some("rejected") => Err(AppError::Authorization(
-            "Artifact was rejected during security review".to_string(),
-        )),
+        Some("rejected") => Err(AppError::Authorization(match reason {
+            Some(reason) => format!("Artifact was rejected during security review: {reason}"),
+            None => "Artifact was rejected during security review".to_string(),
+        })),
         // 'released', 'clean', 'unscanned', 'flagged', or NULL are all downloadable
         _ => Ok(()),
     }
@@ -370,16 +375,26 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
 
     // Use conditional UPDATE to ensure the artifact is currently quarantined.
     // This also prevents race conditions where a scanner tries to overwrite
-    // a rejection set by an admin.
-    let result = sqlx::query(
-        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
-         WHERE id = $1 AND quarantine_status = 'quarantined'",
-    )
-    .bind(artifact_id)
-    .bind(new_status.as_str())
-    .execute(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // a rejection set by an admin. Release clears quarantine_reason (the hold
+    // is over); reject keeps it so the reason remains visible for the
+    // rejected artifact.
+    let query = match new_status {
+        QuarantineState::Released => {
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
+             quarantine_reason = NULL \
+             WHERE id = $1 AND quarantine_status = 'quarantined'"
+        }
+        QuarantineState::Rejected | QuarantineState::Quarantined => {
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
+             WHERE id = $1 AND quarantine_status = 'quarantined'"
+        }
+    };
+    let result = sqlx::query(query)
+        .bind(artifact_id)
+        .bind(new_status.as_str())
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::Conflict(
@@ -390,7 +405,8 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
     Ok(())
 }
 
-/// Fetch the raw `(quarantine_status, quarantine_until)` for a live artifact.
+/// Fetch the raw `(quarantine_status, quarantine_until, quarantine_reason)`
+/// for a live artifact.
 ///
 /// Returns `Ok(None)` when no matching (non-deleted) row exists. Shared by
 /// [`get_status`] and [`check_artifact_download`] so the identical SELECT is
@@ -398,22 +414,24 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
 async fn fetch_quarantine_fields(
     db: &PgPool,
     artifact_id: Uuid,
-) -> Result<Option<(Option<String>, Option<DateTime<Utc>>)>> {
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>, Option<String>)>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         quarantine_status: Option<String>,
         quarantine_until: Option<DateTime<Utc>>,
+        quarantine_reason: Option<String>,
     }
 
     let row = sqlx::query_as::<_, Row>(
-        "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1 AND is_deleted = false",
+        "SELECT quarantine_status, quarantine_until, quarantine_reason \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
     )
     .bind(artifact_id)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until)))
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.quarantine_reason)))
 }
 
 /// Fetch the current quarantine status and expiry for an artifact.
@@ -421,9 +439,10 @@ pub async fn get_status(
     db: &PgPool,
     artifact_id: Uuid,
 ) -> Result<(Option<String>, Option<DateTime<Utc>>)> {
-    fetch_quarantine_fields(db, artifact_id)
+    let (status, until, _reason) = fetch_quarantine_fields(db, artifact_id)
         .await?
-        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))
+        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    Ok((status, until))
 }
 
 /// Fetch quarantine status along with the artifact's repository_id.
@@ -463,8 +482,8 @@ pub async fn get_status_with_repo(
 /// artifact's quarantine fields and returns an error if the artifact is
 /// quarantined (409 Conflict) or rejected (403 Forbidden).
 pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
-    if let Some((status, until)) = fetch_quarantine_fields(db, artifact_id).await? {
-        check_download_allowed(status.as_deref(), until, Utc::now())?;
+    if let Some((status, until, reason)) = fetch_quarantine_fields(db, artifact_id).await? {
+        check_download_allowed(status.as_deref(), until, reason.as_deref(), Utc::now())?;
     }
 
     Ok(())
@@ -546,7 +565,7 @@ mod tests {
         assert_eq!(until, release + Duration::minutes(120));
         assert!(until > now, "recent release must still be held");
         // The held window composes with check_download_allowed -> blocked.
-        assert!(check_download_allowed(Some("quarantined"), Some(until), now).is_err());
+        assert!(check_download_allowed(Some("quarantined"), Some(until), None, now).is_err());
     }
 
     #[test]
@@ -561,7 +580,7 @@ mod tests {
         let until = quarantine_until_from_release(&config, Some(release), now);
         assert!(until < now, "old release must yield an elapsed window");
         // And composes with check_download_allowed -> downloadable.
-        assert!(check_download_allowed(Some("quarantined"), Some(until), now).is_ok());
+        assert!(check_download_allowed(Some("quarantined"), Some(until), None, now).is_ok());
     }
 
     #[test]
@@ -582,39 +601,39 @@ mod tests {
     #[test]
     fn test_download_allowed_no_quarantine() {
         let now = Utc::now();
-        assert!(check_download_allowed(None, None, now).is_ok());
+        assert!(check_download_allowed(None, None, None, now).is_ok());
     }
 
     #[test]
     fn test_download_allowed_released() {
         let now = Utc::now();
-        assert!(check_download_allowed(Some("released"), None, now).is_ok());
+        assert!(check_download_allowed(Some("released"), None, None, now).is_ok());
     }
 
     #[test]
     fn test_download_allowed_clean() {
         let now = Utc::now();
-        assert!(check_download_allowed(Some("clean"), None, now).is_ok());
+        assert!(check_download_allowed(Some("clean"), None, None, now).is_ok());
     }
 
     #[test]
     fn test_download_allowed_unscanned() {
         let now = Utc::now();
-        assert!(check_download_allowed(Some("unscanned"), None, now).is_ok());
+        assert!(check_download_allowed(Some("unscanned"), None, None, now).is_ok());
     }
 
     #[test]
     fn test_download_allowed_flagged() {
         // 'flagged' is from the proxy-scan workflow, not quarantine blocking
         let now = Utc::now();
-        assert!(check_download_allowed(Some("flagged"), None, now).is_ok());
+        assert!(check_download_allowed(Some("flagged"), None, None, now).is_ok());
     }
 
     #[test]
     fn test_download_blocked_quarantined_within_window() {
         let now = Utc::now();
         let until = now + Duration::minutes(30);
-        let result = check_download_allowed(Some("quarantined"), Some(until), now);
+        let result = check_download_allowed(Some("quarantined"), Some(until), None, now);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -627,21 +646,40 @@ mod tests {
     fn test_download_allowed_quarantine_expired() {
         let now = Utc::now();
         let until = now - Duration::minutes(5);
-        assert!(check_download_allowed(Some("quarantined"), Some(until), now).is_ok());
+        assert!(check_download_allowed(Some("quarantined"), Some(until), None, now).is_ok());
     }
 
     #[test]
     fn test_download_blocked_quarantined_no_expiry() {
         // If quarantine_until is NULL but status is 'quarantined', block
         let now = Utc::now();
-        let result = check_download_allowed(Some("quarantined"), None, now);
+        let result = check_download_allowed(Some("quarantined"), None, None, now);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_blocked_message_includes_reason() {
+        let err = check_download_allowed(
+            Some("quarantined"),
+            None,
+            Some("Policy 'demo-cve-gate': 2 findings at or above high"),
+            Utc::now(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("demo-cve-gate"), "reason must surface: {msg}");
+    }
+
+    #[test]
+    fn test_blocked_message_without_reason_unchanged() {
+        let err = check_download_allowed(Some("quarantined"), None, None, Utc::now()).unwrap_err();
+        assert!(format!("{err}").contains("pending security review"));
     }
 
     #[test]
     fn test_download_blocked_rejected() {
         let now = Utc::now();
-        let result = check_download_allowed(Some("rejected"), None, now);
+        let result = check_download_allowed(Some("rejected"), None, None, now);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -715,7 +753,7 @@ mod tests {
     #[test]
     fn test_rejected_returns_forbidden() {
         let now = Utc::now();
-        let result = check_download_allowed(Some("rejected"), None, now);
+        let result = check_download_allowed(Some("rejected"), None, None, now);
         let err = result.unwrap_err();
         // AppError::Authorization maps to 403 FORBIDDEN
         match err {
@@ -728,7 +766,7 @@ mod tests {
     fn test_quarantined_returns_conflict() {
         let now = Utc::now();
         let until = now + Duration::minutes(30);
-        let result = check_download_allowed(Some("quarantined"), Some(until), now);
+        let result = check_download_allowed(Some("quarantined"), Some(until), None, now);
         let err = result.unwrap_err();
         // AppError::Conflict maps to 409 CONFLICT
         match err {

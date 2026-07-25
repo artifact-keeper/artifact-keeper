@@ -657,9 +657,12 @@ impl CacheMetadata {
 /// would refetch upstream and loop.
 fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
     match quarantine_until {
-        Some(until) => {
-            quarantine_service::check_download_allowed(Some("quarantined"), Some(until), Utc::now())
-        }
+        Some(until) => quarantine_service::check_download_allowed(
+            Some("quarantined"),
+            Some(until),
+            None,
+            Utc::now(),
+        ),
         None => Ok(()),
     }
 }

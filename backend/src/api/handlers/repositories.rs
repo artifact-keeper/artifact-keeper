@@ -7378,6 +7378,7 @@ pub async fn download_artifact(
             crate::services::quarantine_service::check_download_allowed(
                 qrow.quarantine_status.as_deref(),
                 qrow.quarantine_until,
+                None,
                 chrono::Utc::now(),
             )?;
         }

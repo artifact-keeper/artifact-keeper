@@ -1435,6 +1435,7 @@ impl ArtifactService {
         crate::services::quarantine_service::check_download_allowed(
             artifact.quarantine_status.as_deref(),
             artifact.quarantine_until,
+            None,
             chrono::Utc::now(),
         )?;
 
