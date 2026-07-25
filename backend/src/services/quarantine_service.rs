@@ -770,18 +770,21 @@ mod tests {
         // finding counts, admin incident notes) is disclosed only by the
         // authenticated, visibility-checked status endpoint (#2912).
         let err = check_download_allowed(Some("quarantined"), None, Utc::now()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("pending security review"));
+        let msg = match err {
+            AppError::Conflict(m) => m,
+            other => panic!("expected Conflict, got {other:?}"),
+        };
         assert_eq!(
             msg, "Artifact is quarantined and pending security review",
             "message must not carry per-artifact detail"
         );
 
         let err = check_download_allowed(Some("rejected"), None, Utc::now()).unwrap_err();
-        assert_eq!(
-            format!("{err}"),
-            "Artifact was rejected during security review"
-        );
+        let msg = match err {
+            AppError::Authorization(m) => m,
+            other => panic!("expected Authorization, got {other:?}"),
+        };
+        assert_eq!(msg, "Artifact was rejected during security review");
     }
 
     #[test]

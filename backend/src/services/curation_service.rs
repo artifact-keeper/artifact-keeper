@@ -64,6 +64,53 @@ impl CurationService {
         }
     }
 
+    /// Fold a package name or glob pattern for PEP 503-insensitive matching:
+    /// lowercase, and collapse runs of `-`, `_`, `.` to a single `-`.
+    ///
+    /// This is the pattern-safe counterpart of `pypi::normalize_pep503`. That
+    /// function additionally *drops* every character outside `[A-Za-z0-9._-]`,
+    /// which makes it unusable on a glob pattern — it would delete the `*` and `?`
+    /// wildcards. On an already-normalized name this fold is the identity, so the
+    /// two agree wherever both apply (asserted in tests).
+    pub(crate) fn fold_pep503(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut last_was_sep = true;
+
+        for c in value.chars() {
+            if c == '-' || c == '_' || c == '.' {
+                if !last_was_sep {
+                    out.push('-');
+                    last_was_sep = true;
+                }
+            } else {
+                out.push(c.to_ascii_lowercase());
+                last_was_sep = false;
+            }
+        }
+
+        if out.ends_with('-') {
+            out.pop();
+        }
+        out
+    }
+
+    /// Fetch the enabled rules that apply to a repository (repo-specific +
+    /// global), ordered by priority.
+    async fn fetch_applicable_rules(
+        &self,
+        staging_repo_id: Uuid,
+    ) -> Result<Vec<CurationRule>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT * FROM curation_rules
+               WHERE enabled = true
+                 AND (staging_repo_id = $1 OR staging_repo_id IS NULL)
+               ORDER BY priority ASC, created_at ASC"#,
+        )
+        .bind(staging_repo_id)
+        .fetch_all(&self.db)
+        .await
+    }
+
     /// Evaluate a package against all applicable rules (repo-specific + global),
     /// returning the first matching rule's action or the default stance.
     pub async fn evaluate_package(
@@ -74,16 +121,7 @@ impl CurationService {
         version: &str,
         architecture: Option<&str>,
     ) -> Result<RuleEvaluation, sqlx::Error> {
-        // Fetch all enabled rules for this repo + global, ordered by priority
-        let rules: Vec<CurationRule> = sqlx::query_as(
-            r#"SELECT * FROM curation_rules
-               WHERE enabled = true
-                 AND (staging_repo_id = $1 OR staging_repo_id IS NULL)
-               ORDER BY priority ASC, created_at ASC"#,
-        )
-        .bind(staging_repo_id)
-        .fetch_all(&self.db)
-        .await?;
+        let rules = self.fetch_applicable_rules(staging_repo_id).await?;
 
         Ok(Self::evaluate_package_in_memory(
             &rules,
@@ -91,6 +129,39 @@ impl CurationService {
             package_name,
             version,
             architecture,
+        ))
+    }
+
+    /// Evaluate a PEP 503 package name against the repository's curation rules.
+    ///
+    /// Differs from [`Self::evaluate_package`] in the two ways the Python proxy
+    /// path requires (#2912):
+    ///
+    /// 1. Rule patterns are folded with [`Self::fold_pep503`] before matching, so
+    ///    a rule written the way PyPI displays the project — `PyYAML`, `Django`,
+    ///    `my_package` — matches a request for the normalized `pyyaml` / `django`
+    ///    / `my-package`. Without this the proxy silently enforces nothing for the
+    ///    spelling operators actually use, while the staging-sync path (which
+    ///    passes raw upstream names) enforces the same rule.
+    /// 2. `version` is an `Option`. When the request does not carry a version, a
+    ///    version-constrained rule is skipped rather than compared against a
+    ///    placeholder.
+    pub async fn evaluate_pep503_package(
+        &self,
+        staging_repo_id: Uuid,
+        default_action: &str,
+        package_name: &str,
+        version: Option<&str>,
+    ) -> Result<RuleEvaluation, sqlx::Error> {
+        let rules = self.fetch_applicable_rules(staging_repo_id).await?;
+
+        Ok(Self::evaluate_rules(
+            &rules,
+            default_action,
+            package_name,
+            version,
+            None,
+            true,
         ))
     }
 
@@ -404,6 +475,9 @@ impl CurationService {
     }
 
     /// Evaluate a package against a pre-fetched rule set in memory (no DB call).
+    ///
+    /// Exact-name matching against a known version — the staging/sync semantics.
+    /// See [`Self::evaluate_rules`] for the general form.
     fn evaluate_package_in_memory(
         rules: &[CurationRule],
         default_action: &str,
@@ -411,18 +485,77 @@ impl CurationService {
         version: &str,
         architecture: Option<&str>,
     ) -> RuleEvaluation {
+        Self::evaluate_rules(
+            rules,
+            default_action,
+            package_name,
+            Some(version),
+            architecture,
+            false,
+        )
+    }
+
+    /// First-match rule evaluation against a pre-fetched rule set (no DB call).
+    ///
+    /// `version` is `None` when the caller does not know the version, and
+    /// `fold_names` folds both the rule pattern and the package name per PEP 503
+    /// before matching (see [`Self::evaluate_pep503_package`]).
+    fn evaluate_rules(
+        rules: &[CurationRule],
+        default_action: &str,
+        package_name: &str,
+        version: Option<&str>,
+        architecture: Option<&str>,
+        fold_names: bool,
+    ) -> RuleEvaluation {
+        let folded_name = fold_names.then(|| Self::fold_pep503(package_name));
+
         for rule in rules {
-            if !Self::pattern_matches(&rule.package_pattern, package_name) {
+            let name_matches = match folded_name.as_deref() {
+                Some(name) => {
+                    Self::pattern_matches(&Self::fold_pep503(&rule.package_pattern), name)
+                }
+                None => Self::pattern_matches(&rule.package_pattern, package_name),
+            };
+            if !name_matches {
                 continue;
             }
-            if !Self::version_matches(&rule.version_constraint, version) {
-                continue;
-            }
-            if rule.architecture != "*" {
-                if let Some(arch) = architecture {
-                    if rule.architecture != arch {
+
+            let constraint = rule.version_constraint.trim();
+            match version {
+                Some(v) => {
+                    if !Self::version_matches(constraint, v) {
                         continue;
                     }
+                }
+                // The request carries no version, so a version-constrained rule
+                // cannot be decided. Skip it rather than comparing the constraint
+                // against a placeholder: `version_compare` would treat the
+                // placeholder as a literal version, which silently makes `>=` and
+                // `=` rules match nothing and `<` rules match *every* version
+                // (#2912).
+                None if constraint != "*" => {
+                    tracing::debug!(
+                        rule_id = %rule.id,
+                        constraint = %constraint,
+                        package = %package_name,
+                        "Skipping version-constrained curation rule: request carries no version"
+                    );
+                    continue;
+                }
+                None => {}
+            }
+
+            if rule.architecture != "*" {
+                match architecture {
+                    Some(arch) if rule.architecture == arch => {}
+                    // Either the request is for a different architecture, or it
+                    // carries none and an architecture-scoped rule cannot be
+                    // decided. Both must skip the rule. Previously a `None`
+                    // request skipped the *check*, so an architecture-scoped rule
+                    // matched every request — including an `allow` rule shadowing
+                    // a lower-priority `block` (#2912).
+                    _ => continue,
                 }
             }
 

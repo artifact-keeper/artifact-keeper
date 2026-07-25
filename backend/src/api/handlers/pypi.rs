@@ -201,36 +201,76 @@ async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["pypi", "poetry", "conda"], "a PyPI").await
 }
 
-/// Curation gate for PyPI proxy requests (#2912). Returns
-/// `Err(403 response)` when a block rule matches. Name matching is done on
-/// the PEP 503 normalized project name; `version` is `"*"` for the
-/// name-level checks on the index and download paths (neither parses a
-/// specific version out of the request before this gate runs).
+/// Best-effort extraction of a distribution version from a PyPI filename.
 ///
-/// No-op when the repository does not have curation enabled. On a rule
-/// evaluation error, fails open (logs a warning) so a curation-service fault
-/// never takes the proxy down.
+/// Wheels are `{name}-{version}(-{build})?-{py}-{abi}-{platform}.whl`, so the
+/// version is the second `-`-separated field. Source distributions are
+/// `{name}-{version}{ext}`, so the version is what remains after stripping the
+/// extension and the trailing `-`-delimited segment boundary.
+///
+/// Returns `None` when the shape is not recognized. Callers must treat that as
+/// "version unknown" and pass it through as `None` rather than substituting a
+/// placeholder: a placeholder is compared as a literal version and silently
+/// inverts version-constrained rules (#2912).
+pub(crate) fn version_from_pypi_filename(filename: &str) -> Option<String> {
+    if let Some(stem) = filename.strip_suffix(".whl") {
+        let mut parts = stem.split('-');
+        let _name = parts.next()?;
+        let version = parts.next()?;
+        return (!version.is_empty()).then(|| version.to_string());
+    }
+
+    const SDIST_EXTS: [&str; 6] = [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".tar"];
+    for ext in SDIST_EXTS {
+        if let Some(stem) = filename.strip_suffix(ext) {
+            // The project name may itself contain `-`, and a PEP 440 version does
+            // not, so the version is the final `-`-delimited segment.
+            let (_, version) = stem.rsplit_once('-')?;
+            return (!version.is_empty()).then(|| version.to_string());
+        }
+    }
+
+    None
+}
+
+/// Curation gate for PyPI proxy requests (#2912). Returns
+/// `Err(403 response)` when a block rule matches.
+///
+/// Name matching is PEP 503-insensitive on both sides — the request name is
+/// normalized and the rule pattern is folded the same way — so a rule written the
+/// way PyPI displays the project (`PyYAML`, `my_package`) matches. `version` is
+/// `None` on the index path, which identifies only a project; the download path
+/// passes the version parsed from the distribution filename so exact-version
+/// rules apply there. A `None` version skips version-constrained rules rather
+/// than mis-evaluating them.
+///
+/// No-op when curation is disabled for the repository, and no-op for hosted
+/// (`local` / `staging`) repositories: curation rules describe what may be pulled
+/// from upstream, so applying them to a hosted repo would 403 that repository's
+/// own published packages. On a rule evaluation error, fails open (logging the
+/// repository and package so the unenforced request is greppable) rather than
+/// taking the proxy down.
 async fn enforce_pypi_curation(
     state: &SharedState,
     repo: &RepoInfo,
     project: &str,
-    version: &str,
+    version: Option<&str>,
 ) -> Result<(), Response> {
-    if !repo.curation_enabled {
+    if !repo.curation_enabled || !matches!(repo.repo_type.as_str(), "remote" | "virtual") {
         return Ok(());
     }
     let svc = crate::services::curation_service::CurationService::new(state.db.clone());
     let eval = svc
-        .evaluate_package(
-            repo.id,
-            &repo.curation_default_action,
-            project,
-            version,
-            None,
-        )
+        .evaluate_pep503_package(repo.id, &repo.curation_default_action, project, version)
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "curation evaluation failed; failing open");
+            tracing::warn!(
+                repo_id = %repo.id,
+                repo_key = %repo.key,
+                package = %project,
+                error = %e,
+                "curation evaluation failed; failing open"
+            );
         })
         .ok();
     if let Some(eval) = eval {
@@ -655,8 +695,10 @@ async fn simple_project(
     let normalized = normalize_pep503(&project);
 
     // Curation gate (#2912): block a curation-ruled package
-    // before doing any local lookup or upstream fetch for it.
-    enforce_pypi_curation(&state, &repo, &normalized, "*").await?;
+    // before doing any local lookup or upstream fetch for it. The index request
+    // names only a project, so version-constrained rules do not apply here — they
+    // are enforced on the download path, which knows the version.
+    enforce_pypi_curation(&state, &repo, &normalized, None).await?;
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
@@ -953,6 +995,21 @@ async fn simple_project(
                     continue;
                 };
 
+                // #2912: apply THIS member's curation rules before its index is
+                // fetched, mirroring the per-member age gate below (#2066). The
+                // entry gate above only saw the virtual repository's own flags, so
+                // without this a virtual repository fronting a curated remote —
+                // the normal curated-mirror topology — served blocked packages. A
+                // block suppresses this member's contribution rather than failing
+                // the whole listing, exactly as the age gate filters it.
+                let member_info = proxy_helpers::repo_info_from_member(member);
+                if enforce_pypi_curation(&state, &member_info, &normalized, None)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+
                 let member_index_path = fetch_pypi_upstream_index_path(&state.db, member.id).await;
                 let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
                     upstream_url,
@@ -991,7 +1048,6 @@ async fn simple_project(
                         // filtering the remote member here mirrors the direct
                         // simple-index path so a young version of a gated member
                         // is not leaked through the virtual listing.
-                        let member_info = proxy_helpers::repo_info_from_member(member);
                         let ct = content_type.clone().unwrap_or_default();
                         let content = if wants_json && ct.contains("json") {
                             let filtered = filter_pypi_simple_json_response(
@@ -1389,12 +1445,14 @@ async fn download_or_metadata(
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
-    // Curation gate (#2912): a name-blocked package must never
-    // serve any version, whether via PEP 658 metadata or a regular file
-    // download, so this runs before either branch below. The filename's
-    // version is not parsed here, hence the name-level "*" check.
+    // Curation gate (#2912): a blocked package must never serve any version,
+    // whether via PEP 658 metadata or a regular file download, so this runs before
+    // either branch below. The version is parsed from the distribution filename so
+    // exact- and range-constrained rules apply on this path; an unrecognized
+    // filename shape yields `None`, which matches on name only.
     let normalized = normalize_pep503(&project);
-    enforce_pypi_curation(&state, &repo, &normalized, "*").await?;
+    let requested_version = version_from_pypi_filename(&filename);
+    enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
     // PEP 658: if filename ends with .metadata, serve extracted METADATA
     if filename.ends_with(".metadata") {
@@ -1828,6 +1886,25 @@ async fn serve_file(
                     // `Ok(None)`. A withheld young version returns the
                     // last-known-good wheel (`Ok(Some(resp))`) or 451 (`Err`).
                     let member_info = proxy_helpers::repo_info_from_member(member);
+
+                    // #2912: enforce THIS member's curation rules before any of its
+                    // bytes are served, including from its local cache row —
+                    // parity with the per-member age gate immediately below. Skips
+                    // the blocked member so a sibling that does not block the
+                    // package still resolves, rather than failing the whole
+                    // virtual request.
+                    if enforce_pypi_curation(
+                        state,
+                        &member_info,
+                        &normalize_pep503(project),
+                        version_from_pypi_filename(filename).as_deref(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        continue;
+                    }
+
                     if let Some(resp) = enforce_pypi_download_age_gate(
                         state,
                         &member_info,
