@@ -4675,25 +4675,55 @@ impl ScannerService {
                 .ok()
                 .flatten();
 
-        let (new_status, clear_until) = match current_status.as_deref() {
-            Some("quarantined") => {
-                // Quarantine-period workflow: transition to released/rejected
-                let state =
-                    crate::services::quarantine_service::status_after_scan(findings_count > 0);
-                (state.as_str().to_string(), true)
-            }
+        // The quarantine-period branch does not consult policies; only the
+        // legacy proxy-scan branch is gated on them, fail-open on error.
+        let policy_result = match current_status.as_deref() {
+            Some("quarantined") => None,
             _ => {
-                // Legacy proxy-scan workflow: use clean/flagged
-                let status = if findings_count > 0 {
-                    "flagged"
-                } else {
-                    "clean"
-                };
-                (status.to_string(), false)
+                let repository_id: Option<Uuid> =
+                    sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+                        .bind(artifact_id)
+                        .fetch_optional(&self.db)
+                        .await
+                        .ok()
+                        .flatten();
+
+                match repository_id {
+                    Some(repository_id) => {
+                        let svc =
+                            crate::services::policy_service::PolicyService::new(self.db.clone());
+                        match svc.evaluate_artifact(artifact_id, repository_id).await {
+                            Ok(r) => Some(r),
+                            Err(e) => {
+                                tracing::warn!(
+                                    artifact_id = %artifact_id,
+                                    error = %e,
+                                    "Policy evaluation failed; falling back to flagged/clean"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                }
             }
         };
 
-        if clear_until {
+        let decision = post_scan_status_decision(
+            current_status.as_deref(),
+            findings_count,
+            policy_result.as_ref(),
+        );
+
+        if let Some(reason) = decision.reason.as_deref() {
+            tracing::info!(
+                artifact_id = %artifact_id,
+                violations = %reason,
+                "Quarantining artifact due to scan policy violation"
+            );
+        }
+
+        if decision.clear_until {
             // Use conditional UPDATE to prevent race conditions: only update
             // if the artifact is still in 'quarantined' state. If an admin
             // already rejected it, this UPDATE will affect 0 rows (which is fine).
@@ -4702,7 +4732,7 @@ impl ScannerService {
                  WHERE id = $1 AND quarantine_status = 'quarantined'",
             )
             .bind(artifact_id)
-            .bind(&new_status)
+            .bind(&decision.status)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -4710,21 +4740,68 @@ impl ScannerService {
             if result.rows_affected() == 0 {
                 tracing::info!(
                     artifact_id = %artifact_id,
-                    attempted_status = %new_status,
+                    attempted_status = %decision.status,
                     "Quarantine transition skipped: artifact is no longer in quarantined state"
                 );
             }
         } else {
-            sqlx::query!(
-                "UPDATE artifacts SET quarantine_status = $2 WHERE id = $1",
-                artifact_id,
-                new_status,
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = $2, \
+                       quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
+                       quarantine_reason = $3 \
+                 WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined'",
             )
+            .bind(artifact_id)
+            .bind(&decision.status)
+            .bind(&decision.reason)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Outcome of the post-scan quarantine decision. Pure; see
+/// update_quarantine_status for the impure wrapper.
+pub(crate) struct PostScanDecision {
+    pub status: String,
+    /// true when the quarantine-period branch must clear quarantine_until
+    pub clear_until: bool,
+    pub reason: Option<String>,
+}
+
+pub(crate) fn post_scan_status_decision(
+    current_status: Option<&str>,
+    findings_count: i32,
+    policy: Option<&crate::models::security::PolicyResult>,
+) -> PostScanDecision {
+    if let Some("quarantined") = current_status {
+        let state = crate::services::quarantine_service::status_after_scan(findings_count > 0);
+        return PostScanDecision {
+            status: state.as_str().to_string(),
+            clear_until: true,
+            reason: None,
+        };
+    }
+    if let Some(p) = policy {
+        if !p.allowed {
+            return PostScanDecision {
+                status: "quarantined".to_string(),
+                clear_until: false,
+                reason: Some(p.violations.join("; ")),
+            };
+        }
+    }
+    PostScanDecision {
+        status: if findings_count > 0 {
+            "flagged"
+        } else {
+            "clean"
+        }
+        .to_string(),
+        clear_until: false,
+        reason: None,
     }
 }
 
@@ -4869,6 +4946,59 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // post_scan_status_decision (pure post-scan quarantine decision)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_post_scan_status_policy_violation_quarantines() {
+        let d = post_scan_status_decision(
+            Some("flagged"),
+            3,
+            Some(&crate::models::security::PolicyResult {
+                allowed: false,
+                violations: vec!["Policy 'demo-cve-gate': severity over threshold".into()],
+            }),
+        );
+        assert_eq!(d.status, "quarantined");
+        assert_eq!(
+            d.reason.as_deref(),
+            Some("Policy 'demo-cve-gate': severity over threshold")
+        );
+    }
+
+    #[test]
+    fn test_post_scan_status_no_policy_keeps_flagged_clean() {
+        assert_eq!(
+            post_scan_status_decision(Some("clean"), 2, None).status,
+            "flagged"
+        );
+        assert_eq!(post_scan_status_decision(None, 0, None).status, "clean");
+        assert!(post_scan_status_decision(None, 0, None).reason.is_none());
+    }
+
+    #[test]
+    fn test_post_scan_status_quarantine_period_branch_untouched() {
+        // current status 'quarantined' (quarantine-period flow) must keep using
+        // status_after_scan regardless of policy result
+        let d = post_scan_status_decision(Some("quarantined"), 0, None);
+        assert_eq!(d.status, "released");
+        let d = post_scan_status_decision(Some("quarantined"), 1, None);
+        assert_eq!(d.status, "rejected");
+    }
+
+    #[test]
+    fn test_post_scan_status_policy_allowed_is_not_quarantine() {
+        let ok = crate::models::security::PolicyResult {
+            allowed: true,
+            violations: vec![],
+        };
+        assert_eq!(
+            post_scan_status_decision(None, 1, Some(&ok)).status,
+            "flagged"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // spawn_scan_on_upload (scan-trigger helper for format-native handlers)
