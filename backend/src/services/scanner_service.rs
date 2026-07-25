@@ -4675,14 +4675,20 @@ impl ScannerService {
     /// (`WHERE quarantine_status = 'quarantined'`) to prevent a clean scan
     /// from overwriting a rejection set by an admin or another scanner.
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
-        // Check if the artifact is currently in quarantine-period mode
-        let current_status: Option<String> =
-            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
-                .bind(artifact_id)
-                .fetch_optional(&self.db)
-                .await
-                .ok()
-                .flatten();
+        // Check if the artifact is currently in quarantine-period mode, and
+        // whether that quarantine is a timed hold (upload/age-gate, non-NULL
+        // quarantine_until) versus an admin- or policy-set block (NULL). Only
+        // a timed hold may be auto-resolved by a rescan.
+        let current_row: Option<(Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten();
+        let current_status = current_row.as_ref().and_then(|(s, _)| s.clone());
+        let has_timed_hold = current_row.and_then(|(_, u)| u).is_some();
 
         // The quarantine-period branch does not consult policies; only the
         // legacy proxy-scan branch is gated on them, fail-open on error.
@@ -4731,6 +4737,7 @@ impl ScannerService {
             current_status.as_deref(),
             findings_count,
             policy_result.as_ref(),
+            has_timed_hold,
         );
 
         if let Some(reason) = decision.reason.as_deref() {
@@ -4765,12 +4772,13 @@ impl ScannerService {
         } else {
             // Deliberate change from the unguarded pre-enforcement UPDATE: a
             // completing scan must never downgrade a concurrently set admin
-            // quarantine.
+            // quarantine, nor a terminal admin rejection.
             sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
                        quarantine_reason = $3 \
-                 WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined'",
+                 WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
+                       AND quarantine_status IS DISTINCT FROM 'rejected'",
             )
             .bind(artifact_id)
             .bind(&decision.status)
@@ -4796,8 +4804,14 @@ pub(crate) fn post_scan_status_decision(
     current_status: Option<&str>,
     findings_count: i32,
     policy: Option<&crate::models::security::PolicyResult>,
+    // True when the current 'quarantined' status came from a timed hold
+    // (upload/age-gate: quarantine_until IS NOT NULL). Admin quarantine
+    // (quarantine_now) and the policy-violation path both set
+    // quarantine_until = NULL, so a rescan must not treat them as an
+    // expiring hold to auto-release.
+    has_timed_hold: bool,
 ) -> PostScanDecision {
-    if let Some("quarantined") = current_status {
+    if matches!(current_status, Some("quarantined")) && has_timed_hold {
         let state = crate::services::quarantine_service::status_after_scan(findings_count > 0);
         return PostScanDecision {
             status: state.as_str().to_string(),
@@ -4981,6 +4995,7 @@ mod tests {
                 allowed: false,
                 violations: vec!["Policy 'demo-cve-gate': severity over threshold".into()],
             }),
+            false,
         );
         assert_eq!(d.status, "quarantined");
         assert_eq!(
@@ -4992,21 +5007,45 @@ mod tests {
     #[test]
     fn test_post_scan_status_no_policy_keeps_flagged_clean() {
         assert_eq!(
-            post_scan_status_decision(Some("clean"), 2, None).status,
+            post_scan_status_decision(Some("clean"), 2, None, false).status,
             "flagged"
         );
-        assert_eq!(post_scan_status_decision(None, 0, None).status, "clean");
-        assert!(post_scan_status_decision(None, 0, None).reason.is_none());
+        assert_eq!(
+            post_scan_status_decision(None, 0, None, false).status,
+            "clean"
+        );
+        assert!(post_scan_status_decision(None, 0, None, false)
+            .reason
+            .is_none());
     }
 
     #[test]
     fn test_post_scan_status_quarantine_period_branch_untouched() {
-        // current status 'quarantined' (quarantine-period flow) must keep using
-        // status_after_scan regardless of policy result
-        let d = post_scan_status_decision(Some("quarantined"), 0, None);
+        // current status 'quarantined' with a timed hold (quarantine_until
+        // non-NULL, e.g. upload/age-gate) must keep using status_after_scan
+        // regardless of policy result.
+        let d = post_scan_status_decision(Some("quarantined"), 0, None, true);
+        assert!(d.clear_until);
         assert_eq!(d.status, "released");
-        let d = post_scan_status_decision(Some("quarantined"), 1, None);
+        let d = post_scan_status_decision(Some("quarantined"), 1, None, true);
+        assert!(d.clear_until);
         assert_eq!(d.status, "rejected");
+    }
+
+    #[test]
+    fn test_post_scan_status_admin_or_policy_quarantine_not_auto_released() {
+        // Admin (quarantine_now) and policy-set quarantines both leave
+        // quarantine_until NULL, i.e. has_timed_hold = false. A rescan must
+        // NOT take the clear_until path for these -- doing so is exactly the
+        // durability bug: a clean/completing rescan would silently release an
+        // admin- or policy-enforced block. clear_until must be false so the
+        // impure caller falls through to the legacy branch, whose UPDATE
+        // guard (quarantine_status IS DISTINCT FROM 'quarantined') then makes
+        // the write a no-op and the artifact stays quarantined.
+        let d = post_scan_status_decision(Some("quarantined"), 0, None, false);
+        assert!(!d.clear_until);
+        let d = post_scan_status_decision(Some("quarantined"), 1, None, false);
+        assert!(!d.clear_until);
     }
 
     #[test]
@@ -5016,9 +5055,170 @@ mod tests {
             violations: vec![],
         };
         assert_eq!(
-            post_scan_status_decision(None, 1, Some(&ok)).status,
+            post_scan_status_decision(None, 1, Some(&ok), false).status,
             "flagged"
         );
+    }
+
+    /// Integration-level companion to
+    /// `test_post_scan_status_admin_or_policy_quarantine_not_auto_released`:
+    /// the 'rejected' protection lives in the legacy-branch UPDATE's WHERE
+    /// guard (SQL), not in the pure `post_scan_status_decision` function, so
+    /// it cannot be exercised by a pure unit test. A 'rejected' artifact has
+    /// quarantine_status = 'rejected' (not 'quarantined'), so it always takes
+    /// the legacy branch; a clean rescan must not downgrade it to 'clean'.
+    #[tokio::test]
+    async fn test_update_quarantine_status_never_downgrades_rejected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("rejected-no-downgrade/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted,
+                quarantine_status, quarantine_until
+            )
+            VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3,
+                    'application/octet-stream', $4, false,
+                    'rejected', NULL)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert rejected artifact");
+
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        // A clean rescan (0 findings) must not release/downgrade the rejection.
+        scanner
+            .update_quarantine_status(artifact_id, 0)
+            .await
+            .expect("update_quarantine_status must not error");
+
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&fx.pool)
+                .await
+                .expect("fetch quarantine_status")
+                .flatten();
+        assert_eq!(
+            status.as_deref(),
+            Some("rejected"),
+            "a clean rescan must not downgrade a 'rejected' artifact"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Integration-level companion to
+    /// `test_post_scan_status_admin_or_policy_quarantine_not_auto_released`:
+    /// exercises the full `update_quarantine_status` wiring (fetching
+    /// quarantine_until, computing has_timed_hold) rather than just the pure
+    /// decision function. An admin/policy quarantine sets quarantine_until =
+    /// NULL; a completing clean rescan must not auto-release it.
+    #[tokio::test]
+    async fn test_update_quarantine_status_never_auto_releases_admin_quarantine() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("admin-quarantine-no-release/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted,
+                quarantine_status, quarantine_until
+            )
+            VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3,
+                    'application/octet-stream', $4, false,
+                    'quarantined', NULL)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert admin-quarantined artifact");
+
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        // A clean rescan (0 findings) must not release the admin/policy hold.
+        scanner
+            .update_quarantine_status(artifact_id, 0)
+            .await
+            .expect("update_quarantine_status must not error");
+
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&fx.pool)
+                .await
+                .expect("fetch quarantine_status")
+                .flatten();
+        assert_eq!(
+            status.as_deref(),
+            Some("quarantined"),
+            "a clean rescan must not auto-release an admin/policy quarantine (quarantine_until IS NULL)"
+        );
+
+        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------
