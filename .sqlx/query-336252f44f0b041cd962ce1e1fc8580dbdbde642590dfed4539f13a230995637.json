@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                promotion_only = COALESCE($8, promotion_only),\n                versioning_enabled = COALESCE($9, versioning_enabled),\n                project_id = COALESCE($10, project_id),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                key = COALESCE($2, key),\n                name = COALESCE($3, name),\n                description = COALESCE($4, description),\n                is_public = COALESCE($5, is_public),\n                quota_bytes = COALESCE($6, quota_bytes),\n                upstream_url = COALESCE($7, upstream_url),\n                promotion_only = COALESCE($8, promotion_only),\n                versioning_enabled = COALESCE($9, versioning_enabled),\n                project_id = COALESCE($10, project_id),\n                curation_enabled = COALESCE($11, curation_enabled),\n                curation_default_action = COALESCE($12, curation_default_action),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -224,7 +224,9 @@
         "Varchar",
         "Bool",
         "Bool",
-        "Uuid"
+        "Uuid",
+        "Bool",
+        "Text"
       ]
     },
     "nullable": [
@@ -255,5 +257,5 @@
       false
     ]
   },
-  "hash": "27a3d57477c57895b9359b0f0b5da753513fb0cb07a105e8fbea0ffe22ee825d"
+  "hash": "336252f44f0b041cd962ce1e1fc8580dbdbde642590dfed4539f13a230995637"
 }

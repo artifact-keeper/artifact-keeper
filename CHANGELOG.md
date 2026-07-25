@@ -36,6 +36,9 @@ A security- and correctness-hardening release closing the 1.6.0 milestone: 24 se
 - **npm scope filtering also covers the legacy `/-/all` and `/-/by-user` map response shapes** (#2542).
 - **npm metadata filtering fails closed on unrecognized response shapes** instead of passing them through (#2551).
 - **CVE blast-radius reports enumerate users who can access a restricted repo but haven't downloaded the affected artifact** (#2386).
+- **Scan policies are now enforced instead of only flagged**: a completed scan that violates an enabled scan policy quarantines the artifact, blocking downloads and surfacing the policy reason in the error response.
+- **Curation block rules now gate PyPI proxy index and download requests** on curation-enabled repositories, rejecting matching packages with a 403 and the rule reason instead of only auditing them.
+- **Blocked downloads now surface a quarantine_reason** in the error response, so callers see why an artifact is unavailable rather than a generic block.
 
 ### Added
 
@@ -50,6 +53,7 @@ A security- and correctness-hardening release closing the 1.6.0 milestone: 24 se
 - **Proxy-cache downloads are now counted correctly on first serve** (#2537).
 - **Scanner UX** — not-applicable image-family rows are collapsed in results, and `TRIVY_ADAPTER_URL` is documented in the base compose (#2471).
 - **Configurable first-run setup password hint** (#2802): the first-time-setup login screen previously hardcoded a `docker exec` instruction for retrieving the generated admin password, which is wrong on Kubernetes and packaged installs. A new optional `SETUP_PASSWORD_HINT` env var overrides that instruction, and the public `/api/v1/setup/status` response now carries the operator-supplied hint. Unset leaves the existing Docker Compose default in place.
+- **New admin endpoint, `POST /api/v1/quarantine/{artifact_id}`, to quarantine a flagged or clean artifact manually**, completing the flagged-to-blocked transition without waiting for a new scan.
 
 ### Fixed
 
