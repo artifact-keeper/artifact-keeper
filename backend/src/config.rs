@@ -3956,22 +3956,55 @@ mod tests {
         out
     }
 
+    /// Read a compose file relative to the repo root, panicking with the path
+    /// on failure so a missing/renamed file fails loudly instead of silently
+    /// passing an empty-string check. Test-only.
+    fn read_compose(repo_root: &std::path::Path, file_name: &str) -> String {
+        let compose_path = repo_root.join(file_name);
+        std::fs::read_to_string(&compose_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()))
+    }
+
+    /// Assert that `dtrack-init` in the given compose file does not run the
+    /// hardened, shell-less backend image (#2059/#2084) — it must run a
+    /// shell-bearing image (alpine) instead, since its init script needs
+    /// sh+curl+jq.
+    fn assert_dtrack_init_uses_shell_bearing_image(compose: &str, file_name: &str) {
+        let dtrack_init = compose_service_block(compose, "dtrack-init");
+        assert!(
+            !dtrack_init.is_empty(),
+            "dtrack-init service not found in {file_name}"
+        );
+        assert!(
+            !dtrack_init.contains("artifact-keeper-backend"),
+            "dtrack-init in {file_name} must not run the shell-less backend image \
+             (#2084). Offending block:\n{dtrack_init}"
+        );
+    }
+
     /// Regression guard for #2084: the hardened runtime image (#2059) ships no
     /// `/bin/sh`, so no compose service that runs that image may be launched
     /// through a shell. On `main` the `backend` service used
     /// `entrypoint: ["/bin/sh","-c", <wait-for-DT-key>]` and `dtrack-init` ran
     /// the backend image via `/bin/sh`; both broke `docker compose up` with
     /// `exec: "/bin/sh": no such file or directory`.
+    ///
+    /// #2126 fixed this in `docker-compose.yml` only. `docker-compose.local-
+    /// dev.yml` carries an independent copy of the `dtrack-init` service that
+    /// pulls the same hardened `ghcr.io/.../artifact-keeper-backend` image and
+    /// drifted back into the identical broken pattern because nothing checked
+    /// it, so it is covered here too. Its `backend` service is exempt from the
+    /// shell-entrypoint check: unlike `docker-compose.yml`, it builds its own
+    /// dev image (`docker/Dockerfile.backend.dev`, based on
+    /// `rust:*-bookworm`), which does ship a shell.
     #[test]
     fn shipped_compose_does_not_run_hardened_image_through_a_shell() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("backend crate has a parent directory (repo root)");
-        let compose_path = repo_root.join("docker-compose.yml");
-        let compose = std::fs::read_to_string(&compose_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()));
 
-        let backend = compose_service_block(&compose, "backend");
+        let prod_compose = read_compose(repo_root, "docker-compose.yml");
+        let backend = compose_service_block(&prod_compose, "backend");
         assert!(
             !backend.is_empty(),
             "backend service not found in docker-compose.yml"
@@ -3981,18 +4014,12 @@ mod tests {
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
         );
+        assert_dtrack_init_uses_shell_bearing_image(&prod_compose, "docker-compose.yml");
 
-        // dtrack-init may legitimately use a shell, but not on the shell-less
-        // backend image — it must run a shell-bearing image instead.
-        let dtrack_init = compose_service_block(&compose, "dtrack-init");
-        assert!(
-            !dtrack_init.is_empty(),
-            "dtrack-init service not found in docker-compose.yml"
-        );
-        assert!(
-            !dtrack_init.contains("artifact-keeper-backend"),
-            "dtrack-init must not run the shell-less backend image (#2084). \
-             Offending block:\n{dtrack_init}"
+        let local_dev_compose = read_compose(repo_root, "docker-compose.local-dev.yml");
+        assert_dtrack_init_uses_shell_bearing_image(
+            &local_dev_compose,
+            "docker-compose.local-dev.yml",
         );
     }
 }
