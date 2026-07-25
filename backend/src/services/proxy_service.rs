@@ -660,7 +660,6 @@ fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()>
         Some(until) => quarantine_service::check_download_allowed(
             Some("quarantined"),
             Some(until),
-            None,
             Utc::now(),
         ),
         None => Ok(()),

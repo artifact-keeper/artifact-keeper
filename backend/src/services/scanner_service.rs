@@ -3768,6 +3768,21 @@ impl ScannerService {
                         scanner.name(),
                         checksum_log_prefix(checksum),
                     );
+                    // Skipping the *scan* must not skip *enforcement*. `bypass_dedup`
+                    // defaults to false, so this is the path a rescan takes for
+                    // already-scanned bytes — and a rescan is the natural way an
+                    // operator applies a policy created after the original scan. It
+                    // is a pure re-derivation from existing rows, so it is cheap and
+                    // idempotent (#2912).
+                    if let Err(e) = self
+                        .update_quarantine_status(artifact_id, source_scan.findings_count)
+                        .await
+                    {
+                        warn!(
+                            "Failed to re-evaluate quarantine status for artifact {} on scan reuse: {}",
+                            artifact_id, e
+                        );
+                    }
                     continue;
                 }
 
@@ -4071,6 +4086,11 @@ impl ScannerService {
                             "Failed to set flagged status after scan failure"
                         );
                     }
+
+                    // 'flagged' is downloadable, so a `block_on_fail` policy has to
+                    // be applied here — this path never reaches
+                    // update_quarantine_status (#2912).
+                    self.enforce_policy_after_failed_scan(artifact_id).await;
                 }
             }
         }
@@ -4664,6 +4684,79 @@ impl ScannerService {
         Ok(())
     }
 
+    /// Apply scan policies after a scan *failed* (#2912).
+    ///
+    /// The failure arm marks the artifact `flagged`, which
+    /// [`quarantine_service::check_download_allowed`] treats as downloadable, and
+    /// it never reaches [`Self::update_quarantine_status`]. Without this, a policy
+    /// with `block_on_fail` could never take effect — the one condition it exists
+    /// to cover is exactly the one that skipped policy evaluation.
+    ///
+    /// Escalate-only: on a violation the artifact becomes a permanent quarantine;
+    /// a clean evaluation leaves the `flagged` status the caller just set, so this
+    /// can never downgrade. Guarded against `rejected`, and fails open on error.
+    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid) {
+        let repository_id: Option<Uuid> =
+            match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&self.db)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        error = %e,
+                        "Repository lookup failed after scan failure; skipping policy enforcement"
+                    );
+                    return;
+                }
+            };
+        let Some(repository_id) = repository_id else {
+            return;
+        };
+
+        let svc = crate::services::policy_service::PolicyService::new(self.db.clone());
+        let result = match svc.evaluate_artifact(artifact_id, repository_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    repository_id = %repository_id,
+                    error = %e,
+                    "Policy evaluation failed after scan failure; failing open"
+                );
+                return;
+            }
+        };
+        if result.allowed {
+            return;
+        }
+
+        let reason = result.violations.join("; ");
+        tracing::info!(
+            artifact_id = %artifact_id,
+            violations = %reason,
+            "Quarantining artifact after failed scan due to scan policy violation"
+        );
+        if let Err(e) = sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+             quarantine_reason = $2 \
+             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
+        )
+        .bind(artifact_id)
+        .bind(&reason)
+        .execute(&self.db)
+        .await
+        {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "Failed to quarantine artifact after failed scan policy violation"
+            );
+        }
+    }
+
     /// Update artifact quarantine_status based on scan findings.
     ///
     /// For proxy-scan artifacts (status is NULL, 'unscanned', 'clean', or
@@ -4675,61 +4768,50 @@ impl ScannerService {
     /// (`WHERE quarantine_status = 'quarantined'`) to prevent a clean scan
     /// from overwriting a rejection set by an admin or another scanner.
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
-        // Check if the artifact is currently in quarantine-period mode, and
-        // whether that quarantine is a timed hold (upload/age-gate, non-NULL
-        // quarantine_until) versus an admin- or policy-set block (NULL). Only
-        // a timed hold may be auto-resolved by a rescan.
-        let current_row: Option<(Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1",
+        // Read the quarantine state and the owning repository in one round trip:
+        // whether the artifact is in quarantine-period mode, whether that
+        // quarantine is a timed hold (upload/age-gate, non-NULL quarantine_until)
+        // versus an admin- or policy-set block (NULL), and whose policies apply.
+        let current_row: Option<(Option<String>, Option<DateTime<Utc>>, Uuid)> = sqlx::query_as(
+            "SELECT quarantine_status, quarantine_until, repository_id FROM artifacts WHERE id = $1",
         )
         .bind(artifact_id)
         .fetch_optional(&self.db)
         .await
         .ok()
         .flatten();
-        let current_status = current_row.as_ref().and_then(|(s, _)| s.clone());
-        let has_timed_hold = current_row.and_then(|(_, u)| u).is_some();
+        let current_status = current_row.as_ref().and_then(|(s, _, _)| s.clone());
+        let has_timed_hold = current_row.as_ref().and_then(|(_, u, _)| *u).is_some();
+        let repository_id = current_row.as_ref().map(|(_, _, r)| *r);
 
-        // The quarantine-period branch does not consult policies; only the
-        // legacy proxy-scan branch is gated on them, fail-open on error.
-        let policy_result = match current_status.as_deref() {
-            Some("quarantined") => None,
-            _ => {
-                let repository_id: Option<Uuid> =
-                    match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
-                        .bind(artifact_id)
-                        .fetch_optional(&self.db)
-                        .await
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            tracing::warn!(
-                                artifact_id = %artifact_id,
-                                error = %e,
-                                "Repository lookup failed; falling back to flagged/clean"
-                            );
-                            None
-                        }
-                    };
-
-                match repository_id {
-                    Some(repository_id) => {
-                        let svc =
-                            crate::services::policy_service::PolicyService::new(self.db.clone());
-                        match svc.evaluate_artifact(artifact_id, repository_id).await {
-                            Ok(r) => Some(r),
-                            Err(e) => {
-                                tracing::warn!(
-                                    artifact_id = %artifact_id,
-                                    error = %e,
-                                    "Policy evaluation failed; falling back to flagged/clean"
-                                );
-                                None
-                            }
-                        }
+        // Policies are evaluated for every artifact, including one currently under
+        // a timed hold. Skipping the hold case would mean scan policies never run
+        // at all on repositories that enable the quarantine period — the strictest
+        // ingest setting — because the first scan always arrives while the hold is
+        // in place (#2912). Fail open on error so a broken policy engine never
+        // takes scanning down.
+        let policy_result = match repository_id {
+            Some(repository_id) => {
+                let svc = crate::services::policy_service::PolicyService::new(self.db.clone());
+                match svc.evaluate_artifact(artifact_id, repository_id).await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(
+                            artifact_id = %artifact_id,
+                            repository_id = %repository_id,
+                            error = %e,
+                            "Policy evaluation failed; falling back to flagged/clean"
+                        );
+                        None
                     }
-                    None => None,
                 }
+            }
+            None => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    "Artifact repository lookup failed; falling back to flagged/clean"
+                );
+                None
             }
         };
 
@@ -4749,15 +4831,23 @@ impl ScannerService {
         }
 
         if decision.clear_until {
-            // Use conditional UPDATE to prevent race conditions: only update
-            // if the artifact is still in 'quarantined' state. If an admin
-            // already rejected it, this UPDATE will affect 0 rows (which is fine).
+            // Guard on BOTH halves of the predicate that selected this branch: the
+            // artifact must still be quarantined AND still carry a timed hold.
+            // Re-checking only the status would let this write land on an admin
+            // quarantine (quarantine_until NULL) set between the read above and
+            // here, silently releasing it (#2912). Releasing clears the reason to
+            // match `quarantine_service::transition`; escalating to a permanent
+            // policy quarantine records it.
             let result = sqlx::query(
-                "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
-                 WHERE id = $1 AND quarantine_status = 'quarantined'",
+                "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
+                       quarantine_reason = CASE WHEN $2 = 'released' THEN NULL \
+                                                ELSE COALESCE($3, quarantine_reason) END \
+                 WHERE id = $1 AND quarantine_status = 'quarantined' \
+                       AND quarantine_until IS NOT NULL",
             )
             .bind(artifact_id)
             .bind(&decision.status)
+            .bind(&decision.reason)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -4766,7 +4856,7 @@ impl ScannerService {
                 tracing::info!(
                     artifact_id = %artifact_id,
                     attempted_status = %decision.status,
-                    "Quarantine transition skipped: artifact is no longer in quarantined state"
+                    "Quarantine transition skipped: artifact is no longer under a timed hold"
                 );
             }
         } else {
@@ -4811,7 +4901,22 @@ pub(crate) fn post_scan_status_decision(
     // expiring hold to auto-release.
     has_timed_hold: bool,
 ) -> PostScanDecision {
+    // A policy violation is the strongest outcome and outranks every other, so it
+    // is resolved first — including ahead of a timed hold's auto-release. Otherwise
+    // a violating artifact whose scan happens to complete while an upload hold is
+    // still in place would be released on a clean severity count (#2912).
+    let violation = policy.filter(|p| !p.allowed);
+
     if matches!(current_status, Some("quarantined")) && has_timed_hold {
+        if let Some(p) = violation {
+            // Convert the expiring hold into a permanent policy quarantine:
+            // `clear_until` drops the expiry so the block does not lapse.
+            return PostScanDecision {
+                status: "quarantined".to_string(),
+                clear_until: true,
+                reason: Some(p.violations.join("; ")),
+            };
+        }
         let state = crate::services::quarantine_service::status_after_scan(findings_count > 0);
         return PostScanDecision {
             status: state.as_str().to_string(),
@@ -4819,14 +4924,12 @@ pub(crate) fn post_scan_status_decision(
             reason: None,
         };
     }
-    if let Some(p) = policy {
-        if !p.allowed {
-            return PostScanDecision {
-                status: "quarantined".to_string(),
-                clear_until: false,
-                reason: Some(p.violations.join("; ")),
-            };
-        }
+    if let Some(p) = violation {
+        return PostScanDecision {
+            status: "quarantined".to_string(),
+            clear_until: false,
+            reason: Some(p.violations.join("; ")),
+        };
     }
     PostScanDecision {
         status: if findings_count > 0 {
@@ -5020,16 +5123,54 @@ mod tests {
     }
 
     #[test]
-    fn test_post_scan_status_quarantine_period_branch_untouched() {
+    fn test_post_scan_status_timed_hold_uses_status_after_scan_when_no_violation() {
         // current status 'quarantined' with a timed hold (quarantine_until
-        // non-NULL, e.g. upload/age-gate) must keep using status_after_scan
-        // regardless of policy result.
+        // non-NULL, e.g. upload/age-gate) resolves via status_after_scan when no
+        // policy is violated.
         let d = post_scan_status_decision(Some("quarantined"), 0, None, true);
         assert!(d.clear_until);
         assert_eq!(d.status, "released");
         let d = post_scan_status_decision(Some("quarantined"), 1, None, true);
         assert!(d.clear_until);
         assert_eq!(d.status, "rejected");
+
+        // An *allowed* policy result must not change that outcome either.
+        let ok = crate::models::security::PolicyResult {
+            allowed: true,
+            violations: vec![],
+        };
+        let d = post_scan_status_decision(Some("quarantined"), 0, Some(&ok), true);
+        assert_eq!(d.status, "released");
+    }
+
+    #[test]
+    fn test_post_scan_status_policy_violation_outranks_timed_hold_release() {
+        // Regression: the timed-hold branch used to return before consulting the
+        // policy, so on a repository with the quarantine period enabled a policy
+        // violation with a clean severity count resolved to 'released' -- policies
+        // never enforced at all on the strictest ingest setting (#2912). A
+        // violation must instead convert the expiring hold into a permanent block:
+        // 'quarantined' with clear_until set, so the expiry is dropped and the
+        // hold cannot lapse.
+        let violated = crate::models::security::PolicyResult {
+            allowed: false,
+            violations: vec!["Policy 'sig-required': artifact is unsigned".into()],
+        };
+        let d = post_scan_status_decision(Some("quarantined"), 0, Some(&violated), true);
+        assert_eq!(d.status, "quarantined");
+        assert!(
+            d.clear_until,
+            "the expiry must be cleared so the block is permanent"
+        );
+        assert_eq!(
+            d.reason.as_deref(),
+            Some("Policy 'sig-required': artifact is unsigned")
+        );
+
+        // Same when the scan also produced findings.
+        let d = post_scan_status_decision(Some("quarantined"), 4, Some(&violated), true);
+        assert_eq!(d.status, "quarantined");
+        assert!(d.clear_until);
     }
 
     #[test]

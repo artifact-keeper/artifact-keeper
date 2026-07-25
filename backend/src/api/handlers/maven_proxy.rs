@@ -262,7 +262,6 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
                 crate::services::quarantine_service::check_download_allowed(
                     quarantine_status.as_deref(),
                     quarantine_until,
-                    None,
                     chrono::Utc::now(),
                 )
                 .map_err(|e| e.into_response())?;
