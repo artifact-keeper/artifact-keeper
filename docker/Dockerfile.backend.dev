@@ -5,6 +5,7 @@ FROM rust:1.97-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     liblzma-dev \
+    libprotobuf-dev \
     libssl-dev \
     pkg-config \
     protobuf-compiler \
