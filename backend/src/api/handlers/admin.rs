@@ -250,6 +250,13 @@ pub struct CreateBackupRequest {
     /// also supplied the excluded ids are removed from that include list;
     /// otherwise every repository except the excluded ones is backed up.
     pub exclude_repositories: Option<Vec<Uuid>>,
+    /// Optional RFC3339 lower bound on artifact modification time (#2789).
+    ///
+    /// When set, the (typically incremental) backup includes only artifacts
+    /// whose `updated_at` is at or after this timestamp, capturing just the
+    /// changes made from the given date/time to now. When omitted every
+    /// artifact is included, so backup behavior is unchanged.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional custom name/label for the backup archive (#2790).
     ///
     /// When provided it becomes the identifying part of the archive
@@ -424,6 +431,7 @@ pub async fn create_backup(
             backup_type,
             repository_ids: payload.repository_ids,
             exclude_repository_ids: payload.exclude_repositories,
+            since: payload.since,
             created_by: Some(auth.user_id),
             name: payload.name,
         })
@@ -1809,6 +1817,25 @@ mod tests {
         let json = r#"{"type": "full"}"#;
         let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
         assert!(req.name.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_since_defaults_none() {
+        // #2789: without `since` the backup keeps its default (all artifacts).
+        let json = r#"{"type": "incremental"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert!(req.since.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_parses_rfc3339_since() {
+        // #2789: an RFC3339 timestamp is accepted and parsed to a UTC instant.
+        let json = r#"{"type": "incremental", "since": "2026-01-15T12:30:00Z"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(req.since, Some(expected));
     }
 
     #[test]
