@@ -68,6 +68,19 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/api/models/:namespace/:name",
             get(model_info_namespaced),
         )
+        // Model info at a specific revision: bare model id. `huggingface_hub`
+        // requests this variant whenever a revision is known (the CLI/
+        // `snapshot_download` default is "main"), so without this route the
+        // client 404s before it ever reaches `download_file`.
+        .route(
+            "/:repo_key/api/models/:model_id/revision/:revision",
+            get(model_info_revision),
+        )
+        // Model info at a specific revision: namespaced model id.
+        .route(
+            "/:repo_key/api/models/:namespace/:name/revision/:revision",
+            get(model_info_revision_namespaced),
+        )
         // Upload file to model: bare model id
         .route(
             "/:repo_key/api/models/:model_id/upload/:revision",
@@ -192,26 +205,64 @@ async fn model_info(
     State(state): State<SharedState>,
     Path((repo_key, model_id)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    model_info_impl(state, repo_key, model_id).await
+    model_info_impl(state, repo_key, model_id, None).await
 }
 
 async fn model_info_namespaced(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
-    model_info_impl(state, repo_key, format!("{namespace}/{name}")).await
+    model_info_impl(state, repo_key, format!("{namespace}/{name}"), None).await
+}
+
+async fn model_info_revision(
+    State(state): State<SharedState>,
+    Path((repo_key, model_id, revision)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    model_info_impl(state, repo_key, model_id, Some(revision)).await
+}
+
+async fn model_info_revision_namespaced(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    model_info_impl(
+        state,
+        repo_key,
+        format!("{namespace}/{name}"),
+        Some(revision),
+    )
+    .await
 }
 
 async fn model_info_impl(
     state: SharedState,
     repo_key: String,
     model_id: String,
+    revision: Option<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let artifact = proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &model_id)
-        .await?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Model not found").into_response())?;
+    let artifact =
+        proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &model_id).await?;
+
+    // Not cached locally: for a Remote repo, proxy the upstream Hugging Face
+    // model-info JSON instead of 404ing immediately. This mirrors the
+    // pull-through `download_file_impl` already does for file downloads
+    // (via `try_remote_or_virtual_download`) - without it, `hf download`
+    // never gets past the initial file-listing call for any model that
+    // hasn't already been cached by a prior download.
+    let artifact = match artifact {
+        Some(a) => a,
+        None => {
+            if let Some(resp) =
+                proxy_model_info(&state, &repo, &model_id, revision.as_deref()).await?
+            {
+                return Ok(resp);
+            }
+            return Err((StatusCode::NOT_FOUND, "Model not found").into_response());
+        }
+    };
 
     let siblings = sqlx::query!(
         r#"
@@ -257,6 +308,64 @@ async fn model_info_impl(
     });
 
     Ok(super::json_response(&json))
+}
+
+/// Proxy the upstream Hugging Face model-info JSON for a Remote repo.
+///
+/// Returns `Ok(None)` when the repo isn't a Remote repo (or has no
+/// `upstream_url`/proxy service wired up), so the caller falls through to its
+/// existing 404. Returns `Err` for a genuine upstream failure (404, 5xx,
+/// path-traversal rejection, ...) via `proxy_helpers::proxy_fetch_capped` -
+/// never a silently-empty 200.
+///
+/// The upstream path mirrors the real `huggingface_hub` client request:
+/// `api/models/{model_id}` with no revision, or
+/// `api/models/{model_id}/revision/{revision}` when one is given.
+/// `proxy_fetch_capped` runs the request through `ProxyService`'s existing
+/// cache-path validator (rejects `..` segments etc.), so no separate
+/// traversal guard is needed here - `model_id` flows into that same
+/// validated path exactly as it already does for `download_file_impl`'s
+/// `resolve/{revision}/{filename}` upstream path.
+async fn proxy_model_info(
+    state: &SharedState,
+    repo: &RepoInfo,
+    model_id: &str,
+    revision: Option<&str>,
+) -> Result<Option<Response>, Response> {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return Ok(None);
+    }
+    let Some(upstream_url) = repo.upstream_url.as_deref() else {
+        return Ok(None);
+    };
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+
+    let upstream_path = match revision {
+        Some(rev) => format!("api/models/{model_id}/revision/{rev}"),
+        None => format!("api/models/{model_id}"),
+    };
+
+    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,5 +1213,251 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Model-info `/revision/{revision}` routes and upstream pull-through.
+    //
+    // `hf download <org/model>` calls
+    // `GET /api/models/{model_id}/revision/{revision}` to list a model's
+    // files before downloading them. Before this fix there was no route for
+    // that path at all (bare or namespaced), and even with a route,
+    // `model_info_impl` never consulted the upstream Hugging Face API for an
+    // uncached model - both gaps 404'd a fresh `hf download` immediately.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_revision_route_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "huggingface/gpt2/main/config.json",
+            "gpt2/main/config.json",
+            "gpt2",
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/models/gpt2/revision/main", f.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the bare /revision/ route must exist and reach model_info_impl"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], "gpt2");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_revision_route_serves_local_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let model_id = "sentence-transformers/all-MiniLM-L6-v2";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("huggingface/{model_id}/main/config.json"),
+            &format!("{model_id}/main/config.json"),
+            model_id,
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/{}/revision/main",
+                f.repo_key, model_id
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the namespaced /revision/ route must exist and reach model_info_impl"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], model_id);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_proxies_upstream_for_uncached_remote_model() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let upstream_json = serde_json::json!({
+            "modelId": "sentence-transformers/all-MiniLM-L6-v2",
+            "sha": "deadbeef",
+            "siblings": [{"rfilename": "config.json"}, {"rfilename": "pytorch_model.bin"}],
+        });
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_json))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an uncached model on a Remote repo must be proxied from upstream, not 404"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(json["siblings"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_proxies_upstream_bare_no_revision() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let upstream_json = serde_json::json!({"modelId": "gpt2", "siblings": []});
+        Mock::given(method("GET"))
+            .and(wm_path("/api/models/gpt2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_json))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/api/models/gpt2", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the no-revision variant must also proxy upstream for an uncached model"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], "gpt2");
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_upstream_404_surfaces_not_empty_200() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/models/does-not-exist/revision/main"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/does-not-exist/revision/main",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a genuine upstream 404 must surface as 404, not a silent empty 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_cached_model_skips_upstream_proxy() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        // No mock registered: if the handler tried to hit upstream for a
+        // cached model, wiremock would return its default 404 and the test
+        // would fail below, proving the DB path was bypassed.
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let repo = f.repo_info("remote", Some(&server.uri()));
+        tdh::seed_artifact(
+            &state,
+            &f.pool,
+            &repo,
+            "huggingface/gpt2/main/config.json",
+            "gpt2/main/config.json",
+            "gpt2",
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"cached\":true}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/api/models/gpt2", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a model already cached in the DB must be served from there, not upstream"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], "gpt2");
     }
 }
