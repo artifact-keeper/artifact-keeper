@@ -109,7 +109,7 @@ pub struct UpdateRepositoryRequest {
     /// default; `Some(true)` opts into legacy unverified ingest.
     pub curation_allow_unverified: Option<bool>,
     /// When `Some`, enables/disables curation-rule enforcement on this
-    /// repository's proxy paths (#<backend issue>); `None` leaves it
+    /// repository's proxy paths (#2912); `None` leaves it
     /// unchanged.
     pub curation_enabled: Option<bool>,
     /// When `Some`, sets the default curation action applied when no rule

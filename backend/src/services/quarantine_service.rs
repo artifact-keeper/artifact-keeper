@@ -405,7 +405,7 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
     Ok(())
 }
 
-/// Pure legality check for the admin quarantine-now action (#<backend issue>).
+/// Pure legality check for the admin quarantine-now action (#2912).
 pub fn admin_quarantine_allowed(current: Option<&str>) -> bool {
     !matches!(current, Some("rejected"))
 }

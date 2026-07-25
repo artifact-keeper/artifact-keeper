@@ -201,7 +201,7 @@ async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["pypi", "poetry", "conda"], "a PyPI").await
 }
 
-/// Curation gate for PyPI proxy requests (#<backend issue>). Returns
+/// Curation gate for PyPI proxy requests (#2912). Returns
 /// `Err(403 response)` when a block rule matches. Name matching is done on
 /// the PEP 503 normalized project name; `version` is `"*"` for the
 /// name-level checks on the index and download paths (neither parses a
@@ -654,7 +654,7 @@ async fn simple_project(
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
     let normalized = normalize_pep503(&project);
 
-    // Curation gate (#<backend issue>): block a curation-ruled package
+    // Curation gate (#2912): block a curation-ruled package
     // before doing any local lookup or upstream fetch for it.
     enforce_pypi_curation(&state, &repo, &normalized, "*").await?;
 
@@ -1389,7 +1389,7 @@ async fn download_or_metadata(
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
-    // Curation gate (#<backend issue>): a name-blocked package must never
+    // Curation gate (#2912): a name-blocked package must never
     // serve any version, whether via PEP 658 metadata or a regular file
     // download, so this runs before either branch below. The filename's
     // version is not parsed here, hence the name-level "*" check.
@@ -7816,7 +7816,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Curation gating (#<backend issue>): a curation "block" rule must 403
+    // Curation gating (#2912): a curation "block" rule must 403
     // requests through the PyPI proxy's simple index on a curation-enabled
     // repository, and must be a no-op on a repository with curation disabled.
     // -----------------------------------------------------------------------

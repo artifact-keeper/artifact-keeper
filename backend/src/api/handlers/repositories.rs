@@ -3087,7 +3087,7 @@ pub async fn update_repository(
         validate_trusted_gpg_key(gpg_key)?;
     }
 
-    // Validate curation_default_action when provided (#<backend issue>).
+    // Validate curation_default_action when provided (#2912).
     // Only "allow" and "review" are accepted: the `repositories.curation_default_action`
     // column has a DB CHECK constraint (migration 071_curation.sql) that does not
     // include "block". Do not widen this list without also widening that constraint.
@@ -3155,7 +3155,7 @@ pub async fn update_repository(
                 // Keyless-sync unverified-ingest opt-in (#2569): omit = unchanged,
                 // Some(false) = fail-closed default, Some(true) = unverified.
                 curation_allow_unverified: payload.curation_allow_unverified,
-                // Curation-rule enforcement (#<backend issue>): omit = unchanged.
+                // Curation-rule enforcement (#2912): omit = unchanged.
                 curation_enabled: payload.curation_enabled,
                 curation_default_action: payload.curation_default_action,
             },
@@ -14589,7 +14589,7 @@ mod tests {
         );
     }
 
-    /// `curation_default_action: "block"` must 400 (#<backend issue>): the
+    /// `curation_default_action: "block"` must 400 (#2912): the
     /// `repositories.curation_default_action` column has a DB CHECK
     /// constraint (migration 071_curation.sql) that allows only "allow" and
     /// "review", never "block". The handler must reject it before the
