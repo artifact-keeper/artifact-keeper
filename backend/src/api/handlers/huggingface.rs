@@ -8,6 +8,14 @@
 //!   GET  /huggingface/{repo_key}/{model_id}/resolve/{revision}/{filename}     - Download file
 //!   POST /huggingface/{repo_key}/api/models/{model_id}/upload/{revision}      - Upload file
 //!   GET  /huggingface/{repo_key}/api/models/{model_id}/tree/{revision}        - List files
+//!
+//! `{model_id}` above is written as a single placeholder, but real Hugging
+//! Face model IDs are almost always namespaced (`org/name`, e.g.
+//! `sentence-transformers/all-MiniLM-L6-v2`). Axum's `:param` segments cannot
+//! contain a literal `/`, so every route that carries a model ID is
+//! registered twice: once with a single `:model_id` segment (bare IDs like
+//! `gpt2`) and once with `:namespace/:name` (two segments, rejoined into
+//! `"namespace/name"` inside the handler). See `router()` below.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -53,22 +61,42 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // List models
         .route("/:repo_key/api/models", get(list_models))
-        // Model info
+        // Model info: bare model id (e.g. "gpt2")
         .route("/:repo_key/api/models/:model_id", get(model_info))
-        // Upload file to model
+        // Model info: namespaced model id (e.g. "org/name")
+        .route(
+            "/:repo_key/api/models/:namespace/:name",
+            get(model_info_namespaced),
+        )
+        // Upload file to model: bare model id
         .route(
             "/:repo_key/api/models/:model_id/upload/:revision",
             post(upload_file),
         )
-        // List files in model (tree)
+        // Upload file to model: namespaced model id
+        .route(
+            "/:repo_key/api/models/:namespace/:name/upload/:revision",
+            post(upload_file_namespaced),
+        )
+        // List files in model (tree): bare model id
         .route(
             "/:repo_key/api/models/:model_id/tree/:revision",
             get(list_files),
         )
-        // Download file from model
+        // List files in model (tree): namespaced model id
+        .route(
+            "/:repo_key/api/models/:namespace/:name/tree/:revision",
+            get(list_files_namespaced),
+        )
+        // Download file from model: bare model id
         .route(
             "/:repo_key/:model_id/resolve/:revision/*filename",
             get(download_file),
+        )
+        // Download file from model: namespaced model id
+        .route(
+            "/:repo_key/:namespace/:name/resolve/:revision/*filename",
+            get(download_file_namespaced),
         )
 }
 
@@ -164,6 +192,21 @@ async fn model_info(
     State(state): State<SharedState>,
     Path((repo_key, model_id)): Path<(String, String)>,
 ) -> Result<Response, Response> {
+    model_info_impl(state, repo_key, model_id).await
+}
+
+async fn model_info_namespaced(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    model_info_impl(state, repo_key, format!("{namespace}/{name}")).await
+}
+
+async fn model_info_impl(
+    state: SharedState,
+    repo_key: String,
+    model_id: String,
+) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
     let artifact = proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &model_id)
@@ -223,6 +266,39 @@ async fn model_info(
 async fn download_file(
     State(state): State<SharedState>,
     Path((repo_key, model_id, revision, filename)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    download_file_impl(state, repo_key, model_id, revision, filename, ctx).await
+}
+
+async fn download_file_namespaced(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name, revision, filename)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    download_file_impl(
+        state,
+        repo_key,
+        format!("{namespace}/{name}"),
+        revision,
+        filename,
+        ctx,
+    )
+    .await
+}
+
+async fn download_file_impl(
+    state: SharedState,
+    repo_key: String,
+    model_id: String,
+    revision: String,
+    filename: String,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
@@ -291,6 +367,37 @@ async fn upload_file(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload_file_impl(state, auth, repo_key, model_id, revision, headers, body).await
+}
+
+async fn upload_file_namespaced(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload_file_impl(
+        state,
+        auth,
+        repo_key,
+        format!("{namespace}/{name}"),
+        revision,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn upload_file_impl(
+    state: SharedState,
+    auth: Option<AuthExtension>,
+    repo_key: String,
+    model_id: String,
+    revision: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
@@ -426,6 +533,22 @@ async fn upload_file(
 async fn list_files(
     State(state): State<SharedState>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    list_files_impl(state, repo_key, model_id, revision).await
+}
+
+async fn list_files_namespaced(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    list_files_impl(state, repo_key, format!("{namespace}/{name}"), revision).await
+}
+
+async fn list_files_impl(
+    state: SharedState,
+    repo_key: String,
+    model_id: String,
+    revision: String,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
@@ -783,6 +906,194 @@ mod tests {
         let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/{}/api/models/my-model/upload/main", f.repo_key))
+            .header("x-filename", "weights.bin")
+            .body(axum::body::Body::from(vec![0u8; 16]))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CREATED,
+            "got {}",
+            status
+        );
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Namespaced model id ("org/name") routing.
+    //
+    // Real Hugging Face model IDs are almost always namespaced (e.g.
+    // "sentence-transformers/all-MiniLM-L6-v2"). Axum's single-segment
+    // `:model_id` placeholder cannot match a value containing `/`, so these
+    // tests exercise the `:namespace/:name` router variants added to fix
+    // that 404.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_huggingface_resolve_serves_local_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let model_id = "sentence-transformers/all-MiniLM-L6-v2";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("huggingface/{model_id}/main/config.json"),
+            &format!("{model_id}/main/config.json"),
+            model_id,
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/{}/resolve/main/config.json",
+                f.repo_key, model_id
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"{\"x\":1}");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_resolve_404_when_missing_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/missing-org/missing-model/resolve/main/missing.bin",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let model_id = "sentence-transformers/all-MiniLM-L6-v2";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("huggingface/{model_id}/main/config.json"),
+            &format!("{model_id}/main/config.json"),
+            model_id,
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/models/{}", f.repo_key, model_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["modelId"], model_id);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_404_when_missing_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/models/missing-org/missing", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_tree_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let model_id = "sentence-transformers/all-MiniLM-L6-v2";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("huggingface/{model_id}/main/config.json"),
+            &format!("{model_id}/main/config.json"),
+            model_id,
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/models/{}/tree/main", f.repo_key, model_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["path"], "config.json");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_upload_unauthenticated_401_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/api/models/my-org/my-model/upload/main",
+                f.repo_key
+            ))
+            .header("x-filename", "file.bin")
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_upload_succeeds_for_local_namespaced() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/api/models/my-org/my-model/upload/main",
+                f.repo_key
+            ))
             .header("x-filename", "weights.bin")
             .body(axum::body::Body::from(vec![0u8; 16]))
             .unwrap();
