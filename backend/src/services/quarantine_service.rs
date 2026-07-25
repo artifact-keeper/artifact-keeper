@@ -405,6 +405,43 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
     Ok(())
 }
 
+/// Pure legality check for the admin quarantine-now action (#<backend issue>).
+pub fn admin_quarantine_allowed(current: Option<&str>) -> bool {
+    !matches!(current, Some("rejected"))
+}
+
+/// Admin-initiated quarantine. Idempotent: already-quarantined returns Ok("quarantined").
+pub async fn quarantine_now(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<String>,
+) -> Result<&'static str> {
+    let Some((status, _until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? else {
+        return Err(AppError::NotFound(format!(
+            "Artifact {artifact_id} not found"
+        )));
+    };
+    if status.as_deref() == Some("quarantined") {
+        return Ok("quarantined");
+    }
+    if !admin_quarantine_allowed(status.as_deref()) {
+        return Err(AppError::Conflict(
+            "Artifact was rejected during security review; cannot re-quarantine".to_string(),
+        ));
+    }
+    let reason = reason.unwrap_or_else(|| "Quarantined by administrator".to_string());
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+         quarantine_reason = $2 WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .bind(reason)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok("quarantined")
+}
+
 /// Fetch the raw `(quarantine_status, quarantine_until, quarantine_reason)`
 /// for a live artifact.
 ///
@@ -773,6 +810,22 @@ mod tests {
             crate::error::AppError::Conflict(_) => {}
             other => panic!("Expected Conflict error, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // admin_quarantine_allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_admin_quarantine_legality() {
+        assert!(admin_quarantine_allowed(None));
+        assert!(admin_quarantine_allowed(Some("clean")));
+        assert!(admin_quarantine_allowed(Some("flagged")));
+        assert!(admin_quarantine_allowed(Some("unscanned")));
+        assert!(admin_quarantine_allowed(Some("released")));
+        assert!(!admin_quarantine_allowed(Some("rejected")));
+        // already quarantined is a no-op handled by the caller, not an error
+        assert!(admin_quarantine_allowed(Some("quarantined")));
     }
 
     // -----------------------------------------------------------------------

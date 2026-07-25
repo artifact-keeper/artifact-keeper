@@ -1,7 +1,8 @@
 //! Quarantine period management handlers.
 //!
 //! Provides endpoints to query and manage artifact quarantine status:
-//! - GET  /quarantine/:artifact_id     - get quarantine status
+//! - GET  /quarantine/:artifact_id         - get quarantine status
+//! - POST /quarantine/:artifact_id         - admin: quarantine now
 //! - POST /quarantine/:artifact_id/release - admin: release from quarantine
 //! - POST /quarantine/:artifact_id/reject  - admin: reject quarantined artifact
 
@@ -22,7 +23,10 @@ use crate::services::quarantine_service;
 /// Create quarantine routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route("/:artifact_id", get(get_quarantine_status))
+        .route(
+            "/:artifact_id",
+            get(get_quarantine_status).post(quarantine_artifact),
+        )
         .route("/:artifact_id/release", post(release_artifact))
         .route("/:artifact_id/reject", post(reject_artifact))
 }
@@ -37,6 +41,12 @@ pub struct QuarantineStatusResponse {
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
     pub is_blocked: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct QuarantineNowRequest {
+    /// Reason shown to developers whose downloads are blocked.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -102,6 +112,58 @@ pub async fn get_quarantine_status(
         quarantine_status: status,
         quarantine_until: until,
         is_blocked,
+    }))
+}
+
+/// Quarantine an artifact immediately (admin only)
+#[utoipa::path(
+    post,
+    path = "/{artifact_id}",
+    context_path = "/api/v1/quarantine",
+    operation_id = "quarantine_artifact_now",
+    tag = "quarantine",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+    ),
+    request_body(content = QuarantineNowRequest, description = "Optional; empty body uses the default reason"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Artifact quarantined", body = QuarantineActionResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin access required"),
+        (status = 404, description = "Artifact not found"),
+        (status = 409, description = "Artifact was rejected during security review"),
+    )
+)]
+pub async fn quarantine_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(artifact_id): Path<Uuid>,
+    body: Option<Json<QuarantineNowRequest>>,
+) -> Result<Json<QuarantineActionResponse>> {
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    auth.require_admin()?;
+
+    let reason = body.and_then(|Json(req)| req.reason);
+    let new_status = quarantine_service::quarantine_now(&state.db, artifact_id, reason).await?;
+
+    tracing::info!(
+        artifact_id = %artifact_id,
+        admin = %auth.username,
+        "Artifact quarantined by admin"
+    );
+
+    state.event_bus.emit(
+        "artifact.quarantine.quarantined",
+        artifact_id,
+        Some(auth.username),
+    );
+
+    Ok(Json(QuarantineActionResponse {
+        artifact_id,
+        new_status: new_status.to_string(),
+        message: "Artifact quarantined".to_string(),
     }))
 }
 
@@ -226,11 +288,13 @@ pub async fn reject_artifact(
 #[openapi(
     paths(
         get_quarantine_status,
+        quarantine_artifact,
         release_artifact,
         reject_artifact,
     ),
     components(schemas(
         QuarantineStatusResponse,
+        QuarantineNowRequest,
         QuarantineActionResponse,
         RejectRequest,
     )),
