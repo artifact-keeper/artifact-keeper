@@ -6763,20 +6763,20 @@ async fn oci_manifest_quarantine_block(
     repo_id: Uuid,
     manifest_digest: &str,
 ) -> Option<Response> {
-    let artifact_id = match resolve_local_manifest_artifact_id(state, repo_id, manifest_digest).await
-    {
-        Ok(Some(id)) => id,
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::warn!(
-                %repo_id,
-                manifest_digest = %manifest_digest,
-                error = %e,
-                "failed to resolve manifest artifact for the quarantine gate; failing open"
-            );
-            return None;
-        }
-    };
+    let artifact_id =
+        match resolve_local_manifest_artifact_id(state, repo_id, manifest_digest).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    %repo_id,
+                    manifest_digest = %manifest_digest,
+                    error = %e,
+                    "failed to resolve manifest artifact for the quarantine gate; failing open"
+                );
+                return None;
+            }
+        };
 
     match crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id).await
     {

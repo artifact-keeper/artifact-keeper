@@ -7947,10 +7947,227 @@ mod tests {
             "403 body must surface the rule's reason: {}",
             String::from_utf8_lossy(&blocked_body)
         );
+        // Asserted as the concrete expected status rather than `!= 403`: a
+        // not-403 assertion passes on pre-enforcement code and for reasons that
+        // have nothing to do with curation, so it is a guard, not a regression
+        // test. 404 is what this handler returns once the request falls through to
+        // the fixture's unreachable upstream.
+        assert_eq!(
+            allowed_status,
+            StatusCode::NOT_FOUND,
+            "a package not matched by any rule must fall through to the (unreachable) \
+             upstream rather than being blocked by curation"
+        );
+    }
+
+    /// Enable curation on a repository and insert one block rule.
+    async fn enable_curation_with_rule(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        pattern: &str,
+        version_constraint: &str,
+    ) {
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("enable curation");
+
+        sqlx::query(
+            "INSERT INTO curation_rules \
+                 (staging_repo_id, package_pattern, version_constraint, architecture, \
+                  action, priority, reason, enabled, created_by) \
+             VALUES ($1, $2, $3, '*', 'block', 10, 'blocked by test rule', true, $4)",
+        )
+        .bind(repo_id)
+        .bind(pattern)
+        .bind(version_constraint)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert curation block rule");
+    }
+
+    /// The download path must be gated too, not just the index. Deleting the gate
+    /// in `download_or_metadata` would otherwise leave the feature looking alive
+    /// while the path that actually serves bytes was open (#2912).
+    #[tokio::test]
+    async fn test_curation_block_rule_403s_download() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "evilpkg*", "*").await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!(
+            "/{}/simple/evilpkg/evilpkg-1.0.tar.gz",
+            fx.repo_key
+        ));
+        let (status, body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a curation block rule must 403 the download path"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("blocked by test rule"),
+            "403 body must surface the rule's reason: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A rule written the way PyPI displays the project must match the normalized
+    /// request name. `glob_match` is case-sensitive and the gate normalizes only the
+    /// request, so before the fix a `PyYAML` rule silently enforced nothing on the
+    /// proxy while the staging-sync path enforced it (#2912).
+    #[tokio::test]
+    async fn test_curation_rule_pattern_is_pep503_insensitive() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        // Display spelling: mixed case AND an underscore separator.
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "Evil_Pkg", "*").await;
+
+        let app = fx.router_with_auth(super::router());
+        // PEP 503 request spelling for the same project.
+        let req = tdh::get(format!("/{}/simple/evil-pkg/", fx.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a rule spelled 'Evil_Pkg' must block a request for 'evil-pkg'"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("blocked by test rule"));
+    }
+
+    /// A version-constrained rule must be decided against the real version, and
+    /// skipped (not mis-evaluated) when the request carries none. Before the fix the
+    /// gate passed the literal "*" as the *version*, which made `>=` rules match
+    /// nothing and `<` rules match everything (#2912).
+    #[tokio::test]
+    async fn test_curation_version_constraint_applies_on_download_only() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "evilpkg", ">= 2.0").await;
+
+        // Download of a version the rule covers: blocked.
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!(
+            "/{}/simple/evilpkg/evilpkg-2.5.tar.gz",
+            fx.repo_key
+        ));
+        let (blocked_status, _) = tdh::send(app, req).await;
+
+        // Download of a version below the constraint: not blocked.
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!(
+            "/{}/simple/evilpkg/evilpkg-1.0.tar.gz",
+            fx.repo_key
+        ));
+        let (allowed_status, _) = tdh::send(app, req).await;
+
+        // Index request carries no version, so the constrained rule is skipped
+        // rather than being read as matching (or not matching) everything.
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/simple/evilpkg/", fx.repo_key));
+        let (index_status, _) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "'>= 2.0' must block version 2.5 on the download path"
+        );
         assert_ne!(
             allowed_status,
             StatusCode::FORBIDDEN,
-            "a package not matched by any rule must not be blocked by curation"
+            "'>= 2.0' must not block version 1.0"
+        );
+        assert_ne!(
+            index_status,
+            StatusCode::FORBIDDEN,
+            "a version-constrained rule must not block a versionless index request"
+        );
+    }
+
+    /// A virtual repository fronting a curated remote must enforce that member's
+    /// rules. Before the fix the gate only saw the virtual repository's own flags,
+    /// so the normal curated-mirror topology served blocked packages — the same
+    /// bypass class #2066 fixed for the age gate (#2912).
+    #[tokio::test]
+    async fn test_curation_enforced_through_virtual_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "evilpkg*", "*").await;
+
+        // A virtual repository with the curated remote as its only member. The
+        // virtual repo itself has curation disabled, which is the point: the
+        // member's rules must still apply.
+        let virtual_id = uuid::Uuid::new_v4();
+        let virtual_key = format!("ph-test-virtual-{virtual_id}");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'virtual'::repository_type, 'pypi'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(fx.storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("create virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!("/{virtual_key}/simple/evilpkg/"));
+        let (status, _body) = tdh::send(app, req).await;
+
+        // Clean up the extra rows the fixture's own teardown does not know about.
+        sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        fx.teardown().await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a package blocked by a virtual member's curation rule must not be served \
+             through the virtual repository"
         );
     }
 
@@ -7983,9 +8200,12 @@ mod tests {
 
         fx.teardown().await;
 
-        assert_ne!(
+        // Concrete expected status rather than `!= 403`, which passes trivially on
+        // pre-enforcement code and for reasons unrelated to curation. 404 is the
+        // fall-through once the request reaches the fixture's unreachable upstream.
+        assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a curation-disabled repo must not be blocked by a matching rule"
         );
     }

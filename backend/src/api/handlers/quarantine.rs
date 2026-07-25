@@ -115,12 +115,10 @@ pub async fn get_quarantine_status(
     )
     .is_err();
 
-    // The reason is per-artifact security detail, so it is disclosed only to
-    // callers who can administer the repository — not to every user who can read
-    // a public repo.
-    // `can_access_repo` is unrestricted for admin scope, so this covers admins and
-    // scoped users who genuinely hold the repository, and excludes an
-    // authenticated caller who merely happens to be able to read a public repo.
+    // The reason is per-artifact security detail, so it goes only to callers who
+    // hold the repository. `can_access_repo` is unrestricted for admin scope, so
+    // this covers admins and scoped users who genuinely hold the repo, and excludes
+    // an authenticated caller who merely happens to be able to read a public one.
     let quarantine_reason = if auth_ext.can_access_repo(row.repository_id) {
         row.quarantine_reason
     } else {
@@ -320,6 +318,366 @@ pub async fn reject_artifact(
         new_status: "rejected".to_string(),
         message: format!("Artifact rejected: {}", reason),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use chrono::{DateTime, Duration, Utc};
+
+    /// Insert an artifact in a given quarantine state and return its id.
+    async fn seed_artifact(
+        fx: &tdh::Fixture,
+        status: Option<&str>,
+        until: Option<DateTime<Utc>>,
+        reason: Option<&str>,
+    ) -> Uuid {
+        let artifact_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted,
+                quarantine_status, quarantine_until, quarantine_reason
+            )
+            VALUES ($1, $2, $8, $8, 4, $3,
+                    'application/octet-stream', $4, false, $5, $6, $7)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(format!("{:064x}", artifact_id.as_u128()))
+        .bind(format!("q-test/{artifact_id}.bin"))
+        .bind(status)
+        .bind(until)
+        .bind(reason)
+        // Unique per artifact: several tests seed more than one row in the same
+        // fixture repository, and (repository_id, path) is unique.
+        .bind(format!("pkg-{artifact_id}.bin"))
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        artifact_id
+    }
+
+    async fn read_state(
+        fx: &tdh::Fixture,
+        artifact_id: Uuid,
+    ) -> (Option<String>, Option<DateTime<Utc>>, Option<String>) {
+        sqlx::query_as(
+            "SELECT quarantine_status, quarantine_until, quarantine_reason \
+             FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read quarantine state")
+    }
+
+    fn admin_router(fx: &tdh::Fixture) -> axum::Router {
+        let auth = tdh::admin_auth(fx.user_id, &fx.username);
+        crate::api::handlers::test_db_helpers::router_with_auth(router(), fx.state.clone(), auth)
+    }
+
+    fn quarantine_req(
+        artifact_id: Uuid,
+        body: &'static str,
+    ) -> axum::http::Request<axum::body::Body> {
+        tdh::post(
+            format!("/{artifact_id}/quarantine"),
+            "application/json",
+            Bytes::from_static(body.as_bytes()),
+        )
+    }
+
+    /// The endpoint must be admin-only. Nothing tested this, so dropping
+    /// `require_admin` would have left it world-writable with a green suite (#2912).
+    #[tokio::test]
+    async fn test_quarantine_now_requires_admin() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx, Some("clean"), None, None).await;
+
+        // `router_with_auth` injects the fixture's ordinary (non-admin) principal.
+        let app = fx.router_with_auth(router());
+        let (status, _) = tdh::send(app, quarantine_req(artifact_id, "{}")).await;
+        let (db_status, _, _) = read_state(&fx, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            db_status.as_deref(),
+            Some("clean"),
+            "a rejected request must not change state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_now_admin_sets_permanent_block_and_reason() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx, Some("clean"), None, None).await;
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            quarantine_req(artifact_id, r#"{"reason":"CVE-2026-9999 exploited"}"#),
+        )
+        .await;
+        let (db_status, until, reason) = read_state(&fx, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(db_status.as_deref(), Some("quarantined"));
+        assert!(until.is_none(), "an admin quarantine must have no expiry");
+        assert_eq!(reason.as_deref(), Some("CVE-2026-9999 exploited"));
+    }
+
+    /// The blocker this endpoint shipped with: `quarantined` covers both an
+    /// expiring upload hold and a permanent block, and the handler returned 200
+    /// without writing when the status already read `quarantined`. The admin's block
+    /// then lapsed with the hold — or, for an already-expired hold, never applied at
+    /// all, since the download gate treats `('quarantined', past)` as downloadable.
+    #[tokio::test]
+    async fn test_quarantine_now_converts_timed_hold_to_permanent() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let future_hold = Utc::now() + Duration::minutes(30);
+        let live = seed_artifact(&fx, Some("quarantined"), Some(future_hold), None).await;
+        // An expired hold is the worse case: downloadable right now.
+        let expired = seed_artifact(
+            &fx,
+            Some("quarantined"),
+            Some(Utc::now() - Duration::minutes(30)),
+            None,
+        )
+        .await;
+
+        let (live_status, _) = tdh::send(
+            admin_router(&fx),
+            quarantine_req(live, r#"{"reason":"malware confirmed"}"#),
+        )
+        .await;
+        let (expired_status, _) = tdh::send(
+            admin_router(&fx),
+            quarantine_req(expired, r#"{"reason":"malware confirmed"}"#),
+        )
+        .await;
+
+        let (live_db, live_until, live_reason) = read_state(&fx, live).await;
+        let (expired_db, expired_until, expired_reason) = read_state(&fx, expired).await;
+        fx.teardown().await;
+
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(expired_status, StatusCode::OK);
+
+        assert_eq!(live_db.as_deref(), Some("quarantined"));
+        assert!(
+            live_until.is_none(),
+            "the hold's expiry must be cleared, or the admin block lapses with it"
+        );
+        assert_eq!(live_reason.as_deref(), Some("malware confirmed"));
+
+        assert_eq!(expired_db.as_deref(), Some("quarantined"));
+        assert!(
+            expired_until.is_none(),
+            "an expired hold must become a permanent block, not stay downloadable"
+        );
+        assert_eq!(expired_reason.as_deref(), Some("malware confirmed"));
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_now_is_idempotent_and_refreshes_reason() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx, Some("quarantined"), None, Some("first reason")).await;
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            quarantine_req(artifact_id, r#"{"reason":"second reason"}"#),
+        )
+        .await;
+        let (db_status, until, reason) = read_state(&fx, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "re-quarantining must not conflict");
+        assert_eq!(db_status.as_deref(), Some("quarantined"));
+        assert!(until.is_none());
+        assert_eq!(
+            reason.as_deref(),
+            Some("second reason"),
+            "an admin correcting the reason must not be silently ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_now_conflicts_on_rejected() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx, Some("rejected"), None, Some("terminal")).await;
+
+        let (status, _) = tdh::send(admin_router(&fx), quarantine_req(artifact_id, "{}")).await;
+        let (db_status, _, reason) = read_state(&fx, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            db_status.as_deref(),
+            Some("rejected"),
+            "a terminal rejection must be preserved"
+        );
+        assert_eq!(reason.as_deref(), Some("terminal"));
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_now_unknown_artifact_is_404() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let (status, _) = tdh::send(admin_router(&fx), quarantine_req(Uuid::new_v4(), "{}")).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// An empty body is allowed (default reason), but a body that was *sent* and is
+    /// malformed must be a 400. `Option<Json<T>>` mapped every rejection to `None`
+    /// on axum 0.7, so a wrong content-type or invalid JSON returned 200 with the
+    /// reason silently defaulted (#2912).
+    #[tokio::test]
+    async fn test_quarantine_now_body_handling() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let empty_body = seed_artifact(&fx, Some("clean"), None, None).await;
+        let bad_json = seed_artifact(&fx, Some("clean"), None, None).await;
+        let wrong_type = seed_artifact(&fx, Some("clean"), None, None).await;
+
+        let (empty_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{empty_body}/quarantine"),
+                "application/json",
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let (bad_status, _) = tdh::send(
+            admin_router(&fx),
+            quarantine_req(bad_json, r#"{"reason": 42}"#),
+        )
+        .await;
+        let (wrong_status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{wrong_type}/quarantine"),
+                "text/plain",
+                Bytes::from_static(b"reason=whatever"),
+            ),
+        )
+        .await;
+
+        let (empty_db, _, empty_reason) = read_state(&fx, empty_body).await;
+        let (bad_db, _, _) = read_state(&fx, bad_json).await;
+        let (wrong_db, _, _) = read_state(&fx, wrong_type).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            empty_status,
+            StatusCode::OK,
+            "an omitted body is valid and uses the default reason"
+        );
+        assert_eq!(empty_db.as_deref(), Some("quarantined"));
+        assert_eq!(
+            empty_reason.as_deref(),
+            Some("Quarantined by administrator")
+        );
+
+        assert_eq!(
+            bad_status,
+            StatusCode::BAD_REQUEST,
+            "a malformed JSON body must not be silently defaulted"
+        );
+        assert_eq!(
+            bad_db.as_deref(),
+            Some("clean"),
+            "a rejected body must not change state"
+        );
+
+        assert_eq!(
+            wrong_status,
+            StatusCode::BAD_REQUEST,
+            "a non-JSON body must not be silently defaulted"
+        );
+        assert_eq!(wrong_db.as_deref(), Some("clean"));
+    }
+
+    /// The reason is disclosed here — the authenticated, visibility-checked read
+    /// path — and not in blocked-download errors, which are reachable anonymously
+    /// on public repositories (#2912).
+    #[tokio::test]
+    async fn test_status_endpoint_exposes_reason_to_authorized_caller() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(
+            &fx,
+            Some("quarantined"),
+            None,
+            Some("Policy 'cve-gate': 2 findings at or above high"),
+        )
+        .await;
+
+        let app = fx.router_with_auth(router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{artifact_id}"))).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("status response must be JSON");
+        assert_eq!(json["quarantine_status"], "quarantined");
+        assert_eq!(json["is_blocked"], true);
+        assert_eq!(
+            json["quarantine_reason"],
+            "Policy 'cve-gate': 2 findings at or above high"
+        );
+    }
+
+    /// Rejecting must persist the admin's stated reason, not merely log it.
+    #[tokio::test]
+    async fn test_reject_persists_admin_reason() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id =
+            seed_artifact(&fx, Some("quarantined"), None, Some("earlier hold reason")).await;
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            tdh::post(
+                format!("/{artifact_id}/reject"),
+                "application/json",
+                Bytes::from_static(br#"{"reason":"malicious maintainer takeover"}"#),
+            ),
+        )
+        .await;
+        let (db_status, _, reason) = read_state(&fx, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(db_status.as_deref(), Some("rejected"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("malicious maintainer takeover"),
+            "the rejection reason must replace the earlier quarantine reason"
+        );
+    }
 }
 
 #[derive(OpenApi)]

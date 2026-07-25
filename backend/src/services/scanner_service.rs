@@ -5201,6 +5201,263 @@ mod tests {
         );
     }
 
+    /// Build a `ScannerService` wired to the fixture's pool and storage.
+    ///
+    /// Shared by the DB-backed quarantine tests so the (long) struct literal is
+    /// expressed once.
+    fn scanner_for_fixture(fx: &crate::api::handlers::test_db_helpers::Fixture) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    /// Seed a completed scan with one `high` finding, so a `max_severity = 'high'`
+    /// policy is violated. Returns the scan_result id.
+    async fn seed_completed_scan_with_high_finding(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) -> Uuid {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                       findings_count, high_count, completed_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 1, 1, NOW())",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repository_id)
+        .execute(pool)
+        .await
+        .expect("insert completed scan");
+
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'high', 'CVE-2026-0001 in libfoo')",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .expect("insert high finding");
+
+        scan_id
+    }
+
+    async fn seed_enabled_policy(pool: &sqlx::PgPool, repository_id: Uuid, name: &str) {
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', false, true, true)",
+        )
+        .bind(name)
+        .bind(repository_id)
+        .execute(pool)
+        .await
+        .expect("insert scan policy");
+    }
+
+    async fn quarantine_row(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+    ) -> (Option<String>, Option<String>, bool) {
+        let row: (Option<String>, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT quarantine_status, quarantine_reason, quarantine_until \
+             FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch quarantine row");
+        (row.0, row.1, row.2.is_some())
+    }
+
+    async fn insert_test_artifact(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        artifact_id: Uuid,
+        label: &str,
+        status: Option<&str>,
+        until: Option<DateTime<Utc>>,
+    ) {
+        let checksum = fresh_checksum();
+        let storage_key = format!("{label}/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted,
+                quarantine_status, quarantine_until
+            )
+            VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3,
+                    'application/octet-stream', $4, false, $5, $6)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .bind(status)
+        .bind(until)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+    }
+
+    /// The regression test for the headline bug (#2912): an enabled scan policy
+    /// must actually quarantine at scan completion.
+    ///
+    /// This exercises the *wiring* — `update_quarantine_status` reaching
+    /// `PolicyService::evaluate_artifact` — not just the pure decision function.
+    /// Before the fix the call site did not exist, so a violating artifact was left
+    /// `flagged`, which the download gate treats as downloadable.
+    #[tokio::test]
+    async fn test_update_quarantine_status_enforces_enabled_scan_policy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "policy-enforced", Some("clean"), None).await;
+        seed_completed_scan_with_high_finding(&fx.pool, artifact_id, fx.repo_id).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, "test-cve-gate").await;
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner
+            .update_quarantine_status(artifact_id, 1)
+            .await
+            .expect("update_quarantine_status must not error");
+
+        let (status, reason, has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status.as_deref(),
+            Some("quarantined"),
+            "a completed scan violating an enabled policy must quarantine the artifact"
+        );
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("test-cve-gate"),
+            "the stored reason must name the violated policy, got {reason:?}"
+        );
+        assert!(
+            !has_until,
+            "a policy quarantine must be permanent (quarantine_until NULL) so it cannot lapse"
+        );
+    }
+
+    /// Negative twin of the above: a *disabled* policy must not quarantine, so the
+    /// test above cannot pass merely because something always quarantines.
+    #[tokio::test]
+    async fn test_update_quarantine_status_ignores_disabled_scan_policy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "policy-disabled", Some("clean"), None).await;
+        seed_completed_scan_with_high_finding(&fx.pool, artifact_id, fx.repo_id).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        is_enabled) \
+             VALUES ('disabled-gate', $1, 'high', false, false)",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert disabled policy");
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner
+            .update_quarantine_status(artifact_id, 1)
+            .await
+            .expect("update_quarantine_status must not error");
+
+        let (status, _reason, _has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status.as_deref(),
+            Some("flagged"),
+            "a disabled policy must leave the artifact at the findings-derived status"
+        );
+    }
+
+    /// A policy violation must convert an *expiring* upload hold into a permanent
+    /// quarantine. Before the fix the timed-hold branch returned before consulting
+    /// the policy, so on a repository with the quarantine period enabled a
+    /// violating artifact was released as soon as its scan completed clean (#2912).
+    #[tokio::test]
+    async fn test_policy_violation_converts_timed_hold_to_permanent_quarantine() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        insert_test_artifact(
+            &fx,
+            artifact_id,
+            "timed-hold-policy",
+            Some("quarantined"),
+            Some(until),
+        )
+        .await;
+        seed_completed_scan_with_high_finding(&fx.pool, artifact_id, fx.repo_id).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, "hold-cve-gate").await;
+
+        let scanner = scanner_for_fixture(&fx);
+        // findings_count = 0 is the interesting case: status_after_scan would have
+        // released it.
+        scanner
+            .update_quarantine_status(artifact_id, 0)
+            .await
+            .expect("update_quarantine_status must not error");
+
+        let (status, reason, has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status.as_deref(),
+            Some("quarantined"),
+            "a policy violation must outrank the timed hold's auto-release"
+        );
+        assert!(
+            !has_until,
+            "the expiry must be cleared so the block does not lapse with the hold"
+        );
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("hold-cve-gate"),
+            "the stored reason must name the violated policy, got {reason:?}"
+        );
+    }
+
     /// Integration-level companion to
     /// `test_post_scan_status_admin_or_policy_quarantine_not_auto_released`:
     /// the 'rejected' protection lives in the legacy-branch UPDATE's WHERE
@@ -5273,13 +5530,14 @@ mod tests {
                 .await
                 .expect("fetch quarantine_status")
                 .flatten();
+        // Tear down before asserting so a failure does not leak the fixture's
+        // repository, user, and artifact rows.
+        fx.teardown().await;
         assert_eq!(
             status.as_deref(),
             Some("rejected"),
             "a clean rescan must not downgrade a 'rejected' artifact"
         );
-
-        fx.teardown().await;
     }
 
     /// Integration-level companion to
@@ -5353,13 +5611,13 @@ mod tests {
                 .await
                 .expect("fetch quarantine_status")
                 .flatten();
+        // Tear down before asserting so a failure does not leak fixture rows.
+        fx.teardown().await;
         assert_eq!(
             status.as_deref(),
             Some("quarantined"),
             "a clean rescan must not auto-release an admin/policy quarantine (quarantine_until IS NULL)"
         );
-
-        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------

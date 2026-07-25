@@ -774,6 +774,10 @@ pub struct UpdateRepositoryRequest {
     /// Default curation action when no rule matches: allow or review.
     /// "block" is rejected (DB CHECK, migration 071); use block rules for
     /// specific packages instead.
+    ///
+    /// The allowed set is spelled out in the schema so a generated SDK presents it
+    /// rather than an unconstrained string.
+    #[schema(value_type = String, example = "allow")]
     pub curation_default_action: Option<String>,
 }
 
