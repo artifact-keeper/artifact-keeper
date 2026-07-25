@@ -368,6 +368,52 @@ async fn proxy_model_info(
     ))
 }
 
+/// Fetch the commit sha upstream reports for `(model_id, revision)`, via the
+/// same model-info pull-through [`proxy_model_info`] proxies
+/// (`api/models/{model_id}/revision/{revision}`), parsing the JSON `"sha"`
+/// field. Used by [`download_file_impl`] to inject `X-Repo-Commit` on the
+/// resolve response for Remote repos: `huggingface_hub`'s HEAD-based
+/// metadata check hard-requires that header, and it only ever exists on the
+/// upstream 302/307 hop that the shared reqwest client's auto-follow
+/// swallows (see `hf-deepdive-report.md`), so recovering it from the
+/// separately-proxied model-info document sidesteps the redirect problem
+/// entirely.
+///
+/// Returns `None` when the repo isn't Remote, has no upstream/proxy wired
+/// up, or the upstream call fails or doesn't parse - this is best-effort
+/// metadata, never worth failing the file download over. The metadata
+/// fetch flows through `ProxyService`'s existing cache, so steady-state
+/// cost is a cache read, identical on fresh and cached file serves.
+async fn fetch_upstream_commit_sha(
+    state: &SharedState,
+    repo: &RepoInfo,
+    model_id: &str,
+    revision: &str,
+) -> Option<String> {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_deref()?;
+    let proxy = state.proxy_service.as_deref()?;
+
+    let upstream_path = format!("api/models/{model_id}/revision/{revision}");
+    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
+
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("sha")?.as_str().map(str::to_string)
+}
+
 // ---------------------------------------------------------------------------
 // GET /huggingface/{repo_key}/{model_id}/resolve/{revision}/{filename} — Download file
 // ---------------------------------------------------------------------------
@@ -436,7 +482,7 @@ async fn download_file_impl(
         Ok(a) => a,
         Err(not_found) => {
             let upstream_path = format!("{}/resolve/{}/{}", model_id, revision, filename);
-            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+            if let Some(mut resp) = proxy_helpers::try_remote_or_virtual_download(
                 &state,
                 &repo,
                 &ctx,
@@ -450,6 +496,18 @@ async fn download_file_impl(
             )
             .await?
             {
+                // `huggingface_hub`'s HEAD-based metadata check hard-requires
+                // `X-Repo-Commit` (see hf-deepdive-report.md); Remote-repo
+                // responses need it injected here since the upstream redirect
+                // hop that would otherwise carry it is swallowed by the
+                // shared reqwest client's auto-follow.
+                if let Some(sha) =
+                    fetch_upstream_commit_sha(&state, &repo, &model_id, &revision).await
+                {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&sha) {
+                        resp.headers_mut().insert("x-repo-commit", value);
+                    }
+                }
                 return Ok(resp);
             }
             return Err(not_found);
@@ -1345,6 +1403,122 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["modelId"], "sentence-transformers/all-MiniLM-L6-v2");
         assert_eq!(json["siblings"].as_array().unwrap().len(), 2);
+    }
+
+    /// `huggingface_hub`'s HEAD-based metadata check hard-requires an ETag
+    /// (`X-Linked-Etag` or plain `ETag`) on the resolve response, or it raises
+    /// `FileMetadataError` -> `LocalEntryNotFoundError` (see
+    /// hf-deepdive-report.md). The proxy response builder must forward
+    /// whatever ETag upstream sent rather than synthesizing a bare 200 with
+    /// only Content-Type/Content-Length.
+    #[tokio::test]
+    async fn test_huggingface_resolve_carries_upstream_etag_header() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .set_body_bytes(b"{\"hidden_size\": 384}".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(
+            etag,
+            Some("\"72b987e498d7e3a1\""),
+            "the proxy must forward the upstream ETag so huggingface_hub's \
+             HEAD-based metadata check (which hard-requires an ETag) succeeds"
+        );
+    }
+
+    /// `huggingface_hub`'s HEAD-based metadata check also hard-requires
+    /// `X-Repo-Commit`, which only ever exists on the upstream redirect hop
+    /// that the shared reqwest client's auto-follow swallows (see
+    /// hf-deepdive-report.md). The handler recovers it from the model-info
+    /// pull-through instead (`api/models/{model_id}/revision/{revision}`,
+    /// parsing the `"sha"` field) and injects it as `X-Repo-Commit` on the
+    /// resolve response.
+    #[tokio::test]
+    async fn test_huggingface_resolve_carries_x_repo_commit_from_model_info() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "modelId": "sentence-transformers/all-MiniLM-L6-v2",
+                "sha": "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"{\"hidden_size\": 384}".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let commit = resp
+            .headers()
+            .get("x-repo-commit")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(
+            commit,
+            Some("1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf"),
+            "the resolve response must carry X-Repo-Commit sourced from the \
+             model-info sha, since huggingface_hub's HEAD-based metadata check \
+             hard-requires it"
+        );
     }
 
     #[tokio::test]

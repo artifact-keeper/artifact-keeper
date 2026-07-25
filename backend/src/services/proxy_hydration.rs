@@ -343,6 +343,11 @@ pub struct StreamHandle {
 pub struct StreamHeaders {
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
+    /// Upstream `ETag` (or, for a cache hit, the sidecar's `upstream_etag`),
+    /// forwarded verbatim to the client so `huggingface_hub`'s HEAD-based
+    /// metadata check (which requires an ETag) succeeds. Generic ETag
+    /// forwarding on every proxied stream, not HF-specific.
+    pub etag: Option<String>,
 }
 
 /// One item on a per-key streaming broadcast channel.
@@ -1192,6 +1197,7 @@ mod tests {
         StreamHeaders {
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(11),
+            etag: None,
         }
     }
 
@@ -1407,6 +1413,7 @@ mod tests {
                 headers: StreamHeaders {
                     content_type: None,
                     content_length: Some(0),
+                    etag: None,
                 },
             })
         })

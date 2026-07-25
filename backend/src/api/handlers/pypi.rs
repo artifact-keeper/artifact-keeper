@@ -4500,6 +4500,7 @@ mod tests {
             content_type: None,
             content_length: len,
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -4614,6 +4615,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(content.len() as u64),
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -5016,6 +5018,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length,
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -7706,6 +7709,7 @@ mod tests {
             content_type: Some("application/zip".to_string()),
             content_length: Some(data_len),
             artifact_id: None,
+            etag: None,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);

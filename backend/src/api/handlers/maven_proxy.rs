@@ -185,6 +185,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
                     content_length: None,
                     // Row-less companion object: not anchored to an artifact row.
                     artifact_id: None,
+                    etag: None,
                 });
             }
         }
@@ -216,6 +217,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             content_length: None,
             // Cloud flat-key legacy object: not anchored to our artifact row.
             artifact_id: None,
+            etag: None,
         });
     }
 
@@ -348,6 +350,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         content_length: None,
         // Remote proxy-cache stream: not our artifact row (#1278), unrecorded.
         artifact_id: None,
+        etag: None,
     })
 }
 

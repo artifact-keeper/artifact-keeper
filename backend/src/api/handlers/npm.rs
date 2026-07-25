@@ -2713,6 +2713,7 @@ async fn npm_local_fetch(
         // Local artifact resolved: surface its id so a virtual npm-member
         // download is recorded exactly once at the streaming resolver (#2260).
         artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 

@@ -420,6 +420,7 @@ async fn maven_local_fetch_snapshot(
         // Local snapshot artifact resolved: surface its id so a virtual
         // maven-snapshot member download is recorded exactly once (#2260).
         artifact_id: Some(resolved.id),
+        etag: None,
     })
 }
 

@@ -127,6 +127,11 @@ pub struct StreamingFetchResult {
     /// recording keys off this field so a local-member serve is counted
     /// exactly once, at the shared local-serve choke point (#2260).
     pub artifact_id: Option<Uuid>,
+    /// Upstream `ETag` when known (fresh fetch, cache hit, or stale-if-error
+    /// serve). `None` for local artifact reads, which have no upstream ETag.
+    /// Forwarded verbatim on the outbound response so clients that require
+    /// an ETag on the resolve HEAD (e.g. `huggingface_hub`) get one.
+    pub etag: Option<String>,
 }
 
 impl From<StreamHandle> for StreamingFetchResult {
@@ -140,6 +145,7 @@ impl From<StreamHandle> for StreamingFetchResult {
             content_length: handle.headers.content_length,
             // Remote/cache stream: not a local artifact row, so unrecorded.
             artifact_id: None,
+            etag: handle.headers.etag,
         }
     }
 }
@@ -149,6 +155,7 @@ impl std::fmt::Debug for StreamingFetchResult {
         f.debug_struct("StreamingFetchResult")
             .field("content_type", &self.content_type)
             .field("content_length", &self.content_length)
+            .field("etag", &self.etag)
             .field("body", &"<stream>")
             .finish()
     }
@@ -3180,6 +3187,7 @@ impl ProxyService {
                 content_length: Some(metadata.size_bytes as u64),
                 // Proxy-cache stream: not our artifact row (#1278), unrecorded.
                 artifact_id: None,
+                etag: metadata.upstream_etag.clone(),
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -3266,6 +3274,7 @@ impl ProxyService {
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
             content_length: upstream.content_length,
+            etag: upstream.etag.clone(),
         };
 
         let body = self.cache_persister.tee_stream(
@@ -3326,6 +3335,7 @@ impl ProxyService {
             let headers = StreamHeaders {
                 content_type: metadata.as_ref().and_then(|m| m.content_type.clone()),
                 content_length: metadata.as_ref().map(|m| m.size_bytes as u64),
+                etag: metadata.as_ref().and_then(|m| m.upstream_etag.clone()),
             };
             return Ok(StreamHandle { body, headers });
         }
@@ -9701,6 +9711,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
             artifact_id: None,
+            etag: None,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));

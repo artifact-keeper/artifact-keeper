@@ -890,6 +890,9 @@ pub(crate) fn build_streaming_response_with_disposition(
     if let Some(len) = result.content_length {
         builder = builder.header("content-length", len);
     }
+    if let Some(ref etag) = result.etag {
+        builder = builder.header("etag", etag);
+    }
     if let Some(fname) = filename {
         builder = builder.header("content-disposition", content_disposition_attachment(fname));
     }
@@ -2714,6 +2717,7 @@ async fn read_local_stream(
         // Local artifact row resolved: surface its id so the virtual-member
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 
@@ -5330,6 +5334,7 @@ mod tests {
             content_type: None,
             content_length: Some(0),
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -8898,6 +8903,7 @@ mod tests {
             content_type: Some("application/java-archive".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -8918,6 +8924,7 @@ mod tests {
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -8940,6 +8947,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -8963,6 +8971,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -8980,6 +8989,7 @@ mod tests {
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -8996,6 +9006,7 @@ mod tests {
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -9017,6 +9028,7 @@ mod tests {
             content_type: Some("application/zip".to_string()),
             content_length: Some(1234),
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -9045,6 +9057,7 @@ mod tests {
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
