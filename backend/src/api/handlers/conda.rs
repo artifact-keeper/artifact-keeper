@@ -1567,23 +1567,32 @@ async fn serve_repodata(
         return Ok(cacheable_response(body, ct, headers));
     }
 
-    // For remote repos, proxy repodata from upstream
+    // For remote repos, proxy repodata from upstream. Real conda-forge
+    // repodata.json.zst commonly runs 20-30 MiB (e.g. noarch/osx-arm64), well
+    // past the 8 MiB DEFAULT_METADATA_MAX_BYTES ceiling used by most other
+    // formats' metadata proxying, so this uses the LARGE tier (128 MiB) the
+    // same way debian/npm/maven/pypi do for their oversized index documents.
+    //
+    // A fetch failure here must propagate to the client instead of silently
+    // falling through to `build_repodata` below: that fallback only reflects
+    // artifacts already cached in our own DB, so masking a real upstream
+    // failure (cap exceeded, upstream down, etc.) behind it would serve a
+    // valid-looking but empty/incomplete index and make the client believe
+    // there are no packages, rather than surfacing the actual problem.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
+                let (content, _ct) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     repo_key,
                     upstream_url,
                     &upstream_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
-                .await
-                {
-                    return Ok(cacheable_response(content.to_vec(), ct, headers));
-                }
+                .await?;
+                return Ok(cacheable_response(content.to_vec(), ct, headers));
             }
         }
     }
@@ -1894,11 +1903,36 @@ fn group_artifacts_by_name<'a>(
     by_name
 }
 
+/// CEP-16 sharded repodata is only built from artifacts already present in
+/// our own DB (see [`list_conda_artifacts`]) - it never proxies an upstream's
+/// real shard index. For a Local/hosted repo that's exactly right: our DB is
+/// the source of truth. For a Remote repo it's not: an upstream like
+/// conda-forge that has not yet been mirrored into our DB would otherwise get
+/// a syntactically valid but semantically empty (or incomplete) shard index
+/// served with 200, which a CEP-16-aware client treats as authoritative and
+/// will not fall back from - silently hiding every package that hasn't
+/// already been cached. Until sharded repodata is actually proxied from the
+/// upstream, Remote repos must 404 here so clients (pixi, conda) take the
+/// documented fallback to `repodata.json`, which IS proxied.
+#[allow(clippy::result_large_err)]
+fn reject_unsupported_remote_sharding(repo: &RepoInfo) -> Result<(), Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Sharded repodata (CEP-16) is not available for remote/proxy conda repositories; \
+             use repodata.json",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 async fn sharded_repodata_index(
     State(state): State<SharedState>,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    reject_unsupported_remote_sharding(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -1950,6 +1984,7 @@ async fn sharded_repodata_shard(
     }
 
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    reject_unsupported_remote_sharding(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -8827,5 +8862,219 @@ mod tests {
 
         assertions.await;
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote conda-forge repodata proxy: cap ceiling + failure propagation,
+    // and CEP-16 sharded repodata scoping. A Remote conda repo's real
+    // repodata.json.zst (e.g. conda-forge's noarch/osx-arm64 channels)
+    // commonly runs 20-30 MiB, well past the 8 MiB DEFAULT_METADATA_MAX_BYTES
+    // tier most other formats' metadata proxying uses. The old code silently
+    // fell through to `build_repodata` (DB-only) whenever the capped fetch
+    // failed for ANY reason, serving a valid-looking but empty 200 instead of
+    // the real upstream index, or an error. These tests pin the fix: the
+    // LARGE tier makes the real-sized fetch succeed, and any other upstream
+    // failure now surfaces to the client instead of being masked.
+    // -----------------------------------------------------------------------
+
+    /// Insert a Remote conda repo pointing at `upstream_url`, marked public so
+    /// anonymous test requests pass `check_read_access`. Returns its id/key.
+    async fn insert_public_remote_conda_repo(
+        pool: &sqlx::PgPool,
+        upstream_url: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, storage_dir) =
+            crate::api::handlers::test_db_helpers::create_repo(pool, "remote", "conda").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream_url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("point repo at upstream and make it public");
+        (repo_id, repo_key, storage_dir)
+    }
+
+    async fn cleanup_conda_repo(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    // A 9 MiB repodata.json.zst -- above the old 8 MiB DEFAULT ceiling that
+    // used to make the capped fetch fail and silently fall back to an empty
+    // `build_repodata` -- is now fetched and served in full (LARGE tier).
+    #[tokio::test]
+    async fn remote_repodata_above_default_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = vec![0x5au8; 9 * 1024 * 1024];
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE so success implies the LARGE tier",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("conda-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata.json.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a repodata.json.zst above the old 8 MiB cap must now succeed"
+        );
+        assert_eq!(
+            resp_body.len(),
+            body.len(),
+            "the full upstream body must be served, not truncated"
+        );
+    }
+
+    // A genuine upstream failure (a 500 that folds to 502 via map_proxy_error)
+    // must surface to the client instead of being swallowed into a silent
+    // fallback that serves an empty, DB-only repodata.json with 200 (the
+    // conda-forge-discovery-blocking bug this fixes).
+    #[tokio::test]
+    async fn remote_repodata_upstream_failure_surfaces_not_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json.zst"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("conda-502-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata.json.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            status.is_server_error(),
+            "a genuine upstream failure must surface as a server error, got {status} with body {:?}",
+            String::from_utf8_lossy(&resp_body),
+        );
+    }
+
+    // CEP-16 sharded repodata is only ever built from artifacts already in our
+    // own DB (never proxied from upstream). For a Remote repo with nothing
+    // cached yet, the old code served a syntactically valid but semantically
+    // empty shard index with 200 -- which a CEP-16-aware client treats as
+    // authoritative and will NOT fall back from, hiding every upstream
+    // package. The endpoint must 404 for Remote repos instead, so clients
+    // take the documented fallback to repodata.json.
+    #[tokio::test]
+    async fn remote_repo_sharded_index_404s_instead_of_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("conda-shard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) =
+            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "sharded repodata for a Remote conda repo must 404, not serve an empty 200"
+        );
+    }
+
+    // Preserve existing behavior for Local/hosted conda repos: the shard index
+    // is (and remains) built from the repo's own DB artifacts and returns 200.
+    #[tokio::test]
+    async fn local_repo_sharded_index_still_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+
+        let tmp = std::env::temp_dir().join(format!("conda-local-shard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+
+        let app = tdh::router_anon(router(), state);
+        let (status, _body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/repodata_shards.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a Local/hosted conda repo's shard index must still serve 200"
+        );
     }
 }
