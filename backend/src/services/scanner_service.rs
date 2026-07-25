@@ -4681,12 +4681,21 @@ impl ScannerService {
             Some("quarantined") => None,
             _ => {
                 let repository_id: Option<Uuid> =
-                    sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+                    match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
                         .bind(artifact_id)
                         .fetch_optional(&self.db)
                         .await
-                        .ok()
-                        .flatten();
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!(
+                                artifact_id = %artifact_id,
+                                error = %e,
+                                "Repository lookup failed; falling back to flagged/clean"
+                            );
+                            None
+                        }
+                    };
 
                 match repository_id {
                     Some(repository_id) => {
@@ -4745,6 +4754,9 @@ impl ScannerService {
                 );
             }
         } else {
+            // Deliberate change from the unguarded pre-enforcement UPDATE: a
+            // completing scan must never downgrade a concurrently set admin
+            // quarantine.
             sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
