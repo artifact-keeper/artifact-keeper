@@ -119,6 +119,36 @@ gh workflow run e2e.yml -f profile=all -f include_stress=true
 
 Rust 1.75+: Follow standard conventions
 
+## Docker & Compose Files
+
+This repo ships multiple Dockerfiles (`docker/Dockerfile.backend`,
+`docker/Dockerfile.backend.dev`, `docker/Dockerfile.backend.alpine`, plus
+scanner/mock images) and multiple compose files
+(`docker-compose.yml`, `docker-compose.local-dev.yml`,
+`docker-compose.*-e2e.yml`, `docker-compose.test.yml`, etc.) that each
+independently encode assumptions about what the backend image provides (e.g.
+whether it has a shell, which packages install which files). These have
+drifted out of sync before: #2126 fixed production's `docker-compose.yml`
+after the hardened runtime image (#2059) dropped `/bin/sh`, but
+`docker-compose.local-dev.yml` carried an independent copy of the same
+`dtrack-init` pattern that nobody updated, so it silently reintroduced the
+exact bug #2126 had already fixed.
+
+**When changing any Dockerfile or compose file, check every other one for the
+same assumption.** Concretely:
+- If a Dockerfile's runtime image gains or loses a shell, package manager, or
+  any binary (e.g. `/bin/sh`, `curl`, `jq`, `protoc`), grep all other
+  Dockerfiles and compose files for the same pattern before assuming only the
+  one you're editing is affected.
+- If a compose file's `dtrack-init` (or any init container) is fixed to stop
+  reusing the hardened backend image through a shell, check every other
+  compose file for a service doing the same thing.
+- Prefer a regression test that scans *all* matching files (e.g. every
+  `docker-compose*.yml` at the repo root) over one hardcoded to the single
+  file you just fixed — see
+  `shipped_compose_does_not_run_hardened_image_through_a_shell` in
+  `backend/src/config.rs` for the pattern.
+
 ## Git & GitHub
 
 ### Branch Protection — NEVER push directly to main
