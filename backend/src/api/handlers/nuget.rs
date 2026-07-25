@@ -1950,83 +1950,16 @@ mod tests {
         format!("{}://{}/nuget/{}", scheme, host, repo_key)
     }
 
-    /// Build the NuGet service index JSON (v3/index.json).
-    fn build_nuget_service_index(base: &str) -> serde_json::Value {
-        serde_json::json!({
-            "version": "3.0.0",
-            "resources": [
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService/3.0.0-beta",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService/3.0.0-rc",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl/3.0.0-beta",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl/3.0.0-rc",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/flatcontainer/", base),
-                    "@type": "PackageBaseAddress/3.0.0",
-                    "comment": "Package content"
-                },
-                {
-                    "@id": format!("{}/api/v2/package", base),
-                    "@type": "PackagePublish/2.0.0",
-                    "comment": "Push packages"
-                }
-            ]
-        })
-    }
-
-    /// Build a single registration item JSON for a NuGet package version.
-    fn build_registration_item(
-        base: &str,
-        package_id: &str,
-        version: &str,
-        description: &str,
-        authors: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
-            "catalogEntry": {
-                "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
-                "id": package_id,
-                "version": version,
-                "description": description,
-                "authors": authors,
-                "packageContent": format!(
-                    "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
-                    base, package_id, version, package_id, version
-                ),
-                "listed": true,
-            },
-            "packageContent": format!(
-                "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
-                base, package_id, version, package_id, version
-            ),
-        })
-    }
+    // NOTE: the test-local `build_registration_item` / `build_nuget_service_index`
+    // copies were removed (#2657). They fabricated advertised-URL documents and
+    // asserted a builder matched its own literal, so they could not catch a
+    // production document advertising a URL that 404s — the exact class behind
+    // #2587. The registration leaf `@id` those copies emitted
+    // (`.../registration/{id}/{version}.json`) is a route the server does NOT
+    // serve; production emits `.../index.json#{version}` instead. The real
+    // service-index resources, registration leaf `@id`, and `packageContent`
+    // are now driven through the mounted router in
+    // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
 
     /// Build the flatcontainer versions JSON response.
     fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
@@ -2393,97 +2326,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // build_nuget_service_index
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_nuget_service_index_structure() {
-        let base = "https://example.com/nuget/main";
-        let index = build_nuget_service_index(base);
-        assert_eq!(index["version"], "3.0.0");
-        let resources = index["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 8);
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_search_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let search = &resources[0];
-        assert_eq!(search["@id"], "https://example.com/nuget/repo/v3/search");
-        assert_eq!(search["@type"], "SearchQueryService");
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_push_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let push = &resources[7];
-        assert_eq!(push["@id"], "https://example.com/nuget/repo/api/v2/package");
-        assert_eq!(push["@type"], "PackagePublish/2.0.0");
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_registration_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let reg = &resources[3];
-        assert_eq!(
-            reg["@id"],
-            "https://example.com/nuget/repo/v3/registration/"
-        );
-        assert_eq!(reg["@type"], "RegistrationsBaseUrl");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_registration_item
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_registration_item_basic() {
-        let item = build_registration_item(
-            "https://example.com/nuget/repo",
-            "newtonsoft.json",
-            "13.0.1",
-            "Popular JSON framework",
-            "James Newton-King",
-        );
-        assert_eq!(item["catalogEntry"]["id"], "newtonsoft.json");
-        assert_eq!(item["catalogEntry"]["version"], "13.0.1");
-        assert_eq!(
-            item["catalogEntry"]["description"],
-            "Popular JSON framework"
-        );
-        assert_eq!(item["catalogEntry"]["authors"], "James Newton-King");
-        assert_eq!(item["catalogEntry"]["listed"], true);
-    }
-
-    #[test]
-    fn test_build_registration_item_package_content_url() {
-        let item = build_registration_item(
-            "https://example.com/nuget/repo",
-            "mypackage",
-            "1.0.0",
-            "",
-            "",
-        );
-        let url = item["packageContent"].as_str().unwrap();
-        assert_eq!(
-            url,
-            "https://example.com/nuget/repo/v3/flatcontainer/mypackage/1.0.0/mypackage.1.0.0.nupkg"
-        );
-    }
-
-    #[test]
-    fn test_build_registration_item_empty_metadata() {
-        let item = build_registration_item("http://localhost/nuget/local", "pkg", "0.1.0", "", "");
-        assert_eq!(item["catalogEntry"]["description"], "");
-        assert_eq!(item["catalogEntry"]["authors"], "");
-    }
+    // The `build_nuget_service_index` / `build_registration_item` self-referential
+    // tests were removed with their builders (#2657); the real service-index
+    // resources, registration leaf `@id`, and `packageContent` are now driven
+    // through the mounted router in
+    // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
 
     // -----------------------------------------------------------------------
     // build_flatcontainer_versions_json
@@ -3821,6 +3668,199 @@ mod read_db_tests {
             &body[..],
             nupkg.as_ref(),
             "streamed choco .nupkg must match upstream"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 / #2587 class)
+    //
+    // These assert the URLs a NuGet V3 document hands a client against the REAL
+    // router, mounted exactly where `api::routes` nests it (`/nuget`). The
+    // `build_*` unit tests in the sibling `tests` module only prove a
+    // *test-local* builder emits the string it was written to emit; they cannot
+    // catch a production document advertising a URL that 404s. Regression guard:
+    // the registration leaf `@id` was once emitted as
+    // `.../registration/{id}/{version}.json`, for which no route exists — every
+    // protocol-conformant client 404'd resolving a package version while
+    // `search`/`index` passed (the #2587 rpm `<location>` shape, in NuGet).
+    // -----------------------------------------------------------------------
+
+    /// The NuGet routes mounted exactly where `api::routes` nests them. The
+    /// advertised `@id`/`packageContent` URLs are absolute and carry the
+    /// `/nuget` prefix, so a router mounted at the root could not resolve them —
+    /// the mount point is part of what these tests pin.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/nuget", super::router())
+    }
+
+    /// Resolve a (possibly relative) advertised URL the way a client does —
+    /// against the URL of the document that advertised it — and return the
+    /// path+query to request, dropping any `#fragment` (a client strips the
+    /// fragment before the GET, so the server never sees it).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// Every URL a NuGet V3 client dereferences — the service-index resources,
+    /// the registration index, its per-version leaf `@id`, and the
+    /// `packageContent` .nupkg link — must resolve against the real router, not
+    /// merely against a test-local string builder.
+    #[tokio::test]
+    async fn test_advertised_v3_urls_resolve_against_real_router() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+
+        let package_id = "Qa.AdUrlPkg";
+        let package_id_lower = package_id.to_lowercase();
+        let version = "1.2.3";
+        let nupkg = build_nupkg(package_id, version, "advertised-url probe");
+
+        // Publish through the real push handler so the document is rendered from
+        // real `artifacts` rows.
+        {
+            let app = f.router_with_auth(mounted_router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::put(
+                    format!("/nuget/{}/api/v2/package", f.repo_key),
+                    bytes::Bytes::from(nupkg.clone()),
+                ),
+            )
+            .await;
+            if !status.is_success() {
+                f.teardown().await;
+                panic!("push failed: {status} {}", String::from_utf8_lossy(&body));
+            }
+        }
+
+        // Helper: GET a path anonymously (read paths need no auth) and parse JSON.
+        async fn get_json(f: &tdh::Fixture, path: String) -> (StatusCode, serde_json::Value) {
+            let app = f.router_anon(mounted_router());
+            let (status, body) = tdh::send(app, tdh::get(path)).await;
+            (
+                status,
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+            )
+        }
+
+        // 1. Service index → the RegistrationsBaseUrl and PackageBaseAddress
+        //    resources a client discovers first.
+        let index_path = format!("/nuget/{}/v3/index.json", f.repo_key);
+        let index_doc_url = format!("http://ak.test{index_path}");
+        let (index_status, index) = get_json(&f, index_path.clone()).await;
+
+        let resource_id = |ty: &str| -> String {
+            index
+                .get("resources")
+                .and_then(|r| r.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|res| res.get("@type").and_then(|v| v.as_str()) == Some(ty))
+                })
+                .and_then(|res| res.get("@id").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let reg_base = resource_id("RegistrationsBaseUrl");
+        let flat_base = resource_id("PackageBaseAddress/3.0.0");
+
+        // 2. Registration index — resolved by appending `{id}/index.json` to the
+        //    advertised RegistrationsBaseUrl, exactly as a client builds it.
+        let reg_index_advertised = format!("{}{}/index.json", reg_base, package_id_lower);
+        let reg_index_path = resolve_advertised(&index_doc_url, &reg_index_advertised);
+        let reg_doc_url = format!("http://ak.test{reg_index_path}");
+        let (reg_status, reg) = get_json(&f, reg_index_path.clone()).await;
+
+        // 3. The registration leaf `@id` + `packageContent` the document
+        //    advertises for the published version.
+        let leaf = reg
+            .get("items")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|page| page.get("items"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let leaf_id = leaf
+            .get("@id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let package_content = leaf
+            .get("packageContent")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let leaf_path = if leaf_id.is_empty() {
+            String::new()
+        } else {
+            resolve_advertised(&reg_doc_url, &leaf_id)
+        };
+        let content_path = if package_content.is_empty() {
+            String::new()
+        } else {
+            resolve_advertised(&reg_doc_url, &package_content)
+        };
+
+        // 4. Flat-container version list — appended to the advertised
+        //    PackageBaseAddress the same way a client resolves it.
+        let flat_advertised = format!("{}{}/index.json", flat_base, package_id_lower);
+        let flat_path = resolve_advertised(&index_doc_url, &flat_advertised);
+
+        // Follow each advertised URL against the real router.
+        let leaf_status = if leaf_path.is_empty() {
+            StatusCode::NOT_FOUND
+        } else {
+            get_json(&f, leaf_path.clone()).await.0
+        };
+        let (content_status, content_body) = if content_path.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let app = f.router_anon(mounted_router());
+            tdh::send(app, tdh::get(content_path.clone())).await
+        };
+        let flat_status = get_json(&f, flat_path.clone()).await.0;
+
+        f.teardown().await;
+
+        assert_eq!(index_status, StatusCode::OK, "service index");
+        assert_ne!(
+            reg_base, "",
+            "service index must advertise a RegistrationsBaseUrl"
+        );
+        assert_ne!(
+            flat_base, "",
+            "service index must advertise a PackageBaseAddress"
+        );
+        assert_eq!(
+            reg_status,
+            StatusCode::OK,
+            "advertised registration index ({reg_index_path})"
+        );
+        assert_eq!(
+            leaf_status,
+            StatusCode::OK,
+            "the registration leaf @id ({leaf_id}) must resolve, not 404"
+        );
+        assert_eq!(
+            content_status,
+            StatusCode::OK,
+            "the advertised packageContent ({package_content}) must resolve, not 404"
+        );
+        assert_eq!(
+            &content_body[..],
+            nupkg.as_slice(),
+            "packageContent must serve the published .nupkg bytes"
+        );
+        assert_eq!(
+            flat_status,
+            StatusCode::OK,
+            "the advertised PackageBaseAddress version list ({flat_path}) must resolve, not 404"
         );
     }
 }

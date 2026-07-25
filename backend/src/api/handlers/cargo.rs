@@ -3397,4 +3397,101 @@ mod tests {
             "expected SSRF rejection reason in error message, got: {err}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `dl` template a cargo client reads from `config.json` is what it
+    // appends `{name}/{version}/download` to. The unit tests above prove the
+    // builder emits a string; only routing the resulting URL against the REAL
+    // router (mounted where `api::routes` nests it) proves a `cargo` client can
+    // actually fetch the published `.crate`.
+    // -----------------------------------------------------------------------
+
+    /// The cargo routes mounted exactly where `api::routes` nests them. The
+    /// `dl` URL in `config.json` is absolute and carries the `/cargo` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/cargo", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// The download URL a cargo client builds from the advertised `dl` template
+    /// must resolve against the real router and serve the published `.crate`.
+    #[tokio::test]
+    async fn test_advertised_dl_download_url_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+
+        let name = "my-crate";
+        let version = "0.1.0";
+        let crate_data: &[u8] = b"fake-crate-tarball-bytes-for-advertised-url";
+
+        // Publish through the real publish handler.
+        let publish_status = {
+            let app = tdh::router_with_auth(
+                mounted_router(),
+                fx.state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::put(
+                    format!("/cargo/{}/api/v1/crates/new", fx.repo_key),
+                    make_publish_payload(&sample_metadata(), crate_data),
+                ),
+            )
+            .await;
+            status
+        };
+
+        // Read the advertised `dl` template from config.json.
+        let config_path = format!("/cargo/{}/config.json", fx.repo_key);
+        let config_doc_url = format!("http://ak.test{config_path}");
+        let (config_status, config_body) = tdh::send(
+            tdh::router_anon(mounted_router(), fx.state.clone()),
+            tdh::get(config_path.clone()),
+        )
+        .await;
+        let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap_or_default();
+        let dl = config["dl"].as_str().unwrap_or_default().to_string();
+
+        // Build the download URL exactly as cargo does: `{dl}/{name}/{version}/download`.
+        let advertised = format!("{dl}/{name}/{version}/download");
+        let (dl_status, dl_body) = if dl.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&config_doc_url, &advertised);
+            tdh::send(
+                tdh::router_anon(mounted_router(), fx.state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(publish_status, StatusCode::OK, "publish must succeed");
+        assert_eq!(config_status, StatusCode::OK, "config.json");
+        assert!(!dl.is_empty(), "config.json must advertise a `dl` template");
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the download URL built from the advertised `dl` ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            crate_data,
+            "the advertised download URL must serve the published .crate bytes"
+        );
+    }
 }

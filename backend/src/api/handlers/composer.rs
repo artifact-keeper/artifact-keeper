@@ -4300,4 +4300,93 @@ mod metadata_db_tests {
             .expect_err("absent version/reference must 404");
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 / #2361 class)
+    //
+    // The `build_version_entry` unit tests prove the builder emits a `dist.url`
+    // string; only routing that URL against the REAL router proves a Composer
+    // client can actually download the package. Regression guard: a
+    // root-relative or wrongly-shaped `dist.url` passes every metadata test yet
+    // 404s (or fails a filesystem-path open) on `composer install` (#2361).
+    // -----------------------------------------------------------------------
+
+    /// The Composer routes mounted exactly where `api::routes` nests them. The
+    /// advertised `dist.url` is absolute and carries the `/composer` prefix, so
+    /// a router mounted at the root could not resolve it.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/composer", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// The `dist.url` the `p2` metadata document advertises for a locally-hosted
+    /// package must resolve against the real download route and serve the
+    /// published archive bytes.
+    #[tokio::test]
+    async fn test_advertised_dist_url_resolves_against_real_router() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+
+        let full_name = "acme/widget";
+        let version = "1.0.0";
+        let archive: &[u8] = b"PK\x03\x04 composer package archive bytes";
+
+        // Seed a hosted package with a realistic full-width sha256 (the download
+        // route matches on `checksum_sha256`, which the advertised
+        // `dist.reference` carries, so the fixture must use a real 64-char digest
+        // rather than a short sentinel that the fixed-width column space-pads).
+        let sha256 = "0123456789abcdef".repeat(4);
+        insert_artifact(&f.pool, f.repo_id, full_name, version, &sha256, None).await;
+        // Write the archive bytes at the exact storage key `insert_artifact` derives.
+        let storage_key = format!("composer/{full_name}/{version}/{sha256}.zip");
+        proxy_helpers::put_artifact_bytes(
+            &f.state,
+            &f.repo_info("local", None),
+            &storage_key,
+            bytes::Bytes::from_static(archive),
+        )
+        .await
+        .expect("write archive bytes");
+
+        let (vendor, package) = full_name.split_once('/').unwrap();
+        let meta_path = format!("/composer/{}/p2/{}/{}.json", f.repo_key, vendor, package);
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) =
+            tdh::send(f.router_anon(mounted_router()), tdh::get(meta_path.clone())).await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let dist_url = meta["packages"][full_name][0]["dist"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if dist_url.is_empty() {
+            (axum::http::StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&meta_doc_url, &dist_url);
+            tdh::send(f.router_anon(mounted_router()), tdh::get(path)).await
+        };
+
+        f.teardown().await;
+
+        assert_eq!(meta_status, axum::http::StatusCode::OK, "p2 metadata");
+        assert!(!dist_url.is_empty(), "metadata must advertise a dist.url");
+        assert_eq!(
+            dl_status,
+            axum::http::StatusCode::OK,
+            "the advertised dist.url ({dist_url}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            archive,
+            "the advertised dist.url must serve the published archive bytes"
+        );
+    }
 }
