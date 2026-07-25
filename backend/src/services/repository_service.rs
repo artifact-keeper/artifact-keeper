@@ -108,6 +108,16 @@ pub struct UpdateRepositoryRequest {
     /// `None` leaves it unchanged. `Some(false)` restores the fail-closed
     /// default; `Some(true)` opts into legacy unverified ingest.
     pub curation_allow_unverified: Option<bool>,
+    /// When `Some`, enables/disables curation-rule enforcement on this
+    /// repository's proxy paths (#<backend issue>); `None` leaves it
+    /// unchanged.
+    pub curation_enabled: Option<bool>,
+    /// When `Some`, sets the default curation action applied when no rule
+    /// matches (`allow` or `review`; `block` is rejected by the handler
+    /// since the DB CHECK constraint from migration 071 does not allow it
+    /// as a default action). `None` leaves it unchanged. Validated by the
+    /// handler before it reaches the service.
+    pub curation_default_action: Option<String>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -1111,6 +1121,8 @@ impl RepositoryService {
                 promotion_only = COALESCE($8, promotion_only),
                 versioning_enabled = COALESCE($9, versioning_enabled),
                 project_id = COALESCE($10, project_id),
+                curation_enabled = COALESCE($11, curation_enabled),
+                curation_default_action = COALESCE($12, curation_default_action),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -1135,6 +1147,8 @@ impl RepositoryService {
             req.promotion_only,
             req.versioning_enabled,
             req.project_id.flatten(),
+            req.curation_enabled,
+            req.curation_default_action,
         )
         .fetch_optional(&self.db)
         .await
@@ -2280,6 +2294,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -2303,6 +2319,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -2324,6 +2342,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -3594,6 +3614,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: Some(None),
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, clear_req).await.expect("clear gpg");
             assert!(
@@ -3614,6 +3636,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: Some(Some(TEST_TRUSTED_PUB_KEY.to_string())),
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, set_req).await.expect("set gpg");
             assert_eq!(
@@ -3635,6 +3659,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, noop_req).await.expect("noop gpg");
             assert_eq!(
@@ -3693,6 +3719,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: flag,
+                curation_enabled: None,
+                curation_default_action: None,
             };
 
             // Update -> Some(true) opts into unverified ingest.

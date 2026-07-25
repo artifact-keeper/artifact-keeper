@@ -158,6 +158,8 @@ pub struct RepoInfo {
     pub promotion_only: bool,
     pub age_gate_enabled: bool,
     pub age_gate_min_age_days: i32,
+    pub curation_enabled: bool,
+    pub curation_default_action: String,
 }
 
 impl RepoInfo {
@@ -198,7 +200,8 @@ pub async fn resolve_repo_by_key(
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
-         age_gate_enabled, age_gate_min_age_days \
+         age_gate_enabled, age_gate_min_age_days, \
+         curation_enabled, curation_default_action \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -234,6 +237,10 @@ pub async fn resolve_repo_by_key(
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
         age_gate_enabled: repo.try_get("age_gate_enabled").unwrap_or(false),
         age_gate_min_age_days: repo.try_get("age_gate_min_age_days").unwrap_or(7),
+        curation_enabled: repo.try_get("curation_enabled").unwrap_or(false),
+        curation_default_action: repo
+            .try_get("curation_default_action")
+            .unwrap_or_else(|_| "allow".to_string()),
     })
 }
 
@@ -2412,7 +2419,8 @@ where
 /// helpers on their virtual-resolution loops (#2066) that the direct-Remote
 /// branches already use, without teaching those helpers about the full model
 /// type. `fetch_virtual_members` already SELECTs `age_gate_enabled` /
-/// `age_gate_min_age_days`, so the gate columns survive the conversion.
+/// `age_gate_min_age_days` (and, likewise, `curation_enabled` /
+/// `curation_default_action`), so the gate columns survive the conversion.
 ///
 /// The `format` string is produced lowercase to match what
 /// [`age_gate_params`] parses (it lower-cases and matches the `npm`/`pypi`
@@ -2431,6 +2439,8 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         promotion_only: m.promotion_only,
         age_gate_enabled: m.age_gate_enabled,
         age_gate_min_age_days: m.age_gate_min_age_days,
+        curation_enabled: m.curation_enabled,
+        curation_default_action: m.curation_default_action.clone(),
     }
 }
 
@@ -4677,6 +4687,21 @@ pub fn age_gate_blocked_response(
         .into_response()
 }
 
+/// 403 response for a curation-rule block on a proxy request.
+pub fn curation_blocked_response(package: &str, reason: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "curation_blocked",
+        "package": package,
+        "reason": reason,
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 ///
 /// Visible to other handler modules so they can construct a stand-in
@@ -5522,6 +5547,8 @@ mod tests {
             promotion_only,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -6225,6 +6252,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -8195,6 +8224,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -8314,6 +8345,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let payload = b"streamed-artifact-body".repeat(64);
@@ -8480,6 +8513,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let opts = DownloadResponseOpts {
@@ -8528,6 +8563,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -8577,6 +8614,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let opts = DownloadResponseOpts {
@@ -8627,6 +8666,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
@@ -8691,6 +8732,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"rpmbytes");
         put_artifact_bytes(&state, &repo, "rpm/ab.rpm", bytes.clone())
@@ -8756,6 +8799,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"dirbytes");
         put_artifact_bytes(&state, &repo, "rpm/packages/hello.rpm", bytes.clone())
@@ -10543,6 +10588,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: true,
             age_gate_min_age_days: 14,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let params = age_gate_params(&info);
         assert!(params.age_gate_enabled);

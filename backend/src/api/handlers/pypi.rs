@@ -201,6 +201,49 @@ async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["pypi", "poetry", "conda"], "a PyPI").await
 }
 
+/// Curation gate for PyPI proxy requests (#<backend issue>). Returns
+/// `Err(403 response)` when a block rule matches. Name matching is done on
+/// the PEP 503 normalized project name; `version` is `"*"` for the
+/// name-level checks on the index and download paths (neither parses a
+/// specific version out of the request before this gate runs).
+///
+/// No-op when the repository does not have curation enabled. On a rule
+/// evaluation error, fails open (logs a warning) so a curation-service fault
+/// never takes the proxy down.
+async fn enforce_pypi_curation(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &str,
+    version: &str,
+) -> Result<(), Response> {
+    if !repo.curation_enabled {
+        return Ok(());
+    }
+    let svc = crate::services::curation_service::CurationService::new(state.db.clone());
+    let eval = svc
+        .evaluate_package(
+            repo.id,
+            &repo.curation_default_action,
+            project,
+            version,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "curation evaluation failed; failing open");
+        })
+        .ok();
+    if let Some(eval) = eval {
+        if eval.action == "block" {
+            return Err(proxy_helpers::curation_blocked_response(
+                project,
+                &eval.reason,
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GET /pypi/{repo_key}/simple/ — PEP 503 root index
 // ---------------------------------------------------------------------------
@@ -610,6 +653,10 @@ async fn simple_project(
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
     let normalized = normalize_pep503(&project);
+
+    // Curation gate (#<backend issue>): block a curation-ruled package
+    // before doing any local lookup or upstream fetch for it.
+    enforce_pypi_curation(&state, &repo, &normalized, "*").await?;
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
@@ -1341,6 +1388,13 @@ async fn download_or_metadata(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+
+    // Curation gate (#<backend issue>): a name-blocked package must never
+    // serve any version, whether via PEP 658 metadata or a regular file
+    // download, so this runs before either branch below. The filename's
+    // version is not parsed here, hence the name-level "*" check.
+    let normalized = normalize_pep503(&project);
+    enforce_pypi_curation(&state, &repo, &normalized, "*").await?;
 
     // PEP 658: if filename ends with .metadata, serve extracted METADATA
     if filename.ends_with(".metadata") {
@@ -7758,6 +7812,104 @@ mod tests {
         assert!(
             result.is_none(),
             "cache miss must yield None, not Some(result)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Curation gating (#<backend issue>): a curation "block" rule must 403
+    // requests through the PyPI proxy's simple index on a curation-enabled
+    // repository, and must be a no-op on a repository with curation disabled.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_curation_block_rule_403s_simple_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable curation on fixture repo");
+
+        sqlx::query(
+            "INSERT INTO curation_rules \
+                 (staging_repo_id, package_pattern, version_constraint, architecture, \
+                  action, priority, reason, enabled, created_by) \
+             VALUES ($1, 'evilpkg*', '*', '*', 'block', 10, 'blocked by test rule', true, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert curation block rule");
+
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/simple/evilpkg/", fx.repo_key));
+        let (blocked_status, blocked_body) = tdh::send(app, req).await;
+
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/simple/goodpkg/", fx.repo_key));
+        let (allowed_status, _allowed_body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "a curation block rule must 403 the simple index for a matching package"
+        );
+        assert!(
+            String::from_utf8_lossy(&blocked_body).contains("blocked by test rule"),
+            "403 body must surface the rule's reason: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_ne!(
+            allowed_status,
+            StatusCode::FORBIDDEN,
+            "a package not matched by any rule must not be blocked by curation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curation_disabled_repo_unaffected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        // curation_enabled defaults to false; the fixture repo is left as-is.
+        // The same block rule that would 403 a curation-enabled repo must be
+        // a no-op here.
+        sqlx::query(
+            "INSERT INTO curation_rules \
+                 (staging_repo_id, package_pattern, version_constraint, architecture, \
+                  action, priority, reason, enabled, created_by) \
+             VALUES ($1, 'evilpkg*', '*', '*', 'block', 10, 'blocked by test rule', true, $2)",
+        )
+        .bind(fx.repo_id)
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert curation block rule");
+
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/simple/evilpkg/", fx.repo_key));
+        let (status, _body) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a curation-disabled repo must not be blocked by a matching rule"
         );
     }
 }

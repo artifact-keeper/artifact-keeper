@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE refresh_token_jti\n                SET consumed_at = NOW()\n                WHERE jti = $1 AND consumed_at IS NULL AND revoked_at IS NULL\n                RETURNING family_id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "family_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "81b74deeaec8d83716533ad3bf5aef389f192d700a31c5216fd918c6dc5398af"
+}

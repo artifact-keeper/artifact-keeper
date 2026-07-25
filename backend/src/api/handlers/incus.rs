@@ -576,6 +576,8 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         format: "generic".to_string(),
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     })
 }
 
@@ -2398,6 +2400,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -2417,6 +2421,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -3698,6 +3704,8 @@ mod streaming_pipeline_regression_tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         finalize_upload(

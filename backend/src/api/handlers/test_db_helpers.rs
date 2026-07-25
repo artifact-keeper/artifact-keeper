@@ -964,6 +964,8 @@ pub fn make_repo_info(
         promotion_only: false,
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     }
 }
 
