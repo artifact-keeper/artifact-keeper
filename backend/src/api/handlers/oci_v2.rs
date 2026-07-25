@@ -6653,6 +6653,15 @@ async fn handle_head_manifest(
         )
         .await
         {
+            // #2912: same gate as the GET path, so a HEAD does not report a
+            // quarantined image as available and a client cannot use it to
+            // confirm the image exists.
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, repo.id, &manifest_digest).await
+            {
+                return blocked;
+            }
+
             return build_local_manifest_response(&manifest_digest, &content_type, data, false);
         }
     }
@@ -6718,6 +6727,85 @@ async fn handle_head_manifest(
 /// storage key, so a manifest addressable under both a tag-keyed and a
 /// digest-keyed path still counts once per GET. Best-effort: a lookup miss or a
 /// stats failure never affects the pull.
+/// Resolve the `artifacts` row for a local manifest by its content-addressed
+/// storage key. Shared by the download-stats and quarantine-gate paths so both
+/// agree on which row represents a manifest.
+async fn resolve_local_manifest_artifact_id(
+    state: &SharedState,
+    repo_id: Uuid,
+    manifest_digest: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let manifest_key = manifest_storage_key(manifest_digest);
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM artifacts \
+         WHERE repository_id = $1 AND storage_key = $2 AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&manifest_key)
+    .fetch_optional(&state.db)
+    .await
+}
+
+/// Quarantine gate for a Docker/OCI manifest pull (#2912).
+///
+/// Container images are exactly what the image scanners raise findings on, so a
+/// policy- or admin-quarantined image must not remain pullable. Gating the
+/// manifest is what makes that stick: an OCI client must fetch the manifest
+/// before any layer, and blobs are content-addressed and shared across images, so
+/// they have no one-to-one `artifacts` row to gate.
+///
+/// Returns `Some(response)` when the pull must be refused. A lookup miss leaves
+/// the pull alone — remote/virtual pass-through manifests resolve no local row —
+/// and a lookup error fails open, consistent with the other quarantine gates.
+async fn oci_manifest_quarantine_block(
+    state: &SharedState,
+    repo_id: Uuid,
+    manifest_digest: &str,
+) -> Option<Response> {
+    let artifact_id = match resolve_local_manifest_artifact_id(state, repo_id, manifest_digest).await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                %repo_id,
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "failed to resolve manifest artifact for the quarantine gate; failing open"
+            );
+            return None;
+        }
+    };
+
+    match crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id).await
+    {
+        Ok(()) => None,
+        Err(e) => {
+            // Mapped explicitly to the OCI error envelope rather than reusing the
+            // REST response, which an OCI client cannot parse.
+            // `check_download_allowed` returns `Conflict` for a quarantine hold and
+            // `Authorization` for a rejection.
+            let (status, code, message) = match e {
+                crate::error::AppError::Conflict(m) => (StatusCode::CONFLICT, "DENIED", m),
+                crate::error::AppError::Authorization(m) => (StatusCode::FORBIDDEN, "DENIED", m),
+                other => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    other.to_string(),
+                ),
+            };
+            tracing::info!(
+                %repo_id,
+                %artifact_id,
+                manifest_digest = %manifest_digest,
+                "refusing OCI manifest pull: artifact is quarantined or rejected"
+            );
+            Some(oci_error(status, code, &message))
+        }
+    }
+}
+
 async fn record_oci_manifest_download(
     state: &SharedState,
     repo_id: Uuid,
@@ -6848,6 +6936,14 @@ async fn handle_get_manifest(
         )
         .await
         {
+            // #2912: a quarantined or rejected image must not be pullable. Checked
+            // before the bytes are returned and before the pull is counted.
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, repo.id, &manifest_digest).await
+            {
+                return blocked;
+            }
+
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: served from local storage (tag row or content-addressable digest)");
             // #2260: count a Docker/OCI pull exactly ONCE, here on the local
             // manifest GET — NOT per blob. A `docker pull` fetches one manifest

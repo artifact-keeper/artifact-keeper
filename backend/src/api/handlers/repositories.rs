@@ -875,6 +875,15 @@ pub struct RepositoryResponse {
     /// Omitted for non-Debian-remote repositories or when no filter is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debian: Option<DebianRepositoryConfig>,
+    /// Whether curation rules are enforced for this repository (#2912).
+    ///
+    /// Echoed back because this flag now *blocks downloads* on the PyPI proxy
+    /// paths, and a security control that cannot be read back is the same class of
+    /// problem as one that is stored but not enforced. Stored on the repositories
+    /// row, so unlike `quarantine_enabled` this needs no separate lookup.
+    pub curation_enabled: bool,
+    /// Stance applied when no curation rule matches: `allow` or `review`.
+    pub curation_default_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -924,6 +933,8 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         debian: None,
+        curation_enabled: repo.curation_enabled,
+        curation_default_action: repo.curation_default_action,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -10669,6 +10680,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -11882,6 +11895,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -18858,6 +18873,8 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
