@@ -4048,9 +4048,18 @@ impl ScannerService {
                         );
                     }
 
-                    // Mark as flagged on failure (conservative)
+                    // Mark as flagged on failure (conservative), but never
+                    // downgrade an artifact that is already in a blocking or
+                    // admin-controlled quarantine-workflow state. A scanner
+                    // that fails AFTER another scanner quarantined the same
+                    // artifact (policy violation, or admin action) must not
+                    // silently un-block it by stomping the status back to
+                    // 'flagged'. Only flag from a non-blocking state.
                     if let Err(e) = sqlx::query!(
-                        "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",
+                        "UPDATE artifacts SET quarantine_status = 'flagged' \
+                         WHERE id = $1 \
+                           AND (quarantine_status IS NULL \
+                                OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
                         artifact_id,
                     )
                     .execute(&self.db)
