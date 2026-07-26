@@ -1124,6 +1124,16 @@ pub async fn proxy_check_cache(
 /// timeout it returns `507 Insufficient Storage` so the
 /// client can retry later. Non-`NotFound` storage errors are propagated as 500
 /// responses so operators still see real backend failures.
+///
+/// No production caller remains: this is the BUFFERED repair primitive, and every
+/// format handler whose repair path pulls an artifact body has moved to a
+/// streaming repair so a body larger than the buffered metadata ceiling is not
+/// 502'd (PyPI wheels via `get_remote_cached_or_refetch_stream`, #2192 / #1608
+/// Phase 4c; NuGet `.nupkg` via `proxy_v3_flatcontainer(.., streaming = true)`).
+/// It is retained — with its coverage below — as the cluster-coordinated
+/// (#1609) buffered form for a future caller whose payload is genuinely small;
+/// anything artifact-sized must use a streaming repair instead.
+#[allow(dead_code)]
 pub(crate) async fn get_cached_or_refetch<F, Fut>(
     db: &PgPool,
     artifact_id: Uuid,
