@@ -943,8 +943,6 @@ async fn download_provider(
         "filename": filename,
         "download_url": download_url,
         "shasum": artifact.checksum_sha256,
-        "shasums_url": "",
-        "shasums_signature_url": "",
         "signing_keys": {
             "gpg_public_keys": []
         },
