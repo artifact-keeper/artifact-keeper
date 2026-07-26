@@ -1521,6 +1521,90 @@ mod tests {
         );
     }
 
+    /// REPRO (act2-fix-hf4): live testing against huggingface.co showed a
+    /// cold-cache HEAD on a nested file (`1_Pooling/config.json`) succeeds,
+    /// but `hf download` still failed on OTHER files in the same repo
+    /// (`README.md`) with `FileMetadataError("Distant resource does not have
+    /// a Content-Length.")`. Root cause, confirmed by `cargo tree -i
+    /// reqwest@0.13.4 -e features`: this crate's `Cargo.toml` requests only
+    /// `["json", "stream", "form"]`, but Cargo unifies features for a single
+    /// resolved `reqwest` version across the whole build, and the
+    /// `opensearch` dependency (full-text search) pulls in `reqwest` with
+    /// its `gzip` feature — silently switching EVERY `reqwest::Client` in
+    /// this binary, including the shared upstream client from
+    /// `http_client::base_client_builder()`, into auto content-negotiation
+    /// mode. That makes the client add `Accept-Encoding: gzip` to outbound
+    /// requests and, whenever upstream compresses the response (HF's
+    /// CloudFront does this for text/JSON responses above a size
+    /// threshold — verified live: small nested configs stay under it,
+    /// `README.md` does not), transparently decode the body AND strip both
+    /// `Content-Encoding` and `Content-Length` from `response.headers()`
+    /// before this proxy's header-capture code
+    /// (`extract_streaming_headers`) ever sees them. This test does not
+    /// depend on live negotiation: it mounts a mock that returns a
+    /// `Content-Encoding: gzip` body regardless of what `Accept-Encoding`
+    /// the client sent, exactly reproducing the header-loss this proxy must
+    /// not exhibit.
+    #[tokio::test]
+    async fn test_huggingface_resolve_survives_upstream_gzip_content_length() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+
+        let body = b"# sentence-transformers model card\n".repeat(200);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&body).expect("gzip encode");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/README.md",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("etag", "\"152b56c8ff5229192e0b1f405f5bf07699854738\"")
+                    .set_body_bytes(compressed.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/README.md",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_length = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(
+            content_length,
+            Some(compressed.len().to_string().as_str()),
+            "the proxy's upstream HTTP client must not silently auto-decode \
+             a gzip-encoded upstream response (which would strip \
+             Content-Length before this proxy's header-capture code ever \
+             sees it): huggingface_hub's HEAD-based metadata check \
+             hard-requires a Content-Length or it raises FileMetadataError"
+        );
+    }
+
     #[tokio::test]
     async fn test_huggingface_model_info_proxies_upstream_bare_no_revision() {
         use wiremock::matchers::{method, path as wm_path};
