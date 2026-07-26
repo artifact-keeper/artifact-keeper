@@ -548,6 +548,25 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     (status, body)
 }
 
+/// Like [`send`], but also returns the response headers.
+///
+/// Body buffering is sanctioned here rather than at the call site: the
+/// module-level `disallowed_methods` exemption above covers test scaffolding,
+/// so a header-asserting test does not have to punch its own hole in the
+/// streaming lint (#1608).
+pub async fn send_with_headers(
+    app: Router,
+    req: Request<Body>,
+) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+    let resp = app.oneshot(req).await.expect("oneshot");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .expect("body");
+    (status, body, headers)
+}
+
 /// Grant `user_id` the `developer` role scoped to `repo_id`, mirroring the
 /// owner auto-grant that `RepositoryService::create` performs for real
 /// callers. Handler smoke tests authenticate as the fixture user, so without

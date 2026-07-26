@@ -1794,22 +1794,15 @@ mod tests {
             .await;
 
         let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
-        // `tdh::send` drops the headers, which are the subject of this test, so
-        // drive the router directly.
-        let resp = tower::ServiceExt::oneshot(
+        // `tdh::send` drops the headers, which are the subject of this test.
+        let (status, body, headers) = tdh::send_with_headers(
             tdh::router_anon(mounted_router(), state.clone()),
             tdh::get(format!(
                 "/cargo/{}/api/v1/crates/{}/{}/download",
                 fx.repo_key, name, version
             )),
         )
-        .await
-        .expect("oneshot");
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
-            .await
-            .expect("body");
+        .await;
 
         fx.teardown().await;
 
