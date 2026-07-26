@@ -3752,7 +3752,6 @@ mod read_db_tests {
             return;
         };
         let upstream = MockServer::start().await;
-        mount_v3_index(&upstream).await;
 
         let package_id = "microsoft.codeanalysis.csharp";
         let version = "4.9.2";
@@ -3763,7 +3762,44 @@ mod read_db_tests {
         let big: Vec<u8> = (0..9 * 1024 * 1024usize).map(|i| (i % 251) as u8).collect();
         assert!(big.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES);
 
-        let discovered_path = format!("/flat/{}/{}/{}", package_id, version, filename);
+        // This fixture deliberately isolates the *cap* defect from the *URL*
+        // defect, which would otherwise mask it. `mount_v3_index` advertises the
+        // base at `/flat/` while `upstream_url` is the service-index document, so
+        // the pre-fix concatenation produced an unmounted
+        // `/v3/index.json/v3/flatcontainer/...` and the request 404'd before a
+        // single byte was buffered — passing for the wrong reason.
+        //
+        // Here `upstream_url` is the bare base and the advertised
+        // PackageBaseAddress is `{upstream}/v3/flatcontainer/`, so the naive
+        // concatenation and the discovered address resolve to the *same* URL.
+        // Both the old and new code therefore reach the body, and the only thing
+        // that can fail is the 8 MiB ceiling. This is the shape a bare-base or
+        // AK-to-AK remote actually has (see the service index built at
+        // `nuget::service_index`), so it is a real configuration, not a contrivance.
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {
+                    "@id": format!("{}/v3/flatcontainer/", upstream.uri()),
+                    "@type": "PackageBaseAddress/3.0.0"
+                }
+            ]
+        });
+        // `nuget_service_index_url` trims the trailing slash and appends
+        // `index.json`, so a bare base is discovered at `/index.json` — not
+        // `/v3/index.json`, which is where a service-index-document upstream
+        // would be.
+        Mock::given(method("GET"))
+            .and(path("/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(serde_json::to_string(&index).unwrap()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let discovered_path = format!("/v3/flatcontainer/{}/{}/{}", package_id, version, filename);
         Mock::given(method("GET"))
             .and(path(discovered_path.clone()))
             .respond_with(
@@ -3775,8 +3811,9 @@ mod read_db_tests {
             .mount(&upstream)
             .await;
 
+        // Bare base, not the service-index document — see the note above.
         sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
-            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(upstream.uri())
             .bind(fx.repo_id)
             .execute(&fx.pool)
             .await
@@ -3808,15 +3845,29 @@ mod read_db_tests {
             }
             Err(r) => Err(r.status()),
         };
+        let requested: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
         fx.teardown().await;
 
         let (status, body) = match outcome {
             Ok(v) => v,
             Err(status) => panic!(
-                "repair of a {} byte .nupkg must not be capped, got {status}",
+                "repair of a {} byte .nupkg must not be capped, got {status}; \
+                 upstream saw {requested:?}",
                 big.len()
             ),
         };
+        // The point of the fixture: the body path really was requested, so a
+        // failure above is the cap and not a misrouted URL.
+        assert!(
+            requested.iter().any(|p| p == &discovered_path),
+            "upstream must have been asked for {discovered_path}; saw {requested:?}"
+        );
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body.len(),
