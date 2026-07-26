@@ -19,8 +19,8 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CONTENT_TYPE, ETAG};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
@@ -28,11 +28,13 @@ use axum::Router;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
+use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -52,6 +54,145 @@ const MAX_REVISION_LEN: usize = 255;
 /// so the artifact path must stay within 2036 to keep the storage key under
 /// the column limit.
 const MAX_PATH_LEN: usize = 2036;
+
+/// Total deadline for the best-effort model-info fallback in
+/// [`fetch_upstream_commit_sha`] (#2915).
+///
+/// The shared upstream client sets only `connect_timeout` and a per-frame
+/// `read_timeout` (see `services::http_client`), so a model-info endpoint that
+/// trickles bytes has no *total* bound and can stall a file download far longer
+/// than the download itself would take. This fallback exists purely to recover
+/// a metadata header, so it gets its own hard ceiling and gives up quietly
+/// rather than holding the client's file response hostage.
+const COMMIT_SHA_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
+// Read-path input validation
+// ---------------------------------------------------------------------------
+
+/// Validate a `model_id` (and optionally a `revision`) taken from a request
+/// path, on **every** route rather than only on upload (#2915).
+///
+/// The length ceilings are database-shaped: `artifacts.name` is VARCHAR(512)
+/// and `artifacts.version` is VARCHAR(255), so an over-long value on a write
+/// would fail with an opaque constraint error, and on a read it is simply a
+/// value no stored row can ever match. Rejecting both at the boundary keeps the
+/// error message the same on every route.
+///
+/// The `..` and NUL rejections mirror `npm::validate_package_name`: axum has
+/// already percent-decoded these captures exactly once by the time a handler
+/// sees them, so `%2e%2e` (from a doubly-encoded `%252e%252e`) arrives decoded
+/// and a substring test on the decoded value is the check that actually bites.
+/// Substrings like `foo..bar` are rejected too — Hugging Face model IDs and git
+/// ref names do not contain `..` (git explicitly forbids it in ref names), so
+/// there is no legitimate value to lose.
+///
+/// The `filename` capture is deliberately not checked here: it is a `*filename`
+/// wildcard whose only use is the exact-match local lookup and the upstream
+/// path, and the latter is validated where the proxy-cache key is derived (see
+/// [`proxy_model_info`]).
+#[allow(clippy::result_large_err)]
+fn validate_model_coordinates(model_id: &str, revision: Option<&str>) -> Result<(), Response> {
+    validate_path_component("Model ID", model_id, MAX_MODEL_ID_LEN)?;
+    if let Some(revision) = revision {
+        validate_path_component("Revision", revision, MAX_REVISION_LEN)?;
+    }
+    Ok(())
+}
+
+/// Shared body of [`validate_model_coordinates`], applied once per captured
+/// component so both carry identical rules and identical error wording.
+#[allow(clippy::result_large_err)]
+fn validate_path_component(label: &str, value: &str, max_len: usize) -> Result<(), Response> {
+    if value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, format!("{label} cannot be empty")).into_response());
+    }
+    if value.len() > max_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} exceeds maximum length of {} characters (got {})",
+                label,
+                max_len,
+                value.len()
+            ),
+        )
+            .into_response());
+    }
+    if value.contains('\0') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} contains null bytes"),
+        )
+            .into_response());
+    }
+    if value.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} contains path traversal"),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Percent-encode a decoded revision so it occupies exactly one segment of an
+/// upstream Hugging Face path (#2915).
+///
+/// `hf download --revision refs/pr/1` puts `resolve/refs%2Fpr%2F1/<file>` on
+/// the wire; axum decodes that capture once, so the handler holds
+/// `refs/pr/1`. Concatenating the decoded value straight into
+/// `{model_id}/resolve/{revision}/{filename}` produced
+/// `…/resolve/refs/pr/1/config.json`, which is a shape the Hub's API does not
+/// serve — the download 404'd (or worse, resolved a different file) and the
+/// model-info request built the same way silently returned nothing, so
+/// `X-Repo-Commit` went missing too.
+///
+/// Re-encoding rather than rejecting is deliberate: `refs/pr/N` and
+/// `refs/convert/parquet` are ordinary Hub revisions that `huggingface_hub`
+/// itself emits (`hf_hub_url` builds them with `quote(revision, safe="")`), so
+/// rejecting slash-bearing revisions would drop a supported client feature to
+/// fix a spelling bug. `urlencoding::encode` matches `quote(safe="")` — it
+/// leaves `A-Za-z0-9-_.~` alone, so ordinary revisions (`main`, a 40-hex sha,
+/// `v1.0`) pass through byte-identical and no existing cache key moves.
+fn encode_upstream_revision(revision: &str) -> String {
+    urlencoding::encode(revision).into_owned()
+}
+
+/// The `X-Repo-Commit` / model-info `sha` value served for a Local/hosted (or
+/// Virtual local-member) Hugging Face repository (#2915).
+///
+/// These repositories have no git history, so there is no real commit to
+/// report — but `huggingface_hub` hard-requires the header on a resolve and
+/// then *names the snapshot directory after it*
+/// (`<cache>/models--org--name/snapshots/<commit>/`). That makes two
+/// properties load-bearing, and neither is "be a real commit":
+///
+///   * **Stable per `(model_id, revision)`.** `snapshot_download` takes the
+///     commit from model-info and computes the snapshot directory from it, then
+///     downloads each file and files it under the commit *that file's* resolve
+///     reported. A value that varied per file would scatter one model across
+///     several snapshot directories and the directory `snapshot_download`
+///     returns would come back incomplete. Deriving it from the coordinates
+///     alone — not from any file's bytes — makes every file of a revision agree
+///     by construction, with no extra query.
+///   * **40 lowercase hex characters.** `huggingface_hub` matches candidate
+///     commit hashes against `^[0-9a-f]{40}$` before it will treat a revision
+///     as already-resolved, so a 64-character digest silently disables that
+///     fast path.
+///
+/// Per-file content identity is carried by the ETag instead (the artifact's
+/// `checksum_sha256`), which is what `huggingface_hub` keys its blob store on —
+/// so re-uploading a file at the same revision still invalidates the client's
+/// copy even though this value does not move.
+fn local_repo_commit_sha(model_id: &str, revision: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(revision.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..40].to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -242,6 +383,7 @@ async fn model_info_impl(
     revision: Option<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
+    validate_model_coordinates(&model_id, revision.as_deref())?;
 
     let artifact =
         proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &model_id).await?;
@@ -298,9 +440,22 @@ async fn model_info_impl(
         .unwrap_or("")
         .to_string();
 
+    // `sha` must be the SAME value the resolve route reports in
+    // `X-Repo-Commit` for this `(model_id, revision)`, or `snapshot_download`
+    // computes its snapshot directory from one value and files the downloaded
+    // blobs under the other (#2915 - see `local_repo_commit_sha`). It used to
+    // be this artifact's `checksum_sha256`, which is per-FILE and 64 hex
+    // characters: it disagreed with every sibling in the same revision and was
+    // never a commit identifier in the first place. Per-file content identity
+    // is still exposed - as the resolve ETag, where `huggingface_hub` looks for
+    // it.
+    let commit_revision = revision
+        .as_deref()
+        .or(artifact.version.as_deref())
+        .unwrap_or("main");
     let json = serde_json::json!({
         "modelId": model_id,
-        "sha": artifact.checksum_sha256,
+        "sha": local_repo_commit_sha(&model_id, commit_revision),
         "lastModified": artifact.version.clone().unwrap_or_default(),
         "pipeline_tag": pipeline_tag,
         "tags": [],
@@ -320,17 +475,90 @@ async fn model_info_impl(
 ///
 /// The upstream path mirrors the real `huggingface_hub` client request:
 /// `api/models/{model_id}` with no revision, or
-/// `api/models/{model_id}/revision/{revision}` when one is given.
-/// `proxy_fetch_capped` runs the request through `ProxyService`'s existing
-/// cache-path validator (rejects `..` segments etc.), so no separate
-/// traversal guard is needed here - `model_id` flows into that same
-/// validated path exactly as it already does for `download_file_impl`'s
-/// `resolve/{revision}/{filename}` upstream path.
+/// `api/models/{model_id}/revision/{revision}` when one is given, with the
+/// revision put back into its single-segment wire spelling by
+/// [`encode_upstream_revision`].
+///
+/// Two independent things check that path for traversal, and it is worth being
+/// precise about which is which because only the first belongs to this module:
+///
+///   * The caller has already run [`validate_model_coordinates`] on `model_id`
+///     and `revision`, which rejects `..` and NUL in the *decoded* values that
+///     reach the handler. That is this file's own guarantee and the one the
+///     read-path tests pin.
+///   * `proxy_fetch_capped` then derives a proxy-cache key from the assembled
+///     path, and that derivation validates it inside `ProxyService`
+///     (`validate_cache_path`: empty/NUL/backslash/dot segments, including the
+///     percent-encoded dot spellings `%2e`, `.%2e`, `%2e.` and `%2e%2e` that the
+///     `url` crate folds back into dot segments when it parses the fetch URL).
+///
+/// An earlier version of this comment claimed the second check alone made a
+/// local guard unnecessary. That was wrong at the time: the validator then
+/// compared segments against `..` literally, and axum decodes a captured
+/// parameter exactly once, so a request spelled `%252e%252e` arrived here as the
+/// literal `%2e%2e`, passed the comparison, and was only collapsed into a dot
+/// segment later by the URL parser. The validator has since been hardened to
+/// reject the encoded spellings as well, but it lives in another module and can
+/// change without this one, so it is relied on here as defence in depth rather
+/// than as the guarantee.
 async fn proxy_model_info(
     state: &SharedState,
     repo: &RepoInfo,
     model_id: &str,
     revision: Option<&str>,
+) -> Result<Option<Response>, Response> {
+    let upstream_path = match revision {
+        Some(rev) => format!(
+            "api/models/{model_id}/revision/{}",
+            encode_upstream_revision(rev)
+        ),
+        None => format!("api/models/{model_id}"),
+    };
+    proxy_hf_metadata_json(state, repo, &upstream_path).await
+}
+
+/// Proxy the upstream Hugging Face file-tree JSON for a Remote repo (#2915).
+///
+/// `list_files_impl` answers from the local `artifacts` table, and a Remote
+/// repository intentionally keeps no `artifacts` rows for proxied content
+/// (#1278) - so its prefix query matched nothing and the endpoint returned `[]`
+/// with 200 for every uncached model. That is the same fail-open this PR removed
+/// from `model_info`, left standing on the sibling endpoint: a client cannot
+/// tell "this revision has no files" from "this backend never asked upstream".
+///
+/// Same contract as [`proxy_model_info`]: `Ok(None)` for a non-Remote repo so
+/// the caller keeps its existing behaviour, `Err` for a real upstream failure.
+///
+/// Only the first page is proxied. The Hub paginates large trees with a `Link:
+/// rel="next"` header, which `proxy_fetch_capped` does not follow, so a model
+/// with more entries than one page holds is reported short here. `hf download`
+/// does not use this endpoint (it lists files from model-info `siblings`), so
+/// that limitation is not on the download path.
+async fn proxy_model_tree(
+    state: &SharedState,
+    repo: &RepoInfo,
+    model_id: &str,
+    revision: &str,
+) -> Result<Option<Response>, Response> {
+    let upstream_path = format!(
+        "api/models/{model_id}/tree/{}",
+        encode_upstream_revision(revision)
+    );
+    proxy_hf_metadata_json(state, repo, &upstream_path).await
+}
+
+/// Shared body of [`proxy_model_info`] and [`proxy_model_tree`]: fetch a
+/// buffered JSON metadata document from a Remote repo's upstream and hand it
+/// back verbatim.
+///
+/// Keeping the Remote/upstream/proxy-wired guards and the capped fetch in one
+/// place is what makes the two endpoints propagate upstream failures
+/// identically - the fail-open the tree endpoint had was precisely a matter of
+/// its not sharing this code.
+async fn proxy_hf_metadata_json(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
 ) -> Result<Option<Response>, Response> {
     if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
         != proxy_helpers::RemoteOrVirtualAction::Remote
@@ -344,17 +572,12 @@ async fn proxy_model_info(
         return Ok(None);
     };
 
-    let upstream_path = match revision {
-        Some(rev) => format!("api/models/{model_id}/revision/{rev}"),
-        None => format!("api/models/{model_id}"),
-    };
-
     let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
-        &upstream_path,
+        upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await?;
@@ -368,22 +591,37 @@ async fn proxy_model_info(
     ))
 }
 
-/// Fetch the commit sha upstream reports for `(model_id, revision)`, via the
-/// same model-info pull-through [`proxy_model_info`] proxies
-/// (`api/models/{model_id}/revision/{revision}`), parsing the JSON `"sha"`
-/// field. Used by [`download_file_impl`] to inject `X-Repo-Commit` on the
-/// resolve response for Remote repos: `huggingface_hub`'s HEAD-based
-/// metadata check hard-requires that header, and it only ever exists on the
-/// upstream 302/307 hop that the shared reqwest client's auto-follow
-/// swallows (see `hf-deepdive-report.md`), so recovering it from the
-/// separately-proxied model-info document sidesteps the redirect problem
-/// entirely.
+/// Last-resort recovery of upstream's commit sha for `(model_id, revision)`,
+/// read out of the model-info document's `"sha"` field.
 ///
-/// Returns `None` when the repo isn't Remote, has no upstream/proxy wired
-/// up, or the upstream call fails or doesn't parse - this is best-effort
-/// metadata, never worth failing the file download over. The metadata
-/// fetch flows through `ProxyService`'s existing cache, so steady-state
-/// cost is a cache read, identical on fresh and cached file serves.
+/// **This is a fallback, and only a fallback.** `ProxyService` now captures
+/// upstream's own `X-Repo-Commit` response header, stores it in the cache
+/// sidecar next to the bytes it describes, and replays it on cache hits and
+/// stale-if-error serves; `build_streaming_response_with_disposition` emits it.
+/// So the ordinary Remote resolve already carries the header, bound to the exact
+/// bytes being served, and [`ensure_resolve_metadata_headers`] calls this
+/// function *only* when that header is absent.
+///
+/// Why it is still worth keeping (#2915): the Hub serves LFS objects as a 302 to
+/// its CDN and puts `X-Repo-Commit` (and `X-Linked-Etag`) on the *redirect*,
+/// while the shared reqwest client follows redirects itself and only exposes the
+/// final hop's headers. Model weights are exactly the files that take that path,
+/// so dropping this fallback would leave `hf download` without a commit header
+/// on the one file type it most needs one for. The genuinely correct fix is to
+/// capture the header from the intermediate hop in `ProxyService`; until that
+/// exists, this recovers the value from a document the Hub serves without a
+/// redirect.
+///
+/// It is deliberately weaker than the forwarded header and must never be
+/// preferred to it: model-info is a *separate* observation of a mutable ref, so
+/// if `main` advances between the two calls this reports a commit that does not
+/// contain the bytes just served - and `huggingface_hub` would then file those
+/// bytes under the wrong snapshot directory.
+///
+/// Returns `None` when the repo isn't Remote, has no upstream/proxy wired up, or
+/// the fetch fails, times out, or doesn't parse. Never propagates an error:
+/// losing a metadata header degrades `hf download` to its
+/// no-header path, whereas failing the request loses the file.
 async fn fetch_upstream_commit_sha(
     state: &SharedState,
     repo: &RepoInfo,
@@ -398,20 +636,196 @@ async fn fetch_upstream_commit_sha(
     let upstream_url = repo.upstream_url.as_deref()?;
     let proxy = state.proxy_service.as_deref()?;
 
-    let upstream_path = format!("api/models/{model_id}/revision/{revision}");
-    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+    let upstream_path = format!(
+        "api/models/{model_id}/revision/{}",
+        encode_upstream_revision(revision)
+    );
+    let fetch = proxy_helpers::proxy_fetch_capped(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-    )
-    .await
-    .ok()?;
+    );
+
+    // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
+    let bytes = match tokio::time::timeout(COMMIT_SHA_FALLBACK_TIMEOUT, fetch).await {
+        Ok(Ok((bytes, _content_type))) => bytes,
+        Ok(Err(_response)) => {
+            tracing::debug!(
+                repo_key = %repo.key,
+                model_id,
+                revision,
+                "upstream model-info lookup failed; serving the file without X-Repo-Commit"
+            );
+            return None;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                repo_key = %repo.key,
+                model_id,
+                revision,
+                timeout_secs = COMMIT_SHA_FALLBACK_TIMEOUT.as_secs(),
+                "upstream model-info lookup exceeded its deadline; serving the file \
+                 without X-Repo-Commit"
+            );
+            return None;
+        }
+    };
 
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("sha")?.as_str().map(str::to_string)
+}
+
+/// Give a resolve response the two headers `huggingface_hub`'s HEAD-based
+/// metadata probe refuses to work without - an ETag and `X-Repo-Commit` - when
+/// the arm that produced it did not already supply them (#2915).
+///
+/// Both are only *added*, never overwritten, so anything the upstream (or an
+/// upstream-backed cache entry) already said wins. What "missing" means differs
+/// per repository type:
+///
+///   * **Remote.** The bytes are upstream's, so an ETag is upstream's to state
+///     and is never synthesized here - inventing one would let a client cache a
+///     proxied object under an identity this backend made up. Only the commit is
+///     recoverable, via [`fetch_upstream_commit_sha`].
+///   * **Virtual.** A Remote member's serve already carries both. A *local*
+///     member's serve comes back with neither, because it is assembled from
+///     stored bytes rather than an HTTP response - so it gets the local
+///     treatment below, keyed on the member row that actually won the
+///     member-priority race.
+///   * **Hosted.** Handled by the caller directly (it already holds the
+///     artifact row), not through this function.
+async fn ensure_resolve_metadata_headers(
+    state: &SharedState,
+    repo: &RepoInfo,
+    model_id: &str,
+    revision: &str,
+    artifact_path: &str,
+    resp: &mut Response,
+) {
+    let needs_commit = !resp.headers().contains_key(UPSTREAM_COMMIT_HEADER);
+    let needs_etag = !resp.headers().contains_key(ETAG);
+    if !needs_commit && !needs_etag {
+        return;
+    }
+
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        == proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        if needs_commit {
+            if let Some(sha) = fetch_upstream_commit_sha(state, repo, model_id, revision).await {
+                insert_header_if_valid(resp, UPSTREAM_COMMIT_HEADER, &sha);
+            }
+        }
+        return;
+    }
+
+    // Virtual: only a local member's bytes get local metadata. If no local
+    // member owns this path the serve came from a Remote member, and whatever
+    // that member's upstream said (possibly nothing) is the honest answer.
+    let Some(checksum) = virtual_member_checksum(&state.db, repo.id, artifact_path).await else {
+        return;
+    };
+    apply_local_metadata_headers(resp, Some(&checksum), model_id, revision);
+}
+
+/// Set the ETag and `X-Repo-Commit` for bytes this instance stores itself
+/// (a hosted artifact, or a Virtual repo's local-member artifact).
+///
+/// The ETag is the artifact's stored `checksum_sha256`, quoted as RFC 9110
+/// requires - `huggingface_hub` names its local blob file after this value, so a
+/// content hash is exactly the right identity and an unquoted one would be an
+/// invalid entity-tag. `X-Repo-Commit` comes from [`local_repo_commit_sha`].
+///
+/// The checksum is trimmed first: `artifacts.checksum_sha256` is `CHAR(64)`, so
+/// Postgres blank-pads anything shorter than 64 characters on read and the raw
+/// value would produce an entity-tag with trailing spaces inside the quotes.
+/// A real SHA-256 fills the column exactly, but nothing enforces that at the
+/// type level.
+///
+/// Neither header is overwritten if already present, and both go through
+/// [`insert_header_if_valid`].
+fn apply_local_metadata_headers(
+    resp: &mut Response,
+    checksum_sha256: Option<&str>,
+    model_id: &str,
+    revision: &str,
+) {
+    if !resp.headers().contains_key(ETAG) {
+        if let Some(checksum) = checksum_sha256.map(str::trim).filter(|c| !c.is_empty()) {
+            insert_header_if_valid(resp, ETAG.as_str(), &format!("\"{checksum}\""));
+        }
+    }
+    if !resp.headers().contains_key(UPSTREAM_COMMIT_HEADER) {
+        insert_header_if_valid(
+            resp,
+            UPSTREAM_COMMIT_HEADER,
+            &local_repo_commit_sha(model_id, revision),
+        );
+    }
+}
+
+/// Insert `name: value` on `resp`, dropping the header if `value` cannot be a
+/// header value at all.
+///
+/// Every value routed through here is derived from data (a stored checksum, an
+/// upstream JSON field), so `HeaderValue::from_str` is checked rather than
+/// unwrapped: its rejection of CR/LF is what stops an upstream `"sha"` from
+/// splicing extra headers into our response, and a value we cannot represent is
+/// worth losing a metadata header over, not the download.
+fn insert_header_if_valid(resp: &mut Response, name: &str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
+            resp.headers_mut().insert(name, value);
+        }
+    }
+}
+
+/// `checksum_sha256` of the artifact a Virtual repository's local member served
+/// for `artifact_path`, or `None` when no local member owns it.
+///
+/// Resolves the same row `resolve_virtual_download` finalizes on - first
+/// non-Remote member by `virtual_repo_members.priority` holding a live artifact
+/// at the exact path - so the ETag describes the bytes that were actually sent.
+/// Mirrors `proxy_helpers::virtual_local_winner_artifact_id`, which re-derives
+/// the same row for download attribution.
+///
+/// Best-effort like that helper: a database error logs and yields `None` so the
+/// download proceeds without the header.
+async fn virtual_member_checksum(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Option<String> {
+    match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT a.checksum_sha256 FROM artifacts a \
+         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE vrm.virtual_repo_id = $1 \
+           AND r.repo_type != 'remote' \
+           AND a.path = $2 \
+           AND a.is_deleted = false \
+         ORDER BY vrm.priority \
+         LIMIT 1",
+    )
+    .bind(virtual_repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(checksum) => checksum.flatten(),
+        Err(e) => {
+            tracing::warn!(
+                %virtual_repo_id,
+                artifact_path,
+                error = %e,
+                "failed to resolve virtual member checksum; serving without an ETag"
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,73 +871,100 @@ async fn download_file_impl(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
+    validate_model_coordinates(&model_id, Some(&revision))?;
 
     let filename = filename.trim_start_matches('/');
     let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
 
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, storage_key, size_bytes
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path = $2
-        LIMIT 1
-        "#,
-        repo.id,
-        artifact_path
+    // Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
+    // alongside the storage key in a single round trip; this is the same
+    // runtime-query + `try_get` shape
+    // `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
+    // the resolve ETag below (#2915).
+    use sqlx::Row;
+    let artifact = sqlx::query(
+        "SELECT id, storage_key, checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND path = $2 \
+         LIMIT 1",
     )
+    .bind(repo.id)
+    .bind(&artifact_path)
     .fetch_optional(&state.db)
     .await
-    .map_err(super::db_err)?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
+    .map_err(super::db_err)?;
 
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            let upstream_path = format!("{}/resolve/{}/{}", model_id, revision, filename);
-            if let Some(mut resp) = proxy_helpers::try_remote_or_virtual_download(
+    let Some(artifact) = artifact else {
+        // The revision is re-encoded here: axum handed us the decoded value, and
+        // the Hub expects it as one segment (`refs%2Fpr%2F1`). See
+        // `encode_upstream_revision`.
+        let upstream_path = format!(
+            "{}/resolve/{}/{}",
+            model_id,
+            encode_upstream_revision(&revision),
+            filename
+        );
+        if let Some(mut resp) = proxy_helpers::try_remote_or_virtual_download(
+            &state,
+            &repo,
+            &ctx,
+            proxy_helpers::DownloadResponseOpts {
+                upstream_path: &upstream_path,
+                virtual_lookup: proxy_helpers::VirtualLookup::ExactPath(&artifact_path),
+                default_content_type: "application/octet-stream",
+                content_disposition_filename: None,
+                suppress_upstream_proxy: false,
+            },
+        )
+        .await?
+        {
+            // Remote serves normally arrive with upstream's own ETag and
+            // `X-Repo-Commit` already forwarded by the streaming response
+            // builder; Virtual local-member serves arrive with neither. This
+            // fills only what is actually missing - and, for Remote, only after
+            // the file response exists, so the fallback round trip can be skipped
+            // entirely whenever the header came through.
+            ensure_resolve_metadata_headers(
                 &state,
                 &repo,
-                &ctx,
-                proxy_helpers::DownloadResponseOpts {
-                    upstream_path: &upstream_path,
-                    virtual_lookup: proxy_helpers::VirtualLookup::ExactPath(&artifact_path),
-                    default_content_type: "application/octet-stream",
-                    content_disposition_filename: None,
-                    suppress_upstream_proxy: false,
-                },
+                &model_id,
+                &revision,
+                &artifact_path,
+                &mut resp,
             )
-            .await?
-            {
-                // `huggingface_hub`'s HEAD-based metadata check hard-requires
-                // `X-Repo-Commit` (see hf-deepdive-report.md); Remote-repo
-                // responses need it injected here since the upstream redirect
-                // hop that would otherwise carry it is swallowed by the
-                // shared reqwest client's auto-follow.
-                if let Some(sha) =
-                    fetch_upstream_commit_sha(&state, &repo, &model_id, &revision).await
-                {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&sha) {
-                        resp.headers_mut().insert("x-repo-commit", value);
-                    }
-                }
-                return Ok(resp);
-            }
-            return Err(not_found);
+            .await;
+            return Ok(resp);
         }
+        return Err((StatusCode::NOT_FOUND, "File not found").into_response());
     };
 
-    proxy_helpers::serve_local_artifact(
+    let artifact_id: uuid::Uuid = artifact.try_get("id").map_err(super::db_err)?;
+    let storage_key: String = artifact.try_get("storage_key").map_err(super::db_err)?;
+    let checksum: Option<String> = artifact
+        .try_get::<Option<String>, _>("checksum_sha256")
+        .ok()
+        .flatten();
+
+    let mut resp = proxy_helpers::serve_local_artifact(
         &state,
         &repo,
-        artifact.id,
-        &artifact.storage_key,
+        artifact_id,
+        &storage_key,
         "application/octet-stream",
         Some(filename),
         &ctx,
     )
-    .await
+    .await?;
+
+    // A hosted serve is built by `proxy_helpers::build_download_response`, which
+    // emits only Content-Type/Content-Length/Content-Disposition - so `hf
+    // download` against a Local or hosted HF repo failed its HEAD metadata probe
+    // outright, on content this instance owns. Adding the two headers here
+    // rather than in `build_download_response` keeps the HF-specific commit
+    // semantics out of the shared, format-agnostic builder (#2915).
+    apply_local_metadata_headers(&mut resp, checksum.as_deref(), &model_id, &revision);
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,31 +1019,10 @@ async fn upload_file_impl(
         return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
     }
 
-    // Validate model_id length: the `name` database column is VARCHAR(512)
-    if model_id.len() > MAX_MODEL_ID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Model ID exceeds maximum length of {} characters (got {})",
-                MAX_MODEL_ID_LEN,
-                model_id.len()
-            ),
-        )
-            .into_response());
-    }
-
-    // Validate revision length: the `version` database column is VARCHAR(255)
-    if revision.len() > MAX_REVISION_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Revision exceeds maximum length of {} characters (got {})",
-                MAX_REVISION_LEN,
-                revision.len()
-            ),
-        )
-            .into_response());
-    }
+    // Length ceilings (`name` is VARCHAR(512), `version` is VARCHAR(255)) plus
+    // the traversal/NUL rejections, from the one helper the read paths also use
+    // so upload and download can never diverge on what they accept (#2915).
+    validate_model_coordinates(&model_id, Some(&revision))?;
 
     // Extract filename from X-Filename or Content-Disposition header.
     let filename = filename_from_headers(&headers);
@@ -718,8 +1138,18 @@ async fn list_files_impl(
     revision: String,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
+    validate_model_coordinates(&model_id, Some(&revision))?;
 
-    let path_prefix = super::escape_path_prefix(&[&model_id, &revision]);
+    // Two prefixes, deliberately: the LIKE pattern is escaped so `%`/`_`/`\` in
+    // a model ID or revision cannot widen the match, while the prefix stripped
+    // off each returned path must be the LITERAL one. Using the escaped form for
+    // both meant any model ID containing `_` (`bert_base_uncased`, and plenty of
+    // real Hub IDs) produced a pattern of `bert\_base_uncased/main/`, which
+    // `strip_prefix` could not match - so `unwrap_or` fell through and the
+    // endpoint reported every entry under its full stored path instead of the
+    // path relative to the revision.
+    let like_prefix = super::escape_path_prefix(&[&model_id, &revision]);
+    let path_prefix = format!("{}/{}/", model_id, revision);
 
     let artifacts = sqlx::query!(
         r#"
@@ -731,11 +1161,22 @@ async fn list_files_impl(
         ORDER BY path
         "#,
         repo.id,
-        path_prefix
+        like_prefix
     )
     .fetch_all(&state.db)
     .await
     .map_err(super::db_err)?;
+
+    // Remote pull-through. Nothing local means one of two very different things
+    // for a Remote repo, and answering `[]` with 200 conflated them - see
+    // `proxy_model_tree`. Gating on emptiness (rather than on repo type) keeps
+    // artifacts that were promoted into a Remote repo authoritative, exactly as
+    // `model_info_impl` does.
+    if artifacts.is_empty() {
+        if let Some(resp) = proxy_model_tree(&state, &repo, &model_id, &revision).await? {
+            return Ok(resp);
+        }
+    }
 
     let files: Vec<serde_json::Value> = artifacts
         .iter()
@@ -1130,13 +1571,24 @@ mod tests {
         f.teardown().await;
     }
 
+    /// The namespaced resolve route must 404 through `download_file_impl`, not
+    /// through axum's router fallback.
+    ///
+    /// This distinction is the whole point of the assertion on the body. Before
+    /// the namespaced routes existed, `/{repo}/org/model/resolve/main/f.bin`
+    /// matched NO route, so axum's fallback produced a bodyless 404 and a
+    /// status-only assertion passed on code that had no feature at all. Pinning
+    /// the handler's own error string means this test can only pass when the
+    /// request actually reached `download_file_impl` (#2915).
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
     async fn test_huggingface_resolve_404_when_missing_namespaced() {
         let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
             return;
         };
         let app = f.router_anon(super::router());
-        let (status, _) = tdh::send(
+        let (status, body) = tdh::send(
             app,
             tdh::get(format!(
                 "/{}/missing-org/missing-model/resolve/main/missing.bin",
@@ -1145,6 +1597,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap_or_default(),
+            "File not found",
+            "the 404 must be `download_file_impl`'s own, proving the namespaced \
+             route was matched rather than falling through to axum's router fallback"
+        );
         f.teardown().await;
     }
 
@@ -1181,18 +1639,31 @@ mod tests {
         f.teardown().await;
     }
 
+    /// Namespaced model-info sibling of
+    /// `test_huggingface_resolve_404_when_missing_namespaced`: assert the
+    /// handler's own 404 body so "no route registered" (axum's bodyless
+    /// fallback, which is what the pre-fix code produced here) cannot be
+    /// mistaken for "route present, model genuinely absent" (#2915).
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
     async fn test_huggingface_model_info_404_when_missing_namespaced() {
         let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
             return;
         };
         let app = f.router_anon(super::router());
-        let (status, _) = tdh::send(
+        let (status, body) = tdh::send(
             app,
             tdh::get(format!("/{}/api/models/missing-org/missing", f.repo_key)),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap_or_default(),
+            "Model not found",
+            "the 404 must be `model_info_impl`'s own, proving the namespaced \
+             route was matched rather than falling through to axum's router fallback"
+        );
         f.teardown().await;
     }
 
@@ -1545,11 +2016,21 @@ mod tests {
     /// `Content-Encoding: gzip` body regardless of what `Accept-Encoding`
     /// the client sent, exactly reproducing the header-loss this proxy must
     /// not exhibit.
+    ///
+    /// #2915 tightened the assertions. The original test checked only the status
+    /// and `Content-Length`, never the body — so it passed while the client
+    /// received a gzip blob labelled as identity-encoded and wrote compressed
+    /// bytes to disk under a `.md` name. Now that `Content-Encoding` is forwarded
+    /// alongside the coded length, this asserts the pair a client actually needs
+    /// to make sense of the transfer: the declared encoding, and that the coded
+    /// bytes really do inflate back to the original document.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
     async fn test_huggingface_resolve_survives_upstream_gzip_content_length() {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use std::io::Write;
+        use std::io::{Read, Write};
         use tower::ServiceExt;
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1590,18 +2071,47 @@ mod tests {
         f.teardown().await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let content_length = resp
-            .headers()
+        let headers = resp.headers().clone();
+        let content_length = headers
             .get(axum::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok());
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         assert_eq!(
-            content_length,
+            content_length.as_deref(),
             Some(compressed.len().to_string().as_str()),
             "the proxy's upstream HTTP client must not silently auto-decode \
              a gzip-encoded upstream response (which would strip \
              Content-Length before this proxy's header-capture code ever \
              sees it): huggingface_hub's HEAD-based metadata check \
              hard-requires a Content-Length or it raises FileMetadataError"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the coded length above is only interpretable alongside the coding \
+             that produced it: without Content-Encoding the client reads \
+             `compressed.len()` bytes and stores them as if they were the file"
+        );
+
+        let served = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect resolve body");
+        assert_eq!(
+            &served[..],
+            &compressed[..],
+            "the body must be the still-coded upstream bytes, matching the \
+             advertised Content-Length"
+        );
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(&served[..])
+            .read_to_end(&mut inflated)
+            .expect("served body must be valid gzip");
+        assert_eq!(
+            inflated, body,
+            "a client that honours the declared gzip encoding must recover the \
+             original document byte for byte"
         );
     }
 
@@ -1637,7 +2147,18 @@ mod tests {
         assert_eq!(json["modelId"], "gpt2");
     }
 
+    /// A genuine upstream 404 must surface as a 404, not a silent empty 200.
+    ///
+    /// The `.expect(1)` and the body assertion together are what make this test
+    /// meaningful. `/{repo}/api/models/does-not-exist/revision/main` matched no
+    /// route before this PR, so axum's fallback returned a bodyless 404 without
+    /// upstream ever being contacted and a status-only assertion passed either
+    /// way. Requiring exactly one upstream call proves the pull-through ran, and
+    /// pinning `map_proxy_error`'s wording proves the 404 came back from it
+    /// (#2915).
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
     async fn test_huggingface_model_info_upstream_404_surfaces_not_empty_200() {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1649,12 +2170,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(wm_path("/api/models/does-not-exist/revision/main"))
             .respond_with(ResponseTemplate::new(404))
+            // Proof the handler consulted upstream at all: without a Remote
+            // pull-through this counter stays at 0 and the mock's verification
+            // fails when `server` drops.
+            .expect(1)
             .mount(&server)
             .await;
 
         let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
         let app = tdh::router_anon(super::router(), state);
-        let (status, _body) = tdh::send(
+        let (status, body) = tdh::send(
             app,
             tdh::get(format!(
                 "/{}/api/models/does-not-exist/revision/main",
@@ -1669,6 +2194,12 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "a genuine upstream 404 must surface as 404, not a silent empty 200"
+        );
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap_or_default(),
+            "Artifact not found upstream",
+            "the 404 must be the proxy's mapped upstream error, not axum's \
+             bodyless router fallback"
         );
     }
 
@@ -1717,5 +2248,751 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["modelId"], "gpt2");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2914 / #2915: read-path input validation and upstream path spelling.
+    //
+    // These are pure-function tests for the boundary checks and the revision
+    // re-encoding; the DB-backed behaviour they feed is covered further down.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_model_coordinates_accepts_real_hub_shapes() {
+        for (model_id, revision) in [
+            ("gpt2", "main"),
+            ("sentence-transformers/all-MiniLM-L6-v2", "main"),
+            (
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf",
+            ),
+            // Slash-bearing Hub revisions must pass validation - they are
+            // re-encoded for upstream, not rejected (see
+            // `encode_upstream_revision`).
+            ("openai/whisper-large-v3", "refs/pr/1"),
+            ("openai/whisper-large-v3", "refs/convert/parquet"),
+            // A dot inside a name/tag is ordinary; only `..` is traversal.
+            ("stabilityai/sd.turbo", "v1.0"),
+        ] {
+            assert!(
+                validate_model_coordinates(model_id, Some(revision)).is_ok(),
+                "{model_id}@{revision} is a legitimate Hub coordinate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_model_coordinates_rejects_traversal_and_overlong() {
+        // axum percent-decodes a captured parameter exactly once, so a request
+        // spelled `%252e%252e` reaches the handler as the literal `%2e%2e` and a
+        // doubly-encoded `%2e%2e` reaches it as `..`. The decoded-value check is
+        // therefore the one that has to catch traversal.
+        for (model_id, revision) in [
+            ("../../etc/passwd", "main"),
+            ("org/..", "main"),
+            ("gpt2", "../main"),
+            ("gpt2", "refs/../../secret"),
+        ] {
+            let err = validate_model_coordinates(model_id, Some(revision));
+            assert!(
+                err.is_err(),
+                "{model_id}@{revision} must be rejected at the handler boundary"
+            );
+        }
+        assert!(validate_model_coordinates(&"a".repeat(MAX_MODEL_ID_LEN + 1), None).is_err());
+        assert!(
+            validate_model_coordinates("gpt2", Some(&"v".repeat(MAX_REVISION_LEN + 1))).is_err()
+        );
+        assert!(validate_model_coordinates("gpt2\0", None).is_err());
+    }
+
+    #[test]
+    fn test_encode_upstream_revision_matches_hub_wire_spelling() {
+        // `huggingface_hub` builds resolve URLs with `quote(revision, safe="")`,
+        // so `refs/pr/1` travels as one segment. Ordinary revisions must pass
+        // through byte-identical, or every existing proxy-cache key would move.
+        assert_eq!(encode_upstream_revision("main"), "main");
+        assert_eq!(
+            encode_upstream_revision("1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf"),
+            "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf"
+        );
+        assert_eq!(encode_upstream_revision("v1.0"), "v1.0");
+        assert_eq!(encode_upstream_revision("my-branch_x"), "my-branch_x");
+        assert_eq!(encode_upstream_revision("refs/pr/1"), "refs%2Fpr%2F1");
+        assert_eq!(
+            encode_upstream_revision("refs/convert/parquet"),
+            "refs%2Fconvert%2Fparquet"
+        );
+    }
+
+    #[test]
+    fn test_local_repo_commit_sha_is_stable_40_hex_per_coordinate() {
+        let a = local_repo_commit_sha("gpt2", "main");
+        assert_eq!(a.len(), 40, "huggingface_hub matches ^[0-9a-f]{{40}}$");
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        // Stable: every file of a revision must report the same commit or
+        // `snapshot_download` scatters one model across snapshot directories.
+        assert_eq!(a, local_repo_commit_sha("gpt2", "main"));
+        // Distinct per coordinate, and the separator keeps the two components
+        // from running together (`("a/b", "c")` must not equal `("a", "b/c")`).
+        assert_ne!(a, local_repo_commit_sha("gpt2", "dev"));
+        assert_ne!(a, local_repo_commit_sha("gpt-2", "main"));
+        assert_ne!(
+            local_repo_commit_sha("a/b", "c"),
+            local_repo_commit_sha("a", "b/c")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2914 / #2915: the metadata headers `hf download` cannot work without.
+    //
+    // `huggingface_hub` probes every file with HEAD before downloading it
+    // (`get_hf_file_metadata`) and raises `FileMetadataError` ->
+    // `LocalEntryNotFoundError` unless that response carries an ETag, a
+    // Content-Length and `X-Repo-Commit`. `X-Repo-Commit` is now captured from
+    // upstream's own response header by `ProxyService`, stored in the cache
+    // sidecar beside the bytes it describes, and replayed on cache hits - so
+    // these tests pin both the forwarded path and the fallbacks around it.
+    // -----------------------------------------------------------------------
+
+    /// A **HEAD** resolve must return the full metadata header set and no body.
+    ///
+    /// Every other resolve test in this module issues a GET, so the exact
+    /// request shape the bug reports came from had no coverage at all. axum
+    /// dispatches HEAD to the `get(...)` handler and strips the body from the
+    /// response afterwards, which is precisely the contract `huggingface_hub`
+    /// depends on: headers as if it were a GET, zero bytes transferred.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_resolve_head_carries_etag_length_and_commit() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let payload = b"{\"hidden_size\": 384}".to_vec();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .insert_header("x-repo-commit", "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf")
+                    .set_body_bytes(payload.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let req = axum::http::Request::builder()
+            .method("HEAD")
+            .uri(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+                f.repo_key
+            ))
+            .body(Body::empty())
+            .expect("build HEAD request");
+        let resp = app.oneshot(req).await.expect("HEAD resolve must respond");
+
+        f.teardown().await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers.get(ETAG).and_then(|v| v.to_str().ok()),
+            Some("\"72b987e498d7e3a1\""),
+            "huggingface_hub names its local blob file after the ETag and fails \
+             the metadata probe outright without one"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(payload.len().to_string().as_str()),
+            "HEAD must still advertise the body size it would have sent"
+        );
+        assert_eq!(
+            headers
+                .get(UPSTREAM_COMMIT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf"),
+            "X-Repo-Commit names the snapshot directory huggingface_hub stores \
+             the file under"
+        );
+
+        let collected = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect HEAD body");
+        assert!(
+            collected.is_empty(),
+            "a HEAD probe must transfer no bytes, got {}",
+            collected.len()
+        );
+    }
+
+    /// `X-Repo-Commit` comes from the resolve response's OWN header when upstream
+    /// sends one, and the model-info endpoint is not touched in that case.
+    ///
+    /// This is the path that matters most: a header captured from the same
+    /// response as the bytes is bound to those bytes, whereas the model-info
+    /// `sha` is a second, independent observation of a mutable ref and can
+    /// describe a different commit entirely. The `.expect(0)` on the model-info
+    /// mock is the load-bearing assertion — the old code fetched model-info on
+    /// *every* Remote resolve, and did it after the file response had already
+    /// been opened, so an idle file socket waited on a full extra round trip
+    /// before the client saw a byte.
+    #[tokio::test]
+    async fn test_huggingface_resolve_prefers_forwarded_commit_header() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .insert_header("x-repo-commit", "aaaabbbbccccddddeeeeffff0000111122223333")
+                    .set_body_bytes(b"{\"hidden_size\": 384}".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": "9999999999999999999999999999999999999999",
+            })))
+            // The forwarded header must make this request unnecessary. A single
+            // call here would also mean the returned commit could disagree with
+            // the bytes served.
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(UPSTREAM_COMMIT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("aaaabbbbccccddddeeeeffff0000111122223333"),
+            "the commit must be the one upstream sent with these bytes, not the \
+             one a separate model-info call would report"
+        );
+    }
+
+    /// A second request for the same file must serve the identical ETag and
+    /// `X-Repo-Commit` from the proxy cache, without touching upstream.
+    ///
+    /// `.expect(1)` is what makes this a cache-hit test rather than a repeat of
+    /// the test above: both headers now travel through the cache sidecar
+    /// (`CacheMetadata::upstream_commit_sha`), so a warm serve that lost either
+    /// one would leave `huggingface_hub` unable to validate a file it had
+    /// already downloaded once.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_resolve_cache_hit_replays_etag_and_commit() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        // Distinct enough in size that `wait_for_cache_commit`'s size gate
+        // cannot be satisfied by some other object in the cache directory.
+        let payload = b"{\"hidden_size\": 384, \"num_layers\": 6}\n".repeat(64);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .insert_header("x-repo-commit", "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf")
+                    .set_body_bytes(payload.clone()),
+            )
+            // Cache-hit proof: one upstream fetch across the two requests below.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let uri = format!(
+            "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            f.repo_key
+        );
+
+        let mut seen: Vec<(Option<String>, Option<String>)> = Vec::new();
+        for attempt in 0..2 {
+            // The streaming write-back tees into the cache as the body drains
+            // and only the metadata sidecar makes the next lookup a hit, so wait
+            // for the commit instead of racing it.
+            if attempt == 1 {
+                tdh::wait_for_cache_commit(cache.path(), payload.len() as u64).await;
+            }
+            let app = tdh::router_anon(super::router(), state.clone());
+            let resp = app
+                .oneshot(tdh::get(uri.clone()))
+                .await
+                .expect("resolve oneshot");
+            assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}");
+            let headers = resp.headers().clone();
+            seen.push((
+                headers
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+                headers
+                    .get(UPSTREAM_COMMIT_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            ));
+            // Drain so the tee can finish writing the cache entry.
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("collect resolve body");
+            assert_eq!(&body[..], &payload[..], "attempt {attempt} body");
+        }
+
+        f.teardown().await;
+
+        assert_eq!(
+            seen[0],
+            (
+                Some("\"72b987e498d7e3a1\"".to_string()),
+                Some("1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf".to_string())
+            ),
+            "cold serve must forward upstream's ETag and X-Repo-Commit"
+        );
+        assert_eq!(
+            seen[1], seen[0],
+            "the warm serve must replay the SAME ETag and X-Repo-Commit from the \
+             cache sidecar; the mock's expect(1) proves it came from cache"
+        );
+    }
+
+    /// The model-info fallback is best-effort: a broken model-info endpoint must
+    /// cost the download its `X-Repo-Commit` header, never the file.
+    ///
+    /// Upstream here answers the resolve without a commit header (the shape the
+    /// Hub produces when it 302s an LFS object to its CDN and the header stays on
+    /// the redirect the HTTP client follows internally), and answers model-info
+    /// with a 500. The `.expect(1)` pins that the fallback really was attempted;
+    /// the body assertion pins that its failure changed nothing about the bytes.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_resolve_survives_model_info_failure() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let payload = b"{\"hidden_size\": 384}".to_vec();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .set_body_bytes(payload.clone()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a failing metadata lookup must not fail the file download"
+        );
+        assert!(
+            resp.headers().get(UPSTREAM_COMMIT_HEADER).is_none(),
+            "with no forwarded header and a broken model-info endpoint there is \
+             no commit to report, and inventing one would mislabel the bytes"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect resolve body");
+        assert_eq!(&body[..], &payload[..]);
+    }
+
+    /// A Local/hosted HF repo's resolve must carry an ETag and `X-Repo-Commit`
+    /// too, and the commit must agree with the `sha` model-info reports.
+    ///
+    /// Hosted serves go through `proxy_helpers::build_download_response`, which
+    /// emits only Content-Type/Content-Length/Content-Disposition — so
+    /// `hf download` failed its metadata probe against content this instance
+    /// owns, not just against proxied content. The cross-endpoint equality is the
+    /// real assertion: `snapshot_download` computes its snapshot directory from
+    /// model-info's `sha` and then files each downloaded file under the commit
+    /// that file's resolve reported, so the two disagreeing yields a snapshot
+    /// directory with nothing in it.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_local_resolve_carries_etag_and_commit() {
+        use tower::ServiceExt;
+
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let model_id = "sentence-transformers/all-MiniLM-L6-v2";
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("huggingface/{model_id}/main/config.json"),
+            &format!("{model_id}/main/config.json"),
+            model_id,
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"hidden_size\": 384}"),
+            f.user_id,
+        )
+        .await;
+
+        let resolve = f
+            .router_anon(super::router())
+            .oneshot(tdh::get(format!(
+                "/{}/{}/resolve/main/config.json",
+                f.repo_key, model_id
+            )))
+            .await
+            .expect("resolve oneshot");
+        assert_eq!(resolve.status(), StatusCode::OK);
+        let headers = resolve.headers().clone();
+
+        let (info_status, info_body) = tdh::send(
+            f.router_anon(super::router()),
+            tdh::get(format!(
+                "/{}/api/models/{}/revision/main",
+                f.repo_key, model_id
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        // `tdh::seed_artifact` stores "test-seed" as the checksum; the point is
+        // that the ETag is the stored per-file content hash, quoted as RFC 9110
+        // requires for an entity-tag. The absence of interior padding also pins
+        // the `CHAR(64)` blank-padding trim - Postgres returns "test-seed" plus
+        // 55 spaces for this column.
+        assert_eq!(
+            headers.get(ETAG).and_then(|v| v.to_str().ok()),
+            Some("\"test-seed\""),
+            "a hosted resolve must expose the artifact's stored checksum as a \
+             quoted ETag"
+        );
+        let commit = headers
+            .get(UPSTREAM_COMMIT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("hosted resolve must carry X-Repo-Commit")
+            .to_string();
+        assert_eq!(commit.len(), 40, "huggingface_hub matches ^[0-9a-f]{{40}}$");
+        assert!(commit
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+
+        assert_eq!(info_status, StatusCode::OK);
+        let info: serde_json::Value = serde_json::from_slice(&info_body).unwrap();
+        assert_eq!(
+            info["sha"].as_str(),
+            Some(commit.as_str()),
+            "model-info's sha and the resolve's X-Repo-Commit must be the same \
+             value or snapshot_download's directory and its file placement diverge"
+        );
+    }
+
+    /// `hf download --revision refs/pr/1` must reach upstream with the revision
+    /// spelled as one percent-encoded segment.
+    ///
+    /// The client puts `resolve/refs%2Fpr%2F1/<file>` on the wire; axum decodes
+    /// that capture once, so the handler holds `refs/pr/1` and a naive
+    /// `format!` produced `…/resolve/refs/pr/1/config.json` upstream — a shape
+    /// the Hub's API does not serve. The wiremock path matcher compares against
+    /// the still-encoded URL path, so an exact match here is proof the outbound
+    /// request carries the spelling `huggingface_hub` itself generates. The
+    /// `X-Repo-Commit` assertion is the second half of the same bug: the
+    /// model-info path was mis-spelled the same way, so the header went missing
+    /// too.
+    #[tokio::test]
+    async fn test_huggingface_resolve_reencodes_slash_bearing_revision() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/openai/whisper-large-v3/resolve/refs%2Fpr%2F1/config.json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"5f2c1d0e\"")
+                    .insert_header("x-repo-commit", "77778888999900001111222233334444aaaabbbb")
+                    .set_body_bytes(b"{\"num_mel_bins\": 128}".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/openai/whisper-large-v3/resolve/refs%2Fpr%2F1/config.json",
+                f.repo_key
+            )))
+            .await
+            .expect("resolve oneshot");
+
+        f.teardown().await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a `refs/pr/N` revision is an ordinary Hub revision and must resolve, \
+             not 404 against a mis-spelled upstream path"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(UPSTREAM_COMMIT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("77778888999900001111222233334444aaaabbbb")
+        );
+    }
+
+    /// A Virtual repo's local-member serve sources its ETag from the member row
+    /// that actually won the member-priority race.
+    ///
+    /// `virtual_member_checksum` swallows database errors by design (a missing
+    /// header must never fail a download), which means a wrong column or join in
+    /// its SQL would degrade silently to "no ETag" rather than surfacing. This
+    /// drives the query directly against a real virtual/member pair so that
+    /// cannot happen unnoticed, and pins the two answers the calling code
+    /// branches on: the winner's checksum, and `None` when no local member owns
+    /// the path (which is how a Remote member's serve keeps whatever its own
+    /// upstream said).
+    #[tokio::test]
+    async fn test_virtual_member_checksum_resolves_priority_winner() {
+        let Some(f) = tdh::Fixture::setup("virtual", "huggingface").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&f.pool, "local", "huggingface").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(f.repo_id)
+        .bind(member_id)
+        .execute(&f.pool)
+        .await
+        .expect("link virtual member");
+
+        let artifact_path = "sentence-transformers/all-MiniLM-L6-v2/main/config.json";
+        // A full 64-hex digest, so the assertion also shows that a real checksum
+        // needs no `CHAR(64)` padding trim.
+        let checksum = "b".repeat(64);
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (id, repository_id, name, version, path, storage_key, size_bytes, \
+              checksum_sha256, content_type, is_deleted) \
+             VALUES (gen_random_uuid(),$1,$2,'main',$3,$4,20,$5,'application/json',false)",
+        )
+        .bind(member_id)
+        .bind("sentence-transformers/all-MiniLM-L6-v2")
+        .bind(artifact_path)
+        .bind(format!("huggingface/{artifact_path}"))
+        .bind(&checksum)
+        .execute(&f.pool)
+        .await
+        .expect("insert member artifact");
+
+        let found = virtual_member_checksum(&f.pool, f.repo_id, artifact_path).await;
+        let missing = virtual_member_checksum(
+            &f.pool,
+            f.repo_id,
+            "sentence-transformers/all-MiniLM-L6-v2/main/absent.json",
+        )
+        .await;
+
+        tdh::cleanup(&f.pool, member_id, f.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        f.teardown().await;
+
+        assert_eq!(
+            found.as_deref().map(str::trim),
+            Some(checksum.as_str()),
+            "the ETag must come from the local member that owns the path"
+        );
+        assert!(
+            missing.is_none(),
+            "no local member owning the path means the bytes came from a Remote \
+             member, whose own upstream metadata must stand unaltered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2915: `/api/models/{id}/tree/{revision}` Remote pull-through.
+    //
+    // `list_files_impl` answers from the local `artifacts` table by path prefix.
+    // A Remote repo keeps no `artifacts` rows for proxied content (#1278), so
+    // that query matched nothing and the endpoint returned `[]` with 200 for
+    // every uncached model - the same fail-open this PR removed from
+    // `model_info`, left standing on the sibling endpoint.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_huggingface_tree_proxies_upstream_for_remote_repo() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(
+                "/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"type": "file", "oid": "abc", "size": 612, "path": "config.json"},
+                {"type": "file", "oid": "def", "size": 90868376, "path": "model.safetensors"},
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = json
+            .as_array()
+            .expect("the tree endpoint must return a JSON array");
+        assert_eq!(
+            entries.len(),
+            2,
+            "an uncached model on a Remote repo must report upstream's tree, not \
+             an empty list"
+        );
+        assert_eq!(entries[1]["path"], "model.safetensors");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_tree_upstream_failure_surfaces_not_empty_200() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/models/does-not-exist/tree/main"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/api/models/does-not-exist/tree/main",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        // #1445 folds an upstream 5xx into 503 in `map_proxy_error`; what matters
+        // here is that the failure is visible at all rather than being flattened
+        // into an authoritative-looking empty listing.
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a real upstream failure must surface as an error, not `[]` with 200"
+        );
+        assert_ne!(
+            std::str::from_utf8(&body).unwrap_or_default(),
+            "[]",
+            "an empty list would tell the client the revision has no files"
+        );
     }
 }

@@ -406,9 +406,44 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
 }
 
 /// Build a cacheable response with ETag and Cache-Control headers.
-fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) -> Response {
+///
+/// Takes `impl Into<Bytes>` so a proxied upstream body (already a [`Bytes`])
+/// rides into the response without the extra whole-body `to_vec()` copy the
+/// remote branches used to make, while locally generated `Vec<u8>` documents
+/// convert for free (#2915).
+async fn cacheable_response(
+    body: impl Into<Bytes>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    cacheable_response_coded(body, content_type, None, headers).await
+}
+
+/// [`cacheable_response`] for a body that may ALREADY carry a content coding.
+///
+/// `upstream_content_encoding` is the `Content-Encoding` the body arrived with
+/// (proxied Remote metadata). Two things follow from it (#2915):
+///
+///  1. It must be forwarded verbatim. The proxy's HTTP client no longer lets
+///     reqwest decode upstream bodies (see `http_client::base_client_builder`),
+///     so an undeclared coded body would have the client write compressed bytes
+///     to disk as if they were JSON.
+///  2. Our own gzip pass below MUST be skipped. Re-gzipping a body that is
+///     already `Content-Encoding: gzip` (as some channel mirrors serve
+///     `repodata.json`) produces doubly-gzipped bytes declared as singly
+///     gzipped — a body no client can read.
+///
+/// `None` means "identity body, compress at will" and is what every locally
+/// generated document passes.
+async fn cacheable_response_coded(
+    body: impl Into<Bytes>,
+    content_type: &str,
+    upstream_content_encoding: Option<&str>,
+    headers: &HeaderMap,
+) -> Response {
     use crate::api::handlers::cache_headers;
 
+    let body: Bytes = body.into();
     let etag = compute_etag(&body);
 
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
@@ -417,29 +452,55 @@ fn cacheable_response(body: Vec<u8>, content_type: &str, headers: &HeaderMap) ->
 
     // Conda-specific: serve gzip-compressed JSON responses when the client
     // advertises gzip (Conda clients commonly don't support zstd/bz2 for
-    // repodata, so gzip is a useful middle ground).
-    if content_type == "application/json" && accepts_gzip(headers) {
-        let compressed = gzip_compress(&body);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_ENCODING, "gzip")
-            .header(CONTENT_LENGTH, compressed.len().to_string())
-            .header(ETAG, &etag)
-            .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
-            .header("Vary", "Accept-Encoding")
-            .body(Body::from(compressed))
-            .unwrap();
+    // repodata, so gzip is a useful middle ground). Never for an
+    // already-content-coded body — see the doc comment above.
+    if content_type == "application/json"
+        && upstream_content_encoding.is_none()
+        && accepts_gzip(headers)
+    {
+        // #2915: repodata documents reach tens of MiB (conda-forge's
+        // linux-64/noarch channels), and gzipping one is a CPU-bound
+        // multi-hundred-millisecond stall. Run it on the blocking pool so it
+        // cannot block the tokio worker (and with it every other request that
+        // worker is driving). `Bytes` clones are refcount bumps, so handing the
+        // body to the blocking task costs nothing.
+        let to_compress = body.clone();
+        match tokio::task::spawn_blocking(move || gzip_compress(&to_compress)).await {
+            Ok(compressed) => {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_ENCODING, "gzip")
+                    .header(CONTENT_LENGTH, compressed.len().to_string())
+                    .header(ETAG, &etag)
+                    .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
+                    .header("Vary", "Accept-Encoding")
+                    .body(Body::from(compressed))
+                    .unwrap();
+            }
+            // A join error means the blocking task panicked or the runtime is
+            // shutting down. Compression is an optimization, not a correctness
+            // requirement: fall through and serve the identity body rather than
+            // failing a request that has all its bytes in hand.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "conda gzip offload failed; serving uncompressed body"
+                );
+            }
+        }
     }
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, body.len().to_string())
         .header(ETAG, &etag)
-        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL)
-        .body(Body::from(body))
-        .unwrap()
+        .header(CACHE_CONTROL, cache_headers::DEFAULT_CACHE_CONTROL);
+    if let Some(encoding) = upstream_content_encoding {
+        builder = builder.header(CONTENT_ENCODING, encoding);
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,29 +1249,52 @@ async fn channeldata_json(
         let body = serde_json::to_string_pretty(&channeldata)
             .unwrap()
             .into_bytes();
-        return Ok(cacheable_response(body, "application/json", &headers));
+        return Ok(cacheable_response(body, "application/json", &headers).await);
     }
 
-    // For remote repos, proxy channeldata from upstream
+    // For remote repos, proxy channeldata from upstream.
+    //
+    // #2915: two problems this branch used to have, both fixed the same way
+    // `serve_repodata` fixed them:
+    //
+    //  * The 8 MiB DEFAULT tier is far too small — conda-forge's
+    //    `channeldata.json` is a single document describing every package in
+    //    the channel and comfortably exceeds it — so the capped fetch ALWAYS
+    //    errored for the channel this endpoint matters most for.
+    //  * The error was then swallowed by `if let Ok(..)`, falling through to
+    //    the DB-only document below. For a freshly created Remote repo that is
+    //    an EMPTY channeldata served with 200, which a client reads as
+    //    authoritative ("this channel has no packages") instead of as the
+    //    upstream failure it actually is. Propagate with `?`.
+    //
+    // The LARGE tier is reserved against the process-wide buffered-metadata
+    // budget (#2684) because this endpoint is anonymously reachable on a public
+    // repo: the per-request cap bounds ONE buffer at 128 MiB, and only the
+    // budget bounds the SUM of concurrent buffers.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    "channeldata.json",
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                let (content, _ct, upstream_encoding, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        "channeldata.json",
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                // `_budget_permit` is held until this function returns, i.e.
+                // across response construction (including the gzip pass), which
+                // is the window where the buffer is resident AND being copied.
+                // Same lifetime as the debian dists path (#2684).
+                return Ok(cacheable_response_coded(
+                    content,
+                    "application/json",
+                    upstream_encoding.as_deref(),
+                    &headers,
                 )
-                .await
-                {
-                    return Ok(cacheable_response(
-                        content.to_vec(),
-                        "application/json",
-                        &headers,
-                    ));
-                }
+                .await);
             }
         }
     }
@@ -1384,7 +1468,7 @@ async fn channeldata_json(
         .unwrap()
         .into_bytes();
 
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,7 +1494,7 @@ async fn notices_json(
     });
 
     let body = serde_json::to_vec_pretty(&notices).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,7 +1544,7 @@ async fn run_exports_json(
     });
 
     let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,7 +1575,7 @@ async fn patch_instructions_json(
     });
 
     let body = serde_json::to_vec_pretty(&response).unwrap();
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,7 +1648,7 @@ async fn serve_repodata(
         )
         .await?;
         let body = encoding.encode(&repodata)?;
-        return Ok(cacheable_response(body, ct, headers));
+        return Ok(cacheable_response(body, ct, headers).await);
     }
 
     // For remote repos, proxy repodata from upstream. Real conda-forge
@@ -1579,27 +1663,46 @@ async fn serve_repodata(
     // failure (cap exceeded, upstream down, etc.) behind it would serve a
     // valid-looking but empty/incomplete index and make the client believe
     // there are no packages, rather than surfacing the actual problem.
+    //
+    // #2915: the 128 MiB buffer is reserved against the process-wide
+    // buffered-metadata budget (#2684) rather than taken unbudgeted. This
+    // endpoint is anonymously reachable on a public repo and re-buffers on every
+    // request (cache hits included), so the per-request cap alone bounds one
+    // buffer while N concurrent requests could still drive resident memory to
+    // N * 128 MiB; the budget bounds the sum. The buffered `Bytes` is then moved
+    // straight into the response instead of being copied via `to_vec()`.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
-                let (content, _ct) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &upstream_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                let (content, _ct, upstream_encoding, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
+                // `_budget_permit` is held until this function returns, i.e.
+                // across response construction (including the gzip pass) — the
+                // window where the buffer is both resident and being read.
+                // Matches the debian dists path (#2684).
+                return Ok(cacheable_response_coded(
+                    content,
+                    ct,
+                    upstream_encoding.as_deref(),
+                    headers,
                 )
-                .await?;
-                return Ok(cacheable_response(content.to_vec(), ct, headers));
+                .await);
             }
         }
     }
 
     let repodata = build_repodata(&state.db, repo.id, repo_key, subdir, false).await?;
     let body = encoding.encode(&repodata)?;
-    Ok(cacheable_response(body, ct, headers))
+    Ok(cacheable_response(body, ct, headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,12 +1835,31 @@ async fn repodata_json_zst(
 ///
 /// Supports HTTP Range requests (`Accept-Ranges: bytes`) so clients can
 /// fetch only newly appended lines on subsequent requests.
+///
+/// Local repos only (#2915). The bootstrap JLAP's footer advertises `latest` =
+/// the BLAKE2b hash of the document [`build_repodata`] produces from our own DB
+/// rows, and that is only the document `repodata.json` actually serves for a
+/// Local repo. For a Remote repo `repodata.json` serves the UPSTREAM document,
+/// and for a Virtual repo the aggregation of its members' — so the advertised
+/// hash can never match what the client holds, the client concludes its cached
+/// index is stale on every single run, and it refetches the full
+/// `repodata.json` anyway (having paid for a JLAP round trip first). 404ing is
+/// the documented "no JLAP available" signal and sends the client straight to
+/// the full fetch, which is the outcome it would have reached regardless.
 async fn repodata_json_jlap(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    if repo.repo_type != RepositoryType::Local {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "JLAP incremental repodata is only available for local/hosted conda repositories; \
+             fetch repodata.json",
+        )
+            .into_response());
+    }
     let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
     // Serialize repodata identically to how repodata_json serves it
@@ -1873,7 +1995,7 @@ async fn current_repodata_json(
         .unwrap()
         .into_bytes();
 
-    Ok(cacheable_response(body, "application/json", &headers))
+    Ok(cacheable_response(body, "application/json", &headers).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,22 +2026,38 @@ fn group_artifacts_by_name<'a>(
 }
 
 /// CEP-16 sharded repodata is only built from artifacts already present in
-/// our own DB (see [`list_conda_artifacts`]) - it never proxies an upstream's
-/// real shard index. For a Local/hosted repo that's exactly right: our DB is
-/// the source of truth. For a Remote repo it's not: an upstream like
-/// conda-forge that has not yet been mirrored into our DB would otherwise get
-/// a syntactically valid but semantically empty (or incomplete) shard index
-/// served with 200, which a CEP-16-aware client treats as authoritative and
-/// will not fall back from - silently hiding every package that hasn't
-/// already been cached. Until sharded repodata is actually proxied from the
-/// upstream, Remote repos must 404 here so clients (pixi, conda) take the
-/// documented fallback to `repodata.json`, which IS proxied.
+/// our own DB, scoped to *this* repository's id (see [`list_conda_artifacts`]) -
+/// it never proxies an upstream's real shard index and never aggregates
+/// members. For a Local repo that's exactly right: our DB is the source of
+/// truth. For anything else it isn't, and the failure mode is the same in every
+/// case - a syntactically valid but semantically empty (or incomplete) shard
+/// index served with 200, which a CEP-16-aware client treats as authoritative
+/// and will NOT fall back from, silently hiding every package:
+///
+///   * **Remote**: an upstream like conda-forge that has not yet been mirrored
+///     into our DB has no rows here at all.
+///   * **Virtual** (#2915): `list_conda_artifacts` is scoped to the virtual
+///     repo's own id, and a virtual repo owns no artifacts - its MEMBERS do. So
+///     a virtual conda repo always served an empty shard index, even though
+///     `repodata.json` for the same repo is correctly aggregated by
+///     [`build_virtual_repodata`].
+///   * **Staging / anything else**: a staging repo's own rows would in fact be
+///     authoritative, but 404ing is the conservative direction (the client
+///     falls back to `repodata.json`, which is complete for a hosted repo, so
+///     the only cost is the CEP-16 bandwidth saving). Failing closed also
+///     covers a `repo_type` this code does not know about — `RepoInfo::repo_type`
+///     is a raw string and `resolve_repo_by_key` yields an empty one when the
+///     column read fails.
+///
+/// Until sharded repodata is actually proxied/aggregated, only Local repos may
+/// answer here; everyone else 404s so clients (pixi, conda) take the documented
+/// fallback to `repodata.json`.
 #[allow(clippy::result_large_err)]
-fn reject_unsupported_remote_sharding(repo: &RepoInfo) -> Result<(), Response> {
-    if repo.repo_type == RepositoryType::Remote {
+fn reject_unsupported_sharding_repo_type(repo: &RepoInfo) -> Result<(), Response> {
+    if repo.repo_type != RepositoryType::Local {
         return Err((
             StatusCode::NOT_FOUND,
-            "Sharded repodata (CEP-16) is not available for remote/proxy conda repositories; \
+            "Sharded repodata (CEP-16) is only available for local/hosted conda repositories; \
              use repodata.json",
         )
             .into_response());
@@ -1932,7 +2070,7 @@ async fn sharded_repodata_index(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    reject_unsupported_remote_sharding(&repo)?;
+    reject_unsupported_sharding_repo_type(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -1984,7 +2122,7 @@ async fn sharded_repodata_shard(
     }
 
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    reject_unsupported_remote_sharding(&repo)?;
+    reject_unsupported_sharding_repo_type(&repo)?;
     let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
     let by_name = group_artifacts_by_name(&subdir_artifacts);
@@ -2458,6 +2596,21 @@ async fn build_virtual_channeldata(
 // GET /conda/{repo_key}/{subdir}/{filename} - Download package
 // ---------------------------------------------------------------------------
 
+/// `Content-Type` for a conda package download.
+///
+/// `.tar.bz2` is a tarball; `.conda` (a zip container) and anything else get the
+/// generic binary type. Shared by the hosted, Remote-proxied and Virtual arms of
+/// [`download_package`] so all three advertise the same type for the same
+/// filename — the Remote arm uses it as the fallback for when upstream omits a
+/// `Content-Type` of its own.
+fn conda_package_content_type(filename: &str) -> &'static str {
+    if filename.ends_with(".tar.bz2") {
+        "application/x-tar"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 async fn download_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2499,23 +2652,39 @@ async fn download_package(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("{}/{}", subdir, filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                    // #2915 BLOCKER: this is the PACKAGE path, not a metadata
+                    // path, and it used to go through the buffered
+                    // `proxy_fetch_capped` at the 8 MiB metadata ceiling. Real
+                    // conda packages dwarf that (`python` ~30 MiB, `scipy`
+                    // ~17 MiB, `pytorch` far more), so the cap turned every
+                    // meaningful package download into a 502 — and the ones that
+                    // did fit were still buffered whole in memory, which is the
+                    // OOM pattern #895/#1608 removed from every other format's
+                    // package download.
+                    //
+                    // Stream instead, exactly as `try_remote_or_virtual_download`
+                    // does for rpm/hex/cran/huggingface and as debian's pool
+                    // handler does for `.deb`: the body is teed from upstream to
+                    // the client and into the proxy cache without ever being
+                    // fully resident. The quarantine gating is unchanged — it
+                    // lives inside `ProxyService` (`check_quarantine_until` on
+                    // both the fresh-fetch and cache-hit paths) and
+                    // `map_proxy_error` still turns a hold into 409 / a rejected
+                    // artifact into 403 for the streaming path too.
+                    //
+                    // `Content-Disposition` is now emitted (the buffered arm
+                    // omitted it) so a proxied package matches what the hosted
+                    // and Virtual arms below already serve.
+                    return proxy_helpers::proxy_fetch_streaming_with_disposition(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
-                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        conda_package_content_type(&filename),
+                        Some(&filename),
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
@@ -2543,14 +2712,11 @@ async fn download_package(
                 )
                 .await?;
 
-                let ct = if filename.ends_with(".conda") {
-                    "application/octet-stream"
-                } else if filename.ends_with(".tar.bz2") {
-                    "application/x-tar"
-                } else {
-                    "application/octet-stream"
-                };
-                return proxy_helpers::stream_fetch_result(result, ct, Some(&filename));
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    conda_package_content_type(&filename),
+                    Some(&filename),
+                );
             }
 
             return Err(not_found);
@@ -2577,17 +2743,9 @@ async fn download_package(
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let content_type = if filename.ends_with(".conda") {
-        "application/octet-stream"
-    } else if filename.ends_with(".tar.bz2") {
-        "application/x-tar"
-    } else {
-        "application/octet-stream"
-    };
-
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_TYPE, conda_package_content_type(&filename))
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
@@ -5964,11 +6122,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_includes_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_includes_etag() {
         let body = b"repodata json content".to_vec();
         let headers = HeaderMap::new();
-        let resp = cacheable_response(body.clone(), "application/json", &headers);
+        let resp = cacheable_response(body.clone(), "application/json", &headers).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
@@ -5985,24 +6143,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_304_on_matching_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_304_on_matching_etag() {
         let body = b"repodata json content".to_vec();
         let etag = compute_etag(&body);
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
-    #[test]
-    fn test_cacheable_response_200_on_stale_etag() {
+    #[tokio::test]
+    async fn test_cacheable_response_200_on_stale_etag() {
         let body = b"updated repodata json content".to_vec();
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, "W/\"stale_etag_value\"".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -7724,13 +7882,13 @@ mod tests {
         assert_eq!(decompressed, original);
     }
 
-    #[test]
-    fn test_cacheable_response_gzip_when_accepted() {
+    #[tokio::test]
+    async fn test_cacheable_response_gzip_when_accepted() {
         let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -7747,24 +7905,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cacheable_response_no_gzip_for_binary() {
+    #[tokio::test]
+    async fn test_cacheable_response_no_gzip_for_binary() {
         let body = vec![0u8; 100];
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
 
-        let resp = cacheable_response(body, "application/x-bzip2", &headers);
+        let resp = cacheable_response(body, "application/x-bzip2", &headers).await;
 
         // Binary content types should not be gzip-encoded
         assert!(resp.headers().get(CONTENT_ENCODING).is_none());
     }
 
-    #[test]
-    fn test_cacheable_response_no_gzip_without_accept() {
+    #[tokio::test]
+    async fn test_cacheable_response_no_gzip_without_accept() {
         let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
         let headers = HeaderMap::new();
 
-        let resp = cacheable_response(body, "application/json", &headers);
+        let resp = cacheable_response(body, "application/json", &headers).await;
 
         // No Accept-Encoding means no gzip
         assert!(resp.headers().get(CONTENT_ENCODING).is_none());
@@ -8949,16 +9107,21 @@ mod tests {
             StatusCode::OK,
             "a repodata.json.zst above the old 8 MiB cap must now succeed"
         );
+        // Byte equality, not just length: a truncated-at-the-cap body and a
+        // correctly proxied one can only be told apart by content.
         assert_eq!(
+            &resp_body[..],
+            &body[..],
+            "the full upstream body must be served verbatim (got {} bytes, want {})",
             resp_body.len(),
             body.len(),
-            "the full upstream body must be served, not truncated"
         );
     }
 
-    // A genuine upstream failure (a 500 that folds to 502 via map_proxy_error)
-    // must surface to the client instead of being swallowed into a silent
-    // fallback that serves an empty, DB-only repodata.json with 200 (the
+    // A genuine upstream failure (a 500, which `validate_upstream_status` folds
+    // to `ServiceUnavailable` and `map_proxy_error` renders as 503) must surface
+    // to the client instead of being swallowed into a silent fallback that
+    // serves an empty, DB-only repodata.json with 200 (the
     // conda-forge-discovery-blocking bug this fixes).
     #[tokio::test]
     async fn remote_repodata_upstream_failure_surfaces_not_empty_200() {
@@ -8993,10 +9156,17 @@ mod tests {
         cleanup_conda_repo(&pool, repo_id).await;
         let _ = std::fs::remove_dir_all(&tmp);
 
-        assert!(
-            status.is_server_error(),
-            "a genuine upstream failure must surface as a server error, got {status} with body {:?}",
+        // Concrete status, not merely "some 5xx": #1445 fixes upstream 5xx at
+        // 503 Service Unavailable (never a raw 502, never the masked 200).
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream 5xx must surface as 503, got {status} with body {:?}",
             String::from_utf8_lossy(&resp_body),
+        );
+        assert!(
+            !String::from_utf8_lossy(&resp_body).contains("repodata_version"),
+            "the failure response must not be a fabricated repodata document"
         );
     }
 
@@ -9075,6 +9245,401 @@ mod tests {
             status,
             StatusCode::OK,
             "a Local/hosted conda repo's shard index must still serve 200"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2915 follow-ups to the #2914 proxy work above.
+    //
+    // 1. The PACKAGE download path for a Remote repo was routed through the
+    //    buffered 8 MiB *metadata* helper, so every real conda package 502'd.
+    // 2. `channeldata.json` kept the exact fail-open that was removed from
+    //    `serve_repodata`: an 8 MiB cap the real document exceeds, plus an
+    //    `if let Ok(..)` that turned the resulting error into an empty 200.
+    // 3. The CEP-16 / JLAP guards only covered Remote, so Virtual repos --
+    //    whose artifacts belong to their MEMBERS, never to the virtual repo id
+    //    `list_conda_artifacts` is scoped to -- still served empty 200s.
+    // -----------------------------------------------------------------------
+
+    /// Wire a `SharedState` whose proxy cache lives in a fresh temp dir. The
+    /// returned `TempDir` must outlive the request (dropping it deletes the
+    /// cache the proxy is writing through).
+    fn state_with_proxy_cache(pool: &sqlx::PgPool) -> (crate::api::SharedState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("proxy cache tempdir");
+        let root = dir.path().to_str().expect("utf8 tempdir path");
+        let proxy =
+            crate::api::handlers::test_db_helpers::build_proxy_service_with_fs(pool.clone(), root);
+        let state = crate::api::handlers::test_db_helpers::build_state_with_proxy(
+            pool.clone(),
+            root,
+            proxy,
+        );
+        (state, dir)
+    }
+
+    /// A 64-hex shard hash that matches no shard. Needed because
+    /// `sharded_repodata_shard` validates the hash FORMAT before it resolves the
+    /// repository, so a malformed hash 400s and never reaches the repo-type
+    /// guard under test.
+    fn well_formed_shard_hash() -> String {
+        "ab".repeat(32)
+    }
+
+    // #2915 BLOCKER regression: a Remote conda package download must stream the
+    // whole upstream body. The old code buffered it through
+    // `proxy_fetch_capped(.., DEFAULT_METADATA_MAX_BYTES)`, so anything past
+    // 8 MiB -- i.e. essentially every package anyone installs (python ~30 MiB,
+    // scipy ~17 MiB) -- came back 502. This fixture is deliberately larger than
+    // that ceiling, so it FAILS on the pre-fix code, and asserts byte equality
+    // so a truncated body cannot pass either.
+    #[tokio::test]
+    async fn remote_package_download_above_metadata_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Non-uniform bytes so a byte-equality assertion is meaningful (a
+        // constant fill would match any equally sized garbage body).
+        let pkg: Vec<u8> = (0..(9 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        assert!(
+            pkg.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "fixture must exceed the metadata cap the buffered path used"
+        );
+        let filename = "python-3.12.0-h30d4d87_0.conda";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/osx-arm64/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(pkg.clone()))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/osx-arm64/{filename}"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a >8 MiB remote conda package must download, not 502; body was {:?}",
+            String::from_utf8_lossy(&resp_body[..resp_body.len().min(200)]),
+        );
+        assert_eq!(
+            &resp_body[..],
+            &pkg[..],
+            "the streamed package must be byte-identical to upstream (got {} bytes, want {})",
+            resp_body.len(),
+            pkg.len(),
+        );
+    }
+
+    // #2915 (4): an upstream `channeldata.json` failure must surface. The old
+    // `if let Ok(..)` swallowed it and fell through to the DB-only document,
+    // which for a fresh Remote repo is an EMPTY channel description served 200 --
+    // indistinguishable, to a client, from "this channel really has no packages".
+    #[tokio::test]
+    async fn remote_channeldata_upstream_failure_surfaces_instead_of_empty_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/channeldata.json"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream 5xx on channeldata.json must surface as 503, got {status}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&resp_body).contains("channeldata_version"),
+            "the failure response must not be a fabricated (empty) channeldata document"
+        );
+    }
+
+    // #2915 (4): conda-forge's `channeldata.json` is a single document covering
+    // every package in the channel and comfortably exceeds the 8 MiB DEFAULT
+    // tier the old code used, so the fetch ALWAYS failed for the channel this
+    // endpoint matters most for. It must now be fetched at the LARGE tier and
+    // served verbatim.
+    #[tokio::test]
+    async fn remote_channeldata_above_default_cap_is_served_in_full() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // A real (if degenerate) JSON document above the DEFAULT cap and below
+        // the LARGE one, so success implies the LARGE tier specifically.
+        let body = format!(
+            "{{\"channeldata_version\":1,\"packages\":{{}},\"_pad\":\"{}\"}}",
+            "p".repeat(9 * 1024 * 1024)
+        )
+        .into_bytes();
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.clone())
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let app = tdh::router_anon(router(), state);
+        // No `Accept-Encoding`, so `cacheable_response` serves the identity body
+        // and the comparison below is against the upstream bytes directly.
+        let (status, resp_body) =
+            tdh::send(app, tdh::get(format!("/{repo_key}/channeldata.json"))).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a channeldata.json above the old 8 MiB cap must now succeed"
+        );
+        assert_eq!(
+            &resp_body[..],
+            &body[..],
+            "the full upstream channeldata must be served verbatim (got {} bytes, want {})",
+            resp_body.len(),
+            body.len(),
+        );
+    }
+
+    // #2915 (5): the shard ENDPOINT needs the same repo-type guard the index
+    // endpoint got -- a Remote repo has no shard rows of its own, so without the
+    // guard it answers 404 "Shard not found" for a reason that has nothing to do
+    // with the repository being unsupported, and the index/shard pair disagree
+    // about whether CEP-16 exists here.
+    #[tokio::test]
+    async fn remote_repo_sharded_shard_404s() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) =
+            insert_public_remote_conda_repo(&pool, "https://upstream.example.test").await;
+
+        let app = tdh::router_anon(router(), state);
+        let hash = well_formed_shard_hash();
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst")),
+        )
+        .await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a CEP-16 shard fetch against a Remote conda repo must 404"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("local/hosted"),
+            "the 404 must come from the repo-type guard, not the shard lookup; got {:?}",
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    // The Local counterpart: a hosted repo's own DB rows ARE authoritative, so a
+    // shard whose content hash the client asks for is still served with 200 and
+    // the exact shard bytes.
+    #[tokio::test]
+    async fn local_repo_sharded_shard_still_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let pkg_path = "linux-64/zlib-1.3-h4ab18f5_1.conda";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            pkg_path,
+            pkg_path,
+            "zlib",
+            "1.3",
+            "application/octet-stream",
+            Bytes::from_static(b"conda package payload"),
+            fx.user_id,
+        )
+        .await;
+
+        let assertions = async {
+            // Recompute the content-addressed shard hash exactly as the index
+            // endpoint advertises it, so the request is one a real CEP-16 client
+            // would make after reading the index.
+            let all = list_conda_artifacts(&fx.pool, fx.repo_id)
+                .await
+                .expect("list conda artifacts");
+            let subdir_artifacts = artifacts_for_subdir(&all, "linux-64");
+            let by_name = group_artifacts_by_name(&subdir_artifacts);
+            let artifacts = by_name.get("zlib").expect("seeded package must shard");
+            let shard = build_shard("linux-64", artifacts);
+            let shard_compressed = serialize_msgpack_zst(&shard).expect("serialize shard");
+            let mut hasher = Sha256::new();
+            hasher.update(&shard_compressed);
+            let hash = format!("{:x}", hasher.finalize());
+
+            let app = fx.router_anon(router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::get(format!(
+                    "/{key}/linux-64/shards/{hash}.msgpack.zst",
+                    key = fx.repo_key
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a Local conda repo must still serve its own CEP-16 shards"
+            );
+            assert_eq!(
+                &body[..],
+                &shard_compressed[..],
+                "the served shard must be the content-addressed bytes"
+            );
+        };
+
+        assertions.await;
+        fx.teardown().await;
+    }
+
+    // #2915 (5): a Virtual conda repo owns no artifacts -- its MEMBERS do -- and
+    // both sharded endpoints plus the JLAP endpoint are built from
+    // `list_conda_artifacts(repo.id)` / `build_repodata(repo.id)`, i.e. from the
+    // virtual repo's own (always empty) rows. `repodata.json` is correctly
+    // aggregated by `build_virtual_repodata`, so all three of these must 404 and
+    // send the client there instead of serving an authoritative-looking empty
+    // index (CEP-16) or an unmatchable `latest` hash (JLAP).
+    #[tokio::test]
+    async fn virtual_repo_404s_on_sharded_and_jlap_endpoints() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "virtual", "conda").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        let (state, _cache) = state_with_proxy_cache(&pool);
+
+        let hash = well_formed_shard_hash();
+        let endpoints = [
+            format!("/{repo_key}/noarch/repodata_shards.msgpack.zst"),
+            format!("/{repo_key}/noarch/shards/{hash}.msgpack.zst"),
+            format!("/{repo_key}/noarch/repodata.json.jlap"),
+        ];
+        let mut results = Vec::new();
+        for uri in &endpoints {
+            let app = tdh::router_anon(router(), state.clone());
+            let (status, _body) = tdh::send(app, tdh::get(uri.clone())).await;
+            results.push((uri.clone(), status));
+        }
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        for (uri, status) in results {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{uri} must 404 for a Virtual conda repo instead of serving an empty document"
+            );
+        }
+    }
+
+    // #2915 (3): `cacheable_response` must not add its own gzip on top of a body
+    // that already arrived content-coded, and must declare the coding it did
+    // arrive with. Double-gzipping while advertising `Content-Encoding: gzip`
+    // once produces a body no client can decode.
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test module exempt — buffering a 22-byte gzipped JSON
+    // body in an assertion is not an artifact path (#1608).
+    #[tokio::test]
+    async fn cacheable_response_does_not_recompress_already_coded_body() {
+        let already_gzipped = gzip_compress(br#"{"repodata_version":1}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
+
+        let resp = cacheable_response_coded(
+            already_gzipped.clone(),
+            "application/json",
+            Some("gzip"),
+            &headers,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the upstream coding must be forwarded verbatim, exactly once"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(already_gzipped.len().to_string().as_str()),
+            "the body must be passed through untouched, not gzipped a second time"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(
+            &body[..],
+            &already_gzipped[..],
+            "an already-coded body must be served byte-for-byte"
         );
     }
 }

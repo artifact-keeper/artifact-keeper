@@ -4496,6 +4496,8 @@ mod tests {
         len: Option<u64>,
     ) -> crate::services::proxy_service::StreamingFetchResult {
         crate::services::proxy_service::StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
             content_type: None,
             content_length: len,
@@ -4611,6 +4613,8 @@ mod tests {
         content: &'static [u8],
     ) -> crate::services::proxy_service::StreamingFetchResult {
         crate::services::proxy_service::StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(content.len() as u64),
@@ -5013,6 +5017,8 @@ mod tests {
         content_length: Option<u64>,
     ) -> crate::services::proxy_service::StreamingFetchResult {
         crate::services::proxy_service::StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))))
                 .boxed(),
             content_type: Some("application/octet-stream".to_string()),
@@ -7705,6 +7711,8 @@ mod tests {
         let data_len = wheel_data.len() as u64;
         let stream = stream::once(async move { Ok::<Bytes, crate::error::AppError>(wheel_data) });
         let result = crate::services::proxy_service::StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: Box::pin(stream),
             content_type: Some("application/zip".to_string()),
             content_length: Some(data_len),

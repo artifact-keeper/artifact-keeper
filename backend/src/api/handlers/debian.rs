@@ -1758,7 +1758,7 @@ async fn resolve_pool_expected_checksum(
         if !is_matching_packages_index(&cache_path, component, &arch) {
             continue;
         }
-        let Ok(Some((bytes, _))) = proxy
+        let Ok(Some((bytes, _, _))) = proxy
             .get_cached_artifact_by_path(repo_key, &cache_path)
             .await
         else {

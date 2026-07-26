@@ -2707,6 +2707,8 @@ async fn npm_local_fetch(
         };
 
     Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),

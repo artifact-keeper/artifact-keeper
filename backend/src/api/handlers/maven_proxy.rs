@@ -180,6 +180,8 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             let storage = state.storage_for_repo_or_500(location)?;
             if let Ok(stream) = storage.get_stream(&scoped_key).await {
                 return Ok(StreamingFetchResult {
+                    commit_sha: None,
+                    content_encoding: None,
                     body: stream,
                     content_type: None,
                     content_length: None,
@@ -212,6 +214,8 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             }
         })?;
         return Ok(StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: stream,
             content_type: None,
             content_length: None,
@@ -345,6 +349,8 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         }
     })?;
     Ok(StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body: stream,
         content_type: None,
         content_length: None,

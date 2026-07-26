@@ -348,6 +348,15 @@ pub struct StreamHeaders {
     /// metadata check (which requires an ETag) succeeds. Generic ETag
     /// forwarding on every proxied stream, not HF-specific.
     pub etag: Option<String>,
+    /// Upstream `Content-Encoding` when the streamed bytes are content coded.
+    /// Must reach every follower with the body: the proxy no longer decodes
+    /// upstream responses, so dropping this serves compressed bytes labelled as
+    /// identity.
+    pub content_encoding: Option<String>,
+    /// Upstream `X-Repo-Commit` for the streamed bytes, so every follower labels
+    /// the body with the commit it actually came from rather than whatever a
+    /// separately-cached metadata document happens to say.
+    pub commit_sha: Option<String>,
 }
 
 /// One item on a per-key streaming broadcast channel.
@@ -1195,6 +1204,8 @@ mod tests {
 
     fn test_headers() -> StreamHeaders {
         StreamHeaders {
+            commit_sha: None,
+            content_encoding: None,
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(11),
             etag: None,
@@ -1411,6 +1422,8 @@ mod tests {
             Ok(StreamHandle {
                 body: body_of(&[]),
                 headers: StreamHeaders {
+                    commit_sha: None,
+                    content_encoding: None,
                     content_type: None,
                     content_length: Some(0),
                     etag: None,

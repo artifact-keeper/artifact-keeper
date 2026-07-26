@@ -84,12 +84,38 @@ pub fn base_client_builder() -> ClientBuilder {
         // "another dependency enabled it" scenario: they stop the
         // auto-negotiation (no automatic `Accept-Encoding`, no automatic
         // decode) regardless of which decompression features happen to be
-        // compiled in, so upstream serves identity and every proxied
-        // format's Content-Length survives intact.
+        // compiled in, so every proxied format's Content-Length survives
+        // intact.
+        //
+        // Only `gzip` is actually in the resolved feature set today; the other
+        // three are defensive, so a future dependency enabling brotli/zstd
+        // cannot silently re-introduce the same bug.
         .no_gzip()
         .no_brotli()
         .no_deflate()
-        .no_zstd();
+        .no_zstd()
+        // Disabling the codecs makes reqwest/tower-http send *no*
+        // `Accept-Encoding` at all, and RFC 9110 §12.5.3 reads an absent
+        // header as "any content coding is acceptable" — the opposite of what
+        // this client can handle now that nothing decodes. Advertise identity
+        // explicitly so a compliant upstream does not elect a coding we would
+        // then pass through to the client. This is belt-and-braces with the
+        // `content_encoding` plumbing in `proxy_service`: object stores
+        // (notably S3) return a stored `Content-Encoding` regardless of what
+        // the request advertised, so the header must still be forwarded
+        // faithfully when it does appear.
+        //
+        // Composes with tower-http's decompression layer, which only inserts
+        // `Accept-Encoding` when the entry is vacant — this explicit value
+        // wins.
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            headers
+        });
 
     apply_custom_ca_cert(builder)
 }
