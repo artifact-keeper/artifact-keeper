@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: migration-e2e-db
     environment:
       POSTGRES_USER: registry
@@ -16,7 +16,7 @@ services:
 
   # Artifactory OSS requires its own PostgreSQL since v7.x latest
   artifactory-db:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: migration-e2e-artifactory-db
     environment:
       POSTGRES_USER: artifactory

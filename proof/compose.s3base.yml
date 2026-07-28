@@ -2,7 +2,7 @@ name: ak-fix2504-s3base
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: ak-2504s3base-db
     environment:
       POSTGRES_USER: registry

@@ -47,7 +47,7 @@ services:
     restart: "no"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: s3-maven-test-db
     environment:
       POSTGRES_USER: registry

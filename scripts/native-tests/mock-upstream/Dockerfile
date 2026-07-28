@@ -1,6 +1,6 @@
 # Minimal ETag/counter/mutation-aware mock upstream for cache-correctness E2E.
 # Stdlib-only Python server — no pip install, tiny image, fast startup.
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 COPY mock_upstream.py /app/mock_upstream.py

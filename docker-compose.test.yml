@@ -30,7 +30,7 @@ services:
   # ==========================================================================
 
   postgres:
-    image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:17-alpine
     container_name: e2e-test-db
     environment:
       POSTGRES_USER: registry
@@ -76,7 +76,7 @@ services:
       - e2e-test-network
 
   trivy:
-    image: ghcr.io/aquasecurity/trivy:0.69.3
+    image: ghcr.io/aquasecurity/trivy:0.72.0
     container_name: e2e-test-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
     volumes:
@@ -86,7 +86,7 @@ services:
 
   # Bootstrap: create test repositories after backend is healthy
   setup:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-setup
     depends_on:
       backend:
@@ -109,7 +109,7 @@ services:
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-pki
     command: >
       sh -c "
@@ -146,7 +146,7 @@ services:
   # ==========================================================================
 
   pypi-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.13-slim
     container_name: e2e-test-pypi
     depends_on:
       setup:
@@ -168,7 +168,7 @@ services:
     profiles: ["pypi", "smoke", "all"]
 
   npm-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/node:24-slim
     container_name: e2e-test-npm
     depends_on:
       setup:
@@ -190,7 +190,7 @@ services:
     profiles: ["npm", "smoke", "all"]
 
   cargo-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/rust:1.75-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/rust:1.97-slim
     container_name: e2e-test-cargo
     depends_on:
       setup:
@@ -237,7 +237,7 @@ services:
     profiles: ["maven", "all"]
 
   go-test:
-    image: golang:1.22-alpine
+    image: golang:1.26-alpine
     container_name: e2e-test-go
     depends_on:
       setup:
@@ -280,7 +280,7 @@ services:
     profiles: ["rpm", "all"]
 
   deb-test:
-    image: debian:bookworm-slim
+    image: debian:trixie-slim
     container_name: e2e-test-deb
     depends_on:
       setup:
@@ -301,7 +301,7 @@ services:
     profiles: ["deb", "all"]
 
   helm-test:
-    image: alpine/helm:3.16
+    image: alpine/helm:3.21
     container_name: e2e-test-helm
     depends_on:
       setup:
@@ -366,7 +366,7 @@ services:
   # ==========================================================================
 
   protobuf-test:
-    image: docker.io/alpine:3.19
+    image: docker.io/alpine:3.24
     container_name: e2e-test-protobuf
     depends_on:
       setup:
@@ -381,7 +381,7 @@ services:
     profiles: ["protobuf", "all"]
 
   hex-test:
-    image: docker.io/alpine:3.19
+    image: docker.io/alpine:3.24
     container_name: e2e-test-hex
     depends_on:
       setup:
@@ -401,7 +401,7 @@ services:
   # ==========================================================================
 
   terraform-mirror-test:
-    image: hashicorp/terraform:1.13.0
+    image: hashicorp/terraform:1.15.8
     container_name: e2e-test-terraform-mirror
     depends_on:
       setup:
@@ -431,7 +431,7 @@ services:
   # ==========================================================================
 
   proxy-virtual-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/node:24-slim
     container_name: e2e-test-proxy-virtual
     depends_on:
       setup:
@@ -448,7 +448,7 @@ services:
     profiles: ["proxy", "smoke", "all"]
 
   docker-proxy-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-docker-proxy
     depends_on:
       setup:
@@ -469,7 +469,7 @@ services:
   # ==========================================================================
 
   tag-replication-test:
-    image: python:3.12-slim
+    image: python:3.13-slim
     container_name: e2e-test-tag-replication
     depends_on:
       setup:
@@ -490,7 +490,7 @@ services:
   # ==========================================================================
 
   storage-gc-test:
-    image: alpine:3.19
+    image: alpine:3.24
     container_name: e2e-test-storage-gc
     depends_on:
       backend:
@@ -560,7 +560,7 @@ services:
       - e2e-test-network
 
   curation-test:
-    image: alpine:3.19
+    image: alpine:3.24
     container_name: e2e-test-curation
     profiles: ["curation"]
     depends_on:
@@ -614,7 +614,7 @@ services:
       - e2e-test-network
 
   virtual-resolution-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.13-slim
     container_name: e2e-test-virtual-resolution
     profiles: ["cache-correctness"]
     depends_on:
@@ -634,7 +634,7 @@ services:
       - e2e-test-network
 
   cache-correctness-test:
-    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.24
     container_name: e2e-test-cache-correctness
     profiles: ["cache-correctness"]
     depends_on:

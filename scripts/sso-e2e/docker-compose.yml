@@ -30,7 +30,7 @@ services:
 
   # Keycloak for OIDC and SAML testing
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:26.7
     container_name: sso-test-keycloak
     environment:
       KEYCLOAK_ADMIN: admin
@@ -46,7 +46,7 @@ services:
 
   # PostgreSQL for Artifact Keeper
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: sso-test-db
     environment:
       POSTGRES_USER: registry
