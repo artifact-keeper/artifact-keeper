@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-07-28
+
+A patch release for the 1.6.0 line fixing Maven flat-key attribution on cloud storage backends. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
+
+### Fixed
+
+- **Maven flat-key attribution consults the recorded claims ledger before deriving ownership from parent metadata** (#2946): `resolve_direct` evaluated the `artifact_metadata` `files[]` derivation ahead of the `maven_flat_object_owner` ledger, so the read path disagreed with the write guard (`guard_flat_key_writable`), which has always enforced against the recorded claim. Two consequences on deployments using a cloud storage backend:
+
+  - A key legitimately claimed at write time could be attributed to a **different repository** when that other repository's metadata happened to reference the same storage key, so a read could resolve to the wrong owner.
+  - A key whose metadata derivation was ambiguous (two distinct candidate owners) failed closed on read even when the ledger held an unambiguous claim, leaving the key **unreadable by its own claimant**.
+
+  A recorded claim now outranks derived attribution on read, matching the write guard. As a side effect, reads of keys the ledger already knows no longer pay the unindexed scan of `artifact_metadata`, which removes a multi-second stall per read on large deployments.
+
+  Backported from #2943. Note that the accompanying jsonb containment rewrite and its GIN index (migration 179) are **not** part of the 1.6.x line, so reads of keys the ledger has never seen still fall through to the sequential scan. Deployments where that scan dominates should plan an upgrade to the 1.7 line rather than expecting the full performance fix here.
+
 ## [1.6.3] - 2026-07-23
 
 A security patch for the 1.6.0 line. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
