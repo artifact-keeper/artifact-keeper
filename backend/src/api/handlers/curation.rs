@@ -88,7 +88,12 @@ pub fn router() -> Router<SharedState> {
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(as = CurationCreateRuleRequest)]
 pub struct CreateRuleRequest {
+    /// Omit (with `scope: "global"` or no `scope`) to create an instance-wide
+    /// baseline rule; set to attach the rule to one staging repository.
     pub staging_repo_id: Option<Uuid>,
+    /// Only meaningful for `rule_type = "pattern"`; defaults to `*` so typed
+    /// rules (`publisher_trust`, `popularity`) can omit it.
+    #[serde(default = "default_wildcard")]
     pub package_pattern: String,
     #[serde(default = "default_wildcard")]
     pub version_constraint: String,
@@ -98,6 +103,18 @@ pub struct CreateRuleRequest {
     #[serde(default = "default_priority")]
     pub priority: i32,
     pub reason: String,
+    /// Evaluation engine: `pattern` (default), `publisher_trust`, `popularity`.
+    #[serde(default = "default_rule_type")]
+    pub rule_type: String,
+    /// Engine-specific parameters (JSON object). `{}` for `pattern` rules.
+    #[serde(default = "default_config")]
+    #[schema(value_type = Object)]
+    pub config: serde_json::Value,
+    /// `repository` (default when `staging_repo_id` is set) or `global`.
+    /// When present it must be consistent with `staging_repo_id`: `global`
+    /// forbids a repo id, `repository` requires one.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn default_wildcard() -> String {
@@ -106,6 +123,14 @@ fn default_wildcard() -> String {
 
 fn default_priority() -> i32 {
     100
+}
+
+fn default_rule_type() -> String {
+    "pattern".to_string()
+}
+
+fn default_config() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -122,6 +147,13 @@ pub struct UpdateRuleRequest {
     pub reason: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Evaluation engine: `pattern` (default), `publisher_trust`, `popularity`.
+    #[serde(default = "default_rule_type")]
+    pub rule_type: String,
+    /// Engine-specific parameters (JSON object). `{}` for `pattern` rules.
+    #[serde(default = "default_config")]
+    #[schema(value_type = Object)]
+    pub config: serde_json::Value,
 }
 
 fn default_true() -> bool {
@@ -139,9 +171,58 @@ pub struct RuleResponse {
     pub priority: i32,
     pub reason: String,
     pub enabled: bool,
+    pub rule_type: String,
+    #[schema(value_type = Object)]
+    pub config: serde_json::Value,
+    pub scope: String,
     pub created_by: Option<Uuid>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Validate the #2947 typed-rule fields shared by create/update.
+///
+/// `declared_scope`/`staging_repo_id` are only checked on create (update never
+/// moves a rule between repos, so its scope is immutable).
+fn validate_typed_rule_fields(
+    rule_type: &str,
+    config: &serde_json::Value,
+    declared_scope: Option<&str>,
+    staging_repo_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if !crate::models::curation::CURATION_RULE_TYPES.contains(&rule_type) {
+        return Err(AppError::Validation(format!(
+            "Invalid rule_type '{rule_type}': expected one of {:?}",
+            crate::models::curation::CURATION_RULE_TYPES
+        )));
+    }
+    if !config.is_object() {
+        return Err(AppError::Validation(
+            "config must be a JSON object".to_string(),
+        ));
+    }
+    if let Some(scope) = declared_scope {
+        if !crate::models::curation::CURATION_RULE_SCOPES.contains(&scope) {
+            return Err(AppError::Validation(format!(
+                "Invalid scope '{scope}': expected one of {:?}",
+                crate::models::curation::CURATION_RULE_SCOPES
+            )));
+        }
+        match (scope, staging_repo_id) {
+            ("global", Some(_)) => {
+                return Err(AppError::Validation(
+                    "scope 'global' is incompatible with staging_repo_id".to_string(),
+                ))
+            }
+            ("repository", None) => {
+                return Err(AppError::Validation(
+                    "scope 'repository' requires staging_repo_id".to_string(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -243,7 +324,10 @@ pub struct SyncTriggerResponse {
     get,
     path = "/api/v1/curation/rules",
     operation_id = "list_curation_rules",
-    params(("staging_repo_id" = Option<Uuid>, Query, description = "Filter by staging repo")),
+    params(
+        ("staging_repo_id" = Option<Uuid>, Query, description = "Filter by staging repo"),
+        ("scope" = Option<String>, Query, description = "Filter by rule scope: `global` lists only the instance-wide baseline rules (admin-only)"),
+    ),
     responses((status = 200, body = Vec<RuleResponse>)),
     tag = "Curation"
 )]
@@ -254,14 +338,43 @@ async fn list_rules(
 ) -> Result<Json<Vec<RuleResponse>>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let repo_id = params.get("staging_repo_id").and_then(|s| s.parse().ok());
+    let scope = params.get("scope").map(|s| s.as_str());
     // Cross-repo authorization (#2443): curation rules expose the private
     // staging repo's package-gating policy. Filtered by staging repo → gate on
-    // that repo's visibility; unfiltered spans every repo → admin-only.
-    match repo_id {
-        Some(id) => require_repo_id_visible(&state.db, &auth, id, "Repository not found").await?,
-        None => auth.require_admin()?,
-    }
-    let rules = svc.list_rules(repo_id).await?;
+    // that repo's visibility; unfiltered or global-baseline listings span
+    // instance-wide policy → admin-only.
+    let rules = match (scope, repo_id) {
+        // Instance-wide baseline view (#2947): only the global rules.
+        (Some("global"), None) => {
+            auth.require_admin()?;
+            svc.list_global_rules().await?
+        }
+        (Some("global"), Some(_)) => {
+            return Err(AppError::Validation(
+                "scope=global is incompatible with staging_repo_id".to_string(),
+            ))
+        }
+        (Some("repository"), None) => {
+            return Err(AppError::Validation(
+                "scope=repository requires staging_repo_id".to_string(),
+            ))
+        }
+        (Some(other), _) if other != "repository" => {
+            return Err(AppError::Validation(format!(
+                "Invalid scope '{other}': expected one of {:?}",
+                crate::models::curation::CURATION_RULE_SCOPES
+            )))
+        }
+        // Repo-filtered view (global baseline included, as always).
+        (_, Some(id)) => {
+            require_repo_id_visible(&state.db, &auth, id, "Repository not found").await?;
+            svc.list_rules(Some(id)).await?
+        }
+        (_, None) => {
+            auth.require_admin()?;
+            svc.list_rules(None).await?
+        }
+    };
     Ok(Json(rules.into_iter().map(rule_to_response).collect()))
 }
 
@@ -279,6 +392,12 @@ async fn create_rule(
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<RuleResponse>), AppError> {
     auth.require_admin()?;
+    validate_typed_rule_fields(
+        &req.rule_type,
+        &req.config,
+        req.scope.as_deref(),
+        req.staging_repo_id,
+    )?;
     let svc = CurationService::new(state.db.clone());
     let rule = svc
         .create_rule(
@@ -289,6 +408,8 @@ async fn create_rule(
             &req.action,
             req.priority,
             &req.reason,
+            &req.rule_type,
+            &req.config,
             auth.user_id,
         )
         .await?;
@@ -345,6 +466,7 @@ async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<Json<RuleResponse>, AppError> {
     auth.require_admin()?;
+    validate_typed_rule_fields(&req.rule_type, &req.config, None, None)?;
     let svc = CurationService::new(state.db.clone());
     let rule = svc
         .update_rule(
@@ -356,6 +478,8 @@ async fn update_rule(
             req.priority,
             &req.reason,
             req.enabled,
+            &req.rule_type,
+            &req.config,
         )
         .await?;
     Ok(Json(rule_to_response(rule)))
@@ -760,6 +884,9 @@ fn rule_to_response(rule: crate::models::curation::CurationRule) -> RuleResponse
         priority: rule.priority,
         reason: rule.reason,
         enabled: rule.enabled,
+        rule_type: rule.rule_type,
+        config: rule.config,
+        scope: rule.scope,
         created_by: rule.created_by,
         created_at: rule.created_at.to_rfc3339(),
         updated_at: rule.updated_at.to_rfc3339(),
@@ -882,18 +1009,24 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
-        for field in ["package_pattern", "action", "reason"] {
+        for field in ["action", "reason"] {
             assert!(
                 required.contains(&field),
                 "expected {field} in required, got {required:?}"
             );
         }
-        // Defaulted/optional fields must not be required.
+        // Defaulted/optional fields must not be required. `package_pattern`
+        // joined this set with #2947: typed rules (publisher_trust,
+        // popularity) have no pattern, so it defaults to `*`.
         for field in [
             "staging_repo_id",
+            "package_pattern",
             "version_constraint",
             "architecture",
             "priority",
+            "rule_type",
+            "config",
+            "scope",
         ] {
             assert!(
                 !required.contains(&field),
@@ -949,6 +1082,203 @@ mod tests {
         assert_eq!(req.architecture, "*");
         assert_eq!(req.priority, 100);
         assert!(req.staging_repo_id.is_none());
+        // #2947 defaults: an untyped body is a pattern rule with empty config.
+        assert_eq!(req.rule_type, "pattern");
+        assert_eq!(req.config, serde_json::json!({}));
+        assert!(req.scope.is_none());
+    }
+
+    // -- #2947 typed rules: request shape + validation ------------------------
+
+    #[test]
+    fn test_create_rule_request_typed_global_deserializes() {
+        // A global publisher_trust rule needs no pattern and no repo.
+        let body = serde_json::json!({
+            "action": "block",
+            "reason": "untrusted publisher",
+            "rule_type": "publisher_trust",
+            "config": {"min_trust": 0.8},
+            "scope": "global"
+        });
+        let req: CreateRuleRequest =
+            serde_json::from_value(body).expect("deserialize typed global create body");
+        assert_eq!(req.rule_type, "publisher_trust");
+        assert_eq!(req.config, serde_json::json!({"min_trust": 0.8}));
+        assert_eq!(req.scope.as_deref(), Some("global"));
+        assert_eq!(req.package_pattern, "*", "pattern defaults for typed rules");
+        assert!(req.staging_repo_id.is_none());
+        assert!(validate_typed_rule_fields(
+            &req.rule_type,
+            &req.config,
+            req.scope.as_deref(),
+            req.staging_repo_id
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_accepts_all_known_types() {
+        for rule_type in crate::models::curation::CURATION_RULE_TYPES {
+            assert!(
+                validate_typed_rule_fields(rule_type, &serde_json::json!({}), None, None).is_ok(),
+                "{rule_type} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_rejects_unknown_type() {
+        let err =
+            validate_typed_rule_fields("mystery", &serde_json::json!({}), None, None).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("mystery")),
+            "unknown rule_type must be a Validation error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_rejects_non_object_config() {
+        for bad in [
+            serde_json::json!([1, 2]),
+            serde_json::json!("s"),
+            serde_json::json!(3),
+            serde_json::json!(null),
+        ] {
+            let err = validate_typed_rule_fields("popularity", &bad, None, None).unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "non-object config {bad} must be rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_scope_consistency() {
+        let cfg = serde_json::json!({});
+        let repo = Some(Uuid::new_v4());
+        // Consistent combinations pass.
+        assert!(validate_typed_rule_fields("pattern", &cfg, Some("global"), None).is_ok());
+        assert!(validate_typed_rule_fields("pattern", &cfg, Some("repository"), repo).is_ok());
+        assert!(validate_typed_rule_fields("pattern", &cfg, None, repo).is_ok());
+        // Inconsistent or unknown scopes are rejected.
+        for (scope, repo_id) in [("global", repo), ("repository", None), ("everywhere", None)] {
+            let err =
+                validate_typed_rule_fields("pattern", &cfg, Some(scope), repo_id).unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "scope={scope} repo={repo_id:?} must be rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_curation_rule_response_has_typed_fields() {
+        let spec = curation_spec_json();
+        let props = &spec["components"]["schemas"]["RuleResponse"]["properties"];
+        for field in ["rule_type", "config", "scope"] {
+            assert!(
+                props.get(field).is_some(),
+                "RuleResponse must document {field}"
+            );
+        }
+    }
+
+    // #2947 DB round-trip through the HANDLERS: an admin creates a global
+    // publisher_trust rule (no repo), it persists with rule_type/config/scope,
+    // shows up in the scope=global listing, and deletes cleanly.
+    #[tokio::test]
+    async fn test_create_list_delete_global_typed_rule_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin, aname) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let created = super::create_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Json(CreateRuleRequest {
+                staging_repo_id: None,
+                package_pattern: "*".to_string(),
+                version_constraint: "*".to_string(),
+                architecture: "*".to_string(),
+                action: "block".to_string(),
+                priority: 42,
+                reason: "publisher below trust floor (#2947 test)".to_string(),
+                rule_type: "publisher_trust".to_string(),
+                config: serde_json::json!({"min_trust": 0.9}),
+                scope: Some("global".to_string()),
+            }),
+        )
+        .await
+        .expect("admin creates a global typed rule");
+        let rule = created.1 .0;
+        assert_eq!(rule.rule_type, "publisher_trust");
+        assert_eq!(rule.config, serde_json::json!({"min_trust": 0.9}));
+        assert_eq!(rule.scope, "global");
+        assert!(rule.staging_repo_id.is_none());
+
+        // scope=global listing (admin-only) contains it.
+        let mut params = std::collections::HashMap::new();
+        params.insert("scope".to_string(), "global".to_string());
+        let listed = super::list_rules(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Query(params.clone()),
+        )
+        .await
+        .expect("admin lists global rules");
+        assert!(
+            listed.0.iter().any(|r| r.id == rule.id),
+            "global listing must contain the created rule"
+        );
+
+        // Non-admin cannot read the instance-wide baseline.
+        let denied = super::list_rules(
+            State(state.clone()),
+            Extension(tdh::make_auth(admin, &aname)),
+            Query(params),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "scope=global listing must be admin-only: {denied:?}"
+        );
+
+        // A bad rule_type is rejected before touching the DB.
+        let invalid = super::create_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Json(CreateRuleRequest {
+                staging_repo_id: None,
+                package_pattern: "*".to_string(),
+                version_constraint: "*".to_string(),
+                architecture: "*".to_string(),
+                action: "block".to_string(),
+                priority: 42,
+                reason: "bad".to_string(),
+                rule_type: "mystery".to_string(),
+                config: serde_json::json!({}),
+                scope: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(invalid, Err(AppError::Validation(_))),
+            "unknown rule_type must be rejected: {invalid:?}"
+        );
+
+        let deleted = super::delete_rule(
+            State(state),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(rule.id),
+        )
+        .await
+        .expect("admin deletes the typed rule");
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+
+        tdh::cleanup_user(&pool, admin).await;
     }
 
     // ----------------------------------------------------------------------

@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::models::curation::{CurationPackage, CurationRule};
+use crate::models::curation::{CurationDecision, CurationPackage, CurationRule};
 
 /// Result of evaluating a package against curation rules.
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +166,108 @@ impl CurationService {
     }
 
     // ---------------------------------------------------------------------------
+    // Typed rule dispatch (#2947)
+    // ---------------------------------------------------------------------------
+
+    /// Evaluate one typed rule against a package context, routing on
+    /// `rule.rule_type` (#2947).
+    ///
+    /// - `"pattern"`: the existing glob/version/arch evaluation, unchanged,
+    ///   wrapped to return a [`CurationDecision`]. The architecture is read
+    ///   from `metadata["architecture"]` when present. A pattern rule that does
+    ///   not match the package returns `NotApplicable` (no effect) — combining
+    ///   rules stays the caller's first-match concern, exactly as today.
+    /// - `"publisher_trust"`: dispatched to
+    ///   [`crate::services::curation::publisher_trust::evaluate`] (#2948 stub);
+    ///   `NotApplicable` for formats without a publisher signal.
+    /// - `"popularity"`: dispatched to
+    ///   [`crate::services::curation::popularity::evaluate_sync_placeholder`]
+    ///   (#2949 stub); `NotApplicable` for formats without an adoption signal.
+    /// - anything else: `Flag` — an unrecognized engine must never silently
+    ///   allow (the API rejects unknown types at write time; this is the
+    ///   defense-in-depth backstop).
+    pub fn evaluate_typed_rule(
+        rule: &CurationRule,
+        format: &str,
+        name: &str,
+        version: &str,
+        metadata: &serde_json::Value,
+    ) -> CurationDecision {
+        match rule.rule_type.as_str() {
+            "pattern" => {
+                let architecture = metadata.get("architecture").and_then(|v| v.as_str());
+                let eval = Self::evaluate_rules(
+                    std::slice::from_ref(rule),
+                    "allow",
+                    name,
+                    Some(version),
+                    architecture,
+                    false,
+                );
+                match eval.rule_id {
+                    None => CurationDecision::NotApplicable, // rule did not match
+                    Some(_) => match eval.action.as_str() {
+                        "allow" => CurationDecision::Allow,
+                        "block" => CurationDecision::Block(eval.reason),
+                        _ => CurationDecision::Flag(eval.reason),
+                    },
+                }
+            }
+            "publisher_trust" => crate::services::curation::publisher_trust::evaluate(
+                &rule.config,
+                format,
+                name,
+                version,
+                metadata,
+            ),
+            "popularity" => crate::services::curation::popularity::evaluate_sync_placeholder(
+                &rule.config,
+                format,
+                name,
+                version,
+                metadata,
+            ),
+            other => CurationDecision::Flag(format!(
+                "Unrecognized curation rule_type '{other}' (rule {}): routed to manual review",
+                rule.id
+            )),
+        }
+    }
+
+    /// First-applicable-wins typed evaluation over a pre-fetched rule set
+    /// (#2947 enforcement seam).
+    ///
+    /// `rules` is the priority-ordered UNION of the applicable global rules and
+    /// the repository's own rules — exactly what
+    /// [`Self::fetch_applicable_rules`] returns, since a global rule is stored
+    /// with `staging_repo_id IS NULL` (`scope = 'global'`) and that query has
+    /// always included the NULL-repo baseline.
+    ///
+    /// Each rule is dispatched through [`Self::evaluate_typed_rule`]; a
+    /// [`CurationDecision::NotApplicable`] result has NO effect (the rule is
+    /// skipped and evaluation continues), so a global `publisher_trust` /
+    /// `popularity` policy silently passes through formats it cannot judge.
+    /// The first `Allow` / `Flag` / `Block` decision wins, mirroring the
+    /// legacy first-match semantics. When no rule renders a decision the
+    /// caller's `default_decision` applies.
+    pub fn evaluate_typed_rules(
+        rules: &[CurationRule],
+        default_decision: CurationDecision,
+        format: &str,
+        name: &str,
+        version: &str,
+        metadata: &serde_json::Value,
+    ) -> (CurationDecision, Option<Uuid>) {
+        for rule in rules {
+            match Self::evaluate_typed_rule(rule, format, name, version, metadata) {
+                CurationDecision::NotApplicable => continue,
+                decision => return (decision, Some(rule.id)),
+            }
+        }
+        (default_decision, None)
+    }
+
+    // ---------------------------------------------------------------------------
     // Rule CRUD
     // ---------------------------------------------------------------------------
 
@@ -179,12 +281,23 @@ impl CurationService {
         action: &str,
         priority: i32,
         reason: &str,
+        rule_type: &str,
+        config: &serde_json::Value,
         created_by: Uuid,
     ) -> Result<CurationRule, sqlx::Error> {
+        // `scope` is DERIVED from the presence of a staging repo, never taken
+        // from the caller, so the invariant scope='global' <=> repo IS NULL
+        // cannot drift (the API validates the request's declared scope against
+        // this same derivation before calling in).
+        let scope = if staging_repo_id.is_some() {
+            "repository"
+        } else {
+            "global"
+        };
         sqlx::query_as(
             r#"INSERT INTO curation_rules
-               (staging_repo_id, package_pattern, version_constraint, architecture, action, priority, reason, created_by)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               (staging_repo_id, package_pattern, version_constraint, architecture, action, priority, reason, rule_type, config, scope, created_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                RETURNING *"#,
         )
         .bind(staging_repo_id)
@@ -194,6 +307,9 @@ impl CurationService {
         .bind(action)
         .bind(priority)
         .bind(reason)
+        .bind(rule_type)
+        .bind(config)
+        .bind(scope)
         .bind(created_by)
         .fetch_one(&self.db)
         .await
@@ -222,6 +338,19 @@ impl CurationService {
         }
     }
 
+    /// List only the instance-wide (global) rules, priority-ordered — the
+    /// baseline policy view backing `GET /curation/rules?scope=global`.
+    /// Served by the `idx_curation_rules_scope_global` partial index.
+    pub async fn list_global_rules(&self) -> Result<Vec<CurationRule>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT * FROM curation_rules
+               WHERE scope = 'global'
+               ORDER BY priority ASC, created_at ASC"#,
+        )
+        .fetch_all(&self.db)
+        .await
+    }
+
     /// Fetch a single rule by id. Returns `NotFound` when the id is unknown.
     pub async fn get_rule(&self, rule_id: Uuid) -> Result<CurationRule, AppError> {
         let rule: Option<CurationRule> =
@@ -243,11 +372,14 @@ impl CurationService {
         priority: i32,
         reason: &str,
         enabled: bool,
+        rule_type: &str,
+        config: &serde_json::Value,
     ) -> Result<CurationRule, AppError> {
         let rule: Option<CurationRule> = sqlx::query_as(
             r#"UPDATE curation_rules SET
                package_pattern = $2, version_constraint = $3, architecture = $4,
-               action = $5, priority = $6, reason = $7, enabled = $8, updated_at = now()
+               action = $5, priority = $6, reason = $7, enabled = $8,
+               rule_type = $9, config = $10, updated_at = now()
                WHERE id = $1
                RETURNING *"#,
         )
@@ -259,6 +391,8 @@ impl CurationService {
         .bind(priority)
         .bind(reason)
         .bind(enabled)
+        .bind(rule_type)
+        .bind(config)
         .fetch_optional(&self.db)
         .await?;
         rule.ok_or_else(|| AppError::NotFound("Curation rule not found".to_string()))
@@ -811,6 +945,9 @@ mod tests {
             priority: 0,
             reason: format!("{action} by test rule"),
             enabled: true,
+            rule_type: "pattern".to_string(),
+            config: serde_json::json!({}),
+            scope: "global".to_string(),
             created_by: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -923,6 +1060,232 @@ mod tests {
         assert!(eval.reason.contains("review"));
     }
 
+    // -- typed rule dispatch (#2947) ------------------------------------------
+
+    fn typed_rule(rule_type: &str, config: serde_json::Value) -> CurationRule {
+        let mut rule = make_rule("*", "*", "*", "allow");
+        rule.rule_type = rule_type.to_string();
+        rule.config = config;
+        rule
+    }
+
+    #[test]
+    fn test_dispatch_pattern_block_matches_legacy_evaluation() {
+        // Regression: a matching pattern rule renders the same verdict + reason
+        // through the typed dispatch as through the legacy in-memory path.
+        let rule = make_rule("telnet*", "*", "*", "block");
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "telnet-server",
+            "1.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Block(rule.reason.clone()));
+
+        let legacy = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "telnet-server",
+            "1.0",
+            None,
+        );
+        assert_eq!(legacy.action, "block");
+        assert_eq!(legacy.reason, rule.reason);
+    }
+
+    #[test]
+    fn test_dispatch_pattern_non_match_is_not_applicable() {
+        let rule = make_rule("telnet*", "*", "*", "block");
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "curl",
+            "8.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::NotApplicable);
+    }
+
+    #[test]
+    fn test_dispatch_pattern_allow_rule_matches() {
+        let rule = make_rule("nginx", ">= 1.0", "*", "allow");
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "nginx",
+            "1.5",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn test_dispatch_pattern_reads_architecture_from_metadata() {
+        // The typed context carries architecture inside `metadata`; an
+        // arch-scoped pattern rule must honor it in both directions.
+        let rule = make_rule("*", "*", "aarch64", "block");
+        let mismatched = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "nginx",
+            "1.0",
+            &serde_json::json!({"architecture": "x86_64"}),
+        );
+        assert_eq!(mismatched, CurationDecision::NotApplicable);
+
+        let matched = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "nginx",
+            "1.0",
+            &serde_json::json!({"architecture": "aarch64"}),
+        );
+        assert_eq!(matched, CurationDecision::Block(rule.reason.clone()));
+    }
+
+    #[test]
+    fn test_dispatch_publisher_trust_reaches_stub() {
+        // TODO(#2948) stub: always Allow. This pins the dispatch wiring only.
+        let rule = typed_rule("publisher_trust", serde_json::json!({"min_trust": 0.8}));
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "npm",
+            "left-pad",
+            "1.3.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn test_dispatch_popularity_reaches_stub() {
+        // TODO(#2949) stub: always Allow. This pins the dispatch wiring only.
+        let rule = typed_rule("popularity", serde_json::json!({"min_downloads": 1000}));
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "pypi",
+            "requests",
+            "2.32.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn test_dispatch_publisher_trust_not_applicable_format() {
+        // A format with no publisher concept must have NO effect — a global
+        // publisher-trust baseline cannot block/flag e.g. generic artifacts.
+        let rule = typed_rule("publisher_trust", serde_json::json!({"min_trust": 0.8}));
+        for format in ["generic", "rpm", "debian", "docker"] {
+            let decision = CurationService::evaluate_typed_rule(
+                &rule,
+                format,
+                "some-artifact",
+                "1.0",
+                &serde_json::json!({}),
+            );
+            assert_eq!(
+                decision,
+                CurationDecision::NotApplicable,
+                "publisher_trust must be NotApplicable for {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_popularity_not_applicable_format() {
+        let rule = typed_rule("popularity", serde_json::json!({"min_downloads": 1000}));
+        for format in ["generic", "rpm", "helm"] {
+            let decision = CurationService::evaluate_typed_rule(
+                &rule,
+                format,
+                "some-artifact",
+                "1.0",
+                &serde_json::json!({}),
+            );
+            assert_eq!(
+                decision,
+                CurationDecision::NotApplicable,
+                "popularity must be NotApplicable for {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evaluate_typed_rules_skips_not_applicable() {
+        // A global popularity rule (NotApplicable for rpm) followed by a
+        // pattern block: the popularity rule must have no effect and the
+        // pattern rule must still decide.
+        let popularity = typed_rule("popularity", serde_json::json!({"min_downloads": 10}));
+        let block = make_rule("telnet*", "*", "*", "block");
+        let (decision, rule_id) = CurationService::evaluate_typed_rules(
+            &[popularity, block.clone()],
+            CurationDecision::Allow,
+            "rpm",
+            "telnet-server",
+            "1.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Block(block.reason.clone()));
+        assert_eq!(rule_id, Some(block.id));
+    }
+
+    #[test]
+    fn test_evaluate_typed_rules_default_when_nothing_applies() {
+        let popularity = typed_rule("popularity", serde_json::json!({}));
+        let miss = make_rule("telnet*", "*", "*", "block");
+        let (decision, rule_id) = CurationService::evaluate_typed_rules(
+            &[popularity, miss],
+            CurationDecision::Allow,
+            "rpm",
+            "curl",
+            "8.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Allow);
+        assert!(rule_id.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_typed_rules_first_decision_wins() {
+        // Legacy parity: an earlier allow shadows a later block.
+        let allow = make_rule("nginx", "*", "*", "allow");
+        let block = make_rule("nginx", "*", "*", "block");
+        let (decision, rule_id) = CurationService::evaluate_typed_rules(
+            &[allow.clone(), block],
+            CurationDecision::Block("default".into()),
+            "rpm",
+            "nginx",
+            "1.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(decision, CurationDecision::Allow);
+        assert_eq!(rule_id, Some(allow.id));
+    }
+
+    #[test]
+    fn test_dispatch_unknown_rule_type_flags_for_review() {
+        // Defense-in-depth: an unrecognized engine must never silently allow.
+        let rule = typed_rule("mystery", serde_json::json!({}));
+        let decision = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "nginx",
+            "1.0",
+            &serde_json::json!({}),
+        );
+        match decision {
+            CurationDecision::Flag(reason) => {
+                assert!(
+                    reason.contains("mystery"),
+                    "reason names the type: {reason}"
+                )
+            }
+            other => panic!("unknown rule_type must Flag, got {other:?}"),
+        }
+    }
+
     // -- by-id not-found mapping (#2020) --------------------------------------
     //
     // get_rule / update_rule / delete_rule must surface an unknown id as
@@ -933,6 +1296,116 @@ mod tests {
         let url = std::env::var("DATABASE_URL").ok()?;
         let pool = sqlx::PgPool::connect(&url).await.ok()?;
         Some(CurationService::new(pool))
+    }
+
+    // -- typed rule persistence (#2947, DB-backed) ----------------------------
+
+    // A global publisher_trust rule round-trips rule_type + config through
+    // create/list/get, derives scope='global' from the absent staging repo,
+    // and shows up in the global-baseline listing.
+    #[tokio::test]
+    async fn test_create_typed_global_rule_round_trip_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+
+        let config = serde_json::json!({"min_trust": 0.9, "trusted_publishers": ["acme"]});
+        let rule = svc
+            .create_rule(
+                None,
+                "*",
+                "*",
+                "*",
+                "block",
+                50,
+                "untrusted publisher (#2947 test)",
+                "publisher_trust",
+                &config,
+                user,
+            )
+            .await
+            .expect("create typed global rule");
+        assert_eq!(rule.rule_type, "publisher_trust");
+        assert_eq!(rule.config, config);
+        assert_eq!(rule.scope, "global", "NULL repo must derive scope=global");
+        assert!(rule.staging_repo_id.is_none());
+
+        let fetched = svc.get_rule(rule.id).await.expect("get typed rule");
+        assert_eq!(fetched.rule_type, "publisher_trust");
+        assert_eq!(fetched.config, config);
+        assert_eq!(fetched.scope, "global");
+
+        let global = svc.list_global_rules().await.expect("list global rules");
+        assert!(
+            global.iter().any(|r| r.id == rule.id),
+            "typed global rule must appear in the global-baseline listing"
+        );
+
+        // The persisted row reaches the (stub) dispatch: applicable format
+        // hits the TODO(#2948) stub (Allow), non-applicable is NotApplicable.
+        let dec = CurationService::evaluate_typed_rule(
+            &fetched,
+            "npm",
+            "left-pad",
+            "1.3.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(dec, CurationDecision::Allow);
+        let na = CurationService::evaluate_typed_rule(
+            &fetched,
+            "generic",
+            "blob",
+            "1.0",
+            &serde_json::json!({}),
+        );
+        assert_eq!(na, CurationDecision::NotApplicable);
+
+        svc.delete_rule(rule.id).await.expect("delete typed rule");
+        tdh::cleanup_user(&pool, user).await;
+    }
+
+    // Migration compatibility: a rule inserted the pre-#2947 way (no
+    // rule_type/config columns named) defaults to rule_type='pattern' with an
+    // empty config and still evaluates exactly as before.
+    #[tokio::test]
+    async fn test_legacy_insert_defaults_to_pattern_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let rule: CurationRule = sqlx::query_as(
+            r#"INSERT INTO curation_rules
+               (staging_repo_id, package_pattern, version_constraint, architecture, action, priority, reason, created_by)
+               VALUES (NULL, 'telnet*', '*', '*', 'block', 100, 'legacy insert (#2947 test)', $1)
+               RETURNING *"#,
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy-shape insert");
+        assert_eq!(
+            rule.rule_type, "pattern",
+            "rule_type must default to pattern"
+        );
+        assert_eq!(rule.config, serde_json::json!({}));
+
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "telnet-server",
+            "1.0",
+            None,
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+
+        let svc = CurationService::new(pool.clone());
+        svc.delete_rule(rule.id).await.expect("delete legacy rule");
+        tdh::cleanup_user(&pool, user).await;
     }
 
     #[tokio::test]
@@ -965,7 +1438,18 @@ mod tests {
             return;
         };
         let err = svc
-            .update_rule(Uuid::new_v4(), "pkg-*", "*", "*", "block", 100, "qa", true)
+            .update_rule(
+                Uuid::new_v4(),
+                "pkg-*",
+                "*",
+                "*",
+                "block",
+                100,
+                "qa",
+                true,
+                "pattern",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert!(
