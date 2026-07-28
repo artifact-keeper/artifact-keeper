@@ -291,8 +291,43 @@ fn rewrite_v3_registration(
     out
 }
 
+/// True when `resource_url`'s origin (host + effective port) matches the
+/// configured `upstream_url`'s origin.
+///
+/// NuGet V3 discovers the `RegistrationsBaseUrl` / `PackageBaseAddress` bases
+/// from the upstream *service index response*, then fetches from them carrying
+/// the repo's configured upstream credentials (`apply_upstream_auth`, keyed by
+/// repo). A malicious or compromised upstream service index could therefore
+/// name an attacker-controlled host in those resources and have the proxy send
+/// the configured credentials there (credential exfiltration, #2925). Pinning
+/// the discovered bases to the operator-configured upstream origin keeps
+/// credentialed fetches on the host the operator actually trusts.
+///
+/// Comparison is host + effective port (`port_or_known_default`, so an
+/// `https`→`http` downgrade to the same host is also rejected because 443 ≠ 80)
+/// and case-insensitive on the host. The real nuget.org feed, GitHub Packages,
+/// Azure DevOps Artifacts and other private feeds all serve their registration
+/// and flat-container resources from the same host as their `index.json`, so
+/// this does not affect legitimate proxying; an upstream that legitimately
+/// fans resources out to a different host is refused by design (host-match on
+/// the upstream origin is the conservative default for a credentialed proxy).
+fn same_upstream_origin(upstream_url: &str, resource_url: &str) -> bool {
+    match (
+        reqwest::Url::parse(upstream_url),
+        reqwest::Url::parse(resource_url),
+    ) {
+        (Ok(up), Ok(res)) => {
+            up.host_str().map(str::to_ascii_lowercase)
+                == res.host_str().map(str::to_ascii_lowercase)
+                && up.port_or_known_default() == res.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 /// Resolve a discovered upstream base URL, rejecting a service index that omits
-/// it or advertises a non-http(s) base.
+/// it, advertises a non-http(s) base, or points the base at a host other than
+/// the configured upstream (#2925 — see [`same_upstream_origin`]).
 ///
 /// The anti-SSRF hard block for the actual outbound request is enforced by the
 /// proxy fetch layer's connect-time DNS guard (`is_blocked_resolved_ip`,
@@ -300,9 +335,15 @@ fn rewrite_v3_registration(
 /// codebase relies on it. A hostile upstream that points a base at a loopback /
 /// link-local / cloud-metadata address is refused there, before any bytes are
 /// read, for both the discovered registration/flat-container fetches here and
-/// the V2 OData fetches below.
+/// the V2 OData fetches below. The origin check added here is complementary: it
+/// keeps the configured upstream *credentials* from being sent to any host the
+/// service index names other than the configured upstream itself.
 #[allow(clippy::result_large_err)]
-fn guard_upstream_base(base: Option<&String>, what: &str) -> Result<String, Response> {
+fn guard_upstream_base(
+    base: Option<&String>,
+    upstream_url: &str,
+    what: &str,
+) -> Result<String, Response> {
     let base = base.ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -314,6 +355,16 @@ fn guard_upstream_base(base: Option<&String>, what: &str) -> Result<String, Resp
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Upstream {what} is not an http(s) URL"),
+        )
+            .into_response());
+    }
+    if !same_upstream_origin(upstream_url, base) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream {what} points off the configured upstream host; \
+                 refusing to send upstream credentials off-host"
+            ),
         )
             .into_response());
     }
@@ -336,8 +387,11 @@ async fn proxy_v3_registration(
 ) -> Result<Response, Response> {
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let reg_base =
-        guard_upstream_base(resources.registration_base.as_ref(), "RegistrationsBaseUrl")?;
+    let reg_base = guard_upstream_base(
+        resources.registration_base.as_ref(),
+        upstream_url,
+        "RegistrationsBaseUrl",
+    )?;
     let fetch_url = format!("{}/{}/index.json", reg_base, package_id_lower);
     let cache_path = format!("v3/registration/{}/index.json", package_id_lower);
     let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
@@ -377,7 +431,11 @@ async fn proxy_v3_flatcontainer(
 ) -> Result<Response, Response> {
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let pkg_base = guard_upstream_base(resources.package_base.as_ref(), "PackageBaseAddress")?;
+    let pkg_base = guard_upstream_base(
+        resources.package_base.as_ref(),
+        upstream_url,
+        "PackageBaseAddress",
+    )?;
     let fetch_url = format!("{}/{}", pkg_base, sub_path);
     let cache_path = format!("v3/flatcontainer/{}", sub_path);
     if streaming {
@@ -3250,6 +3308,69 @@ mod read_db_tests {
             r.package_base.as_deref(),
             Some("https://api.nuget.org/v3-flatcontainer")
         );
+    }
+
+    // #2925 — upstream credentials must stay pinned to the configured upstream
+    // host. A discovered service-index resource base that names a foreign host
+    // is refused by `guard_upstream_base`, so the repo's configured upstream
+    // credentials are never sent to a host the service index chose.
+    #[test]
+    fn test_same_upstream_origin_matches_same_host() {
+        // nuget.org: index.json and the discovered bases share host `api.nuget.org`.
+        assert!(same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json",
+        ));
+        // Host comparison is case-insensitive.
+        assert!(same_upstream_origin(
+            "https://API.NuGet.org/v3/index.json",
+            "https://api.nuget.org/v3-flatcontainer/",
+        ));
+    }
+
+    #[test]
+    fn test_same_upstream_origin_rejects_foreign_host_and_downgrade() {
+        // Foreign host named by a hostile service index → not the same origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://attacker.example/v3-flatcontainer/",
+        ));
+        // Same registrable domain but different host is still a different origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://evil.nuget.org.attacker.example/reg/",
+        ));
+        // http downgrade to the same host is rejected (443 != 80).
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "http://api.nuget.org/v3-flatcontainer/",
+        ));
+        // Different explicit port is a different origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://api.nuget.org:8443/v3-flatcontainer/",
+        ));
+    }
+
+    #[test]
+    fn test_guard_upstream_base_refuses_offhost_resource() {
+        // A service index that points the flat-container base at an attacker
+        // host is refused before any credentialed fetch is issued.
+        let upstream = "https://api.nuget.org/v3/index.json";
+        let foreign = Some("https://attacker.example/flat".to_string());
+        let err = guard_upstream_base(foreign.as_ref(), upstream, "PackageBaseAddress")
+            .expect_err("off-host base must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_guard_upstream_base_accepts_same_host_resource() {
+        // The legitimate same-host base is accepted and returned unchanged.
+        let upstream = "https://api.nuget.org/v3/index.json";
+        let same = Some("https://api.nuget.org/v3-flatcontainer".to_string());
+        let base = guard_upstream_base(same.as_ref(), upstream, "PackageBaseAddress")
+            .expect("same-host base must be accepted");
+        assert_eq!(base, "https://api.nuget.org/v3-flatcontainer");
     }
 
     #[test]
