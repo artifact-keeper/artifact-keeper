@@ -198,6 +198,57 @@ pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
     SsoProviderSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`curation_global_serial_lock`] (#2947).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the global-curation-rule test cluster serializes only against
+/// itself.
+const CURATION_GLOBAL_TEST_LOCK_KEY: i64 = 0x4355_2947; // "CU" + issue #2947
+
+/// Cross-process serialization guard for tests that seed *global* curation
+/// rules (#2947).
+///
+/// A `scope = 'global'` rule (`staging_repo_id IS NULL`) is instance-wide
+/// policy: `fetch_applicable_rules` unions it into EVERY repository's rule
+/// set. Under `cargo nextest`'s process-per-test parallelism, one test's
+/// freshly-seeded global rule can decide (first-applicable-wins) a peer
+/// test's evaluation mid-assert. A Postgres *session* advisory lock —
+/// mirroring [`scan_dedup_serial_lock`] — makes every such test contend for
+/// one key, so only one runs its seed → evaluate → cleanup critical section
+/// at a time. The lock releases when the guard drops (connection closes),
+/// including on panic.
+pub struct CurationGlobalSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide global-curation-rule test lock, blocking until it
+/// is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of any DB-backed test
+/// that seeds global curation rules and asserts on rule evaluation, and bind
+/// the result for the whole test body.
+pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return CurationGlobalSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return CurationGlobalSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(CURATION_GLOBAL_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return CurationGlobalSerialGuard { _conn: None };
+    }
+    CurationGlobalSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.

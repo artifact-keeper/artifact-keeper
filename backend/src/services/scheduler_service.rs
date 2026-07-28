@@ -1114,6 +1114,11 @@ pub(crate) async fn run_curation_sync_cycle(
     }
 
     let curation = CurationService::new(db.clone());
+    // One TTL-cached download-count source for the whole sweep, so `popularity`
+    // rules (#2949) evaluated across many packages / staging repos share
+    // lookups instead of hammering the public stats APIs.
+    let popularity_source =
+        crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
     let client = crate::services::http_client::base_client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
@@ -1407,24 +1412,27 @@ pub(crate) async fn run_curation_sync_cycle(
                 .await
             {
                 Ok(pkg) if pkg.status == "pending" => {
+                    // Typed dispatch (#2947): pattern + publisher_trust +
+                    // popularity rules all apply, with the upstream metadata
+                    // blob as the evaluation context.
                     let eval = curation
-                        .evaluate_package(
+                        .evaluate_package_typed(
                             *staging_id,
                             default_action,
+                            &entry.format,
                             &entry.package_name,
                             &entry.version,
                             entry.architecture.as_deref(),
+                            &entry.metadata,
+                            &popularity_source,
                         )
                         .await;
 
-                    if let Ok(eval) = eval {
-                        let status = match eval.action.as_str() {
-                            "allow" => "approved",
-                            "block" => "blocked",
-                            _ => "review",
-                        };
+                    if let Ok((decision, rule_id)) = eval {
+                        let (status, reason) =
+                            CurationService::decision_to_status_reason(&decision, rule_id);
                         let _ = curation
-                            .set_package_status(pkg.id, status, &eval.reason, None, eval.rule_id)
+                            .set_package_status(pkg.id, status, &reason, None, rule_id)
                             .await;
                     }
                 }
