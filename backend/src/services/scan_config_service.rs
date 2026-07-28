@@ -3,8 +3,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::Result;
-use crate::models::security::ScanConfig;
+use crate::error::{AppError, Result};
+use crate::models::security::{ScanConfig, Severity};
 
 /// Request to create or update a scan configuration.
 ///
@@ -31,6 +31,25 @@ pub struct UpsertScanConfigRequest {
     pub block_on_policy_violation: Option<bool>,
     #[serde(default)]
     pub severity_threshold: Option<String>,
+}
+
+/// Validate + normalize a caller-supplied `severity_threshold` to the canonical
+/// lowercase form enforced by the `scan_configs_severity_threshold_check` CHECK
+/// constraint (`critical|high|medium|low|info`).
+///
+/// Accepts input case-insensitively and resolves aliases ("moderate" -> "medium",
+/// "informational"/"none" -> "info"). A genuinely-invalid value yields a
+/// `Validation` error (HTTP 400) instead of being passed to Postgres where it
+/// would trip the constraint and surface as a raw DB error / HTTP 500 (#2953).
+fn normalize_severity_threshold(raw: &str) -> Result<String> {
+    Severity::from_str_loose(raw)
+        .map(|s| s.as_str().to_string())
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "invalid severity_threshold '{raw}'; allowed values are \
+                 critical, high, medium, low, info"
+            ))
+        })
 }
 
 pub struct ScanConfigService {
@@ -93,12 +112,22 @@ impl ScanConfigService {
                 .map(|c| c.block_on_policy_violation)
                 .unwrap_or(false)
         });
-        let severity_threshold = req.severity_threshold.clone().unwrap_or_else(|| {
-            existing
+        // Validate + normalize the caller-supplied severity_threshold BEFORE the
+        // DB write. The column carries a `scan_configs_severity_threshold_check`
+        // CHECK constraint over the canonical lowercase set
+        // (critical|high|medium|low|info); passing a raw casing like "High" or a
+        // bogus value like "yolo" straight through surfaced the constraint
+        // violation as a raw DB error -> HTTP 500 (#2953). Accept case-insensitive
+        // input and aliases ("moderate" -> "medium"), normalize to the canonical
+        // form, and reject a genuinely-invalid value with a 400. An omitted field
+        // keeps the existing (already-valid) row value, or the documented default.
+        let severity_threshold = match req.severity_threshold.as_deref() {
+            Some(raw) => normalize_severity_threshold(raw)?,
+            None => existing
                 .as_ref()
                 .map(|c| c.severity_threshold.clone())
-                .unwrap_or_else(|| "high".to_string())
-        });
+                .unwrap_or_else(|| "high".to_string()),
+        };
 
         let config = sqlx::query_as!(
             ScanConfig,
@@ -434,5 +463,68 @@ mod tests {
             opt.unwrap_or(false)
         }
         assert!(!is_scan_enabled(Some(false)));
+    }
+
+    // -----------------------------------------------------------------------
+    // severity_threshold validation / normalization (#2953)
+    //
+    // The handler used to pass the raw string straight to Postgres, so a
+    // non-lowercase casing ("High") or a bogus value ("yolo") tripped the
+    // `scan_configs_severity_threshold_check` CHECK constraint and leaked as an
+    // HTTP 500. normalize_severity_threshold now canonicalizes valid input and
+    // rejects invalid input with a Validation error (HTTP 400) before the DB
+    // write. These tests are pure and need no DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_severity_accepts_canonical_lowercase() {
+        for v in ["critical", "high", "medium", "low", "info"] {
+            assert_eq!(normalize_severity_threshold(v).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn test_normalize_severity_normalizes_casing() {
+        // The exact #2953 repro: "High" must be accepted and normalized, not 500.
+        assert_eq!(normalize_severity_threshold("High").unwrap(), "high");
+        assert_eq!(
+            normalize_severity_threshold("CRITICAL").unwrap(),
+            "critical"
+        );
+        assert_eq!(normalize_severity_threshold("Medium").unwrap(), "medium");
+    }
+
+    #[test]
+    fn test_normalize_severity_resolves_aliases() {
+        assert_eq!(normalize_severity_threshold("moderate").unwrap(), "medium");
+        assert_eq!(normalize_severity_threshold("Moderate").unwrap(), "medium");
+        assert_eq!(
+            normalize_severity_threshold("informational").unwrap(),
+            "info"
+        );
+        assert_eq!(normalize_severity_threshold("none").unwrap(), "info");
+    }
+
+    #[test]
+    fn test_normalize_severity_rejects_invalid_with_validation_error() {
+        // "yolo" must be a 400 (Validation), never reach Postgres as a 500.
+        let err = normalize_severity_threshold("yolo").unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "invalid severity must map to Validation (400), got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("severity_threshold") && msg.contains("critical"),
+            "message must name the field and list allowed values: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_severity_rejects_empty() {
+        assert!(matches!(
+            normalize_severity_threshold("").unwrap_err(),
+            AppError::Validation(_)
+        ));
     }
 }
