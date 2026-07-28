@@ -898,6 +898,19 @@ async fn download(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
+    // Curation enforcement (#2930): block a curated artifact pull on a
+    // remote/virtual repo. The package identity is `groupId:artifactId`
+    // (`maven_proxy_package_name`, the same shape the proxy-sync catalog uses),
+    // so a rule authored for the curation catalog matches here. Metadata and
+    // checksum/signature sidecars derive no package identity (the helper returns
+    // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
+    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
+        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
+            .ok()
+            .map(|c| c.version);
+        proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
+    }
+
     // 1. Check if this is a checksum request for metadata.
     //    Always compute the checksum from the actual metadata XML bytes
     //    so the result is guaranteed to match what this same URL returns

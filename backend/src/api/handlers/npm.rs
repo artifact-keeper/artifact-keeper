@@ -2728,6 +2728,14 @@ async fn serve_tarball(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
+    // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
+    // must block the tarball pull, the same way the pypi seam gates simple-index
+    // + download. No-op for hosted repos and when curation is disabled. Version
+    // is not passed: an npm tarball filename (`pkg-1.2.3.tgz`, prerelease
+    // suffixes and hyphenated names included) cannot be split into name/version
+    // unambiguously, so name-pattern rules (the block-a-package case) apply.
+    proxy_helpers::enforce_curation(&state.db, &repo, package_name, None).await?;
+
     // Tarball URLs keep the scope separator as a literal `/`
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream

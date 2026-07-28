@@ -827,6 +827,20 @@ async fn download(
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
 
+    // Curation enforcement (#2930): block a curated crate before it is resolved
+    // locally or proxied from upstream. The cargo handler's private `RepoInfo`
+    // does not carry the curation columns, so use the by-id lookup variant
+    // (no-op / no query for hosted repos and when curation is off).
+    proxy_helpers::enforce_curation_lookup(
+        &state.db,
+        repo.id,
+        &repo_key,
+        &repo.repo_type,
+        &name_lower,
+        Some(&version),
+    )
+    .await?;
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes, checksum_sha256
