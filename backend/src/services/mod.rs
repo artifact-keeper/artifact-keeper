@@ -103,6 +103,7 @@ pub mod webhook_signing;
 pub mod age_gate_service;
 pub mod analytics_service;
 pub mod crash_reporting_service;
+pub mod curation;
 pub mod curation_service;
 pub mod curation_sync;
 pub mod health_monitor_service;
