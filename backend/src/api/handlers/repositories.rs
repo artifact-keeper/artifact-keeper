@@ -4095,6 +4095,28 @@ pub struct ArtifactResponse {
     /// `revision`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_label: Option<String>,
+    /// Per-artifact quarantine state so a client/operator can tell which
+    /// listed artifacts are held for security review (#2940). Always
+    /// serialized so the listing never hides the control:
+    /// - `"quarantined"` — held pending review; downloads return 409 (until
+    ///   any `quarantine_until` lapses),
+    /// - `"rejected"` — terminally blocked by an admin,
+    /// - a scan-lifecycle state (`"clean"`, `"flagged"`, `"unscanned"`,
+    ///   `"released"`),
+    /// - `"not_quarantined"` — the explicit default when the row carries no
+    ///   quarantine state, so clients never have to treat a missing value as
+    ///   a state.
+    ///
+    /// The human-readable *reason* is intentionally NOT surfaced here: it is
+    /// per-artifact security detail disclosed only by the authenticated,
+    /// repository-visibility-checked `GET /api/v1/quarantine/{id}` (#2912),
+    /// whereas this listing is reachable anonymously on public repositories.
+    pub quarantine_status: String,
+    /// When a timed quarantine hold lapses and the artifact becomes
+    /// downloadable again. `None` for a permanent (admin) quarantine and for
+    /// artifacts that are not quarantined. (#2940)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4694,6 +4716,10 @@ fn build_catalog_artifact_response(
         cache_expires_at: None,
         revision: None,
         version_label: None,
+        // Proxy-cached objects have no `artifacts` row and no quarantine
+        // state; the upload-hold workflow only applies to hosted artifacts.
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -4803,6 +4829,10 @@ fn build_cached_artifact_response(
         // Proxy-cache entries carry no versioned history (#2367).
         revision: None,
         version_label: None,
+        // Proxy-cached objects have no `artifacts` row and no quarantine
+        // state; the upload-hold workflow only applies to hosted artifacts.
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -4958,6 +4988,22 @@ fn apply_npm_tarball_url_path(item: &mut ArtifactResponse) {
     }
 }
 
+/// The [`ArtifactResponse::quarantine_status`] label for an artifact that
+/// carries no quarantine row state.
+pub(crate) const NOT_QUARANTINED: &str = "not_quarantined";
+
+/// Map the nullable `artifacts.quarantine_status` column to the always-present
+/// listing label (#2940). A missing or empty column value is reported as the
+/// explicit [`NOT_QUARANTINED`] state so clients never have to treat `null`
+/// as a state; any recorded status (`quarantined`, `rejected`, `clean`, …) is
+/// surfaced verbatim.
+pub(crate) fn quarantine_status_label(raw: Option<&str>) -> String {
+    match raw {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => NOT_QUARANTINED.to_string(),
+    }
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -4987,6 +5033,11 @@ fn build_artifact_response(
         // per-artifact metadata endpoint, not fanned out in listings (#2367).
         revision: None,
         version_label: None,
+        // Quarantine state is carried on the same `artifacts` row already
+        // selected by `list_page`/`list_for_repos_page`, so surfacing it here
+        // adds no extra query (no join, no N+1) (#2940).
+        quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+        quarantine_until: artifact.quarantine_until,
     }
 }
 
@@ -5039,6 +5090,10 @@ fn expand_maven_secondary_files(
             cache_expires_at: None,
             revision: None,
             version_label: None,
+            // Companion files share the primary's `artifacts` row, so they
+            // inherit its quarantine state (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         });
     }
     out
@@ -6359,6 +6414,10 @@ pub async fn get_artifact_metadata(
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
             revision,
             version_label,
+            // Surface the resolved row's quarantine state, matching the
+            // listing (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         })
         .into_response());
     }
@@ -6476,6 +6535,11 @@ fn artifact_version_to_response(
         cache_expires_at: None,
         revision: Some(stored.revision),
         version_label: stored.version_label,
+        // A historical revision row (`artifact_versions`) carries no live
+        // quarantine state; quarantine is tracked on the HEAD `artifacts`
+        // row (#2940).
+        quarantine_status: NOT_QUARANTINED.to_string(),
+        quarantine_until: None,
     }
 }
 
@@ -6838,6 +6902,13 @@ async fn persist_generic_staged_upload(
             cache_expires_at: None,
             revision,
             version_label,
+            // The upload-time quarantine hold (`apply_upload_hold`) runs as a
+            // post-commit UPDATE after the INSERT's `RETURNING` built this
+            // struct, so the value here predates any hold. The authoritative
+            // per-artifact state is the listing / `GET /api/v1/quarantine/{id}`
+            // (#2940).
+            quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
+            quarantine_until: artifact.quarantine_until,
         }),
     )
         .into_response())
@@ -9747,6 +9818,49 @@ mod tests {
         assert_eq!(resp.download_count, 42);
         // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
         assert!(resp.analyzable);
+        // A normal (un-held) artifact reports the explicit not-quarantined
+        // state, never a bare null (#2940).
+        assert_eq!(resp.quarantine_status, "not_quarantined");
+        assert!(resp.quarantine_until.is_none());
+    }
+
+    #[test]
+    fn test_quarantine_status_label_maps_missing_to_not_quarantined() {
+        // A null/empty column is the common (unquarantined) case and must
+        // report the explicit label so clients never treat null as a state.
+        assert_eq!(quarantine_status_label(None), "not_quarantined");
+        assert_eq!(quarantine_status_label(Some("")), "not_quarantined");
+        // Any recorded status is surfaced verbatim.
+        assert_eq!(quarantine_status_label(Some("quarantined")), "quarantined");
+        assert_eq!(quarantine_status_label(Some("rejected")), "rejected");
+        assert_eq!(quarantine_status_label(Some("clean")), "clean");
+    }
+
+    #[test]
+    fn test_build_artifact_response_surfaces_quarantined_state() {
+        // The listing must make a held artifact visible: a quarantined row
+        // surfaces `quarantine_status = "quarantined"` and its hold expiry,
+        // while an unquarantined row surfaces the not-quarantined default.
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+
+        let mut held = make_artifact_for_test("held/pkg-1.0.0.jar");
+        held.quarantine_status = Some("quarantined".to_string());
+        held.quarantine_until = Some(until);
+        let held_resp = build_artifact_response(&held, "generic-hosted", 0);
+        assert_eq!(held_resp.quarantine_status, "quarantined");
+        assert_eq!(held_resp.quarantine_until, Some(until));
+
+        let clean = make_artifact_for_test("clean/pkg-1.0.0.jar");
+        let clean_resp = build_artifact_response(&clean, "generic-hosted", 0);
+        assert_eq!(clean_resp.quarantine_status, "not_quarantined");
+        assert!(clean_resp.quarantine_until.is_none());
+
+        // The held item serializes the state (and the reason is NOT present
+        // here — it is only disclosed by the authenticated quarantine
+        // endpoint, #2912).
+        let json = serde_json::to_value(&held_resp).unwrap();
+        assert_eq!(json["quarantine_status"], "quarantined");
+        assert!(json.get("quarantine_reason").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -11309,9 +11423,16 @@ mod tests {
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
+        // Unquarantined artifacts report the explicit default state (#2940).
+        assert!(json.contains("\"quarantine_status\":\"not_quarantined\""));
+        // `quarantine_until` is omitted when None so the wire shape stays
+        // minimal for the common (unquarantined) case.
+        assert!(!json.contains("quarantine_until"));
         assert!(json.contains("\"size_bytes\":1024"));
         // `analyzable` is always serialized (no serde skip) so clients can
         // gate the SBOM/Scan actions on it (#2227).
@@ -11392,6 +11513,8 @@ mod tests {
             analyzable: false,
             cache_cached_at: Some(cached),
             cache_expires_at: Some(expires),
+            quarantine_status: "not_quarantined".to_string(),
+            quarantine_until: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
