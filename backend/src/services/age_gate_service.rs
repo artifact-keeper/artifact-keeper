@@ -180,12 +180,18 @@ pub fn validate_min_age_days(min_age_days: i32) -> Result<()> {
     Ok(())
 }
 
-/// Reject approve/reject on a review that is no longer pending.
-pub(crate) fn require_pending_review(status: &str) -> Result<()> {
-    if status != AgeGateReviewStatus::Pending.as_str() {
+/// Guard a review state transition. Errors when the review is already in the
+/// requested target state (a no-op transition), otherwise allows the change.
+///
+/// Reviews are no longer terminal: an admin can approve, reject, or reopen a
+/// review from ANY current state (e.g. re-block a previously-approved package
+/// by rejecting it, or re-approve a previously-rejected one). The only refused
+/// transition is one that would not change anything.
+pub(crate) fn require_distinct_status(current: &str, target: AgeGateReviewStatus) -> Result<()> {
+    if current == target.as_str() {
         return Err(AppError::Validation(format!(
             "Review is already {}",
-            status
+            target.as_str()
         )));
     }
     Ok(())
@@ -577,7 +583,7 @@ impl AgeGateService {
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
-        require_pending_review(&review.status)?;
+        require_distinct_status(&review.status, AgeGateReviewStatus::Approved)?;
 
         sqlx::query!(
             r#"
@@ -611,7 +617,7 @@ impl AgeGateService {
         reason: Option<&str>,
     ) -> Result<AgeGateReview> {
         let review = self.get_review_by_id(id).await?;
-        require_pending_review(&review.status)?;
+        require_distinct_status(&review.status, AgeGateReviewStatus::Rejected)?;
 
         sqlx::query!(
             r#"
@@ -636,6 +642,50 @@ impl AgeGateService {
         );
 
         self.get_review_by_id(id).await
+    }
+
+    /// Reopen a decided review, moving it back to `pending` so the age gate can
+    /// be revisited. Allowed from any non-`pending` state; a review that is
+    /// already pending is refused as a no-op. The download path re-reads the
+    /// review status on every request, so reopening a young package's review
+    /// re-blocks subsequent pulls until it is decided again (or ages out).
+    ///
+    /// Returns `(previous_status, updated_review)` so callers can record the
+    /// prior state in the audit trail.
+    pub async fn reopen(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(String, AgeGateReview)> {
+        let review = self.get_review_by_id(id).await?;
+        require_distinct_status(&review.status, AgeGateReviewStatus::Pending)?;
+        let previous_status = review.status.clone();
+
+        sqlx::query!(
+            r#"
+            UPDATE age_gate_reviews
+            SET status = 'pending', reviewed_by = $2, reviewed_at = NOW(),
+                review_reason = $3
+            WHERE id = $1
+            "#,
+            id,
+            reviewer_id,
+            reason
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        self.event_bus.emit_for_repo(
+            "age_gate.reopened",
+            id,
+            review.repository_id,
+            Some(reviewer_id.to_string()),
+        );
+
+        let updated = self.get_review_by_id(id).await?;
+        Ok((previous_status, updated))
     }
 
     pub async fn update_repo_config(
@@ -1639,6 +1689,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_reopen_and_redecide_flips_enforcement() {
+        let Some(pool) = try_db_pool().await else {
+            return;
+        };
+        let bus = Arc::new(EventBus::new(64));
+        let svc = AgeGateService::new(pool.clone(), bus);
+        let (repo_id, repo_key) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 7).await;
+        let params = npm_params(repo_id, repo_key, 7);
+        let reviewer = create_reviewer(&pool).await;
+
+        // A young version is blocked and creates a pending review.
+        let young = Utc::now() - Duration::days(1);
+        let review_id = match svc.check(&params, "reopen-pkg", "1.0.0", Some(young)).await {
+            Ok(AgeGateDecision::Block { review_id, .. }) => review_id,
+            other => panic!("young version should block, got {other:?}"),
+        };
+
+        // Admin approves -> pulls are now allowed.
+        let approved = svc
+            .approve(review_id, reviewer, Some("looked fine"))
+            .await
+            .expect("approve pending");
+        assert_eq!(approved.status, "approved");
+        assert!(matches!(
+            svc.check(&params, "reopen-pkg", "1.0.0", Some(young)).await,
+            Ok(AgeGateDecision::Allow)
+        ));
+
+        // Re-approving an already-approved review is a refused no-op.
+        assert!(svc.approve(review_id, reviewer, None).await.is_err());
+
+        // Reopen the terminal review -> back to pending, and the young version is
+        // re-blocked on the very next pull.
+        let (prev, reopened) = svc
+            .reopen(review_id, reviewer, Some("turned out bad"))
+            .await
+            .expect("reopen approved review");
+        assert_eq!(prev, "approved");
+        assert_eq!(reopened.status, "pending");
+        assert!(matches!(
+            svc.check(&params, "reopen-pkg", "1.0.0", Some(young)).await,
+            Ok(AgeGateDecision::Block { .. })
+        ));
+
+        // Reject the reopened review -> hard block regardless of age.
+        let rejected = svc
+            .reject(review_id, reviewer, Some("confirmed bad"))
+            .await
+            .expect("reject reopened review");
+        assert_eq!(rejected.status, "rejected");
+        assert!(matches!(
+            svc.check(
+                &params,
+                "reopen-pkg",
+                "1.0.0",
+                Some(Utc::now() - Duration::days(90))
+            )
+            .await,
+            Ok(AgeGateDecision::Block { .. })
+        ));
+
+        // Directly re-approve the rejected review (no reopen step) -> unblocked.
+        let reapproved = svc
+            .approve(review_id, reviewer, Some("now fine"))
+            .await
+            .expect("re-approve rejected review");
+        assert_eq!(reapproved.status, "approved");
+        assert!(matches!(
+            svc.check(&params, "reopen-pkg", "1.0.0", Some(young)).await,
+            Ok(AgeGateDecision::Allow)
+        ));
+
+        // Direct re-decide the other way: reject an approved review -> re-blocked.
+        let reblocked = svc
+            .reject(review_id, reviewer, Some("re-block"))
+            .await
+            .expect("reject approved review");
+        assert_eq!(reblocked.status, "rejected");
+        assert!(matches!(
+            svc.check(&params, "reopen-pkg", "1.0.0", Some(young)).await,
+            Ok(AgeGateDecision::Block { .. })
+        ));
+
+        // Reopening an already-pending review is a refused no-op.
+        let pending_id = insert_review_row(
+            &pool,
+            repo_id,
+            "reopen-pkg",
+            "2.0.0",
+            "pending",
+            Some(young),
+        )
+        .await;
+        assert!(svc.reopen(pending_id, reviewer, None).await.is_err());
+    }
+
+    #[tokio::test]
     async fn db_metadata_filters_batch_reviews_and_sweep() {
         let Some(pool) = try_db_pool().await else {
             return;
@@ -1861,10 +2008,18 @@ mod tests {
     }
 
     #[test]
-    fn require_pending_review_rejects_non_pending() {
-        assert!(require_pending_review("pending").is_ok());
-        assert!(require_pending_review("approved").is_err());
-        assert!(require_pending_review("rejected").is_err());
+    fn require_distinct_status_refuses_only_noop_transitions() {
+        // Approve is allowed from pending and rejected, refused from approved.
+        assert!(require_distinct_status("pending", AgeGateReviewStatus::Approved).is_ok());
+        assert!(require_distinct_status("rejected", AgeGateReviewStatus::Approved).is_ok());
+        assert!(require_distinct_status("approved", AgeGateReviewStatus::Approved).is_err());
+        // Reject is allowed from pending and approved, refused from rejected.
+        assert!(require_distinct_status("approved", AgeGateReviewStatus::Rejected).is_ok());
+        assert!(require_distinct_status("rejected", AgeGateReviewStatus::Rejected).is_err());
+        // Reopen is allowed from any terminal state, refused when already pending.
+        assert!(require_distinct_status("approved", AgeGateReviewStatus::Pending).is_ok());
+        assert!(require_distinct_status("rejected", AgeGateReviewStatus::Pending).is_ok());
+        assert!(require_distinct_status("pending", AgeGateReviewStatus::Pending).is_err());
     }
 
     #[test]

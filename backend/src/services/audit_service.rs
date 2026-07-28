@@ -87,6 +87,7 @@ pub enum AuditAction {
     AgeGateQueued,
     AgeGateApproved,
     AgeGateRejected,
+    AgeGateReopened,
 
     // Authorization decisions (#2366 functional audit log). Recorded when an
     // authenticated principal is refused a privileged operation (e.g. a
@@ -153,6 +154,7 @@ impl AuditAction {
             AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
+            AuditAction::AgeGateReopened => "AGE_GATE_REOPENED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
         }

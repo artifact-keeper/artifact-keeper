@@ -53,6 +53,7 @@ pub fn admin_router() -> Router<SharedState> {
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/approve", post(approve_review))
         .route("/reviews/:id/reject", post(reject_review))
+        .route("/reviews/:id/reopen", post(reopen_review))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -137,14 +138,49 @@ fn age_gate_service(
 }
 
 /// Build the audit-log details for an approve/reject action.
-fn build_review_audit_details(
-    review: &AgeGateReviewResponse,
+fn build_review_audit_details(review: &AgeGateReview, reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "review_id": review.id,
+        "package": review.package_name,
+        "version": review.package_version,
+        "reason": reason,
+    })
+}
+
+/// Emit the audit entry for a review state change and return the JSON response.
+/// Shared by approve/reject/reopen so the audit-logging tail lives in one place.
+async fn log_review_action(
+    state: &SharedState,
+    actor: Uuid,
+    action: AuditAction,
+    review: AgeGateReview,
+    details: serde_json::Value,
+) -> Json<AgeGateReviewResponse> {
+    let repository_id = review.repository_id;
+    let resp = review_to_response(review);
+    let audit = AuditService::new(state.db.clone());
+    let _ = audit
+        .log(
+            AuditEntry::new(action, ResourceType::Repository)
+                .user(actor)
+                .resource(repository_id)
+                .details(details),
+        )
+        .await;
+    Json(resp)
+}
+
+/// Build the audit-log details for a reopen action, capturing the prior state.
+fn build_reopen_audit_details(
+    review: &AgeGateReview,
+    previous_status: &str,
     reason: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "review_id": review.id,
         "package": review.package_name,
         "version": review.package_version,
+        "previous_status": previous_status,
         "reason": reason,
     })
 }
@@ -250,19 +286,15 @@ pub async fn approve_review(
         .approve(id, auth.user_id, body.reason.as_deref())
         .await?;
 
-    let repository_id = review.repository_id;
-    let resp = review_to_response(review);
-    let audit = AuditService::new(state.db.clone());
-    let _ = audit
-        .log(
-            AuditEntry::new(AuditAction::AgeGateApproved, ResourceType::Repository)
-                .user(auth.user_id)
-                .resource(repository_id)
-                .details(build_review_audit_details(&resp, body.reason.as_deref())),
-        )
-        .await;
-
-    Ok(Json(resp))
+    let details = build_review_audit_details(&review, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateApproved,
+        review,
+        details,
+    )
+    .await)
 }
 
 #[utoipa::path(
@@ -284,19 +316,45 @@ pub async fn reject_review(
     let svc = age_gate_service(&state)?;
     let review = svc.reject(id, auth.user_id, body.reason.as_deref()).await?;
 
-    let repository_id = review.repository_id;
-    let resp = review_to_response(review);
-    let audit = AuditService::new(state.db.clone());
-    let _ = audit
-        .log(
-            AuditEntry::new(AuditAction::AgeGateRejected, ResourceType::Repository)
-                .user(auth.user_id)
-                .resource(repository_id)
-                .details(build_review_audit_details(&resp, body.reason.as_deref())),
-        )
-        .await;
+    let details = build_review_audit_details(&review, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateRejected,
+        review,
+        details,
+    )
+    .await)
+}
 
-    Ok(Json(resp))
+#[utoipa::path(
+    post,
+    path = "/age-gate/reviews/{id}/reopen",
+    context_path = "/api/v1/admin",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ReviewActionRequest,
+    responses((status = 200, body = AgeGateReviewResponse))
+)]
+pub async fn reopen_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    auth.require_admin()?;
+    let svc = age_gate_service(&state)?;
+    let (previous_status, review) = svc.reopen(id, auth.user_id, body.reason.as_deref()).await?;
+
+    let details = build_reopen_audit_details(&review, &previous_status, body.reason.as_deref());
+    Ok(log_review_action(
+        &state,
+        auth.user_id,
+        AuditAction::AgeGateReopened,
+        review,
+        details,
+    )
+    .await)
 }
 
 #[utoipa::path(
@@ -384,7 +442,7 @@ pub async fn update_repo_age_gate(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_reviews, get_review, approve_review, reject_review, get_repo_age_gate, update_repo_age_gate),
+    paths(list_reviews, get_review, approve_review, reject_review, reopen_review, get_repo_age_gate, update_repo_age_gate),
     components(schemas(
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
@@ -476,39 +534,16 @@ mod tests {
         assert!(require_remote_repo_for_age_gate(&RepositoryType::Remote).is_ok());
     }
 
-    #[test]
-    fn build_review_audit_details_includes_fields() {
+    /// Build an `AgeGateReview` fixture for the pure detail/mapping tests.
+    fn sample_review(name: &str, version: &str, status: &str) -> AgeGateReview {
         let now = Utc::now();
-        let resp = AgeGateReviewResponse {
-            id: Uuid::new_v4(),
-            repository_key: "npm-remote".to_string(),
-            package_name: "react".to_string(),
-            package_version: "18.0.0".to_string(),
-            upstream_published_at: None,
-            status: "pending".to_string(),
-            requested_at: now,
-            reviewed_by: None,
-            reviewed_at: None,
-            review_reason: None,
-            request_count: 1,
-            last_requested_at: now,
-        };
-        let details = build_review_audit_details(&resp, Some("looks safe"));
-        assert_eq!(details["package"], "react");
-        assert_eq!(details["version"], "18.0.0");
-        assert_eq!(details["reason"], "looks safe");
-    }
-
-    #[test]
-    fn review_to_response_maps_fields_and_default_key() {
-        let now = Utc::now();
-        let review = crate::services::age_gate_service::AgeGateReview {
+        AgeGateReview {
             id: Uuid::new_v4(),
             repository_id: Uuid::new_v4(),
-            package_name: "lodash".to_string(),
-            package_version: "4.0.0".to_string(),
+            package_name: name.to_string(),
+            package_version: version.to_string(),
             upstream_published_at: None,
-            status: "pending".to_string(),
+            status: status.to_string(),
             requested_at: now,
             reviewed_by: None,
             reviewed_at: None,
@@ -516,8 +551,31 @@ mod tests {
             request_count: 1,
             last_requested_at: now,
             repository_key: None,
-        };
-        let resp = review_to_response(review);
+        }
+    }
+
+    #[test]
+    fn build_review_audit_details_includes_fields() {
+        let review = sample_review("react", "18.0.0", "pending");
+        let details = build_review_audit_details(&review, Some("looks safe"));
+        assert_eq!(details["package"], "react");
+        assert_eq!(details["version"], "18.0.0");
+        assert_eq!(details["reason"], "looks safe");
+    }
+
+    #[test]
+    fn build_reopen_audit_details_includes_previous_status() {
+        let review = sample_review("left-pad", "1.3.0", "pending");
+        let details = build_reopen_audit_details(&review, "approved", Some("turned out bad"));
+        assert_eq!(details["package"], "left-pad");
+        assert_eq!(details["version"], "1.3.0");
+        assert_eq!(details["previous_status"], "approved");
+        assert_eq!(details["reason"], "turned out bad");
+    }
+
+    #[test]
+    fn review_to_response_maps_fields_and_default_key() {
+        let resp = review_to_response(sample_review("lodash", "4.0.0", "pending"));
         assert_eq!(resp.repository_key, "");
         assert_eq!(resp.package_name, "lodash");
         assert_eq!(resp.status, "pending");

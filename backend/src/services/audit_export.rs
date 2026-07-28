@@ -121,6 +121,7 @@ impl AuditAction {
             | AuditAction::SessionsInvalidated
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
+            | AuditAction::AgeGateReopened
             | AuditAction::CurationSyncTriggered => Outcome::Success,
         }
     }
@@ -847,6 +848,7 @@ mod tests {
             AuditAction::ScanReaped,
             AuditAction::BackupCompleted,
             AuditAction::AgeGateApproved,
+            AuditAction::AgeGateReopened,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }
