@@ -7380,6 +7380,86 @@ mod agent2_recipe_reads {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `build_files_listing_json` unit tests prove the listing echoes the
+    // filenames it is handed; only downloading a file whose name the REAL
+    // `/files` listing advertised — appended to the same `.../files/` base a
+    // Conan client uses — proves that advertised name resolves against the
+    // download route. A listing that names a file the download route 404s
+    // passes every builder test yet breaks `conan install`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_files_list_advertises_downloadable_file() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, &username);
+
+        let contents = b"from conan import ConanFile\nclass T(ConanFile): pass\n";
+        let put_status = upload_recipe_file(
+            &state,
+            &auth,
+            &repo_key,
+            "advurl",
+            "1.0",
+            "_",
+            "_",
+            "rev_adv",
+            "conanfile.py",
+            contents,
+        )
+        .await;
+        assert!(put_status.is_success(), "upload failed: {}", put_status);
+
+        // Read the file the `/files` listing advertises for this revision.
+        let files_base = format!(
+            "/{}/v2/conans/advurl/1.0/_/_/revisions/rev_adv/files",
+            repo_key
+        );
+        let app = router_with_auth(state.clone(), auth.clone());
+        let (list_status, list_body) = send(app, get(files_base.clone())).await;
+        assert_eq!(list_status, StatusCode::OK, "files listing");
+        let listing: serde_json::Value = serde_json::from_slice(&list_body).expect("json");
+        let advertised = listing["files"]
+            .as_object()
+            .and_then(|m| m.keys().next())
+            .cloned()
+            .unwrap_or_default();
+
+        // A Conan client downloads by appending the advertised name to the same
+        // `.../files/` base the listing was served from.
+        let app = router_with_auth(state.clone(), auth.clone());
+        let (dl_status, dl_body) = if advertised.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            send(app, get(format!("{files_base}/{advertised}"))).await
+        };
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            advertised, "conanfile.py",
+            "listing must advertise the file"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised file ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            dl_body.as_ref(),
+            contents,
+            "the advertised file must serve the uploaded bytes"
+        );
+    }
+
     #[tokio::test]
     async fn recipe_file_download_404_when_missing_in_hosted_repo() {
         let Some(pool) = try_pool().await else {

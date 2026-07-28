@@ -3363,6 +3363,106 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `generate_primary_xml` unit tests prove `<location href>` is emitted
+    // as a string; only resolving that href the way dnf/yum does — against the
+    // repository base URL (the directory that holds `repodata/`), NOT against
+    // the primary.xml document itself — and routing it against the REAL router
+    // proves a package the index advertises is actually downloadable. A href
+    // that 404s at the download route passes every generator test yet breaks
+    // `dnf install`.
+    // -----------------------------------------------------------------------
+
+    /// The rpm routes mounted exactly where `api::routes` nests them, so the
+    /// repo-base-relative `<location href>` resolves with the `/rpm` prefix.
+    fn rpm_mounted_router() -> Router<SharedState> {
+        Router::new().nest("/rpm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_primary_location_resolves_against_real_router() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        // Publish a package's bytes under the exact `packages/<file>` path the
+        // native RPM PUT stores, so both the index location and the download
+        // route agree on it.
+        let filename = "realpkg-1.0-1.x86_64.rpm";
+        let rpm_bytes: &[u8] = b"fake-rpm-package-bytes-for-advertised-url";
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("packages/{filename}"),
+            &format!("packages/{filename}"),
+            "realpkg",
+            "1.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(rpm_bytes),
+            f.user_id,
+        )
+        .await;
+
+        // Read the `<location href>` primary.xml advertises for the package.
+        let (status, body) = tdh::send(
+            f.router_anon(rpm_mounted_router()),
+            tdh::get(format!("/rpm/{}/repodata/primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "primary.xml.gz");
+        let mut primary = String::new();
+        GzDecoder::new(&body[..])
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+        let href = primary
+            .split_once("<location href=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default();
+
+        // dnf resolves `<location href>` against the repository base URL — the
+        // directory that CONTAINS `repodata/`, not the primary.xml document.
+        let repo_base = format!("http://ak.test/rpm/{}/", f.repo_key);
+        let (dl_status, dl_body) = if href.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&repo_base, &href);
+            tdh::send(f.router_anon(rpm_mounted_router()), tdh::get(path)).await
+        };
+
+        f.teardown().await;
+
+        assert!(
+            !href.is_empty(),
+            "primary.xml must advertise a <location href>, got: {primary}"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised <location href> ({href}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            rpm_bytes,
+            "the advertised location must serve the published .rpm bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // repomd.xml.asc / repomd.xml.key — the OpenPGP contract (#2636)
     //
     // These replace the former `pgp_armor_signature` tests, which asserted the
