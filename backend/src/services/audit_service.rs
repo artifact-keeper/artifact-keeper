@@ -102,6 +102,14 @@ pub enum AuditAction {
     // outbound sync and when. Appended at the END of the enum to keep the
     // additive change conflict-free with in-flight taxonomy work.
     CurationSyncTriggered,
+
+    // Age-gate review reopen (#2939). Recorded when an admin returns an
+    // approved or rejected review to `pending`, reversing a decision that is
+    // already in the audit trail. Kept distinct from `AgeGateApproved` /
+    // `AgeGateRejected` so a reversal cannot be mistaken for a fresh decision
+    // when the log is read back. Appended at the END of the enum to keep the
+    // additive change conflict-free with in-flight taxonomy work.
+    AgeGateReopened,
 }
 
 impl AuditAction {
@@ -155,6 +163,7 @@ impl AuditAction {
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
             AuditAction::PermissionDenied => "PERMISSION_DENIED",
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
+            AuditAction::AgeGateReopened => "AGE_GATE_REOPENED",
         }
     }
 }

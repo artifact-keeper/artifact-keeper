@@ -9,6 +9,10 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+// The reopen handler takes its body through the crate extractor so a payload
+// missing the required `reason` comes back as a 400 VALIDATION_ERROR like every
+// other client error, instead of Axum's default 422 with a plain-text body.
+use crate::api::extractors::Json as ValidatedJson;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -53,6 +57,7 @@ pub fn admin_router() -> Router<SharedState> {
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/approve", post(approve_review))
         .route("/reviews/:id/reject", post(reject_review))
+        .route("/reviews/:id/reopen", post(reopen_review))
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
@@ -97,6 +102,17 @@ pub struct ReviewActionRequest {
     pub reason: Option<String>,
 }
 
+/// Body for `POST /age-gate/reviews/{id}/reopen`.
+///
+/// Separate from [`ReviewActionRequest`] because `reason` is required here, not
+/// optional: a reopen reverses a decision that is already in the audit log, and
+/// the generated SDKs should refuse to send one without an explanation.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReopenReviewRequest {
+    /// Why the recorded decision is being reversed. Must be non-blank.
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AgeGateConfigResponse {
     pub repository_key: String,
@@ -136,7 +152,7 @@ fn age_gate_service(
         .ok_or_else(|| AppError::Internal("Age gate service not initialized".to_string()))
 }
 
-/// Build the audit-log details for an approve/reject action.
+/// Build the audit-log details shared by every review action.
 fn build_review_audit_details(
     review: &AgeGateReviewResponse,
     reason: Option<&str>,
@@ -147,6 +163,20 @@ fn build_review_audit_details(
         "version": review.package_version,
         "reason": reason,
     })
+}
+
+/// Build the audit-log details for a reopen: the shared review payload plus the
+/// decision that was reversed. Without `previous_status` the entry cannot say
+/// whether an approval or a rejection was undone, since the review is already
+/// back to `pending` by the time it is logged.
+fn build_reopen_audit_details(
+    review: &AgeGateReviewResponse,
+    previous_status: &str,
+    reason: &str,
+) -> serde_json::Value {
+    let mut details = build_review_audit_details(review, Some(reason));
+    details["previous_status"] = serde_json::json!(previous_status);
+    details
 }
 
 /// Return `Err` when the repository type does not support age-gating.
@@ -300,6 +330,51 @@ pub async fn reject_review(
 }
 
 #[utoipa::path(
+    post,
+    path = "/age-gate/reviews/{id}/reopen",
+    context_path = "/api/v1/admin",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    request_body = ReopenReviewRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "Reason missing or blank, or the review is already pending"),
+        (status = 404, description = "Review not found"),
+    )
+)]
+pub async fn reopen_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    ValidatedJson(body): ValidatedJson<ReopenReviewRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    auth.require_admin()?;
+    let svc = age_gate_service(&state)?;
+    let reopened = svc
+        .reopen(id, auth.user_id, Some(body.reason.as_str()))
+        .await?;
+
+    let repository_id = reopened.review.repository_id;
+    let previous_status = reopened.previous_status;
+    let resp = review_to_response(reopened.review);
+    let audit = AuditService::new(state.db.clone());
+    let _ = audit
+        .log(
+            AuditEntry::new(AuditAction::AgeGateReopened, ResourceType::Repository)
+                .user(auth.user_id)
+                .resource(repository_id)
+                .details(build_reopen_audit_details(
+                    &resp,
+                    &previous_status,
+                    &body.reason,
+                )),
+        )
+        .await;
+
+    Ok(Json(resp))
+}
+
+#[utoipa::path(
     get,
     path = "/{key}/age-gate",
     context_path = "/api/v1/repositories",
@@ -384,11 +459,12 @@ pub async fn update_repo_age_gate(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_reviews, get_review, approve_review, reject_review, get_repo_age_gate, update_repo_age_gate),
+    paths(list_reviews, get_review, approve_review, reject_review, reopen_review, get_repo_age_gate, update_repo_age_gate),
     components(schemas(
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
         ReviewActionRequest,
+        ReopenReviewRequest,
         AgeGateConfigResponse,
         UpdateAgeGateConfigRequest,
         ReviewListQuery
@@ -497,6 +573,61 @@ mod tests {
         assert_eq!(details["package"], "react");
         assert_eq!(details["version"], "18.0.0");
         assert_eq!(details["reason"], "looks safe");
+    }
+
+    #[test]
+    fn build_reopen_audit_details_records_the_reversed_decision() {
+        let now = Utc::now();
+        let resp = AgeGateReviewResponse {
+            id: Uuid::new_v4(),
+            repository_key: "npm-remote".to_string(),
+            package_name: "left-pad".to_string(),
+            package_version: "1.3.0".to_string(),
+            upstream_published_at: None,
+            // Already back to pending, which is exactly why the prior status
+            // has to be carried separately.
+            status: "pending".to_string(),
+            requested_at: now,
+            reviewed_by: None,
+            reviewed_at: None,
+            review_reason: None,
+            request_count: 2,
+            last_requested_at: now,
+        };
+        let details = build_reopen_audit_details(&resp, "approved", "approved the wrong version");
+        assert_eq!(details["previous_status"], "approved");
+        assert_eq!(details["reason"], "approved the wrong version");
+        assert_eq!(details["package"], "left-pad");
+        assert_eq!(details["version"], "1.3.0");
+    }
+
+    #[test]
+    fn reopen_request_requires_a_reason_field() {
+        // `reason` is a bare `String`, so a body without it fails to
+        // deserialize. The reopen handler uses the crate's `Json` extractor,
+        // which turns that rejection into a 400 VALIDATION_ERROR rather than
+        // Axum's default 422.
+        assert!(serde_json::from_str::<ReopenReviewRequest>("{}").is_err());
+        assert_eq!(
+            serde_json::from_str::<ReopenReviewRequest>(r#"{"reason":"approved the wrong build"}"#)
+                .expect("reason present")
+                .reason,
+            "approved the wrong build"
+        );
+    }
+
+    #[test]
+    fn openapi_exposes_the_reopen_operation() {
+        // The spec drives all five generated client SDKs, so an endpoint
+        // missing from it does not exist as far as any client is concerned.
+        let doc = AgeGateApi::openapi();
+        assert!(
+            doc.paths
+                .paths
+                .contains_key("/api/v1/admin/age-gate/reviews/{id}/reopen"),
+            "reopen path missing from the spec; paths: {:?}",
+            doc.paths.paths.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

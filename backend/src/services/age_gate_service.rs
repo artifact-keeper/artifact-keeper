@@ -191,6 +191,39 @@ pub(crate) fn require_pending_review(status: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a reopen on a review that is not in a terminal state.
+///
+/// Reopening an already-`pending` review is a 400 rather than a silent no-op.
+/// A reopen carries a mandatory reason and writes an `AGE_GATE_REOPENED` audit
+/// entry describing the reversal of a recorded decision; accepting the no-op
+/// would file that entry for a decision nobody ever made, and would leave an
+/// operator who pasted the wrong review id with no signal that the review they
+/// meant to reverse is still approved.
+pub(crate) fn require_terminal_review(status: &str) -> Result<()> {
+    if status == AgeGateReviewStatus::Pending.as_str() {
+        return Err(AppError::Validation(
+            "Review is already pending".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize the mandatory reopen reason, rejecting a missing or blank value.
+///
+/// Enforced here rather than only at the handler so every caller of
+/// [`AgeGateService::reopen`] pays the same price: a decision reversal with no
+/// stated cause is worse than no reversal at all, because the audit trail then
+/// records that an approved package went back into the queue without saying why.
+pub(crate) fn require_reopen_reason(reason: Option<&str>) -> Result<&str> {
+    let trimmed = reason.map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "A reason is required to reopen a review".to_string(),
+        ));
+    }
+    Ok(trimmed)
+}
+
 /// Outcome of an age-gate check for a single package version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgeGateDecision {
@@ -223,6 +256,17 @@ pub struct AgeGateReview {
     pub last_requested_at: DateTime<Utc>,
     #[sqlx(default)]
     pub repository_key: Option<String>,
+}
+
+/// What a reopen changed, for the caller's audit entry (#2939).
+///
+/// The refreshed review on its own cannot answer "reversed from what?" — by the
+/// time it is returned its status is `pending` — so the decision that was
+/// undone rides back alongside it and lands in the audit `details`.
+#[derive(Debug, Clone)]
+pub struct ReopenedReview {
+    pub previous_status: String,
+    pub review: AgeGateReview,
 }
 
 pub struct AgeGateService {
@@ -636,6 +680,67 @@ impl AgeGateService {
         );
 
         self.get_review_by_id(id).await
+    }
+
+    /// Return a decided review to `pending`, re-applying the gate (#2939).
+    ///
+    /// Approve and reject were both terminal, so a misapplied decision could
+    /// only be undone with a manual `UPDATE` against `age_gate_reviews`. Moving
+    /// the row back to `pending` is enough to restore enforcement: both
+    /// [`decide_age_gate_check`] and [`classify_versions_for_metadata_listing`]
+    /// treat a pending review of a still-too-young version as blocked, and a
+    /// version that has since crossed the threshold auto-approves on the next
+    /// check exactly as a freshly queued one would.
+    pub async fn reopen(
+        &self,
+        id: Uuid,
+        reviewer_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<ReopenedReview> {
+        let reason = require_reopen_reason(reason)?;
+        let review = self.get_review_by_id(id).await?;
+        require_terminal_review(&review.status)?;
+        let previous_status = review.status.clone();
+
+        // Runtime-checked `query` rather than the `query!` macro: the offline
+        // metadata in `.sqlx/` can only be regenerated against a live database,
+        // and this statement (fixed literals, two binds, no returned columns)
+        // gains nothing from compile-time checking.
+        //
+        // `reviewed_by` and `reviewed_at` are cleared so the row is a genuine
+        // pending record again. The queue lists pending reviews, and carrying
+        // the reviewer of the decision that was just reversed would read as if
+        // someone had already handled it. Who reopened it and when lives in the
+        // audit log; `review_reason` keeps the reopen reason so it travels with
+        // the row for anyone reading the review directly.
+        sqlx::query(
+            r#"
+            UPDATE age_gate_reviews
+            SET status = 'pending', reviewed_by = NULL, reviewed_at = NULL,
+                review_reason = $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // No `WebhookEvent` variant maps `age_gate.reopened`, so this fires no
+        // webhook today; it still reaches the SSE stream that carries the rest
+        // of the age-gate lifecycle.
+        self.event_bus.emit_for_repo(
+            "age_gate.reopened",
+            id,
+            review.repository_id,
+            Some(reviewer_id.to_string()),
+        );
+
+        Ok(ReopenedReview {
+            previous_status,
+            review: self.get_review_by_id(id).await?,
+        })
     }
 
     pub async fn update_repo_config(
@@ -1865,6 +1970,79 @@ mod tests {
         assert!(require_pending_review("pending").is_ok());
         assert!(require_pending_review("approved").is_err());
         assert!(require_pending_review("rejected").is_err());
+    }
+
+    #[test]
+    fn require_terminal_review_accepts_decided_and_rejects_pending() {
+        assert!(require_terminal_review("approved").is_ok());
+        assert!(require_terminal_review("rejected").is_ok());
+        assert!(require_terminal_review("pending").is_err());
+    }
+
+    #[test]
+    fn require_reopen_reason_rejects_missing_and_blank() {
+        assert!(require_reopen_reason(None).is_err());
+        assert!(require_reopen_reason(Some("")).is_err());
+        assert!(require_reopen_reason(Some("   \t ")).is_err());
+    }
+
+    #[test]
+    fn require_reopen_reason_trims_accepted_value() {
+        assert_eq!(
+            require_reopen_reason(Some("  approved the wrong version  ")).unwrap(),
+            "approved the wrong version"
+        );
+    }
+
+    #[test]
+    fn reopened_review_blocks_a_still_young_version_again() {
+        // The point of reopen: a decided review goes back to `pending`, and a
+        // version that still fails the age threshold must be withheld and
+        // re-queued rather than served from the reversed decision.
+        assert_eq!(
+            decide_age_gate_check(Some("approved"), false),
+            AgeGateCheckAction::AllowAlreadyApproved,
+            "an approved review serves the young version"
+        );
+        assert_eq!(
+            decide_age_gate_check(Some("pending"), false),
+            AgeGateCheckAction::BlockAndRequestReview,
+            "reopening it must withhold the young version again"
+        );
+        // The other direction: a rejection hard-blocks and never re-queues.
+        // Reopening moves it onto the `pending` arm asserted above, so the
+        // version stays withheld but goes back in front of a reviewer, which
+        // is the recovery path for a mistaken rejection.
+        assert_eq!(
+            decide_age_gate_check(Some("rejected"), false),
+            AgeGateCheckAction::BlockRejected
+        );
+    }
+
+    #[test]
+    fn reopened_review_is_withheld_from_metadata_listing_again() {
+        // The packument / simple-index path classifies versions through
+        // `classify_versions_for_metadata_listing`, not `decide_age_gate_check`,
+        // so the re-application of the gate has to hold there too.
+        let now = Utc.with_ymd_and_hms(2024, 7, 1, 0, 0, 0).unwrap();
+        let young = now - Duration::days(1);
+        let review_id = Uuid::new_v4();
+
+        let versions = vec![("1.0.0".to_string(), Some(young))];
+
+        let mut approved = std::collections::HashMap::new();
+        approved.insert("1.0.0".to_string(), (review_id, "approved".to_string()));
+        let out = classify_versions_for_metadata_listing(&versions, &approved, 7, now);
+        assert!(!out.blocked.contains("1.0.0"), "approved version is listed");
+
+        let mut reopened = std::collections::HashMap::new();
+        reopened.insert("1.0.0".to_string(), (review_id, "pending".to_string()));
+        let out = classify_versions_for_metadata_listing(&versions, &reopened, 7, now);
+        assert!(
+            out.blocked.contains("1.0.0"),
+            "reopened version is withheld from the listing again"
+        );
+        assert_eq!(out.request_versions, vec!["1.0.0".to_string()]);
     }
 
     #[test]
