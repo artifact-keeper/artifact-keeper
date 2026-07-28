@@ -1,0 +1,43 @@
+-- GIN index for the metadata-files attribution lookup (#2942).
+--
+-- The Maven flat-key attribution's metadata layer resolves a row-less
+-- companion object to its parent artifact by searching every
+-- `artifact_metadata.metadata->'files'` array for an entry naming the storage
+-- key. Its original predicate -- `EXISTS (SELECT 1 FROM
+-- jsonb_array_elements(metadata->'files') f WHERE COALESCE(f->>'storageKey',
+-- f->>'storage_key') = $1)` -- is evaluated per row and cannot be served by
+-- any index, so every row-less flat-key read that was not satisfied by a live
+-- artifact row sequentially scanned the whole table (multiple seconds per
+-- request on deployments with millions of rows, and the scan also fired for
+-- keys that do not exist at all, e.g. each cloud-backed local member probed
+-- during a virtual-repository walk).
+--
+-- The lookup is rewritten (same change set) to jsonb containment:
+--
+--   metadata->'files' @> jsonb_build_array(jsonb_build_object('storageKey', $1))
+--   OR metadata->'files' @> jsonb_build_array(jsonb_build_object('storage_key', $1))
+--
+-- which this expression index serves; the two spelling branches (#2706) become
+-- a BitmapOr of two index probes. `jsonb_path_ops` is used instead of the
+-- default operator class: it only supports `@>` (all this lookup needs) and
+-- indexes hash paths rather than every key and value, so it stays much smaller
+-- on wide metadata documents.
+--
+-- CREATE INDEX CONCURRENTLY is intentionally not used here: sqlx::migrate runs
+-- each migration file inside a transaction, and CONCURRENTLY is rejected inside
+-- a transaction block. The non-concurrent build takes a lock that blocks writes
+-- to `artifact_metadata` (uploads and metadata refreshes) for the duration of
+-- the build. Operators who cannot accept the write-block window can create the
+-- index out of band before upgrading:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_artifact_metadata_files_gin
+--     ON artifact_metadata USING gin ((metadata->'files') jsonb_path_ops);
+--
+-- Functionality continues to work without the index; the containment query
+-- falls back to a sequential scan no worse than the EXISTS form it replaces.
+--
+-- Idempotent via IF NOT EXISTS so re-running on an already-migrated DB (or one
+-- prepared out of band) is a no-op.
+
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_files_gin
+    ON artifact_metadata USING gin ((metadata->'files') jsonb_path_ops);
