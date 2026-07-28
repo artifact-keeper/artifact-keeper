@@ -374,13 +374,28 @@ impl ReleaseEpochRead {
 
 /// Remove credential-bearing URL material before rendering an upstream target
 /// into logs or [`AppError`] messages.
+///
+/// Strips three sources of secrets so an upstream URL can be safely echoed to
+/// a client (e.g. a 502/error body) or a user-visible log:
+/// * `user:password@` userinfo — upstream repository credentials (#2926),
+/// * the query string — pre-signed URL signatures / tokens / keys, and
+/// * the fragment.
 fn redact_url_for_diagnostics(url: &str) -> String {
     if let Ok(mut parsed) = reqwest::Url::parse(url) {
+        // Drop userinfo first (password before username so the `@` is removed
+        // cleanly), then the query and fragment. `set_password`/`set_username`
+        // return `Err` for URLs that cannot carry userinfo (e.g. `mailto:`);
+        // there is nothing to strip in that case, so the error is ignored.
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("");
         parsed.set_query(None);
         parsed.set_fragment(None);
         return parsed.to_string();
     }
 
+    // Fallback for inputs `reqwest::Url` cannot parse (e.g. relative paths).
+    // Trim the query/fragment, then strip any `userinfo@` still present in the
+    // leading authority so credentials never survive the redaction.
     let query_pos = url.find('?');
     let fragment_pos = url.find('#');
     let end = match (query_pos, fragment_pos) {
@@ -389,7 +404,32 @@ fn redact_url_for_diagnostics(url: &str) -> String {
         (None, Some(f)) => f,
         (None, None) => url.len(),
     };
-    url[..end].to_string()
+    strip_userinfo_fallback(&url[..end])
+}
+
+/// Best-effort userinfo removal for URL-ish strings that `reqwest::Url` could
+/// not parse. Removes a `userinfo@` segment from the authority (the part
+/// after an optional `scheme://` and before the first `/`), leaving the rest
+/// untouched.
+fn strip_userinfo_fallback(url: &str) -> String {
+    let (prefix, rest) = match url.find("://") {
+        Some(pos) => url.split_at(pos + 3),
+        None if url.starts_with("//") => url.split_at(2),
+        None => ("", url),
+    };
+    // The authority ends at the first path separator.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        format!(
+            "{}{}{}",
+            prefix,
+            &authority[at + 1..],
+            &rest[authority_end..]
+        )
+    } else {
+        url.to_string()
+    }
 }
 
 /// True when the SSRF DNS guard's "all resolved addresses blocked" marker
@@ -3931,7 +3971,14 @@ impl ProxyService {
         }
 
         let response = request.send().await.map_err(|e| {
-            AppError::Storage(format!("Failed to fetch from upstream: {} - {}", url, e))
+            // Redact the target URL (may carry `user:pass@` upstream creds) and
+            // drop the URL reqwest embeds in its own error (#2926) before this
+            // surfaces to a client.
+            AppError::Storage(format!(
+                "Failed to fetch from upstream: {} - {}",
+                redact_url_for_diagnostics(url),
+                e.without_url()
+            ))
         })?;
 
         let status = response.status();
@@ -9153,6 +9200,42 @@ mod tests {
 
         assert_eq!(
             redact_url_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_credentials() {
+        // #2926: upstream `user:password@` credentials and any credential-bearing
+        // query params must never survive into a client-facing diagnostic.
+        let redacted =
+            redact_url_for_diagnostics("https://user:pass@host.example.com/path?token=abc");
+        assert!(!redacted.contains("user"), "username leaked: {redacted}");
+        assert!(!redacted.contains("pass"), "password leaked: {redacted}");
+        assert!(!redacted.contains("abc"), "token leaked: {redacted}");
+        assert!(!redacted.contains('@'), "userinfo `@` retained: {redacted}");
+        assert_eq!(redacted, "https://host.example.com/path");
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_username_only() {
+        // A username-only userinfo (no password) must also be removed.
+        assert_eq!(
+            redact_url_for_diagnostics("https://token@registry.example.com/v2/"),
+            "https://registry.example.com/v2/"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_for_diagnostics_strips_userinfo_unparseable_fallback() {
+        // The non-`reqwest::Url` fallback path must strip userinfo too.
+        assert_eq!(
+            redact_url_for_diagnostics("//user:pass@host/path?token=abc"),
+            "//host/path"
+        );
+        // No userinfo present: authority is left intact.
+        assert_eq!(
+            redact_url_for_diagnostics("packages/pkg.zip"),
             "packages/pkg.zip"
         );
     }
