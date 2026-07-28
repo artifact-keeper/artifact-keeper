@@ -5,8 +5,12 @@
 //!
 //! * [`PublisherSource::Attestation`] — the identity comes from a registry
 //!   provenance/attestation record (PyPI Trusted Publishers / integrity API
-//!   attestation bundles, npm sigstore provenance). These are bound to an
-//!   OIDC identity at publish time and are the *strong* trust signal.
+//!   attestation bundles, npm sigstore provenance). When cryptographically
+//!   verified, these are bound to an OIDC identity at publish time and are
+//!   the *strong* trust signal. Verification of the envelope
+//!   (sigstore/DSSE/PEP 740) is NOT implemented yet (#2955): structural
+//!   presence of a provenance record is not verification, so extraction
+//!   currently always reports `verified = false` for this source.
 //! * [`PublisherSource::Metadata`] — the identity is self-asserted package
 //!   metadata (`author`, `maintainer`, `_npmUser`, ...). Anyone can put
 //!   "Microsoft" in an `author` field, so this is a *weak*, spoofable signal
@@ -19,11 +23,14 @@
 use serde_json::Value;
 
 /// Where a publisher identity was sourced from. Ordering of trust:
-/// `Attestation` (verified provenance) > `Metadata` (self-asserted).
+/// `Attestation` (provenance record) > `Metadata` (self-asserted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublisherSource {
-    /// Registry-verified provenance (PyPI Trusted Publisher attestation
-    /// bundle, npm sigstore attestation). Strong signal.
+    /// A registry provenance record (PyPI Trusted Publisher attestation
+    /// bundle, npm sigstore attestation) was present and an identity was
+    /// extracted from it. Presence alone is NOT trust: until the envelope is
+    /// cryptographically verified (#2955), this identity is unverified and
+    /// [`PublisherIdentity::verified`] stays `false`.
     Attestation,
     /// Self-asserted package metadata (`author` / `maintainer` / `_npmUser`).
     /// Weak, spoofable signal — never sufficient on its own for trust
@@ -40,8 +47,12 @@ pub struct PublisherIdentity {
     pub name: String,
     /// Which class of signal produced [`Self::name`].
     pub source: PublisherSource,
-    /// `true` only when the identity comes from a registry-verified
-    /// provenance record. Always `false` for [`PublisherSource::Metadata`].
+    /// `true` only once the provenance envelope backing the identity has been
+    /// cryptographically verified. Always `false` for
+    /// [`PublisherSource::Metadata`], and — because attestation verification
+    /// (sigstore/DSSE/PEP 740) is not implemented yet (#2955) — currently
+    /// always `false` for [`PublisherSource::Attestation`] too. Structural
+    /// presence of an attestation must never set this to `true`.
     pub verified: bool,
 }
 
@@ -68,11 +79,13 @@ pub fn is_applicable_format(format: &str) -> bool {
 ///   `provenance.attestation_bundles[].publisher`, as returned by
 ///   `/integrity/{pkg}/{version}/{file}/provenance`), the Trusted-Publisher
 ///   identity (repository owner, e.g. the GitHub org) is preferred with
-///   `source = Attestation, verified = true`.
+///   `source = Attestation` — but `verified = false`, because the envelope
+///   is not cryptographically verified yet (#2955).
 /// * `npm` — expects the registry packument / version-document shape:
 ///   self-asserted fields are `_npmUser.name` and `maintainers[].name`. If
 ///   the version's `dist.attestations` carries a sigstore `provenance`
-///   record, the identity is labeled `Attestation`/`verified`.
+///   record, the identity is labeled `Attestation` (again with
+///   `verified = false` pending #2955).
 ///
 /// Any other format, and any metadata where no non-empty publisher can be
 /// found, returns `None` — callers must not fabricate trust from absence.
@@ -91,7 +104,11 @@ fn extract_pypi(metadata: &Value) -> Option<PublisherIdentity> {
         return Some(PublisherIdentity {
             name,
             source: PublisherSource::Attestation,
-            verified: true,
+            // Presence != trust: the attestation envelope is NOT
+            // cryptographically verified here. Until sigstore/PEP 740
+            // verification lands (#2955), a structurally present provenance
+            // blob — which anyone can forge — must stay unverified.
+            verified: false,
         });
     }
 
@@ -143,7 +160,10 @@ fn extract_npm(metadata: &Value) -> Option<PublisherIdentity> {
         return Some(PublisherIdentity {
             name,
             source: PublisherSource::Attestation,
-            verified: true,
+            // Presence != trust: the sigstore provenance record is NOT
+            // cryptographically verified here (#2955). A planted
+            // `dist.attestations.provenance` field must stay unverified.
+            verified: false,
         });
     }
 
@@ -156,9 +176,9 @@ fn extract_npm(metadata: &Value) -> Option<PublisherIdentity> {
 
 /// npm marks provenance on the version document as
 /// `dist.attestations: { "url": ..., "provenance": { "predicateType": ... } }`.
-/// Presence of the `provenance` record means the registry verified a sigstore
-/// attestation for this publish; the publishing identity is the npm user that
-/// performed the attested publish.
+/// Presence of the `provenance` record only *claims* a sigstore attestation
+/// exists for this publish — this module does not fetch or cryptographically
+/// verify it (#2955), so presence is a labeling signal, never trust.
 fn npm_has_provenance(metadata: &Value) -> bool {
     metadata
         .get("dist")
@@ -232,12 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn pypi_prefers_attestation_over_self_asserted_author() {
+    fn pypi_prefers_attestation_over_self_asserted_author_but_stays_unverified() {
         let id = extract_publisher("pypi", &pypi_with_attestation()).unwrap();
-        // The attestation org wins over the spoofable `author` string.
+        // The attestation org wins over the spoofable `author` string...
         assert_eq!(id.name, "NumFOCUS");
         assert_eq!(id.source, PublisherSource::Attestation);
-        assert!(id.verified);
+        // ...but structural presence of a provenance blob is NOT
+        // cryptographic verification (#2955): a forged blob must never
+        // surface as verified.
+        assert!(!id.verified);
     }
 
     #[test]
@@ -297,11 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn npm_provenance_marks_attested_verified() {
+    fn npm_provenance_marks_attested_but_not_verified() {
         let id = extract_publisher("npm", &npm_with_provenance()).unwrap();
         assert_eq!(id.name, "microsoft");
         assert_eq!(id.source, PublisherSource::Attestation);
-        assert!(id.verified);
+        // Presence of `dist.attestations.provenance` is unverified until
+        // #2955 lands actual sigstore envelope verification.
+        assert!(!id.verified);
     }
 
     #[test]

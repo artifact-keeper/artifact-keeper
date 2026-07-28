@@ -1727,8 +1727,9 @@ mod tests {
     // #2948/#2949 evaluators, via the production `evaluate_package_typed`
     // entry point.
 
-    /// PyPI JSON-API blob with a merged integrity-API provenance object:
-    /// registry-verified Trusted-Publisher org `NumFOCUS`.
+    /// PyPI JSON-API blob with a merged integrity-API provenance object
+    /// naming the Trusted-Publisher org `NumFOCUS`. Presence-only: the
+    /// envelope is not cryptographically verified (#2955).
     fn pypi_attested_metadata() -> serde_json::Value {
         serde_json::json!({
             "info": {"author": "NumPy Developers", "name": "numpy", "version": "2.0.0"},
@@ -1799,7 +1800,9 @@ mod tests {
             "non-attested package must be blocked, got {decision:?}"
         );
 
-        // Attested package from the trusted publisher -> Allow.
+        // Attested package from the trusted publisher -> review (Flag): the
+        // attestation is present but not cryptographically verified (#2955),
+        // so presence must not buy trust — and must not hard-block either.
         let (decision, matched) = svc
             .evaluate_package_typed(
                 probe_repo,
@@ -1814,7 +1817,11 @@ mod tests {
             .await
             .expect("typed evaluation");
         assert_eq!(matched, Some(rule.id));
-        assert_eq!(decision, CurationDecision::Allow);
+        assert!(
+            matches!(decision, CurationDecision::Flag(ref r)
+                if r.contains("not cryptographically verified")),
+            "attested-but-unverified package must go to review, got {decision:?}"
+        );
 
         // A format with no publisher concept passes through untouched.
         let (decision, matched) = svc

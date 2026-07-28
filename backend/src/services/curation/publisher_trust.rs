@@ -18,10 +18,17 @@
 //!   `"Microsoft"` must not match `"Evil Microsoft Fans"`).
 //! * `match` — which signal quality is sufficient to consider a publisher
 //!   trusted. Defaults to `"attestation"` (the secure default):
-//!   * `"attestation"` — only a registry-verified provenance identity
-//!     ([`PublisherSource::Attestation`] with `verified = true`) can satisfy
-//!     the allowlist. Self-asserted `author`/`maintainer` metadata is
-//!     spoofable and is deliberately **not** sufficient in this mode.
+//!   * `"attestation"` — only a **cryptographically verified** provenance
+//!     identity ([`PublisherSource::Attestation`] with `verified = true`) can
+//!     satisfy the allowlist. Attestation-envelope verification
+//!     (sigstore/DSSE/PEP 740) is not implemented yet (#2955), so today no
+//!     attestation is verified: a listed publisher asserted via a
+//!     present-but-unverified attestation resolves to `Flag` (review) —
+//!     never `Allow` (presence is forgeable, so it must not confer trust)
+//!     and never a blanket `Block` (unverifiability alone must not reject
+//!     every legitimate package). Self-asserted `author`/`maintainer`
+//!     metadata is spoofable and remains deliberately **not** sufficient in
+//!     this mode (blocked under `action: "block"`, exactly as before).
 //!   * `"metadata"` — an operator opt-in that also accepts the weaker,
 //!     self-asserted metadata identity. Use only where the threat model
 //!     tolerates it.
@@ -46,6 +53,9 @@
 //! * Applicable format but no extractable publisher → [`CurationDecision::Flag`]
 //!   ("publisher unknown"): absence of identity is never trusted, but it is
 //!   surfaced for review rather than hard-blocked.
+//! * Listed publisher via a present-but-unverified attestation under
+//!   `match: "attestation"` → [`CurationDecision::Flag`] pending #2955:
+//!   review, not trust, not a blanket block.
 //! * Malformed config (missing/empty `trusted_publishers`, unknown `match`
 //!   or `action` value) → [`CurationDecision::Flag`] describing the misconfiguration.
 
@@ -121,21 +131,38 @@ pub fn evaluate(
     };
 
     let name_listed = trusted.contains(&publisher.name.to_lowercase());
+    let attestation_present = publisher.source == PublisherSource::Attestation;
     let signal_sufficient = match match_mode {
         "metadata" => true,
-        // `attestation` mode: self-asserted metadata must not be the sole
-        // trust signal (dependency-confusion / spoofing resistance).
-        _ => publisher.source == PublisherSource::Attestation && publisher.verified,
+        // `attestation` mode: only a cryptographically VERIFIED attestation
+        // is a trust signal. Presence != trust: a provenance blob is
+        // attacker-forgeable, and self-asserted metadata must not be the sole
+        // trust signal either (dependency-confusion / spoofing resistance).
+        _ => attestation_present && publisher.verified,
     };
     let is_trusted = name_listed && signal_sufficient;
 
+    // Fail-safe seam for unimplemented attestation verification (#2955):
+    // a listed publisher asserted via a present-but-UNVERIFIED attestation
+    // is neither trusted (Allow would let a forged provenance blob through)
+    // nor rejected wholesale (Block would reject every legitimate attested
+    // package until #2955 ships). It goes to review.
+    if match_mode == "attestation" && name_listed && attestation_present && !publisher.verified {
+        return CurationDecision::Flag(format!(
+            "publisher `{}` for {name}@{version} matches the trusted list via an attestation that is present but not cryptographically verified; held for review pending attestation verification (#2955)",
+            publisher.name
+        ));
+    }
+
     let signal_label = match publisher.source {
-        PublisherSource::Attestation => "verified attestation",
+        PublisherSource::Attestation => "attestation (present, not cryptographically verified)",
         PublisherSource::Metadata => "self-asserted metadata (unverified)",
     };
 
     match (action, is_trusted) {
-        // Trusted publishers pass under both gating modes.
+        // Trusted publishers pass under both gating modes. Under
+        // `match: attestation` this arm requires a genuinely verified
+        // attestation, i.e. it is unreachable until #2955 ships.
         ("allow" | "block", true) => CurationDecision::Allow,
         // Enforcement: everything not provably trusted is rejected.
         ("block", false) => CurationDecision::Block(untrusted_reason(
@@ -245,10 +272,14 @@ mod tests {
         })
     }
 
-    // -- trust via attestation ------------------------------------------------
+    // -- attestation presence is NOT trust (#2955 pending) --------------------
 
     #[test]
-    fn trusted_publisher_via_attestation_is_allowed_under_block() {
+    fn attested_listed_publisher_is_flagged_for_review_not_allowed() {
+        // Until #2955 lands cryptographic verification, an attestation is at
+        // most PRESENT — and presence is forgeable. A listed publisher via a
+        // present-but-unverified attestation must land in review, never be
+        // trusted, and never be blanket-blocked.
         let d = evaluate(
             &config("attestation", "block"),
             "pypi",
@@ -256,11 +287,51 @@ mod tests {
             "2.0.0",
             &pypi_attested(),
         );
-        assert_eq!(d, CurationDecision::Allow);
+        match d {
+            CurationDecision::Flag(reason) => {
+                assert!(
+                    reason.contains("not cryptographically verified"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("#2955"), "reason: {reason}");
+            }
+            other => panic!("expected Flag (review), got {other:?}"),
+        }
     }
 
     #[test]
-    fn npm_trusted_publisher_via_provenance_is_allowed() {
+    fn forged_provenance_blob_cannot_buy_trust() {
+        // The attack: a squatter PLANTS a provenance object naming a trusted
+        // org in the metadata blob. Structural presence used to be treated as
+        // verified — the forgery was approved. It must now go to review.
+        let forged = json!({
+            "info": {"author": "attacker", "name": "numpyy", "version": "99.0.0"},
+            "provenance": {
+                "attestation_bundles": [{
+                    "publisher": {"kind": "GitHub", "repository": "NumFOCUS/numpy", "workflow": "wheels.yml"},
+                    "attestations": [{"envelope": {"payload": "Zm9yZ2Vk"}}]
+                }]
+            }
+        });
+        let d = evaluate(
+            &config("attestation", "block"),
+            "pypi",
+            "numpyy",
+            "99.0.0",
+            &forged,
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("not cryptographically verified")),
+            "forged provenance must resolve to review, not {d:?}"
+        );
+        assert!(
+            !matches!(d, CurationDecision::Allow),
+            "forged provenance must never be trusted"
+        );
+    }
+
+    #[test]
+    fn npm_attested_listed_publisher_is_flagged_for_review() {
         let d = evaluate(
             &config("attestation", "block"),
             "npm",
@@ -268,7 +339,34 @@ mod tests {
             "4.0.0",
             &npm_attested(),
         );
-        assert_eq!(d, CurationDecision::Allow);
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("#2955")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn attested_unlisted_publisher_keeps_normal_untrusted_handling() {
+        // The review carve-out is only for LISTED publishers pending #2955:
+        // an attested-but-unlisted publisher is plain untrusted (blocked
+        // under enforcement), same as before.
+        let md = json!({
+            "name": "some-lib",
+            "version": "1.0.0",
+            "_npmUser": {"name": "some-rando", "email": "x@example.com"},
+            "dist": {"attestations": {"provenance": {"predicateType": "https://slsa.dev/provenance/v1"}}}
+        });
+        let d = evaluate(
+            &config("attestation", "block"),
+            "npm",
+            "some-lib",
+            "1.0.0",
+            &md,
+        );
+        assert!(
+            matches!(d, CurationDecision::Block(ref r) if r.contains("not in the trusted-publisher list")),
+            "got {d:?}"
+        );
     }
 
     // -- spoof resistance -----------------------------------------------------
@@ -306,6 +404,16 @@ mod tests {
             "azure-coore",
             "99.0.0",
             &pypi_spoofed_author(),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+        // The documented weaker mode is unchanged by the #2955 fail-safe: an
+        // attested package satisfies it too (identity name is what matters).
+        let d = evaluate(
+            &config("metadata", "block"),
+            "pypi",
+            "numpy",
+            "2.0.0",
+            &pypi_attested(),
         );
         assert_eq!(d, CurationDecision::Allow);
     }
@@ -356,9 +464,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_publisher_under_action_allow_is_allowed() {
+    fn attested_listed_publisher_under_action_allow_goes_to_review() {
+        // `action: allow` must not admit a package on an unverified
+        // attestation either — review, pending #2955.
         let d = evaluate(
             &config("attestation", "allow"),
+            "npm",
+            "@azure/identity",
+            "4.0.0",
+            &npm_attested(),
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("not cryptographically verified")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_publisher_under_action_allow_is_allowed_metadata_mode() {
+        let d = evaluate(
+            &config("metadata", "allow"),
             "npm",
             "@azure/identity",
             "4.0.0",
@@ -369,9 +494,28 @@ mod tests {
 
     #[test]
     fn action_flag_watches_listed_publishers_and_passes_others() {
-        // Listed publisher → flagged for review (watch mode).
+        // Listed publisher, attestation present but unverified → flagged for
+        // review (the #2955 pending reason takes precedence over the plain
+        // watch-list phrasing under match: attestation).
         let d = evaluate(
             &config("attestation", "flag"),
+            "npm",
+            "@azure/identity",
+            "4.0.0",
+            &npm_attested(),
+        );
+        match d {
+            CurationDecision::Flag(reason) => {
+                assert!(
+                    reason.contains("not cryptographically verified"),
+                    "reason: {reason}"
+                )
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+        // Listed publisher under the metadata opt-in → classic watch flag.
+        let d = evaluate(
+            &config("metadata", "flag"),
             "npm",
             "@azure/identity",
             "4.0.0",
@@ -483,7 +627,7 @@ mod tests {
     fn defaults_are_secure_attestation_match_and_fail_safe_flag_action() {
         // No `match`, no `action`: attestation-only matching, flag action.
         let cfg = json!({"trusted_publishers": ["NumFOCUS"]});
-        // Attested + listed → watch-mode flag (default action=flag).
+        // Attested + listed → review flag (unverified attestation, #2955).
         let d = evaluate(&cfg, "pypi", "numpy", "2.0.0", &pypi_attested());
         assert!(matches!(d, CurationDecision::Flag(_)), "got {d:?}");
         // Metadata-only listed name under default match=attestation is NOT

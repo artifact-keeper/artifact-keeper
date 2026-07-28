@@ -78,6 +78,9 @@ pub fn is_typosquat(name: &str, popular: &[String], max_distance: usize) -> Opti
         return None;
     }
     let (target, distance) = nearest_popular(name, popular)?;
+    // TODO(#2956): pure edit distance misses homoglyph squats (Unicode
+    // confusables, e.g. Cyrillic lookalikes) and affix-style squats
+    // ("requests2", "python-requests"), which can sit beyond max_distance.
     if distance >= 1 && distance <= max_distance {
         Some(target)
     } else {

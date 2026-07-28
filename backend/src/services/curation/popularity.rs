@@ -13,14 +13,22 @@
 //!   applies the configured `action` (`"flag"` default, `"block"` opt-in).
 //!   Flag-first is deliberate: legitimately new packages have low counts.
 //! - **Typo-squat** — a name within `max_distance` (1–2) edits of a popular
-//!   package, while not itself popular, is *flagged* for review. The signal
-//!   is advisory (never a block from this check alone): lexical proximity has
-//!   false positives by construction.
+//!   package, while not itself popular, is *flagged* for review by default.
+//!   The default signal is advisory (lexical proximity has false positives by
+//!   construction), but an operator who accepts those false positives can set
+//!   `"block_typosquat": true` to escalate a typo-squat match to a hard
+//!   Block — otherwise a fresh malicious squat (which has no download
+//!   history and so can never trip the threshold check) only ever lands in
+//!   review.
 //! - **Unknown popularity** — a source outage/rate limit/unlisted package
-//!   yields `Flag("popularity unknown…")`, never Block, regardless of
-//!   `action`. Fail-open on the data source, fail-safe on the decision: the
-//!   package stays reviewable but an upstream stats outage can never
-//!   hard-block installs.
+//!   yields `Flag("popularity unknown…")` by default, never Block, regardless
+//!   of `action`. Fail-open on the data source, fail-safe on the decision:
+//!   the package stays reviewable but an upstream stats outage can never
+//!   hard-block installs. Operators running `action: "block"` who prefer to
+//!   fail *closed* on their own targets (a brand-new package has no history
+//!   and would otherwise evade the block) can opt in with
+//!   `"block_unknown": true`, which turns an `Unknown` count into a Block —
+//!   accepting that a stats outage then blocks new installs too.
 //!
 //! When both the threshold and the typo-squat signal fire, the strongest
 //! outcome wins (Block > Flag) and the reasons are combined.
@@ -55,6 +63,8 @@ const MAX_DISTANCE_CEILING: u64 = 2;
 ///   "typosquat_check": true,
 ///   "max_distance": 2,
 ///   "action": "flag",
+///   "block_unknown": false,
+///   "block_typosquat": false,
 ///   "popular_packages": ["requests", "..."]
 /// }
 /// ```
@@ -65,6 +75,18 @@ const MAX_DISTANCE_CEILING: u64 = 2;
 /// and `popular_packages` to the built-in per-ecosystem seed list. `window`
 /// is currently informational — both supported sources report last-month
 /// counts.
+///
+/// Two opt-in hardening flags (both default `false`, preserving the
+/// fail-open/advisory defaults):
+///
+/// * `block_unknown` — with `action: "block"`, a package whose download
+///   count is `Unknown` (brand-new, unlisted, or stats-source outage) is
+///   **blocked** instead of flagged, closing the fail-open gap where a fresh
+///   package evades the threshold block because it has no history yet.
+///   Without `action: "block"` the flag has no effect.
+/// * `block_typosquat` — a typo-squat match **blocks** instead of flagging,
+///   regardless of `action`. Off by default because lexical proximity has
+///   false positives by construction.
 ///
 /// `version` is accepted for signature-compatibility with the dispatch seam;
 /// popularity is a package-level signal, so it does not influence the
@@ -100,6 +122,15 @@ pub async fn evaluate(
         .and_then(serde_json::Value::as_str)
         .map(|a| a.eq_ignore_ascii_case("block"))
         .unwrap_or(false);
+    // Opt-in hardening flags; both default false (see doc comment).
+    let block_unknown = config
+        .get("block_unknown")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let block_typosquat = config
+        .get("block_typosquat")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     let popular: Vec<String> = match config
         .get("popular_packages")
@@ -134,20 +165,38 @@ pub async fn evaluate(
         }
         PopularityResult::Known(_) => {}
         PopularityResult::Unknown => {
-            // Fail-open on the data source, fail-safe on the decision: a
-            // stats outage or unlisted package is reviewable, never a block.
-            flag_reasons.push(format!(
+            let reason = format!(
                 "popularity unknown for package '{name}' (download-count source unavailable or package not listed)"
-            ));
+            );
+            if block_action && block_unknown {
+                // Opt-in fail-closed: a brand-new package with no download
+                // history must not evade a block rule just because the count
+                // is Unknown.
+                block_reasons.push(reason);
+            } else {
+                // Default: fail-open on the data source, fail-safe on the
+                // decision — a stats outage or unlisted package is
+                // reviewable, never a block.
+                flag_reasons.push(reason);
+            }
         }
     }
 
     if typosquat_check {
         if let Some(target) = is_typosquat(name, &popular, max_distance) {
-            // Advisory signal only: lexical proximity alone never blocks.
-            flag_reasons.push(format!(
+            let reason = format!(
                 "name '{name}' is within edit distance {max_distance} of popular package '{target}' (possible typo-squat)"
-            ));
+            );
+            if block_typosquat {
+                // Opt-in enforcement: the operator accepts the false-positive
+                // rate of lexical matching in exchange for hard-blocking
+                // fresh squats that have no download history to trip on.
+                block_reasons.push(reason);
+            } else {
+                // Default: advisory only — lexical proximity alone never
+                // blocks.
+                flag_reasons.push(reason);
+            }
         }
     }
 
@@ -244,8 +293,9 @@ mod tests {
 
     #[tokio::test]
     async fn typosquat_is_advisory_even_with_block_action() {
-        // action=block applies to the threshold check only; a typo-squat
-        // match on an above-threshold package stays a Flag.
+        // action=block applies to the threshold check only; without the
+        // block_typosquat opt-in, a typo-squat match on an above-threshold
+        // package stays a Flag.
         let source = FakePopularitySource::new().with("pypi", "reqeusts", 9_999_999);
         let cfg = config(serde_json::json!({"min_downloads": 500, "action": "block"}));
         match evaluate(&cfg, "pypi", "reqeusts", "1.0.0", &source).await {
@@ -275,7 +325,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_popularity_flags_never_blocks() {
+    async fn unknown_popularity_flags_by_default_never_blocks() {
+        // Default (no block_unknown): fail-open on the source, Flag only.
         let source = FakePopularitySource::new(); // everything Unknown
         let cfg = config(serde_json::json!({"min_downloads": 1000, "action": "block"}));
         match evaluate(&cfg, "pypi", "brand-new-pkg", "0.1.0", &source).await {
@@ -283,6 +334,79 @@ mod tests {
                 assert!(reason.contains("popularity unknown"), "{reason}");
             }
             other => panic!("expected Flag (fail-open on source outage), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_popularity_blocks_when_block_unknown_opted_in() {
+        // block_unknown=true + action=block: a brand-new package with no
+        // download history no longer evades the block rule.
+        let source = FakePopularitySource::new(); // everything Unknown
+        let cfg = config(serde_json::json!({
+            "min_downloads": 1000,
+            "action": "block",
+            "block_unknown": true
+        }));
+        match evaluate(&cfg, "pypi", "brand-new-pkg", "0.1.0", &source).await {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("popularity unknown"), "{reason}");
+            }
+            other => panic!("expected Block (opt-in fail-closed), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_unknown_without_block_action_still_flags() {
+        // block_unknown only has effect together with action=block; a
+        // flag-mode rule stays advisory.
+        let source = FakePopularitySource::new(); // everything Unknown
+        let cfg = config(serde_json::json!({"min_downloads": 1000, "block_unknown": true}));
+        match evaluate(&cfg, "npm", "brand-new-pkg", "0.1.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("popularity unknown"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typosquat_blocks_when_block_typosquat_opted_in() {
+        // block_typosquat=true escalates the lexical match to a hard Block,
+        // even for a package that clears the download threshold.
+        let source = FakePopularitySource::new().with("pypi", "reqeusts", 9_999_999);
+        let cfg = config(serde_json::json!({
+            "min_downloads": 500,
+            "action": "block",
+            "block_typosquat": true
+        }));
+        match evaluate(&cfg, "pypi", "reqeusts", "1.0.0", &source).await {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("typo-squat"), "{reason}");
+                assert!(reason.contains("requests"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_typosquat_with_both_optins_is_blocked_not_reviewed() {
+        // The finding scenario: a brand-new malicious typo-squat has no
+        // download history (Unknown) AND a near-popular name. With the
+        // default config it only ever lands in review; with both opt-ins a
+        // block rule now actually blocks it, combining both reasons.
+        let source = FakePopularitySource::new(); // everything Unknown
+        let cfg = config(serde_json::json!({
+            "min_downloads": 500,
+            "action": "block",
+            "block_unknown": true,
+            "block_typosquat": true
+        }));
+        match evaluate(&cfg, "pypi", "reqeusts", "0.0.1", &source).await {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("popularity unknown"), "{reason}");
+                assert!(reason.contains("typo-squat"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 
