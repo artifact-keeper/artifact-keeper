@@ -228,6 +228,12 @@ jobs:
           # Postgres service above instead of no-op'ing.
           SQLX_OFFLINE: true
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          # A database is provisioned for this job, so the DB-backed tests are
+          # REQUIRED to actually run. This makes `try_pool` treat a connect
+          # failure as a hard failure instead of a silent skip, so an
+          # unreachable/misconfigured Postgres can no longer "fiction-green" the
+          # suite (#2924).
+          AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         # nextest runs each test in its own process and applies the repo's
         # .config/nextest.toml db-serial test groups, which serialize the
@@ -353,6 +359,11 @@ jobs:
         if: steps.detect.outputs.rust_changed == 'true'
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          # A database is provisioned for this job, so the DB-backed tests are
+          # REQUIRED to run. A connect failure now fails the suite loudly instead
+          # of silently skipping (which would also silently drop coverage). See
+          # issue #2924.
+          AK_TESTS_REQUIRE_DB: "1"
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
           # SSO credential encryption tests in auth_config_service rely on at

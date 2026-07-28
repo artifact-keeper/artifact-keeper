@@ -32,19 +32,16 @@ use crate::api::{AppState, SharedState};
 use crate::config::Config;
 use crate::models::user::User;
 
-/// Connect to the test database. Returns `None` when `DATABASE_URL` is
-/// unset or unreachable so suites no-op gracefully.
+/// Connect to the test database.
+///
+/// Returns `None` only when no database is configured/reachable **and** the DB
+/// is not required, so DB-free local runs no-op gracefully. When the CI
+/// require-DB signal ([`crate::testing::REQUIRE_DB_ENV`]) is set, a missing
+/// `DATABASE_URL` or a connect failure PANICS instead of skipping, so an
+/// unreachable database can no longer silently "fiction-green" the suite
+/// (#2924).
 pub async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        // llvm-cov + nextest runs DB-backed lib tests in parallel processes.
-        // Keep each per-test pool small, but give Postgres pressure a chance
-        // to clear instead of turning transient contention into PoolTimedOut.
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&url)
-        .await
-        .ok()
+    crate::testing::try_pool_with(3).await
 }
 
 /// Advisory-lock key for [`scan_dedup_serial_lock`] (#2000).
@@ -82,12 +79,12 @@ pub struct ScanDedupSerialGuard {
 /// and bind the result for the whole test body.
 pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = crate::testing::require_db_url() else {
         return ScanDedupSerialGuard { _conn: None };
     };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return ScanDedupSerialGuard { _conn: None },
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return ScanDedupSerialGuard { _conn: None };
     };
     if sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(SCAN_DEDUP_TEST_LOCK_KEY)
@@ -131,12 +128,12 @@ pub struct BlobGcSerialGuard {
 /// test and bind the result for the whole test body.
 pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = crate::testing::require_db_url() else {
         return BlobGcSerialGuard { _conn: None };
     };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return BlobGcSerialGuard { _conn: None },
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return BlobGcSerialGuard { _conn: None };
     };
     if sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(BLOB_GC_TEST_LOCK_KEY)
@@ -180,12 +177,12 @@ pub struct SsoProviderSerialGuard {
 /// whole test body.
 pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
     use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = crate::testing::require_db_url() else {
         return SsoProviderSerialGuard { _conn: None };
     };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return SsoProviderSerialGuard { _conn: None },
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return SsoProviderSerialGuard { _conn: None };
     };
     if sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(SSO_PROVIDER_TEST_LOCK_KEY)
@@ -231,12 +228,12 @@ pub struct CurationGlobalSerialGuard {
 /// the result for the whole test body.
 pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
     use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = crate::testing::require_db_url() else {
         return CurationGlobalSerialGuard { _conn: None };
     };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return CurationGlobalSerialGuard { _conn: None },
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return CurationGlobalSerialGuard { _conn: None };
     };
     if sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(CURATION_GLOBAL_TEST_LOCK_KEY)

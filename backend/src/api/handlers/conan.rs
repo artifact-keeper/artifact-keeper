@@ -3579,13 +3579,10 @@ mod tests {
         /// `let Some(pool) = try_pool().await else { return; };` so the suite
         /// is a no-op in environments without Postgres.
         pub async fn try_pool() -> Option<PgPool> {
-            let url = std::env::var("DATABASE_URL").ok()?;
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&url)
-                .await
-                .ok()
+            // Skip only when no DB is configured/reachable AND not required; a
+            // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
+            // #2924).
+            crate::testing::try_pool_with(5).await
         }
 
         // ------------------------------------------------------------------
