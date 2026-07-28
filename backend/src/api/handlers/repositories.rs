@@ -39,6 +39,7 @@ use crate::services::audit_service::{
 use crate::services::cache_classifier;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
+use crate::services::quarantine_service::{self, QuarantineView};
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility,
     RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -4095,6 +4096,42 @@ pub struct ArtifactResponse {
     /// `revision`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_label: Option<String>,
+    /// Whether the artifact's bytes are currently refused because it is under
+    /// quarantine (#2940). Named to match `QuarantineStatusResponse.is_blocked`
+    /// on `GET /api/v1/quarantine/{artifact_id}`, which models the same derived
+    /// verdict over the same three `quarantine_*` fields below.
+    ///
+    /// Computed by that endpoint's own predicate
+    /// ([`quarantine_service::check_download_allowed`]), so `true` here means a
+    /// download of this artifact is refused right now: 409 while a hold is
+    /// live, 403 once it has been rejected.
+    ///
+    /// Present on every row of the repository artifacts listing, including
+    /// unheld ones (`false`). **Absent** on surfaces that do not load
+    /// quarantine state, so a consumer can distinguish "the server looked and
+    /// it is fine" from "the server did not look", the ambiguity that let a
+    /// blocked artifact read as clean in the first place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_blocked: Option<bool>,
+    /// Raw `artifacts.quarantine_status` (`quarantined`, `rejected`,
+    /// `released`, `clean`, `flagged`, `unscanned`). Same gating as
+    /// `is_blocked`. Note a `quarantined` status whose hold has already
+    /// lapsed is downloadable, so read `is_blocked` for the verdict rather
+    /// than comparing this string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_status: Option<String>,
+    /// Why the artifact is held, when a scan policy or an admin recorded a
+    /// reason. Disclosed only to callers that hold the repository: listing
+    /// routes are reachable anonymously on public repositories and the reason
+    /// carries internal policy names, per-artifact finding counts, and admin
+    /// incident notes (#2912).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// When a live hold lapses. Absent for an unconditional hold (admin
+    /// quarantine, scan-policy rejection) and for artifacts that are not held,
+    /// so it is not on its own a signal of quarantine state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4401,6 +4438,25 @@ pub async fn list_artifacts(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
+    // #2940: the listing used to say nothing about quarantine, so an artifact
+    // the download gate refuses with 409 was reported as ordinary and every
+    // client that reads quarantine state from here concluded it was fine. One
+    // batched read per page (the same shape as the download-stats batch above)
+    // fills it in without degrading into a query per row, and the verdict is
+    // computed by the gate's own predicate rather than restated here.
+    let mut quarantine =
+        quarantine_service::views_for_artifacts(&state.db, &artifact_ids, chrono::Utc::now())
+            .await?;
+    // The reason carries internal policy names, per-artifact finding counts and
+    // free-text admin incident notes. This route is reachable anonymously on a
+    // public repository, so gate it exactly as the quarantine status endpoint
+    // does: only a caller that holds the repository sees it (#2912).
+    if !auth.as_ref().is_some_and(|a| a.can_access_repo(repo.id)) {
+        for view in quarantine.values_mut() {
+            view.redact_reason();
+        }
+    }
+
     // Legacy Maven/Gradle uploads used to group POM, sources, javadoc, and
     // other companion files under one artifact row in metadata.files (#1092).
     // New uploads store each Maven asset as its own `artifacts` row, but keep
@@ -4439,7 +4495,8 @@ pub async fn list_artifacts(
     for artifact in artifacts {
         let artifact_id = artifact.id;
         let download_count = *download_counts.get(&artifact_id).unwrap_or(&0);
-        let mut item = build_artifact_response(&artifact, &key, download_count);
+        let quarantine_view = quarantine.get(&artifact_id);
+        let mut item = build_artifact_response(&artifact, &key, download_count, quarantine_view);
         if rewrite_npm_tarball_paths {
             apply_npm_tarball_url_path(&mut item);
         }
@@ -4451,6 +4508,7 @@ pub async fn list_artifacts(
                 &key,
                 secondary,
                 &listed_maven_paths,
+                quarantine_view,
             ));
         }
     }
@@ -4694,6 +4752,16 @@ fn build_catalog_artifact_response(
         cache_expires_at: None,
         revision: None,
         version_label: None,
+        // A proxy-cached object has no `artifacts` row, so the quarantine
+        // columns this listing reads do not exist for it. Its hold lives in the
+        // cache sidecar (`proxy_service::check_quarantine_until`) and is not
+        // indexed in `proxy_cache_artifacts`, so it cannot be reported here
+        // without a storage read per row. Left absent rather than `false` so
+        // this does not claim the object is unheld (#2940).
+        is_blocked: None,
+        quarantine_status: None,
+        quarantine_reason: None,
+        quarantine_until: None,
     }
 }
 
@@ -4803,6 +4871,13 @@ fn build_cached_artifact_response(
         // Proxy-cache entries carry no versioned history (#2367).
         revision: None,
         version_label: None,
+        // No `artifacts` row, so no quarantine columns to read; the sidecar
+        // hold is not visible from a listing. Same rationale as
+        // `build_catalog_artifact_response` (#2940).
+        is_blocked: None,
+        quarantine_status: None,
+        quarantine_reason: None,
+        quarantine_until: None,
     }
 }
 
@@ -4962,6 +5037,7 @@ fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
     download_count: i64,
+    quarantine: Option<&QuarantineView>,
 ) -> ArtifactResponse {
     ArtifactResponse {
         id: artifact.id,
@@ -4987,6 +5063,13 @@ fn build_artifact_response(
         // per-artifact metadata endpoint, not fanned out in listings (#2367).
         revision: None,
         version_label: None,
+        // #2940: quarantine state comes from the caller's batched read, not
+        // from a per-row query, and is left absent (rather than `false`) when
+        // the caller did not load it.
+        is_blocked: quarantine.map(|q| q.is_blocked),
+        quarantine_status: quarantine.and_then(|q| q.quarantine_status.clone()),
+        quarantine_reason: quarantine.and_then(|q| q.quarantine_reason.clone()),
+        quarantine_until: quarantine.and_then(|q| q.quarantine_until),
     }
 }
 
@@ -5002,6 +5085,7 @@ fn expand_maven_secondary_files(
     repo_key: &str,
     secondary: &[serde_json::Value],
     listed_paths: &std::collections::HashSet<String>,
+    quarantine: Option<&QuarantineView>,
 ) -> Vec<ArtifactResponse> {
     let mut out = Vec::new();
     for f in secondary {
@@ -5039,6 +5123,12 @@ fn expand_maven_secondary_files(
             cache_expires_at: None,
             revision: None,
             version_label: None,
+            // Downloads of a secondary file are gated by the primary row's
+            // quarantine state, so the listing must report it here too (#2940).
+            is_blocked: quarantine.map(|q| q.is_blocked),
+            quarantine_status: quarantine.and_then(|q| q.quarantine_status.clone()),
+            quarantine_reason: quarantine.and_then(|q| q.quarantine_reason.clone()),
+            quarantine_until: quarantine.and_then(|q| q.quarantine_until),
         });
     }
     out
@@ -6359,6 +6449,13 @@ pub async fn get_artifact_metadata(
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
             revision,
             version_label,
+            // #2940 fixed the repository artifacts listing; this by-path
+            // metadata surface still does not load quarantine state, so it
+            // omits the keys rather than reporting a `false` it has not checked.
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
         })
         .into_response());
     }
@@ -6476,6 +6573,13 @@ fn artifact_version_to_response(
         cache_expires_at: None,
         revision: Some(stored.revision),
         version_label: stored.version_label,
+        // A historical revision is an `artifact_versions` row; quarantine is
+        // held on the `artifacts` HEAD row, so there is nothing to report for
+        // this id (#2940).
+        is_blocked: None,
+        quarantine_status: None,
+        quarantine_reason: None,
+        quarantine_until: None,
     }
 }
 
@@ -6838,6 +6942,13 @@ async fn persist_generic_staged_upload(
             cache_expires_at: None,
             revision,
             version_label,
+            // The upload-time hold (`apply_upload_hold`) is applied after this
+            // response is built, so reporting a verdict here would be stale.
+            // Omitted rather than guessed (#2940).
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
         }),
     )
         .into_response())
@@ -9738,7 +9849,7 @@ mod tests {
     #[test]
     fn test_build_artifact_response_copies_primary_fields() {
         let a = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
-        let resp = build_artifact_response(&a, "maven-hosted", 42);
+        let resp = build_artifact_response(&a, "maven-hosted", 42, None);
         assert_eq!(resp.id, a.id);
         assert_eq!(resp.repository_key, "maven-hosted");
         assert_eq!(resp.path, a.path);
@@ -9747,6 +9858,102 @@ mod tests {
         assert_eq!(resp.download_count, 42);
         // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
         assert!(resp.analyzable);
+    }
+
+    // -----------------------------------------------------------------------
+    // Quarantine state on the artifacts listing (#2940)
+    //
+    // The listing used to carry no quarantine state at all, so an artifact that
+    // 409s on download was described as perfectly downloadable and every client
+    // that reads quarantine from the listing (the web UI's QuarantineBanner
+    // among them) never fired.
+    // -----------------------------------------------------------------------
+
+    fn held_view(reason: Option<&str>) -> quarantine_service::QuarantineView {
+        quarantine_service::QuarantineView::from_columns(
+            Some("quarantined".to_string()),
+            None,
+            reason.map(str::to_string),
+            chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn test_build_artifact_response_reports_quarantine() {
+        let a = make_artifact_for_test("pyyaml/5.3/PyYAML-5.3-py3-none-any.whl");
+        let view = held_view(Some("Policy 'demo-global-cve': 2 findings"));
+        let resp = build_artifact_response(&a, "team-packages", 0, Some(&view));
+        assert_eq!(resp.is_blocked, Some(true));
+        assert_eq!(resp.quarantine_status.as_deref(), Some("quarantined"));
+        assert_eq!(
+            resp.quarantine_reason.as_deref(),
+            Some("Policy 'demo-global-cve': 2 findings")
+        );
+        assert_eq!(resp.quarantine_until, None);
+    }
+
+    #[test]
+    fn test_build_artifact_response_reports_clean_artifact_explicitly() {
+        // A listed artifact that is not held must say so out loud: the key is
+        // present and false, so a consumer never has to guess whether the
+        // server looked.
+        let a = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let view = quarantine_service::QuarantineView::default();
+        let resp = build_artifact_response(&a, "maven-hosted", 0, Some(&view));
+        assert_eq!(resp.is_blocked, Some(false));
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(
+            json.get("is_blocked"),
+            Some(&serde_json::Value::Bool(false)),
+            "a listed artifact must always carry is_blocked"
+        );
+    }
+
+    #[test]
+    fn test_build_artifact_response_omits_quarantine_when_not_loaded() {
+        // Surfaces that do not load quarantine state omit the keys entirely
+        // rather than emitting a null or a false, so "not loaded" can never be
+        // read as "not quarantined" (#2940).
+        let a = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let resp = build_artifact_response(&a, "maven-hosted", 0, None);
+        assert_eq!(resp.is_blocked, None);
+        let json = serde_json::to_value(&resp).expect("serialize");
+        for key in [
+            "is_blocked",
+            "quarantine_status",
+            "quarantine_reason",
+            "quarantine_until",
+        ] {
+            assert!(
+                json.get(key).is_none(),
+                "{key} must be absent when quarantine state was not loaded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_inherits_primary_quarantine() {
+        // Secondary Maven files are addressed under the primary's artifact row
+        // and are gated by that row's quarantine state, so the listing must
+        // report them held alongside the primary.
+        let primary = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let secondary = vec![serde_json::json!({
+            "path": "com/example/demo/1.0.0/demo-1.0.0.pom",
+            "extension": "pom",
+            "sizeBytes": 120,
+            "sha256": "pom-sha",
+        })];
+        let view = held_view(None);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "maven-hosted",
+            &secondary,
+            &std::collections::HashSet::new(),
+            Some(&view),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].is_blocked, Some(true));
+        assert_eq!(rows[0].quarantine_status.as_deref(), Some("quarantined"));
     }
 
     // -----------------------------------------------------------------------
@@ -9759,7 +9966,7 @@ mod tests {
     #[test]
     fn test_apply_npm_tarball_url_path_rewrites_stored_tarball() {
         let a = make_artifact_for_test("rfs-pkg/1.0.5/rfs-pkg-1.0.5.tgz");
-        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0, None);
         apply_npm_tarball_url_path(&mut resp);
         assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
     }
@@ -9767,7 +9974,7 @@ mod tests {
     #[test]
     fn test_apply_npm_tarball_url_path_rewrites_scoped_stored_tarball() {
         let a = make_artifact_for_test("@angular/core/17.0.0/core-17.0.0.tgz");
-        let mut resp = build_artifact_response(&a, "npm-hosted", 0);
+        let mut resp = build_artifact_response(&a, "npm-hosted", 0, None);
         apply_npm_tarball_url_path(&mut resp);
         assert_eq!(resp.path, "@angular/core/-/core-17.0.0.tgz");
     }
@@ -9776,7 +9983,7 @@ mod tests {
     fn test_apply_npm_tarball_url_path_noop_for_metadata_row() {
         // Non-tarball rows (a bare package metadata path) are left verbatim.
         let a = make_artifact_for_test("rfs-pkg/package.json");
-        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0, None);
         apply_npm_tarball_url_path(&mut resp);
         assert_eq!(resp.path, "rfs-pkg/package.json");
     }
@@ -9785,7 +9992,7 @@ mod tests {
     fn test_apply_npm_tarball_url_path_idempotent_on_url_shape() {
         // A path already in the `/-/` URL shape must not be rewritten again.
         let a = make_artifact_for_test("rfs-pkg/-/rfs-pkg-1.0.5.tgz");
-        let mut resp = build_artifact_response(&a, "rfs-npm", 0);
+        let mut resp = build_artifact_response(&a, "rfs-npm", 0, None);
         apply_npm_tarball_url_path(&mut resp);
         assert_eq!(resp.path, "rfs-pkg/-/rfs-pkg-1.0.5.tgz");
     }
@@ -9825,6 +10032,7 @@ mod tests {
             "maven-hosted",
             &secondary,
             &std::collections::HashSet::new(),
+            None,
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path, "com/example/demo/1.0.0/demo-1.0.0.pom");
@@ -9853,6 +10061,7 @@ mod tests {
             "maven-hosted",
             &secondary,
             &std::collections::HashSet::new(),
+            None,
         );
         assert!(rows.is_empty());
     }
@@ -9869,7 +10078,7 @@ mod tests {
         })];
         let listed_paths = std::collections::HashSet::from([real_path]);
         let rows =
-            expand_maven_secondary_files(&primary, "maven-hosted", &secondary, &listed_paths);
+            expand_maven_secondary_files(&primary, "maven-hosted", &secondary, &listed_paths, None);
         assert!(rows.is_empty());
     }
 
@@ -9887,6 +10096,7 @@ mod tests {
             "k",
             &secondary,
             &std::collections::HashSet::new(),
+            None,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "p/demo.pom");
@@ -9901,6 +10111,7 @@ mod tests {
             "k",
             &secondary,
             &std::collections::HashSet::new(),
+            None,
         );
         assert_eq!(rows[0].size_bytes, 0);
         assert_eq!(rows[0].checksum_sha256, "");
@@ -11295,6 +11506,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id: Uuid::new_v4(),
             repository_key: "my-repo".to_string(),
             path: "org/example/1.0/example-1.0.jar".to_string(),
@@ -11378,6 +11593,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id: Uuid::new_v4(),
             repository_key: "pypi-remote".to_string(),
             path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
@@ -16255,6 +16474,133 @@ mod tests {
         assert!(
             rows.is_empty(),
             "a metadata-only read is not a download and must record nothing"
+        );
+
+        fx.teardown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // list_artifacts: quarantine state must agree with the download gate
+    // (#2940).
+    //
+    // The bug: the listing carried no quarantine state, so an artifact that
+    // was actively blocked (409 on download, `is_blocked: true` from
+    // GET /api/v1/quarantine/{id}) listed as ordinary and downloadable. This
+    // pins both halves in one test so they cannot drift again: the same
+    // artifact is listed and downloaded in the same run.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_artifacts_reports_quarantine_matching_download_gate() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let held_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("q-test/{}.bin", Uuid::new_v4()),
+            "quarantined/blocked.bin",
+            "blocked",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(b"blocked-bytes"),
+            fx.user_id,
+        )
+        .await;
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("q-test/{}.bin", Uuid::new_v4()),
+            "quarantined/ok.bin",
+            "ok",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(b"clean-bytes"),
+            fx.user_id,
+        )
+        .await;
+        quarantine_service::quarantine_now(
+            &fx.pool,
+            held_id,
+            Some("Policy 'demo-global-cve': 2 findings at or above high severity".to_string()),
+        )
+        .await
+        .expect("quarantine the artifact");
+
+        let req = tdh::get(format!("/{}/artifacts?per_page=100", fx.repo_key));
+        let (status, body) = tdh::send(fx.router_with_auth(router()), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("listing JSON");
+        let items = v["items"].as_array().expect("items array");
+
+        let held = items
+            .iter()
+            .find(|i| i["path"] == "quarantined/blocked.bin")
+            .expect("held artifact must be listed");
+        assert_eq!(
+            held["is_blocked"],
+            serde_json::Value::Bool(true),
+            "a blocked artifact must list as quarantined"
+        );
+        assert_eq!(held["quarantine_status"], "quarantined");
+        assert_eq!(
+            held["quarantine_reason"],
+            "Policy 'demo-global-cve': 2 findings at or above high severity",
+            "a caller that holds the repository sees the reason"
+        );
+
+        let clean = items
+            .iter()
+            .find(|i| i["path"] == "quarantined/ok.bin")
+            .expect("clean artifact must be listed");
+        assert_eq!(
+            clean["is_blocked"],
+            serde_json::Value::Bool(false),
+            "an unheld artifact must say so rather than omit the key"
+        );
+
+        // The enforcement path must agree with what the listing just said.
+        let dl = tdh::get(format!("/{}/download/quarantined/blocked.bin", fx.repo_key));
+        let (dl_status, _) = tdh::send(fx.router_with_auth(download_router()), dl).await;
+        assert_eq!(
+            dl_status,
+            axum::http::StatusCode::CONFLICT,
+            "the artifact the listing reports as quarantined must 409 on download"
+        );
+        let dl_ok = tdh::get(format!("/{}/download/quarantined/ok.bin", fx.repo_key));
+        let (dl_ok_status, _) = tdh::send(fx.router_with_auth(download_router()), dl_ok).await;
+        assert_eq!(
+            dl_ok_status,
+            axum::http::StatusCode::OK,
+            "the artifact the listing reports as clean must download"
+        );
+
+        // #2912: the listing is reachable anonymously on a public repository,
+        // so the reason (policy names, finding counts, admin notes) must not
+        // ride along for a caller that has not proven it holds the repo. The
+        // verdict itself still must.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make repo public");
+        let anon_req = tdh::get(format!("/{}/artifacts?per_page=100", fx.repo_key));
+        let (anon_status, anon_body) = tdh::send(fx.router_anon(router()), anon_req).await;
+        assert_eq!(anon_status, axum::http::StatusCode::OK);
+        let anon: serde_json::Value = serde_json::from_slice(&anon_body).expect("listing JSON");
+        let anon_held = anon["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .find(|i| i["path"] == "quarantined/blocked.bin")
+            .expect("held artifact must be listed anonymously too");
+        assert_eq!(anon_held["is_blocked"], serde_json::Value::Bool(true));
+        assert!(
+            anon_held.get("quarantine_reason").is_none(),
+            "the quarantine reason must not be disclosed anonymously (#2912)"
         );
 
         fx.teardown().await;

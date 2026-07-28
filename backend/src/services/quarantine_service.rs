@@ -601,6 +601,125 @@ pub fn validate_duration(minutes: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Listing view (#2940)
+// ---------------------------------------------------------------------------
+
+/// The quarantine state of one artifact as reported by listing endpoints.
+///
+/// Exists so a listing never has to restate "is this blocked" for itself. The
+/// repository artifacts listing used to carry no quarantine state at all, which
+/// let it describe an artifact that 409s on download as perfectly fine (#2940).
+/// Every field here is derived from the same row and the same predicate the
+/// download gate uses, so the listing, the download gate, and
+/// `GET /api/v1/quarantine/{artifact_id}` cannot drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantineView {
+    /// Whether the artifact's bytes are currently refused. Mirrors the
+    /// `is_blocked` field of the quarantine status endpoint exactly: `true`
+    /// covers both a live hold (409 Conflict) and a rejection (403 Forbidden).
+    pub is_blocked: bool,
+    /// Raw `artifacts.quarantine_status` (`quarantined`, `rejected`,
+    /// `released`, ...). `None` when the artifact has never been held.
+    pub quarantine_status: Option<String>,
+    /// When a live hold lapses. `None` for an unconditional hold and for
+    /// artifacts that are not held.
+    pub quarantine_until: Option<DateTime<Utc>>,
+    /// Why the artifact is held. Security-sensitive; see [`redact_reason`].
+    ///
+    /// [`redact_reason`]: Self::redact_reason
+    pub quarantine_reason: Option<String>,
+}
+
+impl QuarantineView {
+    /// Build the view from an artifact row's raw quarantine columns.
+    ///
+    /// `is_blocked` is computed by calling [`check_download_allowed`], not by
+    /// re-reading `quarantine_status` here, and carries the same name as
+    /// `QuarantineStatusResponse.is_blocked` because it is the same verdict. A
+    /// second, independently written notion of "blocked" is how a listing ends
+    /// up describing an artifact the download gate refuses (#2940), so there is
+    /// deliberately only one.
+    pub fn from_columns(
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        quarantine_reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let is_blocked =
+            check_download_allowed(quarantine_status.as_deref(), quarantine_until, now).is_err();
+        Self {
+            is_blocked,
+            quarantine_status,
+            quarantine_until,
+            quarantine_reason,
+        }
+    }
+
+    /// Drop the reason.
+    ///
+    /// The reason carries internal policy names, per-artifact finding counts,
+    /// and free-text admin incident notes. Listing routes are reachable
+    /// anonymously on public repositories, so callers that have not proven they
+    /// hold the repository must not see it (#2912, same rule as
+    /// [`check_download_allowed`]).
+    pub fn redact_reason(&mut self) {
+        self.quarantine_reason = None;
+    }
+}
+
+/// Load the quarantine state for a page of artifacts in one query (#2940).
+///
+/// Batched on purpose: a listing page can hold up to 100 artifacts, and asking
+/// per row would put a quarantine SELECT behind every listed artifact. Keyed by
+/// `artifacts.id`, mirroring `ArtifactService::get_download_stats_batch`.
+///
+/// Ids with no live row are absent from the map rather than defaulting to "not
+/// quarantined", so a caller can tell "loaded, and clean" from "not loaded".
+/// Errors propagate: silently reporting an artifact as unheld because a query
+/// failed is the failure mode this whole change exists to remove.
+pub async fn views_for_artifacts(
+    db: &PgPool,
+    artifact_ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, QuarantineView>> {
+    if artifact_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        quarantine_reason: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT id, quarantine_status, quarantine_until, quarantine_reason \
+         FROM artifacts WHERE id = ANY($1) AND is_deleted = false",
+    )
+    .bind(artifact_ids)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.id,
+                QuarantineView::from_columns(
+                    r.quarantine_status,
+                    r.quarantine_until,
+                    r.quarantine_reason,
+                    now,
+                ),
+            )
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -900,6 +1019,176 @@ mod tests {
         assert!(!admin_quarantine_allowed(Some("rejected")));
         // already quarantined is a no-op handled by the caller, not an error
         assert!(admin_quarantine_allowed(Some("quarantined")));
+    }
+
+    // -----------------------------------------------------------------------
+    // QuarantineView (#2940)
+    // -----------------------------------------------------------------------
+
+    /// Every (status, until) shape the download gate understands, so the
+    /// agreement test below covers the whole decision surface rather than the
+    /// one case someone happened to think of.
+    fn quarantine_column_cases(
+        now: DateTime<Utc>,
+    ) -> Vec<(Option<&'static str>, Option<DateTime<Utc>>)> {
+        vec![
+            (None, None),
+            (Some("quarantined"), None),
+            (Some("quarantined"), Some(now + Duration::minutes(30))),
+            (Some("quarantined"), Some(now - Duration::minutes(30))),
+            (Some("rejected"), None),
+            (Some("rejected"), Some(now + Duration::minutes(30))),
+            (Some("released"), None),
+            (Some("clean"), None),
+            (Some("flagged"), None),
+            (Some("unscanned"), None),
+        ]
+    }
+
+    /// The listing's `is_blocked` and the download gate must be the same
+    /// decision for every input. This is the regression guard for #2940: the
+    /// listing reported nothing while the download path returned 409 for the
+    /// same artifact, because each side had its own idea of "blocked".
+    #[test]
+    fn test_view_is_blocked_agrees_with_download_gate() {
+        let now = Utc::now();
+        for (status, until) in quarantine_column_cases(now) {
+            let view = QuarantineView::from_columns(status.map(str::to_string), until, None, now);
+            let blocked = check_download_allowed(status, until, now).is_err();
+            assert_eq!(
+                view.is_blocked, blocked,
+                "listing and download gate disagree for status={status:?} until={until:?}"
+            );
+        }
+    }
+
+    /// A live hold is reported as quarantined and echoes the raw columns back,
+    /// so a client can render the banner and the expiry without a second call.
+    #[test]
+    fn test_view_reports_live_hold() {
+        let now = Utc::now();
+        let until = now + Duration::minutes(45);
+        let view = QuarantineView::from_columns(
+            Some("quarantined".to_string()),
+            Some(until),
+            Some("Policy 'demo-global-cve': 2 findings at or above high severity".to_string()),
+            now,
+        );
+        assert!(view.is_blocked);
+        assert_eq!(view.quarantine_status.as_deref(), Some("quarantined"));
+        assert_eq!(view.quarantine_until, Some(until));
+        assert!(view.quarantine_reason.is_some());
+    }
+
+    /// An unconditional hold (`quarantine_until IS NULL`) is the shape an admin
+    /// quarantine and a scan-policy hold both take, and is exactly the case the
+    /// issue reproduced. It must not read as "no expiry, so not held".
+    #[test]
+    fn test_view_reports_unconditional_hold() {
+        let now = Utc::now();
+        let view = QuarantineView::from_columns(Some("quarantined".to_string()), None, None, now);
+        assert!(view.is_blocked);
+        assert_eq!(view.quarantine_until, None);
+    }
+
+    /// A rejected artifact is blocked too (403 rather than 409), so the listing
+    /// must not describe it as available.
+    #[test]
+    fn test_view_reports_rejected_as_blocked() {
+        let now = Utc::now();
+        let view = QuarantineView::from_columns(Some("rejected".to_string()), None, None, now);
+        assert!(view.is_blocked);
+        assert_eq!(view.quarantine_status.as_deref(), Some("rejected"));
+    }
+
+    /// An elapsed hold is downloadable again, so the listing reports it as not
+    /// quarantined while still echoing the raw status.
+    #[test]
+    fn test_view_reports_expired_hold_as_downloadable() {
+        let now = Utc::now();
+        let until = now - Duration::minutes(1);
+        let view =
+            QuarantineView::from_columns(Some("quarantined".to_string()), Some(until), None, now);
+        assert!(!view.is_blocked);
+        assert_eq!(view.quarantine_status.as_deref(), Some("quarantined"));
+    }
+
+    #[test]
+    fn test_view_clean_artifact() {
+        let view = QuarantineView::from_columns(None, None, None, Utc::now());
+        assert!(!view.is_blocked);
+        assert_eq!(view, QuarantineView::default());
+    }
+
+    #[test]
+    fn test_view_redact_reason_drops_only_the_reason() {
+        let now = Utc::now();
+        let until = now + Duration::minutes(10);
+        let mut view = QuarantineView::from_columns(
+            Some("quarantined".to_string()),
+            Some(until),
+            Some("internal policy detail".to_string()),
+            now,
+        );
+        view.redact_reason();
+        assert_eq!(view.quarantine_reason, None);
+        assert!(view.is_blocked, "redaction must not change the verdict");
+        assert_eq!(view.quarantine_status.as_deref(), Some("quarantined"));
+        assert_eq!(view.quarantine_until, Some(until));
+    }
+
+    #[tokio::test]
+    async fn test_views_for_artifacts_empty_input_makes_no_query() {
+        // No pool is touched, so this also documents that an empty page costs
+        // nothing.
+        let map = views_for_artifacts(
+            &PgPool::connect_lazy("postgres://invalid/invalid").expect("lazy pool"),
+            &[],
+            Utc::now(),
+        )
+        .await
+        .expect("empty input must not error");
+        assert!(map.is_empty());
+    }
+
+    // DATABASE_URL-gated: the batched read must report a held artifact as
+    // quarantined, must key the map by artifact id, and must omit ids that have
+    // no live row (so "absent" stays distinguishable from "clean").
+    #[tokio::test]
+    async fn test_views_for_artifacts_reports_held_artifact() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let held = seed_row(&fx, "local", "quarantine/views/held.bin").await;
+        let clean = seed_row(&fx, "local", "quarantine/views/clean.bin").await;
+        let missing = Uuid::new_v4();
+        quarantine_now(&fx.pool, held, Some("policy hold".to_string()))
+            .await
+            .expect("quarantine the artifact");
+
+        let now = Utc::now();
+        let map = views_for_artifacts(&fx.pool, &[held, clean, missing], now)
+            .await
+            .expect("batched quarantine read");
+
+        let held_view = map.get(&held).expect("held artifact must be in the map");
+        assert!(held_view.is_blocked);
+        assert_eq!(held_view.quarantine_status.as_deref(), Some("quarantined"));
+        assert_eq!(held_view.quarantine_reason.as_deref(), Some("policy hold"));
+
+        let clean_view = map.get(&clean).expect("clean artifact must be in the map");
+        assert!(!clean_view.is_blocked);
+
+        assert!(
+            !map.contains_key(&missing),
+            "an id with no row must be absent, not reported clean"
+        );
+
+        // And the batched verdict matches the gate the download path runs.
+        assert!(check_artifact_download(&fx.pool, held).await.is_err());
+        assert!(check_artifact_download(&fx.pool, clean).await.is_ok());
+        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------

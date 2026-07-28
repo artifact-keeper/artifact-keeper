@@ -191,6 +191,14 @@ pub async fn get_artifact(
         // the by-id surface leaves it unset.
         revision: None,
         version_label: None,
+        // #2940 populated quarantine state on the repository artifacts
+        // listing. This by-id surface does not load it, so it omits the keys
+        // instead of reporting a `false` it never checked; callers that need
+        // the verdict use GET /api/v1/quarantine/{artifact_id}.
+        is_blocked: None,
+        quarantine_status: None,
+        quarantine_reason: None,
+        quarantine_until: None,
     }))
 }
 
@@ -336,6 +344,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id,
             repository_key: "maven-releases".to_string(),
             path: "com/example/lib/1.0/lib-1.0.jar".to_string(),
@@ -373,6 +385,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id: Uuid::new_v4(),
             repository_key: "generic-local".to_string(),
             path: "file.tar.gz".to_string(),
@@ -413,6 +429,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id: Uuid::new_v4(),
             repository_key: "generic-local".to_string(),
             path: "empty".to_string(),
@@ -531,6 +551,10 @@ mod tests {
         let resp = ArtifactResponse {
             revision: None,
             version_label: None,
+            is_blocked: None,
+            quarantine_status: None,
+            quarantine_reason: None,
+            quarantine_until: None,
             id: Uuid::nil(),
             repository_key: "k".to_string(),
             path: "p".to_string(),
