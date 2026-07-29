@@ -1314,20 +1314,28 @@ async fn upstream_proxy(
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
         let sub_path = sanitize_publication_subpath(&sub)?;
 
-        // Frozen, AK-signed repodata blob?
-        if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
-        {
-            return Ok(resp);
-        }
-
         // A `packages/{filename}.rpm` request under a published @N: resolve the
-        // member, fetch from the curation-config upstream, VERIFY sha256 against
-        // the frozen checksum, and stream — fail-closed on any mismatch.
+        // member from the FROZEN membership, serve the cached copy or fetch from
+        // the curation-config upstream, VERIFY sha256 against the FROZEN
+        // checksum, and stream — fail-closed on any mismatch.
+        //
+        // This is checked BEFORE the generic stored-blob serve on purpose: the
+        // verified bytes are cached under `{prefix}/packages/{filename}`, which
+        // the generic blob path would otherwise happily return as an opaque
+        // `application/octet-stream` with no `X-Checksum-SHA256` — bypassing the
+        // package response contract (content type, disposition, and the frozen
+        // checksum a client validates against).
         if let Some(filename) = sub_path.strip_prefix("packages/") {
             if !filename.is_empty() && !filename.contains('/') {
                 return serve_version_package(&state, &repo, &prefix, version_number, filename)
                     .await;
             }
+        }
+
+        // Frozen, AK-signed repodata blob?
+        if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
+        {
+            return Ok(resp);
         }
 
         // Nothing else is served from an immutable @N.
