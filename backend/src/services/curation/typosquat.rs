@@ -190,8 +190,16 @@ fn strip_separators(s: &str) -> String {
 /// - separator stuffing (`l.o.d.a.s.h` collapses to `lodash`).
 ///
 /// Matching is case-insensitive and `name` must not itself be on the popular
-/// list (so a curated list containing `python-dateutil` never flags it). This
-/// function is purely lexical — the caller MUST additionally gate on the
+/// list (so a curated list containing `python-dateutil` never flags it). The
+/// comparison runs in confusable-skeleton space ([`confusable_skeleton`]) so
+/// a homoglyph-obfuscated affix form (`python-nｕmpy` with fullwidth `ｕ`)
+/// cannot dodge the match — a combined affix+homoglyph name neither collides
+/// as a whole-name skeleton nor (for compatibility codepoints) trips the
+/// mixed-script signal, so the affix arm must fold confusables itself. The
+/// bounded affix tokens below are skeleton-stable (none contain `m`, the one
+/// lowercase ASCII letter the UTS #39 table rewrites, to `rn`).
+///
+/// This function is purely lexical — the caller MUST additionally gate on the
 /// candidate's own popularity (low/unknown downloads) before acting, because
 /// a legitimately popular affixed package is not reputation-riding.
 pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
@@ -200,13 +208,15 @@ pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
     if popular.iter().any(|p| p.to_lowercase() == name_lc) {
         return None;
     }
+    let name_key = confusable_skeleton(name);
     for candidate in popular {
-        let base = candidate.to_lowercase();
-        if base.is_empty() || name_lc == base {
+        let base = confusable_skeleton(candidate);
+        if base.is_empty() || name_key == base {
+            // Whole-name skeleton collision is the homoglyph signal's job.
             continue;
         }
         // Prefix: <prefix><sep><base>
-        if let Some(rest) = name_lc.strip_suffix(&base) {
+        if let Some(rest) = name_key.strip_suffix(&base) {
             if let Some(prefix) = rest.strip_suffix(AFFIX_SEPARATORS) {
                 if AFFIX_PREFIXES.contains(&prefix) {
                     return Some(candidate.clone());
@@ -214,7 +224,7 @@ pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
             }
         }
         // Suffix: <base><sep?><suffix> or <base><sep?><1-2 digits>
-        if let Some(rest) = name_lc.strip_prefix(&base) {
+        if let Some(rest) = name_key.strip_prefix(&base) {
             let rest = rest.strip_prefix(AFFIX_SEPARATORS).unwrap_or(rest);
             if AFFIX_SUFFIXES.contains(&rest)
                 || ((1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_digit()))
@@ -223,7 +233,7 @@ pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
             }
         }
         // Separator stuffing: collapsing separators reproduces the base name.
-        if strip_separators(&name_lc) == strip_separators(&base) {
+        if strip_separators(&name_key) == strip_separators(&base) {
             return Some(candidate.clone());
         }
     }
@@ -510,6 +520,25 @@ mod tests {
                 "{name} should be an affix squat"
             );
         }
+    }
+
+    #[test]
+    fn affix_matches_in_skeleton_space_closing_homoglyph_affix_combo() {
+        // Red-team evasion (#2956): homoglyph INSIDE an affix form. Fullwidth
+        // ｕ (U+FF55) is script-Latin (no mixed-script flag) and the whole
+        // name's skeleton includes the prefix (no whole-name collision), so a
+        // raw-byte affix comparison would miss it entirely.
+        let popular = strings(&["numpy"]);
+        assert_eq!(
+            is_affix_squat("python-n\u{ff55}mpy", &popular),
+            Some("numpy".to_string())
+        );
+        // Cyrillic-у variant of the same combo (also caught by mixed-script,
+        // but the affix arm must name the ridden base).
+        assert_eq!(
+            is_affix_squat("nump\u{0443}-dev", &popular),
+            Some("numpy".to_string())
+        );
     }
 
     #[test]
