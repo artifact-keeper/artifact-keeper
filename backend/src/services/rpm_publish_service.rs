@@ -261,15 +261,33 @@ pub async fn publish(
     // 3. repomd.xml over the three compressed payloads, then sign it.
     let repodata = build_repodata(&primary_xml, &filelists_xml, &other_xml)?;
 
-    let signature = signing
-        .sign_data(repo_id, repodata.repomd_xml.as_bytes())
+    // Sign repomd.xml with a REAL detached OpenPGP signature — the only form
+    // `dnf` (repo_gpgcheck=1) / `rpm --import` can verify. `sign_data()` returns
+    // raw PKCS#1 v1.5 bytes with no OpenPGP packet framing or CRC24 armor
+    // checksum; hand-wrapping those in "BEGIN PGP SIGNATURE" markers is exactly
+    // the theater #2636 removed from the live repomd path — every real client
+    // rejects it. Fail closed if the repo has no active key, or its active key
+    // cannot produce OpenPGP (requires `key_type='gpg'`), so a published @N
+    // never carries an unverifiable signature.
+    let key = signing
+        .get_active_key_for_repo(repo_id)
         .await?
         .ok_or_else(|| {
             AppError::Validation(
                 "Cannot publish: no signing key is configured for this repository".to_string(),
             )
         })?;
-    let armored_asc = armor_pgp_signature(&signature);
+    if key.key_type != "gpg" {
+        return Err(AppError::Validation(
+            "Cannot publish: the repository's active signing key cannot produce an OpenPGP \
+             signature (requires key_type='gpg')"
+                .to_string(),
+        ));
+    }
+    let armored_asc = signing
+        .sign_openpgp_detached_with_key(&key, repodata.repomd_xml.as_bytes())
+        .await?;
+    let _ = signing.mark_key_used(key.id).await;
 
     let public_key = signing.get_repo_public_key(repo_id).await?.ok_or_else(|| {
         AppError::Validation(
@@ -545,6 +563,10 @@ fn meta_to_stub_artifact(meta: &RpmPackageMetadata) -> RpmArtifact {
             "release": meta.release,
             "arch": meta.arch,
         })),
+        // Stub artifacts feed only the pkgid-consistent filelists/other
+        // generators, which never read `updated_at`; a fixed epoch keeps the
+        // stub a pure function of the frozen member.
+        updated_at: chrono::DateTime::UNIX_EPOCH,
     }
 }
 
@@ -612,22 +634,6 @@ fn repomd_data(data_type: &str, href: &str, gz: &[u8], open: &[u8], timestamp: i
         size: gz.len() as u64,
         open_size: Some(open.len() as u64),
     }
-}
-
-/// Wrap a raw detached signature in PGP armor (76-char base64 lines), matching
-/// the `repomd.xml.asc` armor the live RPM signing route emits.
-fn armor_pgp_signature(signature: &[u8]) -> String {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let wrapped: Vec<&str> = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-    format!(
-        "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-        wrapped.join("\n")
-    )
 }
 
 async fn put_blob(storage: &dyn StorageBackend, key: &str, bytes: Vec<u8>) -> Result<(), AppError> {
@@ -798,13 +804,6 @@ mod tests {
         assert_eq!(&rd.other_gz[..2], &[0x1f, 0x8b]);
     }
 
-    #[test]
-    fn test_armor_pgp_signature_shape() {
-        let armored = armor_pgp_signature(b"a-raw-signature-blob");
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n\n"));
-        assert!(armored.trim_end().ends_with("-----END PGP SIGNATURE-----"));
-    }
-
     // -- create_version DB paths (skip silently when DATABASE_URL is unset) ----
 
     /// A realistic structured metadata JSON for `name`, matching what the
@@ -930,13 +929,14 @@ mod tests {
         )
         .await;
 
-        // A signing key + metadata-signing config so sign_data() returns a sig.
+        // A GPG (OpenPGP) signing key + metadata-signing config so publish emits
+        // a real detached OpenPGP repomd.xml.asc.
         let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
         let key = signing
             .create_key(CreateKeyRequest {
                 repository_id: Some(staging),
                 name: "e2e-key".to_string(),
-                key_type: "rsa".to_string(),
+                key_type: "gpg".to_string(),
                 algorithm: "rsa2048".to_string(),
                 uid_name: None,
                 uid_email: None,
@@ -1046,6 +1046,194 @@ mod tests {
         assert!(
             matches!(republish, Err(AppError::Conflict(_))),
             "re-publish must be Conflict(409): {republish:?}"
+        );
+
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // A repo whose active key cannot produce OpenPGP (key_type='rsa', an X.509
+    // key) must FAIL CLOSED at publish — never emit a raw-PKCS#1 signature
+    // hand-wrapped in PGP armor that no client can verify.
+    #[tokio::test]
+    async fn test_publish_rejects_non_openpgp_key_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::signing_service::{CreateKeyRequest, SigningService};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
+
+        let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
+        let key = signing
+            .create_key(CreateKeyRequest {
+                repository_id: Some(staging),
+                name: "rsa-only".to_string(),
+                key_type: "rsa".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: Some(actor),
+            })
+            .await
+            .expect("create signing key");
+        signing
+            .update_signing_config(staging, Some(key.id), true, false, false)
+            .await
+            .expect("set signing config");
+
+        let created = create_version(&pool, staging, actor)
+            .await
+            .expect("version");
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let backend: String =
+            sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
+                .bind(staging)
+                .fetch_one(&pool)
+                .await
+                .expect("repo storage backend");
+        let storage = state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend,
+                path: dir.to_string_lossy().to_string(),
+            })
+            .expect("storage backend");
+
+        let res = publish(
+            &pool,
+            storage.as_ref(),
+            &signing,
+            staging,
+            created.version_number,
+        )
+        .await;
+        match res {
+            Err(AppError::Validation(msg)) => assert!(
+                msg.contains("OpenPGP") || msg.contains("gpg"),
+                "must reject a non-OpenPGP key with a clear message: {msg}"
+            ),
+            other => panic!("expected Validation(OpenPGP) rejection, got {other:?}"),
+        }
+
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // The published @N signature must be REAL, verifiable OpenPGP — not theater.
+    // The detached `repomd.xml.asc` frozen at publish must verify over the frozen
+    // `repomd.xml` under the frozen `repomd.xml.key`, exactly as `dnf
+    // repo_gpgcheck=1` does; and a byte-tampered repomd must FAIL that check.
+    #[tokio::test]
+    async fn test_published_at_n_signature_verifies_and_rejects_tamper_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::signing_service::{verify_detached, CreateKeyRequest, SigningService};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
+
+        // A GPG (OpenPGP) key so the detached signature is real armored OpenPGP.
+        let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
+        let key = signing
+            .create_key(CreateKeyRequest {
+                repository_id: Some(staging),
+                name: "e2e-verify-key".to_string(),
+                key_type: "gpg".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: Some(actor),
+            })
+            .await
+            .expect("create signing key");
+        signing
+            .update_signing_config(staging, Some(key.id), true, false, false)
+            .await
+            .expect("set signing config");
+
+        let created = create_version(&pool, staging, actor)
+            .await
+            .expect("version");
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let backend: String =
+            sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
+                .bind(staging)
+                .fetch_one(&pool)
+                .await
+                .expect("repo storage backend");
+        let storage = state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend,
+                path: dir.to_string_lossy().to_string(),
+            })
+            .expect("storage backend");
+
+        let summary = publish(
+            &pool,
+            storage.as_ref(),
+            &signing,
+            staging,
+            created.version_number,
+        )
+        .await
+        .expect("publish");
+
+        let prefix = &summary.storage_prefix;
+        let repomd = storage
+            .get(&format!("{prefix}/repodata/repomd.xml"))
+            .await
+            .expect("frozen repomd.xml");
+        let asc = String::from_utf8(
+            storage
+                .get(&format!("{prefix}/repodata/repomd.xml.asc"))
+                .await
+                .expect("frozen repomd.xml.asc")
+                .to_vec(),
+        )
+        .expect("asc is ASCII armor");
+        let pubkey = String::from_utf8(
+            storage
+                .get(&format!("{prefix}/repodata/repomd.xml.key"))
+                .await
+                .expect("frozen repomd.xml.key")
+                .to_vec(),
+        )
+        .expect("key is ASCII armor");
+
+        // Real armor shape, and it VERIFIES over the frozen repomd under the
+        // frozen key — the decisive "signature is not theater" assertion.
+        assert!(asc.starts_with("-----BEGIN PGP SIGNATURE-----"));
+        assert!(pubkey.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+        verify_detached(&pubkey, &repomd, &asc)
+            .expect("frozen @N signature must verify over the frozen repomd under the frozen key");
+
+        // Tamper the signed document: verification must fail closed.
+        let tampered = String::from_utf8(repomd.to_vec())
+            .unwrap()
+            .replace("</repomd>", "<data type=\"evil\"></data></repomd>");
+        assert!(
+            verify_detached(&pubkey, tampered.as_bytes(), &asc).is_err(),
+            "a tampered @N repomd.xml must fail signature verification"
         );
 
         tdh::cleanup(&pool, staging, actor).await;

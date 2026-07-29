@@ -2121,20 +2121,6 @@ mod tests {
         );
     }
 
-    /// Wrap a base64-encoded signature in PGP armor format.
-    fn pgp_armor_signature(b64: &str) -> String {
-        let wrapped: Vec<&str> = b64
-            .as_bytes()
-            .chunks(76)
-            .map(|c| std::str::from_utf8(c).unwrap_or(""))
-            .collect();
-        format!(
-            "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-            wrapped.join("\n"),
-        )
-    }
-
-    // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
     // parse_rpm_filename
     // -----------------------------------------------------------------------
