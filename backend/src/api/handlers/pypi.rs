@@ -2859,7 +2859,23 @@ async fn serve_scanned_pypi_file(
         }
     } else {
         // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
-        // asynchronously so the NEXT pull of this digest is blocked if bad.
+        // asynchronously so the NEXT pull of this SAME digest is blocked if bad.
+        //
+        // Honest caveat (#2954, Finding 2): the block is keyed strictly on the
+        // CONTENT digest. That is correct and cannot be relaxed — binding a
+        // verdict to anything an untrusted upstream controls (filename, index
+        // digest) would let a lying index attach a `clean` verdict to malicious
+        // bytes. But it means fail-open does NOT block an ADAPTIVE upstream that
+        // returns byte-varying vulnerable wheels (e.g. random-byte append): each
+        // pull is a new digest, hence a fresh "first pull", so it is served 200
+        // `X-AK-Scan: pending` indefinitely. This is by-design for the
+        // latency-first fail-open posture and is LOUD — every such serve emits
+        // the warn below plus the pending header, so a burst of pending-serves
+        // from one repo is observable in logs/audit and can be alerted on
+        // out-of-band. Operators who cannot tolerate serving an unscanned byte
+        // must use `proxy_scan_action=fail_closed`, which scans inline before
+        // serving and 423s on any inconclusive/adaptive case. Do NOT "fix" this
+        // by turning fail-open into fail-closed here.
         warn!(
             repo_id = %repo_id, file = %filename, digest = %digest,
             "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"

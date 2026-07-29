@@ -2050,6 +2050,97 @@ pub fn aggregate_proxy_verdict(
     }
 }
 
+/// Run the applicable leaf scanners over raw proxy bytes and fold their output
+/// into a [`ProxyScanVerdict`], or return an error when the result is
+/// INCONCLUSIVE. Extracted from [`ScannerService::scan_content`] (minus the
+/// fair-share permit) so the #2954 fail-closed correctness contract is
+/// unit-testable over mock scanners, with no `ScannerService`/DB/storage.
+///
+/// Fail-closed correctness (#2954): a non-error (`clean`/`vulnerable`) verdict
+/// is only trustworthy when the CVE-AUTHORITATIVE scanner (Grype —
+/// [`Scanner::is_cve_authoritative`]) actually completed `Ok`. The always-on
+/// `DependencyScanner` returns `Ok(ScanOutput::default())` on a binary wheel
+/// (non-UTF-8 content -> zero parsed deps), so "some scanner ran" is trivially
+/// true even when Grype hard-errored / timed out / OOM-died or the pre-seeded
+/// CVE-DB aged past its exit-1 time-bomb. Letting that trivial success
+/// aggregate to `clean` is exactly the hole that serves an UNSCANNED,
+/// possibly-vulnerable wheel with a 200 under the fail-closed posture. So: if a
+/// CVE-authoritative scanner was APPLICABLE but none completed `Ok`, we return
+/// an error the caller treats as inconclusive (fail-closed -> 423, fail-open ->
+/// loud pending) and no `clean` verdict is ever persisted for this digest. A
+/// single supplementary scanner failing (e.g. an optional Trivy adapter that is
+/// down) still must NOT abort the scan — only the CVE engine is load-bearing.
+async fn run_inline_proxy_scanners(
+    scanners: &[Arc<dyn Scanner>],
+    synthetic: &Artifact,
+    content: &Bytes,
+) -> Result<ProxyScanVerdict> {
+    let mut findings: Vec<RawFinding> = Vec::new();
+    let mut scanner_version: Option<String> = None;
+    // "did SOME applicable scanner run Ok" — necessary but NOT sufficient.
+    let mut any_ran = false;
+    // "was a CVE-authoritative scanner applicable" vs "did one complete Ok".
+    // Conflating these two questions is the #2954 fail-closed hole.
+    let mut cve_scanner_applicable = false;
+    let mut cve_scanner_ran = false;
+
+    for scanner in scanners {
+        // Applicability gates on the synthetic artifact's path/content-type,
+        // exactly as the orchestrator gates a hosted artifact.
+        if !scanner.is_applicable(synthetic) {
+            continue;
+        }
+        let is_cve_authoritative = scanner.is_cve_authoritative();
+        if is_cve_authoritative {
+            cve_scanner_applicable = true;
+        }
+        match scanner.scan(synthetic, None, content).await {
+            Ok(output) => {
+                any_ran = true;
+                if is_cve_authoritative {
+                    cve_scanner_ran = true;
+                }
+                // Capture the first available scanner version as provenance
+                // for CVE-DB freshness (Grype reports one).
+                if scanner_version.is_none() {
+                    scanner_version = scanner.version().await;
+                }
+                findings.extend(output.findings);
+            }
+            Err(e) => {
+                warn!(
+                    "Inline proxy scan: scanner {} failed on {} ({}); skipping this scanner",
+                    scanner.name(),
+                    synthetic.name,
+                    e
+                );
+            }
+        }
+    }
+
+    // The CVE-authoritative scanner (Grype) is applicable to every proxied
+    // wheel/sdist and is always registered, so `cve_scanner_applicable` is
+    // normally true. If it was applicable but did NOT complete `Ok`, the scan
+    // is inconclusive — never `clean`. Returning an error here is what makes
+    // the caller's fail-closed branch 423 instead of serving unscanned bytes,
+    // and stops a poisoned `clean` row from being persisted.
+    if cve_scanner_applicable && !cve_scanner_ran {
+        return Err(AppError::Internal(
+            "CVE-authoritative scanner did not complete for inline proxy scan; \
+             verdict inconclusive (failing closed instead of reporting clean)"
+                .to_string(),
+        ));
+    }
+
+    if !any_ran {
+        return Err(AppError::Internal(
+            "no applicable scanner completed for inline proxy scan".to_string(),
+        ));
+    }
+
+    Ok(aggregate_proxy_verdict(&findings, scanner_version))
+}
+
 /// A pluggable vulnerability scanner.
 #[async_trait]
 pub trait Scanner: Send + Sync {
@@ -2088,6 +2179,30 @@ pub trait Scanner: Send + Sync {
     /// routing context to override only this method.
     fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
         self.is_applicable(target.artifact)
+    }
+
+    /// Whether this scanner is the CVE-authoritative engine whose successful
+    /// completion is REQUIRED before an inline proxy scan may report a
+    /// non-error (`clean`/`vulnerable`) verdict.
+    ///
+    /// The inline proxy scan-and-block path ([`ScannerService::scan_content`])
+    /// runs every applicable leaf scanner, but only the CVE engine (Grype —
+    /// the always-bundled, fail-closed vulnerability scanner, #2167) actually
+    /// grades an artifact for known CVEs. The always-on [`DependencyScanner`]
+    /// returns `Ok(ScanOutput::default())` on a binary wheel (non-UTF-8
+    /// content parses to zero dependencies), so "a scanner ran successfully"
+    /// is trivially true even when Grype hard-errored or timed out. Letting
+    /// that trivial success aggregate to `clean` would defeat the fail-closed
+    /// guarantee and serve an UNSCANNED, possibly-vulnerable wheel with a 200.
+    ///
+    /// Returning `false` (the default) means the scanner is a supplementary
+    /// signal whose failure must NOT abort the scan and whose success must NOT
+    /// on its own satisfy the "the CVE scanner ran" condition. Only
+    /// `GrypeScanner` overrides this to `true`. Trivy's filesystem scanner is
+    /// deliberately NOT authoritative here: its engine is optional and, when
+    /// absent or down, must not fail-close the proxy path.
+    fn is_cve_authoritative(&self) -> bool {
+        false
     }
 
     /// Run the scan against artifact content and metadata. Returns both
@@ -3594,51 +3709,7 @@ impl ScannerService {
         // as upload scans instead of contending for unbounded extraction slots.
         let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
 
-        let mut findings: Vec<RawFinding> = Vec::new();
-        let mut scanner_version: Option<String> = None;
-        // Track whether at least one applicable scanner actually ran. A single
-        // scanner failing (e.g. an optional Trivy adapter that is down) must NOT
-        // abort the whole scan — the orchestrator `scan_artifact_inner` skips a
-        // failed scanner and keeps going, and Grype (the always-bundled CVE
-        // engine) is what produces the CVE verdict. If NO scanner ran we return
-        // an error so the caller treats it as inconclusive rather than a false
-        // "clean" (fail-closed then 423s instead of serving unscanned bytes).
-        let mut any_ran = false;
-
-        for scanner in &self.scanners {
-            // Applicability gates on the synthetic artifact's path/content-type,
-            // exactly as the orchestrator gates a hosted artifact.
-            if !scanner.is_applicable(synthetic) {
-                continue;
-            }
-            match scanner.scan(synthetic, None, content).await {
-                Ok(output) => {
-                    any_ran = true;
-                    // Capture the first available scanner version as provenance
-                    // for CVE-DB freshness (Grype reports one).
-                    if scanner_version.is_none() {
-                        scanner_version = scanner.version().await;
-                    }
-                    findings.extend(output.findings);
-                }
-                Err(e) => {
-                    warn!(
-                        "Inline proxy scan: scanner {} failed on {} ({}); skipping this scanner",
-                        scanner.name(),
-                        synthetic.name,
-                        e
-                    );
-                }
-            }
-        }
-
-        if !any_ran {
-            return Err(AppError::Internal(
-                "no applicable scanner completed for inline proxy scan".to_string(),
-            ));
-        }
-
-        Ok(aggregate_proxy_verdict(&findings, scanner_version))
+        run_inline_proxy_scanners(&self.scanners, synthetic, content).await
     }
 
     /// Scan a single artifact: run all applicable scanners, persist results,
@@ -13297,6 +13368,209 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "scan() must be called once when is_applicable() returns true"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline proxy scan fail-closed correctness (#2954)
+    //
+    // The security-critical contract of `run_inline_proxy_scanners` (the loop
+    // behind `ScannerService::scan_content`): a non-error verdict is only
+    // emitted when the CVE-AUTHORITATIVE scanner (Grype) completed `Ok`. A
+    // Grype error/timeout must NOT be masked by a supplementary scanner's
+    // trivial `Ok(ScanOutput::default())` and aggregate to `clean` — that is
+    // the hole that served an unscanned vulnerable wheel 200 under fail-closed.
+    // -----------------------------------------------------------------------
+    mod inline_proxy_scan_fixtures {
+        use super::*;
+
+        /// A CVE-authoritative scanner (mimics Grype) with a configurable
+        /// outcome: hard error, clean Ok, or Ok with a critical finding.
+        pub(super) enum CveOutcome {
+            /// Grype hard-errored / timed out / stale-DB exit-1 / OOM.
+            Error,
+            /// Grype ran and found nothing.
+            Clean,
+            /// Grype ran and found a critical CVE.
+            Critical,
+        }
+
+        pub(super) struct CveAuthoritativeScanner {
+            pub(super) outcome: CveOutcome,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for CveAuthoritativeScanner {
+            fn name(&self) -> &str {
+                "cve-authoritative-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            fn is_cve_authoritative(&self) -> bool {
+                true
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                match self.outcome {
+                    CveOutcome::Error => Err(AppError::Internal(
+                        "simulated grype failure (exit 1, no stderr)".to_string(),
+                    )),
+                    CveOutcome::Clean => Ok(ScanOutput::default()),
+                    CveOutcome::Critical => Ok(ScanOutput::findings_only(vec![RawFinding {
+                        severity: Severity::Critical,
+                        title: "CVE-2020-0000 test".to_string(),
+                        description: None,
+                        cve_id: Some("CVE-2020-0000".to_string()),
+                        affected_component: Some("pyyaml".to_string()),
+                        affected_version: Some("5.3.1".to_string()),
+                        fixed_version: Some("5.4".to_string()),
+                        source: Some("grype".to_string()),
+                        source_url: None,
+                    }])),
+                }
+            }
+        }
+
+        /// A non-CVE supplementary scanner that always returns
+        /// `Ok(ScanOutput::default())` — exactly what `DependencyScanner` does
+        /// on a binary wheel (non-UTF-8 content -> zero parsed deps). It must
+        /// NOT, on its own, satisfy the "the CVE scanner ran" condition.
+        pub(super) struct TrivialDependencyScanner;
+
+        #[async_trait::async_trait]
+        impl Scanner for TrivialDependencyScanner {
+            fn name(&self) -> &str {
+                "trivial-dependency-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "dependency"
+            }
+            // Inherits is_cve_authoritative = false (default).
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+    }
+
+    fn inline_scan_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl",
+            "application/octet-stream",
+            "pypi/pyyaml/5.3.1/PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl",
+        )
+    }
+
+    /// THE #2954 discriminator: DependencyScanner (trivial Ok) + a Grype error
+    /// must yield an INCONCLUSIVE error, NOT a `clean` verdict. Before the fix
+    /// `any_ran` was true (DependencyScanner succeeded), so a Grype-only error
+    /// aggregated to `clean` and the fail-closed serve path returned 200 for an
+    /// unscanned, possibly-vulnerable wheel.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_error_is_inconclusive_not_clean() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let result = run_inline_proxy_scanners(&scanners, &artifact, &Bytes::new()).await;
+        assert!(
+            result.is_err(),
+            "a Grype error must be inconclusive (Err), never a clean verdict, \
+             even though DependencyScanner returned Ok(default) (#2954)"
+        );
+    }
+
+    /// Ordering must not matter: Grype error first, then a trivially-successful
+    /// supplementary scanner, is still inconclusive.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_error_first_still_inconclusive() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Error,
+            }),
+            Arc::new(TrivialDependencyScanner),
+        ];
+        let artifact = inline_scan_artifact();
+        assert!(
+            run_inline_proxy_scanners(&scanners, &artifact, &Bytes::new())
+                .await
+                .is_err(),
+            "Grype error remains inconclusive regardless of scanner order (#2954)"
+        );
+    }
+
+    /// A genuinely-clean Grype run (Ok, no findings) alongside the trivial
+    /// dependency scanner still yields a `clean` verdict — the fix must not
+    /// over-correct and block legitimate clean pulls.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_clean_is_clean() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Clean,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners(&scanners, &artifact, &Bytes::new())
+            .await
+            .expect("clean Grype run must produce a verdict");
+        assert!(!verdict.is_vulnerable(), "clean run -> not vulnerable");
+        assert_eq!(verdict.findings_count, 0);
+    }
+
+    /// A Grype run that finds a critical CVE yields a `vulnerable` verdict.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_grype_findings_are_vulnerable() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Critical,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners(&scanners, &artifact, &Bytes::new())
+            .await
+            .expect("Grype run with findings must produce a verdict");
+        assert!(verdict.is_vulnerable(), "findings -> vulnerable");
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// Defensive: with NO scanner registered at all the result is inconclusive
+    /// (no scanner ran), never a false clean.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_no_scanner_is_inconclusive() {
+        use std::sync::Arc;
+        let scanners: Vec<Arc<dyn Scanner>> = vec![];
+        let artifact = inline_scan_artifact();
+        assert!(
+            run_inline_proxy_scanners(&scanners, &artifact, &Bytes::new())
+                .await
+                .is_err(),
+            "no scanner at all -> inconclusive, never clean"
         );
     }
 

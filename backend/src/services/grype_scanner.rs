@@ -1290,6 +1290,16 @@ impl Scanner for GrypeScanner {
         "grype"
     }
 
+    /// Grype is the CVE-authoritative engine for the inline proxy scan path.
+    /// It is bundled in the runtime image and stays fail-closed (#2167): its
+    /// successful completion is what makes a `clean` verdict trustworthy, so
+    /// [`ScannerService::scan_content`] must treat a Grype error/timeout as
+    /// inconclusive rather than letting a supplementary scanner's trivial
+    /// success mask it (#2954).
+    fn is_cve_authoritative(&self) -> bool {
+        true
+    }
+
     /// Grype handles both filesystem-style artifacts (npm tarballs, PyPI
     /// wheels, lockfiles) via `dir:` mode and OCI / Docker images via
     /// `registry:` mode (#1160). The only artifacts we explicitly reject
