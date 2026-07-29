@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-07-28
+
+A security patch for the 1.6.0 line, hardening Maven flat-key tenant isolation on cloud storage backends. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
+
+### Security
+
+- **Maven flat-key attribution now consults the recorded claims ledger before deriving ownership from parent metadata** (#2946): `attributed_owner` evaluated the `artifact_metadata` `files[]` derivation ahead of the `maven_flat_object_owner` ledger. Because both the read path (`flat_key_readable`) and the write guard (`guard_flat_key_writable`) resolve ownership through that one function, a repository that merely referenced another repository's claimed storage key in its own `files[]` metadata was treated as that key's owner. On deployments using a cloud storage backend this produced three distinct failures:
+
+  - **Cross-repository overwrite (write-poison).** The write guard saw the referencing repository as the owner and permitted it to overwrite the claimed object, so one repository could replace the bytes of an artifact belonging to another.
+  - **Owner lockout.** The true claimant was seen as a non-owner and was refused writes to its own object.
+  - **Read misattribution.** Reads resolved to the referencing repository rather than the claimant, and a key whose derivation was ambiguous failed closed even when the ledger held an unambiguous claim, leaving it unreadable by its own claimant.
+
+  A recorded claim now outranks derived attribution, so the read path, the write guard, and the ledger agree. As a side effect, operations on keys the ledger already knows no longer pay the unindexed scan of `artifact_metadata`, which removes a multi-second stall on large deployments.
+
+  **Am I affected?** Only deployments on a cloud storage backend (S3 or compatible) serving Maven repositories that share a flat key namespace. Filesystem backends short-circuit the guard entirely and are unaffected. Reported and fixed by @ThaSami (#2942, #2943).
+
+  Backported from #2943. The accompanying jsonb containment rewrite and its GIN index (migration 179) are **not** part of the 1.6.x line: a write-blocking in-transaction index build is heavier than a patch release should carry, and the isolation fix is independent of the SQL form. Keys the ledger has never seen therefore still fall through to the sequential scan, so deployments where that scan dominates should plan an upgrade to the 1.7 line rather than expecting the full performance fix here.
+
 ## [1.6.3] - 2026-07-23
 
 A security patch for the 1.6.0 line. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
