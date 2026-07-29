@@ -2743,6 +2743,32 @@ async fn serve_tarball(
                 response_filename = lkg_filename;
             }
 
+            // #3003: when scan-on-proxy is enabled, route through the inline
+            // scan-and-block path (buffered capped fetch + digest-keyed
+            // verdict gate shared with proxy-PyPI, #2954/#2970/#2976). Taken
+            // INSTEAD of the streaming path below, which serves tarball bytes
+            // without consulting a scan verdict. Repos that have not enabled
+            // scan-on-proxy skip this entirely and keep today's untouched
+            // streaming behavior (no regression). Runs after the age gate so
+            // a last-known-good substitution is scanned as what is served.
+            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                .is_proxy_scan_enabled(repo.id)
+                .await
+                .unwrap_or(false)
+            {
+                return serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    &fetch_path,
+                    &response_filename,
+                    ctx,
+                )
+                .await;
+            }
+
             // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
             // metadata. The buffered fallback (#2181) capped it at
             // LARGE_METADATA_MAX_BYTES and 502'd a tarball larger than the cap
@@ -3005,6 +3031,187 @@ async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::U
             path,
             e
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on npm proxy tarball download.
+//
+// npm parity with proxy-PyPI (#2954/#2970/#2976): the verdict state machine,
+// the fail-closed scanner loop, and the block/lock responses are the SHARED
+// implementations in `proxy_helpers` / `proxy_scan_service` /
+// `scanner_service` — this section only supplies the npm-specific fetch,
+// synthetic-artifact shape, and response builder.
+// ---------------------------------------------------------------------------
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// the leaf scanners run over for a proxied npm tarball. There is NO
+/// `artifacts` row (proxy-cached bytes are deliberately not persisted as
+/// artifacts, #1278/#1280). The `.tgz` filename plus the `application/gzip`
+/// content type drive scanner applicability and archive extraction exactly as
+/// for a hosted npm tarball (see [`correct_cached_tarball_content_type`] for
+/// why the content type must be gzip).
+fn npm_synthetic_artifact(
+    repo_id: uuid::Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+) -> crate::models::artifact::Artifact {
+    let now = chrono::Utc::now();
+    crate::models::artifact::Artifact {
+        id: uuid::Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version: None,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: NPM_TARBALL_CONTENT_TYPE.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a buffered 200 response for scanned npm tarball bytes. `pending`
+/// selects the loud `X-AK-Scan: pending` header for the fail-open
+/// serve-before-verdict path so a served-unscanned byte is observable.
+fn build_scanned_tarball_response(
+    filename: &str,
+    bytes: Bytes,
+    digest: &str,
+    pending: bool,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header("X-AK-Scan", if pending { "pending" } else { "clean" })
+        .header("X-NPM-Tarball-SHA256", digest)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// Inline scan-and-block for an npm proxy tarball download (#3003).
+///
+/// Runs ONLY when scan-on-proxy is enabled for the repo; the caller keeps the
+/// untouched streaming path otherwise. Flow mirrors `serve_scanned_pypi_file`:
+/// buffered capped fetch (cache-first, so a repeat pull is served from cache
+/// with no upstream hit) → content digest over the TARBALL bytes (never the
+/// packument or anything the upstream index controls) → shared digest-keyed
+/// verdict gate → serve / block (403) / lock (423) per the repo's
+/// fail-open/closed action. Scoped packages need no special-casing: the
+/// concrete `@scope/pkg/-/file.tgz` fetch path is the single seam every
+/// `npm install` byte passes through, and the verdict is keyed on content.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_npm_tarball(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+        .proxy_scan_action(repo_id)
+        .await
+        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+
+    // Buffered capped fetch (cache-first) under the SAME cache key as the
+    // streaming path (`fetch_path`), so the cache stays warm across the two
+    // paths and a repeat pull returns from cache with NO upstream fetch.
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        upstream_url,
+        RepositoryFormat::Npm,
+    );
+    let bytes = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &remote_repo,
+            fetch_path,
+            fetch_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok((bytes, _upstream_content_type)) => bytes,
+        Err(e) if proxy_helpers::is_over_cap_error(&e) => {
+            // Over the byte cap: never buffer unbounded (#895 OOM).
+            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
+                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-closed -> 423"
+                    );
+                    Err(proxy_helpers::scan_pending_locked_response(filename))
+                }
+                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
+                    // Fail-open oversized: serve via the untouched streaming
+                    // path (loud: X-AK-Scan pending header on the stream).
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+                    );
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                        proxy,
+                        repo_id,
+                        repo_key,
+                        upstream_url,
+                        fetch_path,
+                        fetch_path,
+                        RepositoryFormat::Npm,
+                    )
+                    .await?;
+                    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+                    proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx)
+                        .await;
+                    let mut resp = build_tarball_response_stream(
+                        result.body,
+                        filename,
+                        npm_virtual_tarball_content_type(result.content_type),
+                        result.content_length,
+                    );
+                    resp.headers_mut()
+                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+                    Ok(resp)
+                }
+            };
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+
+    // The upstream registry may return application/octet-stream; correct the
+    // cached record so SBOM generation / background scanners see gzip (same
+    // as the streaming path).
+    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+
+    let digest = proxy_helpers::sha256_hex(&bytes);
+    let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
+    match proxy_helpers::gate_proxy_scan_serve(
+        state, repo_id, filename, &digest, synthetic, &bytes, action,
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
+            proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx).await;
+            Ok(build_scanned_tarball_response(
+                filename, bytes, &digest, pending,
+            ))
+        }
     }
 }
 
@@ -8939,5 +9146,667 @@ mod db_cov_tests {
         }
 
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on the npm remote tarball serve path.
+//
+// These drive `serve_tarball` end-to-end into `serve_scanned_npm_tarball`
+// with a wiremock upstream, a real proxy service, and a scan_configs row
+// with scan_on_proxy enabled — mirroring the PyPI #2954/#2976 suite so
+// npm demonstrably inherits the same shared gate. Skip cleanly when
+// DATABASE_URL is unset.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod proxy_scan_block_tests {
+    use super::*;
+
+    use crate::api::handlers::proxy_helpers::sha256_hex;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+    /// Mount the concrete tarball route (`/{package}/-/{filename}`) — the
+    /// single seam every `npm install` byte passes through.
+    async fn mount_tarball_upstream(
+        upstream: &wiremock::MockServer,
+        package: &str,
+        filename: &str,
+        tarball: &'static [u8],
+        expected_fetches: Option<u64>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mut mock = Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball)
+                    .insert_header("Content-Type", "application/octet-stream"),
+            );
+        if let Some(n) = expected_fetches {
+            mock = mock.expect(n);
+        }
+        mock.mount(upstream).await;
+    }
+
+    /// Point the fixture repo's upstream_url at the wiremock server (the
+    /// serve path re-reads the repository row from the DB).
+    async fn point_upstream(fx: &tdh::Fixture, upstream: &wiremock::MockServer) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+    }
+
+    async fn cleanup_proxy_scan_row(pool: &sqlx::PgPool, digest: &str) {
+        // proxy_scan_results outlives repo cleanup (repository_id is SET NULL
+        // on delete): remove the digest row explicitly.
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// The synthetic scan identity for a proxied npm tarball: `.tgz` name +
+    /// `application/gzip` content type (drives Grype applicability + archive
+    /// extraction), digest-keyed, with NO artifacts-row storage key.
+    #[test]
+    fn test_npm_synthetic_artifact_shape() {
+        let repo_id = uuid::Uuid::new_v4();
+        let a = npm_synthetic_artifact(repo_id, "widget-1.0.0.tgz", "ab12", 42);
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.name, "widget-1.0.0.tgz");
+        assert_eq!(a.path, "widget-1.0.0.tgz");
+        assert_eq!(a.content_type, NPM_TARBALL_CONTENT_TYPE);
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 42);
+        assert!(a.storage_key.is_empty());
+    }
+
+    /// Fail-closed + inconclusive scan (no scanner service on the state) must
+    /// 423, never serve unscanned tarball bytes — npm inherits the #2954
+    /// fail-closed contract through the shared gate.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_closed_inconclusive_is_423() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b sealed-npm-tarball-3003-fail-closed";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // No scanner service on the state: the inline scan is inconclusive.
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "fail-closed + inconclusive scan must never serve tarball bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "fail-closed inconclusive must be 423 Locked"
+            ),
+        }
+    }
+
+    /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`, the
+    /// digest header, and byte-identical content.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_open_serves_pending() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b open-npm-tarball-3003-fail-open";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open first pull must serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let digest_header = resp
+            .headers()
+            .get("X-NPM-Tarball-SHA256")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b open-npm-tarball-3003-fail-open",
+        ));
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("pending"),
+            "a served-before-verdict byte must be observable (X-AK-Scan: pending)"
+        );
+        assert_eq!(ct.as_deref(), Some(NPM_TARBALL_CONTENT_TYPE));
+        assert_eq!(digest_header.as_deref(), Some(digest.as_str()));
+        assert_eq!(&body[..], tarball, "served bytes must equal upstream bytes");
+    }
+
+    /// A fresh cached VULNERABLE verdict for the tarball digest blocks with
+    /// 403 — and a SECOND pull is blocked from the proxy cache with no
+    /// upstream re-fetch (wiremock `expect(1)` verifies on drop), proving the
+    /// verdict is keyed per sha256 and reused.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_cached_vulnerable_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "poisoned-widget",
+            "poisoned-widget-0.1.0.tgz",
+            tarball,
+            Some(1),
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Seed a fresh vulnerable verdict for this digest through the real
+        // service so record_verdict + lookup_verdict are covered end-to-end.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        for pull in ["first", "second (cache-served)"] {
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "poisoned-widget",
+                "poisoned-widget-0.1.0.tgz",
+                &Default::default(),
+            )
+            .await;
+            match result {
+                Ok(r) => {
+                    let status = r.status();
+                    cleanup_proxy_scan_row(&fx.pool, &digest).await;
+                    fx.teardown().await;
+                    panic!("{pull} pull of a vulnerable digest must be blocked, got {status}");
+                }
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{pull} pull: cached vulnerable digest must be a 403 scan_blocked"
+                ),
+            }
+        }
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+        // Dropping the mock server verifies expect(1): the second blocked
+        // pull came from the proxy cache, not upstream.
+    }
+
+    /// A SCOPED package (`@scope/pkg`) flows through the same seam and the
+    /// same digest key: a cached vulnerable verdict blocks its tarball too.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_scoped_package() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b scoped-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b scoped-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        // Tarball URLs keep the scope separator as a literal `/`.
+        mount_tarball_upstream(
+            &upstream,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "scoped vulnerable tarball must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// The cached-`clean` fast path serves 200 `X-AK-Scan: clean` — on a
+    /// FAIL-OPEN repo with no scanner service the header is the
+    /// discriminator (without the verdict this pull would be `pending`).
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_serves_cached_clean_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b verified-npm-tarball-3003-clean";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b verified-npm-tarball-3003-clean",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fresh clean verdict must serve from the cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "a verdict-backed serve must be marked clean, not pending"
+        );
+        assert_eq!(&body[..], tarball);
+    }
+
+    /// #2976 inherited: a cached `clean` verdict recorded by an OLDER
+    /// scanner/CVE-DB version must NOT be reused once the live CVE engine
+    /// reports a newer version — the pull re-scans and (mock now knows the
+    /// CVE) blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_rescans_when_scanner_version_advances() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b staleclean-npm-tarball-3003-bumped";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b staleclean-npm-tarball-3003-bumped",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Cached CLEAN verdict recorded at stored version V...
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        // ...while the LIVE engine is at V+1 and now flags the bytes.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "clean verdict from an older scanner version must be re-scanned \
+                 (and blocked), not served from cache; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan against the bumped CVE-DB found the CVE -> 403"
+            ),
+        }
+    }
+
+    /// #2976 probe-None case inherited: an UNKNOWN live scanner version must
+    /// not let a cached clean verdict short-circuit a fail-closed repo — the
+    /// pull re-scans (mock flags it) and blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_unknown_live_version_rescans_under_fail_closed() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b probenone-npm-tarball-3003-failclosed";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b probenone-npm-tarball-3003-failclosed",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        // Live engine present but its version probe FAILS (None).
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: None,
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "an UNKNOWN live scanner version must not let a cached clean \
+                 verdict short-circuit the fail-closed gate; got {} (expected \
+                 a re-scan -> 403)",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// Regression guard: a remote repo WITHOUT scan-on-proxy keeps today's
+    /// untouched streaming behavior — 200, no `X-AK-Scan` header.
+    #[tokio::test]
+    async fn test_serve_tarball_without_proxy_scan_streams_untouched() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b unscanned-npm-tarball-3003-passthrough";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        // NO scan_configs row: scan-on-proxy disabled.
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("non-opted-in repo must keep streaming, got {status}");
+            }
+        };
+        let status = resp.status();
+        let has_scan_header = resp.headers().contains_key("X-AK-Scan");
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !has_scan_header,
+            "repos without scan-on-proxy must be untouched (no X-AK-Scan header)"
+        );
+        assert_eq!(&body[..], tarball);
     }
 }

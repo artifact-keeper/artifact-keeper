@@ -2631,20 +2631,16 @@ fn build_streaming_file_response(
 
 // ---------------------------------------------------------------------------
 // #2954: inline scan-and-block on proxy download (PyPI Phase 1).
+//
+// The format-agnostic pieces — digesting, the verdict state machine, the
+// block/lock response shapes, and the scan-and-record orchestration — were
+// lifted into `proxy_helpers` (#3003) so npm (and later OCI) share ONE
+// implementation of the #2954 fail-closed gate and the #2976 freshness gate.
+// This module keeps only the PyPI-specific glue: index-target resolution, the
+// synthetic-artifact shape, and the PyPI response builders.
 // ---------------------------------------------------------------------------
 
-/// The scan_type stored for the Grype CVE scanner in `proxy_scan_results`.
-const PROXY_SCAN_TYPE: &str = "grype";
-
-/// SHA-256 hex of the fetched bytes. The verdict cache is keyed on the CONTENT
-/// digest we compute ourselves — never an index-advertised digest — so a lying
-/// upstream index cannot bind a clean verdict to malicious bytes (#2954 inv 4).
-fn sha256_hex(bytes: &Bytes) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
+use super::proxy_helpers::{is_over_cap_error, scan_pending_locked_response, sha256_hex};
 
 /// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
 /// that [`ScannerService::scan_content`] runs the leaf scanners over. There is
@@ -2679,40 +2675,6 @@ fn pypi_synthetic_artifact(
     }
 }
 
-/// A 403 for a proxy pull blocked by a vulnerable inline-scan verdict. Body is
-/// neutral: it names the file, not the specific CVEs (the download route is
-/// anonymous-readable for public repos).
-fn scan_blocked_response(filename: &str) -> Response {
-    let body = serde_json::json!({
-        "error": "scan_blocked",
-        "file": filename,
-        "reason": "blocked by inline vulnerability scan policy",
-    });
-    (
-        StatusCode::FORBIDDEN,
-        [(CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
-}
-
-/// A 423 Locked for the fail-closed inconclusive branch (over-cap / budget /
-/// scan error): the object could not be scanned inline and fail-closed must
-/// NEVER serve unscanned bytes.
-fn scan_pending_locked_response(filename: &str) -> Response {
-    let body = serde_json::json!({
-        "error": "scan_pending",
-        "file": filename,
-        "reason": "artifact is being scanned; retry shortly",
-    });
-    (
-        StatusCode::LOCKED,
-        [(CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
-}
-
 /// Build a buffered 200 response for scanned bytes. `pending` adds the loud
 /// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
 /// served-unscanned byte is observable (kills the #1274 silent gap).
@@ -2737,73 +2699,6 @@ fn build_scanned_file_response(
         builder = builder.header("X-PyPI-File-SHA256", d);
     }
     builder.body(Body::from(bytes)).unwrap()
-}
-
-/// Classify a buffered-fetch error as the byte-cap-exceeded case (vs a genuine
-/// upstream 404 / 5xx). Over-cap is the only error the fail-open/closed
-/// inconclusive branch handles specially; every other error is propagated as-is
-/// so a 404 stays a 404.
-fn is_over_cap_error(e: &AppError) -> bool {
-    matches!(e, AppError::BadGateway(m) if m.contains("exceeded") && m.contains("limit"))
-}
-
-/// Run the leaf scanners over the buffered bytes within the inline budget and
-/// persist the digest-keyed verdict. Returns the verdict, or `None` when the
-/// scan was inconclusive (no scanner configured, budget exceeded, or scanner
-/// error) — the caller maps `None` onto the fail-open/closed decision.
-async fn scan_and_record(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    digest: &str,
-    filename: &str,
-    bytes: &Bytes,
-) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
-    let scanner = state.scanner_service.as_ref()?;
-    let synthetic = pypi_synthetic_artifact(repo_id, filename, digest, bytes.len() as i64);
-    let scan_fut = scanner.scan_content(&synthetic, bytes);
-    let verdict = match tokio::time::timeout(
-        crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
-        scan_fut,
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            warn!(
-                repo_id = %repo_id, file = %filename, error = %e,
-                "inline proxy scan failed; treating as inconclusive"
-            );
-            return None;
-        }
-        Err(_) => {
-            warn!(
-                repo_id = %repo_id, file = %filename,
-                "inline proxy scan exceeded the budget; treating as inconclusive"
-            );
-            return None;
-        }
-    };
-
-    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
-    if let Err(e) = pss
-        .record_verdict(
-            digest,
-            PROXY_SCAN_TYPE,
-            verdict.verdict_token(),
-            verdict.findings_count,
-            verdict.critical_count,
-            verdict.high_count,
-            verdict.medium_count,
-            verdict.low_count,
-            verdict.max_severity_token(),
-            verdict.scanner_version.as_deref(),
-            Some(repo_id),
-        )
-        .await
-    {
-        warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
-    }
-    Some(verdict)
 }
 
 /// Inline scan-and-block for a PyPI proxy file download (#2954).
@@ -2907,135 +2802,28 @@ async fn serve_scanned_pypi_file(
 
     let digest = sha256_hex(&bytes);
 
-    // Verdict fast path: a fresh vulnerable verdict blocks WITHOUT re-scanning
-    // (and, since the fetch above was a cache hit on a repeat pull, without any
-    // upstream fetch). A fresh clean verdict serves from the buffer.
-    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
-    if let Ok(Some(row)) = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await {
-        // #2976: compare the verdict's stored provenance against the LIVE
-        // CVE-scanner version so a verdict recorded against an older scanner /
-        // CVE-DB is treated stale and falls through to the re-scan branches
-        // below (fail-closed: inline re-scan → 403/423; fail-open: serve
-        // pending + async re-scan) instead of serving stale-clean for the full
-        // TTL window. `Scanner::version()` is VersionCache-backed, so this is
-        // a memory read on the hot path, never a per-download subprocess.
-        //
-        // The repo's action is part of the decision, not just the versions:
-        // this fast path runs BEFORE the inline scan, so on a fail-closed repo
-        // an UNKNOWN live version (probe failed mid-upgrade, binary absent,
-        // probe past its timeout) must NOT let a cached `clean` verdict
-        // short-circuit the gate — see `verdict_is_reusable`.
-        //
-        // No per-digest singleflight here: N concurrent pulls of the same
-        // newly-stale digest each re-scan. They queue behind the #2555
-        // fair-share extraction semaphore so this cannot starve upload scans,
-        // and the window closes as soon as the first re-scan upserts the row.
-        // Coalescing is a possible follow-up, not a correctness requirement.
-        let current_version = match state.scanner_service.as_deref() {
-            Some(scanner) => scanner.cve_scanner_version().await,
-            None => None,
-        };
-        let reusable = crate::services::proxy_scan_service::verdict_is_reusable(
-            &row.verdict,
-            row.scanned_at,
-            row.scanner_version.as_deref(),
-            current_version.as_deref(),
-            action,
-            crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
-            Utc::now(),
-        );
-        if !reusable && current_version.is_none() && action.is_fail_closed() {
-            warn!(
-                repo_id = %repo_id, file = %filename, digest = %digest,
-                stored_version = ?row.scanner_version,
-                "live CVE-scanner version unknown; not reusing the cached verdict \
-                 on a fail-closed repo (re-scanning)"
-            );
-        }
-        if reusable {
-            if crate::services::proxy_scan_service::verdict_blocks(&row.verdict) {
-                warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
-                return Err(scan_blocked_response(filename));
-            }
+    // Digest-keyed verdict gate, shared with every proxy format (#3003):
+    // lookup → `decide_serve` (freshness incl. the #2976 unknown-live-version
+    // fail-closed tightening) → inline scan / async scan per the action, with
+    // the #2954 fail-closed contract enforced inside the shared scanner loop.
+    let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
+    match proxy_helpers::gate_proxy_scan_serve(
+        state, repo_id, filename, &digest, synthetic, &bytes, action,
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
             proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
                 .await;
-            return Ok(build_scanned_file_response(
+            Ok(build_scanned_file_response(
                 filename,
                 bytes,
                 content_type,
                 Some(&digest),
-                false,
-            ));
+                pending,
+            ))
         }
-    }
-
-    // No fresh verdict: first pull of this digest.
-    if action.is_fail_closed() {
-        // Fail-closed: scan inline before serving a single byte.
-        match scan_and_record(state, repo_id, &digest, filename, &bytes).await {
-            Some(verdict) if verdict.is_vulnerable() => {
-                warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
-                Err(scan_blocked_response(filename))
-            }
-            Some(_) => {
-                proxy_helpers::record_proxy_download(
-                    state,
-                    repo_id,
-                    repo_key,
-                    &target.cache_path,
-                    ctx,
-                )
-                .await;
-                Ok(build_scanned_file_response(
-                    filename,
-                    bytes,
-                    content_type,
-                    Some(&digest),
-                    false,
-                ))
-            }
-            // Inconclusive under fail-closed => 423, never serve unscanned bytes.
-            None => Err(scan_pending_locked_response(filename)),
-        }
-    } else {
-        // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
-        // asynchronously so the NEXT pull of this SAME digest is blocked if bad.
-        //
-        // Honest caveat (#2954, Finding 2): the block is keyed strictly on the
-        // CONTENT digest. That is correct and cannot be relaxed — binding a
-        // verdict to anything an untrusted upstream controls (filename, index
-        // digest) would let a lying index attach a `clean` verdict to malicious
-        // bytes. But it means fail-open does NOT block an ADAPTIVE upstream that
-        // returns byte-varying vulnerable wheels (e.g. random-byte append): each
-        // pull is a new digest, hence a fresh "first pull", so it is served 200
-        // `X-AK-Scan: pending` indefinitely. This is by-design for the
-        // latency-first fail-open posture and is LOUD — every such serve emits
-        // the warn below plus the pending header, so a burst of pending-serves
-        // from one repo is observable in logs/audit and can be alerted on
-        // out-of-band. Operators who cannot tolerate serving an unscanned byte
-        // must use `proxy_scan_action=fail_closed`, which scans inline before
-        // serving and 423s on any inconclusive/adaptive case. Do NOT "fix" this
-        // by turning fail-open into fail-closed here.
-        warn!(
-            repo_id = %repo_id, file = %filename, digest = %digest,
-            "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
-        );
-        let state_bg = state.clone();
-        let digest_bg = digest.clone();
-        let filename_bg = filename.to_string();
-        let bytes_bg = bytes.clone();
-        tokio::spawn(async move {
-            let _ = scan_and_record(&state_bg, repo_id, &digest_bg, &filename_bg, &bytes_bg).await;
-        });
-        proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
-            .await;
-        Ok(build_scanned_file_response(
-            filename,
-            bytes,
-            content_type,
-            Some(&digest),
-            true,
-        ))
     }
 }
 
@@ -4142,6 +3930,7 @@ async fn pypi_owned_wheel_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
 
     fn headers_with_replication(value: &str) -> HeaderMap {
@@ -9583,19 +9372,7 @@ mod tests {
     // Skip cleanly when DATABASE_URL is unset.
     // -----------------------------------------------------------------------
 
-    async fn enable_proxy_scan(pool: &sqlx::PgPool, repo_id: uuid::Uuid, action: &str) {
-        sqlx::query(
-            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
-                 scan_on_proxy, block_on_policy_violation, severity_threshold, \
-                 proxy_scan_action) \
-             VALUES ($1, true, false, true, false, 'high', $2)",
-        )
-        .bind(repo_id)
-        .bind(action)
-        .execute(pool)
-        .await
-        .expect("enable scan-on-proxy");
-    }
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
 
     /// Mount a PEP 503 index page (with no matching href, so the fetch target
     /// falls back to the conventional simple/ path) plus the wheel bytes.
@@ -9928,65 +9705,10 @@ mod tests {
     // version must keep using the cache (no needless re-scan).
     // -----------------------------------------------------------------------
 
-    /// Outcome of the mock CVE engine when the serve path re-scans.
-    enum MockCveRescan {
-        /// Re-scan against the bumped CVE-DB now flags the bytes.
-        Vulnerable,
-        /// Re-scan is inconclusive (scanner hard-error).
-        Error,
-    }
-
-    /// CVE-authoritative mock scanner reporting a fixed live version string.
-    /// `live_version: None` models a FAILED version probe — the engine is
-    /// mid-upgrade / absent / past its probe timeout — which is the
-    /// unknown-`current_version` case the fail-closed gate must not fail open on.
-    struct VersionedCveScanner {
-        live_version: Option<&'static str>,
-        rescan: MockCveRescan,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::services::scanner_service::Scanner for VersionedCveScanner {
-        fn name(&self) -> &str {
-            "versioned-cve-test-scanner"
-        }
-        fn scan_type(&self) -> &str {
-            "grype"
-        }
-        fn is_cve_authoritative(&self) -> bool {
-            true
-        }
-        async fn version(&self) -> Option<String> {
-            self.live_version.map(str::to_string)
-        }
-        async fn scan(
-            &self,
-            _: &crate::models::artifact::Artifact,
-            _: Option<&crate::models::artifact::ArtifactMetadata>,
-            _: &Bytes,
-        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
-            match self.rescan {
-                MockCveRescan::Error => Err(AppError::Internal(
-                    "simulated grype failure on re-scan".to_string(),
-                )),
-                MockCveRescan::Vulnerable => {
-                    Ok(crate::services::scanner_service::ScanOutput::findings_only(
-                        vec![crate::models::security::RawFinding {
-                            severity: crate::models::security::Severity::Critical,
-                            title: "CVE-2026-0001 test".to_string(),
-                            description: None,
-                            cve_id: Some("CVE-2026-0001".to_string()),
-                            affected_component: Some("pyyaml".to_string()),
-                            affected_version: Some("5.3.1".to_string()),
-                            fixed_version: None,
-                            source: Some("grype".to_string()),
-                            source_url: None,
-                        }],
-                    ))
-                }
-            }
-        }
-    }
+    // The mock CVE engine (`VersionedCveScanner`/`MockCveRescan`) and the
+    // state builder moved to shared test helpers so the npm inline-scan tests
+    // (#3003) drive the identical mock through the identical wiring.
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
 
     /// Build a state whose scanner service holds exactly the given mock CVE
     /// engine, wired over the fixture's storage + a real proxy service.
@@ -9995,21 +9717,11 @@ mod tests {
         storage_path: &str,
         scanner: VersionedCveScanner,
     ) -> crate::api::SharedState {
-        use crate::api::handlers::test_db_helpers as tdh;
-        use std::sync::Arc;
-        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path);
-        let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
-            fx.pool.clone(),
-            vec![Arc::new(scanner)],
-            fx.state.storage.clone(),
-            fx.state.storage_registry.clone(),
-            storage_path.to_string(),
-            fx.storage_dir
-                .join("scan-workspace")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        tdh::build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+        crate::api::handlers::test_db_helpers::build_scan_state_with_leaf_scanners(
+            fx,
+            storage_path,
+            vec![std::sync::Arc::new(scanner)],
+        )
     }
 
     /// #2976 discriminator: a cached `clean` verdict recorded by an OLDER

@@ -1383,6 +1383,47 @@ pub fn build_state_with_proxy_and_scanner(
     Arc::new(state)
 }
 
+/// Enable scan-on-proxy for a repository with the given
+/// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
+/// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold, \
+             proxy_scan_action) \
+         VALUES ($1, true, false, true, false, 'high', $2)",
+    )
+    .bind(repo_id)
+    .bind(action)
+    .execute(pool)
+    .await
+    .expect("enable scan-on-proxy");
+}
+
+/// Build a state whose scanner service holds exactly the given mock leaf
+/// scanners, wired over the fixture's storage + a real proxy service. Shared
+/// by the #2976 verdict-freshness handler tests across formats so each format
+/// file does not re-assemble the ScannerService by hand.
+pub fn build_scan_state_with_leaf_scanners(
+    fx: &Fixture,
+    storage_path: &str,
+    scanners: Vec<Arc<dyn crate::services::scanner_service::Scanner>>,
+) -> crate::api::SharedState {
+    let proxy = build_proxy_service_with_fs(fx.pool.clone(), storage_path);
+    let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
+        fx.pool.clone(),
+        scanners,
+        fx.state.storage.clone(),
+        fx.state.storage_registry.clone(),
+        storage_path.to_string(),
+        fx.storage_dir
+            .join("scan-workspace")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+}
+
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
 /// state so handler tests can exercise the download age gate end-to-end
 /// (`serve_file` / `serve_tarball` only enforce the gate when the service is

@@ -175,6 +175,77 @@ pub fn decide_inconclusive(action: ProxyScanAction) -> InconclusiveOutcome {
     }
 }
 
+/// What the proxy serve path must do for one pull, given the stored verdict
+/// row (if any), the LIVE CVE-scanner version, and the repo's scan action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeDecision {
+    /// Fresh reusable clean verdict: serve the buffered bytes (`X-AK-Scan:
+    /// clean`), no re-scan.
+    ServeCached,
+    /// Fresh reusable vulnerable verdict: block (403) without re-scanning.
+    BlockCached,
+    /// Fail-closed with no reusable verdict: scan inline before serving a
+    /// single byte; the scan outcome then serves / blocks / 423s.
+    ScanInline,
+    /// Fail-open with no reusable verdict: serve now (`X-AK-Scan: pending`)
+    /// and scan asynchronously so the NEXT pull of this digest is gated.
+    ServePendingScanAsync,
+}
+
+/// The freshness + fail-open/closed serve state machine, single-sourced for
+/// every proxy format (PyPI wheels, npm tarballs, OCI manifests). Lifted from
+/// the PyPI serve path so per-format handlers cannot re-implement — and
+/// silently drift on — the two carried defenses:
+///
+/// * #2976: an UNKNOWN live CVE-scanner version (`current_version = None`)
+///   under `fail_closed` must NOT reuse a cached `clean` verdict — the pull
+///   falls through to the re-scan branch ([`verdict_is_reusable`]).
+/// * #2954: the re-scan branch under `fail_closed` is [`ServeDecision::
+///   ScanInline`], whose inconclusive outcome the caller fail-closes (423)
+///   rather than serving unscanned bytes.
+///
+/// Pure over the row + versions + clock (the one `warn!` is observability,
+/// not behavior), so the regression cases are unit-testable without a DB or a
+/// live scanner.
+pub fn decide_serve(
+    row: Option<&ProxyScanRow>,
+    current_version: Option<&str>,
+    action: ProxyScanAction,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+) -> ServeDecision {
+    if let Some(row) = row {
+        let reusable = verdict_is_reusable(
+            &row.verdict,
+            row.scanned_at,
+            row.scanner_version.as_deref(),
+            current_version,
+            action,
+            ttl_days,
+            now,
+        );
+        if !reusable && current_version.is_none() && action.is_fail_closed() {
+            tracing::warn!(
+                stored_version = ?row.scanner_version,
+                "live CVE-scanner version unknown; not reusing the cached verdict \
+                 on a fail-closed repo (re-scanning)"
+            );
+        }
+        if reusable {
+            return if verdict_blocks(&row.verdict) {
+                ServeDecision::BlockCached
+            } else {
+                ServeDecision::ServeCached
+            };
+        }
+    }
+    if action.is_fail_closed() {
+        ServeDecision::ScanInline
+    } else {
+        ServeDecision::ServePendingScanAsync
+    }
+}
+
 pub struct ProxyScanService {
     db: PgPool,
 }
@@ -546,6 +617,136 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+
+    fn row(
+        verdict: &str,
+        scanned_at: DateTime<Utc>,
+        scanner_version: Option<&str>,
+    ) -> ProxyScanRow {
+        ProxyScanRow {
+            checksum_sha256: "0".repeat(64),
+            scan_type: "grype".to_string(),
+            verdict: verdict.to_string(),
+            findings_count: i32::from(verdict == VERDICT_VULNERABLE),
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: None,
+            scanner_version: scanner_version.map(str::to_string),
+            scanned_at,
+        }
+    }
+
+    /// The serve state machine truth table, single-sourced for every proxy
+    /// format: fresh-clean serves, fresh-vulnerable blocks, and every
+    /// no-reusable-verdict case forks on the action (fail-closed scans
+    /// inline, fail-open serves pending + async scan).
+    #[test]
+    fn decide_serve_truth_table() {
+        let now = Utc::now();
+        let fresh = now - Duration::days(1);
+        let live = Some("grype-0.84.0");
+
+        // Fresh reusable clean -> serve from cache (both actions).
+        for action in [ProxyScanAction::FailClosed, ProxyScanAction::FailOpen] {
+            assert_eq!(
+                decide_serve(
+                    Some(&row(VERDICT_CLEAN, fresh, live)),
+                    live,
+                    action,
+                    30,
+                    now
+                ),
+                ServeDecision::ServeCached
+            );
+            // Fresh reusable vulnerable -> block from cache, no re-scan.
+            assert_eq!(
+                decide_serve(
+                    Some(&row(VERDICT_VULNERABLE, fresh, live)),
+                    live,
+                    action,
+                    30,
+                    now
+                ),
+                ServeDecision::BlockCached
+            );
+        }
+
+        // No row at all: first pull of this digest.
+        assert_eq!(
+            decide_serve(None, live, ProxyScanAction::FailClosed, 30, now),
+            ServeDecision::ScanInline
+        );
+        assert_eq!(
+            decide_serve(None, live, ProxyScanAction::FailOpen, 30, now),
+            ServeDecision::ServePendingScanAsync
+        );
+
+        // Stale rows fall through to the same first-pull fork: past-TTL...
+        let expired = now - Duration::days(31);
+        assert_eq!(
+            decide_serve(
+                Some(&row(VERDICT_CLEAN, expired, live)),
+                live,
+                ProxyScanAction::FailClosed,
+                30,
+                now
+            ),
+            ServeDecision::ScanInline
+        );
+        // ...and a scanner/CVE-DB version bump within the TTL (#2976).
+        assert_eq!(
+            decide_serve(
+                Some(&row(VERDICT_CLEAN, fresh, Some("grype-0.83.0"))),
+                live,
+                ProxyScanAction::FailClosed,
+                30,
+                now
+            ),
+            ServeDecision::ScanInline
+        );
+        assert_eq!(
+            decide_serve(
+                Some(&row(VERDICT_CLEAN, fresh, Some("grype-0.83.0"))),
+                live,
+                ProxyScanAction::FailOpen,
+                30,
+                now
+            ),
+            ServeDecision::ServePendingScanAsync
+        );
+    }
+
+    /// THE #2976 case, pinned at the decision seam every format now shares:
+    /// a cached `clean` verdict whose provenance cannot be proven current
+    /// (live version probe returned `None`) must NOT short-circuit a
+    /// fail-closed repo — the pull re-scans inline. Fail-open keeps the
+    /// TTL-only fallback (its re-scan branch serves-with-pending anyway).
+    #[test]
+    fn decide_serve_probe_none_fail_closed_rescans_clean() {
+        let now = Utc::now();
+        let fresh = now - Duration::days(1);
+        let clean = row(VERDICT_CLEAN, fresh, Some("grype-0.83.0"));
+
+        assert_eq!(
+            decide_serve(Some(&clean), None, ProxyScanAction::FailClosed, 30, now),
+            ServeDecision::ScanInline,
+            "probe-None + fail_closed must re-scan, never serve stale-clean"
+        );
+        assert_eq!(
+            decide_serve(Some(&clean), None, ProxyScanAction::FailOpen, 30, now),
+            ServeDecision::ServeCached,
+            "fail-open keeps the TTL-only fallback on an unknown live version"
+        );
+        // A cached vulnerable verdict still blocks even with no live version:
+        // never re-fetch/re-scan bytes already known bad.
+        let vuln = row(VERDICT_VULNERABLE, fresh, Some("grype-0.83.0"));
+        assert_eq!(
+            decide_serve(Some(&vuln), None, ProxyScanAction::FailClosed, 30, now),
+            ServeDecision::BlockCached
+        );
     }
 
     #[test]
