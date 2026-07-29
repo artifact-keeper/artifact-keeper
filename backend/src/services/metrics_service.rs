@@ -175,19 +175,22 @@ pub fn record_webhook_dead_letter(event: &str) {
     .increment(1);
 }
 
-/// Record a download side-effect event (stats/audit) dropped by the bounded
+/// Record download side-effect events (stats/audit) dropped by the bounded
 /// dispatcher (#2522). `kind` is `"stats"` or `"audit"`; `reason` is
-/// `"queue_full"` (overflow shed under load), `"closed"` (workers gone), or
-/// `"uninitialised"` (no dispatcher installed — tests/embedders). A sustained
-/// `queue_full` rate is the operator signal that the event store cannot keep
-/// up with download volume; the byte plane is unaffected by design.
-pub fn record_download_event_dropped(kind: &str, reason: &str) {
+/// `"queue_full"` (overflow shed under load), `"closed"` (workers gone),
+/// `"uninitialised"` (no dispatcher installed — tests/embedders), or
+/// `"flush_failed"` (the DB rejected the row even via the per-row fallback,
+/// e.g. a poison row or event-store error — `count` is the rows lost). A
+/// sustained `queue_full` rate means the event store cannot keep up with
+/// download volume; any `flush_failed` deserves a look at the warn logs. The
+/// byte plane is unaffected by design in every case.
+pub fn record_download_events_dropped(kind: &str, reason: &str, count: u64) {
     counter!(
         "ak_download_events_dropped_total",
         "kind" => kind.to_string(),
         "reason" => reason.to_string()
     )
-    .increment(1);
+    .increment(count);
 }
 
 /// Update the bounded download-event queue-depth gauge (#2522). Sampled on

@@ -588,27 +588,35 @@ impl AuditService {
     /// column to this INSERT's column list.
     pub async fn log(&self, entry: AuditEntry) -> Result<Uuid> {
         audit_export::emit_entry(&entry);
-
         let id = entry.event_id;
+        self.insert_row(&entry)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// Single-row `audit_log` INSERT — the shared statement behind
+    /// [`AuditService::log`] and the per-row fallback in
+    /// [`AuditService::log_batch`]. Does NOT emit the export record (callers
+    /// emit exactly once, before any insert attempt).
+    async fn insert_row(&self, entry: &AuditEntry) -> sqlx::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
-        .bind(id)
+        .bind(entry.event_id)
         .bind(entry.user_id)
         .bind(entry.action.as_str())
         .bind(entry.resource_type.as_str())
         .bind(entry.resource_id)
-        .bind(entry.details)
+        .bind(&entry.details)
         .bind(entry.ip_address.map(|ip| ip.to_string()))
-        .bind(entry.correlation_id)
+        .bind(&entry.correlation_id)
         .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(id)
+        .await?;
+        Ok(())
     }
 
     /// Log a batch of audit entries with one multi-row INSERT (#2522).
@@ -621,32 +629,61 @@ impl AuditService {
     /// outage), and ids are the client-minted `event_id`s. Parallel-array
     /// UNNEST, runtime (non-macro) query — same shape as `webhook_producer`'s
     /// batch insert — so no offline `.sqlx` prepare is needed.
-    pub async fn log_batch(&self, entries: Vec<AuditEntry>) -> Result<()> {
+    ///
+    /// Batching must not amplify loss: if Postgres rejects the multi-row
+    /// statement, every entry is retried individually so one bad row can only
+    /// lose itself, never its co-batched neighbors. Returns the number of
+    /// entries that could not be persisted even via the fallback (0 on the
+    /// happy path); failures are warn-logged, matching the best-effort
+    /// download-audit contract.
+    pub async fn log_batch(&self, entries: Vec<AuditEntry>) -> usize {
         if entries.is_empty() {
-            return Ok(());
+            return 0;
         }
         for entry in &entries {
             audit_export::emit_entry(entry);
         }
 
+        match self.insert_batch_rows(&entries).await {
+            Ok(()) => 0,
+            Err(batch_err) => {
+                tracing::warn!(
+                    rows = entries.len(),
+                    error = %batch_err,
+                    "audit_log batch INSERT failed; retrying rows individually"
+                );
+                let mut lost = 0usize;
+                for entry in &entries {
+                    if let Err(e) = self.insert_row(entry).await {
+                        tracing::warn!(event_id = %entry.event_id, error = %e, "audit log row write failed; ignored (best-effort)");
+                        lost += 1;
+                    }
+                }
+                lost
+            }
+        }
+    }
+
+    /// The batched multi-row INSERT behind [`AuditService::log_batch`].
+    async fn insert_batch_rows(&self, entries: &[AuditEntry]) -> sqlx::Result<()> {
         let n = entries.len();
         let mut ids: Vec<Uuid> = Vec::with_capacity(n);
         let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(n);
         let mut actions: Vec<&'static str> = Vec::with_capacity(n);
         let mut resource_types: Vec<&'static str> = Vec::with_capacity(n);
         let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(n);
-        let mut details: Vec<Option<serde_json::Value>> = Vec::with_capacity(n);
+        let mut details: Vec<Option<&serde_json::Value>> = Vec::with_capacity(n);
         let mut ip_addresses: Vec<Option<String>> = Vec::with_capacity(n);
-        let mut correlation_ids: Vec<String> = Vec::with_capacity(n);
+        let mut correlation_ids: Vec<&str> = Vec::with_capacity(n);
         for entry in entries {
             ids.push(entry.event_id);
             user_ids.push(entry.user_id);
             actions.push(entry.action.as_str());
             resource_types.push(entry.resource_type.as_str());
             resource_ids.push(entry.resource_id);
-            details.push(entry.details);
+            details.push(entry.details.as_ref());
             ip_addresses.push(entry.ip_address.map(|ip| ip.to_string()));
-            correlation_ids.push(entry.correlation_id);
+            correlation_ids.push(&entry.correlation_id);
         }
 
         sqlx::query(
@@ -668,9 +705,7 @@ impl AuditService {
         .bind(ip_addresses)
         .bind(correlation_ids)
         .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
+        .await?;
         Ok(())
     }
 
@@ -2269,5 +2304,58 @@ mod tests {
             .bind(resource_id)
             .execute(&pool)
             .await;
+    }
+
+    /// #2522 batching must not amplify loss: a row Postgres rejects (here a
+    /// duplicate client-minted id) fails the multi-row INSERT, but the
+    /// per-row fallback persists every innocent co-batched entry and reports
+    /// exactly the poison row as lost.
+    #[tokio::test]
+    async fn test_log_batch_poison_row_only_loses_itself() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = AuditService::new(pool.clone());
+
+        let poison_resource = Uuid::new_v4();
+        let innocent_resource = Uuid::new_v4();
+        let poison = AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
+            .resource(poison_resource);
+        // Pre-occupy the poison entry's client-minted id so its INSERT hits a
+        // primary-key violation both in the batch and individually.
+        sqlx::query(
+            "INSERT INTO audit_log (id, action, resource_type, correlation_id) \
+             VALUES ($1, 'ARTIFACT_DOWNLOADED', 'artifact', $2)",
+        )
+        .bind(poison.event_id)
+        .bind(Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await
+        .expect("pre-occupy poison id");
+
+        let innocent = AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
+            .resource(innocent_resource);
+
+        let lost = service.log_batch(vec![poison, innocent]).await;
+        assert_eq!(lost, 1, "exactly the poison entry is lost");
+
+        let innocent_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE resource_id = $1")
+                .bind(innocent_resource)
+                .fetch_one(&pool)
+                .await
+                .expect("count innocent");
+        assert_eq!(
+            innocent_rows, 1,
+            "the innocent co-batched entry must persist via the row fallback"
+        );
+
+        for r in [poison_resource, innocent_resource] {
+            let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+                .bind(r)
+                .execute(&pool)
+                .await;
+        }
     }
 }
