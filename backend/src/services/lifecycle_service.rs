@@ -983,17 +983,31 @@ impl LifecycleService {
             AppError::Validation("max_versions requires a repository_id".to_string())
         })?;
 
-        // Find artifacts to remove: for each (name), keep only the latest N
+        // Find artifacts to remove: for each package/image, keep only the latest N.
+        // Docker manifest artifacts store the tag as part of `name`
+        // (`namespace/image:tag`), while other formats store the package name
+        // independently from its version.  Partition Docker entries by the
+        // image reference without its final tag so version retention applies to
+        // all tags of one image.  `regexp_replace` removes only the final
+        // colon segment, preserving a registry port in e.g.
+        // `registry:5000/team/image:v1`.
         let matched = sqlx::query_as::<_, CountBytes>(
             r#"
             SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
             FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
             WHERE a.repository_id = $1
               AND a.is_deleted = false
               AND a.id NOT IN (
                   SELECT a2.id FROM artifacts a2
                   WHERE a2.repository_id = $1
-                    AND a2.name = a.name
+                    AND CASE WHEN r.format = 'docker'
+                        THEN regexp_replace(a2.name, ':[^:]+$', '')
+                        ELSE a2.name
+                    END = CASE WHEN r.format = 'docker'
+                        THEN regexp_replace(a.name, ':[^:]+$', '')
+                        ELSE a.name
+                    END
                     AND a2.is_deleted = false
                   ORDER BY a2.created_at DESC
                   LIMIT $2
@@ -1010,13 +1024,21 @@ impl LifecycleService {
         if !dry_run && matched.count > 0 {
             let result = sqlx::query(
                 r#"
-                UPDATE artifacts SET is_deleted = true
-                WHERE repository_id = $1
-                  AND is_deleted = false
-                  AND id NOT IN (
+                UPDATE artifacts a SET is_deleted = true
+                FROM repositories r
+                WHERE a.repository_id = r.id
+                  AND a.repository_id = $1
+                  AND a.is_deleted = false
+                  AND a.id NOT IN (
                       SELECT a2.id FROM artifacts a2
                       WHERE a2.repository_id = $1
-                        AND a2.name = artifacts.name
+                        AND CASE WHEN r.format = 'docker'
+                            THEN regexp_replace(a2.name, ':[^:]+$', '')
+                            ELSE a2.name
+                        END = CASE WHEN r.format = 'docker'
+                            THEN regexp_replace(a.name, ':[^:]+$', '')
+                            ELSE a.name
+                        END
                         AND a2.is_deleted = false
                       ORDER BY a2.created_at DESC
                       LIMIT $2
