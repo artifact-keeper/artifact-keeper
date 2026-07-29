@@ -245,9 +245,15 @@ run_init() {
 KEY_FILE="$SHARED_DIR/dtrack-api-key"
 PUBLIC_ID_MARKER="$SHARED_DIR/.dtrack-publicid"
 
+# Portable permission probe (GNU and BSD stat disagree on flags; python3 is
+# already a hard dependency of this test).
+file_mode() {
+  python3 -c 'import os,sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, "03o"))' "$1"
+}
+
 fail() {
   echo "FAIL: $1" >&2
-  for f in init init2 init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6 init7 init8; do
+  for f in init init2 init2_permrepair init2_force init2_authfail init2_permfail init2_unreachable init3 init4 init5 init6 init7 init8; do
     if [ -f "$WORK_DIR/${f}.out" ] || [ -f "$WORK_DIR/${f}.err" ]; then
       echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" >&2 || true
       echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" >&2 || true
@@ -267,6 +273,13 @@ FIRST_KEY="$(tr -d '\n' < "$KEY_FILE")"
 EXPECTED_FIRST="${EXPECTED_KEY}_run1"
 [ "$FIRST_KEY" = "$EXPECTED_FIRST" ] || \
   fail "Phase 1: API key file '$FIRST_KEY' != expected '$EXPECTED_FIRST'"
+# #2865: the key file must be owner-only (0600). In the container the script
+# additionally chowns it to the backend UID (1001:0); running unprivileged
+# here the chown branch is skipped (the writer already owns the file), but
+# the mode contract is asserted exactly.
+KEY_MODE="$(file_mode "$KEY_FILE")"
+[ "$KEY_MODE" = "600" ] || \
+  fail "Phase 1: key file mode $KEY_MODE != 600"
 [ -s "$PUBLIC_ID_MARKER" ] || fail "Phase 1: $PUBLIC_ID_MARKER missing — ownership not recorded"
 OUR_PUBLIC_ID="$(cat "$PUBLIC_ID_MARKER")"
 [ "$OUR_PUBLIC_ID" = "newpub1" ] || \
@@ -321,6 +334,25 @@ for PERM in "${REQUIRED_PERMISSIONS[@]}"; do
   [ "$COUNT" -eq 2 ] || \
     fail "Phase 2: permission $PERM was granted $COUNT times (expected 2)"
 done
+
+# #2865 self-heal: a warm restart must repair drifted permissions on an
+# existing key file WITHOUT rotating the key. Deployments that minted the key
+# with a pre-fix init (wrong owner/mode) get corrected on the next restart.
+chmod 644 "$KEY_FILE"
+KEY_BEFORE_REPAIR="$(tr -d '\n' < "$KEY_FILE")"
+PUT_COUNT_BEFORE_REPAIR=$(wc -l < "$KEY_LOG" | tr -d ' ')
+INIT_RC2_REPAIR=$(run_init init2_permrepair)
+[ "$INIT_RC2_REPAIR" -eq 0 ] || \
+  fail "Phase 2 perm repair: warm restart exited $INIT_RC2_REPAIR (expected 0)"
+KEY_MODE_AFTER_REPAIR="$(file_mode "$KEY_FILE")"
+[ "$KEY_MODE_AFTER_REPAIR" = "600" ] || \
+  fail "Phase 2 perm repair: key file mode $KEY_MODE_AFTER_REPAIR != 600 after warm restart"
+KEY_AFTER_REPAIR="$(tr -d '\n' < "$KEY_FILE")"
+[ "$KEY_AFTER_REPAIR" = "$KEY_BEFORE_REPAIR" ] || \
+  fail "Phase 2 perm repair: warm restart rotated the key while repairing permissions"
+PUT_COUNT_AFTER_REPAIR=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$PUT_COUNT_AFTER_REPAIR" -eq "$PUT_COUNT_BEFORE_REPAIR" ] || \
+  fail "Phase 2 perm repair: warm restart minted a key unexpectedly"
 
 # Explicit forced rotation must override the existing-key warm path. This is
 # the operator recovery path when /shared/dtrack-api-key is stale or revoked:
