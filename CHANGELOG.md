@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - TBD
+
+### Fixed
+
+- **The repository artifacts listing reports per-artifact quarantine state** (#2940): `GET /api/v1/repositories/{key}/artifacts` rows now carry `quarantine_status`, `quarantine_until`, `quarantine_reason` and a derived `is_blocked`. Previously the listing said nothing about quarantine, so an artifact the download gate refuses with `409` was reported as ordinary and downloadable, and any client reading quarantine state from the listing got a clean bill of health. `is_blocked` is computed by the download gate's own predicate rather than restated, so the listing, the gate and `GET /api/v1/quarantine/{artifact_id}` cannot drift apart. State is loaded once per page rather than per row. The reason is visible only to a caller that can access the repository, because it carries policy names, per-artifact finding counts and admin incident notes, and listing routes are reachable anonymously on public repositories. All four fields are omitted rather than returned as null on surfaces that do not load quarantine state, so "not loaded" cannot be read as "not quarantined".
+
 ## [1.6.0] - TBD
 
 A security- and correctness-hardening release closing the 1.6.0 milestone: 24 security fixes, 9 features and enhancements, and 47 bug fixes, spanning multi-tenant isolation, supply-chain signing, ingestion/scan resource limits, native-client format fidelity across a dozen ecosystems, proxy/cache accounting, and SSO group mapping. It also folds in the cross-repository Maven flat-key attribution hardening and the npm replication-feed and webhook cluster-safety fixes carried over from the 1.5.x hotfix line. In-place upgrade from 1.5.x is automatic — a startup migration-ledger reconciliation resolves the history divergence with no operator action (#2686). The release date is stamped at cut.
