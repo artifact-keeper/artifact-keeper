@@ -2911,12 +2911,23 @@ async fn serve_scanned_pypi_file(
     // (and, since the fetch above was a cache hit on a repeat pull, without any
     // upstream fetch). A fresh clean verdict serves from the buffer.
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
-    let current_version = None; // provenance compared only when both sides known
     if let Ok(Some(row)) = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await {
+        // #2976: compare the verdict's stored provenance against the LIVE
+        // CVE-scanner version so a verdict recorded against an older scanner /
+        // CVE-DB is treated stale and falls through to the re-scan branches
+        // below (fail-closed: inline re-scan → 403/423; fail-open: serve
+        // pending + async re-scan) instead of serving stale-clean for the full
+        // TTL window. `Scanner::version()` is VersionCache-backed, so this is
+        // a memory read on the hot path, never a per-download subprocess. When
+        // either side is unknown, `verdict_is_fresh` falls back to the TTL.
+        let current_version = match state.scanner_service.as_deref() {
+            Some(scanner) => scanner.cve_scanner_version().await,
+            None => None,
+        };
         let fresh = crate::services::proxy_scan_service::verdict_is_fresh(
             row.scanned_at,
             row.scanner_version.as_deref(),
-            current_version,
+            current_version.as_deref(),
             crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
             Utc::now(),
         );
@@ -9874,5 +9885,356 @@ mod tests {
             "a verdict-backed serve must be marked clean, not pending"
         );
         assert_eq!(&body[..], wheel);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2976: cached-verdict freshness vs the LIVE CVE-scanner version.
+    //
+    // These drive `serve_file` end-to-end with a scanner service on the state
+    // whose CVE-authoritative mock reports an injected "live" version — the
+    // `current_version` side of `verdict_is_fresh`. A cached verdict recorded
+    // by an OLDER version must be treated stale and re-scanned; the SAME
+    // version must keep using the cache (no needless re-scan).
+    // -----------------------------------------------------------------------
+
+    /// Outcome of the mock CVE engine when the serve path re-scans.
+    enum MockCveRescan {
+        /// Re-scan against the bumped CVE-DB now flags the bytes.
+        Vulnerable,
+        /// Re-scan is inconclusive (scanner hard-error).
+        Error,
+    }
+
+    /// CVE-authoritative mock scanner reporting a fixed live version string.
+    struct VersionedCveScanner {
+        live_version: &'static str,
+        rescan: MockCveRescan,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionedCveScanner {
+        fn name(&self) -> &str {
+            "versioned-cve-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn version(&self) -> Option<String> {
+            Some(self.live_version.to_string())
+        }
+        async fn scan(
+            &self,
+            _: &crate::models::artifact::Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            match self.rescan {
+                MockCveRescan::Error => Err(AppError::Internal(
+                    "simulated grype failure on re-scan".to_string(),
+                )),
+                MockCveRescan::Vulnerable => {
+                    Ok(crate::services::scanner_service::ScanOutput::findings_only(
+                        vec![crate::models::security::RawFinding {
+                            severity: crate::models::security::Severity::Critical,
+                            title: "CVE-2026-0001 test".to_string(),
+                            description: None,
+                            cve_id: Some("CVE-2026-0001".to_string()),
+                            affected_component: Some("pyyaml".to_string()),
+                            affected_version: Some("5.3.1".to_string()),
+                            fixed_version: None,
+                            source: Some("grype".to_string()),
+                            source_url: None,
+                        }],
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Build a state whose scanner service holds exactly the given mock CVE
+    /// engine, wired over the fixture's storage + a real proxy service.
+    fn scan_state_with_live_scanner(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        storage_path: &str,
+        scanner: VersionedCveScanner,
+    ) -> crate::api::SharedState {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::Arc;
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path);
+        let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
+            fx.pool.clone(),
+            vec![Arc::new(scanner)],
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            storage_path.to_string(),
+            fx.storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        tdh::build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
+    }
+
+    /// #2976 discriminator: a cached `clean` verdict recorded by an OLDER
+    /// scanner/CVE-DB version must NOT be reused once the live CVE engine
+    /// reports a newer version. The serve path re-scans, and the re-scan
+    /// (which now knows the new CVE) blocks with 403. Before the fix the call
+    /// site passed `current_version=None`, so `verdict_is_fresh` never saw
+    /// the bump and this pull served 200 stale-clean from cache for the full
+    /// 30-day TTL.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_rescans_when_scanner_version_advances() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "staleclean";
+        let filename = "staleclean-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 staleclean-wheel-2976-bumped";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 staleclean-wheel-2976-bumped",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Cached CLEAN verdict recorded at stored version V...
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        // ...while the LIVE engine is at V+1 and now flags the bytes.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: "grype-0.84.0-test",
+                rescan: MockCveRescan::Vulnerable,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "clean verdict from an older scanner version must be re-scanned \
+                 (and blocked), not served from cache; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan against the bumped CVE-DB found the CVE -> 403"
+            ),
+        }
+    }
+
+    /// Same-version control: when the live CVE engine still reports the SAME
+    /// version that produced the cached `clean` verdict, the cache is reused —
+    /// the mock would 403 if a re-scan ran, so a 200 `X-AK-Scan: clean` proves
+    /// there was no needless re-scan (no perf regression from #2976).
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_reuses_cached_verdict_same_version() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "sameversion";
+        let filename = "sameversion-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 sameversion-wheel-2976-cached";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 sameversion-wheel-2976-cached",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.84.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: "grype-0.84.0-test",
+                rescan: MockCveRescan::Vulnerable, // would 403 if re-scanned
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("same-version clean verdict must serve from cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "cache hit must serve clean (a re-scan would have blocked)"
+        );
+    }
+
+    /// Fail-closed alignment after a version bump: when the invalidating
+    /// re-scan is INCONCLUSIVE (scanner error), the pull must 423, never a
+    /// 200 of the stale-clean cache (#2976 + #2954 fail-closed contract).
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_version_bump_inconclusive_locks() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "bumplocked";
+        let filename = "bumplocked-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 bumplocked-wheel-2976-locked";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 bumplocked-wheel-2976-locked",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = scan_state_with_live_scanner(
+            &fx,
+            &storage_path,
+            VersionedCveScanner {
+                live_version: "grype-0.84.0-test",
+                rescan: MockCveRescan::Error,
+            },
+        );
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "inconclusive re-scan after a version bump must 423 under \
+                 fail-closed, not serve stale-clean; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::LOCKED),
+        }
     }
 }

@@ -1231,6 +1231,23 @@ pub fn build_state_with_proxy(
     Arc::new(state)
 }
 
+/// Like [`build_state_with_proxy`] but also wires a
+/// [`crate::services::scanner_service::ScannerService`] onto the state, so
+/// handler tests can exercise the inline proxy scan + verdict-freshness wiring
+/// end-to-end (#2954/#2976): the serve path only re-scans (and only consults
+/// the live CVE-scanner version) when a scanner service is present.
+pub fn build_state_with_proxy_and_scanner(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    scanner: Arc<crate::services::scanner_service::ScannerService>,
+) -> crate::api::SharedState {
+    let mut state = app_state_with(cfg(storage_path), pool, storage_path);
+    state.set_proxy_service(proxy);
+    state.set_scanner_service(scanner);
+    Arc::new(state)
+}
+
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
 /// state so handler tests can exercise the download age gate end-to-end
 /// (`serve_file` / `serve_tarball` only enforce the gate when the service is

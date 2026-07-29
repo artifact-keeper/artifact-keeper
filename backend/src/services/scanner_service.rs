@@ -2141,6 +2141,28 @@ async fn run_inline_proxy_scanners(
     Ok(aggregate_proxy_verdict(&findings, scanner_version))
 }
 
+/// Live version string of the CVE-authoritative scanner (Grype), e.g.
+/// `grype-0.83.0` — the SAME provenance string [`run_inline_proxy_scanners`]
+/// persists on a `proxy_scan_results` verdict. Serve paths pass it as
+/// `current_version` to
+/// [`crate::services::proxy_scan_service::verdict_is_fresh`] so a cached
+/// verdict recorded against an older scanner / CVE-DB is invalidated and
+/// re-scanned instead of being reused for the full TTL window (#2976).
+///
+/// Cheap by construction: [`Scanner::version`] implementations are
+/// [`VersionCache`]-backed ([`VERSION_CACHE_HIT_TTL`] on hit), so this never
+/// shells out per download. Returns `None` when no CVE-authoritative scanner
+/// is registered or its version probe failed — `verdict_is_fresh` then falls
+/// back to the TTL alone, exactly as before.
+async fn cve_authoritative_scanner_version(scanners: &[Arc<dyn Scanner>]) -> Option<String> {
+    for scanner in scanners {
+        if scanner.is_cve_authoritative() {
+            return scanner.version().await;
+        }
+    }
+    None
+}
+
 /// A pluggable vulnerability scanner.
 #[async_trait]
 pub trait Scanner: Send + Sync {
@@ -3710,6 +3732,42 @@ impl ScannerService {
         let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
 
         run_inline_proxy_scanners(&self.scanners, synthetic, content).await
+    }
+
+    /// Live version of the CVE-authoritative scanner for verdict-freshness
+    /// checks (#2976): see [`cve_authoritative_scanner_version`]. The PyPI
+    /// proxy serve path threads this into `verdict_is_fresh` as
+    /// `current_version` so a cached verdict from an older scanner / CVE-DB
+    /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    pub async fn cve_scanner_version(&self) -> Option<String> {
+        cve_authoritative_scanner_version(&self.scanners).await
+    }
+
+    /// Test-only constructor with injected leaf scanners, for handler tests
+    /// that need a `ScannerService` on the shared state (e.g. the #2976
+    /// verdict-freshness wiring in the PyPI proxy serve path). Mirrors the
+    /// `scanner_for_fixture` struct literal in this module's tests, which
+    /// sibling modules cannot reach.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_scanners(
+        db: PgPool,
+        scanners: Vec<Arc<dyn Scanner>>,
+        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<crate::storage::StorageRegistry>,
+        storage_base_path: String,
+        scan_workspace_path: String,
+    ) -> Self {
+        ScannerService {
+            db: db.clone(),
+            scanners,
+            scan_result_service: Arc::new(ScanResultService::new(db.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(db)),
+            storage,
+            storage_registry,
+            storage_base_path,
+            scan_workspace_path,
+            dependency_track: None,
+        }
     }
 
     /// Scan a single artifact: run all applicable scanners, persist results,
@@ -13588,6 +13646,67 @@ mod tests {
             outcome: CveOutcome::Clean,
         }
         .is_cve_authoritative());
+    }
+
+    /// #2976: `cve_authoritative_scanner_version` returns the CVE engine's
+    /// (cached) version string — skipping non-authoritative scanners
+    /// regardless of registration order — and `None` when no CVE engine is
+    /// registered or its probe failed, so `verdict_is_fresh` falls back to
+    /// the TTL alone rather than inventing a comparison.
+    #[tokio::test]
+    async fn test_cve_authoritative_scanner_version_picks_cve_engine_only() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        struct VersionedCveScanner;
+        #[async_trait::async_trait]
+        impl Scanner for VersionedCveScanner {
+            fn name(&self) -> &str {
+                "versioned-cve-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            fn is_cve_authoritative(&self) -> bool {
+                true
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+            async fn version(&self) -> Option<String> {
+                Some("grype-0.84.0-test".to_string())
+            }
+        }
+
+        // A non-authoritative scanner registered FIRST must not shadow the
+        // CVE engine's version (DependencyScanner precedes Grype in prod).
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(VersionedCveScanner),
+        ];
+        assert_eq!(
+            cve_authoritative_scanner_version(&scanners)
+                .await
+                .as_deref(),
+            Some("grype-0.84.0-test")
+        );
+
+        // No CVE engine at all: None (freshness falls back to TTL).
+        let none: Vec<Arc<dyn Scanner>> = vec![Arc::new(TrivialDependencyScanner)];
+        assert!(cve_authoritative_scanner_version(&none).await.is_none());
+        assert!(cve_authoritative_scanner_version(&[]).await.is_none());
+
+        // CVE engine whose version probe failed (trait default None): the
+        // accessor surfaces None rather than inventing a version.
+        let unprobed: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Clean,
+        })];
+        assert!(cve_authoritative_scanner_version(&unprobed).await.is_none());
     }
 
     /// `ScannerService::scan_content` (#2954): the fair-share-permitted wrapper
