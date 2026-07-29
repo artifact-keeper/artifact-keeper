@@ -22,17 +22,22 @@
 //!   review.
 //! - **Homoglyph / mixed-script** (#2956) — a name whose Unicode-confusable
 //!   skeleton collides with a popular package's while the raw name differs
-//!   (Cyrillic/fullwidth lookalikes), or a name mixing scripts in one
-//!   identifier. Both dodge pure edit distance. Gated by `homoglyph_check`
-//!   (default on, under the `typosquat_check` master toggle) and escalated by
-//!   the same `block_typosquat` opt-in.
+//!   (Cyrillic/fullwidth lookalikes), or a name that mixes scripts in one
+//!   identifier AND sits near a popular package in skeleton space (mixed
+//!   script alone is not impersonation — internationalized names
+//!   legitimately mix scripts and must not flood review). Both dodge pure
+//!   edit distance. Gated by `homoglyph_check` (default on, under the
+//!   `typosquat_check` master toggle) and escalated by the same
+//!   `block_typosquat` opt-in.
 //! - **Affix reputation-riding** (#2956) — a low/unknown-download candidate
-//!   whose name is a popular name plus a bounded ecosystem affix
-//!   (`python-numpy`, `numpy-dev`, `numpy2`) or separator stuffing. The
-//!   candidate-popularity gate (below `affix_max_downloads`, default 1000)
-//!   plus popular-list self-exclusion keep legitimately popular affixed names
-//!   (`python-dateutil`) unflagged. Gated by `affix_check` (default on, under
-//!   `typosquat_check`), escalated by `block_typosquat`.
+//!   that wraps a popular name in ANY boundary-delimited affix token
+//!   (`python-numpy`, `data-numpy`, `numpy-helper`, `numpy2024`,
+//!   `fastNumpy`) or separator stuffing, matched in confusable-skeleton
+//!   space. The candidate-popularity gate (below `affix_max_downloads`,
+//!   default 1000) plus popular-list self-exclusion keep legitimately
+//!   popular affixed names (`python-dateutil`, `pytest-django`) unflagged.
+//!   Gated by `affix_check` (default on, under `typosquat_check`), escalated
+//!   by `block_typosquat`.
 //! - **Unknown popularity** — a source outage/rate limit/unlisted package
 //!   yields `Flag("popularity unknown…")` by default, never Block, regardless
 //!   of `action`. Fail-open on the data source, fail-safe on the decision:
@@ -51,6 +56,7 @@ use crate::models::curation::CurationDecision;
 use super::popularity_source::{ecosystem_for_format, PopularityResult, PopularitySource};
 use super::typosquat::{
     default_popular_packages, is_affix_squat, is_homoglyph_squat, is_mixed_script, is_typosquat,
+    nearest_popular_skeleton,
 };
 
 /// Whether this rule type applies to `format` at all — i.e. a public
@@ -244,10 +250,18 @@ pub async fn evaluate(
                     "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
                 ));
             }
+            // Mixed script alone is NOT impersonation (internationalized
+            // names legitimately mix scripts); it only signals when the name
+            // ALSO sits near a popular package in confusable-skeleton space
+            // (collision = distance 0, or within max_distance edits).
             if is_mixed_script(name) {
-                lexical_reasons.push(format!(
-                    "name '{name}' mixes Unicode scripts in one identifier (homoglyph-impersonation indicator)"
-                ));
+                if let Some((target, distance)) = nearest_popular_skeleton(name, &popular) {
+                    if distance <= max_distance {
+                        lexical_reasons.push(format!(
+                            "name '{name}' mixes Unicode scripts and visually resembles popular package '{target}' (homoglyph-impersonation indicator)"
+                        ));
+                    }
+                }
             }
         }
 
@@ -558,6 +572,79 @@ mod tests {
             }
             CurationDecision::Allow => {}
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn benign_multiscript_name_far_from_popular_is_not_lexically_flagged() {
+        // #3005 red-team finding 2: mixed script alone must NOT flag —
+        // internationalized names that resemble nothing popular stay clean.
+        for name in ["py中文tools", "sigma-δ", "бank-utils"] {
+            let source = FakePopularitySource::new().with("pypi", name, 5_000);
+            let cfg = config(serde_json::json!({"affix_max_downloads": 1}));
+            assert_eq!(
+                evaluate(&cfg, "pypi", name, "1.0.0", &source).await,
+                CurationDecision::Allow,
+                "benign multi-script '{name}' must not be flagged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_script_near_popular_still_flags() {
+        // A mixed-script homoglyph of a popular name (skeleton distance 0)
+        // still carries the mixed-script reason after the proximity gate.
+        let source = FakePopularitySource::new().with("pypi", "nump\u{0443}", 50_000);
+        let cfg = config(serde_json::json!({}));
+        match evaluate(&cfg, "pypi", "nump\u{0443}", "1.0.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("mixes Unicode scripts"), "{reason}");
+                assert!(reason.contains("homoglyph"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generalized_affix_tokens_flag_when_low_popularity() {
+        // #3005 red-team finding 1: arbitrary (non-allowlisted) affix tokens.
+        for (name, base) in [
+            ("data-numpy", "numpy"),
+            ("fast-numpy", "numpy"),
+            ("numpy-helper", "numpy"),
+            ("numpy-extras", "numpy"),
+            ("awesome-lodash", "lodash"),
+            ("numpy2024", "numpy"),
+            ("numpy-python", "numpy"),
+        ] {
+            let eco = if base == "lodash" { "npm" } else { "pypi" };
+            let source = FakePopularitySource::new().with(eco, name, 3);
+            let cfg = config(serde_json::json!({}));
+            match evaluate(&cfg, eco, name, "0.0.1", &source).await {
+                CurationDecision::Flag(reason) => {
+                    assert!(reason.contains("reputation-riding"), "{name}: {reason}");
+                    assert!(reason.contains(&format!("'{base}'")), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected Flag, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn homoglyph_with_unlisted_affix_is_caught() {
+        // #3005 red-team finding 3: fullwidth ｕ + arbitrary affix `-x`
+        // evaded raw-byte affix matching, whole-name skeleton collision, and
+        // mixed-script (fullwidth is script-Latin). Skeleton-space affix
+        // matching with generalized tokens closes it.
+        let name = "n\u{ff55}mpy-x";
+        let source = FakePopularitySource::new(); // Unknown -> low-popularity
+        let cfg = config(serde_json::json!({}));
+        match evaluate(&cfg, "pypi", name, "0.0.1", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("reputation-riding"), "{reason}");
+                assert!(reason.contains("'numpy'"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
         }
     }
 

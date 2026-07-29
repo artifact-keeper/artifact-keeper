@@ -21,15 +21,16 @@
 //!   confusable *skeleton* (via the `unicode-security` crate — the same
 //!   implementation rustc's `non_ascii_idents` lints use) and flags a skeleton
 //!   collision with a popular name whose raw name differs.
-//! - **Affix** ([`is_affix_squat`]) — a popular name wrapped in a bounded
-//!   ecosystem prefix/suffix (`python-numpy`, `numpy-dev`, `numpy2`) or
-//!   stuffed with separators (`l.o.d.a.s.h`), riding the base name's
-//!   reputation. Lexically this is `len(affix)+1` edits away, again beyond
-//!   `max_distance`. This signal is *popularity-gated by the caller*: a
-//!   legitimately popular affixed name (`python-dateutil`) must not be
-//!   flagged, so [`super::popularity::evaluate`] only applies it to
-//!   low/unknown-download candidates (and self-exclusion covers affixed names
-//!   that are themselves on the popular list).
+//! - **Affix** ([`is_affix_squat`]) — a popular name wrapped in an arbitrary
+//!   boundary-delimited affix token (`python-numpy`, `numpy-helper`,
+//!   `data-numpy`, `numpy2024`, `fastNumpy`) or stuffed with separators
+//!   (`l.o.d.a.s.h`), riding the base name's reputation. Lexically this is
+//!   `len(affix)+1` edits away, again beyond `max_distance`. This signal is
+//!   *popularity-gated by the caller*: a legitimately popular affixed name
+//!   (`python-dateutil`, `pytest-django`) must not be flagged, so
+//!   [`super::popularity::evaluate`] only applies it to low/unknown-download
+//!   candidates (and self-exclusion covers affixed names that are themselves
+//!   on the popular list).
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_security::MixedScript;
@@ -149,29 +150,67 @@ pub fn is_homoglyph_squat(name: &str, popular: &[String]) -> Option<String> {
 }
 
 /// Whether `name` mixes Unicode scripts (e.g. Latin and Cyrillic letters in
-/// one identifier). Package names have no legitimate reason to mix scripts;
-/// mixing is the standard way to smuggle confusables past a reader, so it is
-/// a strong impersonation signal on its own (UTS #39 mixed-script
-/// restriction). ASCII digits and separators are script-Common and never
-/// count as mixing.
+/// one identifier — UTS #39 mixed-script restriction). Mixing is the standard
+/// way to smuggle confusables past a reader, but it is NOT an impersonation
+/// signal on its own: internationalized names legitimately mix scripts.
+/// Callers must pair this predicate with popular-list proximity
+/// ([`nearest_popular_skeleton`]) before flagging. ASCII digits and
+/// separators are script-Common and never count as mixing.
 pub fn is_mixed_script(name: &str) -> bool {
     !name.is_single_script()
 }
 
-/// Ecosystem-style prefixes commonly prepended to a popular base name.
-const AFFIX_PREFIXES: &[&str] = &[
-    "py", "python", "node", "nodejs", "js", "go", "rs", "lib", "the", "dev", "test",
-];
-
-/// Ecosystem-style suffixes commonly appended to a popular base name.
-const AFFIX_SUFFIXES: &[&str] = &[
-    "dev", "devel", "js", "py", "node", "cli", "util", "utils", "lib", "libs", "api", "sdk",
-    "core", "plugin", "tools", "test", "rs", "bin", "beta", "pro", "new", "official", "update",
-    "updated", "secure",
-];
-
 /// Separator characters allowed between a base name and an affix.
 const AFFIX_SEPARATORS: &[char] = &['-', '_', '.'];
+
+/// Insert a `-` at camelCase boundaries (`fastNumpy` → `fast-Numpy`) so case
+/// transitions count as affix separators downstream.
+fn split_camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for c in name.chars() {
+        if c.is_uppercase() && prev_lower_or_digit {
+            out.push('-');
+        }
+        prev_lower_or_digit = c.is_lowercase() || c.is_ascii_digit();
+        out.push(c);
+    }
+    out
+}
+
+/// Split a skeleton key into affix tokens: on separator characters and on
+/// letter↔digit boundaries (`numpy2024` → `["numpy", "2024"]`).
+fn tokenize(key: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut prev_is_digit: Option<bool> = None;
+    for c in key.chars() {
+        if AFFIX_SEPARATORS.contains(&c) {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev_is_digit = None;
+            continue;
+        }
+        let is_digit = c.is_ascii_digit();
+        if prev_is_digit.is_some_and(|p| p != is_digit) && !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+        prev_is_digit = Some(is_digit);
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Whether `needle` occurs as a CONTIGUOUS token run inside `haystack`.
+fn contains_contiguous(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
+}
 
 /// Strip every separator character from `s` (for separator-stuffing
 /// comparison, e.g. `l.o.d.a.s.h` → `lodash`).
@@ -181,63 +220,81 @@ fn strip_separators(s: &str) -> String {
         .collect()
 }
 
-/// Return `Some(target)` when `name` is a popular name wrapped in a bounded
-/// affix, riding the base name's reputation:
-///
-/// - a known prefix plus separator (`py-numpy`, `python-numpy`),
-/// - separator? plus a known suffix (`numpy-dev`, `numpy_utils`),
-/// - separator? plus 1–2 trailing digits (`numpy2`, `lodash-4`), or
-/// - separator stuffing (`l.o.d.a.s.h` collapses to `lodash`).
+/// Return `Some(target)` when `name` rides a popular base name's reputation:
+/// the popular name occurs as a contiguous, boundary-delimited token run
+/// inside the candidate with at least one extra affix token on either side
+/// (ANY token, not an allowlist — `data-numpy`, `numpy-helper`,
+/// `awesome-lodash`, `numpy2024`, `fastNumpy` all match), or the candidate is
+/// the base with separators stuffed in (`l.o.d.a.s.h`). Token boundaries are
+/// the separators `-`/`_`/`.`, letter↔digit transitions, and camelCase
+/// transitions; a base merely EMBEDDED without a boundary
+/// (`supernumpyish`) does not match.
 ///
 /// Matching is case-insensitive and `name` must not itself be on the popular
 /// list (so a curated list containing `python-dateutil` never flags it). The
 /// comparison runs in confusable-skeleton space ([`confusable_skeleton`]) so
-/// a homoglyph-obfuscated affix form (`python-nｕmpy` with fullwidth `ｕ`)
-/// cannot dodge the match — a combined affix+homoglyph name neither collides
-/// as a whole-name skeleton nor (for compatibility codepoints) trips the
-/// mixed-script signal, so the affix arm must fold confusables itself. The
-/// bounded affix tokens below are skeleton-stable (none contain `m`, the one
-/// lowercase ASCII letter the UTS #39 table rewrites, to `rn`).
+/// a homoglyph-obfuscated affix form (`python-nｕmpy` with fullwidth `ｕ`, or
+/// `nｕmpy-x` with an arbitrary affix) cannot dodge the match — a combined
+/// affix+homoglyph name neither collides as a whole-name skeleton nor (for
+/// compatibility codepoints) trips the mixed-script signal, so the affix arm
+/// must fold confusables itself.
 ///
 /// This function is purely lexical — the caller MUST additionally gate on the
 /// candidate's own popularity (low/unknown downloads) before acting, because
-/// a legitimately popular affixed package is not reputation-riding.
+/// a legitimately popular affixed package (`pytest-django`,
+/// `django-rest-framework`) is not riding anyone's reputation.
 pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
     let name_lc = name.to_lowercase();
     // A package that IS popular by name is never a squat of another entry.
     if popular.iter().any(|p| p.to_lowercase() == name_lc) {
         return None;
     }
-    let name_key = confusable_skeleton(name);
+    let name_key = confusable_skeleton(&split_camel(name));
+    let name_tokens = tokenize(&name_key);
+    // Prefer the most specific (longest token run) base for attribution:
+    // `react-dom-utils` rides `react-dom`, not merely `react`. Ties resolve
+    // to list order.
+    let mut best: Option<(String, usize)> = None;
     for candidate in popular {
-        let base = confusable_skeleton(candidate);
-        if base.is_empty() || name_key == base {
+        let base_key = confusable_skeleton(candidate);
+        if base_key.is_empty() || name_key == base_key {
             // Whole-name skeleton collision is the homoglyph signal's job.
             continue;
         }
-        // Prefix: <prefix><sep><base>
-        if let Some(rest) = name_key.strip_suffix(&base) {
-            if let Some(prefix) = rest.strip_suffix(AFFIX_SEPARATORS) {
-                if AFFIX_PREFIXES.contains(&prefix) {
-                    return Some(candidate.clone());
-                }
-            }
-        }
-        // Suffix: <base><sep?><suffix> or <base><sep?><1-2 digits>
-        if let Some(rest) = name_key.strip_prefix(&base) {
-            let rest = rest.strip_prefix(AFFIX_SEPARATORS).unwrap_or(rest);
-            if AFFIX_SUFFIXES.contains(&rest)
-                || ((1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_digit()))
-            {
-                return Some(candidate.clone());
-            }
-        }
-        // Separator stuffing: collapsing separators reproduces the base name.
-        if strip_separators(&name_key) == strip_separators(&base) {
+        // Separator stuffing: collapsing separators reproduces the base name
+        // — an exact visual reproduction, always the most specific match.
+        if strip_separators(&name_key) == strip_separators(&base_key) {
             return Some(candidate.clone());
         }
+        // Generalized affix: the base's token run appears intact inside the
+        // candidate, which carries at least one additional affix token.
+        let base_tokens = tokenize(&base_key);
+        if base_tokens.len() < name_tokens.len()
+            && contains_contiguous(&name_tokens, &base_tokens)
+            && best.as_ref().map_or(true, |(_, n)| *n < base_tokens.len())
+        {
+            best = Some((candidate.clone(), base_tokens.len()));
+        }
     }
-    None
+    best.map(|(candidate, _)| candidate)
+}
+
+/// Nearest popular package to `name` in confusable-skeleton space: the entry
+/// whose skeleton has the smallest Damerau-Levenshtein distance to `name`'s
+/// skeleton, with that distance (0 = skeleton collision). `None` for an empty
+/// popular list. Used to proximity-gate the mixed-script signal: a
+/// multi-script name that resembles nothing popular is not an impersonation.
+pub fn nearest_popular_skeleton(name: &str, popular: &[String]) -> Option<(String, usize)> {
+    let name_key = confusable_skeleton(name);
+    let mut best: Option<(String, usize)> = None;
+    for candidate in popular {
+        let d = damerau_levenshtein(&name_key, &confusable_skeleton(candidate));
+        match &best {
+            Some((_, best_d)) if *best_d <= d => {}
+            _ => best = Some((candidate.clone(), d)),
+        }
+    }
+    best
 }
 
 /// Built-in seed list of heavily downloaded package names per ecosystem
@@ -497,6 +554,7 @@ mod tests {
     fn affix_flags_prefix_suffix_digit_and_separator_stuffing() {
         let popular = strings(&["numpy", "lodash"]);
         for name in [
+            // Ecosystem-style affixes.
             "python-numpy",
             "py-numpy",
             "py_numpy",
@@ -505,12 +563,27 @@ mod tests {
             "numpy2",
             "numpy-2",
             "lodash-js",
+            // Arbitrary (non-allowlisted) affix tokens — the 95%-evasion
+            // class from the #3005 red-team.
+            "data-numpy",
+            "fast-numpy",
+            "numpy-helper",
+            "numpy-extras",
+            "awesome-lodash",
+            "numpy2024",
+            "numpy-python",
+            "mycompany-numpy",
+            "numpy-extras-for-science",
+            // camelCase boundary.
+            "fastNumpy",
+            "numpyHelper",
+            // Separator stuffing.
             "l.o.d.a.s.h",
         ] {
             assert_eq!(
                 is_affix_squat(name, &popular),
                 Some(
-                    if name.contains("lodash") || name.contains("l.o") {
+                    if name.to_lowercase().contains("lodash") || name.contains("l.o") {
                         "lodash"
                     } else {
                         "numpy"
@@ -520,6 +593,47 @@ mod tests {
                 "{name} should be an affix squat"
             );
         }
+    }
+
+    #[test]
+    fn affix_requires_a_token_boundary_and_a_full_base_run() {
+        let popular = strings(&["numpy", "react", "react-dom", "s3transfer"]);
+        // Base merely embedded without a boundary: not an affix.
+        assert_eq!(is_affix_squat("supernumpyish", &popular), None);
+        assert_eq!(is_affix_squat("numpyish", &popular), None);
+        // Partial token overlap with the multi-token base `react-dom` is not
+        // a react-dom match — but the first token alone still rides `react`.
+        assert_eq!(
+            is_affix_squat("react-domx", &popular),
+            Some("react".to_string())
+        );
+        // Multi-token base as a contiguous run IS a match.
+        assert_eq!(
+            is_affix_squat("react-dom-utils", &popular),
+            Some("react-dom".to_string())
+        );
+        // Digit-containing base tokenizes consistently on both sides.
+        assert_eq!(
+            is_affix_squat("s3transfer-stubs", &popular),
+            Some("s3transfer".to_string())
+        );
+    }
+
+    #[test]
+    fn nearest_popular_skeleton_distances() {
+        let popular = strings(&["numpy", "requests"]);
+        // Homoglyph collision: distance 0.
+        assert_eq!(
+            nearest_popular_skeleton("nump\u{0443}", &popular),
+            Some(("numpy".to_string(), 0))
+        );
+        // Near miss in skeleton space.
+        let (t, d) = nearest_popular_skeleton("nump\u{0443}1", &popular).unwrap();
+        assert_eq!((t.as_str(), d), ("numpy", 1));
+        // Unrelated multi-script name: far from everything popular.
+        let (_, d) = nearest_popular_skeleton("py中文tools", &popular).unwrap();
+        assert!(d > 2, "unrelated international name must not be near: {d}");
+        assert_eq!(nearest_popular_skeleton("anything", &[]), None);
     }
 
     #[test]
@@ -542,20 +656,14 @@ mod tests {
     }
 
     #[test]
-    fn affix_ignores_popular_unrelated_and_unbounded_names() {
+    fn affix_ignores_popular_and_unrelated_names() {
         let popular = strings(&["numpy", "python-dateutil", "react", "react-dom"]);
         // On the popular list itself: never a squat (the legit-affix guard).
         assert_eq!(is_affix_squat("python-dateutil", &popular), None);
         assert_eq!(is_affix_squat("react-dom", &popular), None);
-        // Unknown affix token: not in the bounded set.
-        assert_eq!(is_affix_squat("numpy-extras-for-science", &popular), None);
-        assert_eq!(is_affix_squat("mycompany-numpy", &popular), None);
-        // 3+ digit suffix is out of bounds (e.g. a year-fork naming scheme).
-        assert_eq!(is_affix_squat("numpy2024", &popular), None);
-        // Unrelated name.
+        // Unrelated names: no popular base token run inside.
         assert_eq!(is_affix_squat("leftpad", &popular), None);
-        // Base embedded mid-name without a bounded affix.
-        assert_eq!(is_affix_squat("supernumpyish", &popular), None);
+        assert_eq!(is_affix_squat("some-random-lib", &popular), None);
     }
 
     #[test]
