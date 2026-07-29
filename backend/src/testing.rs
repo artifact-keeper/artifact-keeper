@@ -102,18 +102,71 @@ pub fn on_connect_result<T>(result: Result<T, sqlx::Error>) -> Option<T> {
 /// the DB is not required; a connect failure under [`REQUIRE_DB_ENV`] panics.
 pub async fn try_pool_with(max_connections: u32) -> Option<PgPool> {
     let url = require_db_url()?;
-    let pool = on_connect_result(
+    // Fail-fast reachability probe (#2986). Two hang shapes hid here:
+    //
+    // * `PgPoolOptions::connect` RETRIES failed connects with backoff until
+    //   `acquire_timeout`, so an unreachable URL burned the full 30s budget
+    //   in every DB-gated test — serialized through the module `*_serial_lock`
+    //   guards, that reads as an indefinite hang of the whole suite.
+    // * A listener that accepts TCP but never completes the Postgres
+    //   handshake (e.g. a dead container's still-forwarded port) is not
+    //   bounded by `acquire_timeout` at all and parked the await forever.
+    //
+    // A single raw connect attempt fails in microseconds on refusal and is
+    // hard-bounded against stalled handshakes; only when it succeeds do we
+    // pay for building the real pool.
+    match bounded_connect(&url).await {
+        Ok(conn) => {
+            use sqlx::Connection;
+            let _ = conn.close().await;
+        }
+        Err(err) => return on_connect_result(Err(err)),
+    }
+    // The outer timeout keeps the pool build itself hang-proof even if the
+    // database degrades between the probe and this connect.
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(35),
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(max_connections)
             // llvm-cov + nextest run DB-backed lib tests in parallel processes.
             // Keep each per-test pool small, but give Postgres pressure a chance
             // to clear instead of turning transient contention into PoolTimedOut.
             .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect(&url)
-            .await,
-    )?;
+            .connect(&url),
+    )
+    .await
+    .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+    let pool = on_connect_result(connect)?;
     ensure_download_event_dispatch(&url).await;
     Some(pool)
+}
+
+/// Bound for any single raw connect attempt. Generous for a healthy (even
+/// heavily loaded) local/CI Postgres answering a TCP + auth handshake, while
+/// keeping an unreachable database from stalling a test for long.
+const CONNECT_ATTEMPT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `PgConnection::connect` with a hard client-side deadline (#2986).
+///
+/// Unlike the pool path this makes exactly ONE attempt, so refusal fails in
+/// microseconds, and the deadline covers the case `acquire_timeout` cannot:
+/// a listener that accepts TCP but never speaks the Postgres protocol. An
+/// expired deadline surfaces as [`sqlx::Error::PoolTimedOut`] so callers
+/// route it through the same skip-or-fail decision as any connect error.
+pub async fn bounded_connect(url: &str) -> Result<sqlx::PgConnection, sqlx::Error> {
+    bounded_connect_with(url, CONNECT_ATTEMPT_BOUND).await
+}
+
+/// [`bounded_connect`] with an explicit deadline, factored out so the
+/// regression test can exercise the bound without waiting out the real one.
+async fn bounded_connect_with(
+    url: &str,
+    bound: std::time::Duration,
+) -> Result<sqlx::PgConnection, sqlx::Error> {
+    use sqlx::Connection;
+    tokio::time::timeout(bound, sqlx::PgConnection::connect(url))
+        .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut))
 }
 
 /// Start (once per test process) the bounded download-event dispatcher that
@@ -194,5 +247,41 @@ mod tests {
         assert!(!must_fail_loud(false, false));
         // Database absent AND required -> the fiction-green case we must block.
         assert!(must_fail_loud(false, true));
+    }
+
+    /// Regression test for the #2986 hang: a listener that ACCEPTS the TCP
+    /// connection but never speaks the Postgres protocol must yield a bounded
+    /// connect error, not park the caller forever. Before the fix, the
+    /// `*_serial_lock` guards issued a raw un-timed `PgConnection::connect`,
+    /// so this exact shape (a dead container's still-forwarded port, a
+    /// wedged proxy) hung the storage-GC / scanner test modules — and every
+    /// test queued behind their module serial locks — indefinitely.
+    #[tokio::test]
+    async fn bounded_connect_fails_instead_of_hanging_on_silent_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept and HOLD sockets without ever responding, so the client is
+        // neither refused nor answered — the pre-fix forever-park shape.
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+        let url = format!("postgres://u:p@{addr}/db");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            bounded_connect_with(&url, std::time::Duration::from_millis(500)),
+        )
+        .await
+        .expect("bounded_connect must return well before the outer 10s budget");
+        assert!(
+            result.is_err(),
+            "a silent listener must surface a connect error, not a connection"
+        );
     }
 }

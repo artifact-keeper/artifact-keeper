@@ -44,6 +44,35 @@ pub async fn try_pool() -> Option<PgPool> {
     crate::testing::try_pool_with(3).await
 }
 
+/// Open a dedicated Postgres session and take `pg_advisory_lock(lock_key)`,
+/// blocking until the lock is free. Returns `None` — which the `*_serial_lock`
+/// guards below surface as an inert guard — when no database is configured or
+/// the session cannot be established, mirroring [`try_pool`] so DB-free
+/// environments no-op cleanly.
+///
+/// The connect itself is HARD-BOUNDED (#2986): unlike the pooled path in
+/// [`crate::testing::try_pool_with`], whose `acquire_timeout` bounds
+/// connection establishment, a raw `PgConnection::connect` has no client-side
+/// timeout. A listener that accepts TCP but never completes the Postgres
+/// handshake (e.g. a dead container's still-forwarded :5432) therefore parked
+/// the guard — and every test queued behind the same module lock — forever.
+/// The 30s bound matches the pooled path's pressure budget; an expired bound
+/// routes through the same skip-or-fail decision as a connect error.
+async fn serial_lock_session(lock_key: i64) -> Option<sqlx::PgConnection> {
+    let url = crate::testing::require_db_url()?;
+    let connect = crate::testing::bounded_connect(&url).await;
+    let mut conn = crate::testing::on_connect_result(connect)?;
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    Some(conn)
+}
+
 /// Advisory-lock key for [`scan_dedup_serial_lock`] (#2000).
 ///
 /// A single-key `pg_advisory_lock(bigint)` — a lock space distinct from the
@@ -78,23 +107,9 @@ pub struct ScanDedupSerialGuard {
 /// still no-op cleanly. Call this as the first line of a scan-dedup DB test
 /// and bind the result for the whole test body.
 pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return ScanDedupSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return ScanDedupSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(SCAN_DEDUP_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return ScanDedupSerialGuard { _conn: None };
+    ScanDedupSerialGuard {
+        _conn: serial_lock_session(SCAN_DEDUP_TEST_LOCK_KEY).await,
     }
-    ScanDedupSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
@@ -127,23 +142,9 @@ pub struct BlobGcSerialGuard {
 /// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
 /// test and bind the result for the whole test body.
 pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return BlobGcSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return BlobGcSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(BLOB_GC_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return BlobGcSerialGuard { _conn: None };
+    BlobGcSerialGuard {
+        _conn: serial_lock_session(BLOB_GC_TEST_LOCK_KEY).await,
     }
-    BlobGcSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
@@ -176,23 +177,9 @@ pub struct UsageLedgerSerialGuard {
 /// still no-op cleanly. Call this as the first line of a DB-backed
 /// usage-ledger test and bind the result for the whole test body.
 pub async fn usage_ledger_serial_lock() -> UsageLedgerSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return UsageLedgerSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return UsageLedgerSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(USAGE_LEDGER_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return UsageLedgerSerialGuard { _conn: None };
+    UsageLedgerSerialGuard {
+        _conn: serial_lock_session(USAGE_LEDGER_TEST_LOCK_KEY).await,
     }
-    UsageLedgerSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`sso_provider_serial_lock`] (#2621).
@@ -225,23 +212,9 @@ pub struct SsoProviderSerialGuard {
 /// that seeds or asserts on enabled SSO providers and bind the result for the
 /// whole test body.
 pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return SsoProviderSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return SsoProviderSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(SSO_PROVIDER_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return SsoProviderSerialGuard { _conn: None };
+    SsoProviderSerialGuard {
+        _conn: serial_lock_session(SSO_PROVIDER_TEST_LOCK_KEY).await,
     }
-    SsoProviderSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`curation_global_serial_lock`] (#2947).
@@ -276,23 +249,9 @@ pub struct CurationGlobalSerialGuard {
 /// that seeds global curation rules and asserts on rule evaluation, and bind
 /// the result for the whole test body.
 pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return CurationGlobalSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return CurationGlobalSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(CURATION_GLOBAL_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return CurationGlobalSerialGuard { _conn: None };
+    CurationGlobalSerialGuard {
+        _conn: serial_lock_session(CURATION_GLOBAL_TEST_LOCK_KEY).await,
     }
-    CurationGlobalSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`path_stats_serial_lock`] (#2601).
@@ -328,23 +287,9 @@ pub struct PathStatsSerialGuard {
 /// still no-op cleanly. Call this as the first line of a DB-backed path-stats
 /// test and bind the result for the whole test body.
 pub async fn path_stats_serial_lock() -> PathStatsSerialGuard {
-    use sqlx::Connection;
-    let Some(url) = crate::testing::require_db_url() else {
-        return PathStatsSerialGuard { _conn: None };
-    };
-    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
-    else {
-        return PathStatsSerialGuard { _conn: None };
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(PATH_STATS_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return PathStatsSerialGuard { _conn: None };
+    PathStatsSerialGuard {
+        _conn: serial_lock_session(PATH_STATS_TEST_LOCK_KEY).await,
     }
-    PathStatsSerialGuard { _conn: Some(conn) }
 }
 
 /// Refresh the materialized storage stats for a test, absorbing transient
