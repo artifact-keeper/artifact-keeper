@@ -10135,7 +10135,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions for testability
+    // Test-local pagination/path helpers.
+    //
+    // KNOWN RESIDUAL (#2657): compute_pagination / compute_total_pages /
+    // extract_name_from_path / content_disposition_attachment /
+    // extract_name_version_from_path duplicate inline production logic in this
+    // file and should be promoted into production and wired like the format
+    // handlers were.
     // -----------------------------------------------------------------------
 
     /// Compute pagination offset from page number and per_page size.
@@ -10154,11 +10160,6 @@ mod tests {
     /// Extract the filename from a slash-delimited path.
     fn extract_name_from_path(path: &str) -> String {
         path.split('/').next_back().unwrap_or(path).to_string()
-    }
-
-    /// Build a storage path from a base dir and repository key.
-    fn build_storage_path(storage_base: &str, repo_key: &str) -> String {
-        format!("{}/{}", storage_base, repo_key)
     }
 
     /// Build a Content-Disposition attachment header value.
@@ -11837,26 +11838,6 @@ mod tests {
     #[test]
     fn test_extract_name_from_path_deep() {
         assert_eq!(extract_name_from_path("a/b/c/d/e/file.bin"), "file.bin");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_storage_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_storage_path_basic() {
-        assert_eq!(
-            build_storage_path("/var/data", "my-repo"),
-            "/var/data/my-repo"
-        );
-    }
-
-    #[test]
-    fn test_build_storage_path_relative() {
-        assert_eq!(
-            build_storage_path("./storage", "repo-1"),
-            "./storage/repo-1"
-        );
     }
 
     // -----------------------------------------------------------------------

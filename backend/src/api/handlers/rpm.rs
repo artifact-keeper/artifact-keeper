@@ -1128,24 +1128,7 @@ async fn upload_package_post(
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
     // Try to get filename from Content-Disposition header, fall back to a hash-based name
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("X-Package-Filename")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| {
-            let hash = sha256_hex(&body);
-            format!("{}.rpm", &hash[..16])
-        });
+    let filename = extract_rpm_filename(&headers, &body);
 
     if !filename.ends_with(".rpm") {
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
@@ -1179,8 +1162,8 @@ async fn store_rpm(
             .into_response()
     })?;
 
-    let full_version = format!("{}-{}", pkg_version, release);
-    let artifact_path = format!("packages/{}", filename);
+    let full_version = build_rpm_full_version(&pkg_version, &release);
+    let artifact_path = build_rpm_artifact_path(filename);
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1190,7 +1173,7 @@ async fn store_rpm(
     )
     .await?;
 
-    let storage_key = format!("rpm/{}/{}", repo.id, filename);
+    let storage_key = build_rpm_storage_key(&repo.id, filename);
     proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
 
     let size_bytes = content.len() as i64;
@@ -1216,15 +1199,8 @@ async fn store_rpm(
     // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
     // describe the package fully (#2588). The filename already parsed above,
     // so the builder always yields metadata here.
-    let rpm_metadata = build_rpm_artifact_metadata(filename, &content).unwrap_or_else(|| {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "release": release,
-            "arch": arch,
-            "filename": filename,
-        })
-    });
+    let rpm_metadata = build_rpm_artifact_metadata(filename, &content)
+        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
@@ -1238,17 +1214,97 @@ async fn store_rpm(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "release": release,
-                "arch": arch,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_rpm_upload_response(
+                &pkg_name,
+                &pkg_version,
+                &release,
+                &arch,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Path/key builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for an RPM package.
+fn build_rpm_artifact_path(filename: &str) -> String {
+    format!("packages/{}", filename)
+}
+
+/// Build the storage key for an RPM package.
+fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
+    format!("rpm/{}/{}", repo_id, filename)
+}
+
+/// Build the full version string from version and release.
+fn build_rpm_full_version(version: &str, release: &str) -> String {
+    format!("{}-{}", version, release)
+}
+
+/// Build the filename-derived RPM metadata JSON (fallback when the RPM header
+/// cannot be parsed).
+fn build_rpm_metadata(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "filename": filename,
+    })
+}
+
+/// Build the upload response JSON.
+fn build_rpm_upload_response(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Extract RPM filename from headers, falling back to a hash-based name
+/// derived from the body (hashed only when no header names the file).
+fn extract_rpm_filename(headers: &HeaderMap, body: &[u8]) -> String {
+    headers
+        .get("Content-Disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split("filename=")
+                .nth(1)
+                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("X-Package-Filename")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            let hash = sha256_hex(body);
+            format!("{}.rpm", &hash[..16])
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1382,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         let location = if artifact.path.starts_with("packages/") {
             artifact.path.clone()
         } else {
-            format!("packages/{filename}")
+            build_rpm_artifact_path(filename)
         };
 
         xml.push_str(&format!(
@@ -1597,79 +1653,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
-    /// Build the artifact path for an RPM package.
-    fn build_rpm_artifact_path(filename: &str) -> String {
-        format!("packages/{}", filename)
-    }
-
-    /// Build the storage key for an RPM package.
-    fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
-        format!("rpm/{}/{}", repo_id, filename)
-    }
-
-    /// Build the full version string from version and release.
-    fn build_rpm_full_version(version: &str, release: &str) -> String {
-        format!("{}-{}", version, release)
-    }
-
-    /// Build RPM-specific metadata JSON.
-    fn build_rpm_metadata(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "filename": filename,
-        })
-    }
-
-    /// Build the upload response JSON.
-    fn build_rpm_upload_response(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Extract RPM filename from headers, falling back to a hash-based name.
-    fn extract_rpm_filename(headers: &HeaderMap, body_hash: &str) -> String {
-        headers
-            .get("Content-Disposition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.split("filename=")
-                    .nth(1)
-                    .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-            })
-            .or_else(|| {
-                headers
-                    .get("X-Package-Filename")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| format!("{}.rpm", &body_hash[..16]))
-    }
-
     // -----------------------------------------------------------------------
     // parse_rpm_filename
     // -----------------------------------------------------------------------
@@ -1988,7 +1971,7 @@ mod tests {
             HeaderValue::from_static("attachment; filename=my-pkg-1.0-1.x86_64.rpm"),
         );
         assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
+            extract_rpm_filename(&headers, b""),
             "my-pkg-1.0-1.x86_64.rpm"
         );
     }
@@ -2000,17 +1983,16 @@ mod tests {
             "X-Package-Filename",
             HeaderValue::from_static("custom-name.rpm"),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
-            "custom-name.rpm"
-        );
+        assert_eq!(extract_rpm_filename(&headers, b""), "custom-name.rpm");
     }
 
     #[test]
     fn test_extract_rpm_filename_fallback_to_hash() {
         let headers = HeaderMap::new();
-        let result = extract_rpm_filename(&headers, "abcdef1234567890abcdef");
-        assert_eq!(result, "abcdef1234567890.rpm");
+        // sha256("") = e3b0c44298fc1c14...; the fallback name is the first 16 hex
+        // chars of the body hash.
+        let result = extract_rpm_filename(&headers, b"");
+        assert_eq!(result, "e3b0c44298fc1c14.rpm");
     }
 
     #[test]
@@ -2025,7 +2007,7 @@ mod tests {
             HeaderValue::from_static("from-header.rpm"),
         );
         // Content-Disposition has priority
-        assert_eq!(extract_rpm_filename(&headers, "hash"), "from-cd.rpm");
+        assert_eq!(extract_rpm_filename(&headers, b""), "from-cd.rpm");
     }
 
     #[test]
@@ -2035,10 +2017,7 @@ mod tests {
             "Content-Disposition",
             HeaderValue::from_static("attachment; filename=\"quoted.rpm\""),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "hash1234567890123456"),
-            "quoted.rpm"
-        );
+        assert_eq!(extract_rpm_filename(&headers, b""), "quoted.rpm");
     }
 
     // -----------------------------------------------------------------------

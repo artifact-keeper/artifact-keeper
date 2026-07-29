@@ -1114,7 +1114,7 @@ async fn download_package(
 
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
 
-    let artifact_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+    let artifact_path = build_alpine_artifact_path(&branch, &repository, &arch, &filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -1457,7 +1457,7 @@ async fn store_apk(
         );
     }
 
-    let artifact_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+    let artifact_path = build_alpine_artifact_path(branch, repository, arch, filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1476,7 +1476,7 @@ async fn store_apk(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = format!("alpine/{}/{}", repo.id, artifact_path);
+    let storage_key = build_alpine_storage_key(repo.id, &artifact_path);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -1561,15 +1561,15 @@ async fn store_apk(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "arch": arch,
-                "branch": branch,
-                "repository": repository,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_alpine_upload_response(
+                &pkg_name,
+                &pkg_version,
+                arch,
+                branch,
+                repository,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
@@ -1653,6 +1653,46 @@ fn apk_info_metadata_fields(
 /// For example, `v3.22/main/x86_64/APKINDEX.tar.gz`.
 fn build_apk_index_upstream_path(branch: &str, repository: &str, arch: &str) -> String {
     format!("{}/{}/{}/APKINDEX.tar.gz", branch, repository, arch)
+}
+
+/// Build the artifact path for an Alpine package.
+///
+/// Unit tests pin this (and the builders below) against hardcoded literals so a
+/// format change here fails the tests (#2657).
+fn build_alpine_artifact_path(
+    branch: &str,
+    repository: &str,
+    arch: &str,
+    filename: &str,
+) -> String {
+    format!("{}/{}/{}/{}", branch, repository, arch, filename)
+}
+
+/// Build the storage key for an Alpine package.
+fn build_alpine_storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
+    format!("alpine/{}/{}", repo_id, artifact_path)
+}
+
+/// Build the JSON upload response for an Alpine package.
+#[allow(clippy::too_many_arguments)]
+fn build_alpine_upload_response(
+    pkg_name: &str,
+    pkg_version: &str,
+    arch: &str,
+    branch: &str,
+    repository: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": pkg_name,
+        "version": pkg_version,
+        "arch": arch,
+        "branch": branch,
+        "repository": repository,
+        "sha256": sha256,
+        "size": size,
+    })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -2345,68 +2385,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
+    // Test-local helper. KNOWN RESIDUAL (#2657): duplicates the inline
+    // Content-Disposition parsing in production upload handlers.
     // -----------------------------------------------------------------------
-
-    /// Build the artifact path for an Alpine package.
-    fn build_alpine_artifact_path(
-        branch: &str,
-        repository: &str,
-        arch: &str,
-        filename: &str,
-    ) -> String {
-        format!("{}/{}/{}/{}", branch, repository, arch, filename)
-    }
-
-    /// Build the storage key for an Alpine package.
-    fn build_alpine_storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
-        format!("alpine/{}/{}", repo_id, artifact_path)
-    }
-
-    /// Build Alpine-specific metadata JSON.
-    fn build_alpine_metadata(
-        pkg_name: &str,
-        pkg_version: &str,
-        arch: &str,
-        branch: &str,
-        repository: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "arch": arch,
-            "branch": branch,
-            "repository": repository,
-            "filename": filename,
-        })
-    }
-
-    /// Build the JSON upload response for an Alpine package.
-    fn build_alpine_upload_response(
-        pkg_name: &str,
-        pkg_version: &str,
-        arch: &str,
-        branch: &str,
-        repository: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "arch": arch,
-            "branch": branch,
-            "repository": repository,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Build the path prefix used for listing Alpine artifacts.
-    fn build_alpine_path_prefix(branch: &str, repository: &str, arch: &str) -> String {
-        format!("{}/{}/{}/", branch, repository, arch)
-    }
 
     /// Extract filename from a Content-Disposition header value.
     fn extract_filename_from_content_disposition(value: &str) -> Option<String> {
@@ -2585,18 +2566,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_alpine_metadata
+    // build_alpine_artifact_metadata (production builder; no apk control data)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_alpine_metadata_basic() {
-        let meta = build_alpine_metadata(
+        let meta = build_alpine_artifact_metadata(
             "curl",
             "8.5.0-r0",
             "x86_64",
             "edge",
             "main",
             "curl-8.5.0-r0.apk",
+            None,
         );
         assert_eq!(meta["name"], "curl");
         assert_eq!(meta["version"], "8.5.0-r0");
@@ -2608,13 +2590,14 @@ mod tests {
 
     #[test]
     fn test_build_alpine_metadata_different_arch() {
-        let meta = build_alpine_metadata(
+        let meta = build_alpine_artifact_metadata(
             "nginx",
             "1.25.4-r0",
             "aarch64",
             "v3.19",
             "community",
             "nginx-1.25.4-r0.apk",
+            None,
         );
         assert_eq!(meta["arch"], "aarch64");
         assert_eq!(meta["branch"], "v3.19");
@@ -2666,21 +2649,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_alpine_path_prefix
+    // escape_path_prefix (production LIKE-prefix; the old test-local
+    // build_alpine_path_prefix ignored LIKE escaping — it claimed the listing
+    // prefix for x86_64 is `edge/main/x86_64/`, but production escapes the `_`
+    // for the SQL LIKE query)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_alpine_path_prefix_basic() {
         assert_eq!(
-            build_alpine_path_prefix("edge", "main", "x86_64"),
-            "edge/main/x86_64/"
+            crate::api::handlers::escape_path_prefix(&["edge", "main", "x86_64"]),
+            "edge/main/x86\\_64/"
         );
     }
 
     #[test]
     fn test_build_alpine_path_prefix_versioned() {
         assert_eq!(
-            build_alpine_path_prefix("v3.18", "community", "aarch64"),
+            crate::api::handlers::escape_path_prefix(&["v3.18", "community", "aarch64"]),
             "v3.18/community/aarch64/"
         );
     }

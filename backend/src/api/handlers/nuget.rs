@@ -484,7 +484,7 @@ async fn service_index(
     let _repo = resolve_nuget_repo(&state.db, &repo_key).await?;
 
     // Determine the base URL from reverse-proxy / Host headers.
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     let index = serde_json::json!({
         "version": "3.0.0",
@@ -573,10 +573,10 @@ async fn search_packages(
     let prerelease = params.prerelease.unwrap_or(false);
 
     // Determine base URL for building resource links.
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     // Search distinct package names matching the query term.
-    let search_pattern = format!("%{}%", query_term.to_lowercase());
+    let search_pattern = build_nuget_search_pattern(&query_term);
 
     // Federate over virtual members (local/staging) when the repo is virtual;
     // otherwise query the repo itself.
@@ -683,7 +683,7 @@ async fn registration_index(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
     // local/staging members for a virtual repo.
@@ -928,9 +928,7 @@ async fn flatcontainer_versions(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
-    let response = serde_json::json!({
-        "versions": versions
-    });
+    let response = build_flatcontainer_versions_json(&versions);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1583,7 +1581,7 @@ async fn v2_download(
         })?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
     use futures::StreamExt as _;
-    let filename = format!("{}.{}.nupkg", id_lower, version);
+    let filename = build_nupkg_filename(&id_lower, version);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/octet-stream")
@@ -1712,8 +1710,8 @@ async fn push_package(
     }
 
     let size_bytes = staged.size_bytes();
-    let filename = format!("{}.{}.nupkg", package_id, version);
-    let artifact_path = format!("{}/{}/{}", package_id, version, filename);
+    let filename = build_nupkg_filename(&package_id, &version);
+    let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
     // Converge onto the shared content-addressed streaming service method:
     // deduplication, the release-immutability backstop (a duplicate id.version or
@@ -1745,13 +1743,7 @@ async fn push_package(
     drop(staged);
 
     // Build metadata JSON.
-    let metadata = serde_json::json!({
-        "id": nuspec.id,
-        "version": nuspec.version,
-        "description": nuspec.description,
-        "authors": nuspec.authors,
-        "filename": filename,
-    });
+    let metadata = build_nuget_push_metadata(&nuspec);
 
     // Store metadata.
     let _ = sqlx::query!(
@@ -1869,6 +1861,52 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(content[..end_pos].trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Path/URL builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the base URL for NuGet service index resources from the request base
+/// (`{scheme}://{host}`) and repo key.
+fn build_nuget_base_url(request_base: &str, repo_key: &str) -> String {
+    format!("{}/nuget/{}", request_base, repo_key)
+}
+
+/// Build the flatcontainer versions JSON response.
+fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "versions": versions
+    })
+}
+
+/// Build the canonical `.nupkg` filename (`{id}.{version}.nupkg`; the caller
+/// passes the lowercased package id).
+fn build_nupkg_filename(package_id: &str, version: &str) -> String {
+    format!("{}.{}.nupkg", package_id, version)
+}
+
+/// Build the NuGet artifact path for a .nupkg.
+fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
+    let filename = build_nupkg_filename(package_id, version);
+    format!("{}/{}/{}", package_id, version, filename)
+}
+
+/// Build the NuGet push metadata JSON.
+fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.id,
+        "version": info.version,
+        "description": info.description,
+        "authors": info.authors,
+        "filename": build_nupkg_filename(&info.id.to_lowercase(), &info.version),
+    })
+}
+
+/// Build the search pattern for NuGet package queries.
+fn build_nuget_search_pattern(query_term: &str) -> String {
+    format!("%{}%", query_term.to_lowercase())
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
@@ -1950,10 +1988,6 @@ mod tests {
         .expect("encode jwt")
     }
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
     /// The handler must never authenticate a push itself.
     ///
     /// `repo_visibility_middleware` is the single credential authority for
@@ -2013,11 +2047,6 @@ mod tests {
         }
     }
 
-    /// Build the base URL for NuGet service index resources.
-    fn build_nuget_base_url(scheme: &str, host: &str, repo_key: &str) -> String {
-        format!("{}://{}/nuget/{}", scheme, host, repo_key)
-    }
-
     // NOTE: the test-local `build_registration_item` / `build_nuget_service_index`
     // copies were removed (#2657). They fabricated advertised-URL documents and
     // asserted a builder matched its own literal, so they could not catch a
@@ -2028,41 +2057,6 @@ mod tests {
     // service-index resources, registration leaf `@id`, and `packageContent`
     // are now driven through the mounted router in
     // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
-
-    /// Build the flatcontainer versions JSON response.
-    fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
-        serde_json::json!({
-            "versions": versions
-        })
-    }
-
-    /// Build the NuGet artifact path for a .nupkg.
-    fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
-        let filename = format!("{}.{}.nupkg", package_id, version);
-        format!("{}/{}/{}", package_id, version, filename)
-    }
-
-    /// Build the NuGet storage key for a .nupkg.
-    fn build_nuget_storage_key(package_id: &str, version: &str) -> String {
-        let filename = format!("{}.{}.nupkg", package_id, version);
-        format!("nuget/{}/{}/{}", package_id, version, filename)
-    }
-
-    /// Build the NuGet push metadata JSON.
-    fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
-        serde_json::json!({
-            "id": info.id,
-            "version": info.version,
-            "description": info.description,
-            "authors": info.authors,
-            "filename": format!("{}.{}.nupkg", info.id.to_lowercase(), info.version),
-        })
-    }
-
-    /// Build the search pattern for NuGet package queries.
-    fn build_nuget_search_pattern(query_term: &str) -> String {
-        format!("%{}%", query_term.to_lowercase())
-    }
 
     // -----------------------------------------------------------------------
     // extract_xml_tag
@@ -2375,7 +2369,7 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_https() {
         assert_eq!(
-            build_nuget_base_url("https", "registry.example.com", "nuget-hosted"),
+            build_nuget_base_url("https://registry.example.com", "nuget-hosted"),
             "https://registry.example.com/nuget/nuget-hosted"
         );
     }
@@ -2383,7 +2377,7 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_http_localhost() {
         assert_eq!(
-            build_nuget_base_url("http", "localhost", "main"),
+            build_nuget_base_url("http://localhost", "main"),
             "http://localhost/nuget/main"
         );
     }
@@ -2391,7 +2385,7 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_with_port() {
         assert_eq!(
-            build_nuget_base_url("http", "localhost:8080", "nuget-local"),
+            build_nuget_base_url("http://localhost:8080", "nuget-local"),
             "http://localhost:8080/nuget/nuget-local"
         );
     }
@@ -2453,18 +2447,6 @@ mod tests {
         assert_eq!(
             build_nuget_artifact_path("mypackage", "1.0.0-beta.1"),
             "mypackage/1.0.0-beta.1/mypackage.1.0.0-beta.1.nupkg"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // build_nuget_storage_key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_nuget_storage_key_basic() {
-        assert_eq!(
-            build_nuget_storage_key("newtonsoft.json", "13.0.1"),
-            "nuget/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"
         );
     }
 

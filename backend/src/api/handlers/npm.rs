@@ -1450,7 +1450,7 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(&state, &repo_key, &full_name, base_url.as_str(), &headers).await
 }
@@ -1472,7 +1472,7 @@ async fn get_scoped_version_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_version_metadata(&state, &repo_key, &full_name, &version, base_url.as_str()).await
 }
@@ -1509,45 +1509,20 @@ fn build_npm_metadata_response(
 
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
-        let tarball_url = format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        );
+        let tarball_url = build_npm_tarball_url(base_url, repo_key, package_name, filename);
 
         let version_metadata = artifact
             .metadata
             .as_ref()
-            .and_then(|m| m.get("version_data").cloned())
-            .unwrap_or_else(|| serde_json::json!({}));
+            .and_then(|m| m.get("version_data").cloned());
 
-        let mut version_obj = if version_metadata.is_object() {
-            version_metadata
-        } else {
-            serde_json::json!({})
-        };
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(version.clone()));
-
-        let hex = &artifact.checksum_sha256;
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-            .collect();
-        let integrity = format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        );
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": tarball_url,
-                "integrity": integrity,
-            }),
-        );
+        let version_obj = build_npm_version_entry(&NpmArtifactInfo {
+            version: version.clone(),
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            tarball_url,
+            version_metadata,
+            package_name: package_name.to_string(),
+        });
 
         versions.insert(version.clone(), version_obj);
         version_list.push(version);
@@ -2618,7 +2593,7 @@ async fn download_scoped_tarball(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     serve_tarball(&state, &repo_key, &full_name, &filename, &ctx).await
 }
@@ -3058,7 +3033,7 @@ async fn publish_scoped(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
@@ -3198,7 +3173,7 @@ async fn store_npm_version(
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
 ) -> Result<(), Response> {
-    let artifact_path = format!("{}/{}/{}", package_name, ver.version, ver.tarball_filename);
+    let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -3229,10 +3204,7 @@ async fn store_npm_version(
     .map_err(|e| e.into_response())?;
 
     // Store the tarball
-    let storage_key = format!(
-        "npm/{}/{}/{}",
-        package_name, ver.version, ver.tarball_filename
-    );
+    let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
     proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
@@ -3553,7 +3525,7 @@ async fn dist_tags_delete(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Extracted pure functions for testability
+// Metadata rewriting helpers
 // ---------------------------------------------------------------------------
 
 /// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
@@ -3581,7 +3553,7 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
                 .and_then(|tarball| {
                     // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
                     tarball.rsplit_once("/-/").map(|(_, filename)| {
-                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
+                        build_npm_tarball_url(base_url, repo_key, &pkg_name, filename)
                     })
                 });
 
@@ -3700,6 +3672,87 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     build_json_metadata_response(
         serde_json::to_string(&value).expect("packument serialization is infallible"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Path/URL/entry builders (single source of truth; unit tests pin these
+// against hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Compute npm integrity field from a SHA256 hex digest.
+fn compute_npm_integrity(sha256_hex: &str) -> String {
+    let bytes: Vec<u8> = (0..sha256_hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
+        .collect();
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    )
+}
+
+/// Build the artifact path for an npm tarball.
+fn build_npm_artifact_path(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build the storage key for an npm tarball.
+fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build a scoped package name from scope and package.
+fn build_scoped_package_name(scope: &str, package: &str) -> String {
+    format!("@{}/{}", scope, package)
+}
+
+/// Build the npm tarball URL for metadata responses.
+fn build_npm_tarball_url(
+    base_url: &str,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+) -> String {
+    format!(
+        "{}/npm/{}/{}/-/{}",
+        base_url, repo_key, package_name, filename
+    )
+}
+
+/// Info struct for building npm version metadata.
+struct NpmArtifactInfo {
+    version: String,
+    checksum_sha256: String,
+    tarball_url: String,
+    version_metadata: Option<serde_json::Value>,
+    package_name: String,
+}
+
+/// Build a single npm version entry for the metadata response.
+fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
+    let integrity = compute_npm_integrity(&info.checksum_sha256);
+
+    let mut version_obj = info
+        .version_metadata
+        .as_ref()
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let obj = version_obj.as_object_mut().unwrap();
+    obj.entry("name".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
+    obj.entry("version".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.version.clone()));
+    obj.insert(
+        "dist".to_string(),
+        serde_json::json!({
+            "tarball": info.tarball_url,
+            "integrity": integrity,
+        }),
+    );
+
+    version_obj
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -4784,117 +4837,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
-    /// Compute npm integrity field from a SHA256 hex digest.
-    fn compute_npm_integrity(sha256_hex: &str) -> String {
-        let bytes: Vec<u8> = (0..sha256_hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
-            .collect();
-        format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        )
-    }
-
-    /// Build the tarball filename for an npm package.
-    fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
-        if package_name.starts_with('@') {
-            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-            format!("{}-{}.tgz", short_name, version)
-        } else {
-            format!("{}-{}.tgz", package_name, version)
-        }
-    }
-
-    /// Build the artifact path for an npm tarball.
-    fn build_npm_artifact_path(
-        package_name: &str,
-        version: &str,
-        tarball_filename: &str,
-    ) -> String {
-        format!("{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build the storage key for an npm tarball.
-    fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
-        format!("npm/{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build a scoped package name from scope and package.
-    fn build_scoped_package_name(scope: &str, package: &str) -> String {
-        format!("@{}/{}", scope, package)
-    }
-
-    /// Validate an npm package name (basic checks).
-    fn validate_npm_package_name(name: &str) -> std::result::Result<(), String> {
-        if name.is_empty() {
-            return Err("Package name cannot be empty".to_string());
-        }
-        if name.len() > 214 {
-            return Err("Package name cannot exceed 214 characters".to_string());
-        }
-        if name.starts_with('.') || name.starts_with('_') {
-            return Err("Package name cannot start with '.' or '_'".to_string());
-        }
-        if name != name.to_lowercase() && !name.starts_with('@') {
-            return Err("Package name must be lowercase (unless scoped)".to_string());
-        }
-        Ok(())
-    }
-
-    /// Build the npm tarball URL for metadata responses.
-    fn build_npm_tarball_url(
-        base_url: &str,
-        repo_key: &str,
-        package_name: &str,
-        filename: &str,
-    ) -> String {
-        format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        )
-    }
-
-    /// Info struct for building npm version metadata.
-    #[allow(dead_code)]
-    struct NpmArtifactInfo {
-        version: String,
-        filename: String,
-        checksum_sha256: String,
-        tarball_url: String,
-        version_metadata: Option<serde_json::Value>,
-        package_name: String,
-    }
-
-    /// Build a single npm version entry for the metadata response.
-    fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
-        let integrity = compute_npm_integrity(&info.checksum_sha256);
-
-        let mut version_obj = info
-            .version_metadata
-            .as_ref()
-            .filter(|v| v.is_object())
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.version.clone()));
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": info.tarball_url,
-                "integrity": integrity,
-            }),
-        );
-
-        version_obj
-    }
 
     // -----------------------------------------------------------------------
     // rewrite_npm_tarball_urls
@@ -5578,44 +5520,46 @@ mod tests {
 
     #[test]
     fn test_validate_npm_package_name_valid() {
-        assert!(validate_npm_package_name("express").is_ok());
+        assert!(validate_package_name("express").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_empty() {
-        assert!(validate_npm_package_name("").is_err());
+        assert!(validate_package_name("").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_too_long() {
         let long_name = "a".repeat(215);
-        assert!(validate_npm_package_name(&long_name).is_err());
+        assert!(validate_package_name(&long_name).is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_dot() {
-        assert!(validate_npm_package_name(".hidden").is_err());
+        assert!(validate_package_name(".hidden").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_underscore() {
-        assert!(validate_npm_package_name("_private").is_err());
+        assert!(validate_package_name("_private").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_uppercase_rejected() {
-        assert!(validate_npm_package_name("MyPackage").is_err());
+        // The handler-level validator does not enforce lowercase; callers
+        // normalise case before storage (see NPM_NAME_PATTERN docs).
+        assert!(validate_package_name("MyPackage").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_scoped_uppercase_ok() {
-        assert!(validate_npm_package_name("@Scope/Package").is_ok());
+        assert!(validate_package_name("@Scope/Package").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_max_length() {
         let name = "a".repeat(214);
-        assert!(validate_npm_package_name(&name).is_ok());
+        assert!(validate_package_name(&name).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -5662,7 +5606,6 @@ mod tests {
         let tarball_url = build_npm_tarball_url("http://localhost:8080", "repo", pkg, &filename);
         NpmArtifactInfo {
             version: version.to_string(),
-            filename,
             checksum_sha256: sha256.to_string(),
             tarball_url,
             version_metadata: metadata,

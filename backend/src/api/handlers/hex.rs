@@ -526,13 +526,7 @@ async fn package_info(
         .iter()
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-
-            serde_json::json!({
-                "version": version,
-                "url": tarball_url,
-                "checksum": a.checksum_sha256,
-            })
+            build_hex_release_entry(&repo_key, &name, &version, Some(&a.checksum_sha256))
         })
         .collect();
 
@@ -862,14 +856,14 @@ async fn publish_package(
             .into_response());
     }
 
-    let filename = format!("{}-{}.tar", pkg_name, pkg_version);
+    let filename = build_hex_filename(&pkg_name, &pkg_version);
 
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
-    let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
+    let artifact_path = build_hex_artifact_path(&pkg_name, &pkg_version);
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -879,7 +873,7 @@ async fn publish_package(
     )
     .await?;
 
-    let storage_key = format!("hex/{}/{}/{}", pkg_name, pkg_version, filename);
+    let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     // Record the facts the signed registry has to advertise for this release:
@@ -894,12 +888,7 @@ async fn publish_package(
     })
     .map_err(|e| e.into_response())?;
 
-    let mut hex_metadata = serde_json::json!({
-        "format": "hex",
-        "name": pkg_name,
-        "version": pkg_version,
-        "filename": filename,
-    });
+    let mut hex_metadata = build_hex_metadata(&pkg_name, &pkg_version);
     match registry_facts {
         Ok(facts) => {
             if let Some(obj) = hex_metadata.as_object_mut() {
@@ -950,11 +939,7 @@ async fn publish_package(
         pkg_name, pkg_version, filename, repo_key
     );
 
-    let response_json = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "url": format!("/hex/{}/tarballs/{}", repo_key, filename),
-    });
+    let response_json = build_hex_publish_response(&repo_key, &pkg_name, &pkg_version);
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -1440,12 +1425,7 @@ fn build_package_info_json(
         .iter()
         .map(|(version, checksum)| {
             let v = version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", virtual_repo_key, name, v);
-            serde_json::json!({
-                "version": v,
-                "url": tarball_url,
-                "checksum": checksum,
-            })
+            build_hex_release_entry(virtual_repo_key, name, &v, Some(checksum))
         })
         .collect();
     serde_json::json!({
@@ -1704,6 +1684,68 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Path/URL builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the standard hex tarball filename: `{name}-{version}.tar`
+fn build_hex_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar", name, version)
+}
+
+/// Build the artifact storage path: `{name}/{version}/{name}-{version}.tar`
+fn build_hex_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
+fn build_hex_storage_key(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("hex/{}/{}/{}", name, version, filename)
+}
+
+/// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
+fn build_hex_tarball_url(repo_key: &str, name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("/hex/{}/tarballs/{}", repo_key, filename)
+}
+
+/// Build hex metadata JSON for a package.
+fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
+    let filename = build_hex_filename(name, version);
+    serde_json::json!({
+        "format": "hex",
+        "name": name,
+        "version": version,
+        "filename": filename,
+    })
+}
+
+/// Build the JSON publish response.
+fn build_hex_publish_response(repo_key: &str, name: &str, version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+    })
+}
+
+/// Build a release entry for the package info endpoint.
+fn build_hex_release_entry(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    checksum: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+        "checksum": checksum,
+    })
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -2281,67 +2323,6 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert_eq!(ordered[0].key, "l1");
         assert_eq!(ordered[1].key, "s1");
-    }
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the standard hex tarball filename: `{name}-{version}.tar`
-    fn build_hex_filename(name: &str, version: &str) -> String {
-        format!("{}-{}.tar", name, version)
-    }
-
-    /// Build the artifact storage path: `{name}/{version}/{name}-{version}.tar`
-    fn build_hex_artifact_path(name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
-    fn build_hex_storage_key(name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("hex/{}/{}/{}", name, version, filename)
-    }
-
-    /// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
-    fn build_hex_tarball_url(repo_key: &str, name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("/hex/{}/tarballs/{}", repo_key, filename)
-    }
-
-    /// Build hex metadata JSON for a package.
-    fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
-        let filename = build_hex_filename(name, version);
-        serde_json::json!({
-            "format": "hex",
-            "name": name,
-            "version": version,
-            "filename": filename,
-        })
-    }
-
-    /// Build the JSON publish response.
-    fn build_hex_publish_response(repo_key: &str, name: &str, version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "url": build_hex_tarball_url(repo_key, name, version),
-        })
-    }
-
-    /// Build a release entry for the package info endpoint.
-    fn build_hex_release_entry(
-        repo_key: &str,
-        name: &str,
-        version: &str,
-        checksum: Option<&str>,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "version": version,
-            "url": build_hex_tarball_url(repo_key, name, version),
-            "checksum": checksum,
-        })
     }
 
     // -----------------------------------------------------------------------

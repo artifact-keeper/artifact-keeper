@@ -444,11 +444,7 @@ async fn list_versions(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    let body = versions
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let body = build_version_list(&versions);
 
     if body.is_empty() {
         // Virtual repo: the version list also lives in the artifact tables of
@@ -474,11 +470,7 @@ async fn list_versions(
             .await
             .map_err(crate::api::handlers::db_err)?;
 
-            let member_body = member_versions
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n");
+            let member_body = build_version_list(&member_versions);
 
             if !member_body.is_empty() {
                 return Ok(Response::builder()
@@ -489,8 +481,7 @@ async fn list_versions(
             }
         }
 
-        let encoded = encode_module_path(module);
-        let upstream_path = format!("{}/@v/list", encoded);
+        let upstream_path = build_go_upstream_list_path(module);
         if let Ok(resp) =
             try_proxy_go_metadata(state, repo, &upstream_path, "text/plain; charset=utf-8").await
         {
@@ -571,24 +562,17 @@ async fn version_info(
                 .await
                 .map_err(crate::api::handlers::db_err)?
                 {
-                    let time_str = member_row
-                        .created_at
-                        .format("%Y-%m-%dT%H:%M:%SZ")
-                        .to_string();
-                    let info = serde_json::json!({
-                        "Version": version,
-                        "Time": time_str,
-                    });
+                    let time_str = format_go_timestamp(&member_row.created_at);
+                    let info = build_version_info_json(version, &time_str);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(serde_json::to_string(&info).unwrap()))
+                        .body(Body::from(info))
                         .unwrap());
                 }
             }
 
-            let encoded = encode_module_path(module);
-            let upstream_path = format!("{}/@v/{}.info", encoded, version);
+            let upstream_path = build_go_upstream_path(module, version, "info");
             if let Ok(resp) =
                 try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
             {
@@ -598,17 +582,14 @@ async fn version_info(
         }
     };
 
-    let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let time_str = format_go_timestamp(&artifact.created_at);
 
-    let info = serde_json::json!({
-        "Version": version,
-        "Time": time_str,
-    });
+    let info = build_version_info_json(version, &time_str);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&info).unwrap()))
+        .body(Body::from(info))
         .unwrap())
 }
 
@@ -656,8 +637,7 @@ async fn get_mod_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let encoded = encode_module_path(module);
-                    let upstream_path = format!("{}/@v/{}.mod", encoded, version);
+                    let upstream_path = build_go_upstream_path(module, version, "mod");
                     let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
@@ -681,8 +661,7 @@ async fn get_mod_file(
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
-                let encoded = encode_module_path(module);
-                let upstream_path = format!("{}/@v/{}.mod", encoded, version);
+                let upstream_path = build_go_upstream_path(module, version, "mod");
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
                 let result = proxy_helpers::resolve_virtual_download(
@@ -790,8 +769,7 @@ async fn download_zip(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let encoded = encode_module_path(module);
-                    let upstream_path = format!("{}/@v/{}.zip", encoded, version);
+                    let upstream_path = build_go_upstream_path(module, version, "zip");
                     // #895: stream large module .zip; default Content-Type
                     // matches the buffered handler's prior fallback so the
                     // Go toolchain still sees `application/zip` when
@@ -811,8 +789,7 @@ async fn download_zip(
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
-                let encoded = encode_module_path(module);
-                let upstream_path = format!("{}/@v/{}.zip", encoded, version);
+                let upstream_path = build_go_upstream_path(module, version, "zip");
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
                 let result = proxy_helpers::resolve_virtual_download(
@@ -869,11 +846,7 @@ async fn download_zip(
         .header(CONTENT_TYPE, "application/zip")
         .header(
             "Content-Disposition",
-            format!(
-                "attachment; filename=\"{}@{}.zip\"",
-                encode_module_path(module),
-                version
-            ),
+            build_go_zip_content_disposition(module, version),
         )
         .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .body(Body::from_stream(stream))
@@ -917,8 +890,7 @@ async fn latest_version(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
-            let encoded = encode_module_path(module);
-            let upstream_path = format!("{}/@latest", encoded);
+            let upstream_path = build_go_upstream_latest_path(module);
             if let Ok(resp) =
                 try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
             {
@@ -929,17 +901,14 @@ async fn latest_version(
     };
 
     let version = artifact.version.unwrap_or_default();
-    let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let time_str = format_go_timestamp(&artifact.created_at);
 
-    let info = serde_json::json!({
-        "Version": version,
-        "Time": time_str,
-    });
+    let info = build_version_info_json(&version, &time_str);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&info).unwrap()))
+        .body(Body::from(info))
         .unwrap())
 }
 
@@ -955,8 +924,7 @@ async fn upload_zip(
     user_id: uuid::Uuid,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let encoded_module = encode_module_path(module);
-    let artifact_path = format!("{}/{}/{}.zip", encoded_module, version, version);
+    let artifact_path = build_go_zip_artifact_path(module, version);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -987,7 +955,7 @@ async fn upload_zip(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
-    let storage_key = format!("go/{}/{}/{}.zip", encoded_module, version, version);
+    let storage_key = build_go_zip_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -1031,11 +999,7 @@ async fn upload_zip(
         .await;
 
     // Store metadata
-    let metadata = serde_json::json!({
-        "module": module,
-        "version": version,
-        "type": "zip",
-    });
+    let metadata = build_go_artifact_metadata(module, version, "zip");
 
     let _ = sqlx::query!(
         r#"
@@ -1077,8 +1041,7 @@ async fn upload_mod(
     user_id: uuid::Uuid,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let encoded_module = encode_module_path(module);
-    let artifact_path = format!("{}/{}/go.mod", encoded_module, version);
+    let artifact_path = build_go_mod_artifact_path(module, version);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1109,7 +1072,7 @@ async fn upload_mod(
     let checksum = format!("{:x}", hasher.finalize());
 
     let size_bytes = body.len() as i64;
-    let storage_key = format!("go/{}/{}/go.mod", encoded_module, version);
+    let storage_key = build_go_mod_storage_key(module, version);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -1153,11 +1116,7 @@ async fn upload_mod(
         .await;
 
     // Store metadata
-    let metadata = serde_json::json!({
-        "module": module,
-        "version": version,
-        "type": "mod",
-    });
+    let metadata = build_go_artifact_metadata(module, version, "mod");
 
     let _ = sqlx::query!(
         r#"
@@ -1191,89 +1150,98 @@ async fn upload_mod(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Path/JSON builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build a version info JSON string (used by .info and @latest endpoints).
+fn build_version_info_json(version: &str, time_str: &str) -> String {
+    serde_json::json!({
+        "Version": version,
+        "Time": time_str,
+    })
+    .to_string()
+}
+
+/// Format a chrono DateTime into Go-compatible timestamp string.
+fn format_go_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Build a newline-separated version list from a vec of optional version strings.
+fn build_version_list(versions: &[Option<String>]) -> String {
+    versions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the artifact path for a Go module zip.
+fn build_go_zip_artifact_path(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("{}/{}/{}.zip", encoded_module, version, version)
+}
+
+/// Build the storage key for a Go module zip.
+fn build_go_zip_storage_key(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("go/{}/{}/{}.zip", encoded_module, version, version)
+}
+
+/// Build the artifact path for a Go go.mod file.
+fn build_go_mod_artifact_path(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("{}/{}/go.mod", encoded_module, version)
+}
+
+/// Build the storage key for a Go go.mod file.
+fn build_go_mod_storage_key(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("go/{}/{}/go.mod", encoded_module, version)
+}
+
+/// Build Go module metadata JSON for storage.
+fn build_go_artifact_metadata(module: &str, version: &str, file_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "module": module,
+        "version": version,
+        "type": file_type,
+    })
+}
+
+/// Build Content-Disposition header for Go zip downloads.
+fn build_go_zip_content_disposition(module: &str, version: &str) -> String {
+    format!(
+        "attachment; filename=\"{}@{}.zip\"",
+        encode_module_path(module),
+        version
+    )
+}
+
+/// Build the upstream path for a Go module request (used by remote/virtual repos).
+fn build_go_upstream_path(module: &str, version: &str, ext: &str) -> String {
+    let encoded = encode_module_path(module);
+    format!("{}/@v/{}.{}", encoded, version, ext)
+}
+
+/// Build the upstream path for a Go module version-list request.
+fn build_go_upstream_list_path(module: &str) -> String {
+    let encoded = encode_module_path(module);
+    format!("{}/@v/list", encoded)
+}
+
+/// Build the upstream path for a Go module @latest request.
+fn build_go_upstream_latest_path(module: &str) -> String {
+    let encoded = encode_module_path(module);
+    format!("{}/@latest", encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build a version info JSON string (used by .info and @latest endpoints).
-    fn build_version_info_json(version: &str, time_str: &str) -> String {
-        serde_json::json!({
-            "Version": version,
-            "Time": time_str,
-        })
-        .to_string()
-    }
-
-    /// Format a chrono DateTime into Go-compatible timestamp string.
-    fn format_go_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> String {
-        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-    }
-
-    /// Build a newline-separated version list from a vec of optional version strings.
-    fn build_version_list(versions: &[Option<String>]) -> String {
-        versions
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Build the artifact path for a Go module zip.
-    fn build_go_zip_artifact_path(module: &str, version: &str) -> String {
-        let encoded_module = encode_module_path(module);
-        format!("{}/{}/{}.zip", encoded_module, version, version)
-    }
-
-    /// Build the storage key for a Go module zip.
-    fn build_go_zip_storage_key(module: &str, version: &str) -> String {
-        let encoded_module = encode_module_path(module);
-        format!("go/{}/{}/{}.zip", encoded_module, version, version)
-    }
-
-    /// Build the artifact path for a Go go.mod file.
-    fn build_go_mod_artifact_path(module: &str, version: &str) -> String {
-        let encoded_module = encode_module_path(module);
-        format!("{}/{}/go.mod", encoded_module, version)
-    }
-
-    /// Build the storage key for a Go go.mod file.
-    fn build_go_mod_storage_key(module: &str, version: &str) -> String {
-        let encoded_module = encode_module_path(module);
-        format!("go/{}/{}/go.mod", encoded_module, version)
-    }
-
-    /// Build Go module metadata JSON for storage.
-    fn build_go_artifact_metadata(
-        module: &str,
-        version: &str,
-        file_type: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "module": module,
-            "version": version,
-            "type": file_type,
-        })
-    }
-
-    /// Build Content-Disposition header for Go zip downloads.
-    fn build_go_zip_content_disposition(module: &str, version: &str) -> String {
-        format!(
-            "attachment; filename=\"{}@{}.zip\"",
-            encode_module_path(module),
-            version
-        )
-    }
-
-    /// Build the upstream path for a Go module request (used by remote/virtual repos).
-    fn build_go_upstream_path(module: &str, version: &str, ext: &str) -> String {
-        let encoded = encode_module_path(module);
-        format!("{}/@v/{}.{}", encoded, version, ext)
-    }
 
     #[test]
     fn test_decode_module_path() {
@@ -1667,21 +1635,6 @@ mod tests {
     // (covers the paths built by the new proxy fallback code)
     // -----------------------------------------------------------------------
 
-    fn build_go_upstream_list_path(module: &str) -> String {
-        let encoded = encode_module_path(module);
-        format!("{}/@v/list", encoded)
-    }
-
-    fn build_go_upstream_info_path(module: &str, version: &str) -> String {
-        let encoded = encode_module_path(module);
-        format!("{}/@v/{}.info", encoded, version)
-    }
-
-    fn build_go_upstream_latest_path(module: &str) -> String {
-        let encoded = encode_module_path(module);
-        format!("{}/@latest", encoded)
-    }
-
     #[test]
     fn test_build_go_upstream_list_path_simple() {
         assert_eq!(
@@ -1701,7 +1654,7 @@ mod tests {
     #[test]
     fn test_build_go_upstream_info_path_simple() {
         assert_eq!(
-            build_go_upstream_info_path("github.com/user/repo", "v1.0.0"),
+            build_go_upstream_path("github.com/user/repo", "v1.0.0", "info"),
             "github.com/user/repo/@v/v1.0.0.info"
         );
     }
@@ -1709,7 +1662,7 @@ mod tests {
     #[test]
     fn test_build_go_upstream_info_path_prerelease() {
         assert_eq!(
-            build_go_upstream_info_path("golang.org/x/text", "v0.14.0-rc.1"),
+            build_go_upstream_path("golang.org/x/text", "v0.14.0-rc.1", "info"),
             "golang.org/x/text/@v/v0.14.0-rc.1.info"
         );
     }

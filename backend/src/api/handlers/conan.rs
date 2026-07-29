@@ -458,7 +458,7 @@ async fn search_recipes_for_repo(
                 .unwrap_or("0.0.0");
             let user = r.meta_user.as_deref().unwrap_or("_");
             let channel = r.meta_channel.as_deref().unwrap_or("_");
-            format!("{}/{}@{}/{}", r.name, version, user, channel)
+            build_conan_reference(&r.name, version, user, channel)
         })
         .collect())
 }
@@ -952,7 +952,7 @@ async fn search(
     let pattern = query.q.unwrap_or_else(|| "*".to_string());
 
     // Convert glob-like pattern to SQL LIKE pattern.
-    let like_pattern = pattern.replace('*', "%");
+    let like_pattern = conan_glob_to_like(&pattern);
 
     // Aggregate using a deduped Vec so order is preserved across members.
     let mut seen = std::collections::HashSet::<String>::new();
@@ -1596,14 +1596,8 @@ async fn recipe_file_download(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path = format!(
-                        "v2/conans/{}/{}/{}/{}/revisions/{}/files/{}",
-                        name,
-                        version,
-                        user,
-                        channel,
-                        revision,
-                        file_path.trim_start_matches('/')
+                    let upstream_path = build_recipe_upstream_path(
+                        &name, &version, &user, &channel, &revision, &file_path,
                     );
                     // #1608 Phase 4: stream the recipe file body (may be a
                     // large conan_export.tgz / conan_sources.tgz) straight to
@@ -1626,14 +1620,8 @@ async fn recipe_file_download(
             // Virtual repo: try each member in priority order
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
-                let upstream_path = format!(
-                    "v2/conans/{}/{}/{}/{}/revisions/{}/files/{}",
-                    name,
-                    version,
-                    user,
-                    channel,
-                    revision,
-                    file_path.trim_start_matches('/')
+                let upstream_path = build_recipe_upstream_path(
+                    &name, &version, &user, &channel, &revision, &file_path,
                 );
                 let vpath = artifact_path.clone();
                 let result = proxy_helpers::resolve_virtual_download(
@@ -1797,15 +1785,7 @@ async fn recipe_file_upload(
         .map_err(map_storage_err)?;
 
     // Build metadata JSON
-    let metadata = serde_json::json!({
-        "name": name,
-        "version": version,
-        "user": normalize_user(&user),
-        "channel": normalize_channel(&channel),
-        "revision": revision,
-        "type": "recipe",
-        "file": file_path.trim_start_matches('/'),
-    });
+    let metadata = build_recipe_metadata(&name, &version, &user, &channel, &revision, &file_path);
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -2397,80 +2377,82 @@ async fn package_file_download(
     .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
-    let artifact =
-        match artifact {
-            Ok(a) => a,
-            Err(not_found) => {
-                if repo.repo_type == RepositoryType::Remote {
-                    if let (Some(ref upstream_url), Some(ref proxy)) =
-                        (&repo.upstream_url, &state.proxy_service)
-                    {
-                        let upstream_path =
-                            format!(
-                        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
-                        name, version, user, channel, revision, package_id, pkg_revision,
-                        file_path.trim_start_matches('/')
+    let artifact = match artifact {
+        Ok(a) => a,
+        Err(not_found) => {
+            if repo.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    let upstream_path = build_package_upstream_path(
+                        &name,
+                        &version,
+                        &user,
+                        &channel,
+                        &revision,
+                        &package_id,
+                        &pkg_revision,
+                        &file_path,
                     );
-                        // #1608 Phase 4: stream the package file body (the
-                        // conan_package.tgz binary can be very large) to the
-                        // client while teeing to the proxy cache, instead of
-                        // buffering it in memory. Single-flight via the merged
-                        // coordinator (#1609). octet-stream default matches the
-                        // buffered handler's prior fallback.
-                        return proxy_helpers::proxy_fetch_streaming(
-                            proxy,
-                            repo.id,
-                            &repo_key,
-                            upstream_url,
-                            &upstream_path,
-                            "application/octet-stream",
-                        )
-                        .await;
-                    }
-                }
-                // Virtual repo: try each member in priority order
-                if repo.repo_type == RepositoryType::Virtual {
-                    let db = state.db.clone();
-                    let upstream_path = format!(
-                        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
-                        name,
-                        version,
-                        user,
-                        channel,
-                        revision,
-                        package_id,
-                        pkg_revision,
-                        file_path.trim_start_matches('/')
-                    );
-                    let vpath = artifact_path.clone();
-                    let result = proxy_helpers::resolve_virtual_download(
-                        &state.db,
-                        state.proxy_service.as_deref(),
+                    // #1608 Phase 4: stream the package file body (the
+                    // conan_package.tgz binary can be very large) to the
+                    // client while teeing to the proxy cache, instead of
+                    // buffering it in memory. Single-flight via the merged
+                    // coordinator (#1609). octet-stream default matches the
+                    // buffered handler's prior fallback.
+                    return proxy_helpers::proxy_fetch_streaming(
+                        proxy,
                         repo.id,
+                        &repo_key,
+                        upstream_url,
                         &upstream_path,
-                        |member_id, location| {
-                            let db = db.clone();
-                            let state = state.clone();
-                            let vpath = vpath.clone();
-                            async move {
-                                proxy_helpers::local_fetch_by_path(
-                                    &db, &state, member_id, &location, &vpath,
-                                )
-                                .await
-                            }
-                        },
-                    )
-                    .await?;
-
-                    return proxy_helpers::stream_fetch_result(
-                        result,
                         "application/octet-stream",
-                        None,
-                    );
+                    )
+                    .await;
                 }
-                return Err(not_found);
             }
-        };
+            // Virtual repo: try each member in priority order
+            if repo.repo_type == RepositoryType::Virtual {
+                let db = state.db.clone();
+                let upstream_path = build_package_upstream_path(
+                    &name,
+                    &version,
+                    &user,
+                    &channel,
+                    &revision,
+                    &package_id,
+                    &pkg_revision,
+                    &file_path,
+                );
+                let vpath = artifact_path.clone();
+                let result = proxy_helpers::resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    &upstream_path,
+                    |member_id, location| {
+                        let db = db.clone();
+                        let state = state.clone();
+                        let vpath = vpath.clone();
+                        async move {
+                            proxy_helpers::local_fetch_by_path(
+                                &db, &state, member_id, &location, &vpath,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await?;
+
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    None,
+                );
+            }
+            return Err(not_found);
+        }
+    };
 
     // Read from storage
     let storage = state
@@ -2619,17 +2601,16 @@ async fn package_file_upload(
         .map_err(map_storage_err)?;
 
     // Build metadata JSON
-    let metadata = serde_json::json!({
-        "name": name,
-        "version": version,
-        "user": normalize_user(&user),
-        "channel": normalize_channel(&channel),
-        "revision": revision,
-        "packageId": package_id,
-        "packageRevision": pkg_revision,
-        "type": "package",
-        "file": file_path.trim_start_matches('/'),
-    });
+    let metadata = build_package_metadata(
+        &name,
+        &version,
+        &user,
+        &channel,
+        &revision,
+        &package_id,
+        &pkg_revision,
+        &file_path,
+    );
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -2694,6 +2675,112 @@ async fn package_file_upload(
         .status(StatusCode::CREATED)
         .body(Body::from("Created"))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Reference/metadata/upstream-path builders (single source of truth; unit
+// tests pin these against hardcoded literals so a format change here fails
+// the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Convert a Conan glob pattern to a SQL LIKE pattern.
+fn conan_glob_to_like(pattern: &str) -> String {
+    pattern.replace('*', "%")
+}
+
+/// Build a Conan reference string: `name/version@user/channel`.
+fn build_conan_reference(name: &str, version: &str, user: &str, channel: &str) -> String {
+    format!("{}/{}@{}/{}", name, version, user, channel)
+}
+
+/// Build recipe metadata JSON.
+fn build_recipe_metadata(
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    file_path: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "user": normalize_user(user),
+        "channel": normalize_channel(channel),
+        "revision": revision,
+        "type": "recipe",
+        "file": file_path.trim_start_matches('/'),
+    })
+}
+
+/// Build package metadata JSON.
+#[allow(clippy::too_many_arguments)]
+fn build_package_metadata(
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+    pkg_revision: &str,
+    file_path: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "user": normalize_user(user),
+        "channel": normalize_channel(channel),
+        "revision": revision,
+        "packageId": package_id,
+        "packageRevision": pkg_revision,
+        "type": "package",
+        "file": file_path.trim_start_matches('/'),
+    })
+}
+
+/// Build the upstream path for proxying a recipe file.
+fn build_recipe_upstream_path(
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    file_path: &str,
+) -> String {
+    format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/files/{}",
+        name,
+        version,
+        user,
+        channel,
+        revision,
+        file_path.trim_start_matches('/')
+    )
+}
+
+/// Build the upstream path for proxying a package file.
+#[allow(clippy::too_many_arguments)]
+fn build_package_upstream_path(
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+    pkg_revision: &str,
+    file_path: &str,
+) -> String {
+    format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
+        name,
+        version,
+        user,
+        channel,
+        revision,
+        package_id,
+        pkg_revision,
+        file_path.trim_start_matches('/')
+    )
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -3002,110 +3089,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Convert a Conan glob pattern to a SQL LIKE pattern.
-    fn conan_glob_to_like(pattern: &str) -> String {
-        pattern.replace('*', "%")
-    }
-
-    /// Build a Conan reference string: "name/version@user/channel".
-    fn build_conan_reference(name: &str, version: &str) -> String {
-        format!("{}/{}@_/_", name, version)
-    }
-
-    /// Build recipe metadata JSON.
-    fn build_recipe_metadata(
-        name: &str,
-        version: &str,
-        user: &str,
-        channel: &str,
-        revision: &str,
-        file_path: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "user": normalize_user(user),
-            "channel": normalize_channel(channel),
-            "revision": revision,
-            "type": "recipe",
-            "file": file_path.trim_start_matches('/'),
-        })
-    }
-
-    /// Build package metadata JSON.
-    #[allow(clippy::too_many_arguments)]
-    fn build_package_metadata(
-        name: &str,
-        version: &str,
-        user: &str,
-        channel: &str,
-        revision: &str,
-        package_id: &str,
-        pkg_revision: &str,
-        file_path: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "user": normalize_user(user),
-            "channel": normalize_channel(channel),
-            "revision": revision,
-            "packageId": package_id,
-            "packageRevision": pkg_revision,
-            "type": "package",
-            "file": file_path.trim_start_matches('/'),
-        })
-    }
-
-    /// Build the upstream path for proxying a recipe file.
-    fn build_recipe_upstream_path(
-        name: &str,
-        version: &str,
-        user: &str,
-        channel: &str,
-        revision: &str,
-        file_path: &str,
-    ) -> String {
-        format!(
-            "v2/conans/{}/{}/{}/{}/revisions/{}/files/{}",
-            name,
-            version,
-            user,
-            channel,
-            revision,
-            file_path.trim_start_matches('/')
-        )
-    }
-
-    /// Build the upstream path for proxying a package file.
-    #[allow(clippy::too_many_arguments)]
-    fn build_package_upstream_path(
-        name: &str,
-        version: &str,
-        user: &str,
-        channel: &str,
-        revision: &str,
-        package_id: &str,
-        pkg_revision: &str,
-        file_path: &str,
-    ) -> String {
-        format!(
-            "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files/{}",
-            name,
-            version,
-            user,
-            channel,
-            revision,
-            package_id,
-            pkg_revision,
-            file_path.trim_start_matches('/')
-        )
-    }
-
-    // -----------------------------------------------------------------------
     // normalize_user
     // -----------------------------------------------------------------------
 
@@ -3383,17 +3366,23 @@ mod tests {
 
     #[test]
     fn test_build_conan_reference_basic() {
-        assert_eq!(build_conan_reference("zlib", "1.2.13"), "zlib/1.2.13@_/_");
+        assert_eq!(
+            build_conan_reference("zlib", "1.2.13", "_", "_"),
+            "zlib/1.2.13@_/_"
+        );
     }
 
     #[test]
     fn test_build_conan_reference_boost() {
-        assert_eq!(build_conan_reference("boost", "1.80.0"), "boost/1.80.0@_/_");
+        assert_eq!(
+            build_conan_reference("boost", "1.80.0", "_", "_"),
+            "boost/1.80.0@_/_"
+        );
     }
 
     #[test]
     fn test_build_conan_reference_empty_version() {
-        assert_eq!(build_conan_reference("pkg", ""), "pkg/@_/_");
+        assert_eq!(build_conan_reference("pkg", "", "_", "_"), "pkg/@_/_");
     }
 
     // -----------------------------------------------------------------------
