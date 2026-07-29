@@ -102,6 +102,59 @@ impl ProxyScanAction {
     }
 }
 
+/// Whether a cached verdict may SHORT-CIRCUIT the serve path for this repo's
+/// scan action — the policy-aware gate the serve path actually asks.
+///
+/// [`verdict_is_fresh`] answers the narrower, policy-free question "can we
+/// prove this verdict is stale?", and deliberately fails OPEN when a version
+/// string is unknown on either side (probe failed / legacy row): it cannot
+/// prove a mismatch, so it relies on the TTL. That default is right for
+/// fail-open, but on a `fail_closed` repo it is a hole: the freshness check
+/// runs BEFORE the inline scan, so an unprovable `clean` verdict short-circuits
+/// the whole fail-closed gate (including the #2954 "the CVE engine actually
+/// ran" condition) and serves cached-clean bytes that nothing on this node can
+/// currently vouch for.
+///
+/// That unknown-version window is common exactly when it matters most: a Grype
+/// UPGRADE — the CVE-DB advance #2976 is about — transiently fails
+/// `grype --version` (a >=60s [`VERSION_CACHE_MISS_TTL`] window), a missing
+/// binary makes it permanent, and a loaded host can push the probe past its
+/// 5s timeout. A node that 423s a FRESH pull (provably fail-closed) must not
+/// serve a stale `clean` digest through the same policy.
+///
+/// So under `fail_closed` a CLEAN verdict is reusable only when its provenance
+/// is PROVEN current — both version strings known and equal. Otherwise the
+/// verdict is treated as stale and the caller falls through to the re-scan
+/// branch, whose inconclusive outcome correctly fail-closes (423). This
+/// self-heals: the re-scan records the live version, so the next pull of that
+/// digest hits the cache normally.
+///
+/// Everything else is unchanged: `fail_open` keeps the TTL-only fallback (its
+/// re-scan branch serves-with-pending anyway, so availability is unaffected),
+/// and non-`clean` verdicts keep their existing handling — a cached
+/// `vulnerable` verdict still blocks via [`verdict_blocks`].
+///
+/// [`VERSION_CACHE_MISS_TTL`]: crate::services::scanner_service
+pub fn verdict_is_reusable(
+    verdict: &str,
+    scanned_at: DateTime<Utc>,
+    stored_version: Option<&str>,
+    current_version: Option<&str>,
+    action: ProxyScanAction,
+    ttl_days: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    if !verdict_is_fresh(scanned_at, stored_version, current_version, ttl_days, now) {
+        return false;
+    }
+    if action.is_fail_closed() && verdict == VERDICT_CLEAN {
+        // Fail-closed: "not provably stale" is not good enough for a clean
+        // verdict; require provably-current provenance.
+        return matches!((stored_version, current_version), (Some(_), Some(_)));
+    }
+    true
+}
+
 /// Outcome when the inline scan could NOT produce a conclusive clean/vulnerable
 /// verdict before serve time: the object was over the byte cap, the inline scan
 /// budget was exceeded, or the scanner errored.
@@ -292,6 +345,102 @@ mod tests {
             30,
             now
         ));
+    }
+
+    /// #2976 follow-up: `verdict_is_fresh` fails OPEN on an unknown version
+    /// (it cannot prove a mismatch). `verdict_is_reusable` must NOT let that
+    /// default short-circuit a fail-closed repo for a CLEAN verdict — the
+    /// freshness check runs before the inline scan, so an unprovable clean
+    /// verdict would otherwise serve bytes nothing on this node can vouch for.
+    #[test]
+    fn unknown_version_is_not_reusable_for_clean_under_fail_closed() {
+        let now = Utc::now();
+        let scanned = now - Duration::days(1); // well within TTL
+        let cases = [
+            (None, Some("grype-0.84.0")), // live probe known, legacy row
+            (Some("grype-0.84.0"), None), // stored known, probe failed
+            (None, None),                 // neither known
+        ];
+        for (stored, current) in cases {
+            assert!(
+                verdict_is_fresh(scanned, stored, current, 30, now),
+                "precondition: the policy-free check still fails open"
+            );
+            assert!(
+                !verdict_is_reusable(
+                    VERDICT_CLEAN,
+                    scanned,
+                    stored,
+                    current,
+                    ProxyScanAction::FailClosed,
+                    30,
+                    now
+                ),
+                "fail-closed + clean + unprovable provenance ({stored:?}/{current:?}) \
+                 must re-scan, never serve from cache"
+            );
+            // Fail-open is unchanged: its re-scan branch serves-with-pending
+            // anyway, so the TTL-only fallback costs no availability.
+            assert!(verdict_is_reusable(
+                VERDICT_CLEAN,
+                scanned,
+                stored,
+                current,
+                ProxyScanAction::FailOpen,
+                30,
+                now
+            ));
+            // Non-clean verdicts keep their existing handling under both
+            // actions: a cached `vulnerable` row must still short-circuit to
+            // the block path rather than being re-fetched/re-scanned.
+            assert!(verdict_is_reusable(
+                VERDICT_VULNERABLE,
+                scanned,
+                stored,
+                current,
+                ProxyScanAction::FailClosed,
+                30,
+                now
+            ));
+        }
+    }
+
+    /// The working paths are untouched: a PROVEN version match is reusable
+    /// under both actions, a proven mismatch is not, and an expired TTL is
+    /// never reusable regardless of provenance.
+    #[test]
+    fn reusable_matches_fresh_when_both_versions_known() {
+        let now = Utc::now();
+        let scanned = now - Duration::days(1);
+        for action in [ProxyScanAction::FailClosed, ProxyScanAction::FailOpen] {
+            assert!(verdict_is_reusable(
+                VERDICT_CLEAN,
+                scanned,
+                Some("grype-0.83.0"),
+                Some("grype-0.83.0"),
+                action,
+                30,
+                now
+            ));
+            assert!(!verdict_is_reusable(
+                VERDICT_CLEAN,
+                scanned,
+                Some("grype-0.83.0"),
+                Some("grype-0.84.0"),
+                action,
+                30,
+                now
+            ));
+            assert!(!verdict_is_reusable(
+                VERDICT_CLEAN,
+                now - Duration::days(31),
+                Some("grype-0.83.0"),
+                Some("grype-0.83.0"),
+                action,
+                30,
+                now
+            ));
+        }
     }
 
     #[test]
