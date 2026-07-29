@@ -192,11 +192,31 @@ pub(crate) fn is_token_revoked(revoked_at: Option<DateTime<Utc>>) -> bool {
 }
 
 /// Check if a set of scopes grants access for a required scope.
-/// Scopes match if the exact scope is present, or `*` or `admin` is present.
+///
+/// A held scope satisfies the requirement iff one of:
+///   * it is the exact required scope (`write:artifacts` -> `write:artifacts`),
+///   * it is `*` or `admin` (wildcard short-circuit),
+///   * the required scope is colon-form (`action:resource`) and the held scope
+///     is its bare action parent — a broad `write` covers the specific
+///     `write:artifacts` (#2989).
+///
+/// The direction is deliberately broad-covers-specific ONLY. A held
+/// colon-form scope never satisfies a bare requirement and never satisfies a
+/// colon-form requirement for a *different* resource: `write:artifacts` does
+/// NOT satisfy bare `write` (which still gates non-artifact writes such as
+/// repository settings) and does NOT satisfy `write:repositories`. Widening
+/// either of those directions would let a least-privilege resource token cross
+/// into other resources.
 pub(crate) fn scopes_grant_access(scopes: &[String], required_scope: &str) -> bool {
-    scopes.contains(&required_scope.to_string())
-        || scopes.contains(&"*".to_string())
-        || scopes.contains(&"admin".to_string())
+    if scopes.iter().any(|s| s == required_scope) || scopes.iter().any(|s| s == "*" || s == "admin")
+    {
+        return true;
+    }
+    // Bare-parent satisfaction: held `write` covers required `write:artifacts`.
+    match required_scope.split_once(':') {
+        Some((parent, _resource)) => !parent.is_empty() && scopes.iter().any(|s| s == parent),
+        None => false,
+    }
 }
 
 /// API Token Service for managing programmatic access tokens.
@@ -972,6 +992,57 @@ mod tests {
     fn test_scopes_grant_access_empty_scopes() {
         let scopes: Vec<String> = vec![];
         assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2989 bare-parent satisfaction matrix. Broad-covers-specific ONLY:
+    // held bare `write` satisfies colon-form `write:*` requirements, but a
+    // held colon-form scope satisfies neither a bare requirement nor a
+    // colon-form requirement for a different resource.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scopes_grant_access_bare_parent_satisfies_colon_required() {
+        // held global `write` -> satisfies required `write:artifacts`
+        let scopes = vec!["write".to_string()];
+        assert!(scopes_grant_access(&scopes, "write:artifacts"));
+        assert!(scopes_grant_access(&scopes, "write:repositories"));
+        // ...but not a different action family.
+        assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+        assert!(!scopes_grant_access(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_colon_held_does_not_satisfy_bare_required() {
+        // held `write:artifacts` must NOT satisfy bare `write` — bare `write`
+        // still gates non-artifact writes (repo settings, groups, projects).
+        let scopes = vec!["write:artifacts".to_string()];
+        assert!(!scopes_grant_access(&scopes, "write"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_colon_held_does_not_cross_resources() {
+        // held `write:repositories` must NOT satisfy `write:artifacts` and
+        // vice versa: specific never satisfies a different specific.
+        let repo_write = vec!["write:repositories".to_string()];
+        assert!(!scopes_grant_access(&repo_write, "write:artifacts"));
+        let artifact_write = vec!["write:artifacts".to_string()];
+        assert!(!scopes_grant_access(&artifact_write, "write:repositories"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_read_never_satisfies_write() {
+        for held in [vec!["read".to_string()], vec!["read:artifacts".to_string()]] {
+            assert!(!scopes_grant_access(&held, "write"));
+            assert!(!scopes_grant_access(&held, "write:artifacts"));
+        }
+    }
+
+    #[test]
+    fn test_scopes_grant_access_bare_read_satisfies_colon_read() {
+        // Symmetric bare-parent rule for the read family.
+        let scopes = vec!["read".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
     }
 
     // -----------------------------------------------------------------------

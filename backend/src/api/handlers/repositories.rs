@@ -6598,7 +6598,11 @@ pub async fn upload_artifact(
     body: Body,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    // Artifact write: the resource-specific `write:artifacts` (repo-scoped
+    // token vocabulary, #2989); bare `write` still satisfies via the
+    // parent rule in `scopes_grant_access`.
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
 
     // Validate the composed artifact path against traversal, null bytes,
     // backslashes, percent-encoded traversal, absolute paths, etc. This
@@ -6926,7 +6930,8 @@ async fn upload_artifact_multipart_with_path(
     multipart: Multipart,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
     let (staged, digests, filename) = stage_multipart_file(&state, multipart).await?;
@@ -6971,7 +6976,8 @@ async fn upload_artifact_multipart(
     multipart: Multipart,
 ) -> std::result::Result<Response, Response> {
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
-    auth.require_scope("write").map_err(|e| e.into_response())?;
+    auth.require_scope("write:artifacts")
+        .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
 
     let (staged, digests, filename, custom_path) =

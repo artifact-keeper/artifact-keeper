@@ -149,11 +149,12 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Response, Response> {
     // Token action-scope ceiling (GHSA-5f2q). Opening a chunked-upload session is
-    // a write, so it must require the `write` scope BEFORE the repo-RBAC gate
-    // below — matching the direct-write path (`repositories::upload_artifact`).
+    // an artifact write, so it must require `write:artifacts` BEFORE the repo-RBAC
+    // gate below — matching the direct-write path (`repositories::upload_artifact`).
+    // Bare `write` still satisfies via the parent rule (#2989).
     // Defense-in-depth: this is IN ADDITION to `require_repo_write_access`; a
     // read-scoped token whose owner holds repo write must still be rejected here.
-    auth.require_scope("write")
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -328,9 +329,9 @@ async fn upload_chunk(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    // Token action-scope ceiling (GHSA-5f2q). Appending a chunk is a write and
-    // must require the `write` scope, matching the direct-write path.
-    auth.require_scope("write")
+    // Token action-scope ceiling (GHSA-5f2q). Appending a chunk is an artifact
+    // write and must require `write:artifacts`, matching the direct-write path.
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -497,9 +498,9 @@ async fn complete(
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
     // Token action-scope ceiling (GHSA-5f2q). Finalizing a session commits the
-    // artifact (a write) and must require the `write` scope, matching the
-    // direct-write path.
-    auth.require_scope("write")
+    // artifact (an artifact write) and must require `write:artifacts`, matching
+    // the direct-write path.
+    auth.require_scope("write:artifacts")
         .map_err(IntoResponse::into_response)?;
 
     let user_id = auth.user_id;
@@ -1210,7 +1211,7 @@ mod tests {
     // read-scoped token whose OWNER holds repo RBAC write could push artifacts
     // via /uploads/*, sidestepping the token's action ceiling. Each verb must
     // call `require_scope` with the same scope its direct-path twin uses:
-    //   create_session / upload_chunk / complete -> "write"
+    //   create_session / upload_chunk / complete -> "write:artifacts"
     //   cancel                                    -> "delete"
     // The handlers need a real DB to execute, so these are string-grep gates
     // (mirroring `test_create_session_enforces_tenant_gate`), plus a behavioral
@@ -1232,24 +1233,24 @@ mod tests {
     #[test]
     fn create_session_requires_write_scope() {
         assert!(
-            handler_body("create_session").contains("require_scope(\"write\")"),
-            "create_session must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("create_session").contains("require_scope(\"write:artifacts\")"),
+            "create_session must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
     #[test]
     fn upload_chunk_requires_write_scope() {
         assert!(
-            handler_body("upload_chunk").contains("require_scope(\"write\")"),
-            "upload_chunk must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("upload_chunk").contains("require_scope(\"write:artifacts\")"),
+            "upload_chunk must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
     #[test]
     fn complete_requires_write_scope() {
         assert!(
-            handler_body("complete").contains("require_scope(\"write\")"),
-            "complete must enforce the token `write` action-scope (GHSA-5f2q)"
+            handler_body("complete").contains("require_scope(\"write:artifacts\")"),
+            "complete must enforce the token `write:artifacts` action-scope (GHSA-5f2q, #2989)"
         );
     }
 
@@ -1284,24 +1285,46 @@ mod tests {
     fn read_scoped_token_denied_upload_write_and_delete() {
         // Read-scoped token (its owner may hold repo write) -> the upload verbs'
         // scope gate denies both write and delete -> 403.
-        let read = auth_with_scopes(vec!["read"]);
-        assert!(
-            read.require_scope("write").is_err(),
-            "read-scoped token must be denied the upload write scope"
-        );
-        assert!(
-            read.require_scope("delete").is_err(),
-            "read-scoped token must be denied the cancel delete scope"
-        );
+        for read in [
+            auth_with_scopes(vec!["read"]),
+            auth_with_scopes(vec!["read:artifacts"]),
+        ] {
+            assert!(
+                read.require_scope("write:artifacts").is_err(),
+                "read-scoped token must be denied the upload write scope"
+            );
+            assert!(
+                read.require_scope("delete").is_err(),
+                "read-scoped token must be denied the cancel delete scope"
+            );
+        }
     }
 
     #[test]
     fn write_scoped_token_allowed_upload_write() {
-        // Properly write-scoped token -> the write verbs remain 2xx (unchanged).
+        // Global bare `write` still covers the artifact-specific requirement
+        // via the parent rule (#2989) -> the write verbs remain 2xx.
         let write = auth_with_scopes(vec!["write"]);
         assert!(
-            write.require_scope("write").is_ok(),
-            "write-scoped token must retain upload access (no behavior change)"
+            write.require_scope("write:artifacts").is_ok(),
+            "bare write-scoped token must retain upload access (no regression)"
+        );
+    }
+
+    #[test]
+    fn artifact_write_scoped_token_allowed_upload_write() {
+        // #2989: a repo-scoped token minted with the colon-form
+        // `write:artifacts` must pass the upload verbs' scope gate...
+        let write = auth_with_scopes(vec!["write:artifacts"]);
+        assert!(
+            write.require_scope("write:artifacts").is_ok(),
+            "write:artifacts token must be able to upload"
+        );
+        // ...without gaining the bare `write` used by non-artifact
+        // (settings-class) handlers.
+        assert!(
+            write.require_scope("write").is_err(),
+            "write:artifacts token must not satisfy the bare write scope"
         );
     }
 

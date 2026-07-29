@@ -95,13 +95,14 @@ fn authorize_label_read(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 }
 
 /// Authorize a label mutation: require an authenticated caller that also holds
-/// the `write` scope, mirroring the sibling artifact-mutation handlers.
+/// the `write:artifacts` scope (bare `write` satisfies via the parent rule,
+/// #2989), mirroring the sibling artifact-mutation handlers.
 ///
 /// Repository visibility/scope is enforced separately by
 /// [`check_artifact_visibility`] (which needs DB access) at the call site.
 fn authorize_label_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:artifacts")?;
     Ok(auth)
 }
 

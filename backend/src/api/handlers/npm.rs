@@ -3297,7 +3297,7 @@ async fn publish_package(
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // `npm publish`. Enforce the write scope before falling through to the
     // Bearer-fallback helper.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
@@ -3413,7 +3413,7 @@ async fn dist_tags_put(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
@@ -3488,7 +3488,7 @@ async fn dist_tags_delete(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;

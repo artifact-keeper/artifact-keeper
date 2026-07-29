@@ -1629,7 +1629,7 @@ async fn push_package(
             .unwrap()
     })?;
     // GHSA-vvc3-h39c-mrq5: enforce write scope before doing anything else.
-    crate::api::middleware::auth::require_scope_response(Some(&auth), "write")?;
+    crate::api::middleware::auth::require_scope_response(Some(&auth), "write:artifacts")?;
     let user_id = auth.user_id;
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;

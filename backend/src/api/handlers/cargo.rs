@@ -724,7 +724,7 @@ async fn publish(
     // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
     // accepted for `cargo publish`. Enforce the write scope on the token
     // before falling back to the Bearer-as-base64 credential path.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
