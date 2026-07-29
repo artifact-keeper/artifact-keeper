@@ -76,12 +76,65 @@ struct MemberPackage {
     frozen_filename: String,
 }
 
+/// How many times a serialization failure re-runs [`create_version`].
+///
+/// The snapshot runs at SERIALIZABLE isolation, and Postgres is explicitly
+/// allowed to abort such a transaction with SQLSTATE `40001` ("could not
+/// serialize access due to read/write dependencies among transactions … The
+/// transaction might succeed if retried"). Retrying is the caller's job under
+/// that isolation level, so a concurrent create — or unrelated write traffic
+/// that makes this transaction a pivot — must not surface as a 500.
+const CREATE_VERSION_MAX_ATTEMPTS: u32 = 5;
+
+/// Whether a failed snapshot attempt is a transient concurrency abort that is
+/// safe to retry: a serialization failure (`40001`), a deadlock (`40P01`), or a
+/// unique-violation (`23505`) from two racers colliding on the same
+/// `(repository_id, version_number)` — the constraint backstop. `create_version`
+/// commits atomically, so a retry never double-inserts.
+fn is_retryable_snapshot_conflict(err: &AppError) -> bool {
+    let AppError::Sqlx(sqlx::Error::Database(db_err)) = err else {
+        return false;
+    };
+    matches!(db_err.code().as_deref(), Some("40001" | "40P01" | "23505"))
+}
+
 /// Snapshot the *approved* curation set of `repo_id` into a new monotonic
 /// version. Fails closed (400) when there is nothing approved to freeze, and
 /// (400) when any approved package is missing its retained upstream metadata
 /// snippet — those rows predate snippet retention and must be re-synced before
 /// a publish can include them (never emit a package without its snippet).
+///
+/// Transient serialization conflicts are retried (see
+/// [`CREATE_VERSION_MAX_ATTEMPTS`]); every other error propagates unchanged.
 pub async fn create_version(
+    db: &PgPool,
+    repo_id: Uuid,
+    actor: Uuid,
+) -> Result<VersionSummary, AppError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match create_version_once(db, repo_id, actor).await {
+            Ok(summary) => return Ok(summary),
+            Err(err)
+                if attempt < CREATE_VERSION_MAX_ATTEMPTS
+                    && is_retryable_snapshot_conflict(&err) =>
+            {
+                // Brief, growing backoff so racers do not immediately re-collide.
+                tokio::time::sleep(std::time::Duration::from_millis(20 * u64::from(attempt))).await;
+                tracing::debug!(
+                    repo_id = %repo_id,
+                    attempt,
+                    "curated snapshot hit a serialization conflict; retrying"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// One snapshot attempt. See [`create_version`] for the retry contract.
+async fn create_version_once(
     db: &PgPool,
     repo_id: Uuid,
     actor: Uuid,
@@ -1126,6 +1179,69 @@ mod tests {
         assert_eq!(v2.version_number, 2);
         assert_eq!(v1.package_count, 1);
         assert!(v2.version_number > v1.version_number, "monotonic");
+
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // Only transient CONCURRENCY aborts are retried. A business rejection (an
+    // empty approved set, a package needing re-sync) must surface immediately —
+    // retrying it would just burn the attempt budget and delay a 400.
+    #[test]
+    fn test_only_concurrency_aborts_are_retryable() {
+        for err in [
+            AppError::Validation("no approved packages to freeze".to_string()),
+            AppError::NotFound("Repository version not found".to_string()),
+            AppError::Conflict("already published".to_string()),
+            AppError::Sqlx(sqlx::Error::PoolTimedOut),
+            AppError::Sqlx(sqlx::Error::RowNotFound),
+        ] {
+            assert!(
+                !is_retryable_snapshot_conflict(&err),
+                "must not retry {err:?}"
+            );
+        }
+    }
+
+    // CONCURRENT creates must both succeed with DISTINCT monotonic numbers.
+    //
+    // The snapshot runs at SERIALIZABLE isolation, where Postgres may abort a
+    // transaction with 40001 ("could not serialize access … might succeed if
+    // retried") — including when unrelated concurrent write traffic makes it a
+    // pivot. Without the retry that is a spurious 500 for the operator; this
+    // pins the retry so racers allocate 1 and 2 instead of one of them failing.
+    #[tokio::test]
+    async fn test_create_version_concurrent_racers_both_succeed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
+
+        let (a, b) = tokio::join!(
+            create_version(&pool, staging, actor),
+            create_version(&pool, staging, actor),
+        );
+        let a = a.expect("racer A must not fail on a serialization conflict");
+        let b = b.expect("racer B must not fail on a serialization conflict");
+
+        let mut numbers = [a.version_number, b.version_number];
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            [1, 2],
+            "concurrent creates must allocate distinct monotonic versions"
+        );
 
         tdh::cleanup(&pool, staging, actor).await;
         tdh::cleanup(&pool, remote, actor).await;
