@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
@@ -34,8 +34,8 @@ use crate::services::auth_service::AuthService;
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
-    validate_trivy_purl, ScanOutput, ScanReferenceResolution, ScanTarget, ScanWorkspace, Scanner,
-    VersionCache,
+    validate_trivy_purl, CatalogedComponent, ScanOutput, ScanReferenceResolution, ScanTarget,
+    ScanWorkspace, Scanner, VersionCache,
 };
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::StorageBackend;
@@ -276,6 +276,35 @@ fn grype_output_indicates_failure(stderr: &str) -> bool {
 ///
 /// Split out from `run_grype_target` as a pure function so the exit-0 error
 /// classification is unit-testable without spawning the real `grype` binary.
+/// Extract the cataloged component list from Grype's `cyclonedx-json` BOM
+/// (#3003): every package syft/grype actually identified in the target,
+/// whether or not it matched a CVE.
+///
+/// Only `type: "library"` components are packages; the BOM also carries
+/// `type: "file"` entries for the files that produced them (e.g. the
+/// lockfile itself), which are not gradeable identities. Returns `None` when
+/// the BOM is unparseable or carries no `components` array at all — an
+/// absent signal, deliberately distinct from `Some(vec![])` ("the engine
+/// cataloged nothing"), which is a fail-closed condition for the caller.
+pub(crate) fn parse_cyclonedx_catalog(bom: &[u8]) -> Option<Vec<CatalogedComponent>> {
+    let v: serde_json::Value = serde_json::from_slice(bom).ok()?;
+    let components = v.get("components")?.as_array()?;
+    Some(
+        components
+            .iter()
+            .filter(|c| c.get("type").and_then(|t| t.as_str()) == Some("library"))
+            .filter_map(|c| {
+                let name = c.get("name")?.as_str()?;
+                let version = c.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                (!name.is_empty() && !version.is_empty()).then(|| CatalogedComponent {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn parse_grype_output(
     success: bool,
     status_display: &str,
@@ -711,6 +740,7 @@ impl GrypeScanner {
             findings,
             packages,
             scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            cataloged: None,
         })
     }
 
@@ -744,6 +774,7 @@ impl GrypeScanner {
                     findings,
                     packages,
                     scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+                    cataloged: None,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -966,11 +997,67 @@ impl GrypeScanner {
     }
 
     /// Run grype against the workspace directory.
-    async fn run_grype(&self, workspace: &Path) -> Result<GrypeReport> {
+    /// Dir-mode scan that ALSO captures what Grype cataloged (#3003).
+    ///
+    /// Grype's `json` report only names CVE-MATCHED artifacts, so a
+    /// zero-match report cannot distinguish "nothing vulnerable here" from
+    /// "nothing was catalogable here" — the blindness that let a vulnerable
+    /// npm tarball and an ordinary PyPI sdist serve as clean. Its
+    /// `cyclonedx-json` presenter emits the FULL catalog (every component
+    /// syft found, matched or not), so we ask for both in the SAME
+    /// invocation: no second scan, no extra extraction, one subprocess.
+    ///
+    /// The catalog is a best-effort side channel: if the BOM cannot be
+    /// written or parsed we return `None` (rather than failing the scan), and
+    /// `None` means "no catalog signal", which the caller's assessment gate
+    /// treats as "keep prior behavior".
+    async fn run_grype_dir_with_catalog(
+        &self,
+        workspace: &Path,
+    ) -> Result<(GrypeReport, Option<Vec<CatalogedComponent>>)> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
-        // Directory (local layout) scans never touch the registry, so no
-        // registry-auth env is needed.
-        self.run_grype_target(&dir_arg, &[]).await
+        // Keep the BOM out of the scanned tree: writing it inside `workspace`
+        // would make the next catalog include our own artifact.
+        let bom_path = workspace.with_extension("grype-bom.json");
+
+        let mut command = tokio::process::Command::new("grype");
+        command
+            .args([
+                dir_arg.as_str(),
+                "-o",
+                "json",
+                "-o",
+                &format!("cyclonedx-json={}", bom_path.to_string_lossy()),
+            ])
+            .env("GRYPE_DB_AUTO_UPDATE", "false")
+            .env("GRYPE_DB_VALIDATE_AGE", "false")
+            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        let output = command
+            .output()
+            .await
+            .map_err(|e| classify_grype_spawn_error(&e))?;
+
+        let report = parse_grype_output(
+            output.status.success(),
+            &output.status.to_string(),
+            &output.stdout,
+            &output.stderr,
+        );
+
+        let catalog = match tokio::fs::read(&bom_path).await {
+            Ok(bytes) => parse_cyclonedx_catalog(&bytes),
+            Err(e) => {
+                debug!(
+                    "Grype catalog BOM unavailable at {}: {}",
+                    bom_path.display(),
+                    e
+                );
+                None
+            }
+        };
+        let _ = tokio::fs::remove_file(&bom_path).await;
+
+        Ok((report?, catalog))
     }
 
     /// Run grype against an arbitrary target string (e.g. `dir:/path`,
@@ -1385,11 +1472,37 @@ impl Scanner for GrypeScanner {
             return self.scan_oci_registry_ref(artifact, image_ref, None).await;
         }
 
-        let workspace =
-            ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
+        self.scan_file_pinned(artifact, content, None).await
+    }
 
-        let report = match self.run_grype(&workspace).await {
-            Ok(report) => report,
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+    ) -> Result<ScanOutput> {
+        self.scan_target_inner(target, metadata, content).await
+    }
+}
+
+impl GrypeScanner {
+    /// Filesystem-artifact scan with an optional inline-proxy component PIN
+    /// (#3003). The pin is materialized into the scan workspace so Grype has
+    /// a gradeable component for the artifact being served, and the resulting
+    /// catalog is surfaced on [`ScanOutput::cataloged`] so the caller can tell
+    /// "clean" apart from "nothing was assessed".
+    async fn scan_file_pinned(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+        pin: Option<&crate::services::scanner_service::ExpectedComponent>,
+    ) -> Result<ScanOutput> {
+        let workspace =
+            ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
+                .await?;
+
+        let (report, cataloged) = match self.run_grype_dir_with_catalog(&workspace).await {
+            Ok(pair) => pair,
             Err(e) => {
                 return Err(
                     fail_scan("Grype scan", artifact, &e, &self.scan_workspace, None).await,
@@ -1401,10 +1514,11 @@ impl Scanner for GrypeScanner {
         let packages = Self::convert_packages(&report);
 
         info!(
-            "Grype scan complete for {}: {} vulnerabilities, {} components",
+            "Grype scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
             artifact.name,
             findings.len(),
-            packages.len()
+            packages.len(),
+            cataloged.as_ref().map_or(0, |c| c.len()),
         );
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
@@ -1424,10 +1538,11 @@ impl Scanner for GrypeScanner {
             findings,
             packages,
             scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+            cataloged,
         })
     }
 
-    async fn scan_target(
+    async fn scan_target_inner(
         &self,
         target: &ScanTarget<'_>,
         metadata: Option<&ArtifactMetadata>,
@@ -1454,7 +1569,11 @@ impl Scanner for GrypeScanner {
                 .await;
         }
 
-        self.scan(artifact, metadata, content).await
+        // Filesystem artifact: carry the inline-proxy pin (if any) so the
+        // served component is actually cataloged and graded (#3003).
+        let _ = metadata;
+        self.scan_file_pinned(artifact, content, target.expected_component)
+            .await
     }
 }
 
@@ -1465,6 +1584,72 @@ mod tests {
 
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         make_test_artifact(name, content_type, &format!("test/{}", name))
+    }
+
+    /// #3003: the catalog side channel. Grype's `json` report only names
+    /// CVE-MATCHED artifacts, so the FULL catalog comes from its cyclonedx
+    /// BOM: `library` components are gradeable identities, `file` components
+    /// (the lockfile that produced them) are not.
+    #[test]
+    fn test_parse_cyclonedx_catalog() {
+        let bom = br#"{
+            "components": [
+                {"type": "library", "name": "lodash", "version": "4.17.11"},
+                {"type": "file", "name": "/scan/package-lock.json"},
+                {"type": "library", "name": "isarray", "version": "2.0.5"},
+                {"type": "library", "name": "no-version"}
+            ]
+        }"#;
+        let catalog = parse_cyclonedx_catalog(bom).expect("a BOM with components parses");
+        assert_eq!(
+            catalog,
+            vec![
+                CatalogedComponent {
+                    name: "lodash".into(),
+                    version: "4.17.11".into()
+                },
+                CatalogedComponent {
+                    name: "isarray".into(),
+                    version: "2.0.5".into()
+                },
+            ],
+            "only versioned `library` components are gradeable identities"
+        );
+
+        // The load-bearing distinction: an engine that cataloged NOTHING is
+        // `Some(empty)` (a fail-closed condition), while an unusable/absent
+        // BOM is `None` (no signal — keep prior behavior).
+        assert_eq!(
+            parse_cyclonedx_catalog(br#"{"components": []}"#),
+            Some(vec![])
+        );
+        assert!(parse_cyclonedx_catalog(b"not json").is_none());
+        assert!(parse_cyclonedx_catalog(br#"{"bomFormat":"CycloneDX"}"#).is_none());
+    }
+
+    /// The catalog-capturing dir invocation must ask grype for BOTH the json
+    /// report and the cyclonedx BOM in ONE run — a second scan would double
+    /// the inline budget on every proxy pull.
+    #[test]
+    fn test_catalog_invocation_is_single_run_dual_output() {
+        let src = include_str!("grype_scanner.rs");
+        let start = src
+            .find("async fn run_grype_dir_with_catalog")
+            .expect("run_grype_dir_with_catalog must exist");
+        let body = &src[start..start + 2000];
+        assert!(
+            body.contains("\"-o\",\n                \"json\",") || body.contains("\"json\","),
+            "must request the json report"
+        );
+        assert!(
+            body.contains("cyclonedx-json={}"),
+            "must request the cyclonedx BOM in the same invocation"
+        );
+        assert_eq!(
+            body.matches("Command::new(\"grype\")").count(),
+            1,
+            "exactly one grype subprocess per scan"
+        );
     }
 
     // ---- #2093: registry-auth env builder --------------------------------
@@ -1824,6 +2009,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: Some(helm_body),
+            expected_component: None,
         };
         assert!(
             !grype().is_applicable_for_target(&target),
@@ -1851,6 +2037,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: Some(image_body),
+            expected_component: None,
         };
         assert!(grype().is_applicable_for_target(&target));
     }
@@ -2138,6 +2325,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -2184,6 +2372,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -2250,6 +2439,7 @@ mod tests {
             db: Some(&fx.pool),
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
+            expected_component: None,
         };
 
         let layout = scanner
@@ -2354,6 +2544,7 @@ mod tests {
             db: Some(&fx.pool),
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
+            expected_component: None,
         };
 
         let layout = scanner
@@ -2432,6 +2623,7 @@ mod tests {
             db: None,
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
+            expected_component: None,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -2478,6 +2670,7 @@ mod tests {
             db: Some(&fx.pool),
             storage: None,
             manifest_body: None,
+            expected_component: None,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 

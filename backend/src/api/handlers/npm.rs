@@ -2762,6 +2762,7 @@ async fn serve_tarball(
                     repo.id,
                     repo_key,
                     upstream_url,
+                    package_name,
                     &fetch_path,
                     &response_filename,
                     ctx,
@@ -3044,6 +3045,54 @@ async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::U
 // synthetic-artifact shape, and response builder.
 // ---------------------------------------------------------------------------
 
+/// The npm version a tarball filename encodes for `package_name`, per the
+/// registry's invariant filename shape `{basename}-{version}.tgz` (#3003).
+///
+/// `basename` is the unscoped half of the name (`@acme/widget` → `widget`), so
+/// this resolves scoped and unscoped packages identically. Returns `None` when
+/// the filename does not have that shape for this package — which the serve
+/// path treats as inconclusive rather than guessing, because the version is
+/// half of the identity the CVE engine must grade.
+fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Option<String> {
+    let basename = package_name.rsplit('/').next().unwrap_or(package_name);
+    let stem = filename.strip_suffix(".tgz")?;
+    let version = stem.strip_prefix(&format!("{basename}-"))?;
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// The `name`/`version` an npm tarball claims for ITSELF, read from the
+/// `package/package.json` that `npm pack` always writes (#3003).
+///
+/// Returns `None` when the entry is absent, unparseable, or carries a
+/// non-string / empty name or version — including the JSON-number version
+/// shape. Every one of those is "this tarball does not state a usable
+/// identity", which the caller must treat as inconclusive, never clean.
+fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
+    let body = crate::util::bounded_archive::read_metadata_from_tar_gz(&tarball[..], |path| {
+        path == std::path::Path::new("package/package.json")
+    })
+    .ok()??;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let name = v.get("name")?.as_str()?.trim().to_string();
+    let version = v.get("version")?.as_str()?.trim().to_string();
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// Whether the identity a tarball claims for itself agrees with the coordinate
+/// it is being served at (#3003).
+///
+/// npm names are lowercase by construction, but compare case-insensitively so a
+/// legacy mixed-case publication is not spuriously withheld. Version equality
+/// is exact: a tarball claiming a different version than the URL pins is not
+/// the artifact the consumer asked for.
+fn npm_identity_agrees(
+    requested_name: &str,
+    requested_version: &str,
+    claimed: &(String, String),
+) -> bool {
+    claimed.0.eq_ignore_ascii_case(requested_name) && claimed.1 == requested_version
+}
+
 /// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
 /// the leaf scanners run over for a proxied npm tarball. There is NO
 /// `artifacts` row (proxy-cached bytes are deliberately not persisted as
@@ -3120,6 +3169,7 @@ async fn serve_scanned_npm_tarball(
     repo_id: uuid::Uuid,
     repo_key: &str,
     upstream_url: &str,
+    package_name: &str,
     fetch_path: &str,
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
@@ -3199,9 +3249,53 @@ async fn serve_scanned_npm_tarball(
     correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
 
     let digest = proxy_helpers::sha256_hex(&bytes);
+
+    // #3003: establish WHAT these bytes are being served as.
+    //
+    // The coordinate comes from the REQUEST (route package name + the
+    // registry's invariant `{basename}-{version}.tgz` filename), never from
+    // bytes the upstream controls, and the tarball's own `package/package.json`
+    // must agree with it. A tarball that states a different identity, states
+    // none, or states an unusable one (missing/empty/non-string version) is
+    // unassessable: any scan of it would grade something other than the package
+    // the consumer is about to install under this coordinate.
+    //
+    // This is only consulted when the shared gate actually needs to SCAN — a
+    // cached vulnerable verdict for this digest still blocks first, from cache.
+    let identity = match npm_version_from_tarball_filename(package_name, filename) {
+        Some(version) => match npm_claimed_identity(&bytes) {
+            Some(claimed) if npm_identity_agrees(package_name, &version, &claimed) => {
+                proxy_helpers::ProxyScanIdentity::Established(
+                    crate::services::scanner_service::ExpectedComponent::new(
+                        crate::services::scanner_service::ComponentEcosystem::Npm,
+                        package_name,
+                        &version,
+                    ),
+                )
+            }
+            other => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    requested = %format!("{package_name}@{version}"),
+                    claimed = ?other,
+                    "npm proxy tarball does not state the identity it is served as"
+                );
+                proxy_helpers::ProxyScanIdentity::Unestablished
+            }
+        },
+        None => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                package = %package_name,
+                "npm proxy tarball filename does not encode a version for this package"
+            );
+            proxy_helpers::ProxyScanIdentity::Unestablished
+        }
+    };
+
     let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
     match proxy_helpers::gate_proxy_scan_serve(
-        state, repo_id, filename, &digest, synthetic, &bytes, action,
+        state, repo_id, filename, &digest, synthetic, &bytes, action, identity,
     )
     .await
     {
@@ -9175,7 +9269,7 @@ mod proxy_scan_block_tests {
         upstream: &wiremock::MockServer,
         package: &str,
         filename: &str,
-        tarball: &'static [u8],
+        tarball: &[u8],
         expected_fetches: Option<u64>,
     ) {
         use wiremock::matchers::{method, path};
@@ -9184,7 +9278,7 @@ mod proxy_scan_block_tests {
             .and(path(format!("/{package}/-/{filename}")))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_bytes(tarball)
+                    .set_body_bytes(tarball.to_vec())
                     .insert_header("Content-Type", "application/octet-stream"),
             );
         if let Some(n) = expected_fetches {
@@ -9230,6 +9324,272 @@ mod proxy_scan_block_tests {
         assert!(a.storage_key.is_empty());
     }
 
+    /// Build an npm-shaped `.tgz` whose `package/package.json` is exactly
+    /// `body` (or omit the file entirely when `body` is `None`), so the
+    /// crafted-identity shapes are exercised over real tarball bytes.
+    fn crafted_tgz(package_json: Option<&[u8]>) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            if let Some(body) = package_json {
+                let mut header = tar::Header::new_gnu();
+                header.set_path("package/package.json").unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            let index = b"module.exports = 1;\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("package/index.js").unwrap();
+            header.set_size(index.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, index.as_ref()).unwrap();
+            builder.finish().unwrap();
+        }
+        gz.flush().unwrap();
+        Bytes::from(gz.finish().unwrap())
+    }
+
+    /// A real npm-shaped `.tgz` that honestly states `name@version` — what the
+    /// registry serves, and what the identity gate requires before a scan of
+    /// it can be vouched for.
+    fn honest_tgz(name: &str, version: &str) -> Bytes {
+        crafted_tgz(Some(
+            serde_json::json!({ "name": name, "version": version })
+                .to_string()
+                .as_bytes(),
+        ))
+    }
+
+    /// #3003: the served version comes from the registry's invariant filename
+    /// shape, for scoped and unscoped packages alike — never from the bytes.
+    #[test]
+    fn test_npm_version_from_tarball_filename() {
+        assert_eq!(
+            npm_version_from_tarball_filename("lodash", "lodash-4.17.11.tgz").as_deref(),
+            Some("4.17.11")
+        );
+        // Scoped: the filename uses the UNSCOPED basename.
+        assert_eq!(
+            npm_version_from_tarball_filename("@acme/widget", "widget-1.0.0.tgz").as_deref(),
+            Some("1.0.0")
+        );
+        // Prerelease/build metadata is part of the version, not a delimiter.
+        assert_eq!(
+            npm_version_from_tarball_filename("pkg", "pkg-1.0.0-beta.1.tgz").as_deref(),
+            Some("1.0.0-beta.1")
+        );
+        // Shapes we must NOT guess at.
+        assert!(npm_version_from_tarball_filename("lodash", "other-1.0.0.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-1.0.0.tar.gz").is_none());
+    }
+
+    /// #3003: what the tarball claims about itself — and the shapes that mean
+    /// "this tarball states no usable identity" (red-team shapes c and d).
+    #[test]
+    fn test_npm_claimed_identity_shapes() {
+        let honest = crafted_tgz(Some(br#"{"name":"lodash","version":"4.17.11"}"#));
+        assert_eq!(
+            npm_claimed_identity(&honest),
+            Some(("lodash".to_string(), "4.17.11".to_string()))
+        );
+
+        // (c) no package.json at all.
+        assert!(npm_claimed_identity(&crafted_tgz(None)).is_none());
+        // (d) version as a JSON NUMBER, not a string.
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash","version":4.17}"#)))
+                .is_none()
+        );
+        // Missing / empty halves.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash"}"#))).is_none());
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"","version":"1.0.0"}"#))).is_none()
+        );
+        // Not even valid JSON.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
+    }
+
+    /// #3003 (red-team shape a): a tarball whose package.json was rewritten to
+    /// a benign identity does NOT agree with the coordinate it is served at.
+    #[test]
+    fn test_npm_identity_agreement() {
+        assert!(npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.11".into())
+        ));
+        // Legacy mixed-case publication still agrees.
+        assert!(npm_identity_agrees(
+            "@acme/Widget",
+            "1.0.0",
+            &("@acme/widget".into(), "1.0.0".into())
+        ));
+        // (a) rewritten to a benign name.
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("totally-benign".into(), "1.0.0".into())
+        ));
+        // Rewritten to a benign VERSION of the right name (e.g. a patched one).
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.21".into())
+        ));
+    }
+
+    /// #3003 END-TO-END, red-team Finding 1: each crafted shape that defeats
+    /// content-derived identity must be WITHHELD under fail_closed (423),
+    /// never served 200-clean. The state has no scanner service, so a 200 here
+    /// could only mean the gate let unassessed bytes through.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_shapes_are_withheld() {
+        let shapes: Vec<(&str, Option<&[u8]>)> = vec![
+            // (a) identity rewritten to something benign.
+            (
+                "rewritten-identity",
+                Some(br#"{"name":"totally-benign","version":"1.0.0"}"#),
+            ),
+            // (c) package.json removed entirely.
+            ("no-package-json", None),
+            // (d) version as a JSON number.
+            (
+                "numeric-version",
+                Some(br#"{"name":"lodash","version":4.17}"#),
+            ),
+            // Right name, wrong version.
+            (
+                "version-mismatch",
+                Some(br#"{"name":"lodash","version":"4.17.21"}"#),
+            ),
+        ];
+
+        for (label, package_json) in shapes {
+            let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+                return;
+            };
+            let tarball = crafted_tgz(package_json);
+            let upstream = wiremock::MockServer::start().await;
+            {
+                use wiremock::matchers::{method, path};
+                use wiremock::{Mock, ResponseTemplate};
+                Mock::given(method("GET"))
+                    .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(tarball.to_vec())
+                            .insert_header("Content-Type", "application/octet-stream"),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            point_upstream(&fx, &upstream).await;
+            enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "lodash",
+                "lodash-4.17.11.tgz",
+                &Default::default(),
+            )
+            .await;
+
+            let digest = sha256_hex(&tarball);
+            cleanup_proxy_scan_row(&fx.pool, &digest).await;
+            fx.teardown().await;
+
+            match result {
+                Ok(r) => panic!(
+                    "{label}: a tarball that does not state the identity it is served \
+                     as must be withheld under fail_closed, got {}",
+                    r.status()
+                ),
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::LOCKED,
+                    "{label}: expected 423 (inconclusive), not a clean serve"
+                ),
+            }
+        }
+    }
+
+    /// Availability control for the shapes above: under fail_OPEN the same
+    /// unassessable tarball still serves, loudly marked pending — the
+    /// hardening tightens fail_closed without changing the latency-first
+    /// posture operators opted into.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_serves_pending_under_fail_open() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = crafted_tgz(Some(br#"{"name":"totally-benign","version":"1.0.0"}"#));
+        let upstream = wiremock::MockServer::start().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(tarball.to_vec())
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "lodash",
+            "lodash-4.17.11.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail_open must still serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        cleanup_proxy_scan_row(&fx.pool, &sha256_hex(&tarball)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan.as_deref(),
+            Some("pending"),
+            "an unassessable serve under fail_open must be loudly marked pending"
+        );
+    }
+
     /// Fail-closed + inconclusive scan (no scanner service on the state) must
     /// 423, never serve unscanned tarball bytes — npm inherits the #2954
     /// fail-closed contract through the shared gate.
@@ -9238,14 +9598,14 @@ mod proxy_scan_block_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-        let tarball: &[u8] = b"\x1f\x8b sealed-npm-tarball-3003-fail-closed";
+        let tarball = honest_tgz("sealed-widget", "1.0.0");
 
         let upstream = wiremock::MockServer::start().await;
         mount_tarball_upstream(
             &upstream,
             "sealed-widget",
             "sealed-widget-1.0.0.tgz",
-            tarball,
+            &tarball,
             None,
         )
         .await;
@@ -9288,14 +9648,14 @@ mod proxy_scan_block_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-        let tarball: &[u8] = b"\x1f\x8b open-npm-tarball-3003-fail-open";
+        let tarball = honest_tgz("open-widget", "2.0.0");
 
         let upstream = wiremock::MockServer::start().await;
         mount_tarball_upstream(
             &upstream,
             "open-widget",
             "open-widget-2.0.0.tgz",
-            tarball,
+            &tarball,
             None,
         )
         .await;
@@ -9339,9 +9699,7 @@ mod proxy_scan_block_tests {
         let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
             .await
             .expect("body");
-        let digest = sha256_hex(&Bytes::from_static(
-            b"\x1f\x8b open-npm-tarball-3003-fail-open",
-        ));
+        let digest = sha256_hex(&tarball);
         cleanup_proxy_scan_row(&fx.pool, &digest).await;
         fx.teardown().await;
 
@@ -9353,7 +9711,11 @@ mod proxy_scan_block_tests {
         );
         assert_eq!(ct.as_deref(), Some(NPM_TARBALL_CONTENT_TYPE));
         assert_eq!(digest_header.as_deref(), Some(digest.as_str()));
-        assert_eq!(&body[..], tarball, "served bytes must equal upstream bytes");
+        assert_eq!(
+            &body[..],
+            &tarball[..],
+            "served bytes must equal upstream bytes"
+        );
     }
 
     /// A fresh cached VULNERABLE verdict for the tarball digest blocks with
@@ -9603,17 +9965,15 @@ mod proxy_scan_block_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-        let tarball: &[u8] = b"\x1f\x8b staleclean-npm-tarball-3003-bumped";
-        let digest = sha256_hex(&Bytes::from_static(
-            b"\x1f\x8b staleclean-npm-tarball-3003-bumped",
-        ));
+        let tarball = honest_tgz("staleclean-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
 
         let upstream = wiremock::MockServer::start().await;
         mount_tarball_upstream(
             &upstream,
             "staleclean-widget",
             "staleclean-widget-1.0.0.tgz",
-            tarball,
+            &tarball,
             None,
         )
         .await;
@@ -9685,17 +10045,15 @@ mod proxy_scan_block_tests {
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-        let tarball: &[u8] = b"\x1f\x8b probenone-npm-tarball-3003-failclosed";
-        let digest = sha256_hex(&Bytes::from_static(
-            b"\x1f\x8b probenone-npm-tarball-3003-failclosed",
-        ));
+        let tarball = honest_tgz("probenone-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
 
         let upstream = wiremock::MockServer::start().await;
         mount_tarball_upstream(
             &upstream,
             "probenone-widget",
             "probenone-widget-1.0.0.tgz",
-            tarball,
+            &tarball,
             None,
         )
         .await;

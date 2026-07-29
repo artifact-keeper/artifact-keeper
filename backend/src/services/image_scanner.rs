@@ -1047,6 +1047,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: Some(helm_body),
+            expected_component: None,
         };
         assert!(!scanner.is_applicable_for_target(&target));
     }
@@ -1070,6 +1071,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: Some(image_body),
+            expected_component: None,
         };
         assert!(scanner.is_applicable_for_target(&target));
     }
@@ -1091,6 +1093,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
         };
         assert!(scanner.is_applicable_for_target(&target));
     }
@@ -1368,6 +1371,7 @@ mod tests {
             db: None,
             storage: None,
             manifest_body: None,
+            expected_component: None,
         };
         let result = scanner.scan_target(&target, None, &Bytes::new()).await;
         assert!(

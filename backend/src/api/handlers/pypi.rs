@@ -2802,13 +2802,41 @@ async fn serve_scanned_pypi_file(
 
     let digest = sha256_hex(&bytes);
 
+    // #3003: the identity these bytes are being served as. `project` is the
+    // requested distribution and the version comes from the filename, so the
+    // coordinate is request-derived, never upstream-controlled.
+    //
+    // This is what finally grades an SDIST. syft/grype catalog a wheel from its
+    // `.dist-info/METADATA`, but an sdist ships only a ROOT `PKG-INFO`, which
+    // syft does not catalog — so a vulnerable sdist scanned with zero cataloged
+    // components, reported zero findings, and served 200 "clean" while the same
+    // release's wheel was correctly blocked. Pinning the coordinate gives the
+    // CVE engine the component to grade, and the shared assessment gate refuses
+    // to call the result clean unless it actually graded it.
+    //
+    // Filenames we cannot parse a version from keep the prior behavior (no
+    // pin, no assessment gate) rather than newly withholding an odd-but-legit
+    // artifact.
+    let identity = match version_from_pypi_filename(filename) {
+        Some(version) => proxy_helpers::ProxyScanIdentity::Established(
+            crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                project,
+                &version,
+            ),
+        ),
+        // An unparseable filename keeps the pre-#3003 behavior rather than
+        // newly withholding an odd-but-legitimate artifact.
+        None => proxy_helpers::ProxyScanIdentity::NotApplicable,
+    };
+
     // Digest-keyed verdict gate, shared with every proxy format (#3003):
     // lookup → `decide_serve` (freshness incl. the #2976 unknown-live-version
     // fail-closed tightening) → inline scan / async scan per the action, with
     // the #2954 fail-closed contract enforced inside the shared scanner loop.
     let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
     match proxy_helpers::gate_proxy_scan_serve(
-        state, repo_id, filename, &digest, synthetic, &bytes, action,
+        state, repo_id, filename, &digest, synthetic, &bytes, action, identity,
     )
     .await
     {

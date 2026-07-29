@@ -5068,10 +5068,11 @@ pub(crate) async fn proxy_scan_and_record(
     digest: &str,
     synthetic: &crate::models::artifact::Artifact,
     bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
 ) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
     let scanner = state.scanner_service.as_ref()?;
     let filename = synthetic.name.clone();
-    let scan_fut = scanner.scan_content(synthetic, bytes);
+    let scan_fut = scanner.scan_content_expecting(synthetic, bytes, expected);
     let verdict = match tokio::time::timeout(
         crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
         scan_fut,
@@ -5117,6 +5118,29 @@ pub(crate) async fn proxy_scan_and_record(
     Some(verdict)
 }
 
+/// What the serve path was able to establish about WHAT these bytes are being
+/// served as, before any scanning (#3003).
+///
+/// The CVE engine grades a component identity, not a blob, so a scan is only
+/// meaningful once the identity is known — and an engine with nothing to grade
+/// reports zero findings, which is indistinguishable from clean. Formats
+/// therefore state explicitly whether they could establish the coordinate.
+pub(crate) enum ProxyScanIdentity {
+    /// The coordinate these bytes are served as, derived from the REQUEST (not
+    /// from upstream-controlled bytes) and agreed to by the artifact itself.
+    /// Turns on the assessment gate: the engine must actually catalog this
+    /// identity before a `clean` verdict is trusted.
+    Established(crate::services::scanner_service::ExpectedComponent),
+    /// The format expects a coordinate but could NOT establish one for these
+    /// bytes (identity absent, unusable, or disagreeing with the coordinate
+    /// they are served at). Nothing a scanner returned could be vouched for,
+    /// so this is inconclusive — fail-closed withholds, fail-open serves loudly
+    /// pending, exactly like any other inconclusive scan.
+    Unestablished,
+    /// This format does not supply a coordinate. Pre-#3003 behavior, unchanged.
+    NotApplicable,
+}
+
 /// Outcome of [`gate_proxy_scan_serve`], mapped by the caller onto its
 /// format-specific 200 response (`pending` selects the `X-AK-Scan` header
 /// value) or returned as the block/lock response as-is.
@@ -5138,6 +5162,7 @@ pub(crate) enum ProxyScanServeOutcome {
 ///
 /// `synthetic` is the format-specific scan identity for these bytes; it is
 /// also what the async fail-open scan runs over.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
     repo_id: Uuid,
@@ -5146,6 +5171,7 @@ pub(crate) async fn gate_proxy_scan_serve(
     synthetic: crate::models::artifact::Artifact,
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
+    identity: ProxyScanIdentity,
 ) -> ProxyScanServeOutcome {
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
@@ -5178,7 +5204,24 @@ pub(crate) async fn gate_proxy_scan_serve(
         ServeDecision::ServeCached => ProxyScanServeOutcome::Serve { pending: false },
         ServeDecision::ScanInline => {
             // Fail-closed: scan inline before serving a single byte.
-            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes).await {
+            //
+            // An artifact whose identity could not be established is withheld
+            // WITHOUT scanning: the scan could only produce a zero-finding
+            // result over content the engine cannot grade, and reporting that
+            // as clean is precisely the hole this closes.
+            let expected = match &identity {
+                ProxyScanIdentity::Unestablished => {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename, digest = %digest,
+                        "cannot establish what these bytes are served as; \
+                         fail-closed -> withholding rather than reporting clean"
+                    );
+                    return ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename));
+                }
+                ProxyScanIdentity::Established(e) => Some(e),
+                ProxyScanIdentity::NotApplicable => None,
+            };
+            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected).await {
                 Some(verdict) if verdict.is_vulnerable() => {
                     tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
                     ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
@@ -5213,10 +5256,26 @@ pub(crate) async fn gate_proxy_scan_serve(
             let state_bg = state.clone();
             let digest_bg = digest.to_string();
             let bytes_bg = bytes.clone();
+            let expected = match identity {
+                // Nothing to assess: serve loudly pending (fail-open's
+                // posture) but do not run a scan whose only possible result
+                // would be an unfounded `clean` row for this digest.
+                ProxyScanIdentity::Unestablished => {
+                    return ProxyScanServeOutcome::Serve { pending: true }
+                }
+                ProxyScanIdentity::Established(e) => Some(e),
+                ProxyScanIdentity::NotApplicable => None,
+            };
             tokio::spawn(async move {
-                let _ =
-                    proxy_scan_and_record(&state_bg, repo_id, &digest_bg, &synthetic, &bytes_bg)
-                        .await;
+                let _ = proxy_scan_and_record(
+                    &state_bg,
+                    repo_id,
+                    &digest_bg,
+                    &synthetic,
+                    &bytes_bg,
+                    expected.as_ref(),
+                )
+                .await;
             });
             ProxyScanServeOutcome::Serve { pending: true }
         }
