@@ -139,6 +139,9 @@ pub struct ScanConfig {
     pub scan_on_proxy: bool,
     pub block_on_policy_violation: bool,
     pub severity_threshold: String,
+    /// #2954: fail-open (default) vs fail-closed action for the inline proxy
+    /// scan-on-fetch. `'fail_open'` | `'fail_closed'`.
+    pub proxy_scan_action: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -467,6 +470,7 @@ mod tests {
             scan_on_proxy: false,
             block_on_policy_violation: true,
             severity_threshold: "critical".to_string(),
+            proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -483,6 +487,7 @@ mod tests {
             scan_on_proxy: false,
             block_on_policy_violation: false,
             severity_threshold: "garbage".to_string(),
+            proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

@@ -529,6 +529,34 @@ async fn fetch_quarantine_fields(
     Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.quarantine_reason)))
 }
 
+/// Fetch the quarantine status/expiry AND the owning repository_id in one query
+/// (#2954). The download gate needs the repository_id to evaluate scan policy;
+/// folding it into the same SELECT the quarantine check already runs keeps the
+/// gate to a single read on the hot download path. Returns `Ok(None)` when no
+/// matching (non-deleted) row exists, so an absent artifact stays a no-op.
+async fn fetch_quarantine_fields_with_repo(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>, Uuid)>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        repository_id: Uuid,
+    }
+
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT quarantine_status, quarantine_until, repository_id \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.repository_id)))
+}
+
 /// Fetch the current quarantine status and expiry for an artifact.
 pub async fn get_status(
     db: &PgPool,
@@ -587,12 +615,68 @@ pub async fn get_status_with_repo(db: &PgPool, artifact_id: Uuid) -> Result<Quar
 /// This is the common quarantine gate for all download paths. It queries the
 /// artifact's quarantine fields and returns an error if the artifact is
 /// quarantined (409 Conflict) or rejected (403 Forbidden).
+///
+/// As of #2954 this delegates to [`enforce_download_gate`], which additionally
+/// consults the repository's scan policy after the quarantine check. Repos with
+/// no enabled scan policy are unaffected: `PolicyService::evaluate_artifact`
+/// no-ops to `allowed` when no policy matches, so today's behavior is preserved
+/// for operators who have not opted in.
 pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
-    if let Some((status, until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? {
-        check_download_allowed(status.as_deref(), until, Utc::now())?;
-    }
+    enforce_download_gate(db, artifact_id).await
+}
 
-    Ok(())
+/// The shared download choke point (#2954): enforce quarantine THEN scan policy.
+///
+/// This folds `PolicyService::evaluate_artifact` — which enforces
+/// `block_unscanned` / `block_on_fail` / `max_severity`
+/// (`block_on_policy_violation`) and previously only ran on the promotion gate —
+/// into the single function every ~30 per-format download handler already calls,
+/// so scan-policy blocking lights up on the raw download path for all formats at
+/// once (it was a false affordance before: a hosted artifact with CVE findings
+/// was downloadable unless a scan happened to auto-quarantine it).
+///
+/// Ordering is deliberate: the quarantine state is checked FIRST (a quarantined
+/// artifact is a 409 before any policy consideration), then the scan policy. A
+/// disallowed policy result maps to 403.
+///
+/// Guardrail: when the artifact row is absent (deleted / never existed) this is
+/// a no-op `Ok(())`, exactly as the pre-#2954 quarantine-only check was, and
+/// when no enabled scan policy matches the repo the policy evaluation returns
+/// `allowed` — so a repo without a scan policy sees NO change.
+pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()> {
+    let Some((status, until, repository_id)) =
+        fetch_quarantine_fields_with_repo(db, artifact_id).await?
+    else {
+        // Artifact absent: preserve the pre-#2954 no-op behavior.
+        return Ok(());
+    };
+
+    // Quarantine gate first (409 quarantined / 403 rejected).
+    check_download_allowed(status.as_deref(), until, Utc::now())?;
+
+    // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
+    let policy_result = crate::services::policy_service::PolicyService::new(db.clone())
+        .evaluate_artifact(artifact_id, repository_id)
+        .await?;
+    policy_gate_result(policy_result.allowed)
+}
+
+/// Map a scan-policy `allowed` decision onto the download gate result (#2954).
+///
+/// Split out from [`enforce_download_gate`] so the "disallowed → 403 with a
+/// neutral, non-disclosing message" contract is pure and unit-testable. The
+/// message deliberately omits the violated policy names / per-artifact finding
+/// counts: the download route is anonymous-readable for public repos, so those
+/// details must not leak here (mirrors [`check_download_allowed`]). Authorized
+/// callers read specifics from the authenticated security endpoints.
+fn policy_gate_result(allowed: bool) -> Result<()> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
 }
 
 /// Validate that a quarantine duration is at least 1 minute.
@@ -612,6 +696,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // should_quarantine
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // policy_gate_result (#2954 hosted download gate)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_gate_allowed_is_ok() {
+        // No-policy repos / clean-and-scanned artifacts evaluate to allowed:
+        // the gate must be a pass-through (the regression guardrail).
+        assert!(policy_gate_result(true).is_ok());
+    }
+
+    #[test]
+    fn test_policy_gate_disallowed_is_403() {
+        // A blocking policy maps to 403 Forbidden (AppError::Authorization) with
+        // a non-disclosing message.
+        let err = policy_gate_result(false).unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "disallowed policy must be a 403 Authorization error"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scan policy"),
+            "message should name the scan policy generically: {msg}"
+        );
+        // Must NOT leak specific policy names or finding counts.
+        assert!(
+            !msg.contains("critical"),
+            "must not disclose finding detail"
+        );
+    }
 
     #[test]
     fn test_should_quarantine_enabled() {

@@ -81,6 +81,23 @@ pub(crate) const ZERO_FINDINGS_DEDUP_TTL_DAYS: i32 = 1;
 /// still capping a hostile or runaway upload.
 pub(crate) const MAX_SCAN_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// Hard byte ceiling for the inline proxy scan-on-fetch buffer (#2954).
+///
+/// The proxy download miss path deliberately STREAMS the upstream body so a
+/// multi-hundred-MiB wheel never sits in memory (#895 OOM). Buffering to scan
+/// reintroduces that risk, so the buffer is capped: an object larger than this
+/// is never buffered. Over-cap objects fall back to the streaming serve under
+/// the fail-open path, or return 423 under fail-closed — never an unbounded
+/// buffer. 200 MiB covers essentially every real wheel/sdist while bounding
+/// worst-case per-request memory.
+pub const PROXY_SCAN_MAX_BYTES: usize = 200 * 1024 * 1024;
+
+/// Wall-clock budget for a single inline proxy scan (#2954). A cold Grype scan
+/// of a fresh wheel is seconds; this bounds the added `pip install` latency so a
+/// slow or contended scan cannot stall the pull indefinitely. Budget exceeded
+/// is treated as inconclusive (fail-open serves-with-pending, fail-closed 423).
+pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
+
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
 /// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
@@ -1959,6 +1976,80 @@ pub struct ScanTarget<'a> {
     pub manifest_body: Option<&'a [u8]>,
 }
 
+/// Aggregated verdict from an inline proxy scan over raw bytes (#2954).
+///
+/// Produced by [`ScannerService::scan_content`], which runs the leaf scanners
+/// over a synthetic in-memory [`Artifact`] + `Bytes` with NO `artifacts` row
+/// (proxy-cached bytes are intentionally not persisted as artifacts —
+/// #1278/#1280). The counts feed the digest-keyed `proxy_scan_results` store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyScanVerdict {
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    /// Highest severity observed across all findings, for policy comparison.
+    pub max_severity: Option<Severity>,
+    /// Scanner binary/DB version string (e.g. `grype-0.83.0`), for CVE-DB
+    /// freshness gating of a reused verdict.
+    pub scanner_version: Option<String>,
+}
+
+impl ProxyScanVerdict {
+    /// A vulnerable verdict is any non-zero finding count. Whether that BLOCKS a
+    /// pull is a policy decision made by the caller against the repo's action.
+    pub fn is_vulnerable(&self) -> bool {
+        self.findings_count > 0
+    }
+
+    /// The stored `proxy_scan_results.verdict` token for this result.
+    pub fn verdict_token(&self) -> &'static str {
+        if self.is_vulnerable() {
+            crate::services::proxy_scan_service::VERDICT_VULNERABLE
+        } else {
+            crate::services::proxy_scan_service::VERDICT_CLEAN
+        }
+    }
+
+    /// Lowercase token for the highest observed severity (schema-compatible).
+    pub fn max_severity_token(&self) -> Option<&'static str> {
+        self.max_severity.map(severity_token)
+    }
+}
+
+/// Stable lowercase token for a [`Severity`], matching the DB CHECK vocabulary.
+pub fn severity_token(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "info",
+    }
+}
+
+/// Fold a flat list of [`RawFinding`]s (from one or more scanners run over the
+/// same bytes) into a [`ProxyScanVerdict`]. Pure: no DB, no I/O — the security-
+/// relevant verdict logic is unit-testable over a synthetic finding list.
+pub fn aggregate_proxy_verdict(
+    findings: &[RawFinding],
+    scanner_version: Option<String>,
+) -> ProxyScanVerdict {
+    let count = |sev: Severity| findings.iter().filter(|f| f.severity == sev).count() as i32;
+    // Severity is ordered Critical=0 .. Info=4, so `min` is the highest.
+    let max_severity = findings.iter().map(|f| f.severity).min();
+    ProxyScanVerdict {
+        findings_count: findings.len() as i32,
+        critical_count: count(Severity::Critical),
+        high_count: count(Severity::High),
+        medium_count: count(Severity::Medium),
+        low_count: count(Severity::Low),
+        max_severity,
+        scanner_version,
+    }
+}
+
 /// A pluggable vulnerability scanner.
 #[async_trait]
 pub trait Scanner: Send + Sync {
@@ -3477,6 +3568,77 @@ impl ScannerService {
     ) -> Result<()> {
         self.scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
             .await
+    }
+
+    /// Run the leaf scanners over raw in-memory bytes with NO `artifacts` row
+    /// and NO `scan_results` persistence (#2954 inline proxy scan-on-fetch).
+    ///
+    /// This is the seam that makes proxy scan-on-fetch feasible: the scanner
+    /// CORE (`Scanner::scan` — e.g. `GrypeScanner` running `grype dir:<ws>` over
+    /// the bytes) never needs a DB row. `synthetic` is an [`Artifact`] the
+    /// caller fabricates from the proxied object's filename/digest so the
+    /// per-scanner applicability + workspace naming behave exactly as for a
+    /// hosted artifact; the returned [`ProxyScanVerdict`] is stored digest-keyed
+    /// in `proxy_scan_results` by the caller, never in `scan_results`.
+    ///
+    /// The scanner's per-tenant fair-share extraction permit is acquired for the
+    /// duration so a burst of inline pulls cannot starve upload scans (#2555).
+    /// Any scanner error is surfaced to the caller so the fail-open/closed
+    /// decision can treat it as inconclusive rather than silently "clean".
+    pub async fn scan_content(
+        &self,
+        synthetic: &Artifact,
+        content: &Bytes,
+    ) -> Result<ProxyScanVerdict> {
+        // Fair-share + global cap: inline scans queue behind the same semaphore
+        // as upload scans instead of contending for unbounded extraction slots.
+        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+
+        let mut findings: Vec<RawFinding> = Vec::new();
+        let mut scanner_version: Option<String> = None;
+        // Track whether at least one applicable scanner actually ran. A single
+        // scanner failing (e.g. an optional Trivy adapter that is down) must NOT
+        // abort the whole scan — the orchestrator `scan_artifact_inner` skips a
+        // failed scanner and keeps going, and Grype (the always-bundled CVE
+        // engine) is what produces the CVE verdict. If NO scanner ran we return
+        // an error so the caller treats it as inconclusive rather than a false
+        // "clean" (fail-closed then 423s instead of serving unscanned bytes).
+        let mut any_ran = false;
+
+        for scanner in &self.scanners {
+            // Applicability gates on the synthetic artifact's path/content-type,
+            // exactly as the orchestrator gates a hosted artifact.
+            if !scanner.is_applicable(synthetic) {
+                continue;
+            }
+            match scanner.scan(synthetic, None, content).await {
+                Ok(output) => {
+                    any_ran = true;
+                    // Capture the first available scanner version as provenance
+                    // for CVE-DB freshness (Grype reports one).
+                    if scanner_version.is_none() {
+                        scanner_version = scanner.version().await;
+                    }
+                    findings.extend(output.findings);
+                }
+                Err(e) => {
+                    warn!(
+                        "Inline proxy scan: scanner {} failed on {} ({}); skipping this scanner",
+                        scanner.name(),
+                        synthetic.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        if !any_ran {
+            return Err(AppError::Internal(
+                "no applicable scanner completed for inline proxy scan".to_string(),
+            ));
+        }
+
+        Ok(aggregate_proxy_verdict(&findings, scanner_version))
     }
 
     /// Scan a single artifact: run all applicable scanners, persist results,
@@ -8950,6 +9112,63 @@ mod tests {
             source: None,
             source_url: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // aggregate_proxy_verdict / ProxyScanVerdict (#2954 inline proxy scan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_verdict_clean_when_no_findings() {
+        let verdict = aggregate_proxy_verdict(&[], Some("grype-0.83.0".to_string()));
+        assert_eq!(verdict.findings_count, 0);
+        assert!(!verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "clean");
+        assert_eq!(verdict.max_severity, None);
+        assert_eq!(verdict.max_severity_token(), None);
+        assert_eq!(verdict.scanner_version.as_deref(), Some("grype-0.83.0"));
+    }
+
+    #[test]
+    fn test_proxy_verdict_vulnerable_with_critical() {
+        // A single critical finding (the CVE-wheel case) => vulnerable verdict.
+        let findings = vec![make_finding(Severity::Critical)];
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 1);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert_eq!(verdict.critical_count, 1);
+        assert_eq!(verdict.max_severity, Some(Severity::Critical));
+        assert_eq!(verdict.max_severity_token(), Some("critical"));
+    }
+
+    #[test]
+    fn test_proxy_verdict_max_severity_is_highest() {
+        // Mixed findings: max_severity must be the HIGHEST (Critical < .. < Info
+        // in ordinal terms), and per-severity counts must tally.
+        let findings = vec![
+            make_finding(Severity::Low),
+            make_finding(Severity::High),
+            make_finding(Severity::Medium),
+            make_finding(Severity::High),
+        ];
+        let verdict = aggregate_proxy_verdict(&findings, None);
+        assert_eq!(verdict.findings_count, 4);
+        assert_eq!(verdict.high_count, 2);
+        assert_eq!(verdict.medium_count, 1);
+        assert_eq!(verdict.low_count, 1);
+        assert_eq!(verdict.critical_count, 0);
+        assert_eq!(verdict.max_severity, Some(Severity::High));
+        assert_eq!(verdict.max_severity_token(), Some("high"));
+    }
+
+    #[test]
+    fn test_severity_token_vocabulary() {
+        assert_eq!(severity_token(Severity::Critical), "critical");
+        assert_eq!(severity_token(Severity::High), "high");
+        assert_eq!(severity_token(Severity::Medium), "medium");
+        assert_eq!(severity_token(Severity::Low), "low");
+        assert_eq!(severity_token(Severity::Info), "info");
     }
 
     #[test]

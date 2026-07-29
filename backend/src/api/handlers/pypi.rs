@@ -1741,6 +1741,33 @@ async fn serve_file(
                         return Ok(resp);
                     }
 
+                    // #2954: when scan-on-proxy is enabled, route through the
+                    // inline scan-and-block path (buffered fetch + digest-keyed
+                    // verdict gate). It handles the cache internally, so we take
+                    // it INSTEAD of the streaming/redirect cache paths below,
+                    // which serve bytes without consulting a scan verdict. Repos
+                    // that have not enabled scan-on-proxy skip this entirely and
+                    // keep today's untouched streaming behavior (no regression).
+                    if crate::services::scan_config_service::ScanConfigService::new(
+                        state.db.clone(),
+                    )
+                    .is_proxy_scan_enabled(repo.id)
+                    .await
+                    .unwrap_or(false)
+                    {
+                        return serve_scanned_pypi_file(
+                            state,
+                            proxy,
+                            repo.id,
+                            repo_key,
+                            upstream_url,
+                            project,
+                            filename,
+                            ctx,
+                        )
+                        .await;
+                    }
+
                     // Try the proxy cache first using a predictable local
                     // path. This avoids fetching the simple index from upstream
                     // just to rediscover the download URL when the file is
@@ -2492,6 +2519,368 @@ fn build_streaming_file_response(
                 .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
         ))
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// #2954: inline scan-and-block on proxy download (PyPI Phase 1).
+// ---------------------------------------------------------------------------
+
+/// The scan_type stored for the Grype CVE scanner in `proxy_scan_results`.
+const PROXY_SCAN_TYPE: &str = "grype";
+
+/// SHA-256 hex of the fetched bytes. The verdict cache is keyed on the CONTENT
+/// digest we compute ourselves — never an index-advertised digest — so a lying
+/// upstream index cannot bind a clean verdict to malicious bytes (#2954 inv 4).
+fn sha256_hex(bytes: &Bytes) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// that [`ScannerService::scan_content`] runs the leaf scanners over. There is
+/// NO `artifacts` row: proxy-cached bytes are deliberately not persisted as
+/// artifacts (#1278/#1280). The filename drives per-scanner applicability +
+/// workspace naming exactly as for a hosted wheel.
+fn pypi_synthetic_artifact(
+    repo_id: uuid::Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+) -> crate::models::artifact::Artifact {
+    let now = Utc::now();
+    crate::models::artifact::Artifact {
+        id: uuid::Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version: version_from_pypi_filename(filename),
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: pypi_content_type(filename).to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// A 403 for a proxy pull blocked by a vulnerable inline-scan verdict. Body is
+/// neutral: it names the file, not the specific CVEs (the download route is
+/// anonymous-readable for public repos).
+fn scan_blocked_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_blocked",
+        "file": filename,
+        "reason": "blocked by inline vulnerability scan policy",
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// A 423 Locked for the fail-closed inconclusive branch (over-cap / budget /
+/// scan error): the object could not be scanned inline and fail-closed must
+/// NEVER serve unscanned bytes.
+fn scan_pending_locked_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_pending",
+        "file": filename,
+        "reason": "artifact is being scanned; retry shortly",
+    });
+    (
+        StatusCode::LOCKED,
+        [(CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Build a buffered 200 response for scanned bytes. `pending` adds the loud
+/// `X-AK-Scan: pending` header for the fail-open serve-before-verdict path so a
+/// served-unscanned byte is observable (kills the #1274 silent gap).
+fn build_scanned_file_response(
+    filename: &str,
+    bytes: Bytes,
+    content_type: Option<String>,
+    digest: Option<&str>,
+    pending: bool,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| pypi_content_type(filename).to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, ct)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header("X-AK-Scan", if pending { "pending" } else { "clean" });
+    if let Some(d) = digest {
+        builder = builder.header("X-PyPI-File-SHA256", d);
+    }
+    builder.body(Body::from(bytes)).unwrap()
+}
+
+/// Classify a buffered-fetch error as the byte-cap-exceeded case (vs a genuine
+/// upstream 404 / 5xx). Over-cap is the only error the fail-open/closed
+/// inconclusive branch handles specially; every other error is propagated as-is
+/// so a 404 stays a 404.
+fn is_over_cap_error(e: &AppError) -> bool {
+    matches!(e, AppError::BadGateway(m) if m.contains("exceeded") && m.contains("limit"))
+}
+
+/// Run the leaf scanners over the buffered bytes within the inline budget and
+/// persist the digest-keyed verdict. Returns the verdict, or `None` when the
+/// scan was inconclusive (no scanner configured, budget exceeded, or scanner
+/// error) — the caller maps `None` onto the fail-open/closed decision.
+async fn scan_and_record(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    digest: &str,
+    filename: &str,
+    bytes: &Bytes,
+) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
+    let scanner = state.scanner_service.as_ref()?;
+    let synthetic = pypi_synthetic_artifact(repo_id, filename, digest, bytes.len() as i64);
+    let scan_fut = scanner.scan_content(&synthetic, bytes);
+    let verdict = match tokio::time::timeout(
+        crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        scan_fut,
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn!(
+                repo_id = %repo_id, file = %filename, error = %e,
+                "inline proxy scan failed; treating as inconclusive"
+            );
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                repo_id = %repo_id, file = %filename,
+                "inline proxy scan exceeded the budget; treating as inconclusive"
+            );
+            return None;
+        }
+    };
+
+    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    if let Err(e) = pss
+        .record_verdict(
+            digest,
+            PROXY_SCAN_TYPE,
+            verdict.verdict_token(),
+            verdict.findings_count,
+            verdict.critical_count,
+            verdict.high_count,
+            verdict.medium_count,
+            verdict.low_count,
+            verdict.max_severity_token(),
+            verdict.scanner_version.as_deref(),
+            Some(repo_id),
+        )
+        .await
+    {
+        warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
+    }
+    Some(verdict)
+}
+
+/// Inline scan-and-block for a PyPI proxy file download (#2954).
+///
+/// Runs ONLY when scan-on-proxy is enabled for the repo; the caller falls back
+/// to the untouched streaming path otherwise, so repos that have not opted in
+/// see NO change. Flow: buffered capped fetch (cache-first, so a repeat pull is
+/// served from cache with no upstream hit) → content digest → verdict lookup →
+/// serve / block / scan-inline per the fail-open/closed action.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_pypi_file(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+        .proxy_scan_action(repo_id)
+        .await
+        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        &index_path,
+    )
+    .await?;
+
+    // Buffered capped fetch (cache-first). The proxy caches the bytes under
+    // cache_path, so a repeat pull returns from cache with NO upstream fetch.
+    let repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        RepositoryFormat::Pypi,
+    );
+    let (bytes, content_type) = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &repo,
+            &target.fetch_path,
+            &target.cache_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) if is_over_cap_error(&e) => {
+            // Over the byte cap: never buffer unbounded (#895 OOM).
+            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
+                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
+                    warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "proxy object exceeds scan byte cap; fail-closed -> 423"
+                    );
+                    Err(scan_pending_locked_response(filename))
+                }
+                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
+                    // Fail-open oversized: serve via the untouched streaming path
+                    // (loud: X-AK-Scan pending header carried on the stream).
+                    warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "proxy object exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+                    );
+                    let result = fetch_from_pypi_remote_streaming(
+                        proxy,
+                        repo_id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                        &index_path,
+                        RepositoryFormat::Pypi,
+                    )
+                    .await?;
+                    proxy_helpers::record_proxy_download(
+                        state,
+                        repo_id,
+                        repo_key,
+                        &target.cache_path,
+                        ctx,
+                    )
+                    .await;
+                    let mut resp = build_streaming_file_response(filename, result);
+                    resp.headers_mut()
+                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+                    Ok(resp)
+                }
+            };
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+
+    let digest = sha256_hex(&bytes);
+
+    // Verdict fast path: a fresh vulnerable verdict blocks WITHOUT re-scanning
+    // (and, since the fetch above was a cache hit on a repeat pull, without any
+    // upstream fetch). A fresh clean verdict serves from the buffer.
+    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    let current_version = None; // provenance compared only when both sides known
+    if let Ok(Some(row)) = pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await {
+        let fresh = crate::services::proxy_scan_service::verdict_is_fresh(
+            row.scanned_at,
+            row.scanner_version.as_deref(),
+            current_version,
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
+            Utc::now(),
+        );
+        if fresh {
+            if crate::services::proxy_scan_service::verdict_blocks(&row.verdict) {
+                warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
+                return Err(scan_blocked_response(filename));
+            }
+            proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
+                .await;
+            return Ok(build_scanned_file_response(
+                filename,
+                bytes,
+                content_type,
+                Some(&digest),
+                false,
+            ));
+        }
+    }
+
+    // No fresh verdict: first pull of this digest.
+    if action.is_fail_closed() {
+        // Fail-closed: scan inline before serving a single byte.
+        match scan_and_record(state, repo_id, &digest, filename, &bytes).await {
+            Some(verdict) if verdict.is_vulnerable() => {
+                warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
+                Err(scan_blocked_response(filename))
+            }
+            Some(_) => {
+                proxy_helpers::record_proxy_download(
+                    state,
+                    repo_id,
+                    repo_key,
+                    &target.cache_path,
+                    ctx,
+                )
+                .await;
+                Ok(build_scanned_file_response(
+                    filename,
+                    bytes,
+                    content_type,
+                    Some(&digest),
+                    false,
+                ))
+            }
+            // Inconclusive under fail-closed => 423, never serve unscanned bytes.
+            None => Err(scan_pending_locked_response(filename)),
+        }
+    } else {
+        // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
+        // asynchronously so the NEXT pull of this digest is blocked if bad.
+        warn!(
+            repo_id = %repo_id, file = %filename, digest = %digest,
+            "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
+        );
+        let state_bg = state.clone();
+        let digest_bg = digest.clone();
+        let filename_bg = filename.to_string();
+        let bytes_bg = bytes.clone();
+        tokio::spawn(async move {
+            let _ = scan_and_record(&state_bg, repo_id, &digest_bg, &filename_bg, &bytes_bg).await;
+        });
+        proxy_helpers::record_proxy_download(state, repo_id, repo_key, &target.cache_path, ctx)
+            .await;
+        Ok(build_scanned_file_response(
+            filename,
+            bytes,
+            content_type,
+            Some(&digest),
+            true,
+        ))
+    }
 }
 
 async fn serve_metadata(

@@ -5,6 +5,24 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::models::security::ScanConfig;
+use crate::services::proxy_scan_service::ProxyScanAction;
+
+/// Canonicalize a client-supplied `proxy_scan_action` (#2954), preserving the
+/// existing row's value when the patch omits it and defaulting to `fail_open`.
+///
+/// Unknown values are coerced to `fail_open` rather than passed through to the
+/// DB CHECK constraint (which would surface as an opaque 500). Pure /
+/// unit-testable.
+fn normalize_proxy_scan_action(patch: Option<&str>, existing: Option<&str>) -> String {
+    let raw = patch
+        .or(existing)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "fail_open".to_string());
+    match raw.as_str() {
+        "fail_closed" => "fail_closed".to_string(),
+        _ => "fail_open".to_string(),
+    }
+}
 
 /// Request to create or update a scan configuration.
 ///
@@ -31,6 +49,10 @@ pub struct UpsertScanConfigRequest {
     pub block_on_policy_violation: Option<bool>,
     #[serde(default)]
     pub severity_threshold: Option<String>,
+    /// #2954: `'fail_open'` (default) | `'fail_closed'` for the inline proxy
+    /// scan-on-fetch action.
+    #[serde(default)]
+    pub proxy_scan_action: Option<String>,
 }
 
 pub struct ScanConfigService {
@@ -48,7 +70,8 @@ impl ScanConfigService {
             ScanConfig,
             r#"
             SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
-                   block_on_policy_violation, severity_threshold, created_at, updated_at
+                   block_on_policy_violation, severity_threshold, proxy_scan_action,
+                   created_at, updated_at
             FROM scan_configs
             WHERE repository_id = $1
             "#,
@@ -99,13 +122,21 @@ impl ScanConfigService {
                 .map(|c| c.severity_threshold.clone())
                 .unwrap_or_else(|| "high".to_string())
         });
+        // #2954: default fail-open (matches the column default) so operators who
+        // have not opted into fail-closed see today's behavior. A bad value is
+        // normalized to fail-open rather than tripping the DB CHECK constraint.
+        let proxy_scan_action = normalize_proxy_scan_action(
+            req.proxy_scan_action.as_deref(),
+            existing.as_ref().map(|c| c.proxy_scan_action.as_str()),
+        );
 
         let config = sqlx::query_as!(
             ScanConfig,
             r#"
             INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
-                                      block_on_policy_violation, severity_threshold)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                                      block_on_policy_violation, severity_threshold,
+                                      proxy_scan_action)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (repository_id)
             DO UPDATE SET
                 scan_enabled = EXCLUDED.scan_enabled,
@@ -113,9 +144,11 @@ impl ScanConfigService {
                 scan_on_proxy = EXCLUDED.scan_on_proxy,
                 block_on_policy_violation = EXCLUDED.block_on_policy_violation,
                 severity_threshold = EXCLUDED.severity_threshold,
+                proxy_scan_action = EXCLUDED.proxy_scan_action,
                 updated_at = NOW()
             RETURNING id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
-                      block_on_policy_violation, severity_threshold, created_at, updated_at
+                      block_on_policy_violation, severity_threshold, proxy_scan_action,
+                      created_at, updated_at
             "#,
             repository_id,
             scan_enabled,
@@ -123,6 +156,7 @@ impl ScanConfigService {
             scan_on_proxy,
             block_on_policy_violation,
             severity_threshold,
+            proxy_scan_action,
         )
         .fetch_one(&self.db)
         .await
@@ -137,7 +171,8 @@ impl ScanConfigService {
             ScanConfig,
             r#"
             SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
-                   block_on_policy_violation, severity_threshold, created_at, updated_at
+                   block_on_policy_violation, severity_threshold, proxy_scan_action,
+                   created_at, updated_at
             FROM scan_configs
             WHERE scan_enabled = true
             ORDER BY created_at DESC
@@ -175,6 +210,23 @@ impl ScanConfigService {
 
         Ok(result.unwrap_or(false))
     }
+
+    /// The inline proxy scan action (fail-open / fail-closed) for this repo
+    /// (#2954). Defaults to fail-open when no config row exists, matching the
+    /// column default and preserving today's availability-first behavior.
+    pub async fn proxy_scan_action(&self, repository_id: Uuid) -> Result<ProxyScanAction> {
+        let result = sqlx::query_scalar!(
+            r#"SELECT proxy_scan_action FROM scan_configs WHERE repository_id = $1"#,
+            repository_id
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+        Ok(result
+            .map(|v| ProxyScanAction::from_db(&v))
+            .unwrap_or(ProxyScanAction::FailOpen))
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +252,32 @@ mod tests {
         assert_eq!(req.scan_on_proxy, Some(false));
         assert_eq!(req.block_on_policy_violation, Some(true));
         assert_eq!(req.severity_threshold.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_normalize_proxy_scan_action() {
+        // Patch wins over existing.
+        assert_eq!(
+            normalize_proxy_scan_action(Some("fail_closed"), Some("fail_open")),
+            "fail_closed"
+        );
+        // Omitted patch preserves existing.
+        assert_eq!(
+            normalize_proxy_scan_action(None, Some("fail_closed")),
+            "fail_closed"
+        );
+        // Neither => fail-open default.
+        assert_eq!(normalize_proxy_scan_action(None, None), "fail_open");
+        // Case-insensitive + trimmed.
+        assert_eq!(
+            normalize_proxy_scan_action(Some("  FAIL_CLOSED "), None),
+            "fail_closed"
+        );
+        // Unknown value coerced to fail-open (never trips the DB CHECK).
+        assert_eq!(
+            normalize_proxy_scan_action(Some("garbage"), None),
+            "fail_open"
+        );
     }
 
     #[test]
@@ -294,6 +372,7 @@ mod tests {
             scan_on_proxy: false,
             block_on_policy_violation: true,
             severity_threshold: "medium".to_string(),
+            proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -360,6 +439,7 @@ mod tests {
             scan_on_proxy: Some(true),
             block_on_policy_violation: Some(true),
             severity_threshold: Some("medium".to_string()),
+            proxy_scan_action: Some("fail_closed".to_string()),
         };
         let cloned = req.clone();
         assert_eq!(cloned.scan_enabled, req.scan_enabled);
@@ -380,6 +460,7 @@ mod tests {
             scan_on_proxy: Some(false),
             block_on_policy_violation: Some(false),
             severity_threshold: Some("low".to_string()),
+            proxy_scan_action: None,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("UpsertScanConfigRequest"));
@@ -402,6 +483,7 @@ mod tests {
             scan_on_proxy: false,
             block_on_policy_violation: true,
             severity_threshold: "medium".to_string(),
+            proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
