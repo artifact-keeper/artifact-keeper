@@ -2951,10 +2951,24 @@ fn html_escape(s: &str) -> String {
 // Static regexes (compiled once, reused across requests)
 // ---------------------------------------------------------------------------
 
-static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r##"<a\s+[^>]*?href="([^"#]+)"##).unwrap());
+// #2967: quote-agnostic + case-insensitive so a single-quoted / uppercase
+// `HREF` upstream anchor cannot slip an un-rewritten off-site href past the
+// proxy render (defense-in-depth behind the Case-A HTML REBUILD). The URL lands
+// in group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+static HREF_RE: Lazy<Regex> = Lazy::new(|| {
+    // Like the historical pattern, the URL is captured up to the first `#` (the
+    // fragment is dropped) and the closing quote is NOT required — a `#sha256=`
+    // fragment sits between the URL and the closing quote. The value lands in
+    // group 1 (double-quoted), 2 (single-quoted), or 3 (unquoted).
+    Regex::new(r##"(?is)<a\s+[^>]*?\bhref\s*=\s*(?:"([^"#]*)|'([^'#]*)|([^\s>#]+))"##).unwrap()
+});
 
-static REWRITE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"<a\s+([^>]*?)href="([^"]+)"([^>]*)>"#).unwrap());
+// URL lands in group 2 (double-quoted), 3 (single-quoted), or 4 (unquoted);
+// group 1 = attributes before `href`, group 5 = attributes after.
+static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<a\s+([^>]*?)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>"#)
+        .unwrap()
+});
 
 static METADATA_ATTR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
@@ -2997,7 +3011,12 @@ fn find_upstream_url_for_file(
     index_url: Option<&str>,
 ) -> Option<String> {
     for caps in HREF_RE.captures_iter(index_html) {
-        let href = &caps[1];
+        let href = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
         let href_filename = href.rsplit('/').next().unwrap_or("");
         if href_filename != filename {
             continue;
@@ -3108,8 +3127,15 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     REWRITE_RE
         .replace_all(html, |caps: &regex::Captures| {
             let before_href = &caps[1];
-            let full_url = &caps[2];
-            let after_href = &caps[3];
+            // The href value is in whichever quote-alternation group matched
+            // (double / single / unquoted); `after` is the trailing group.
+            let full_url = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            let after_href = caps.get(5).map(|m| m.as_str()).unwrap_or("");
 
             // Split off the fragment (#sha256=...) if present
             let (url_path, fragment) = match full_url.find('#') {
@@ -3492,70 +3518,83 @@ fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile) -> String {
     serde_json::to_string(&doc).unwrap_or_else(|_| json.to_string())
 }
 
-/// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a Remote
-/// member's PEP 503 HTML simple index to its Case-A union candidates.
+/// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a suppressed
+/// Remote member's PEP 503 HTML simple index to its Case-A union candidates by
+/// REBUILDING a fresh index from parsed anchors — never by editing the raw
+/// upstream in place.
 ///
-/// SECURITY (href-based, never text-based): the file identity is taken from the
-/// anchor's `href` URL basename — NOT its visible text — because pip and every
-/// downstream keys off the href, and a hostile upstream can make the text an
-/// admitted owned-version wheel while the href points off-site at a remote-only
-/// version. Each surviving anchor is RE-EMITTED as an Artifact Keeper path
-/// (`/pypi/{repo}/simple/{project}/{filename}`), so a suppressed member can
-/// never carry an off-site href through the rendered index regardless of quote
-/// style / letter case. The href attribute is matched case-insensitively and in
-/// either quote form; anything whose href cannot be parsed, or whose basename is
-/// not a Case-A wheel, is dropped. This keeps the index symmetric with the
-/// download gate (which admits the same filenames) — no anchor is emitted that
-/// the download route would deny.
+/// SECURITY. A span-replacing filter is fundamentally leaky: an UNCLOSED or
+/// malformed anchor (no `</a>`, `</a >`, `</ a>`, …) is not a matched span, so
+/// it passes through untouched, and combined with a quote/case gap in any later
+/// URL rewriter it delivers a raw off-site href to the client (#2967 R3, the
+/// #1600 class). This function instead scans anchor START-tags only (`<a ...>`
+/// with NO required `</a>`, so unclosed/malformed anchors are covered); extracts
+/// the `href` quote-agnostically and case-insensitively (double, single, or
+/// unquoted; minimal-entity-decoded; query/fragment stripped) and derives the
+/// file identity from its URL basename — never the anchor text; admits Case-A
+/// wheels of that basename; and emits a FRESH minimal PEP 503 document
+/// containing ONLY Artifact-Keeper-pathed anchors for the survivors.
+///
+/// No raw upstream anchor (closed or not, any quote style or letter case) ever
+/// reaches the client, and every emitted href is an AK path the download gate
+/// keys on — so the index stays symmetric with the download route.
 fn filter_remote_case_a_html(
     html: &str,
     owned: &OwnedWheelProfile,
     repo_key: &str,
     normalized: &str,
 ) -> String {
-    static ANCHOR_BLOCK: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?is)<a\b([^>]*)>.*?</a>\s*(?:<br\s*/?>)?\s*").unwrap());
+    static ANCHOR_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<a\b[^>]*>").unwrap());
     static HREF_ATTR: Lazy<Regex> =
         Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
-    ANCHOR_BLOCK
-        .replace_all(html, |caps: &regex::Captures| {
-            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let Some(href_caps) = HREF_ATTR.captures(attrs) else {
-                return String::new();
-            };
-            let href_raw = href_caps
-                .get(1)
-                .or_else(|| href_caps.get(2))
-                .or_else(|| href_caps.get(3))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            // Decode minimal HTML entities so an entity-encoded href resolves,
-            // then split off the fragment and any query before taking the URL
-            // basename — the file identity, never the anchor's visible text.
-            let href = decode_html_entities_minimal(href_raw);
-            let (url_part, fragment) = match href.find('#') {
-                Some(pos) => (&href[..pos], &href[pos..]),
-                None => (href.as_str(), ""),
-            };
-            let url_no_query = url_part.split('?').next().unwrap_or(url_part);
-            let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
-            if filename.is_empty() || !owned.admits(filename) {
-                return String::new();
-            }
-            // Re-emit an Artifact-Keeper-pathed anchor ONLY. The upstream sha256
-            // fragment is preserved (escaped) so pip can still verify the bytes
-            // AK proxies; both filename and fragment are escaped so neither can
-            // break out of the attribute.
-            format!(
-                "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
-                repo_key,
-                normalized,
-                html_escape(filename),
-                html_escape(fragment),
-                html_escape(filename),
-            )
-        })
-        .into_owned()
+
+    let mut survivors = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tag in ANCHOR_START.find_iter(html) {
+        let Some(href_caps) = HREF_ATTR.captures(tag.as_str()) else {
+            continue;
+        };
+        let href_raw = href_caps
+            .get(1)
+            .or_else(|| href_caps.get(2))
+            .or_else(|| href_caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        let href = decode_html_entities_minimal(href_raw);
+        // File identity = URL basename (never the anchor text). Keep the upstream
+        // sha256 fragment so pip can verify the bytes AK proxies; strip the
+        // fragment and any query before taking the basename.
+        let fragment = match href.find('#') {
+            Some(pos) => &href[pos..],
+            None => "",
+        };
+        let url_part = href.split('#').next().unwrap_or(&href);
+        let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+        let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+        if filename.is_empty() || !owned.admits(filename) {
+            continue;
+        }
+        if !seen.insert(filename.to_string()) {
+            continue;
+        }
+        // AK path ONLY — no upstream host survives. filename + fragment are
+        // escaped so neither can break out of the attribute.
+        survivors.push_str(&format!(
+            "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
+            repo_key,
+            normalized,
+            html_escape(filename),
+            html_escape(fragment),
+            html_escape(filename),
+        ));
+    }
+
+    // Fresh minimal PEP 503 document: only AK-pathed survivor anchors. The local
+    // splice (`merge_local_into_remote_simple_html`) inserts before `</body>`
+    // and `tracks` metas before `</head>`, so both markers are present.
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"1.0\"/>\n</head>\n<body>\n{survivors}</body>\n</html>\n"
+    )
 }
 
 /// Build the owning local member(s)' [`OwnedWheelProfile`] for a normalized PEP
@@ -4705,6 +4744,69 @@ mod tests {
             ),
             "genuine Case-A wheel re-emitted as AK path: {out}"
         );
+    }
+
+    // HIGH regression R3 (#2967 round 3): a span-replace filter left UNCLOSED and
+    // MALFORMED anchors untouched. The REBUILD covers every anchor shape —
+    // unclosed (no `</a>`), `</a >` / `</ a>`, uppercase, single/double-quoted,
+    // and UNQUOTED — all pointing off-site at remote-only versions must be
+    // dropped, and only genuine Case-A wheels survive as AK paths.
+    #[test]
+    fn test_filter_remote_case_a_html_rebuild_covers_unclosed_and_all_quote_shapes() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // 1) UNCLOSED single-quoted anchor, off-site remote-only 1.9.
+            "<a href='http://evil/pydantic_core-1.9-cp39-cp39-win_amd64.whl'>\n",
+            // 2) UNCLOSED uppercase double-quoted anchor, off-site remote-only 9.9.
+            "<A HREF=\"http://evil/pydantic_core-9.9-cp39-cp39-win_amd64.whl\">\n",
+            // 3) malformed close `</a >`, off-site remote-only 8.8.
+            "<a href=\"http://evil/pydantic_core-8.8-cp39-cp39-win_amd64.whl\">x</a >\n",
+            // 4) malformed close `</ a>`, off-site remote-only 6.6.
+            "<a href=\"http://evil/pydantic_core-6.6-cp39-cp39-win_amd64.whl\">y</ a>\n",
+            // 5) UNQUOTED off-site remote-only 5.5.
+            "<a href=http://evil/pydantic_core-5.5-cp39-cp39-win_amd64.whl>z</a>\n",
+            // 6) genuine Case-A: unquoted href basename is the owned windows wheel.
+            "<a href=http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl>ok</a>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        assert!(!out.contains("evil"), "no off-site host survives: {out}");
+        assert!(!out.contains("mirror"), "no off-site host survives: {out}");
+        for v in ["1.9", "9.9", "8.8", "6.6", "5.5"] {
+            assert!(!out.contains(v), "remote-only {v} must not surface: {out}");
+        }
+        // Only the genuine Case-A wheel survives, as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
+        );
+    }
+
+    // Defense-in-depth (#2967): rewrite_upstream_urls now rewrites single-quoted
+    // and uppercase-`HREF` upstream anchors too, so no off-site href survives the
+    // proxy render even outside the suppressed-member rebuild path.
+    #[test]
+    fn test_rewrite_upstream_urls_handles_single_quote_and_uppercase() {
+        let html = concat!(
+            "<a href='https://files.pythonhosted.org/x/pkg-1.0.whl#sha256=aa'>pkg-1.0.whl</a>\n",
+            "<A HREF=\"https://files.pythonhosted.org/y/pkg-2.0.whl\">pkg-2.0.whl</A>\n",
+            "<a href=https://files.pythonhosted.org/z/pkg-3.0.whl>pkg-3.0.whl</a>\n"
+        );
+        let out = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(
+            !out.contains("files.pythonhosted.org"),
+            "offsite host rewritten: {out}"
+        );
+        assert!(
+            out.contains("/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aa"),
+            "{out}"
+        );
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-2.0.whl"), "{out}");
+        assert!(out.contains("/pypi/repo/simple/pkg/pkg-3.0.whl"), "{out}");
     }
 
     #[test]
