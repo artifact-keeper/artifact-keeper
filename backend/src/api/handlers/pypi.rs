@@ -1098,7 +1098,13 @@ async fn simple_project(
                         // entries (remote-only versions, same-platform rebuilds)
                         // are dropped here, mirroring the download gate below.
                         let content = if case_a_only {
-                            case_a_filter_remote_body(&content, &ct, &owned_profile)
+                            case_a_filter_remote_body(
+                                &content,
+                                &ct,
+                                &owned_profile,
+                                &repo_key,
+                                &normalized,
+                            )
                         } else {
                             content
                         };
@@ -3365,19 +3371,29 @@ impl OwnedWheelProfile {
         Self { per_version }
     }
 
-    /// Case-A test for one remote distribution filename: it must be a wheel, of
-    /// a version the owner already provides, whose compat tag the owner does NOT
-    /// already ship. Sdists, unowned versions, and same-platform rebuilds of an
-    /// owned version are all Case B (rejected → stay suppressed). Fails closed
-    /// (rejects) when the shape is unrecognized.
+    /// Case-A test for one remote distribution filename: it must be a
+    /// PLATFORM-SPECIFIC wheel, of a version the owner already provides, whose
+    /// (case-normalized) compat tag the owner does NOT already ship. Rejected as
+    /// Case B (stay suppressed): sdists, universal `*-none-any` wheels
+    /// (installable everywhere — not a distinct build target, and a vector for a
+    /// lower-priority remote to inject arbitrary code), unowned versions, and
+    /// same-platform rebuilds (including a case-variant of a tag the local
+    /// already ships). Fails closed (rejects) when the shape is unrecognized.
     fn admits(&self, filename: &str) -> bool {
         let Some(tag) = wheel_compat_tag(filename) else {
             return false;
         };
+        // Exclude universal (pure-python) wheels: platform tag `any`. Case A
+        // only adds a genuinely platform-specific target the owner lacks.
+        if tag.rsplit('-').next() == Some("any") {
+            return false;
+        }
         let Some(version) = version_from_pypi_filename(filename) else {
             return false;
         };
         match self.per_version.get(&version) {
+            // `tag` and the stored tags are both lowercased by `wheel_compat_tag`,
+            // so a case-variant of the local's own tag compares equal (Case B).
             Some(local_tags) => !local_tags.contains(&tag),
             None => false,
         }
@@ -3387,8 +3403,10 @@ impl OwnedWheelProfile {
 /// Parse the `{python}-{abi}-{platform}` compatibility tag of a wheel filename
 /// per the binary-distribution spec
 /// (`{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`): the
-/// last three `-`-separated fields of the stem. Returns `None` for non-wheels
-/// (an sdist has no platform tag) or malformed names.
+/// last three `-`-separated fields of the stem, LOWERCASED so the Case-A
+/// comparison is case-insensitive (wheel tags are case-insensitive; a
+/// case-variant must not read as a distinct platform). Returns `None` for
+/// non-wheels (an sdist has no platform tag) or malformed names.
 fn wheel_compat_tag(filename: &str) -> Option<String> {
     let stem = filename.strip_suffix(".whl")?;
     let parts: Vec<&str> = stem.split('-').collect();
@@ -3396,7 +3414,7 @@ fn wheel_compat_tag(filename: &str) -> Option<String> {
     if parts.len() < 5 {
         return None;
     }
-    Some(parts[parts.len() - 3..].join("-"))
+    Some(parts[parts.len() - 3..].join("-").to_ascii_lowercase())
 }
 
 /// Narrow a suppressed Remote member's contribution to Case-A distributions
@@ -3405,16 +3423,24 @@ fn wheel_compat_tag(filename: &str) -> Option<String> {
 /// (sniffed) forms, mirroring the render dispatch. A body that parses as
 /// neither is replaced with an empty listing (fail closed — never surface an
 /// unfilterable remote body for a locally-owned name).
-fn case_a_filter_remote_body(content: &[u8], ct: &str, owned: &OwnedWheelProfile) -> Bytes {
+fn case_a_filter_remote_body(
+    content: &[u8],
+    ct: &str,
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> Bytes {
     let body = String::from_utf8_lossy(content);
     let filtered = if ct.contains("json") {
         filter_remote_case_a_json(&body, owned)
     } else if ct.contains("text/html") {
-        filter_remote_case_a_html(&body, owned)
+        filter_remote_case_a_html(&body, owned, repo_key, normalized)
     } else {
         match sniff_simple_index(content) {
             SniffedSimpleIndex::Json => filter_remote_case_a_json(&body, owned),
-            SniffedSimpleIndex::Html => filter_remote_case_a_html(&body, owned),
+            SniffedSimpleIndex::Html => {
+                filter_remote_case_a_html(&body, owned, repo_key, normalized)
+            }
             SniffedSimpleIndex::Binary => String::new(),
         }
     };
@@ -3466,21 +3492,68 @@ fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile) -> String {
     serde_json::to_string(&doc).unwrap_or_else(|_| json.to_string())
 }
 
-/// HTML sibling of [`filter_remote_case_a_json`] (#2937): remove every anchor in
-/// a Remote member's PEP 503 HTML simple index whose distribution is not a
-/// Case-A union candidate, leaving only platform/ABI-distinct wheels of a
-/// version the local owner already provides.
-fn filter_remote_case_a_html(html: &str, owned: &OwnedWheelProfile) -> String {
+/// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a Remote
+/// member's PEP 503 HTML simple index to its Case-A union candidates.
+///
+/// SECURITY (href-based, never text-based): the file identity is taken from the
+/// anchor's `href` URL basename — NOT its visible text — because pip and every
+/// downstream keys off the href, and a hostile upstream can make the text an
+/// admitted owned-version wheel while the href points off-site at a remote-only
+/// version. Each surviving anchor is RE-EMITTED as an Artifact Keeper path
+/// (`/pypi/{repo}/simple/{project}/{filename}`), so a suppressed member can
+/// never carry an off-site href through the rendered index regardless of quote
+/// style / letter case. The href attribute is matched case-insensitively and in
+/// either quote form; anything whose href cannot be parsed, or whose basename is
+/// not a Case-A wheel, is dropped. This keeps the index symmetric with the
+/// download gate (which admits the same filenames) — no anchor is emitted that
+/// the download route would deny.
+fn filter_remote_case_a_html(
+    html: &str,
+    owned: &OwnedWheelProfile,
+    repo_key: &str,
+    normalized: &str,
+) -> String {
     static ANCHOR_BLOCK: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?is)<a\s[^>]*>([^<]+)</a>\s*(?:<br\s*/?>)?\s*").unwrap());
+        Lazy::new(|| Regex::new(r"(?is)<a\b([^>]*)>.*?</a>\s*(?:<br\s*/?>)?\s*").unwrap());
+    static HREF_ATTR: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap());
     ANCHOR_BLOCK
         .replace_all(html, |caps: &regex::Captures| {
-            let filename = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-            if owned.admits(filename) {
-                caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
-            } else {
-                String::new()
+            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let Some(href_caps) = HREF_ATTR.captures(attrs) else {
+                return String::new();
+            };
+            let href_raw = href_caps
+                .get(1)
+                .or_else(|| href_caps.get(2))
+                .or_else(|| href_caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            // Decode minimal HTML entities so an entity-encoded href resolves,
+            // then split off the fragment and any query before taking the URL
+            // basename — the file identity, never the anchor's visible text.
+            let href = decode_html_entities_minimal(href_raw);
+            let (url_part, fragment) = match href.find('#') {
+                Some(pos) => (&href[..pos], &href[pos..]),
+                None => (href.as_str(), ""),
+            };
+            let url_no_query = url_part.split('?').next().unwrap_or(url_part);
+            let filename = url_no_query.rsplit('/').next().unwrap_or("").trim();
+            if filename.is_empty() || !owned.admits(filename) {
+                return String::new();
             }
+            // Re-emit an Artifact-Keeper-pathed anchor ONLY. The upstream sha256
+            // fragment is preserved (escaped) so pip can still verify the bytes
+            // AK proxies; both filename and fragment are escaped so neither can
+            // break out of the attribute.
+            format!(
+                "<a href=\"/pypi/{}/simple/{}/{}{}\">{}</a><br/>\n",
+                repo_key,
+                normalized,
+                html_escape(filename),
+                html_escape(fragment),
+                html_escape(filename),
+            )
         })
         .into_owned()
 }
@@ -4565,18 +4638,72 @@ mod tests {
         let owned = linux_owner_profile();
         let remote = concat!(
             "<!DOCTYPE html><html><head></head><body>\n",
-            "<a href=\"https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "<a href=\"https://files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
             "<a href=\"https://files/pydantic_core-1.9-cp39-cp39-win_amd64.whl\">pydantic_core-1.9-cp39-cp39-win_amd64.whl</a><br/>\n",
             "</body></html>\n"
         );
-        let out = filter_remote_case_a_html(remote, &owned);
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // Case-A survivor is re-emitted as an AK path (no offsite host), fragment preserved.
         assert!(
-            out.contains("pydantic_core-2.0-cp39-cp39-win_amd64.whl"),
-            "Case-A windows wheel kept"
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa"
+            ),
+            "Case-A wheel re-emitted as an AK path: {out}"
+        );
+        assert!(
+            !out.contains("https://files"),
+            "no offsite href survives: {out}"
         );
         assert!(
             !out.contains("pydantic_core-1.9-cp39-cp39-win_amd64.whl"),
-            "Case-B remote-only version dropped"
+            "Case-B remote-only version dropped: {out}"
+        );
+    }
+
+    // HIGH regression (#2967 red-team): a hostile upstream whose anchor TEXT is
+    // an admitted owned-version wheel but whose HREF (single-quoted / uppercase /
+    // text != href) points off-site at a remote-only version must NOT leak that
+    // off-site URL nor surface the remote-only version. Membership is decided on
+    // the href basename and every survivor is re-emitted as an AK path.
+    #[test]
+    fn test_filter_remote_case_a_html_href_based_defeats_text_spoof() {
+        let owned = linux_owner_profile();
+        let remote = concat!(
+            "<body>\n",
+            // text = admitted owned wheel, href (single-quoted) = remote-only 1.9 off-site.
+            "<a href='http://evil/files/pydantic_core-1.9-cp39-cp39-win_amd64.whl#sha256=bad'>pydantic_core-2.0-cp99-cp99-win_amd64.whl</a><br/>\n",
+            // uppercase HREF, double-quoted, also a remote-only version off-site.
+            "<A HREF=\"http://evil/files/pydantic_core-7.7-cp39-cp39-win_amd64.whl\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</A><br/>\n",
+            // a genuine Case-A anchor (href basename is the owned-version windows wheel).
+            "<a href=\"http://mirror/pydantic_core-2.0-cp39-cp39-win_amd64.whl\">whatever</a><br/>\n",
+            "</body>\n"
+        );
+        let out = filter_remote_case_a_html(remote, &owned, "virt", "pydantic-core");
+        // No off-site host, in any form.
+        assert!(
+            !out.contains("evil"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(
+            !out.contains("mirror"),
+            "off-site href must not survive: {out}"
+        );
+        assert!(!out.contains("http://"), "no absolute URL survives: {out}");
+        // Remote-only versions (from the spoofed hrefs) must not surface at all.
+        assert!(
+            !out.contains("1.9"),
+            "remote-only 1.9 must not surface: {out}"
+        );
+        assert!(
+            !out.contains("7.7"),
+            "remote-only 7.7 must not surface: {out}"
+        );
+        // The genuine Case-A wheel (decided on its href basename) IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "genuine Case-A wheel re-emitted as AK path: {out}"
         );
     }
 
@@ -4586,12 +4713,39 @@ mod tests {
         let json = r#"{"meta":{"api-version":"1.1"},"name":"p","versions":["2.0"],
             "files":[{"filename":"pydantic_core-2.0-cp39-cp39-win_amd64.whl","url":"u","hashes":{"sha256":"w"}}]}"#;
         // Mislabeled Content-Type: still sniffed to JSON and filtered.
-        let out = case_a_filter_remote_body(json.as_bytes(), "application/octet-stream", &owned);
+        let out = case_a_filter_remote_body(
+            json.as_bytes(),
+            "application/octet-stream",
+            &owned,
+            "virt",
+            "p",
+        );
         let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(doc["files"].as_array().unwrap().len(), 1);
         // Unparseable body -> empty listing (fail closed, never leak raw remote).
-        let out = case_a_filter_remote_body(b"\x00\x01binary", "application/octet-stream", &owned);
+        let out = case_a_filter_remote_body(
+            b"\x00\x01binary",
+            "application/octet-stream",
+            &owned,
+            "virt",
+            "p",
+        );
         assert!(out.is_empty());
+    }
+
+    // MEDIUM regression (#2967 red-team): admits() must reject a universal
+    // `*-none-any` wheel (installable everywhere, not a distinct build target)
+    // and a case-variant of a tag the local already ships (same platform).
+    #[test]
+    fn test_owned_profile_admits_tightened_universal_and_case_variant() {
+        let owned = linux_owner_profile(); // local ships cp39-cp39-manylinux_2_17_x86_64
+                                           // Universal pure-python wheel of the owned version -> NOT a platform build.
+        assert!(!owned.admits("pydantic_core-2.0-py3-none-any.whl"));
+        assert!(!owned.admits("pydantic_core-2.0-py2.py3-none-any.whl"));
+        // Case-variant of the local's own tag -> same platform, Case B.
+        assert!(!owned.admits("pydantic_core-2.0-cp39-cp39-MANYLINUX_2_17_X86_64.whl"));
+        // A genuinely new platform-specific target of the owned version is still Case A.
+        assert!(owned.admits("pydantic_core-2.0-cp39-cp39-win_amd64.whl"));
     }
 
     #[test]
