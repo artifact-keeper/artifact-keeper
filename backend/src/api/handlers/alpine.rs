@@ -3172,6 +3172,65 @@ mod db_cov_tests {
         fx.teardown().await;
     }
 
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // apk-tools does not read a download URL out of the APKINDEX: it downloads
+    // `{P}-{V}.apk` from the SAME arch directory the index was fetched from.
+    // The `build_alpine_artifact_path` unit tests prove that path is a string;
+    // only reconstructing the filename from the `P:`/`V:` the REAL index
+    // advertises and fetching it against the download route proves an `apk add`
+    // of an indexed package resolves. A `P:`/`V:` pair whose `{P}-{V}.apk` the
+    // download route 404s passes every builder test yet breaks `apk add`.
+    // -----------------------------------------------------------------------
+
+    /// Read the first value of a single-letter APKINDEX field (`P:`, `V:`).
+    fn apkindex_field(text: &str, key: char) -> String {
+        let prefix = format!("{key}:");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_indexed_package_apk_resolves_against_download_route() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let text = publish_marker_and_fetch_index(&fx).await;
+
+        // Reconstruct the download filename exactly as apk-tools does from the
+        // `P:`/`V:` the index advertises: `{name}-{version}.apk`, fetched from
+        // the same `{branch}/{repository}/{arch}` directory as APKINDEX.tar.gz.
+        let name = apkindex_field(&text, 'P');
+        let version = apkindex_field(&text, 'V');
+        assert_eq!(name, "dtf-marker", "index must advertise P:");
+        assert!(!version.is_empty(), "index must advertise V:");
+        let advertised_filename = format!("{name}-{version}.apk");
+
+        let k = fx.repo_key.clone();
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{k}/v3.21/main/aarch64/{advertised_filename}")),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the package the index advertises ({advertised_filename}) must resolve, not 404"
+        );
+        assert_eq!(
+            &body[..],
+            super::MARKER_APK,
+            "the advertised .apk must serve the published package bytes"
+        );
+    }
+
     /// A package stored before the apk checksum was recorded is backfilled from
     /// the stored bytes on the next index request, instead of dropping out of it.
     #[tokio::test]

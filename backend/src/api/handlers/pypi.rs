@@ -256,32 +256,10 @@ async fn enforce_pypi_curation(
     project: &str,
     version: Option<&str>,
 ) -> Result<(), Response> {
-    if !repo.curation_enabled || !matches!(repo.repo_type.as_str(), "remote" | "virtual") {
-        return Ok(());
-    }
-    let svc = crate::services::curation_service::CurationService::new(state.db.clone());
-    let eval = svc
-        .evaluate_pep503_package(repo.id, &repo.curation_default_action, project, version)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                repo_id = %repo.id,
-                repo_key = %repo.key,
-                package = %project,
-                error = %e,
-                "curation evaluation failed; failing open"
-            );
-        })
-        .ok();
-    if let Some(eval) = eval {
-        if eval.action == "block" {
-            return Err(proxy_helpers::curation_blocked_response(
-                project,
-                &eval.reason,
-            ));
-        }
-    }
-    Ok(())
+    // Delegate to the shared, format-agnostic curation seam (#2930). PyPI was
+    // the original (and once only) enforced format; the seam now lives in
+    // `proxy_helpers` so every proxy format shares one implementation.
+    proxy_helpers::enforce_curation(&state.db, repo, project, version).await
 }
 
 // ---------------------------------------------------------------------------

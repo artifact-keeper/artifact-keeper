@@ -4790,6 +4790,147 @@ pub fn curation_blocked_response(package: &str, reason: &str) -> Response {
         .into_response()
 }
 
+/// The repository fields curation enforcement needs, decoupled from any one
+/// handler's repo struct so every proxy format can reach the shared seam.
+///
+/// Most format handlers carry a [`RepoInfo`] (which converts for free via
+/// `From`); the OCI/Docker handler carries its own `OciRepoInfo`, so it builds
+/// this borrow-only view by hand.
+pub struct CurationTarget<'a> {
+    pub id: Uuid,
+    pub key: &'a str,
+    pub repo_type: &'a str,
+    pub curation_enabled: bool,
+    pub default_action: &'a str,
+}
+
+impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
+    fn from(repo: &'a RepoInfo) -> Self {
+        CurationTarget {
+            id: repo.id,
+            key: &repo.key,
+            repo_type: &repo.repo_type,
+            curation_enabled: repo.curation_enabled,
+            default_action: &repo.curation_default_action,
+        }
+    }
+}
+
+/// Enforce a repository's curation rules on a proxy pull/download for ANY
+/// format (#2930).
+///
+/// This is the format-agnostic generalization of the pypi-specific
+/// `enforce_pypi_curation` seam. PyPI historically enforced curation on its
+/// simple-index and download paths, but every other proxy format left
+/// `curation_enabled` settable yet inert — a `block` rule was silently ignored
+/// on npm / docker / maven / cargo / nuget / … pulls. Each format handler now
+/// calls this at its download seam with the package identity it already parses
+/// (npm package name, OCI image, `groupId:artifactId`, crate name, nuget id).
+///
+/// No-op unless the repository has curation enabled AND is a `remote` /
+/// `virtual` proxy repo: curation rules describe what may be pulled from
+/// upstream, so applying them to a hosted (`local` / `staging`) repo would 403
+/// that repository's own published packages. On a rule-evaluation error it
+/// fails OPEN (logged with repo + package so the unenforced request is
+/// greppable) rather than taking the proxy down — identical to the pypi seam.
+///
+/// Only `pattern` rules are consulted here (via
+/// [`CurationService::evaluate_pep503_package`]), matching the pypi seam
+/// exactly; typed `publisher_trust` / `popularity` rules run on the
+/// staging/sync path, not on the hot download path.
+#[allow(clippy::result_large_err)]
+pub async fn enforce_curation<'a>(
+    db: &PgPool,
+    target: impl Into<CurationTarget<'a>>,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), Response> {
+    let target = target.into();
+    if !target.curation_enabled || !matches!(target.repo_type, "remote" | "virtual") {
+        return Ok(());
+    }
+    let svc = crate::services::curation_service::CurationService::new(db.clone());
+    let eval = svc
+        .evaluate_pep503_package(target.id, target.default_action, package, version)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                repo_id = %target.id,
+                repo_key = %target.key,
+                package = %package,
+                error = %e,
+                "curation evaluation failed; failing open"
+            );
+        })
+        .ok();
+    if let Some(eval) = eval {
+        if eval.action == "block" {
+            return Err(curation_blocked_response(package, &eval.reason));
+        }
+    }
+    Ok(())
+}
+
+/// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
+/// the curation columns (the cargo handler's private `RepoInfo`, the OCI
+/// handler's `OciRepoInfo`). Looks the two columns up by id, then defers to
+/// [`enforce_curation`].
+///
+/// The lookup is skipped entirely for hosted repos: `repo_type` is already in
+/// hand, so a `local` / `staging` pull costs no extra query. On the
+/// remote/virtual path it is one small primary-key SELECT, comparable to the
+/// per-request repo resolution these handlers already perform. A lookup error
+/// fails OPEN (logged), matching the evaluation-error stance of the seam.
+#[allow(clippy::result_large_err)]
+pub async fn enforce_curation_lookup(
+    db: &PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    repo_type: &str,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), Response> {
+    if !matches!(repo_type, "remote" | "virtual") {
+        return Ok(());
+    }
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT curation_enabled, curation_default_action FROM repositories WHERE id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await;
+    let (curation_enabled, default_action) = match row {
+        Ok(Some(r)) => (
+            r.try_get::<bool, _>("curation_enabled").unwrap_or(false),
+            r.try_get::<String, _>("curation_default_action")
+                .unwrap_or_else(|_| "allow".to_string()),
+        ),
+        // Row missing or query failed: fail open (the pull proceeds unenforced),
+        // logged so the gap is greppable — never take the proxy down on a
+        // curation-config read error.
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                repo_key = %repo_key,
+                package = %package,
+                error = %e,
+                "curation config lookup failed; failing open"
+            );
+            return Ok(());
+        }
+    };
+    let target = CurationTarget {
+        id: repo_id,
+        key: repo_key,
+        repo_type,
+        curation_enabled,
+        default_action: &default_action,
+    };
+    enforce_curation(db, target, package, version).await
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 ///
 /// Visible to other handler modules so they can construct a stand-in
@@ -11021,5 +11162,164 @@ mod tests {
 
         assert!(out.is_none(), "feature disabled must stream, not 302");
         assert_eq!(presign_calls, 0, "no presign when the feature is off");
+    }
+
+    // ── Cross-format curation enforcement (#2930) ────────────────────────
+    //
+    // The shared `enforce_curation` seam must block a proxy pull whose package
+    // matches a `block` rule on a curation-enabled remote/virtual repo, and be
+    // an inert no-op otherwise — hosted repos, curation disabled, or a
+    // non-matching package. These pin the behaviour every format handler now
+    // depends on. DB-backed; skip silently when `DATABASE_URL` is unset so
+    // offline `cargo test --lib` stays usable.
+
+    /// Create a repo of `repo_type`, set `curation_enabled`, and (optionally)
+    /// insert a `block` rule for `blocked_pkg`. Returns (user_id, repo_id, key).
+    async fn seed_curated_repo(
+        pool: &sqlx::PgPool,
+        repo_type: &str,
+        curation_enabled: bool,
+        blocked_pkg: Option<&str>,
+    ) -> (uuid::Uuid, uuid::Uuid, String) {
+        let user_id = db_helpers::create_user(pool).await;
+        let (repo_id, key, _) = db_helpers::create_repo(pool, repo_type, "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = $2, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .bind(curation_enabled)
+        .execute(pool)
+        .await
+        .expect("enable curation");
+        if let Some(pkg) = blocked_pkg {
+            sqlx::query(
+                "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+                 architecture, action, priority, reason, created_by) \
+                 VALUES ($1, $2, '*', '*', 'block', 100, '#2930 test block', $3)",
+            )
+            .bind(repo_id)
+            .bind(pkg)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert block rule");
+        }
+        (user_id, repo_id, key)
+    }
+
+    async fn curation_cleanup(pool: &sqlx::PgPool, repo_id: uuid::Uuid, user_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        db_helpers::cleanup(pool, repo_id, user_id).await;
+    }
+
+    fn repo_info_for(
+        id: uuid::Uuid,
+        key: &str,
+        repo_type: &str,
+        curation_enabled: bool,
+    ) -> RepoInfo {
+        RepoInfo {
+            id,
+            key: key.to_string(),
+            storage_path: "/tmp/ph-curation".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: repo_type.to_string(),
+            format: "npm".to_string(),
+            upstream_url: Some("https://upstream.example.test".to_string()),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
+            curation_enabled,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_blocks_matching_and_passes_others_remote() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", true, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+
+        // Matching package -> blocked (403).
+        let blocked = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        let resp = blocked.expect_err("blocked package must 403");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // A different package on the same repo is unaffected.
+        let allowed = enforce_curation(&pool, &repo, "some-other-pkg", None).await;
+        assert!(allowed.is_ok(), "non-matching package must pass through");
+
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_noop_when_disabled() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // Rule present but curation_enabled = false: the block must NOT fire.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", false, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "remote", false);
+        let out = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        assert!(
+            out.is_ok(),
+            "curation disabled must be a no-op even with a block rule"
+        );
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_noop_on_hosted_repo() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // Hosted (local) repo: curation describes upstream pulls, so a hosted
+        // repo's own published package must never be 403'd.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "local", true, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "local", true);
+        let out = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        assert!(
+            out.is_ok(),
+            "hosted repo pulls must never be curation-blocked"
+        );
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_lookup_blocks_and_skips_hosted() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // The by-id lookup path (cargo/oci handlers) resolves the curation
+        // columns itself and blocks a matching pull on a remote repo.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", true, Some("blocked-pkg")).await;
+        let blocked =
+            enforce_curation_lookup(&pool, repo_id, &key, "remote", "blocked-pkg", None).await;
+        assert_eq!(
+            blocked
+                .expect_err("lookup path must 403 a blocked pull")
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // A hosted repo_type short-circuits before any lookup.
+        let hosted =
+            enforce_curation_lookup(&pool, repo_id, &key, "local", "blocked-pkg", None).await;
+        assert!(
+            hosted.is_ok(),
+            "hosted repo must skip curation lookup entirely"
+        );
+
+        curation_cleanup(&pool, repo_id, user_id).await;
     }
 }

@@ -227,6 +227,16 @@ pub struct ComposerJson {
     pub keywords: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
+    /// Every other valid composer.json property not modelled by an explicit
+    /// field above (e.g. `bin`, `extra`, `scripts`, `conflict`, `replace`,
+    /// `provide`, `suggest`, `support`, `funding`, `minimum-stability`,
+    /// `prefer-stable`, ...). Captured verbatim via `#[serde(flatten)]` so an
+    /// upload preserves the FULL Composer schema through the
+    /// parse -> stored-metadata round-trip. Previously any unmodelled field was
+    /// silently dropped, which broke composer-plugin installs (missing `extra`)
+    /// and vendor/bin symlinks (missing `bin`) (#2846).
+    #[serde(flatten, default)]
+    pub additional: HashMap<String, serde_json::Value>,
 }
 
 /// Composer package author
@@ -590,6 +600,7 @@ mod tests {
             }]),
             keywords: Some(vec!["test".to_string()]),
             homepage: Some("https://example.com".to_string()),
+            additional: HashMap::new(),
         };
         let json = serde_json::to_string(&cj).unwrap();
         let parsed: ComposerJson = serde_json::from_str(&json).unwrap();
@@ -615,6 +626,7 @@ mod tests {
             authors: None,
             keywords: None,
             homepage: None,
+            additional: HashMap::new(),
         };
         let value = serde_json::to_value(&cj).unwrap();
         let obj = value.as_object().unwrap();
@@ -639,5 +651,56 @@ mod tests {
                 absent
             );
         }
+    }
+
+    // #2846: valid composer.json properties not modelled by an explicit field
+    // (here `bin` and `extra`) must survive the parse -> serialize round-trip
+    // via `#[serde(flatten)]` instead of being silently stripped.
+    #[test]
+    fn test_composer_json_preserves_unmodelled_properties() {
+        let json = r#"{
+            "name": "snsconsulting/dummy-package",
+            "type": "composer-plugin",
+            "version": "1.0.0",
+            "bin": ["bin/dummy"],
+            "extra": {"class": "SNSConsulting\\DummyPackage\\Plugin"},
+            "scripts": {"post-install-cmd": "echo hi"},
+            "minimum-stability": "dev",
+            "prefer-stable": true
+        }"#;
+        let cj: ComposerJson = serde_json::from_str(json).unwrap();
+        // Explicitly modelled fields still land in their typed slots.
+        assert_eq!(cj.name, "snsconsulting/dummy-package");
+        assert_eq!(cj.package_type, Some("composer-plugin".to_string()));
+        // Unmodelled properties are captured in `additional`, not dropped.
+        assert_eq!(
+            cj.additional.get("bin"),
+            Some(&serde_json::json!(["bin/dummy"]))
+        );
+        assert_eq!(
+            cj.additional.get("extra"),
+            Some(&serde_json::json!({"class": "SNSConsulting\\DummyPackage\\Plugin"}))
+        );
+        assert!(cj.additional.contains_key("scripts"));
+        assert_eq!(
+            cj.additional.get("prefer-stable"),
+            Some(&serde_json::json!(true))
+        );
+
+        // ...and they re-emit at the top level on serialize (what gets stored
+        // in artifact_metadata and later merged into the served packages.json).
+        let value = serde_json::to_value(&cj).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("bin"), Some(&serde_json::json!(["bin/dummy"])));
+        assert_eq!(
+            obj.get("extra"),
+            Some(&serde_json::json!({"class": "SNSConsulting\\DummyPackage\\Plugin"}))
+        );
+        assert_eq!(
+            obj.get("minimum-stability"),
+            Some(&serde_json::json!("dev"))
+        );
+        // The flattened map must NOT nest under an `additional` key.
+        assert!(obj.get("additional").is_none());
     }
 }

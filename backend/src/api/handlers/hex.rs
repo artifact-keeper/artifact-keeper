@@ -3113,6 +3113,122 @@ mod tests {
         f.teardown().await;
     }
 
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `build_hex_tarball_url` unit tests prove the builder emits a string;
+    // only routing the URL the `/packages/{name}` document actually advertises
+    // against the REAL router (mounted where `api::routes` nests it) proves a
+    // hex client can fetch the published tarball. A wrongly-shaped or
+    // wrongly-prefixed release `url` passes every builder test yet 404s on
+    // `mix deps.get`.
+    // -----------------------------------------------------------------------
+
+    /// The hex routes mounted exactly where `api::routes` nests them. The
+    /// advertised release `url` is root-absolute and carries the `/hex` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/hex", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// The tarball `url` the `/packages/{name}` document advertises (the JSON
+    /// release resource a Virtual hex repo serves) must resolve against the real
+    /// download route and serve the published tarball bytes. The advertised url
+    /// carries the VIRTUAL repo key, so a client following it lands back on the
+    /// same virtual repo, which serves the local member's bytes.
+    #[tokio::test]
+    async fn test_advertised_release_url_resolves_against_real_router() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_repo_id, _local_key, local_storage_dir) =
+            tdh::create_repo(&pool, "local", "hex").await;
+        let (virtual_repo_id, virtual_key, _virtual_storage_dir) =
+            tdh::create_repo(&pool, "virtual", "hex").await;
+        let state = tdh::build_state(pool.clone(), local_storage_dir.to_str().unwrap());
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_repo_id)
+        .bind(local_repo_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+
+        let name = "jason";
+        let version = "1.4.1";
+        let tarball: &[u8] = b"hex-tarball-bytes-for-advertised-url";
+        let local_repo =
+            tdh::make_repo_info(local_repo_id, "local-hex", &local_storage_dir, "hex", None);
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &local_repo,
+            &format!("hex/{name}/{version}/{name}-{version}.tar"),
+            &format!("{name}/{version}/{name}-{version}.tar"),
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from_static(tarball),
+            user_id,
+        )
+        .await;
+
+        // Read the release `url` the package-info document advertises.
+        let meta_path = format!("/hex/{virtual_key}/packages/{name}");
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(meta_path),
+        )
+        .await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let advertised = meta["releases"][0]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if advertised.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&meta_doc_url, &advertised);
+            tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        tdh::cleanup(&pool, virtual_repo_id, user_id).await;
+        tdh::cleanup(&pool, local_repo_id, user_id).await;
+
+        assert_eq!(meta_status, StatusCode::OK, "package-info document");
+        assert!(
+            !advertised.is_empty(),
+            "package-info must advertise a release url"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised release url ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tarball,
+            "the advertised release url must serve the published tarball bytes"
+        );
+    }
+
     #[tokio::test]
     async fn test_hex_package_info_404_when_missing() {
         let Some(f) = tdh::Fixture::setup("local", "hex").await else {

@@ -77,6 +77,20 @@ impl Severity {
         }
     }
 
+    /// Canonical lowercase form, matching the `scan_configs_severity_threshold_check`
+    /// database CHECK constraint (`critical|high|medium|low|info`). Use this when
+    /// persisting a severity so a normalized value (e.g. "High" -> "high",
+    /// "moderate" -> "medium") is what reaches Postgres.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+            Severity::Info => "info",
+        }
+    }
+
     /// Returns true if this severity is at or above the given threshold.
     pub fn meets_threshold(self, threshold: Severity) -> bool {
         self <= threshold
@@ -387,6 +401,30 @@ mod tests {
         assert_eq!(Severity::from_str_loose("unknown"), None);
         assert_eq!(Severity::from_str_loose(""), None);
         assert_eq!(Severity::from_str_loose("very-high"), None);
+    }
+
+    #[test]
+    fn test_severity_as_str_canonical_lowercase() {
+        // as_str() must match the scan_configs_severity_threshold_check set so a
+        // normalized value can be persisted safely (#2953).
+        assert_eq!(Severity::Critical.as_str(), "critical");
+        assert_eq!(Severity::High.as_str(), "high");
+        assert_eq!(Severity::Medium.as_str(), "medium");
+        assert_eq!(Severity::Low.as_str(), "low");
+        assert_eq!(Severity::Info.as_str(), "info");
+    }
+
+    #[test]
+    fn test_severity_as_str_roundtrips_through_from_str_loose() {
+        for s in [
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+            Severity::Info,
+        ] {
+            assert_eq!(Severity::from_str_loose(s.as_str()), Some(s));
+        }
     }
 
     #[test]

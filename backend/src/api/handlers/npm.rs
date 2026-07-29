@@ -2728,6 +2728,14 @@ async fn serve_tarball(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
+    // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
+    // must block the tarball pull, the same way the pypi seam gates simple-index
+    // + download. No-op for hosted repos and when curation is disabled. Version
+    // is not passed: an npm tarball filename (`pkg-1.2.3.tgz`, prerelease
+    // suffixes and hyphenated names included) cannot be split into name/version
+    // unambiguously, so name-pattern rules (the block-a-package case) apply.
+    proxy_helpers::enforce_curation(&state.db, &repo, package_name, None).await?;
+
     // Tarball URLs keep the scope separator as a literal `/`
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
@@ -5324,6 +5332,101 @@ mod tests {
         assert!(
             json["versions"]["1.0.0"]["dist"]["tarball"].is_string(),
             "abbreviated version keeps dist.tarball, got {json:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The rewrite/build tests prove `dist.tarball` is emitted as a string;
+    // only routing that URL against the REAL router (mounted where `api::routes`
+    // nests it) proves an npm client can fetch the published tarball. A tarball
+    // URL whose path the download route 404s passes every rewrite test yet
+    // breaks `npm install` (the #2587 class).
+    // -----------------------------------------------------------------------
+
+    /// The npm routes mounted exactly where `api::routes` nests them. The
+    /// advertised `dist.tarball` is absolute and carries the `/npm` prefix.
+    fn npm_mounted_router() -> Router<crate::api::SharedState> {
+        Router::new().nest("/npm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_dist_tarball_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let package = "widget";
+        let version = "1.0.0";
+        let tgz: &[u8] = b"npm-tgz-bytes-for-advertised-url";
+        let repo = fx.repo_info("local", None);
+        let path = format!("{package}/{version}/{package}-{version}.tgz");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            package,
+            version,
+            "application/gzip",
+            Bytes::from_static(tgz),
+            fx.user_id,
+        )
+        .await;
+
+        // Read the `dist.tarball` the packument advertises.
+        let meta_path = format!("/npm/{}/{package}", fx.repo_key);
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+            tdh::get(meta_path),
+        )
+        .await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let tarball = meta["versions"][version]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if tarball.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let dl_path = resolve_advertised(&meta_doc_url, &tarball);
+            tdh::send(
+                tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+                tdh::get(dl_path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(meta_status, StatusCode::OK, "packument");
+        assert!(
+            !tarball.is_empty(),
+            "packument must advertise a dist.tarball"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised dist.tarball ({tarball}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tgz,
+            "the advertised dist.tarball must serve the published tarball bytes"
         );
     }
 

@@ -2465,6 +2465,58 @@ mod tests {
         .expect("seed artifact");
     }
 
+    /// #2940: `list_page` must keep selecting the quarantine columns so the
+    /// listing handler can surface per-artifact quarantine state. Guards
+    /// against a future refactor dropping them from the SELECT (which would
+    /// silently report every artifact as unquarantined again).
+    #[tokio::test]
+    async fn test_list_page_carries_quarantine_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let held_key = format!("generic/{}", Uuid::new_v4());
+        let clean_key = format!("generic/{}", Uuid::new_v4());
+        seed_artifact(&pool, repo_id, "held/pkg-1.0.0.bin", &held_key).await;
+        seed_artifact(&pool, repo_id, "clean/pkg-1.0.0.bin", &clean_key).await;
+
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = $2 \
+             WHERE repository_id = $1 AND path = 'held/pkg-1.0.0.bin'",
+        )
+        .bind(repo_id)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .expect("apply quarantine");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let page = service
+            .list_page(repo_id, None, None, None, 0, 50)
+            .await
+            .expect("list page");
+
+        let held = page
+            .iter()
+            .find(|a| a.path == "held/pkg-1.0.0.bin")
+            .expect("held artifact listed");
+        assert_eq!(held.quarantine_status.as_deref(), Some("quarantined"));
+        assert!(held.quarantine_until.is_some());
+
+        let clean = page
+            .iter()
+            .find(|a| a.path == "clean/pkg-1.0.0.bin")
+            .expect("clean artifact listed");
+        assert!(clean.quarantine_status.is_none());
+        assert!(clean.quarantine_until.is_none());
+    }
+
     #[tokio::test]
     async fn test_guard_rejects_foreign_repo_owning_key() {
         use crate::api::handlers::test_db_helpers as tdh;

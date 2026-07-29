@@ -150,6 +150,92 @@ impl PermissionService {
         Ok(actions.iter().any(|a| a == action))
     }
 
+    /// Check an action against repository ownership, fine-grained rules, and
+    /// legacy role assignments in one decision.
+    ///
+    /// A role carrying `admin` is a durable owner capability and always wins.
+    /// For every other principal, an applicable direct/group repository rule
+    /// (or inherited project rule) is authoritative for that principal only.
+    /// Users without an applicable rule retain their role-based capabilities.
+    /// This principal-scoped transition prevents the first rule on a target
+    /// from dropping every unrelated legacy principal to no access.
+    pub async fn check_repository_action(
+        &self,
+        user_id: Uuid,
+        repository_id: Uuid,
+        action: &str,
+        is_admin: bool,
+    ) -> Result<bool> {
+        if is_admin {
+            return Ok(true);
+        }
+
+        let allowed: bool = sqlx::query_scalar(
+            r#"
+            WITH applicable_rules AS (
+                SELECT p.actions
+                FROM permissions p
+                WHERE (
+                    (p.principal_type IN ('user', 'service_account') AND p.principal_id = $1)
+                    OR (
+                        p.principal_type = 'group'
+                        AND p.principal_id IN (
+                            SELECT group_id
+                            FROM user_group_members
+                            WHERE user_id = $1
+                        )
+                    )
+                )
+                AND (
+                    (p.target_type = 'repository' AND p.target_id = $2)
+                    OR (
+                        p.target_type = 'project'
+                        AND p.target_id = (
+                            SELECT project_id
+                            FROM repositories
+                            WHERE id = $2
+                        )
+                    )
+                )
+            ),
+            assigned_roles AS (
+                SELECT r.permissions
+                FROM role_assignments ra
+                JOIN roles r ON r.id = ra.role_id
+                WHERE ra.user_id = $1
+                  AND (ra.repository_id = $2 OR ra.repository_id IS NULL)
+            )
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM assigned_roles
+                    WHERE 'admin' = ANY(permissions)
+                )
+                OR CASE
+                    WHEN EXISTS (SELECT 1 FROM applicable_rules)
+                    THEN EXISTS (
+                        SELECT 1
+                        FROM applicable_rules
+                        WHERE $3 = ANY(actions) OR 'admin' = ANY(actions)
+                    )
+                    ELSE EXISTS (
+                        SELECT 1
+                        FROM assigned_roles
+                        WHERE $3 = ANY(permissions) OR 'admin' = ANY(permissions)
+                    )
+                END
+            "#,
+        )
+        .bind(user_id)
+        .bind(repository_id)
+        .bind(action)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(allowed)
+    }
+
     /// Return true when at least one permission rule exists for the given
     /// target, regardless of principal. This is used by middleware to decide
     /// whether fine-grained rules should be enforced at all (targets without
@@ -1561,5 +1647,369 @@ mod tests {
             .await
             .unwrap();
         assert!(!art_read);
+    }
+
+    // -----------------------------------------------------------------------
+    // Repository action model -- DB-backed lib tests run in Tier 1 CI
+    // -----------------------------------------------------------------------
+
+    mod repository_actions_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sqlx::PgPool;
+
+        async fn assign_repo_role(pool: &PgPool, user_id: Uuid, repo_id: Uuid, role: &str) {
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, id, $2 FROM roles WHERE name = $3 \
+                 ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .bind(role)
+            .execute(pool)
+            .await
+            .expect("assign repository role");
+        }
+
+        async fn cleanup_action_fixture(
+            pool: &PgPool,
+            repo_id: Uuid,
+            user_ids: &[Uuid],
+            storage_dir: &std::path::Path,
+        ) {
+            let _ = sqlx::query(
+                "DELETE FROM permissions \
+                 WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+                .bind(user_ids)
+                .execute(pool)
+                .await;
+            let _ = std::fs::remove_dir_all(storage_dir);
+        }
+
+        #[tokio::test]
+        async fn test_repository_action_uses_owner_roles_and_principal_scoped_rules() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = PermissionService::new(pool.clone());
+            let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let (owner_id, _) = tdh::create_user(&pool).await;
+            let (developer_id, _) = tdh::create_user(&pool).await;
+            let (reader_id, _) = tdh::create_user(&pool).await;
+            let (other_id, _) = tdh::create_user(&pool).await;
+            let user_ids = [owner_id, developer_id, reader_id, other_id];
+
+            let project_id: Uuid =
+                sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $2) RETURNING id")
+                    .bind(format!("owner-model-{}", Uuid::new_v4()))
+                    .bind("Repository owner model test")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create project");
+            sqlx::query("UPDATE repositories SET project_id = $1 WHERE id = $2")
+                .bind(project_id)
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("assign repository project");
+
+            let group_id: Uuid =
+                sqlx::query_scalar("INSERT INTO groups (name) VALUES ($1) RETURNING id")
+                    .bind(format!("owner-model-{}", Uuid::new_v4()))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("create permission group");
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(reader_id)
+                .bind(group_id)
+                .execute(&pool)
+                .await
+                .expect("assign permission group");
+
+            assign_repo_role(&pool, owner_id, repo_id, "repository-owner").await;
+            assign_repo_role(&pool, developer_id, repo_id, "developer").await;
+            assign_repo_role(&pool, reader_id, repo_id, "reader").await;
+
+            assert!(service
+                .check_repository_action(other_id, repo_id, "admin", true)
+                .await
+                .expect("global admin short-circuit"));
+            assert!(!service
+                .check_repository_action(other_id, repo_id, "read", false)
+                .await
+                .expect("unassigned user decision"));
+            assert!(service
+                .check_repository_action(owner_id, repo_id, "admin", false)
+                .await
+                .expect("owner admin decision"));
+            assert!(service
+                .check_repository_action(owner_id, repo_id, "delete", false)
+                .await
+                .expect("owner delete decision"));
+            assert!(service
+                .check_repository_action(developer_id, repo_id, "write", false)
+                .await
+                .expect("developer write decision"));
+            assert!(!service
+                .check_repository_action(developer_id, repo_id, "delete", false)
+                .await
+                .expect("developer delete decision"));
+            assert!(service
+                .check_repository_action(reader_id, repo_id, "read", false)
+                .await
+                .expect("reader read decision"));
+            assert!(!service
+                .check_repository_action(reader_id, repo_id, "write", false)
+                .await
+                .expect("reader write decision"));
+
+            // Project rules and group membership participate in the same
+            // principal-scoped decision. Once applicable, the rule replaces
+            // this reader's legacy role fallback.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('group', $1, 'project', $2, ARRAY['write'])",
+            )
+            .bind(group_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("insert inherited group rule");
+            assert!(service
+                .check_repository_action(reader_id, repo_id, "write", false)
+                .await
+                .expect("inherited group write decision"));
+            assert!(!service
+                .check_repository_action(reader_id, repo_id, "read", false)
+                .await
+                .expect("inherited group rule replaces role fallback"));
+
+            // A rule for somebody else must not disable the developer's role
+            // fallback. This is the first-rule-falls-closed regression.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(other_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert unrelated fine-grained rule");
+            assert!(service
+                .check_repository_action(developer_id, repo_id, "write", false)
+                .await
+                .expect("developer fallback with unrelated rule"));
+
+            // A rule that does apply to the developer is authoritative for
+            // that principal and may narrow the legacy role to read-only.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(developer_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert developer override");
+            assert!(!service
+                .check_repository_action(developer_id, repo_id, "write", false)
+                .await
+                .expect("developer principal override"));
+
+            // Owner/admin is durable and cannot be accidentally stripped by
+            // an ordinary fine-grained rule on the same principal.
+            sqlx::query(
+                "INSERT INTO permissions \
+                   (principal_type, principal_id, target_type, target_id, actions) \
+                 VALUES ('user', $1, 'repository', $2, ARRAY['read'])",
+            )
+            .bind(owner_id)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("insert owner rule");
+            assert!(service
+                .check_repository_action(owner_id, repo_id, "delete", false)
+                .await
+                .expect("durable owner decision"));
+
+            sqlx::query("DELETE FROM permissions WHERE target_type = 'project' AND target_id = $1")
+                .bind(project_id)
+                .execute(&pool)
+                .await
+                .expect("delete project permissions");
+            cleanup_action_fixture(&pool, repo_id, &user_ids, &storage_dir).await;
+            sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(group_id)
+                .execute(&pool)
+                .await
+                .expect("delete permission group");
+            sqlx::query("DELETE FROM projects WHERE id = $1")
+                .bind(project_id)
+                .execute(&pool)
+                .await
+                .expect("delete project");
+        }
+
+        #[tokio::test]
+        async fn test_repository_owner_migration_backfills_without_flag_day() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let mut tx = pool.begin().await.expect("begin migration fixture");
+
+            // Shadow only the tables touched by migration 172. Executing the
+            // exact migration file against temporary tables tests upgrade
+            // behavior without mutating the shared CI database.
+            sqlx::raw_sql(
+                r#"
+                CREATE TEMP TABLE roles (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    permissions TEXT[] NOT NULL DEFAULT '{}',
+                    is_system BOOLEAN NOT NULL DEFAULT false,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                ) ON COMMIT DROP;
+                CREATE TEMP TABLE repositories (
+                    id UUID PRIMARY KEY,
+                    created_by UUID,
+                    project_id UUID
+                ) ON COMMIT DROP;
+                CREATE TEMP TABLE role_assignments (
+                    user_id UUID NOT NULL,
+                    role_id UUID NOT NULL,
+                    repository_id UUID,
+                    UNIQUE (user_id, role_id, repository_id)
+                ) ON COMMIT DROP;
+                CREATE TEMP TABLE permissions (
+                    target_type TEXT NOT NULL,
+                    target_id UUID NOT NULL
+                ) ON COMMIT DROP;
+                "#,
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("create isolated migration tables");
+
+            sqlx::query(
+                "INSERT INTO roles (name, description) VALUES \
+                 ('admin', 'admin'), ('developer', 'developer'), ('reader', 'reader')",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("seed legacy roles");
+
+            let known_repo = Uuid::new_v4();
+            let known_owner = Uuid::new_v4();
+            let legacy_repo = Uuid::new_v4();
+            let legacy_developer = Uuid::new_v4();
+            let ruled_repo = Uuid::new_v4();
+            let ruled_developer = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO repositories (id, created_by) VALUES \
+                 ($1, $2), ($3, NULL), ($4, NULL)",
+            )
+            .bind(known_repo)
+            .bind(known_owner)
+            .bind(legacy_repo)
+            .bind(ruled_repo)
+            .execute(&mut *tx)
+            .await
+            .expect("seed legacy repositories");
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, id, $2 FROM roles WHERE name = 'developer' \
+                 UNION ALL \
+                 SELECT $3, id, $4 FROM roles WHERE name = 'developer'",
+            )
+            .bind(legacy_developer)
+            .bind(legacy_repo)
+            .bind(ruled_developer)
+            .bind(ruled_repo)
+            .execute(&mut *tx)
+            .await
+            .expect("seed legacy developer assignments");
+            sqlx::query(
+                "INSERT INTO permissions (target_type, target_id) \
+                 VALUES ('repository', $1)",
+            )
+            .bind(ruled_repo)
+            .execute(&mut *tx)
+            .await
+            .expect("seed authoritative rule");
+
+            sqlx::raw_sql(include_str!(
+                "../../migrations/172_repository_owner_capability.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .expect("run repository owner migration");
+
+            // The SQL is intentionally safe to replay while an operator
+            // repairs or validates a staged upgrade.
+            sqlx::raw_sql(include_str!(
+                "../../migrations/172_repository_owner_capability.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .expect("re-run repository owner migration");
+
+            let developer_actions: Vec<String> =
+                sqlx::query_scalar("SELECT permissions FROM roles WHERE name = 'developer'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read developer actions");
+            let reader_actions: Vec<String> =
+                sqlx::query_scalar("SELECT permissions FROM roles WHERE name = 'reader'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read reader actions");
+            assert_eq!(developer_actions, vec!["read", "write"]);
+            assert_eq!(reader_actions, vec!["read"]);
+
+            for (user_id, repo_id, expected) in [
+                (known_owner, known_repo, true),
+                (legacy_developer, legacy_repo, true),
+                (ruled_developer, ruled_repo, false),
+            ] {
+                let has_owner: bool = sqlx::query_scalar(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM role_assignments ra \
+                         JOIN roles r ON r.id = ra.role_id \
+                         WHERE ra.user_id = $1 AND ra.repository_id = $2 \
+                           AND r.name = 'repository-owner' \
+                     )",
+                )
+                .bind(user_id)
+                .bind(repo_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read owner backfill");
+                assert_eq!(
+                    has_owner, expected,
+                    "unexpected owner backfill for {repo_id}"
+                );
+            }
+
+            tx.rollback().await.expect("rollback migration fixture");
+        }
     }
 }

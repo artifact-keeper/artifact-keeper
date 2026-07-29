@@ -951,6 +951,11 @@ async fn flatcontainer_download(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
+    // Curation enforcement (#2930): block a curated package before it is
+    // resolved locally or proxied from an upstream V3 feed. No-op for hosted
+    // repos / curation off.
+    proxy_helpers::enforce_curation(&state.db, &repo, &package_id_lower, Some(&version)).await?;
+
     // Find the artifact matching this package/version.
     let artifact = sqlx::query!(
         r#"
@@ -1511,6 +1516,11 @@ async fn v2_download(
     version: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // Curation enforcement (#2930): gate the V2 .nupkg download seam too, so a
+    // block rule holds regardless of whether the client uses the V3 flat
+    // container or the legacy V2 package route. No-op for hosted / curation off.
+    proxy_helpers::enforce_curation(&state.db, repo, &id.to_lowercase(), Some(version)).await?;
+
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)

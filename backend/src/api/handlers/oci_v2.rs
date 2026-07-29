@@ -6600,6 +6600,22 @@ async fn handle_head_manifest(
         }
     }
 
+    // Curation enforcement (#2930): mirror the GET-manifest gate so a HEAD probe
+    // (which many clients issue before the GET) is blocked identically. No-op
+    // for hosted repos / curation off.
+    if let Err(resp) = proxy_helpers::enforce_curation_lookup(
+        &state.db,
+        repo.id,
+        &repo.key,
+        &repo.repo_type,
+        &repo.image,
+        None,
+    )
+    .await
+    {
+        return resp;
+    }
+
     // Reference can be a tag or a digest. Resolve locally first: a surviving
     // tag row, or — for a digest this hosted repo proves it owns via committed
     // metadata — the content-addressable object itself, so a manifest stays
@@ -6881,6 +6897,26 @@ async fn handle_get_manifest(
         if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
+    }
+
+    // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
+    // must block the image pull. The manifest GET is the single seam every
+    // `docker pull` passes through (blobs are content-addressed by digest and
+    // carry no image identity), so gating it here blocks the pull without a
+    // per-blob check. The image name is the curation identity; the reference
+    // (tag or digest) is not passed as a version. No-op for hosted repos /
+    // curation off.
+    if let Err(resp) = proxy_helpers::enforce_curation_lookup(
+        &state.db,
+        repo.id,
+        &repo.key,
+        &repo.repo_type,
+        &repo.image,
+        None,
+    )
+    .await
+    {
+        return resp;
     }
 
     // Resolve locally first: a surviving tag row, or — for a digest this hosted
