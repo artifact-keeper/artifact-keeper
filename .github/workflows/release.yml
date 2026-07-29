@@ -92,7 +92,7 @@ jobs:
   # longer part of the backend release's version set (issue #2708).
   #
   # Ordering (A5): preflight -> resolve (blocks <=35 min on the publish) ->
-  # release-gate/mesh -> build-binaries -> verify-images-published -> release.
+  # release-gate -> build-binaries -> verify-images-published -> release.
   # The GitHub Release object still publishes strictly last; this job only
   # moves the gate's START to after the candidate bytes exist.
   # ════════════════════════════════════════════════════════════════════════════
@@ -213,15 +213,18 @@ jobs:
       include_stress: false
       include_failure: false
 
-  mesh-e2e-gate:
-    name: Mesh Replication E2E (optional)
-    # Advisory, but it was the last `dev` literal on the release path; run it
-    # against the published candidate tag like everything else.
-    needs: [release-preflight, resolve-candidate-digest]
-    uses: ./.github/workflows/mesh-e2e.yml
-    with:
-      image_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
-    secrets: inherit
+  # NOTE: `mesh-e2e-gate` was removed from the release path (first on 1.6.x,
+  # commit 919439bb; cherry-picked to main for #2980). It called
+  # ./.github/workflows/mesh-e2e.yml, which patches the ArgoCD Applications
+  # ak-mesh-main / ak-mesh-peer-{1,2,3}. Those Applications are not present on
+  # the cluster (the artifact-keeper-mesh-test ApplicationSet is not applied),
+  # so the job failed with `applications.argoproj.io "ak-mesh-main" not found`
+  # on every recent run on main and every 1.6.x tag (v1.6.0, v1.6.2, v1.6.3),
+  # marking each release run
+  # red. It never blocked publication -- the `release` job below deliberately
+  # did not require it -- so the only effect was a permanently failing advisory
+  # gate on the release path. mesh-e2e.yml is retained and still runnable via
+  # workflow_dispatch once the mesh ApplicationSet is restored.
 
   release-gate:
     name: Release Gate (Full Suite)
@@ -592,10 +595,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, release-gate, mesh-e2e-gate, verify-images-published]
-    # `mesh-e2e-gate` is advisory, so this cannot fall back to the default
-    # `success()` -- it has to name the gates it requires. `!cancelled()` rather
-    # than `always()`: with `always()`, cancelling the run does not stop the
+    needs: [build-binaries, release-gate, verify-images-published]
+    # Every named gate is now required, but the condition stays explicit rather
+    # than falling back to the default `success()`. `!cancelled()` rather than
+    # `always()`: with `always()`, cancelling the run does not stop the
     # publication, because the gates it names have already reported success.
     if: |
       !cancelled() &&
