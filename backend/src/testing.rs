@@ -102,7 +102,7 @@ pub fn on_connect_result<T>(result: Result<T, sqlx::Error>) -> Option<T> {
 /// the DB is not required; a connect failure under [`REQUIRE_DB_ENV`] panics.
 pub async fn try_pool_with(max_connections: u32) -> Option<PgPool> {
     let url = require_db_url()?;
-    on_connect_result(
+    let pool = on_connect_result(
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(max_connections)
             // llvm-cov + nextest run DB-backed lib tests in parallel processes.
@@ -111,7 +111,74 @@ pub async fn try_pool_with(max_connections: u32) -> Option<PgPool> {
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect(&url)
             .await,
-    )
+    )?;
+    ensure_download_event_dispatch(&url).await;
+    Some(pool)
+}
+
+/// Start (once per test process) the bounded download-event dispatcher that
+/// the production binary installs in `main.rs` (#2522), so DB-backed tests
+/// asserting `download_statistics` / download-audit rows exercise the REAL
+/// bounded path. An uninstalled dispatcher degrades to a silent drop by
+/// design, which would otherwise fiction-green those assertions into
+/// timeouts. Living here — the shared body every module-local `try_pool`
+/// delegates to — is what guarantees every DB-backed test gets it.
+///
+/// The flush workers must outlive any single `#[tokio::test]` runtime: under
+/// plain `cargo test` every test builds and drops its own runtime, which would
+/// kill workers spawned on it and strand the process-global sender on a closed
+/// channel. So the dispatcher runs on a dedicated background thread with its
+/// own long-lived current-thread runtime and its own small pool. Under
+/// `cargo nextest` (one process per test) each test process starts its own.
+async fn ensure_download_event_dispatch(url: &str) {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    let url = url.to_string();
+    INIT.call_once(move || {
+        let _ = std::thread::Builder::new()
+            .name("dl-event-dispatch-test".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("test download-event dispatcher: runtime build failed: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    match sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(2)
+                        .acquire_timeout(std::time::Duration::from_secs(30))
+                        .connect(&url)
+                        .await
+                    {
+                        Ok(pool) => {
+                            crate::services::download_event_dispatch::start_download_event_dispatch(
+                                pool,
+                                tokio_util::sync::CancellationToken::new(),
+                            );
+                            // Keep the worker runtime alive for the process
+                            // lifetime; the thread dies with the process.
+                            std::future::pending::<()>().await;
+                        }
+                        Err(e) => {
+                            eprintln!("test download-event dispatcher: DB connect failed: {e}");
+                        }
+                    }
+                });
+            });
+    });
+    // Wait (bounded) until the dispatcher handle is installed so a test's very
+    // first `record_download` cannot race the background install and no-op.
+    for _ in 0..500 {
+        if crate::services::download_event_dispatch::dispatch_installed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]

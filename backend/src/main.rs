@@ -859,6 +859,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
     }
 
+    // Start the bounded download-event dispatcher (#2522): a bounded queue +
+    // fixed pool of flush workers that batch-INSERT the download-path
+    // side-effect writes (download_statistics + ARTIFACT_DOWNLOADED audit).
+    // Replaces the per-request `tokio::spawn`s so a download flood against a
+    // slow/failing event store sheds telemetry (bounded, counted) instead of
+    // growing detached tasks + pool connections without bound. Started before
+    // the HTTP servers bind so no request can observe an uninstalled
+    // dispatcher. Sizing: DOWNLOAD_EVENT_QUEUE_DEPTH / DOWNLOAD_EVENT_FLUSH_WORKERS.
+    artifact_keeper_backend::services::download_event_dispatch::start_download_event_dispatch(
+        app_state.db.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     app_state
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);

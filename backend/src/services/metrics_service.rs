@@ -175,6 +175,29 @@ pub fn record_webhook_dead_letter(event: &str) {
     .increment(1);
 }
 
+/// Record a download side-effect event (stats/audit) dropped by the bounded
+/// dispatcher (#2522). `kind` is `"stats"` or `"audit"`; `reason` is
+/// `"queue_full"` (overflow shed under load), `"closed"` (workers gone), or
+/// `"uninitialised"` (no dispatcher installed — tests/embedders). A sustained
+/// `queue_full` rate is the operator signal that the event store cannot keep
+/// up with download volume; the byte plane is unaffected by design.
+pub fn record_download_event_dropped(kind: &str, reason: &str) {
+    counter!(
+        "ak_download_events_dropped_total",
+        "kind" => kind.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Update the bounded download-event queue-depth gauge (#2522). Sampled on
+/// enqueue; a depth pinned at the configured capacity together with a rising
+/// `ak_download_events_dropped_total{reason="queue_full"}` means the flush
+/// workers are saturated.
+pub fn set_download_event_queue_depth(depth: f64) {
+    gauge!("ak_download_event_queue_depth").set(depth);
+}
+
 /// Record an outbound URL that was rejected by SSRF validation, either
 /// at handler entry (`validate_outbound_url`) or on a redirect hop
 /// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,

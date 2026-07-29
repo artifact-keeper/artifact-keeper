@@ -1469,13 +1469,17 @@ impl ArtifactService {
 
         // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
         // per-access record auditors need to answer "who fetched this artifact,
-        // and when?". Fire-and-forget: a download must never fail because the
-        // audit table is unavailable, mirroring the download-statistics write
-        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        // and when?". Routed through the bounded download-event dispatcher
+        // (#2522) rather than a per-request spawn: a download must never fail
+        // (or slow) because the audit table is unavailable, and a flood must
+        // never grow tasks/connections without bound — mirroring the
+        // download-statistics write above. Only this download hot-path emitter
+        // uses the dispatcher; the non-hot-path `audit_fire_and_forget` call
+        // sites (auth/user/token lifecycle) keep their existing spawn. The IP
+        // is parsed leniently; a malformed value is simply omitted.
         {
-            use crate::services::audit_service::{
-                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
-            };
+            use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+            use crate::services::download_event_dispatch::{try_enqueue, DownloadEvent};
             let mut entry =
                 AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
                     .resource(artifact_id)
@@ -1495,7 +1499,7 @@ impl ArtifactService {
             if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
                 entry = entry.ip(ip);
             }
-            audit_fire_and_forget(self.db.clone(), entry).await;
+            let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
 
         // Trigger AfterDownload hooks (non-blocking)
@@ -2319,7 +2323,12 @@ pub async fn guard_foreign_storage_key_for_backend(
 ///
 /// Call this only after a **local** artifact row has been resolved; remote
 /// pass-through proxy fetches are not our artifacts and stay unrecorded.
-pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+///
+/// The pool parameter is retained (underscore-bound) purely for call-site
+/// stability: the ~45 format/generic/OCI call sites keep compiling unchanged
+/// while the bounded dispatcher's flush workers own the only side-effect DB
+/// connections (#2522).
+pub async fn record_download(_db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
     // A HEAD request serves no body — it must never write a download row
     // (#2260 §5). This is the single choke point every serving path funnels
     // through (hosted stream, presigned redirect, virtual-member local resolve,
@@ -2330,33 +2339,26 @@ pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadConte
     if ctx.is_head {
         return;
     }
-    // Move the statistics INSERT OFF the synchronous download hot path (#2522).
-    // Historically this awaited the write on the catalog pool before the byte
-    // stream could return, coupling byte-plane latency/availability to DB-pool
-    // pressure. Spawn a detached best-effort task instead: the caller returns
-    // immediately (no await on the write), the row is still eventually written,
-    // and a failure is logged at `warn` and swallowed exactly as before —
-    // statistics must never block or fail the download itself. The `is_head`
-    // "no body ⇒ no row" contract is preserved (checked synchronously above).
-    let db = db.clone();
-    let user_id = ctx.user_id;
-    let ip_address = ctx.client_ip.map(|ip| ip.to_string());
-    let user_agent = ctx.user_agent.clone();
-    tokio::spawn(async move {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(artifact_id)
-        .bind(user_id)
-        .bind(ip_address)
-        .bind(user_agent)
-        .execute(&db)
-        .await
-        {
-            warn!(%artifact_id, error = %e, "failed to record download statistics");
-        }
-    });
+    // Route the statistics write through the BOUNDED download-event dispatcher
+    // (#2522). The first #2522 slice moved this INSERT off the byte plane with
+    // a per-request `tokio::spawn`, which left task + pool-connection growth
+    // unbounded under a download flood with a slow event store. `try_enqueue`
+    // never blocks, awaits, or spawns: the event is queued for a fixed pool of
+    // batch-flush workers, shed (dropped + counted) on overflow, and silently
+    // skipped when no dispatcher is installed (tests) — statistics must never
+    // block or fail the download itself. Attribution (trusted-proxy client IP,
+    // user, user-agent) is captured HERE, at request time, so it cannot drift
+    // across the async hop. The `is_head` "no body ⇒ no row" contract is
+    // preserved (checked synchronously above).
+    use crate::services::download_event_dispatch::{
+        try_enqueue, DownloadEvent, DownloadStatsEvent,
+    };
+    let _ = try_enqueue(DownloadEvent::Stats(DownloadStatsEvent {
+        artifact_id,
+        user_id: ctx.user_id,
+        ip_address: ctx.client_ip.map(|ip| ip.to_string()),
+        user_agent: ctx.user_agent.clone(),
+    }));
 }
 
 /// URL fields commonly found in package metadata across all formats.
@@ -4138,13 +4140,15 @@ mod tests {
             user_agent: Some("unit-test/1.0".to_string()),
             is_head: false,
         };
-        // Returns without awaiting the INSERT (spawned); the row lands shortly
-        // after. The count must still reach 1 — the eventual-write contract.
+        // Returns without awaiting the INSERT (enqueued to the bounded
+        // dispatcher `tdh::try_pool` installed); the batch flush lands the row
+        // shortly after. The count must still reach 1 — the eventual-write
+        // contract survives the spawn -> bounded-dispatch change (#2522).
         record_download(&pool, artifact_id, &ctx).await;
         let count = poll_dl_count(&pool, artifact_id, 1).await;
         assert_eq!(
             count, 1,
-            "spawned download_statistics write must eventually land"
+            "dispatched download_statistics write must eventually land"
         );
     }
 

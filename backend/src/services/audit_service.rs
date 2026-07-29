@@ -611,6 +611,69 @@ impl AuditService {
         Ok(id)
     }
 
+    /// Log a batch of audit entries with one multi-row INSERT (#2522).
+    ///
+    /// Used by the bounded download-event dispatcher's flush workers so a
+    /// burst of `ARTIFACT_DOWNLOADED` events costs one round-trip instead of
+    /// one per event. Semantics match [`AuditService::log`] per entry: the
+    /// structured export record is emitted BEFORE the INSERT and regardless of
+    /// its outcome (the stdout stream must not lose the SIEM copy to a DB
+    /// outage), and ids are the client-minted `event_id`s. Parallel-array
+    /// UNNEST, runtime (non-macro) query — same shape as `webhook_producer`'s
+    /// batch insert — so no offline `.sqlx` prepare is needed.
+    pub async fn log_batch(&self, entries: Vec<AuditEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in &entries {
+            audit_export::emit_entry(entry);
+        }
+
+        let n = entries.len();
+        let mut ids: Vec<Uuid> = Vec::with_capacity(n);
+        let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(n);
+        let mut actions: Vec<&'static str> = Vec::with_capacity(n);
+        let mut resource_types: Vec<&'static str> = Vec::with_capacity(n);
+        let mut resource_ids: Vec<Option<Uuid>> = Vec::with_capacity(n);
+        let mut details: Vec<Option<serde_json::Value>> = Vec::with_capacity(n);
+        let mut ip_addresses: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut correlation_ids: Vec<String> = Vec::with_capacity(n);
+        for entry in entries {
+            ids.push(entry.event_id);
+            user_ids.push(entry.user_id);
+            actions.push(entry.action.as_str());
+            resource_types.push(entry.resource_type.as_str());
+            resource_ids.push(entry.resource_id);
+            details.push(entry.details);
+            ip_addresses.push(entry.ip_address.map(|ip| ip.to_string()));
+            correlation_ids.push(entry.correlation_id);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log
+                (id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
+            SELECT * FROM UNNEST(
+                $1::uuid[], $2::uuid[], $3::text[], $4::text[],
+                $5::uuid[], $6::jsonb[], $7::text[], $8::text[])
+                AS t(id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
+            "#,
+        )
+        .bind(ids)
+        .bind(user_ids)
+        .bind(actions)
+        .bind(resource_types)
+        .bind(resource_ids)
+        .bind(details)
+        .bind(ip_addresses)
+        .bind(correlation_ids)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Query audit logs, with each row joined to its actor's username (#2392).
     ///
     /// A `LEFT JOIN` on `users` embeds `actor_username` without ever dropping

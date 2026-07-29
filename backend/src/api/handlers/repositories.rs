@@ -9746,12 +9746,11 @@ mod tests {
     }
 
     async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .ok()
+        // Delegate to the shared harness pool: it also installs the bounded
+        // download-event dispatcher (#2522) that `record_redirect_download`'s
+        // stats write now flows through — a bare `PgPoolOptions` connect would
+        // leave the dispatcher uninstalled and the write a designed no-op.
+        crate::testing::try_pool_with(2).await
     }
 
     async fn seed_artifact(pool: &sqlx::PgPool) -> Uuid {
