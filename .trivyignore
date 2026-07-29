@@ -85,6 +85,26 @@ CVE-2026-50162
 GHSA-vh4v-2xq2-g5cg
 
 # ---------------------------------------------------------------------------
+# trivy 0.72.0 binary (scanner-adapter image): golang.org/x/text @ v0.38.0
+# Fixed in x/text 0.39.0. trivy 0.72.0 is the latest upstream release and has
+# not been rebuilt against it, so there is no tool version to bump to. Drops
+# off when Aqua ships a trivy release built on x/text >= 0.39.0.
+#
+# Scope verified on 2026-07-29 (v1.6.4 scan): this CVE is present ONLY in the
+# vendored trivy CLI. The scanner-adapter's own binary cannot carry it, since
+# docker/scanner-adapter/go.mod declares no dependencies at all (stdlib only).
+# The backend and openscap images scan clean at 0 findings and do not bundle
+# trivy (#1544), so nothing in the network-reachable service surface is
+# affected. No reachability argument is claimed for the x/text code path
+# itself; the justification here is vendored-binary scope plus the absence of
+# any fixed tool release.
+#
+# The same scan also reported CVE-2026-46600 (golang.org/x/net @ v0.55.0) at
+# UNKNOWN severity. It is not suppressed: CI alerts on CRITICAL/HIGH only, so
+# it does not gate, and it should be re-checked on the next trivy bump.
+CVE-2026-56852
+
+# ---------------------------------------------------------------------------
 # trivy 0.72.0 binary (scanner-adapter image) — sigstore verification stack
 # github.com/sigstore/sigstore-go @ v1.1.4 (fixed 1.2.0) and
 # github.com/sigstore/timestamp-authority/v2 @ v2.0.6 (fixed 2.1.0); trivy
