@@ -18,6 +18,15 @@
 //! `/bin/sh` entrypoint wrapper (issues #2059/#2084). The direct
 //! `DEPENDENCY_TRACK_API_KEY` value takes precedence when both are set.
 //!
+//! The bootstrap step that writes the key file runs alongside the backend and
+//! can finish after it, so the file is allowed to appear late: when a key file
+//! is configured but not yet readable, the integration is still wired up and
+//! the key is resolved on first use, retried at most once every
+//! [`DT_KEY_FILE_RETRY_INTERVAL`] until the file lands. No restart is needed.
+//! Requests made before the key is available fail with `ServiceUnavailable`
+//! and the status endpoint reports the integration as unhealthy with the
+//! reason.
+//!
 //! ## Required Dependency-Track team permissions (#1472)
 //!
 //! The API key passed via `DEPENDENCY_TRACK_API_KEY` must belong to a team
@@ -60,7 +69,8 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
-use std::time::Duration;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use url::Url;
 use utoipa::ToSchema;
@@ -179,8 +189,14 @@ fn dt_upstream_parse_err(operation: &str, err: impl std::fmt::Display) -> AppErr
 pub struct DependencyTrackConfig {
     /// Base URL of the Dependency-Track API server
     pub base_url: String,
-    /// API key for authentication (X-Api-Key header)
+    /// API key for authentication (X-Api-Key header). Empty when the key is
+    /// supplied through [`Self::api_key_file`] and that file was not readable
+    /// at startup; see [`DependencyTrackService::api_key`].
     pub api_key: String,
+    /// Path the API key is read from when `api_key` is empty. Re-read until it
+    /// yields a key, so a bootstrap step that writes the file after the backend
+    /// starts does not leave the integration dead for the life of the process.
+    pub api_key_file: Option<String>,
     /// Whether integration is enabled
     pub enabled: bool,
 }
@@ -195,6 +211,15 @@ impl DependencyTrackConfig {
     /// health monitor skips its probe (see `health_monitor_service.rs`),
     /// and the system-config endpoint reports DT as disabled. This is the
     /// canonical kill-switch for the integration (issues #1395, #1480).
+    ///
+    /// When enabled, `None` is also returned if `DEPENDENCY_TRACK_URL` is unset
+    /// or if no key source is configured at all (neither
+    /// `DEPENDENCY_TRACK_API_KEY` nor `DEPENDENCY_TRACK_API_KEY_FILE`); there is
+    /// nothing to wait for in that case.
+    ///
+    /// A configured key file that is not readable yet does NOT return `None`.
+    /// The config is returned with an empty `api_key` and the file path
+    /// retained, and the key is picked up on first use once the file appears.
     pub fn from_env() -> Option<Self> {
         let enabled = std::env::var("DEPENDENCY_TRACK_ENABLED")
             .map(|v| {
@@ -208,14 +233,34 @@ impl DependencyTrackConfig {
         }
 
         let base_url = std::env::var("DEPENDENCY_TRACK_URL").ok()?;
+
+        // Normalize the path once. A blank value means "no file configured",
+        // which is how resolve_api_key already treats it.
+        let api_key_file = std::env::var("DEPENDENCY_TRACK_API_KEY_FILE")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+
         let api_key = resolve_api_key(
             std::env::var("DEPENDENCY_TRACK_API_KEY").ok(),
-            std::env::var("DEPENDENCY_TRACK_API_KEY_FILE").ok(),
-        )?;
+            api_key_file.clone(),
+        );
+
+        match (&api_key, &api_key_file) {
+            // No key and no file to wait for: nothing usable, stay unwired.
+            (None, None) => return None,
+            (None, Some(path)) => warn!(
+                path = %path,
+                "Dependency-Track API key file is not readable yet; the integration \
+                 is wired up and will start working as soon as the file appears"
+            ),
+            _ => {}
+        }
 
         Some(Self {
             base_url,
-            api_key,
+            api_key: api_key.unwrap_or_default(),
+            api_key_file,
             enabled,
         })
     }
@@ -261,11 +306,32 @@ fn resolve_api_key(direct: Option<String>, key_file: Option<String>) -> Option<S
     }
 }
 
+/// Minimum interval between attempts to re-read `DEPENDENCY_TRACK_API_KEY_FILE`
+/// while it is still missing or empty. Short enough that the integration comes
+/// up within seconds of the bootstrap step finishing, long enough that a busy
+/// registry does not stat the file on every request.
+const DT_KEY_FILE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cached API key plus the time of the last unsuccessful read of the key file.
+/// Behind a lock so the key can be picked up after startup without a restart.
+#[derive(Debug, Default)]
+struct ApiKeyCache {
+    /// Resolved key. `None` until the key file yields one.
+    key: Option<String>,
+    /// When the key file was last read and found missing or empty.
+    last_failed_read: Option<Instant>,
+}
+
 /// Dependency-Track API client
 pub struct DependencyTrackService {
     client: Client,
     config: DependencyTrackConfig,
     page_size: u32,
+    api_key: RwLock<ApiKeyCache>,
+    /// Minimum spacing between reads of the key file while no key is
+    /// available. Always [`DT_KEY_FILE_RETRY_INTERVAL`] in production; tests
+    /// shorten it so they do not have to wait out the throttle.
+    key_retry_interval: Duration,
 }
 
 /// Dependency-Track project representation
@@ -668,21 +734,117 @@ impl DependencyTrackService {
             .build()
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
-        info!(
-            url = %config.base_url,
-            "Dependency-Track integration initialized"
-        );
+        let trimmed_key = config.api_key.trim();
+        let api_key = ApiKeyCache {
+            key: if trimmed_key.is_empty() {
+                None
+            } else {
+                Some(trimmed_key.to_string())
+            },
+            last_failed_read: None,
+        };
+
+        if api_key.key.is_none() {
+            warn!(
+                url = %config.base_url,
+                "Dependency-Track integration initialized without an API key; \
+                 requests fail until the key file becomes readable"
+            );
+        } else {
+            info!(
+                url = %config.base_url,
+                "Dependency-Track integration initialized"
+            );
+        }
 
         Ok(Self {
             client,
             config,
             page_size: DT_PAGE_SIZE,
+            api_key: RwLock::new(api_key),
+            key_retry_interval: DT_KEY_FILE_RETRY_INTERVAL,
         })
     }
 
     /// Create from environment variables, returns None if not enabled
     pub fn from_env() -> Option<Result<Self>> {
         DependencyTrackConfig::from_env().map(Self::new)
+    }
+
+    /// The API key to send as `X-Api-Key`, resolving it from
+    /// `DEPENDENCY_TRACK_API_KEY_FILE` if it was not available at startup.
+    ///
+    /// The bootstrap step that writes the key file races the backend and often
+    /// loses, so a key that is missing when the process starts is not treated
+    /// as permanent. The file is re-read on use, at most once every
+    /// [`DT_KEY_FILE_RETRY_INTERVAL`], until it yields a key; after that the
+    /// key is cached and the file is not touched again. Every request goes
+    /// through here, so a key that lands mid-flight is observed by the next
+    /// call without a restart.
+    ///
+    /// Returns `ServiceUnavailable` while no key is available, which is more
+    /// honest than sending an empty header and reporting DT's 401.
+    fn api_key(&self) -> Result<String> {
+        {
+            let cache = self.api_key.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(key) = &cache.key {
+                return Ok(key.clone());
+            }
+            if !self.retry_due(&cache) {
+                return Err(self.missing_api_key_err());
+            }
+        }
+
+        let mut cache = self.api_key.write().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have resolved the key, or just tried and failed,
+        // while this one waited for the write lock.
+        if let Some(key) = &cache.key {
+            return Ok(key.clone());
+        }
+        if !self.retry_due(&cache) {
+            return Err(self.missing_api_key_err());
+        }
+
+        match resolve_api_key(None, self.config.api_key_file.clone()) {
+            Some(key) => {
+                info!("Dependency-Track API key file is readable; integration is now active");
+                cache.key = Some(key.clone());
+                cache.last_failed_read = None;
+                Ok(key)
+            }
+            None => {
+                cache.last_failed_read = Some(Instant::now());
+                Err(self.missing_api_key_err())
+            }
+        }
+    }
+
+    /// True when the key file has never been read, or was last read longer ago
+    /// than [`Self::key_retry_interval`].
+    fn retry_due(&self, cache: &ApiKeyCache) -> bool {
+        match cache.last_failed_read {
+            Some(at) => at.elapsed() >= self.key_retry_interval,
+            None => true,
+        }
+    }
+
+    /// Operator-facing error for "the key has not shown up yet". Names the path
+    /// so the fix is obvious, and says no restart is needed so nobody bounces
+    /// the pod while the bootstrap job is still running.
+    fn missing_api_key_err(&self) -> AppError {
+        match &self.config.api_key_file {
+            Some(path) => AppError::ServiceUnavailable(format!(
+                "Dependency-Track API key is not available yet: {} is missing or empty. \
+                 The integration activates on its own once the file is written; \
+                 no restart is needed.",
+                path
+            )),
+            None => AppError::ServiceUnavailable(
+                "Dependency-Track API key is not configured. Set DEPENDENCY_TRACK_API_KEY \
+                 or DEPENDENCY_TRACK_API_KEY_FILE."
+                    .to_string(),
+            ),
+        }
     }
 
     /// Check if the service is available
@@ -700,6 +862,19 @@ impl DependencyTrackService {
     /// the web UI can render an explicit unavailable state instead of silently
     /// showing "0 dependencies" when DT is misconfigured (issue #963).
     pub async fn health_status(&self) -> DtHealthStatus {
+        // `/api/version` is unauthenticated, so it would report healthy for an
+        // instance we cannot actually talk to. A missing API key is reported as
+        // unhealthy with the reason instead, and clears itself once the key
+        // file lands.
+        if let Err(e) = self.api_key() {
+            let reason = e.to_string();
+            warn!(reason = %reason, "Dependency-Track health check: no API key available");
+            return DtHealthStatus::Unhealthy {
+                status: None,
+                reason,
+            };
+        }
+
         let url = format!("{}/api/version", self.config.base_url);
 
         match self.client.get(&url).send().await {
@@ -773,10 +948,11 @@ impl DependencyTrackService {
             ),
         };
 
+        let api_key = self.api_key()?;
         let response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("project lookup", e))?;
@@ -819,10 +995,11 @@ impl DependencyTrackService {
             description: description.map(String::from),
         };
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .put(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -871,10 +1048,11 @@ impl DependencyTrackService {
             "bom": encoded_bom
         });
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .put(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -905,10 +1083,11 @@ impl DependencyTrackService {
     pub async fn is_bom_processing(&self, token: &str) -> Result<bool> {
         let url = format!("{}/api/v1/bom/token/{}", self.config.base_url, token);
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("BOM status check", e))?;
@@ -954,6 +1133,7 @@ impl DependencyTrackService {
         endpoint: &str,
         operation: &str,
     ) -> Result<Vec<T>> {
+        let api_key = self.api_key()?;
         let mut page: u32 = 1;
         let mut all = Vec::new();
         let mut pages_fetched: u32 = 0;
@@ -966,7 +1146,7 @@ impl DependencyTrackService {
             let response = self
                 .client
                 .get(&url)
-                .header("X-Api-Key", &self.config.api_key)
+                .header("X-Api-Key", &api_key)
                 .send()
                 .await
                 .map_err(|e| dt_transport_err(&format!("{} (page {})", operation, page), e))?;
@@ -1074,10 +1254,11 @@ impl DependencyTrackService {
     pub async fn delete_project(&self, project_uuid: &str) -> Result<()> {
         let url = format!("{}/api/v1/project/{}", self.config.base_url, project_uuid);
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .delete(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("delete project", e))?;
@@ -1103,10 +1284,11 @@ impl DependencyTrackService {
             self.config.base_url, project_uuid
         );
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("get project metrics", e))?;
@@ -1144,10 +1326,11 @@ impl DependencyTrackService {
             self.config.base_url, project_uuid, days
         );
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("get project metrics history", e))?;
@@ -1175,10 +1358,11 @@ impl DependencyTrackService {
     pub async fn get_portfolio_metrics(&self) -> Result<DtPortfolioMetrics> {
         let url = format!("{}/api/v1/metrics/portfolio/current", self.config.base_url);
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await
             .map_err(|e| dt_transport_err("get portfolio metrics", e))?;
@@ -1209,10 +1393,11 @@ impl DependencyTrackService {
             self.config.base_url, project_uuid
         );
 
+        let api_key = self.api_key()?;
         let response = self
             .client
             .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .send()
             .await;
 
@@ -1262,10 +1447,11 @@ impl DependencyTrackService {
             is_suppressed: suppressed,
         };
 
+        let api_key = self.api_key()?;
         let response: reqwest::Response = self
             .client
             .put(&url)
-            .header("X-Api-Key", &self.config.api_key)
+            .header("X-Api-Key", &api_key)
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -1933,6 +2119,7 @@ mod tests {
         let config = DependencyTrackConfig {
             base_url: "http://localhost:8092".to_string(),
             api_key: "test-api-key".to_string(),
+            api_key_file: None,
             enabled: true,
         };
         assert_eq!(config.base_url, "http://localhost:8092");
@@ -1944,6 +2131,7 @@ mod tests {
         let config = DependencyTrackConfig {
             base_url: "http://dt.example.com".to_string(),
             api_key: "key-123".to_string(),
+            api_key_file: None,
             enabled: false,
         };
         let cloned = config.clone();
@@ -2230,9 +2418,15 @@ mod tests {
             config: DependencyTrackConfig {
                 base_url: base_url.to_string(),
                 api_key: "test-key".to_string(),
+                api_key_file: None,
                 enabled: true,
             },
             page_size: TEST_PAGE_SIZE,
+            api_key: RwLock::new(ApiKeyCache {
+                key: Some("test-key".to_string()),
+                last_failed_read: None,
+            }),
+            key_retry_interval: DT_KEY_FILE_RETRY_INTERVAL,
         }
     }
 
@@ -2908,5 +3102,250 @@ mod tests {
         std::fs::write(f.path(), "\n  \n").unwrap();
         let got = resolve_api_key(None, Some(f.path().to_string_lossy().into_owned()));
         assert_eq!(got, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred API key file: the bootstrap step that writes the key file can
+    // finish after the backend has started, and the integration has to recover
+    // on its own when it does (iac #202).
+    // -----------------------------------------------------------------------
+
+    const DT_ENV_KEYS: [&str; 4] = [
+        "DEPENDENCY_TRACK_ENABLED",
+        "DEPENDENCY_TRACK_URL",
+        "DEPENDENCY_TRACK_API_KEY",
+        "DEPENDENCY_TRACK_API_KEY_FILE",
+    ];
+
+    static DT_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes the env-mutating tests (the environment is process-global)
+    /// and restores every DT variable on drop so nothing leaks into the rest
+    /// of the suite.
+    struct DtEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl DtEnvGuard {
+        fn new() -> Self {
+            let lock = DT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = DT_ENV_KEYS
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect();
+            for k in DT_ENV_KEYS {
+                std::env::remove_var(k);
+            }
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for DtEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Service pointed at `base_url` whose only key source is `key_file`, with
+    /// the retry throttle disabled so a file written mid-test is seen at once.
+    fn service_awaiting_key_file(
+        base_url: &str,
+        key_file: &std::path::Path,
+    ) -> DependencyTrackService {
+        let mut service = DependencyTrackService::new(DependencyTrackConfig {
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            api_key_file: Some(key_file.to_string_lossy().into_owned()),
+            enabled: true,
+        })
+        .expect("service construction must not depend on the key being present");
+        service.key_retry_interval = Duration::ZERO;
+        service
+    }
+
+    #[test]
+    fn from_env_defers_when_key_file_is_not_written_yet() {
+        let env = DtEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("dtrack-api-key");
+        env.set("DEPENDENCY_TRACK_ENABLED", "true");
+        env.set("DEPENDENCY_TRACK_URL", "http://dt.example.svc:8080");
+        env.set("DEPENDENCY_TRACK_API_KEY_FILE", &key_path.to_string_lossy());
+
+        // The file does not exist. Before the fix this returned None and the
+        // integration stayed dead until someone restarted the backend.
+        let config = DependencyTrackConfig::from_env().expect("config must still be produced");
+        assert!(config.enabled);
+        assert!(config.api_key.is_empty());
+        assert_eq!(
+            config.api_key_file.as_deref(),
+            Some(key_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn from_env_none_when_disabled_even_with_a_readable_key_file() {
+        let env = DtEnvGuard::new();
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "unused-key").unwrap();
+        env.set("DEPENDENCY_TRACK_URL", "http://dt.example.svc:8080");
+        env.set("DEPENDENCY_TRACK_API_KEY_FILE", &f.path().to_string_lossy());
+
+        // Kill-switch unset (#1395, #1480).
+        assert!(DependencyTrackConfig::from_env().is_none());
+
+        env.set("DEPENDENCY_TRACK_ENABLED", "false");
+        assert!(DependencyTrackConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn from_env_none_when_no_key_source_is_configured() {
+        let env = DtEnvGuard::new();
+        env.set("DEPENDENCY_TRACK_ENABLED", "true");
+        env.set("DEPENDENCY_TRACK_URL", "http://dt.example.svc:8080");
+
+        // Nothing to wait for, so this stays unwired as it did before.
+        assert!(DependencyTrackConfig::from_env().is_none());
+
+        // A blank file path is the same as no file path.
+        env.set("DEPENDENCY_TRACK_API_KEY_FILE", "   ");
+        assert!(DependencyTrackConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn from_env_direct_key_wins_over_key_file() {
+        let env = DtEnvGuard::new();
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "file-key").unwrap();
+        env.set("DEPENDENCY_TRACK_ENABLED", "true");
+        env.set("DEPENDENCY_TRACK_URL", "http://dt.example.svc:8080");
+        env.set("DEPENDENCY_TRACK_API_KEY", "direct-key");
+        env.set("DEPENDENCY_TRACK_API_KEY_FILE", &f.path().to_string_lossy());
+
+        let config = DependencyTrackConfig::from_env().expect("config");
+        assert_eq!(config.api_key, "direct-key");
+
+        // The direct key is used as-is; the file is never consulted, even if it
+        // later disappears.
+        let service = DependencyTrackService::new(config).expect("service");
+        drop(f);
+        assert_eq!(service.api_key().unwrap(), "direct-key");
+    }
+
+    #[test]
+    fn api_key_is_picked_up_after_the_file_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("dtrack-api-key");
+        let service = service_awaiting_key_file("http://127.0.0.1:1", &key_path);
+
+        let err = service.api_key().unwrap_err();
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(ref m) if m.contains("dtrack-api-key")),
+            "expected a ServiceUnavailable naming the key file, got {err:?}"
+        );
+
+        // Bootstrap finishes.
+        std::fs::write(&key_path, "late-key\n").unwrap();
+
+        assert_eq!(service.api_key().unwrap(), "late-key");
+
+        // Once resolved the key is cached, so losing the file does not undo it.
+        std::fs::remove_file(&key_path).unwrap();
+        assert_eq!(service.api_key().unwrap(), "late-key");
+    }
+
+    #[test]
+    fn key_file_reads_are_throttled_while_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("dtrack-api-key");
+        // Default retry interval, so a failed read is not repeated immediately.
+        let service = DependencyTrackService::new(DependencyTrackConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: String::new(),
+            api_key_file: Some(key_path.to_string_lossy().into_owned()),
+            enabled: true,
+        })
+        .expect("service");
+
+        assert!(service.api_key().is_err());
+        std::fs::write(&key_path, "late-key").unwrap();
+        assert!(
+            service.api_key().is_err(),
+            "a second read inside the retry interval must not stat the file again"
+        );
+
+        // Pretend the interval elapsed; the next call reads the file.
+        service
+            .api_key
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_failed_read = None;
+        assert_eq!(service.api_key().unwrap(), "late-key");
+    }
+
+    #[tokio::test]
+    async fn health_status_is_unhealthy_until_the_key_lands() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("dtrack-api-key");
+        let service = service_awaiting_key_file(&server.uri(), &key_path);
+
+        // DT itself is up, but without a key the integration is not usable, so
+        // the status endpoint must not report it healthy.
+        match service.health_status().await {
+            DtHealthStatus::Unhealthy { status, reason } => {
+                assert_eq!(status, None);
+                assert!(reason.contains("dtrack-api-key"), "reason: {reason}");
+            }
+            DtHealthStatus::Healthy => panic!("must not report healthy without an API key"),
+        }
+
+        std::fs::write(&key_path, "late-key").unwrap();
+        assert_eq!(service.health_status().await, DtHealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn requests_recover_once_the_key_file_appears() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(header("X-Api-Key", "late-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtProject>::new()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("dtrack-api-key");
+        let service = service_awaiting_key_file(&server.uri(), &key_path);
+
+        // No key yet: fail fast and explicitly rather than sending an empty
+        // header and reporting DT's 401.
+        let err = service.list_projects().await.unwrap_err();
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable, got {err:?}"
+        );
+
+        std::fs::write(&key_path, "late-key\n").unwrap();
+
+        // No restart: the next request authenticates with the key that landed.
+        let projects = service.list_projects().await.expect("request must succeed");
+        assert!(projects.is_empty());
     }
 }

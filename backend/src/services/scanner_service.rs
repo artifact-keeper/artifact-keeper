@@ -14926,6 +14926,7 @@ mod tests {
             let dt = DependencyTrackService::new(DependencyTrackConfig {
                 base_url: base_url.to_string(),
                 api_key: "matrix-test-key".to_string(),
+                api_key_file: None,
                 enabled: true,
             })
             .expect("construct DT service");
