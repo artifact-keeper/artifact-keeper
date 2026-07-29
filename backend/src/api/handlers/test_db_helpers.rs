@@ -295,6 +295,92 @@ pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
     CurationGlobalSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`path_stats_serial_lock`] (#2601).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks (including the `hashtext('repository_path_storage_stats_rebuild')`
+/// transaction lock the rebuild itself takes), so the path-stats test cluster
+/// serializes only against itself.
+const PATH_STATS_TEST_LOCK_KEY: i64 = 0x5053_2601; // "PS" + issue #2601
+
+/// Cross-process serialization guard for the DB-backed path-stats tests
+/// (#2601).
+///
+/// `StorageStatsService::recompute_path_stats` rebuilds the WHOLE
+/// `repository_path_storage_stats` table (delete + reinsert in one
+/// transaction), taking row locks across every repository's rows and FK
+/// key-share locks on `repositories`. A peer test's `cleanup` (DELETE FROM
+/// repositories, which cascades into the same stats rows) ordered against a
+/// concurrent rebuild is a textbook two-table deadlock, and a repo deleted
+/// between the rebuild's snapshot and its insert surfaces as an FK violation.
+/// A Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`]
+/// — makes every path-stats test contend for one key, so only one runs its
+/// seed → rebuild → assert → cleanup critical section at a time. The lock
+/// releases when the guard drops (connection closes), including on panic.
+pub struct PathStatsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide path-stats test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed path-stats
+/// test and bind the result for the whole test body.
+pub async fn path_stats_serial_lock() -> PathStatsSerialGuard {
+    use sqlx::Connection;
+    let Some(url) = crate::testing::require_db_url() else {
+        return PathStatsSerialGuard { _conn: None };
+    };
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return PathStatsSerialGuard { _conn: None };
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PATH_STATS_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return PathStatsSerialGuard { _conn: None };
+    }
+    PathStatsSerialGuard { _conn: Some(conn) }
+}
+
+/// Refresh the materialized storage stats for a test, absorbing transient
+/// cross-suite interference.
+///
+/// [`path_stats_serial_lock`] serializes the path-stats tests against each
+/// other, but suites that do NOT take that lock still delete repositories
+/// concurrently (their `cleanup`), which can deadlock against — or FK-abort —
+/// a whole-table rebuild that has already snapshotted the deleted repo. Both
+/// are transient orderings (the scheduler's answer in production is simply
+/// the next tick), so the test helper retries a few times rather than letting
+/// unrelated suite noise flake these assertions. `full` additionally runs the
+/// repo-level persist (`recompute_all`), covering the #2601 chaining change.
+pub async fn recompute_storage_stats_with_retry(pool: &PgPool, full: bool) {
+    let service = crate::services::storage_stats_service::StorageStatsService::new(
+        pool.clone(),
+        "filesystem",
+    );
+    let mut last_err = None;
+    for _ in 0..5 {
+        let result = if full {
+            service.recompute_all().await
+        } else {
+            service.recompute_path_stats().await
+        };
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("storage stats recompute kept failing after retries: {last_err:?}");
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
