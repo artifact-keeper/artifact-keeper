@@ -23,7 +23,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -954,70 +954,100 @@ impl ScanWorkspace {
         }
     }
 
-    /// Materialize the npm pin without destroying gradeable signal the archive
-    /// shipped (#3004 follow-up).
+    /// Make the npm supply-chain signal gradeable WITHOUT rewriting anything
+    /// the archive shipped (#3004 follow-up 2).
     ///
-    /// The pin has to land at a lockfile path so syft catalogs it, and the
-    /// natural path — `package-lock.json` at the workspace root — is one an
-    /// archive can itself occupy. Truncating it was a real loss: a shipped
-    /// lockfile enumerates RESOLVED transitive versions (unlike `package.json`,
-    /// whose dependencies are semver ranges and correctly not materialized), so
-    /// clobbering it hid vulnerable transitives that would otherwise have been
-    /// graded. Three cases:
+    /// Earlier revisions tried to merge the pin into a shipped
+    /// `package-lock.json` and normalize its `lockfileVersion`. That was the
+    /// wrong shape: every rewrite is a chance to parse npm's lockfile formats
+    /// slightly differently from the scanner, and each mismatch is a silent
+    /// mask. Two real bypasses came out of it — bumping a v1 lockfile to v3
+    /// made the CVE engine read only `packages` and ignore the `dependencies`
+    /// tree where the vulnerable transitives actually were, and a dummy
+    /// `packages` map was enough to trigger that bump. So this no longer reads,
+    /// parses, merges, re-versions, or overwrites ANY shipped file.
     ///
-    /// * **No shipped root lockfile** — write the single-entry pin. Nothing to
-    ///   preserve.
-    /// * **Shipped root lockfile we can merge** (v2/v3 `packages` map) — keep
-    ///   every resolved entry and inject/override ONLY the top-level
-    ///   `node_modules/<name>` entry with the request coordinate. Transitives
-    ///   stay graded; a decoy that hides or rewrites the top-level is still
-    ///   defeated because the top-level comes from the request, not the bytes.
-    /// * **Shipped root lockfile we cannot merge** (v1-only, empty, malformed)
-    ///   — leave it exactly where it is and put the pin in its own
-    ///   subdirectory instead. syft catalogs lockfiles at any depth, so both
-    ///   are graded and nothing is lost.
+    /// Instead every signal is presented to the engine as its own file, at a
+    /// path nothing else claims:
     ///
-    /// Lockfiles anywhere else in the tree (the usual
-    /// `package/package-lock.json`, or a `npm-shrinkwrap.json`) are never
-    /// written to at all, so they are preserved and catalogued as-is.
+    /// * **Shipped `package-lock.json`** (root, `package/`, anywhere) — left
+    ///   exactly as shipped. The engine already grades both v1 `dependencies`
+    ///   and v2/v3 `packages` NATIVELY; it only failed to when we rewrote them.
+    /// * **Shipped `npm-shrinkwrap.json`** — the engine does not catalog this
+    ///   name at all, yet npm HONORS it over `package-lock.json`, so a
+    ///   vulnerable shrinkwrap was completely invisible. Copied VERBATIM (same
+    ///   JSON format, no parsing) to a `package-lock.json` under
+    ///   [`NPM_SHRINKWRAP_SUBDIR`], where the engine does catalog it.
+    /// * **Top-level identity pin** — always written to
+    ///   [`NPM_PIN_SUBDIR`], never at a path an archive can occupy, so a decoy
+    ///   can neither shadow nor suppress it.
+    ///
+    /// The engine globs `package-lock.json` at any depth and grades every one
+    /// it finds (verified: shipped lock + shrinkwrap copy + pin are all
+    /// cataloged in a single scan), so the union of these is what gets graded.
     async fn write_npm_lock_pin(workspace: &Path, pin: &ExpectedComponent) -> Result<()> {
-        const LOCKFILE_READ_CAP: u64 = 16 * 1024 * 1024;
-        let root_lock = PathBuf::from(NPM_LOCKFILE_NAME);
-        let root_lock_path = workspace.join(&root_lock);
+        Self::stage_shrinkwraps_for_grading(workspace).await;
 
-        let shipped = match tokio::fs::metadata(&root_lock_path).await {
-            Ok(meta) if meta.is_file() && meta.len() <= LOCKFILE_READ_CAP => {
-                tokio::fs::read_to_string(&root_lock_path).await.ok()
+        // The pin lives in its own directory, so it never collides with a
+        // shipped lockfile and never has to displace one.
+        Self::write_pin_file(
+            workspace,
+            &PathBuf::from(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME),
+            npm_package_lock_pin_json(&pin.name, &pin.version),
+        )
+        .await
+    }
+
+    /// Copy any shipped `npm-shrinkwrap.json` to a `package-lock.json` the CVE
+    /// engine will actually catalog (#3004 follow-up 2).
+    ///
+    /// A shrinkwrap is the SAME JSON format as a lockfile and takes precedence
+    /// over one for `npm install`, but the engine's cataloger keys on the
+    /// `package-lock.json` filename, so a vulnerable shrinkwrap graded as
+    /// nothing at all. Copied byte-for-byte — no parse, no normalization, so
+    /// there is no format for us to get wrong — under a per-source
+    /// subdirectory, because a tarball may ship both a root and a `package/`
+    /// shrinkwrap and they can legitimately differ.
+    ///
+    /// Best-effort by design: the original is never modified, and a copy that
+    /// fails leaves strictly less signal, never wrong signal. The top-level
+    /// pin (and the assessment gate behind it) is unaffected.
+    async fn stage_shrinkwraps_for_grading(workspace: &Path) {
+        // Generous vs any real lockfile; bounded so a hostile archive cannot
+        // make us duplicate an enormous file into the workspace.
+        const SHRINKWRAP_COPY_CAP: u64 = 64 * 1024 * 1024;
+        // The conventional locations: the archive root and the `package/`
+        // directory every npm tarball unpacks into.
+        const SOURCES: [(&str, &str); 2] = [("root", ""), ("package", "package")];
+
+        for (label, dir) in SOURCES {
+            let src = if dir.is_empty() {
+                workspace.join(NPM_SHRINKWRAP_NAME)
+            } else {
+                workspace.join(dir).join(NPM_SHRINKWRAP_NAME)
+            };
+            match tokio::fs::metadata(&src).await {
+                Ok(meta) if meta.is_file() && meta.len() <= SHRINKWRAP_COPY_CAP => {}
+                _ => continue,
             }
-            _ => None,
-        };
-
-        let Some(shipped) = shipped else {
-            return Self::write_pin_file(
-                workspace,
-                &root_lock,
-                npm_package_lock_pin_json(&pin.name, &pin.version),
-            )
-            .await;
-        };
-
-        match merge_npm_lock_pin(&shipped, &pin.name, &pin.version) {
-            Some(merged) => Self::write_pin_file(workspace, &root_lock, merged).await,
-            None => {
-                // Unmergeable but possibly still meaningful to syft: preserve
-                // it and pin alongside rather than trading their signal for
-                // ours.
-                debug!(
-                    "npm scan pin: root {} is not mergeable; preserving it and pinning \
-                     {}@{} in {}",
-                    NPM_LOCKFILE_NAME, pin.name, pin.version, NPM_PIN_SUBDIR
+            let dest_dir = workspace.join(NPM_SHRINKWRAP_SUBDIR).join(label);
+            if let Err(e) = tokio::fs::create_dir_all(&dest_dir).await {
+                warn!(
+                    "Failed to stage {} for grading ({}): {}",
+                    NPM_SHRINKWRAP_NAME,
+                    dest_dir.display(),
+                    e
                 );
-                Self::write_pin_file(
-                    workspace,
-                    &PathBuf::from(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME),
-                    npm_package_lock_pin_json(&pin.name, &pin.version),
-                )
-                .await
+                continue;
+            }
+            let dest = dest_dir.join(NPM_LOCKFILE_NAME);
+            if let Err(e) = tokio::fs::copy(&src, &dest).await {
+                warn!(
+                    "Failed to copy {} to {} for grading: {}",
+                    src.display(),
+                    dest.display(),
+                    e
+                );
             }
         }
     }
@@ -1172,74 +1202,18 @@ impl ScanWorkspace {
 /// the preserve-fallback subdirectory pin gradeable.
 pub(crate) const NPM_LOCKFILE_NAME: &str = "package-lock.json";
 
-/// Where the npm pin goes when a shipped root lockfile exists that we cannot
-/// merge into: its own subdirectory, so the shipped one is left untouched.
+/// Where the top-level identity pin is written — always its own subdirectory,
+/// never a path an archive can occupy, so no shipped file is ever displaced.
 pub(crate) const NPM_PIN_SUBDIR: &str = ".ak-scan-pin";
 
-/// Merge the request-coordinate pin INTO a lockfile the archive shipped,
-/// instead of replacing it (#3004 follow-up).
-///
-/// A shipped lockfile enumerates RESOLVED dependency versions — real,
-/// gradeable supply-chain signal. Overwriting it with a single-entry pin hid
-/// vulnerable TRANSITIVES: the CVE engine would then see only a clean
-/// top-level and report zero findings for a tarball that resolves, say, a
-/// known-vulnerable nested `lodash`.
-///
-/// So: keep every entry the lockfile declares, and inject/override ONLY the
-/// top-level `node_modules/<name>` entry with the version from the request
-/// coordinate. That keeps the top-level AUTHORITATIVE (a decoy that omits or
-/// downgrades the served package cannot suppress its grading) while leaving
-/// the transitive graph intact. The root `name`/`version` are also set to the
-/// coordinate so the document describes the package actually being served.
-///
-/// Returns `None` when the document is not a mergeable v2/v3 lockfile — not an
-/// object, no `packages` map, or an empty one. The caller then PRESERVES the
-/// shipped file and writes the pin elsewhere, so an unparseable-to-us lockfile
-/// is never traded away for our pin.
-pub(crate) fn merge_npm_lock_pin(shipped: &str, name: &str, version: &str) -> Option<String> {
-    let mut doc: serde_json::Value = serde_json::from_str(shipped).ok()?;
-    let obj = doc.as_object_mut()?;
+/// The lockfile npm HONORS over `package-lock.json` but the CVE engine does
+/// not catalog, so a vulnerable one was invisible until it is staged.
+pub(crate) const NPM_SHRINKWRAP_NAME: &str = "npm-shrinkwrap.json";
 
-    let packages = obj.get_mut("packages")?.as_object_mut()?;
-    if packages.is_empty() {
-        return None;
-    }
-
-    // Authoritative top-level: preserve any other keys the entry carried
-    // (resolved/integrity/dependencies) but force the served version.
-    let key = format!("node_modules/{name}");
-    match packages.get_mut(&key).and_then(|e| e.as_object_mut()) {
-        Some(entry) => {
-            entry.insert(
-                "version".to_string(),
-                serde_json::Value::String(version.to_string()),
-            );
-        }
-        None => {
-            packages.insert(key, serde_json::json!({ "version": version }));
-        }
-    }
-
-    obj.insert(
-        "name".to_string(),
-        serde_json::Value::String(name.to_string()),
-    );
-    obj.insert(
-        "version".to_string(),
-        serde_json::Value::String(version.to_string()),
-    );
-    // A `packages` map is v2+; make sure the declared version agrees so the
-    // parser reads the map we just merged into.
-    let lv_ok = obj
-        .get("lockfileVersion")
-        .and_then(|v| v.as_i64())
-        .is_some_and(|v| v >= 2);
-    if !lv_ok {
-        obj.insert("lockfileVersion".to_string(), serde_json::json!(3));
-    }
-
-    Some(doc.to_string())
-}
+/// Where shipped shrinkwraps are copied (verbatim) so they get graded. One
+/// subdirectory per source location, since a root and a `package/` shrinkwrap
+/// can legitimately differ.
+pub(crate) const NPM_SHRINKWRAP_SUBDIR: &str = ".ak-scan-shrinkwrap";
 
 /// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
 /// installed npm package, so the CVE engine catalogs and grades it (#3003).
@@ -7762,6 +7736,39 @@ mod tests {
         path
     }
 
+    /// npm-shaped `.tgz` plus an arbitrary set of extra archive entries.
+    fn write_npm_tgz_with_entries(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let pkg_json = br#"{"name":"widget","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_ref()).unwrap();
+
+        for (entry_path, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(entry_path).unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *body).unwrap();
+        }
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
     /// npm-shaped `.tgz` that ships its own lockfile at the ARCHIVE ROOT —
     /// the path the component pin also wants, i.e. the collision under test.
     fn write_npm_tgz_with_root_lock(dir: &Path, name: &str, lock: &[u8]) -> PathBuf {
@@ -7868,179 +7875,77 @@ mod tests {
         }));
     }
 
-    /// #3004 follow-up: merging keeps every RESOLVED entry a shipped lockfile
-    /// declares (so vulnerable transitives stay gradeable) while forcing the
-    /// top-level to the request coordinate.
-    #[test]
-    fn test_merge_npm_lock_pin_keeps_transitives_and_forces_top_level() {
-        let shipped = r#"{
-            "name": "widget",
-            "version": "9.9.9",
-            "lockfileVersion": 3,
-            "packages": {
-                "": {"name": "widget", "version": "9.9.9"},
-                "node_modules/widget": {"version": "9.9.9"},
-                "node_modules/lodash": {"version": "4.17.11", "resolved": "https://r/lodash"}
-            }
-        }"#;
-        let merged = merge_npm_lock_pin(shipped, "widget", "1.0.0").expect("mergeable");
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-
-        // The vulnerable transitive SURVIVES -- this is the whole point.
-        assert_eq!(v["packages"]["node_modules/lodash"]["version"], "4.17.11");
-        assert_eq!(
-            v["packages"]["node_modules/lodash"]["resolved"], "https://r/lodash",
-            "unrelated fields on a preserved entry are untouched"
-        );
-        // The top-level is AUTHORITATIVE: the request coordinate wins over the
-        // version the archive claimed for itself.
-        assert_eq!(v["packages"]["node_modules/widget"]["version"], "1.0.0");
-        assert_eq!(v["name"], "widget");
-        assert_eq!(v["version"], "1.0.0");
-    }
-
-    /// A decoy that omits the served package entirely still gets it pinned,
-    /// and a lockfile with no `lockfileVersion` is normalized to a v3 shape so
-    /// the merged `packages` map is the one that gets parsed.
-    #[test]
-    fn test_merge_npm_lock_pin_injects_missing_top_level() {
-        let shipped = r#"{"packages": {"node_modules/lodash": {"version": "4.17.11"}}}"#;
-        let merged = merge_npm_lock_pin(shipped, "widget", "1.0.0").expect("mergeable");
-        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(v["packages"]["node_modules/widget"]["version"], "1.0.0");
-        assert_eq!(v["packages"]["node_modules/lodash"]["version"], "4.17.11");
-        assert_eq!(v["lockfileVersion"], 3);
-
-        // An explicit v1 declaration alongside a `packages` map is corrected
-        // upward rather than left to be parsed as v1 (which would ignore it).
-        let shipped =
-            r#"{"lockfileVersion": 1, "packages": {"node_modules/a": {"version": "1.0.0"}}}"#;
-        let v: serde_json::Value =
-            serde_json::from_str(&merge_npm_lock_pin(shipped, "w", "2.0.0").unwrap()).unwrap();
-        assert_eq!(v["lockfileVersion"], 3);
-    }
-
-    /// Not-mergeable documents return `None` so the caller PRESERVES them
-    /// instead of trading their signal for the pin.
-    #[test]
-    fn test_merge_npm_lock_pin_rejects_unmergeable() {
-        // No packages map (v1-only lockfile: its `dependencies` are still
-        // gradeable by syft, so it must be kept).
-        assert!(merge_npm_lock_pin(
-            r#"{"lockfileVersion":1,"dependencies":{"lodash":{"version":"4.17.11"}}}"#,
-            "w",
-            "1.0.0"
-        )
-        .is_none());
-        // Empty packages map (the decoy shape).
-        assert!(
-            merge_npm_lock_pin(r#"{"lockfileVersion":3,"packages":{}}"#, "w", "1.0.0").is_none()
-        );
-        // Malformed / wrong root type.
-        assert!(merge_npm_lock_pin("not json", "w", "1.0.0").is_none());
-        assert!(merge_npm_lock_pin("[]", "w", "1.0.0").is_none());
-        assert!(merge_npm_lock_pin(r#"{"packages": 42}"#, "w", "1.0.0").is_none());
-    }
-
-    /// End-to-end through `prepare_pinned`: a tarball that SHIPS a root
-    /// lockfile resolving a vulnerable transitive keeps that transitive in the
-    /// scanned workspace, and gains the authoritative top-level pin.
+    /// #3004 follow-up 2, HIGH-1 regression: a shipped lockfile is left
+    /// BYTE-FOR-BYTE alone. The previous revision merged the pin into it and
+    /// normalized `lockfileVersion` 1 -> 3, which made the CVE engine read only
+    /// `packages` and ignore the `dependencies` tree where the vulnerable
+    /// transitives were -- a dummy `packages` map was enough to trigger that
+    /// bump and mask them.
     #[tokio::test]
-    async fn test_prepare_pinned_merges_shipped_root_lockfile() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let shipped_lock = br#"{"name":"widget","version":"9.9.9","lockfileVersion":3,"packages":{"node_modules/widget":{"version":"9.9.9"},"node_modules/lodash":{"version":"4.17.11"}}}"#;
-        let tgz = write_npm_tgz_with_root_lock(tmp.path(), "widget-1.0.0.tgz", shipped_lock);
-        let content = Bytes::from(std::fs::read(&tgz).unwrap());
-        let artifact = test_helpers::make_test_artifact(
-            "widget-1.0.0.tgz",
-            "application/gzip",
-            "widget-1.0.0.tgz",
-        );
-        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+    async fn test_prepare_pinned_never_rewrites_a_shipped_lockfile() {
+        // The exact bypass shape: v1 `dependencies` carrying the vulnerable
+        // transitive, plus a dummy `packages` map to bait a merge.
+        let shipped = br#"{"name":"widget","version":"1.0.0","lockfileVersion":1,"dependencies":{"lodash":{"version":"4.17.11"}},"packages":{"node_modules/widget":{"version":"1.0.0"}}}"#;
+        for (label, path) in [
+            ("root", "package-lock.json"),
+            ("nested", "package/package-lock.json"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let tgz = write_npm_tgz_with_entry(tmp.path(), "widget-1.0.0.tgz", path, shipped);
+            let content = Bytes::from(std::fs::read(&tgz).unwrap());
+            let artifact = test_helpers::make_test_artifact(
+                "widget-1.0.0.tgz",
+                "application/gzip",
+                "widget-1.0.0.tgz",
+            );
+            let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
 
-        let base = tmp.path().join("ws-base");
-        let workspace = ScanWorkspace::prepare_pinned(
-            base.to_str().unwrap(),
-            None,
-            &artifact,
-            &content,
-            Some(&pin),
-        )
-        .await
-        .expect("prepare_pinned");
-
-        let body = tokio::fs::read_to_string(workspace.join("package-lock.json"))
+            let base = tmp.path().join("ws-base");
+            let workspace = ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &content,
+                Some(&pin),
+            )
             .await
-            .expect("lockfile");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            v["packages"]["node_modules/lodash"]["version"], "4.17.11",
-            "a shipped lockfile's resolved transitive must survive the pin"
-        );
-        assert_eq!(v["packages"]["node_modules/widget"]["version"], "1.0.0");
+            .expect("prepare_pinned");
 
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+            let kept = tokio::fs::read(workspace.join(path)).await.expect(path);
+            assert_eq!(
+                kept,
+                &shipped[..],
+                "{label}: a shipped lockfile must be graded natively, never rewritten"
+            );
+            assert!(
+                workspace_pins_component(&workspace, "widget", "1.0.0").await,
+                "{label}: the served identity must still be pinned"
+            );
+
+            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+        }
     }
 
-    /// An UNMERGEABLE shipped root lockfile (v1) is left byte-for-byte intact
-    /// and the pin goes to its own subdirectory — syft catalogs lockfiles at
-    /// any depth, so both are graded and nothing is traded away.
+    /// #3004 follow-up 2, HIGH-2 regression: the CVE engine does not catalog
+    /// `npm-shrinkwrap.json`, yet npm HONORS it over `package-lock.json` -- so a
+    /// vulnerable shrinkwrap was invisible. It is copied VERBATIM to a
+    /// `package-lock.json` the engine does catalog, from both conventional
+    /// locations, with the original untouched.
     #[tokio::test]
-    async fn test_prepare_pinned_preserves_unmergeable_shipped_lockfile() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let shipped_lock =
-            br#"{"lockfileVersion":1,"dependencies":{"lodash":{"version":"4.17.11"}}}"#;
-        let tgz = write_npm_tgz_with_root_lock(tmp.path(), "widget-1.0.0.tgz", shipped_lock);
-        let content = Bytes::from(std::fs::read(&tgz).unwrap());
-        let artifact = test_helpers::make_test_artifact(
-            "widget-1.0.0.tgz",
-            "application/gzip",
-            "widget-1.0.0.tgz",
-        );
-        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
-
-        let base = tmp.path().join("ws-base");
-        let workspace = ScanWorkspace::prepare_pinned(
-            base.to_str().unwrap(),
-            None,
-            &artifact,
-            &content,
-            Some(&pin),
-        )
-        .await
-        .expect("prepare_pinned");
-
-        let kept = tokio::fs::read_to_string(workspace.join("package-lock.json"))
-            .await
-            .expect("shipped lockfile must still be there");
-        assert_eq!(
-            kept.as_bytes(),
-            &shipped_lock[..],
-            "an unmergeable shipped lockfile must be preserved byte-for-byte"
-        );
-        let pinned =
-            tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
-                .await
-                .expect("pin must be written alongside");
-        let v: serde_json::Value = serde_json::from_str(&pinned).unwrap();
-        assert_eq!(v["packages"]["node_modules/widget"]["version"], "1.0.0");
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
-    }
-
-    /// A lockfile the archive ships at the CONVENTIONAL `package/` location is
-    /// never written to at all — the pin only ever touches the workspace root
-    /// (or its own subdir), so nested lockfiles are untouched by construction.
-    #[tokio::test]
-    async fn test_prepare_pinned_leaves_nested_lockfile_untouched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let nested =
+    async fn test_prepare_pinned_stages_shipped_shrinkwraps() {
+        let root_sw =
             br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
-        let tgz = write_npm_tgz_with_entry(
+        let pkg_sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/minimist":{"version":"1.2.0"}}}"#;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz_with_entries(
             tmp.path(),
             "widget-1.0.0.tgz",
-            "package/package-lock.json",
-            nested,
+            &[
+                ("npm-shrinkwrap.json", root_sw.as_ref()),
+                ("package/npm-shrinkwrap.json", pkg_sw.as_ref()),
+            ],
         );
         let content = Bytes::from(std::fs::read(&tgz).unwrap());
         let artifact = test_helpers::make_test_artifact(
@@ -8061,12 +7966,64 @@ mod tests {
         .await
         .expect("prepare_pinned");
 
-        let kept = tokio::fs::read_to_string(workspace.join("package").join("package-lock.json"))
-            .await
-            .expect("nested lockfile");
-        assert_eq!(kept.as_bytes(), &nested[..]);
-        // ...and the pin still exists at the root for the top-level identity.
-        assert!(workspace.join("package-lock.json").exists());
+        // Both sources are staged separately (they can legitimately differ)...
+        let staged_root = tokio::fs::read(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("root")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("root shrinkwrap must be staged for grading");
+        assert_eq!(staged_root, &root_sw[..], "staged verbatim, not rewritten");
+        let staged_pkg = tokio::fs::read(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("package")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("package/ shrinkwrap must be staged for grading");
+        assert_eq!(staged_pkg, &pkg_sw[..]);
+
+        // ...and the originals are untouched.
+        assert_eq!(
+            tokio::fs::read(workspace.join(NPM_SHRINKWRAP_NAME))
+                .await
+                .unwrap(),
+            &root_sw[..]
+        );
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+    }
+
+    /// No shrinkwrap shipped => nothing staged. The staging step must not
+    /// fabricate a lockfile out of nowhere.
+    #[tokio::test]
+    async fn test_prepare_pinned_stages_nothing_without_a_shrinkwrap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz(tmp.path(), "left-pad-1.3.0.tgz");
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "left-pad-1.3.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "left-pad", "1.3.0");
+
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await
+        .expect("prepare_pinned");
+
+        assert!(!workspace.join(NPM_SHRINKWRAP_SUBDIR).exists());
+        assert!(workspace_pins_component(&workspace, "left-pad", "1.3.0").await);
 
         ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
@@ -8096,11 +8053,16 @@ mod tests {
         .await
         .expect("prepare_pinned");
 
-        let body = tokio::fs::read_to_string(workspace.join("package-lock.json"))
-            .await
-            .expect("pin lockfile must exist");
+        let body =
+            tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+                .await
+                .expect("pin lockfile must exist in its own directory");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["packages"]["node_modules/left-pad"]["version"], "1.3.0");
+        assert!(
+            !workspace.join("package-lock.json").exists(),
+            "the pin must never occupy a path an archive could ship"
+        );
 
         ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
