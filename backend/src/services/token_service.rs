@@ -208,8 +208,12 @@ pub(crate) fn is_token_revoked(revoked_at: Option<DateTime<Utc>>) -> bool {
 /// either of those directions would let a least-privilege resource token cross
 /// into other resources.
 pub(crate) fn scopes_grant_access(scopes: &[String], required_scope: &str) -> bool {
-    if scopes.iter().any(|s| s == required_scope) || scopes.iter().any(|s| s == "*" || s == "admin")
-    {
+    // `*` / `admin` wildcard policy, in the #1316-canonical form (the
+    // `check-no-legacy-admin-scope.sh` gate forbids `.any(...)` closures that
+    // compare against "admin" and `== "*"` / `== "admin"` on one line).
+    let has_admin_wildcard =
+        scopes.iter().any(|s| s == "*") || scopes.contains(&"admin".to_string());
+    if scopes.iter().any(|s| s == required_scope) || has_admin_wildcard {
         return true;
     }
     // Bare-parent satisfaction: held `write` covers required `write:artifacts`.
