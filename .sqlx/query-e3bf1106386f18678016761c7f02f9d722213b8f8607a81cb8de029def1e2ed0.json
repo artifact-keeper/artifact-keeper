@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository_usage_ledger SET hosted_bytes = GREATEST(hosted_bytes + $2, 0), updated_at = now() WHERE repository_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e3bf1106386f18678016761c7f02f9d722213b8f8607a81cb8de029def1e2ed0"
+}

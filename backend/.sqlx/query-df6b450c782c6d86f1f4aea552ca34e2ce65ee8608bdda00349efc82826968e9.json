@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository_usage_ledger SET hosted_bytes = $2, proxy_bytes = $3, oci_bytes = $4, updated_at = now() WHERE repository_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df6b450c782c6d86f1f4aea552ca34e2ce65ee8608bdda00349efc82826968e9"
+}

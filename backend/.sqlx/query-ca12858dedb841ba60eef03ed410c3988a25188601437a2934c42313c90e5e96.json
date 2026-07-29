@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                   block_on_policy_violation, severity_threshold, created_at, updated_at\n            FROM scan_configs\n            WHERE scan_enabled = true\n            ORDER BY created_at DESC\n            ",
+  "query": "\n            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                   block_on_policy_violation, severity_threshold, proxy_scan_action,\n                   created_at, updated_at\n            FROM scan_configs\n            WHERE scan_enabled = true\n            ORDER BY created_at DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -40,11 +40,16 @@
       },
       {
         "ordinal": 7,
+        "name": "proxy_scan_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -61,8 +66,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "19f5a956489a0b5d593db879331416703c57eeccf5741306099737d1313f1023"
+  "hash": "ca12858dedb841ba60eef03ed410c3988a25188601437a2934c42313c90e5e96"
 }

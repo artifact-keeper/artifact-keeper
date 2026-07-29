@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                                      block_on_policy_violation, severity_threshold,\n                                      proxy_scan_action)\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                scan_enabled = EXCLUDED.scan_enabled,\n                scan_on_upload = EXCLUDED.scan_on_upload,\n                scan_on_proxy = EXCLUDED.scan_on_proxy,\n                block_on_policy_violation = EXCLUDED.block_on_policy_violation,\n                severity_threshold = EXCLUDED.severity_threshold,\n                proxy_scan_action = EXCLUDED.proxy_scan_action,\n                updated_at = NOW()\n            RETURNING id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,\n                      block_on_policy_violation, severity_threshold, proxy_scan_action,\n                      created_at, updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "scan_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_on_upload",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "scan_on_proxy",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "block_on_policy_violation",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "severity_threshold",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "proxy_scan_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Varchar",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e60806829a3e318566dfbe9910c325b7aee4113fc2124c1c36c9fd9b73384ce0"
+}

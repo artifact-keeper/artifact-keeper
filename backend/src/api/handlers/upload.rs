@@ -588,6 +588,44 @@ async fn complete(
     // repositories keep their existing behaviour (version may be NULL).
     let derived_version = completed_format_artifact_version(&session, &repo.format);
     let artifact_version = derived_version.as_deref();
+
+    // #2516 S2: atomic quota admission for the chunked path, in the same
+    // transaction as the artifact INSERT. The session-create quota check is
+    // an unlocked best-effort preflight, so two concurrent near-limit
+    // sessions could both pass it and both land here (#2523's over-admission
+    // race, which the direct-write path closed in `finalize_upload` but this
+    // handler never did). `check_quota_locked` serializes same-repo
+    // admissions on the usage-ledger row and decides off its O(1) counters;
+    // the artifact INSERT below runs in the same transaction while that lock
+    // is held, so migration 182's trigger charges the admitted bytes before
+    // commit. Replication sessions keep their documented exemption (artifacts
+    // that legitimately predate a quota change must still replicate; the
+    // background reconciler folds their bytes into the ledger).
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !is_replication_request {
+        let admission =
+            crate::services::repository_service::RepositoryService::new(state.db.clone())
+                .check_quota_locked(
+                    &mut tx,
+                    session.repository_id,
+                    &session.artifact_path,
+                    session.total_size,
+                )
+                .await
+                .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !admission.allowed {
+            // Drop `tx` (rolls back). The stored blob is content-addressed;
+            // if this upload orphaned it, storage GC reclaims it.
+            return Err(map_err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Repository storage quota exceeded",
+            ));
+        }
+    }
     let artifact_id: Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -609,9 +647,12 @@ async fn complete(
     .bind(&session.content_type)
     .bind(&storage_key)
     .bind(user_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    tx.commit()
+        .await
+        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if let (Some(format), Some(metadata)) = (
         session.artifact_metadata_format.as_deref(),

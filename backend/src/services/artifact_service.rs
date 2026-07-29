@@ -1955,6 +1955,12 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;
 
+        // The soft-delete's usage-ledger decrement is applied by migration
+        // 182's row-level trigger in this statement's own transaction
+        // (is_deleted false -> true releases the bytes; re-flipping an
+        // already-deleted row is a zero-delta no-op), so freed space is
+        // admissible by the very next quota-checked upload with no manual
+        // ledger write here.
         let result = sqlx::query!(
             "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1",
             id
@@ -4168,5 +4174,96 @@ mod tests {
         .await
         .expect("count download_statistics");
         assert_eq!(count, 0, "a HEAD serves no body and must never write a row");
+    }
+
+    /// #2516 S2: the service delete's soft-delete releases the artifact's
+    /// bytes from the usage ledger in the same transaction (migration 182's
+    /// trigger fires on the `is_deleted` flip), so freed space is admissible
+    /// by the very next upload — no reconciler pass needed. End-state
+    /// assertions only: the ledger must equal the live sum after each step.
+    #[tokio::test]
+    async fn test_delete_releases_ledger_bytes_immediately() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        // A 600-byte artifact; the insert trigger charges the ledger.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'rel/big.bin', 'big.bin', 600, repeat('a', 64), \
+                     'application/octet-stream', 'keys/rel/big.bin')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(pool.clone());
+
+        let artifact_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = 'rel/big.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        // Another 600 bytes cannot be admitted while the first artifact holds
+        // its quota share.
+        assert!(!repo_service
+            .check_quota(repo_id, 600)
+            .await
+            .expect("preflight"));
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete");
+
+        let hosted = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row");
+        assert_eq!(
+            hosted, 0,
+            "delete must release the bytes in the same transaction"
+        );
+        assert!(
+            repo_service
+                .check_quota(repo_id, 600)
+                .await
+                .expect("preflight after delete"),
+            "freed space must be admissible by the very next upload"
+        );
+        // Idempotence: re-deleting maps to NotFound, and re-flipping an
+        // already-deleted row is a zero-delta no-op for the trigger — the
+        // same bytes are never released twice.
+        assert!(service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .is_err());
+        let hosted_after = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row after re-delete");
+        assert_eq!(hosted_after, 0, "re-delete must not decrement again");
     }
 }
