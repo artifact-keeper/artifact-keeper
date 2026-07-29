@@ -149,6 +149,33 @@ impl AuthExtension {
         }
     }
 
+    /// Delegation ceiling for token minting (#2996): a non-admin caller may
+    /// not mint a token carrying a scope its own presenting credential does
+    /// not hold. `scopes: None` (interactive/UI/CI login) is
+    /// action-unrestricted, so this is a no-op for those principals and never
+    /// affects the console mint flow; it only constrains a scoped API token
+    /// (or a JWT exchanged from one, #2430) attempting to mint a token that
+    /// exceeds its own authority — e.g. a `read:artifacts` token minting
+    /// `write:artifacts`.
+    ///
+    /// The per-scope decision is delegated to `has_scope` →
+    /// `scopes_grant_access`, so the wildcard (`*`/`admin`) and bare-parent
+    /// coverage semantics stay in the one canonical helper (#1316).
+    pub fn enforce_mint_ceiling(&self, requested: &[String]) -> crate::error::Result<()> {
+        if self.is_admin {
+            return Ok(());
+        }
+        for s in requested {
+            if !self.has_scope(s) {
+                return Err(AppError::Authorization(format!(
+                    "Cannot mint a token with scope '{s}': it exceeds the scopes of the \
+                     presenting credential",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Fold the effective-admin decision at construction time so every
     /// downstream `is_admin` read (both `require_admin` and the ~34 raw
     /// `if !auth.is_admin` handler checks) inherits scope awareness from a
@@ -2662,6 +2689,89 @@ mod tests {
     fn test_has_scope_admin_grants_all() {
         let ext = make_api_token_ext(vec!["admin".to_string()], None);
         assert!(ext.has_scope("delete:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthExtension::enforce_mint_ceiling (#2996)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_ceiling_interactive_none_scopes_unrestricted() {
+        // Interactive/UI/CI principals (`scopes: None`) are action-unrestricted:
+        // the ceiling never bites, so console token minting is unaffected.
+        let ext = AuthExtension::from(claims_with(false, None));
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_ok());
+        assert!(ext
+            .enforce_mint_ceiling(&["read:repositories".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_scoped_token_cannot_exceed_itself() {
+        // A read-scoped API token may re-mint its own scope but not escalate
+        // to a scope it does not hold.
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext
+            .enforce_mint_ceiling(&["read:artifacts".to_string()])
+            .is_ok());
+        let err = ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .expect_err("read token must not mint write");
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_mint_ceiling_exchanged_jwt_inherits_token_ceiling() {
+        // A JWT exchanged from a read-scoped API token (#2430) carries
+        // `is_api_token = false` but `Some(scopes)`: the ceiling still binds.
+        let ext = AuthExtension::from(claims_with(false, Some(vec!["read:artifacts".to_string()])));
+        assert!(!ext.is_api_token);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_wildcard_and_admin_scope_cover_everything() {
+        let star = make_api_token_ext(vec!["*".to_string()], None);
+        assert!(star
+            .enforce_mint_ceiling(&["write:artifacts".to_string(), "read:users".to_string()])
+            .is_ok());
+        let admin_scope = make_api_token_ext(vec!["admin".to_string()], None);
+        assert!(admin_scope
+            .enforce_mint_ceiling(&["delete:artifacts".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_effective_admin_bypasses() {
+        // An effective admin (admin owner + admin-granting credential) is not
+        // held to the ceiling.
+        let ext = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:users".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_admin_owned_narrow_token_still_bound() {
+        // GHSA-vvc3 interaction: an admin-OWNED but narrowly-scoped token has
+        // `is_admin = false` after the scope-gated fold, so it is held to its
+        // token's ceiling rather than laundered up to the owner's admin.
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(!ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_empty_request_ok() {
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext.enforce_mint_ceiling(&[]).is_ok());
     }
 
     // #1316: pin the authorization decision now that `has_scope` delegates to

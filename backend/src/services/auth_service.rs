@@ -2341,6 +2341,15 @@ impl AuthService {
                 "Scope name too long (max 256 characters)".to_string(),
             ));
         }
+        // Defense-in-depth: reject scopes outside the canonical vocabulary at
+        // the single mint choke-point, so no handler can persist arbitrary or
+        // unknown scope strings even if it forgets the per-endpoint validation
+        // (#2996). Bare action parents (`read`/`write`/`delete`) are not in
+        // `ALLOWED_SCOPES`, so they become un-mintable here — which matters
+        // because `scopes_grant_access` treats a held bare parent as covering
+        // every colon-form child of that action (#2989).
+        crate::services::token_service::validate_scopes_pure(&scopes)
+            .map_err(AppError::Validation)?;
 
         // Generate random token
         let token = format!(

@@ -771,6 +771,71 @@ mod tests {
         assert!(validate_scopes_pure(&scopes).is_err());
     }
 
+    #[test]
+    fn test_validate_scopes_bare_action_parents_rejected() {
+        // Bare action parents are NOT vocabulary. This is load-bearing (#2996):
+        // `scopes_grant_access` treats a held bare parent as covering every
+        // colon-form child of that action (#2989), so if bare `delete` were
+        // mintable a non-admin could ride it into the admin-only
+        // `delete:artifacts`. The mint-primitive backstop in
+        // `generate_api_token` relies on these being rejected here.
+        for bare in ["read", "write", "delete", "promote", "trigger"] {
+            assert!(
+                validate_scopes_pure(&[bare.to_string()]).is_err(),
+                "bare action parent `{bare}` must not be valid scope vocabulary",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Consistency invariant: mintability classification vs. grant semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_admin_mintable_scope_never_grants_an_admin_only_scope() {
+        // For every scope a non-admin is allowed to MINT (vocabulary entry
+        // that passes `enforce_admin_only_scopes` for a non-admin), that scope
+        // must not grant ACCESS (via `scopes_grant_access`) to any admin-only
+        // scope. This pins the interaction between the explicit
+        // `ADMIN_ONLY_SCOPES` classification and the broad-covers-specific
+        // parent rule (#2989): the invariant holds today because no bare
+        // action parent is in `ALLOWED_SCOPES`. If a future change adds a
+        // mintable scope that covers e.g. `delete:artifacts` (say, by adding
+        // bare `delete` to the vocabulary without classifying it admin-only),
+        // this test fails and forces a decision (#2996).
+        for scope in ALLOWED_SCOPES {
+            let one = vec![scope.to_string()];
+            if enforce_admin_only_scopes(&one, false).is_ok() {
+                for admin_only in ADMIN_ONLY_SCOPES {
+                    assert!(
+                        !scopes_grant_access(&one, admin_only),
+                        "non-admin-mintable scope `{scope}` grants admin-only `{admin_only}`",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_bare_parent_of_an_admin_only_scope_is_unmintable() {
+        // Companion invariant: for each colon-form ADMIN_ONLY scope, the bare
+        // parent that would cover it under the #2989 parent rule must be
+        // rejected by the mint vocabulary (or itself be admin-only). Otherwise
+        // a non-admin could mint the bare parent and hold effective
+        // admin-only authority without ever requesting the classified scope.
+        for admin_only in ADMIN_ONLY_SCOPES {
+            if let Some((parent, _resource)) = admin_only.split_once(':') {
+                let bare = vec![parent.to_string()];
+                let mintable_by_non_admin = validate_scopes_pure(&bare).is_ok()
+                    && enforce_admin_only_scopes(&bare, false).is_ok();
+                assert!(
+                    !mintable_by_non_admin,
+                    "bare parent `{parent}` of admin-only `{admin_only}` is mintable by a non-admin",
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // enforce_admin_only_scopes (privilege-escalation gate on token issuance)
     // -----------------------------------------------------------------------
