@@ -72,6 +72,55 @@ const REPO_OBJECT_UNION_SQL: &str = r#"
       FROM proxy_cache_artifacts
 "#;
 
+/// The *path-bearing* subset of the repo-object union (#2601): one row per
+/// reference that has a logical `path`, projected to
+/// `(repository_id, path, dedup_key, size_bytes)`.
+///
+/// `oci_blobs` is deliberately absent: layer blobs carry no logical path (the
+/// blob→image-name edge only exists inside manifest content, not the catalog),
+/// so their bytes cannot be placed in the tree. They are surfaced separately
+/// as the root node's `unattributed_bytes` so `root.logical_bytes +
+/// unattributed_bytes` still reconciles with the repo-level logical total.
+/// OCI *manifests* do have paths (`v2/<image>/manifests/<ref>` artifact rows),
+/// so the tree still groups per image name at `v2/<image>/`.
+const PATH_REF_UNION_SQL: &str = r#"
+    SELECT repository_id, path, storage_key AS dedup_key, size_bytes
+      FROM artifacts
+     WHERE is_deleted = false
+       AND storage_key NOT LIKE 'proxy-cache/%'
+    UNION ALL
+    SELECT repository_id, path, storage_key AS dedup_key, size_bytes
+      FROM proxy_cache_artifacts
+"#;
+
+/// Maximum directory depth materialized into `repository_path_storage_stats`.
+///
+/// Caps the row-explosion factor of the prefix explode (each reference emits
+/// one row per ancestor level): a pathological 1000-segment path contributes
+/// to at most this many prefix nodes instead of 1000. Deeper files still
+/// roll up into every ancestor at or above this depth; only nodes *below* it
+/// are not individually materialized.
+pub const MAX_MATERIALIZED_PATH_DEPTH: i32 = 16;
+
+// The cap bounds the explode factor; keep it positive and small relative to
+// real repo layouts (deepest common layouts are ~6-8 levels).
+const _: () = assert!(MAX_MATERIALIZED_PATH_DEPTH >= 8 && MAX_MATERIALIZED_PATH_DEPTH <= 64);
+
+/// Normalize a caller-supplied tree prefix to the canonical stored form:
+/// no leading/trailing `/`, `''` = repository root.
+pub fn normalize_prefix(raw: &str) -> String {
+    raw.trim().trim_matches('/').to_string()
+}
+
+/// Number of path segments in a canonical prefix (`''` = 0, the root).
+pub fn prefix_depth(prefix: &str) -> i32 {
+    if prefix.is_empty() {
+        0
+    } else {
+        prefix.split('/').count() as i32
+    }
+}
+
 /// Backend-aware deduplication scope. `filesystem` shards physical objects
 /// per repository; cloud backends share one object instance-wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,11 +324,126 @@ impl StorageStatsService {
     }
 
     /// Full refresh: recompute every repository's footprint + the instance
-    /// total and upsert them. Run on the scheduler cadence and after GC.
+    /// total and upsert them, then refresh the per-path-prefix tree rollup
+    /// (#2601). Run on the scheduler cadence and after GC.
     pub async fn recompute_all(&self) -> Result<()> {
         let rows = self.load_repo_object_rows().await?;
         let computed = compute_stats(&rows, self.scope);
-        self.persist(&computed).await
+        self.persist(&computed).await?;
+        self.recompute_path_stats().await
+    }
+
+    /// Rebuild `repository_path_storage_stats` (#2601): one row per
+    /// (repository, path prefix) with logical/physical/file/blob figures.
+    ///
+    /// Runs entirely set-based in Postgres — the path-bearing union is
+    /// exploded into its ancestor prefixes (capped at
+    /// [`MAX_MATERIALIZED_PATH_DEPTH`]) with a `generate_series` lateral,
+    /// deduplicated per `(repo, prefix, dedup_key)`, aggregated per node, and
+    /// inserted in one statement. Nothing is shipped to the app; API reads are
+    /// then index lookups on the materialized rows (#2516 readiness).
+    ///
+    /// Delete + reinsert inside one transaction: readers never observe a
+    /// partially-rebuilt tree, and pruned paths cannot leave stale rows. A
+    /// transaction-scoped advisory lock serializes concurrent rebuilds (the
+    /// cron tick can overlap a GC-triggered refresh) — the loser simply
+    /// rebuilds again, which is idempotent. An incremental (trigger-maintained)
+    /// variant is the deferred 1.7.0 perf follow-up alongside the P1 keyset
+    /// recompute (#2056).
+    pub async fn recompute_path_stats(&self) -> Result<()> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Serialize whole-table rebuilds: without this, two overlapping
+        // refreshers both DELETE against the same snapshot and then collide on
+        // the PK during reinsert. Released automatically at commit/rollback.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('repository_path_storage_stats_rebuild'))",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("DELETE FROM repository_path_storage_stats")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Explode each path-bearing reference into its ancestor prefixes:
+        // depth 0 is the root (''), depth g is the first g segments joined by
+        // '/'. The file's own full path is never a prefix node (g stops at
+        // cardinality - 1), so leaves aggregate into their parent directory.
+        let insert_sql = format!(
+            r#"
+            WITH path_ref AS ({union}),
+            exploded AS (
+                SELECT pr.repository_id,
+                       pr.dedup_key,
+                       pr.size_bytes,
+                       g.depth,
+                       CASE WHEN g.depth = 0 THEN ''
+                            ELSE array_to_string((pr.segs)[1:g.depth], '/')
+                       END AS prefix
+                  FROM (SELECT repository_id, dedup_key, size_bytes,
+                               string_to_array(trim(leading '/' from path), '/') AS segs
+                          FROM path_ref) pr
+                 CROSS JOIN LATERAL generate_series(
+                     0, LEAST(cardinality(pr.segs) - 1, {max_depth})
+                 ) AS g(depth)
+            ),
+            per_prefix_key AS (
+                SELECT repository_id, prefix, depth, dedup_key,
+                       MAX(size_bytes) AS size_bytes,
+                       COUNT(*)        AS ref_count,
+                       SUM(size_bytes) AS logical_bytes
+                  FROM exploded
+                 GROUP BY repository_id, prefix, depth, dedup_key
+            )
+            INSERT INTO repository_path_storage_stats
+                (repository_id, prefix, depth, logical_bytes, physical_bytes,
+                 file_count, blob_count, unattributed_bytes, computed_at)
+            SELECT repository_id, prefix, depth,
+                   COALESCE(SUM(logical_bytes), 0)::BIGINT,
+                   COALESCE(SUM(size_bytes), 0)::BIGINT,
+                   COALESCE(SUM(ref_count), 0)::BIGINT,
+                   COUNT(*)::BIGINT,
+                   0, now()
+              FROM per_prefix_key
+             GROUP BY repository_id, prefix, depth
+            "#,
+            union = PATH_REF_UNION_SQL,
+            max_depth = MAX_MATERIALIZED_PATH_DEPTH,
+        );
+        sqlx::query(&insert_sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // OCI layer bytes have no logical path; record them on the root row so
+        // the tree total still reconciles with the repo-level logical total.
+        // The upsert also creates the root row for blob-only repositories.
+        sqlx::query(
+            r#"
+            INSERT INTO repository_path_storage_stats
+                (repository_id, prefix, depth, unattributed_bytes, computed_at)
+            SELECT repository_id, '', 0, SUM(size_bytes)::BIGINT, now()
+              FROM oci_blobs
+             GROUP BY repository_id
+            ON CONFLICT (repository_id, prefix) DO UPDATE
+               SET unattributed_bytes = EXCLUDED.unattributed_bytes,
+                   computed_at        = EXCLUDED.computed_at
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Persist a computed snapshot: upsert every repo row, prune repos that no
@@ -476,6 +640,34 @@ mod tests {
         assert_eq!(sa.blob_count, 2);
         // instance: shared(100) counted once + aonly(30) = 130
         assert_eq!(out.instance_unique_bytes, 130);
+    }
+
+    #[test]
+    fn normalize_prefix_strips_slashes_and_whitespace() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("a/b"), "a/b");
+        assert_eq!(normalize_prefix("/a/b/"), "a/b");
+        assert_eq!(normalize_prefix("  /a/b/  "), "a/b");
+        assert_eq!(normalize_prefix("///"), "");
+    }
+
+    #[test]
+    fn prefix_depth_counts_segments() {
+        assert_eq!(prefix_depth(""), 0);
+        assert_eq!(prefix_depth("a"), 1);
+        assert_eq!(prefix_depth("a/b"), 2);
+        assert_eq!(prefix_depth("v2/library/nginx"), 3);
+    }
+
+    #[test]
+    fn path_union_excludes_pathless_oci_blobs() {
+        // The tree union must never include oci_blobs (no logical path): those
+        // bytes are surfaced as root `unattributed_bytes` instead. Guard the
+        // SQL fragment against a drive-by "add the third source for parity".
+        assert!(!PATH_REF_UNION_SQL.contains("oci_blobs"));
+        assert!(PATH_REF_UNION_SQL.contains("FROM artifacts"));
+        assert!(PATH_REF_UNION_SQL.contains("proxy_cache_artifacts"));
     }
 
     #[test]

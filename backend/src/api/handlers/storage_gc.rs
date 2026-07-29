@@ -64,6 +64,23 @@ pub async fn run_storage_gc(
 
     let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
     let result = service.run_gc(payload.dry_run).await?;
+
+    // Post-GC storage-stats refresh (#2056/#2601): the *scheduled* GC pass
+    // already recomputes the materialized repository/path storage stats right
+    // after reclaim (scheduler_service), but the admin-triggered pass left
+    // them stale until the next cron tick. Mirror the scheduler here so an
+    // operator-initiated GC settles the reported numbers too. Best-effort:
+    // a refresh failure must not fail the GC that already ran.
+    if !payload.dry_run {
+        let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+            state.db.clone(),
+            &state.config.storage_backend,
+        );
+        if let Err(e) = stats_service.recompute_all().await {
+            tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+        }
+    }
+
     Ok(Json(result))
 }
 

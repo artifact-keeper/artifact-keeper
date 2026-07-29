@@ -442,6 +442,8 @@ pub fn router() -> Router<SharedState> {
         )
         // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
         .route("/:key/storage", get(get_repository_storage))
+        // Per-prefix (folder tree) storage rollup (#2601)
+        .route("/:key/storage/tree", get(get_repository_storage_tree))
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
         // npm scope policy for Remote members of npm virtual repositories (#2327)
@@ -3025,6 +3027,235 @@ pub async fn get_repository_storage(
     };
 
     Ok(Json(response))
+}
+
+/// Query parameters for the per-prefix storage tree (#2601).
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct StorageTreeQuery {
+    /// Folder prefix to root the listing at (`''`/absent = repository root).
+    /// Leading/trailing slashes are ignored.
+    pub prefix: Option<String>,
+    /// How many tree levels below `prefix` to return (default 1 = immediate
+    /// children, clamped to 1..=5).
+    pub depth: Option<i32>,
+    /// Maximum number of descendant nodes returned (default 200, clamped to
+    /// 1..=1000). `truncated` is set when the limit cut the listing.
+    pub limit: Option<i64>,
+}
+
+/// Levels below the requested prefix a single tree call may return.
+const STORAGE_TREE_MAX_QUERY_DEPTH: i32 = 5;
+/// Hard cap on descendant nodes per tree call (million-artifact guard, #2516).
+const STORAGE_TREE_MAX_LIMIT: i64 = 1000;
+const STORAGE_TREE_DEFAULT_LIMIT: i64 = 200;
+
+/// Clamp the requested levels-below-prefix to 1..=[`STORAGE_TREE_MAX_QUERY_DEPTH`].
+fn clamp_tree_depth(depth: Option<i32>) -> i32 {
+    depth.unwrap_or(1).clamp(1, STORAGE_TREE_MAX_QUERY_DEPTH)
+}
+
+/// Clamp the requested node limit to 1..=[`STORAGE_TREE_MAX_LIMIT`].
+fn clamp_tree_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(STORAGE_TREE_DEFAULT_LIMIT)
+        .clamp(1, STORAGE_TREE_MAX_LIMIT)
+}
+
+/// One folder node in the per-prefix storage rollup (#2601).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StorageTreeNode {
+    /// Canonical prefix (no leading/trailing `/`; `''` = repository root).
+    pub prefix: String,
+    /// Number of path segments in `prefix` (0 = root).
+    pub depth: i32,
+    /// Sum over every artifact/proxy-cache reference under this prefix.
+    pub logical_bytes: i64,
+    /// Deduplicated within this repository: each distinct physical object
+    /// under the prefix counted once. Because an object shared by two sibling
+    /// subtrees counts once in each but once at their common ancestor, the sum
+    /// of children's `physical_bytes` can exceed the parent's — the difference
+    /// is the cross-subtree dedup saving.
+    pub physical_bytes: i64,
+    /// References (artifact/proxy-cache rows) under this prefix.
+    pub file_count: i64,
+    /// Distinct physical objects under this prefix.
+    pub blob_count: i64,
+}
+
+/// Per-prefix (folder tree) storage rollup response (#2601).
+///
+/// All figures are read from the materialized `repository_path_storage_stats`
+/// cache (refreshed on the storage-stats schedule + post-GC) — a tree call is
+/// an index scan over pre-aggregated rows, never a walk of the artifact table.
+///
+/// Every figure is within-repository only (references this repo holds), so
+/// unlike the repo-level endpoint's cross-tenant-derivable dedup breakdown
+/// (#2560) nothing here needs an admin restriction beyond repo visibility.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryStorageTreeResponse {
+    pub repository_key: String,
+    /// The node the listing is rooted at (zeros when the prefix has no
+    /// materialized data — unknown folder or refresher not yet run).
+    pub node: StorageTreeNode,
+    /// Descendant folder nodes, up to `depth` levels below `node`, largest
+    /// `logical_bytes` first.
+    pub children: Vec<StorageTreeNode>,
+    /// True when `limit` cut the descendant listing.
+    pub truncated: bool,
+    /// Bytes referenced by this repository that carry no logical path and so
+    /// cannot be placed in the tree (today: OCI layer blobs; the blob→image
+    /// edge lives only in manifest content). Root-level figure; present only
+    /// when the request is rooted at `''`. `node.logical_bytes +
+    /// unattributed_bytes` reconciles with the repo-level logical total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unattributed_bytes: Option<i64>,
+    /// Folder levels below the root that are individually materialized;
+    /// deeper files roll up into their ancestor at this depth.
+    pub max_materialized_depth: i32,
+    /// When the rollup was last recomputed. `null` before the first refresh.
+    pub computed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Get the per-prefix (folder tree) storage rollup for a repository (#2601).
+///
+/// Returns the requested prefix's own rollup plus its descendant folder nodes
+/// (default: immediate children) from the materialized per-prefix cache. Same
+/// visibility rules as `get_repository`: public repos and repo members pass;
+/// everyone else gets an existence-hiding 404.
+#[utoipa::path(
+    get,
+    path = "/{key}/storage/tree",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        StorageTreeQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Per-prefix storage rollup", body = RepositoryStorageTreeResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_repository_storage_tree(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<StorageTreeQuery>,
+) -> Result<Json<RepositoryStorageTreeResponse>> {
+    use crate::services::storage_stats_service::{
+        normalize_prefix, prefix_depth, MAX_MATERIALIZED_PATH_DEPTH,
+    };
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &service).await?;
+
+    let prefix = normalize_prefix(query.prefix.as_deref().unwrap_or(""));
+    let root_depth = prefix_depth(&prefix);
+    let levels = clamp_tree_depth(query.depth);
+    let limit = clamp_tree_limit(query.limit);
+
+    // The rooted node's own rollup (with the root-only unattributed figure).
+    let node_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>(
+        r#"
+        SELECT logical_bytes, physical_bytes, file_count, blob_count,
+               unattributed_bytes, computed_at
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1 AND prefix = $2
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&prefix)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Descendants: depth-bounded range under the prefix. Fetch limit+1 to
+    // detect truncation without a second COUNT pass.
+    let like_pattern = if prefix.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}/%",
+            crate::api::handlers::escape_like_literal(&prefix)
+        ))
+    };
+    let child_rows = sqlx::query_as::<_, (String, i32, i64, i64, i64, i64)>(
+        r#"
+        SELECT prefix, depth, logical_bytes, physical_bytes, file_count, blob_count
+          FROM repository_path_storage_stats
+         WHERE repository_id = $1
+           AND depth > $2 AND depth <= $3
+           AND ($4::text IS NULL OR prefix LIKE $4)
+         ORDER BY logical_bytes DESC, prefix ASC
+         LIMIT $5
+        "#,
+    )
+    .bind(repo.id)
+    .bind(root_depth)
+    .bind(root_depth.saturating_add(levels))
+    .bind(&like_pattern)
+    .bind(limit + 1)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let truncated = child_rows.len() as i64 > limit;
+    let children: Vec<StorageTreeNode> = child_rows
+        .into_iter()
+        .take(limit as usize)
+        .map(
+            |(prefix, depth, logical_bytes, physical_bytes, file_count, blob_count)| {
+                StorageTreeNode {
+                    prefix,
+                    depth,
+                    logical_bytes,
+                    physical_bytes,
+                    file_count,
+                    blob_count,
+                }
+            },
+        )
+        .collect();
+
+    let (node, unattributed_bytes, computed_at) = match node_row {
+        Some((logical, physical, files, blobs, unattributed, at)) => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: logical,
+                physical_bytes: physical,
+                file_count: files,
+                blob_count: blobs,
+            },
+            (root_depth == 0).then_some(unattributed),
+            Some(at),
+        ),
+        // Unknown prefix or refresher not yet run: zeros, no freshness marker.
+        None => (
+            StorageTreeNode {
+                prefix: prefix.clone(),
+                depth: root_depth,
+                logical_bytes: 0,
+                physical_bytes: 0,
+                file_count: 0,
+                blob_count: 0,
+            },
+            (root_depth == 0).then_some(0),
+            None,
+        ),
+    };
+
+    Ok(Json(RepositoryStorageTreeResponse {
+        repository_key: repo.key,
+        node,
+        children,
+        truncated,
+        unattributed_bytes,
+        max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+        computed_at,
+    }))
 }
 
 /// Update repository
@@ -8698,6 +8929,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         create_repository,
         get_repository,
         get_repository_storage,
+        get_repository_storage_tree,
         update_repository,
         delete_repository,
         set_cache_ttl,
@@ -8731,6 +8963,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
+        StorageTreeQuery,
+        StorageTreeNode,
+        RepositoryStorageTreeResponse,
         SetCacheTtlRequest,
         CacheTtlResponse,
         SetNpmScopePolicyRequest,
@@ -8923,6 +9158,72 @@ mod tests {
         assert_eq!(json["logical_bytes"], 54033);
         assert_eq!(json["blob_count"], 4);
         assert_eq!(json["dedup_scope"], "instance");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-prefix storage tree (#2601): query clamps + response serde.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_tree_depth_clamps_to_bounds() {
+        assert_eq!(clamp_tree_depth(None), 1, "default is immediate children");
+        assert_eq!(clamp_tree_depth(Some(0)), 1);
+        assert_eq!(clamp_tree_depth(Some(-3)), 1);
+        assert_eq!(clamp_tree_depth(Some(3)), 3);
+        assert_eq!(clamp_tree_depth(Some(999)), STORAGE_TREE_MAX_QUERY_DEPTH);
+    }
+
+    #[test]
+    fn storage_tree_limit_clamps_to_bounds() {
+        assert_eq!(clamp_tree_limit(None), STORAGE_TREE_DEFAULT_LIMIT);
+        assert_eq!(clamp_tree_limit(Some(0)), 1);
+        assert_eq!(clamp_tree_limit(Some(-5)), 1);
+        assert_eq!(clamp_tree_limit(Some(50)), 50);
+        assert_eq!(clamp_tree_limit(Some(1_000_000)), STORAGE_TREE_MAX_LIMIT);
+    }
+
+    #[test]
+    fn storage_tree_response_omits_unattributed_off_root() {
+        // `unattributed_bytes` is a root-only figure: present (even when 0) at
+        // the root, absent entirely when the listing is rooted at a subfolder.
+        let node = |prefix: &str, depth: i32| StorageTreeNode {
+            prefix: prefix.into(),
+            depth,
+            logical_bytes: 100,
+            physical_bytes: 80,
+            file_count: 2,
+            blob_count: 1,
+        };
+        let root = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("", 0),
+            children: vec![node("a", 1)],
+            truncated: false,
+            unattributed_bytes: Some(0),
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["unattributed_bytes"], 0);
+        assert_eq!(json["children"][0]["prefix"], "a");
+
+        let sub = RepositoryStorageTreeResponse {
+            repository_key: "demo".into(),
+            node: node("a", 1),
+            children: vec![],
+            truncated: true,
+            unattributed_bytes: None,
+            max_materialized_depth:
+                crate::services::storage_stats_service::MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at: None,
+        };
+        let json = serde_json::to_value(&sub).unwrap();
+        assert!(
+            json.get("unattributed_bytes").is_none(),
+            "root-only figure must be absent off-root, not null"
+        );
+        assert_eq!(json["truncated"], true);
     }
 
     #[test]
