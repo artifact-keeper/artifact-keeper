@@ -1469,6 +1469,55 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
+/// Is `path` a POST route that is *not* a repository mutation despite using a
+/// write HTTP method?
+///
+/// A handful of format endpoints are `POST` by protocol but are negotiation /
+/// credential-exchange steps rather than artifact writes. The method-based
+/// mutation gate in [`repo_visibility_middleware`] (#2603 G1) would otherwise
+/// reject them with 403 for any caller lacking the repository `write` action,
+/// which breaks legitimate reads/logins:
+///
+/// * **git-lfs batch** — `POST /lfs/<repo_key>/objects/batch` is the mandatory
+///   download/upload negotiation. `git lfs pull` issues an `{"operation":
+///   "download"}` batch, so a read-only member or a public-repo non-member must
+///   be able to reach it. The `batch` handler self-gates uploads: an
+///   `{"operation":"upload"}` batch is authorized as a repository `write`
+///   in-handler, and the subsequent object `PUT` is write-gated by this same
+///   middleware, so exempting the batch POST does not open an upload hole.
+/// * **conan authenticate** — `POST /conan/<repo_key>/v2/users/authenticate` is
+///   a Basic→JWT credential exchange, not a write. The handler requires a valid
+///   credential and mints a scope-ceilinged token; no repository `write` is
+///   needed or implied.
+///
+/// The `#508` write-auth requirement (writes require authentication; anonymous
+/// callers get 401) still applies to these paths independently, so this
+/// exemption never loosens the anonymous contract — it only routes the
+/// *authenticated* caller through the read/visibility path instead of the
+/// deny-by-default write choke-point.
+fn is_non_mutating_format_post(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    match segments.next() {
+        // /lfs/<repo_key>/objects/batch
+        Some("lfs") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("objects")
+                && segments.next() == Some("batch")
+                && segments.next().is_none()
+        }
+        // /conan/<repo_key>/v2/users/authenticate
+        Some("conan") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("v2")
+                && segments.next() == Some("users")
+                && segments.next() == Some("authenticate")
+                && segments.next().is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
 /// and Bearer schemes.  Package manager clients use the challenge to decide
 /// how to retry with credentials.
@@ -1800,9 +1849,21 @@ pub async fn repo_visibility_middleware(
     // to preserve backward compatibility and avoid unnecessary DB lookups.
     if let Some(ref ext) = auth_ext {
         if !ext.is_admin {
-            let action = action_for_method(request.method());
+            // A few POST routes are negotiation / credential-exchange steps, not
+            // repository mutations, even though the HTTP method is a write (see
+            // `is_non_mutating_format_post`). Classify them as reads so a
+            // read-only member or a public-repo non-member can still perform
+            // download negotiation / token exchange. The #508 write-auth gate
+            // above (401 for anonymous) is unaffected, and actual LFS uploads
+            // remain write-gated by the batch handler and the object-PUT path.
+            let non_mutating_post = is_non_mutating_format_post(&path);
+            let action = if non_mutating_post {
+                "read"
+            } else {
+                action_for_method(request.method())
+            };
 
-            if is_write {
+            if is_write && !non_mutating_post {
                 // #2603 G1: writes and deletes route through the single
                 // canonical action choke-point, DENY-BY-DEFAULT. `is_public`
                 // confers a read baseline only and never satisfies a write, and
@@ -3197,6 +3258,62 @@ mod tests {
     #[test]
     fn test_is_write_method_options_is_not_write() {
         assert!(!is_write_method(&Method::OPTIONS));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_non_mutating_format_post
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_mutating_lfs_batch_is_exempt() {
+        assert!(is_non_mutating_format_post("/lfs/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_authenticate_is_exempt() {
+        assert!(is_non_mutating_format_post(
+            "/conan/myrepo/v2/users/authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_object_put_is_not_exempt() {
+        // The actual object upload (PUT /lfs/<repo>/objects/<oid>) is a real
+        // write and must NOT be exempted from the mutation gate.
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/abcdef0123456789"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_verify_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs/myrepo/verify"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_missing_repo_key_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs//objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_upload_is_not_exempt() {
+        // A conan artifact upload path must remain write-gated.
+        assert!(!is_non_mutating_format_post(
+            "/conan/myrepo/v2/conans/pkg/1.0/user/channel/upload_urls"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_other_format_batch_is_not_exempt() {
+        // The exemption is scoped to the git-lfs and conan prefixes only.
+        assert!(!is_non_mutating_format_post("/npm/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_trailing_segment_is_not_exempt() {
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/batch/extra"
+        ));
     }
 
     // -----------------------------------------------------------------------
