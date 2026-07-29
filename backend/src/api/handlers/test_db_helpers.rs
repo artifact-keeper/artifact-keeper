@@ -146,6 +146,55 @@ pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     BlobGcSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the usage-ledger test cluster serializes only against itself.
+const USAGE_LEDGER_TEST_LOCK_KEY: i64 = 0x554C_2992; // "UL" + issue #2992
+
+/// Cross-process serialization guard for the DB-backed usage-ledger tests
+/// (#2992).
+///
+/// `reconcile_all_usage_ledgers` operates on the WHOLE database: it reads
+/// every repository's live sums and then upserts the ledger row, so a
+/// concurrently mutating peer test can have its ledger row overwritten with a
+/// snapshot taken before its mutation committed (read-then-write race). The
+/// migration-183 trigger tests assert exact per-step ledger values, so that
+/// stale overwrite makes them flaky under `cargo nextest`'s process-per-test
+/// parallelism. A Postgres *session* advisory lock — mirroring
+/// [`scan_dedup_serial_lock`] — makes the global-reconcile test and the
+/// exact-value trigger tests contend for one key. The lock releases when the
+/// guard drops (connection closes), including on panic.
+pub struct UsageLedgerSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide usage-ledger test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed
+/// usage-ledger test and bind the result for the whole test body.
+pub async fn usage_ledger_serial_lock() -> UsageLedgerSerialGuard {
+    use sqlx::Connection;
+    let Some(url) = crate::testing::require_db_url() else {
+        return UsageLedgerSerialGuard { _conn: None };
+    };
+    let Some(mut conn) = crate::testing::on_connect_result(sqlx::PgConnection::connect(&url).await)
+    else {
+        return UsageLedgerSerialGuard { _conn: None };
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(USAGE_LEDGER_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return UsageLedgerSerialGuard { _conn: None };
+    }
+    UsageLedgerSerialGuard { _conn: Some(conn) }
+}
+
 /// Advisory-lock key for [`sso_provider_serial_lock`] (#2621).
 ///
 /// Distinct from the other test lock keys and from the application advisory

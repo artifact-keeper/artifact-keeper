@@ -4851,6 +4851,7 @@ mod tests {
         /// the correct per-component columns.
         #[tokio::test]
         async fn test_usage_ledger_reconcile_matches_union() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -4903,6 +4904,7 @@ mod tests {
         /// bad ledger value is repaired back to the true sum and reported.
         #[tokio::test]
         async fn test_usage_ledger_reconciler_repairs_drift() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -4953,6 +4955,405 @@ mod tests {
             .await
             .expect("ledger row");
             assert_eq!(hosted, 7_000, "drift repaired back to the true sum");
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        // =================================================================
+        // #2992: trigger-maintained usage ledger (migration 183). Every
+        // INSERT/UPDATE/DELETE on artifacts / proxy_cache_artifacts /
+        // oci_blobs must charge or decrement the matching ledger component
+        // inside the mutating statement's own transaction, with no
+        // application code involved.
+        // =================================================================
+
+        async fn ledger_row(pool: &PgPool, repo: Uuid) -> (i64, i64, i64) {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+                 FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo)
+            .fetch_optional(pool)
+            .await
+            .expect("ledger query")
+            .unwrap_or((0, 0, 0))
+        }
+
+        /// F1 (#2992): a raw `INSERT INTO artifacts` — the shape every format
+        /// handler that bypasses the enforced admission path uses — must
+        /// charge `hosted_bytes` immediately (trigger, same tx), and the next
+        /// enforced admission must observe the real usage. On pre-183 code
+        /// the ledger stays 0 here until the background reconciler runs.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_charges_bypassing_artifact_insert() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(CreateRepositoryRequest {
+                    quota_bytes: Some(1_000),
+                    ..make_create_req(&suffix, RepositoryFormat::Generic)
+                })
+                .await
+                .expect("create repo");
+
+            // No admission call, no reconcile: the trigger alone must charge.
+            insert_artifact(
+                &pool,
+                repo.id,
+                "bypass/a-1.0.jar",
+                &format!("cas/aa/{}", Uuid::new_v4()),
+                5_000,
+            )
+            .await;
+            let (hosted, _, _) = ledger_row(&pool, repo.id).await;
+            assert_eq!(
+                hosted, 5_000,
+                "bypassing insert must be charged by the trigger in its own tx"
+            );
+
+            // Enforced admission (unchanged behaviour) sees the usage and
+            // rejects a further upload over the 1000-byte quota.
+            let mut tx = pool.begin().await.expect("begin");
+            let admission = service
+                .check_quota_locked(&mut tx, repo.id, "p2", 300)
+                .await
+                .expect("admission");
+            tx.rollback().await.expect("rollback");
+            assert!(
+                !admission.allowed,
+                "admission after the bypassing insert must see 5000 used"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// F2 (#2992): deletes return the ledger to its prior value exactly.
+        /// A soft-delete decrements once; a later hard DELETE of the already
+        /// soft-deleted row must not decrement again; and the counter is
+        /// floored at zero even against injected under-count drift.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_delete_returns_to_prior_value() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "f2/a", "cas/f2/a", 600).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 600);
+
+            // Soft-delete (the dominant delete shape in the handlers).
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("f2/a")
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "soft-delete must decrement exactly the charged bytes"
+            );
+
+            // Hard-deleting the already soft-deleted row contributes nothing
+            // (old contribution is 0), so no double decrement.
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/a")
+                .execute(&pool)
+                .await
+                .expect("hard delete of soft-deleted row");
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 0);
+
+            // Hard delete of a live row decrements exactly its size.
+            insert_artifact(&pool, repo.id, "f2/b", "cas/f2/b", 400).await;
+            insert_artifact(&pool, repo.id, "f2/c", "cas/f2/c", 250).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 650);
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/b")
+                .execute(&pool)
+                .await
+                .expect("hard delete");
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 250);
+
+            // Injected under-count drift: the floor keeps the counter at 0
+            // rather than going negative (phantom free quota).
+            sqlx::query(
+                "UPDATE repository_usage_ledger SET hosted_bytes = 0 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject drift");
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/c")
+                .execute(&pool)
+                .await
+                .expect("hard delete under drift");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "decrement must clamp at zero, never negative"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: the charge lives in the mutation's own transaction, so a
+        /// rolled-back INSERT leaves the ledger unchanged (inside the tx the
+        /// charge is visible; after ROLLBACK it is gone).
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_rollback_uncharges() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "rb/base", "cas/rb/base", 300).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 300);
+
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'rb/tx', 'rb/tx', 900, repeat('a', 64), \
+                         'application/octet-stream', 'cas/rb/tx', false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo.id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert inside tx");
+            let in_tx: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ledger inside tx");
+            assert_eq!(in_tx, 1_200, "charge is visible inside the transaction");
+            tx.rollback().await.expect("rollback");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                300,
+                "ROLLBACK must un-charge the aborted insert"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: in-place overwrites (the `ON CONFLICT (repository_id, path)
+        /// DO UPDATE` upsert shape) charge the net size delta, and a
+        /// reclassification to a proxy-cache storage key removes the row from
+        /// `hosted_bytes` entirely.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_update_charges_net_delta() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "ow/a", "cas/ow/a", 900).await;
+            sqlx::query(
+                "UPDATE artifacts SET size_bytes = 1000 \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("ow/a")
+            .execute(&pool)
+            .await
+            .expect("overwrite size");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                1_000,
+                "overwrite must charge the +100 delta, not another +1000"
+            );
+
+            sqlx::query(
+                "UPDATE artifacts SET storage_key = 'proxy-cache/x/__content__' \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("ow/a")
+            .execute(&pool)
+            .await
+            .expect("reclassify to proxy-cache key");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "proxy-cache-keyed rows must not count toward hosted_bytes"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: each source table feeds exactly its own ledger component;
+        /// the OCI dedup re-push upsert (`DO UPDATE SET pending_delete_at =
+        /// NULL`) is a zero-delta no-op; deletes drain each component back to
+        /// zero.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_components_isolated() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            insert_proxy_cache(&pool, repo.id, "cached/pkg.tgz", 2_500).await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 0));
+
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 500_000).await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 500_000));
+
+            // Dedup re-push of the same blob: fires only the
+            // pending_delete_at column, so the trigger must not run and the
+            // blob stays counted exactly once.
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+            )
+            .bind(repo.id)
+            .bind(&digest)
+            .bind(500_000_i64)
+            .bind(format!("oci-blobs/{digest}"))
+            .execute(&pool)
+            .await
+            .expect("dedup re-push upsert");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (0, 2_500, 500_000),
+                "dedup re-push must not double-count the blob"
+            );
+
+            // artifacts rows carrying a proxy-cache storage key contribute 0.
+            insert_artifact(
+                &pool,
+                repo.id,
+                "legacy/proxy-row",
+                &format!("proxy-cache/{}/legacy/__content__", repo.id),
+                700,
+            )
+            .await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 500_000));
+
+            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("proxy invalidate");
+            sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("oci purge");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (0, 0, 0),
+                "component deletes must drain exactly their own counters"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: migration 183's one-time true-up sets every ledger row to
+        /// the authoritative live sums (DO UPDATE, unlike 171's DO NOTHING),
+        /// erasing pre-trigger drift. Exercises the same statement scoped to
+        /// one repository so concurrently running DB tests are untouched.
+        #[tokio::test]
+        async fn test_usage_ledger_migration_true_up_repairs_drift() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "tu/a", "cas/tu/a", 1_000).await;
+            insert_proxy_cache(&pool, repo.id, "tu/p.tgz", 2_500).await;
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 4_000).await;
+
+            // Simulate pre-trigger drift the migration must erase.
+            sqlx::query(
+                "UPDATE repository_usage_ledger \
+                 SET hosted_bytes = 1, proxy_bytes = 2, oci_bytes = 3 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject drift");
+
+            // The 183 true-up statement, scoped to this repository.
+            sqlx::query(
+                "INSERT INTO repository_usage_ledger \
+                     (repository_id, hosted_bytes, proxy_bytes, oci_bytes, updated_at) \
+                 SELECT r.id, \
+                     COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a \
+                                WHERE a.repository_id = r.id AND a.is_deleted = false \
+                                  AND a.storage_key NOT LIKE 'proxy-cache/%'), 0), \
+                     COALESCE((SELECT SUM(p.size_bytes) FROM proxy_cache_artifacts p \
+                                WHERE p.repository_id = r.id), 0), \
+                     COALESCE((SELECT SUM(o.size_bytes) FROM oci_blobs o \
+                                WHERE o.repository_id = r.id), 0), \
+                     now() \
+                 FROM repositories r WHERE r.id = $1 \
+                 ON CONFLICT (repository_id) DO UPDATE SET \
+                     hosted_bytes = EXCLUDED.hosted_bytes, \
+                     proxy_bytes  = EXCLUDED.proxy_bytes, \
+                     oci_bytes    = EXCLUDED.oci_bytes, \
+                     updated_at   = now()",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("true-up");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (1_000, 2_500, 4_000),
+                "true-up must restore the exact live sums"
+            );
 
             cleanup_repo(&pool, repo.id).await;
         }
