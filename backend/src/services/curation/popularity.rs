@@ -20,6 +20,19 @@
 //!   Block — otherwise a fresh malicious squat (which has no download
 //!   history and so can never trip the threshold check) only ever lands in
 //!   review.
+//! - **Homoglyph / mixed-script** (#2956) — a name whose Unicode-confusable
+//!   skeleton collides with a popular package's while the raw name differs
+//!   (Cyrillic/fullwidth lookalikes), or a name mixing scripts in one
+//!   identifier. Both dodge pure edit distance. Gated by `homoglyph_check`
+//!   (default on, under the `typosquat_check` master toggle) and escalated by
+//!   the same `block_typosquat` opt-in.
+//! - **Affix reputation-riding** (#2956) — a low/unknown-download candidate
+//!   whose name is a popular name plus a bounded ecosystem affix
+//!   (`python-numpy`, `numpy-dev`, `numpy2`) or separator stuffing. The
+//!   candidate-popularity gate (below `affix_max_downloads`, default 1000)
+//!   plus popular-list self-exclusion keep legitimately popular affixed names
+//!   (`python-dateutil`) unflagged. Gated by `affix_check` (default on, under
+//!   `typosquat_check`), escalated by `block_typosquat`.
 //! - **Unknown popularity** — a source outage/rate limit/unlisted package
 //!   yields `Flag("popularity unknown…")` by default, never Block, regardless
 //!   of `action`. Fail-open on the data source, fail-safe on the decision:
@@ -36,7 +49,9 @@
 use crate::models::curation::CurationDecision;
 
 use super::popularity_source::{ecosystem_for_format, PopularityResult, PopularitySource};
-use super::typosquat::{default_popular_packages, is_typosquat};
+use super::typosquat::{
+    default_popular_packages, is_affix_squat, is_homoglyph_squat, is_mixed_script, is_typosquat,
+};
 
 /// Whether this rule type applies to `format` at all — i.e. a public
 /// download-count ecosystem exists for it. The dispatch checks this BEFORE
@@ -51,6 +66,11 @@ const DEFAULT_MAX_DISTANCE: u64 = 2;
 /// Ceiling for the configurable distance. Beyond 2 edits the false-positive
 /// rate on short names makes the signal noise.
 const MAX_DISTANCE_CEILING: u64 = 2;
+/// Default candidate-popularity ceiling for the affix signal (#2956): an
+/// affixed name only counts as reputation-riding while the candidate itself
+/// has fewer recent downloads than this (or an Unknown count). Keeps
+/// legitimately popular affixed packages (`python-dateutil`) unflagged.
+const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 
 /// Evaluate the `popularity` rule for one package.
 ///
@@ -62,6 +82,9 @@ const MAX_DISTANCE_CEILING: u64 = 2;
 ///   "window": "month",
 ///   "typosquat_check": true,
 ///   "max_distance": 2,
+///   "homoglyph_check": true,
+///   "affix_check": true,
+///   "affix_max_downloads": 1000,
 ///   "action": "flag",
 ///   "block_unknown": false,
 ///   "block_typosquat": false,
@@ -86,7 +109,14 @@ const MAX_DISTANCE_CEILING: u64 = 2;
 ///   Without `action: "block"` the flag has no effect.
 /// * `block_typosquat` — a typo-squat match **blocks** instead of flagging,
 ///   regardless of `action`. Off by default because lexical proximity has
-///   false positives by construction.
+///   false positives by construction. Applies uniformly to all lexical
+///   signals: edit distance, homoglyph/mixed-script, and affix (#2956).
+///
+/// The #2956 sub-toggles (`homoglyph_check`, `affix_check`, both default
+/// `true`) sit under the `typosquat_check` master toggle: turning
+/// `typosquat_check` off disables every lexical signal, matching the
+/// pre-#2956 meaning of that key. `affix_max_downloads` (default 1000) is the
+/// candidate-popularity ceiling for the affix signal only.
 ///
 /// `version` is accepted for signature-compatibility with the dispatch seam;
 /// popularity is a package-level signal, so it does not influence the
@@ -131,6 +161,19 @@ pub async fn evaluate(
         .get("block_typosquat")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // #2956 sub-toggles, both under the typosquat_check master toggle.
+    let homoglyph_check = config
+        .get("homoglyph_check")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let affix_check = config
+        .get("affix_check")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let affix_max_downloads = config
+        .get("affix_max_downloads")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_AFFIX_MAX_DOWNLOADS);
 
     let popular: Vec<String> = match config
         .get("popular_packages")
@@ -183,20 +226,53 @@ pub async fn evaluate(
     }
 
     if typosquat_check {
+        // All lexical signals share the block_typosquat escalation: opt-in
+        // enforcement where the operator accepts the false-positive rate of
+        // lexical matching in exchange for hard-blocking fresh squats that
+        // have no download history to trip on. Default: advisory only.
+        let mut lexical_reasons: Vec<String> = Vec::new();
+
         if let Some(target) = is_typosquat(name, &popular, max_distance) {
-            let reason = format!(
+            lexical_reasons.push(format!(
                 "name '{name}' is within edit distance {max_distance} of popular package '{target}' (possible typo-squat)"
-            );
-            if block_typosquat {
-                // Opt-in enforcement: the operator accepts the false-positive
-                // rate of lexical matching in exchange for hard-blocking
-                // fresh squats that have no download history to trip on.
-                block_reasons.push(reason);
-            } else {
-                // Default: advisory only — lexical proximity alone never
-                // blocks.
-                flag_reasons.push(reason);
+            ));
+        }
+
+        if homoglyph_check {
+            if let Some(target) = is_homoglyph_squat(name, &popular) {
+                lexical_reasons.push(format!(
+                    "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
+                ));
             }
+            if is_mixed_script(name) {
+                lexical_reasons.push(format!(
+                    "name '{name}' mixes Unicode scripts in one identifier (homoglyph-impersonation indicator)"
+                ));
+            }
+        }
+
+        if affix_check {
+            // Reputation-riding requires the candidate itself to be
+            // unpopular: a legitimately popular affixed name (e.g.
+            // `python-dateutil`, were it missing from the popular list) is
+            // not riding anyone's reputation.
+            let candidate_low_popularity = match downloads {
+                PopularityResult::Known(d) => d < affix_max_downloads,
+                PopularityResult::Unknown => true,
+            };
+            if candidate_low_popularity {
+                if let Some(target) = is_affix_squat(name, &popular) {
+                    lexical_reasons.push(format!(
+                        "name '{name}' is popular package '{target}' plus an ecosystem affix, and '{name}' itself has low/unknown downloads (possible reputation-riding)"
+                    ));
+                }
+            }
+        }
+
+        if block_typosquat {
+            block_reasons.extend(lexical_reasons);
+        } else {
+            flag_reasons.extend(lexical_reasons);
         }
     }
 
@@ -405,6 +481,169 @@ mod tests {
             CurationDecision::Block(reason) => {
                 assert!(reason.contains("popularity unknown"), "{reason}");
                 assert!(reason.contains("typo-squat"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn homoglyph_lookalike_flags_and_names_the_target() {
+        // Fullwidth ｕ: pixel-identical to numpy, edit distance 1 BUT the
+        // point is full-substitution lookalikes; use Cyrillic multi-swap
+        // "пumру"-style too. Candidate is even "popular" by count — the
+        // homoglyph signal is not popularity-gated.
+        let source = FakePopularitySource::new().with("pypi", "n\u{ff55}mpy", 9_999);
+        let cfg = config(serde_json::json!({"min_downloads": 500}));
+        match evaluate(&cfg, "pypi", "n\u{ff55}mpy", "1.0.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("homoglyph"), "{reason}");
+                assert!(reason.contains("numpy"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cyrillic_multiswap_beyond_edit_distance_is_caught() {
+        // "requests" with FOUR Cyrillic substitutions (е U+0435, у... use
+        // е/а-style): distance > 2 so the pre-#2956 check misses it; the
+        // skeleton collision and mixed-script signals both fire.
+        let name4 = "\u{0433}\u{0435}qu\u{0435}\u{0455}ts"; // г е е ѕ — distance 4
+        let source = FakePopularitySource::new().with("pypi", name4, 100_000);
+        let cfg = config(serde_json::json!({"max_distance": 2}));
+        match evaluate(&cfg, "pypi", name4, "1.0.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("mixes Unicode scripts"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_package_not_flagged_by_homoglyph_check() {
+        let source = FakePopularitySource::new().with("pypi", "numpy", 50_000_000);
+        let cfg = config(serde_json::json!({"min_downloads": 500}));
+        assert_eq!(
+            evaluate(&cfg, "pypi", "numpy", "2.0.0", &source).await,
+            CurationDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn homoglyph_check_can_be_disabled() {
+        let source = FakePopularitySource::new().with("pypi", "n\u{ff55}mpy", 9_999);
+        let cfg = config(serde_json::json!({
+            "min_downloads": 500,
+            "homoglyph_check": false,
+            // distance("nｕmpy","numpy") == 1, so silence the distance
+            // heuristic too to isolate the homoglyph toggle.
+            "max_distance": 1,
+            "popular_packages": ["numpy"]
+        }));
+        // With homoglyph off the only signal left is edit distance 1 — verify
+        // the homoglyph-specific reason is gone when fully disabled.
+        let cfg_off = config(serde_json::json!({
+            "min_downloads": 500,
+            "typosquat_check": false
+        }));
+        assert_eq!(
+            evaluate(&cfg_off, "pypi", "n\u{ff55}mpy", "1.0.0", &source).await,
+            CurationDecision::Allow,
+            "master toggle off: no lexical flagging at all"
+        );
+        match evaluate(&cfg, "pypi", "n\u{ff55}mpy", "1.0.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(!reason.contains("homoglyph"), "{reason}");
+                assert!(!reason.contains("mixes Unicode scripts"), "{reason}");
+            }
+            CurationDecision::Allow => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn affix_squat_low_popularity_flags() {
+        for name in ["python-numpy", "numpy-dev", "numpy2"] {
+            // Fresh squat: no download history at all (Unknown) — the
+            // threshold reason and the affix reason both surface.
+            let source = FakePopularitySource::new();
+            let cfg = config(serde_json::json!({"min_downloads": 500}));
+            match evaluate(&cfg, "pypi", name, "0.0.1", &source).await {
+                CurationDecision::Flag(reason) => {
+                    assert!(reason.contains("reputation-riding"), "{name}: {reason}");
+                    assert!(reason.contains("'numpy'"), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected Flag, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legitimately_popular_affixed_name_is_not_flagged() {
+        // python-dateutil is on the popular list itself (self-exclusion) AND
+        // has a huge download count — must not be flagged.
+        let source = FakePopularitySource::new().with("pypi", "python-dateutil", 40_000_000);
+        let cfg = config(serde_json::json!({"min_downloads": 500}));
+        assert_eq!(
+            evaluate(&cfg, "pypi", "python-dateutil", "2.9.0", &source).await,
+            CurationDecision::Allow
+        );
+        // And the popularity gate alone also protects a popular affixed name
+        // NOT on the list: custom list with only the base name.
+        let source = FakePopularitySource::new().with("pypi", "python-dateutil", 40_000_000);
+        let cfg = config(serde_json::json!({
+            "min_downloads": 500,
+            "popular_packages": ["dateutil"]
+        }));
+        assert_eq!(
+            evaluate(&cfg, "pypi", "python-dateutil", "2.9.0", &source).await,
+            CurationDecision::Allow,
+            "high candidate downloads must gate the affix signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn affix_check_toggle_and_threshold_are_respected() {
+        // Disabled: low-pop python-numpy only gets the threshold flag reason.
+        let source = FakePopularitySource::new().with("pypi", "python-numpy", 10);
+        let cfg = config(serde_json::json!({"min_downloads": 500, "affix_check": false}));
+        match evaluate(&cfg, "pypi", "python-numpy", "0.0.1", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(!reason.contains("reputation-riding"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+        // Custom affix_max_downloads: candidate at 5000 downloads is above
+        // the default 1000 ceiling (no affix flag), but below a raised one.
+        let source = FakePopularitySource::new().with("pypi", "numpy-dev", 5_000);
+        let cfg = config(serde_json::json!({}));
+        assert_eq!(
+            evaluate(&cfg, "pypi", "numpy-dev", "1.0.0", &source).await,
+            CurationDecision::Allow,
+            "default ceiling 1000: 5000-download candidate not reputation-riding"
+        );
+        let cfg = config(serde_json::json!({"affix_max_downloads": 10_000}));
+        match evaluate(&cfg, "pypi", "numpy-dev", "1.0.0", &source).await {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("reputation-riding"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn homoglyph_and_affix_escalate_with_block_typosquat() {
+        let source = FakePopularitySource::new().with("pypi", "n\u{ff55}mpy", 9_999);
+        let cfg = config(serde_json::json!({"min_downloads": 500, "block_typosquat": true}));
+        match evaluate(&cfg, "pypi", "n\u{ff55}mpy", "1.0.0", &source).await {
+            CurationDecision::Block(reason) => assert!(reason.contains("homoglyph"), "{reason}"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+        let source = FakePopularitySource::new().with("pypi", "numpy-dev", 10);
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate(&cfg, "pypi", "numpy-dev", "1.0.0", &source).await {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("reputation-riding"), "{reason}")
             }
             other => panic!("expected Block, got {other:?}"),
         }

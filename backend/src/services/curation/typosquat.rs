@@ -1,4 +1,5 @@
-//! Lexical typo-squat detection for the `popularity` curation rule (#2949).
+//! Lexical typo-squat detection for the `popularity` curation rule (#2949,
+//! extended by #2956).
 //!
 //! A classic supply-chain attack registers a package whose name is one or two
 //! keystrokes away from a heavily downloaded package (`reqeusts` vs
@@ -8,6 +9,30 @@
 //! popular-package list, and a small built-in seed list of top packages per
 //! ecosystem. The seed list is a default only — rules can supply their own
 //! list via config.
+//!
+//! #2956 adds two detectors for evasion classes pure edit distance misses:
+//!
+//! - **Homoglyph / Unicode-confusable** ([`is_homoglyph_squat`],
+//!   [`is_mixed_script`]) — a name built from visually-identical-but-different
+//!   codepoints (Cyrillic `а` U+0430 for Latin `a`, fullwidth `ｕ` U+FF55 for
+//!   `u`). Every substituted codepoint costs one edit, so a fully
+//!   confusable-substituted name sits far beyond `max_distance` while looking
+//!   pixel-identical. Detection normalizes through NFKC plus the UTS #39
+//!   confusable *skeleton* (via the `unicode-security` crate — the same
+//!   implementation rustc's `non_ascii_idents` lints use) and flags a skeleton
+//!   collision with a popular name whose raw name differs.
+//! - **Affix** ([`is_affix_squat`]) — a popular name wrapped in a bounded
+//!   ecosystem prefix/suffix (`python-numpy`, `numpy-dev`, `numpy2`) or
+//!   stuffed with separators (`l.o.d.a.s.h`), riding the base name's
+//!   reputation. Lexically this is `len(affix)+1` edits away, again beyond
+//!   `max_distance`. This signal is *popularity-gated by the caller*: a
+//!   legitimately popular affixed name (`python-dateutil`) must not be
+//!   flagged, so [`super::popularity::evaluate`] only applies it to
+//!   low/unknown-download candidates (and self-exclusion covers affixed names
+//!   that are themselves on the popular list).
+
+use unicode_normalization::UnicodeNormalization;
+use unicode_security::MixedScript;
 
 /// Damerau-Levenshtein distance (optimal string alignment variant): the
 /// minimum number of single-character insertions, deletions, substitutions,
@@ -78,14 +103,131 @@ pub fn is_typosquat(name: &str, popular: &[String], max_distance: usize) -> Opti
         return None;
     }
     let (target, distance) = nearest_popular(name, popular)?;
-    // TODO(#2956): pure edit distance misses homoglyph squats (Unicode
-    // confusables, e.g. Cyrillic lookalikes) and affix-style squats
-    // ("requests2", "python-requests"), which can sit beyond max_distance.
+    // Homoglyph and affix squats sit beyond max_distance by construction;
+    // they are handled by `is_homoglyph_squat` / `is_affix_squat` (#2956).
     if distance >= 1 && distance <= max_distance {
         Some(target)
     } else {
         None
     }
+}
+
+/// UTS #39 confusable skeleton of a package name, case-folded.
+///
+/// Pipeline: NFKC (folds compatibility forms such as fullwidth `ｕ` U+FF55
+/// and ligatures) → `unicode-security` confusable skeleton (maps
+/// visually-confusable codepoints, e.g. Cyrillic `а` U+0430, onto a canonical
+/// exemplar) → lowercase. Two names whose skeletons collide are visually
+/// interchangeable to a human reader even when their raw codepoints differ.
+pub fn confusable_skeleton(name: &str) -> String {
+    let nfkc: String = name.nfkc().collect();
+    let skeleton: String = unicode_security::confusable_detection::skeleton(&nfkc).collect();
+    skeleton.to_lowercase()
+}
+
+/// Return `Some(target)` when `name` is a Unicode-confusable (homoglyph)
+/// impersonation of a popular package: its confusable skeleton collides with
+/// a popular name's skeleton while the raw (case-folded) names differ, and
+/// `name` itself is not on the popular list.
+///
+/// Unlike edit distance, this catches full-substitution lookalikes
+/// (`nｕmpy`, Cyrillic `реqueѕts`) that are pixel-identical but many edits
+/// away. A skeleton collision with a differing raw name has essentially no
+/// legitimate cause, so callers may treat this as a stronger signal than the
+/// distance heuristic.
+pub fn is_homoglyph_squat(name: &str, popular: &[String]) -> Option<String> {
+    let name_lc = name.to_lowercase();
+    // A package that IS popular by name is never a squat of another entry.
+    if popular.iter().any(|p| p.to_lowercase() == name_lc) {
+        return None;
+    }
+    let name_skeleton = confusable_skeleton(name);
+    popular
+        .iter()
+        .find(|p| confusable_skeleton(p) == name_skeleton)
+        .cloned()
+}
+
+/// Whether `name` mixes Unicode scripts (e.g. Latin and Cyrillic letters in
+/// one identifier). Package names have no legitimate reason to mix scripts;
+/// mixing is the standard way to smuggle confusables past a reader, so it is
+/// a strong impersonation signal on its own (UTS #39 mixed-script
+/// restriction). ASCII digits and separators are script-Common and never
+/// count as mixing.
+pub fn is_mixed_script(name: &str) -> bool {
+    !name.is_single_script()
+}
+
+/// Ecosystem-style prefixes commonly prepended to a popular base name.
+const AFFIX_PREFIXES: &[&str] = &[
+    "py", "python", "node", "nodejs", "js", "go", "rs", "lib", "the", "dev", "test",
+];
+
+/// Ecosystem-style suffixes commonly appended to a popular base name.
+const AFFIX_SUFFIXES: &[&str] = &[
+    "dev", "devel", "js", "py", "node", "cli", "util", "utils", "lib", "libs", "api", "sdk",
+    "core", "plugin", "tools", "test", "rs", "bin", "beta", "pro", "new", "official", "update",
+    "updated", "secure",
+];
+
+/// Separator characters allowed between a base name and an affix.
+const AFFIX_SEPARATORS: &[char] = &['-', '_', '.'];
+
+/// Strip every separator character from `s` (for separator-stuffing
+/// comparison, e.g. `l.o.d.a.s.h` → `lodash`).
+fn strip_separators(s: &str) -> String {
+    s.chars()
+        .filter(|c| !AFFIX_SEPARATORS.contains(c))
+        .collect()
+}
+
+/// Return `Some(target)` when `name` is a popular name wrapped in a bounded
+/// affix, riding the base name's reputation:
+///
+/// - a known prefix plus separator (`py-numpy`, `python-numpy`),
+/// - separator? plus a known suffix (`numpy-dev`, `numpy_utils`),
+/// - separator? plus 1–2 trailing digits (`numpy2`, `lodash-4`), or
+/// - separator stuffing (`l.o.d.a.s.h` collapses to `lodash`).
+///
+/// Matching is case-insensitive and `name` must not itself be on the popular
+/// list (so a curated list containing `python-dateutil` never flags it). This
+/// function is purely lexical — the caller MUST additionally gate on the
+/// candidate's own popularity (low/unknown downloads) before acting, because
+/// a legitimately popular affixed package is not reputation-riding.
+pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
+    let name_lc = name.to_lowercase();
+    // A package that IS popular by name is never a squat of another entry.
+    if popular.iter().any(|p| p.to_lowercase() == name_lc) {
+        return None;
+    }
+    for candidate in popular {
+        let base = candidate.to_lowercase();
+        if base.is_empty() || name_lc == base {
+            continue;
+        }
+        // Prefix: <prefix><sep><base>
+        if let Some(rest) = name_lc.strip_suffix(&base) {
+            if let Some(prefix) = rest.strip_suffix(AFFIX_SEPARATORS) {
+                if AFFIX_PREFIXES.contains(&prefix) {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+        // Suffix: <base><sep?><suffix> or <base><sep?><1-2 digits>
+        if let Some(rest) = name_lc.strip_prefix(&base) {
+            let rest = rest.strip_prefix(AFFIX_SEPARATORS).unwrap_or(rest);
+            if AFFIX_SUFFIXES.contains(&rest)
+                || ((1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some(candidate.clone());
+            }
+        }
+        // Separator stuffing: collapsing separators reproduces the base name.
+        if strip_separators(&name_lc) == strip_separators(&base) {
+            return Some(candidate.clone());
+        }
+    }
+    None
 }
 
 /// Built-in seed list of heavily downloaded package names per ecosystem
@@ -254,6 +396,137 @@ mod tests {
         let popular = strings(&["requests", "request"]);
         assert_eq!(is_typosquat("request", &popular, 2), None);
         assert_eq!(is_typosquat("requests", &popular, 2), None);
+    }
+
+    #[test]
+    fn skeleton_folds_confusables_and_compatibility_forms() {
+        // Skeletons are canonical-exemplar strings, not readable names (the
+        // UTS #39 table maps e.g. `m` → `rn`), so correctness is skeleton
+        // EQUALITY with the impersonated name, not a literal value.
+        // Fullwidth ｕ (U+FF55) and Cyrillic а (U+0430) fold onto their Latin
+        // exemplars:
+        assert_eq!(
+            confusable_skeleton("n\u{ff55}mpy"),
+            confusable_skeleton("numpy")
+        );
+        assert_eq!(
+            confusable_skeleton("p\u{0430}ndas"),
+            confusable_skeleton("pandas")
+        );
+        // Case-insensitive: the cased name collides with the lowercase one.
+        assert_eq!(confusable_skeleton("NumPy"), confusable_skeleton("numpy"));
+        // Distinct real names do NOT collide.
+        assert_ne!(confusable_skeleton("numpy"), confusable_skeleton("pandas"));
+    }
+
+    #[test]
+    fn homoglyph_flags_confusable_lookalikes() {
+        let popular = strings(&["numpy", "requests"]);
+        // Fullwidth ｕ: skeleton collides with numpy, raw differs.
+        assert_eq!(
+            is_homoglyph_squat("n\u{ff55}mpy", &popular),
+            Some("numpy".to_string())
+        );
+        // Cyrillic е/у/р/ѕ substitution of "requests".
+        assert_eq!(
+            is_homoglyph_squat("r\u{0435}quests", &popular),
+            Some("requests".to_string())
+        );
+        // All-Cyrillic-confusable numpy (у U+0443 for y is confusable).
+        assert_eq!(
+            is_homoglyph_squat("nump\u{0443}", &popular),
+            Some("numpy".to_string())
+        );
+    }
+
+    #[test]
+    fn homoglyph_never_flags_the_real_or_unrelated_package() {
+        let popular = strings(&["numpy", "requests"]);
+        // The real package: raw name matches a popular entry.
+        assert_eq!(is_homoglyph_squat("numpy", &popular), None);
+        assert_eq!(is_homoglyph_squat("NumPy", &popular), None);
+        // Unrelated ASCII name: no skeleton collision.
+        assert_eq!(is_homoglyph_squat("leftpad", &popular), None);
+        // Edit-distance-1 ASCII typo is NOT a skeleton collision (that is the
+        // distance heuristic's job).
+        assert_eq!(is_homoglyph_squat("nunpy", &popular), None);
+    }
+
+    #[test]
+    fn mixed_script_detection() {
+        // Latin + Cyrillic in one identifier.
+        assert!(is_mixed_script("num\u{0440}y")); // Cyrillic р
+        assert!(is_mixed_script("lod\u{0430}sh")); // Cyrillic а
+                                                   // Single script (digits and separators are script-Common).
+        assert!(!is_mixed_script("numpy"));
+        assert!(!is_mixed_script("numpy2"));
+        assert!(!is_mixed_script("python-dateutil"));
+        assert!(!is_mixed_script("charset_normalizer.v2"));
+    }
+
+    #[test]
+    fn unicode_edge_cases_do_not_panic_or_mis_skeleton() {
+        let popular = strings(&["numpy"]);
+        // Combining chars: n + u + combining-acute + mpy — NFC-composes to ú,
+        // which is not a plain-u confusable; must not panic either way.
+        let _ = is_homoglyph_squat("nu\u{0301}mpy", &popular);
+        // Multibyte CJK, emoji, empty string, lone combining mark.
+        assert_eq!(is_homoglyph_squat("包管理器", &popular), None);
+        assert_eq!(is_homoglyph_squat("🦀crate", &popular), None);
+        assert_eq!(is_homoglyph_squat("", &popular), None);
+        let _ = confusable_skeleton("\u{0301}");
+        let _ = is_mixed_script("");
+        // NFKC folding of the ﬁ ligature (U+FB01) — collides with "file".
+        assert_eq!(
+            confusable_skeleton("\u{fb01}le"),
+            confusable_skeleton("file")
+        );
+    }
+
+    #[test]
+    fn affix_flags_prefix_suffix_digit_and_separator_stuffing() {
+        let popular = strings(&["numpy", "lodash"]);
+        for name in [
+            "python-numpy",
+            "py-numpy",
+            "py_numpy",
+            "numpy-dev",
+            "numpy_utils",
+            "numpy2",
+            "numpy-2",
+            "lodash-js",
+            "l.o.d.a.s.h",
+        ] {
+            assert_eq!(
+                is_affix_squat(name, &popular),
+                Some(
+                    if name.contains("lodash") || name.contains("l.o") {
+                        "lodash"
+                    } else {
+                        "numpy"
+                    }
+                    .to_string()
+                ),
+                "{name} should be an affix squat"
+            );
+        }
+    }
+
+    #[test]
+    fn affix_ignores_popular_unrelated_and_unbounded_names() {
+        let popular = strings(&["numpy", "python-dateutil", "react", "react-dom"]);
+        // On the popular list itself: never a squat (the legit-affix guard).
+        assert_eq!(is_affix_squat("python-dateutil", &popular), None);
+        assert_eq!(is_affix_squat("react-dom", &popular), None);
+        // Unknown affix token: not in the bounded set.
+        assert_eq!(is_affix_squat("numpy-extras-for-science", &popular), None);
+        assert_eq!(is_affix_squat("mycompany-numpy", &popular), None);
+        // 3+ digit suffix is out of bounds (e.g. a year-fork naming scheme).
+        assert_eq!(is_affix_squat("numpy2024", &popular), None);
+        // Unrelated name.
+        assert_eq!(is_affix_squat("leftpad", &popular), None);
+        // Base embedded mid-name without a bounded affix.
+        assert_eq!(is_affix_squat("supernumpyish", &popular), None);
     }
 
     #[test]
