@@ -313,6 +313,92 @@ mod tests {
         assert!(!ProxyScanAction::FailOpen.is_fail_closed());
     }
 
+    /// DB-backed round trip: record → lookup → upsert-on-conflict → lookup.
+    /// Covers the two sqlx paths (`record_verdict`, `lookup_verdict`) against
+    /// the real `proxy_scan_results` schema (unique key + CHECK vocabulary).
+    /// Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn record_and_lookup_verdict_roundtrip_and_upsert() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        // Unique digest per run so parallel/repeat runs never collide.
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+
+        // Missing digest: no row.
+        let missing = svc.lookup_verdict(&digest, "grype").await.expect("lookup");
+        assert!(missing.is_none(), "unknown digest must have no verdict");
+
+        // First record: clean.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_CLEAN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-0.99.0-test"),
+            None,
+        )
+        .await
+        .expect("record clean");
+        let row = svc
+            .lookup_verdict(&digest, "grype")
+            .await
+            .expect("lookup")
+            .expect("row after record");
+        assert_eq!(row.verdict, VERDICT_CLEAN);
+        assert_eq!(row.findings_count, 0);
+        assert_eq!(row.max_severity, None);
+        assert_eq!(row.scanner_version.as_deref(), Some("grype-0.99.0-test"));
+
+        // Re-record the SAME digest (e.g. re-scan against a bumped CVE-DB
+        // that now flags it): the upsert must replace, not duplicate/err.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_VULNERABLE,
+            2,
+            1,
+            1,
+            0,
+            0,
+            Some("critical"),
+            Some("grype-1.0.0-test"),
+            None,
+        )
+        .await
+        .expect("upsert vulnerable");
+        let row = svc
+            .lookup_verdict(&digest, "grype")
+            .await
+            .expect("lookup")
+            .expect("row after upsert");
+        assert_eq!(row.verdict, VERDICT_VULNERABLE);
+        assert_eq!(row.findings_count, 2);
+        assert_eq!(row.critical_count, 1);
+        assert_eq!(row.high_count, 1);
+        assert_eq!(row.max_severity.as_deref(), Some("critical"));
+        assert_eq!(row.scanner_version.as_deref(), Some("grype-1.0.0-test"));
+        // A different scan_type is a distinct verdict slot.
+        assert!(svc
+            .lookup_verdict(&digest, "trivy")
+            .await
+            .expect("lookup other type")
+            .is_none());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
     #[test]
     fn inconclusive_is_pending_open_locked_closed() {
         // Over-cap / budget / scan-error: fail-open serves-with-pending,

@@ -1188,4 +1188,109 @@ mod tests {
         assert_eq!(until, None);
         fx.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // enforce_download_gate (#2954): quarantine THEN scan policy at the shared
+    // download choke point. DB-backed; no-op without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_absent_artifact_is_noop() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        // A deleted / never-existing artifact preserves the pre-#2954 no-op.
+        let result = enforce_download_gate(&fx.pool, Uuid::new_v4()).await;
+        fx.teardown().await;
+        assert!(result.is_ok(), "absent artifact must stay a no-op Ok");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_no_policy_allows_then_quarantine_blocks() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/g/1.0/g-1.0.jar").await;
+
+        // Regression guardrail: no quarantine + no enabled scan policy => the
+        // gate is a pass-through (repos that never opted in see NO change).
+        let clean = enforce_download_gate(&fx.pool, aid).await;
+
+        // Quarantined (unexpired hold): 409 Conflict BEFORE any policy logic.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                 quarantine_until = NOW() + INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(aid)
+        .execute(&fx.pool)
+        .await
+        .expect("set quarantined");
+        let quarantined = enforce_download_gate(&fx.pool, aid).await;
+
+        // Rejected: 403.
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1")
+            .bind(aid)
+            .execute(&fx.pool)
+            .await
+            .expect("set rejected");
+        let rejected = enforce_download_gate(&fx.pool, aid).await;
+
+        fx.teardown().await;
+
+        assert!(clean.is_ok(), "no hold + no policy must allow: {clean:?}");
+        assert!(
+            matches!(quarantined, Err(AppError::Conflict(_))),
+            "active quarantine must be a 409 Conflict, got {quarantined:?}"
+        );
+        assert!(
+            matches!(rejected, Err(AppError::Authorization(_))),
+            "rejected artifact must be a 403, got {rejected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_blocks_unscanned_via_scan_policy() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/h/1.0/h-1.0.jar").await;
+
+        // A repo-scoped enabled policy with block_unscanned: the seeded
+        // artifact has no completed scan, so the policy evaluation disallows
+        // and the download gate must 403 — the exact false affordance #2954
+        // closes (scan policy previously only ran on the promotion gate).
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', true, true, true)",
+        )
+        .bind(format!("gate-2954-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let result = enforce_download_gate(&fx.pool, aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("scan policy"),
+                    "gate message names the scan policy generically: {msg}"
+                );
+                // Anonymous-readable route: no policy names / finding counts.
+                assert!(!msg.contains("gate-2954"), "must not leak policy names");
+            }
+            other => panic!("unscanned artifact under block_unscanned must 403, got {other:?}"),
+        }
+    }
 }

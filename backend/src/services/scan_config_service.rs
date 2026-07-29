@@ -609,4 +609,71 @@ mod tests {
             AppError::Validation(_)
         ));
     }
+
+    /// DB-backed round trip for the #2954 `proxy_scan_action` column: default
+    /// when no config row exists, persist via `upsert_config`, read back via
+    /// `proxy_scan_action` / `is_proxy_scan_enabled`, and preserve the stored
+    /// value when a later patch omits the field (#1374 B11 semantics).
+    /// Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_proxy_scan_action_db_default_upsert_and_patch_preserve() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let svc = ScanConfigService::new(fx.pool.clone());
+
+        // No config row: action defaults to fail-open (today's behavior) and
+        // scan-on-proxy reads disabled.
+        assert_eq!(
+            svc.proxy_scan_action(fx.repo_id).await.expect("action"),
+            ProxyScanAction::FailOpen
+        );
+        assert!(!svc
+            .is_proxy_scan_enabled(fx.repo_id)
+            .await
+            .expect("enabled"));
+
+        // Upsert with fail_closed persists and round-trips.
+        let req = UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            scan_on_upload: None,
+            scan_on_proxy: Some(true),
+            block_on_policy_violation: None,
+            severity_threshold: None,
+            proxy_scan_action: Some("fail_closed".to_string()),
+        };
+        let cfg = svc.upsert_config(fx.repo_id, &req).await.expect("upsert");
+        assert_eq!(cfg.proxy_scan_action, "fail_closed");
+        assert!(cfg.scan_on_proxy);
+        assert_eq!(
+            svc.proxy_scan_action(fx.repo_id).await.expect("action"),
+            ProxyScanAction::FailClosed
+        );
+        assert!(svc
+            .is_proxy_scan_enabled(fx.repo_id)
+            .await
+            .expect("enabled"));
+
+        // A later patch that omits proxy_scan_action must PRESERVE the stored
+        // fail_closed, not silently reset the security posture to fail-open.
+        let patch = UpsertScanConfigRequest {
+            scan_enabled: None,
+            scan_on_upload: Some(true),
+            scan_on_proxy: None,
+            block_on_policy_violation: None,
+            severity_threshold: None,
+            proxy_scan_action: None,
+        };
+        let cfg = svc.upsert_config(fx.repo_id, &patch).await.expect("patch");
+        assert_eq!(
+            cfg.proxy_scan_action, "fail_closed",
+            "an omitted proxy_scan_action must keep the existing value"
+        );
+        // get_config reads the column back too.
+        let read = svc.get_config(fx.repo_id).await.expect("get").expect("row");
+        assert_eq!(read.proxy_scan_action, "fail_closed");
+
+        fx.teardown().await;
+    }
 }

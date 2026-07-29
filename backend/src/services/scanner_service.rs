@@ -13574,6 +13574,63 @@ mod tests {
         );
     }
 
+    /// The `Scanner::is_cve_authoritative` trait DEFAULT is false: a scanner
+    /// that does not opt in is a supplementary signal whose success must not
+    /// satisfy the "the CVE scanner ran" condition (only `GrypeScanner`
+    /// overrides to true — pinned in grype_scanner's own tests).
+    #[test]
+    fn test_scanner_trait_default_is_not_cve_authoritative() {
+        use inline_proxy_scan_fixtures::*;
+        // TrivialDependencyScanner inherits the trait default.
+        assert!(!TrivialDependencyScanner.is_cve_authoritative());
+        // The mock CVE scanner overrides it, mirroring GrypeScanner.
+        assert!(CveAuthoritativeScanner {
+            outcome: CveOutcome::Clean,
+        }
+        .is_cve_authoritative());
+    }
+
+    /// `ScannerService::scan_content` (#2954): the fair-share-permitted wrapper
+    /// over `run_inline_proxy_scanners`. DB-backed only for the fixture state;
+    /// the scanners are in-memory mocks. Covers the verdict path and the
+    /// no-scanner inconclusive path through the public seam the PyPI handler
+    /// calls. Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_scan_content_verdict_and_inconclusive_through_service() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "pypi").await
+        else {
+            return;
+        };
+        let mut svc = scanner_for_fixture(&fx);
+        svc.scanners = vec![
+            Arc::new(TrivialDependencyScanner),
+            Arc::new(CveAuthoritativeScanner {
+                outcome: CveOutcome::Critical,
+            }),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = svc.scan_content(&artifact, &Bytes::new()).await;
+
+        // Same service with NO scanners: inconclusive error, never clean.
+        svc.scanners = vec![];
+        let inconclusive = svc.scan_content(&artifact, &Bytes::new()).await;
+
+        fx.teardown().await;
+
+        let verdict = verdict.expect("critical Grype-mock run must yield a verdict");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert!(
+            inconclusive.is_err(),
+            "scan_content with no scanner must surface the inconclusive error"
+        );
+    }
+
     /// Concrete regression for #994: the lodash fixture (generic tarball
     /// uploaded as `scan_type=image`) must trigger
     /// `ImageScanner::is_applicable=false`, so the orchestrator can skip

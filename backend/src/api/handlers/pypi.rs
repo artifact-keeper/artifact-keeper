@@ -8604,4 +8604,498 @@ mod tests {
             "a curation-disabled repo must not be blocked by a matching rule"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #2954 inline proxy scan-and-block: pure helpers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_known_vectors() {
+        // Empty input and the classic "abc" NIST vector: the verdict cache is
+        // keyed on this digest, so it must be the plain lowercase-hex SHA-256
+        // of the CONTENT (never an index-advertised digest).
+        assert_eq!(
+            sha256_hex(&Bytes::new()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(&Bytes::from_static(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_pypi_synthetic_artifact_shape() {
+        let repo_id = uuid::Uuid::new_v4();
+        let filename = "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl";
+        let digest = "deadbeef".repeat(8);
+        let art = pypi_synthetic_artifact(repo_id, filename, &digest, 1234);
+
+        // The synthetic artifact drives scanner applicability + workspace
+        // naming exactly as a hosted wheel would.
+        assert_eq!(art.repository_id, repo_id);
+        assert_eq!(art.name, filename);
+        assert_eq!(art.path, filename);
+        assert_eq!(art.version.as_deref(), Some("5.3.1"));
+        assert_eq!(art.size_bytes, 1234);
+        assert_eq!(art.checksum_sha256, digest);
+        assert_eq!(art.content_type, "application/zip");
+        // No artifacts row backs this: storage key stays empty by design.
+        assert!(art.storage_key.is_empty());
+        assert!(!art.is_deleted);
+        assert_eq!(art.quarantine_status, None);
+
+        // sdist naming resolves version + gzip content type too.
+        let sdist = pypi_synthetic_artifact(repo_id, "requests-2.31.0.tar.gz", &digest, 1);
+        assert_eq!(sdist.version.as_deref(), Some("2.31.0"));
+        assert_eq!(sdist.content_type, "application/gzip");
+    }
+
+    #[test]
+    fn test_scan_blocked_response_is_403_neutral_json() {
+        let resp = scan_blocked_response("evil-1.0.whl");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_blocked_response_body_names_file_not_cves() {
+        // The download route is anonymous-readable for public repos: the body
+        // must name the file, never the specific CVEs.
+        let resp = scan_blocked_response("evil-1.0.whl");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "scan_blocked");
+        assert_eq!(json["file"], "evil-1.0.whl");
+        assert!(!body.windows(4).any(|w| w == b"CVE-"), "no CVE detail leak");
+    }
+
+    #[tokio::test]
+    async fn test_scan_pending_locked_response_is_423() {
+        // The fail-closed inconclusive branch must be 423 Locked, never a 200
+        // of unscanned bytes.
+        let resp = scan_pending_locked_response("big-1.0.whl");
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(json["file"], "big-1.0.whl");
+    }
+
+    #[test]
+    fn test_build_scanned_file_response_clean_and_pending_headers() {
+        let bytes = Bytes::from_static(b"PK\x03\x04wheel-bytes");
+        let digest = sha256_hex(&bytes);
+
+        // Clean serve: explicit content type wins, digest header present.
+        let resp = build_scanned_file_response(
+            "pkg-1.0-py3-none-any.whl",
+            bytes.clone(),
+            Some("application/x-custom".to_string()),
+            Some(&digest),
+            false,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/x-custom"
+        );
+        assert_eq!(
+            resp.headers().get("X-AK-Scan").unwrap().to_str().unwrap(),
+            "clean"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-PyPI-File-SHA256")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            digest
+        );
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            bytes.len().to_string()
+        );
+
+        // Pending serve (fail-open before a verdict): loud header, and the
+        // content type falls back to the filename-derived default.
+        let resp = build_scanned_file_response("pkg-1.0.tar.gz", bytes, None, None, true);
+        assert_eq!(
+            resp.headers().get("X-AK-Scan").unwrap().to_str().unwrap(),
+            "pending"
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/gzip"
+        );
+        assert!(resp.headers().get("X-PyPI-File-SHA256").is_none());
+    }
+
+    #[test]
+    fn test_is_over_cap_error_classification() {
+        // The real over-cap shape emitted by the capped proxy fetch.
+        let over_cap = AppError::BadGateway(
+            "Upstream metadata response exceeded the 209715200-byte limit".to_string(),
+        );
+        assert!(is_over_cap_error(&over_cap));
+
+        // Any other BadGateway (upstream 5xx etc.) must be propagated as-is,
+        // not treated as the over-cap inconclusive branch.
+        let other_bad_gateway = AppError::BadGateway("upstream returned 500".to_string());
+        assert!(!is_over_cap_error(&other_bad_gateway));
+
+        // Non-BadGateway errors (a 404 stays a 404).
+        let not_found = AppError::NotFound("no such file".to_string());
+        assert!(!is_over_cap_error(&not_found));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2954 inline proxy scan-and-block: DB-backed serve paths.
+    //
+    // These drive `serve_file` end-to-end into `serve_scanned_pypi_file` with
+    // a wiremock upstream, a real proxy service, and a scan_configs row with
+    // scan_on_proxy enabled. The state carries NO scanner service, so a
+    // first-pull scan is inconclusive — exactly the branch whose fail-closed
+    // handling (423, never a 200 of unscanned bytes) is the point of the fix.
+    // Cached-verdict paths are seeded through ProxyScanService::record_verdict
+    // so the digest-keyed block/serve fast path is covered against a real DB.
+    //
+    // Skip cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+
+    async fn enable_proxy_scan(pool: &sqlx::PgPool, repo_id: uuid::Uuid, action: &str) {
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold, \
+                 proxy_scan_action) \
+             VALUES ($1, true, false, true, false, 'high', $2)",
+        )
+        .bind(repo_id)
+        .bind(action)
+        .execute(pool)
+        .await
+        .expect("enable scan-on-proxy");
+    }
+
+    /// Mount a PEP 503 index page (with no matching href, so the fetch target
+    /// falls back to the conventional simple/ path) plus the wheel bytes.
+    async fn mount_scan_upstream(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        filename: &str,
+        wheel: &'static [u8],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body></body></html>")
+                    .insert_header("Content-Type", "text/html"),
+            )
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel)
+                    .insert_header("Content-Type", "application/zip"),
+            )
+            .mount(upstream)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_fail_closed_inconclusive_is_423() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "sealed";
+        let filename = "sealed-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 sealed-wheel-2954-fail-closed";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // No scanner service on the state: the inline scan is inconclusive.
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "fail-closed + inconclusive scan must never serve bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "fail-closed inconclusive must be 423 Locked"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_fail_open_serves_pending() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "openpkg";
+        let filename = "openpkg-2.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 open-wheel-2954-fail-open";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        // Default action (fail_open): first pull serves LOUDLY with pending.
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open first pull must serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let digest_header = resp
+            .headers()
+            .get("X-PyPI-File-SHA256")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("pending"),
+            "a served-before-verdict byte must be observable (X-AK-Scan: pending)"
+        );
+        assert_eq!(
+            digest_header.as_deref(),
+            Some(sha256_hex(&Bytes::from_static(b"PK\x03\x04 open-wheel-2954-fail-open")).as_str())
+        );
+        assert_eq!(&body[..], wheel, "served bytes must equal upstream bytes");
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_blocks_cached_vulnerable_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "poisoned";
+        let filename = "poisoned-0.1.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 poisoned-wheel-2954-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"PK\x03\x04 poisoned-wheel-2954-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Seed a fresh vulnerable verdict for this digest through the real
+        // service so record_verdict + lookup_verdict are covered end-to-end.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        // proxy_scan_results outlives repo cleanup (repository_id is SET
+        // NULL on delete): remove the digest row explicitly.
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a fresh cached vulnerable verdict must block the pull, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "cached vulnerable digest must be a 403 scan_blocked (not 423: \
+                 the verdict is conclusive)"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_serves_cached_clean_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "verified";
+        let filename = "verified-3.2.1-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 verified-wheel-2954-clean";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 verified-wheel-2954-clean"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        // Fail-closed: without the fresh clean verdict this pull would 423
+        // (no scanner service on the state), so a 200 here proves the cached
+        // verdict fast path served it.
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fresh clean verdict must serve under fail-closed, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "a verdict-backed serve must be marked clean, not pending"
+        );
+        assert_eq!(&body[..], wheel);
+    }
 }

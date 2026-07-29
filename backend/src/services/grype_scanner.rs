@@ -1694,6 +1694,19 @@ mod tests {
         GrypeScanner::new("/tmp/grype-applicability-test".to_string())
     }
 
+    /// #2954: Grype is THE CVE-authoritative engine for the inline proxy scan.
+    /// If this override were lost, `run_inline_proxy_scanners` would see no
+    /// authoritative scanner as applicable and a Grype hard-error could
+    /// aggregate to `clean` off a supplementary scanner's trivial success —
+    /// serving an unscanned, possibly-vulnerable wheel under fail-closed.
+    #[test]
+    fn test_grype_is_cve_authoritative() {
+        assert!(
+            grype().is_cve_authoritative(),
+            "GrypeScanner must override Scanner::is_cve_authoritative to true"
+        );
+    }
+
     /// Serializes env-var mutation across the parallel tests in this module
     /// so the registry-host probe's `AK_GRYPE_REGISTRY_HOST` /
     /// `PEER_PUBLIC_ENDPOINT` reads stay deterministic. Same pattern as
