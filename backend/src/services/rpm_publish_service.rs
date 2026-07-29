@@ -70,6 +70,10 @@ struct MemberPackage {
     primary_metadata: Option<serde_json::Value>,
     package_name: String,
     version: String,
+    /// The identity FROZEN into the snapshot at create time. The signed
+    /// `primary.xml` must attest exactly these, or the publish fails closed.
+    frozen_checksum_sha256: String,
+    frozen_filename: String,
 }
 
 /// Snapshot the *approved* curation set of `repo_id` into a new monotonic
@@ -90,8 +94,8 @@ pub async fn create_version(
         .execute(&mut *tx)
         .await?;
 
-    let approved: Vec<(Uuid, Option<serde_json::Value>, String, String)> = sqlx::query_as(
-        r#"SELECT id, primary_metadata, package_name, version
+    let approved: Vec<(Uuid, Option<serde_json::Value>, String, String, String)> = sqlx::query_as(
+        r#"SELECT id, primary_metadata, package_name, version, upstream_path
            FROM curation_packages
            WHERE staging_repo_id = $1 AND status = 'approved'
            ORDER BY package_name ASC, version ASC"#,
@@ -111,8 +115,8 @@ pub async fn create_version(
     // sync). List them so the operator knows exactly what to re-sync.
     let needs_resync: Vec<String> = approved
         .iter()
-        .filter(|(_, meta, _, _)| meta.as_ref().map(|v| v.is_null()).unwrap_or(true))
-        .map(|(_, _, name, version)| format!("{name}-{version}"))
+        .filter(|(_, meta, _, _, _)| meta.as_ref().map(|v| v.is_null()).unwrap_or(true))
+        .map(|(_, _, name, version, _)| format!("{name}-{version}"))
         .collect();
     if !needs_resync.is_empty() {
         return Err(AppError::Validation(format!(
@@ -121,6 +125,41 @@ pub async fn create_version(
             needs_resync.len(),
             needs_resync.join(", ")
         )));
+    }
+
+    // FREEZE the package identity now, derived from the SAME structured metadata
+    // the signed `primary.xml` is generated from. `curation_packages` is a live
+    // table (a re-sync upserts the same row), so anything the `@N` serve path
+    // reads back from it could be changed after publish — which would let an
+    // immutable, signed snapshot serve bytes contradicting its own signed
+    // metadata. The checksum frozen here is exactly the one the signed
+    // `primary.xml` attests, and the filename is exactly its `<location href>`.
+    let mut frozen: Vec<(Uuid, String, String, String)> = Vec::with_capacity(approved.len());
+    for (id, meta_json, name, version, upstream_path) in &approved {
+        let raw = meta_json.as_ref().filter(|v| !v.is_null()).ok_or_else(|| {
+            AppError::Validation(format!(
+                "Cannot create a version: package {name}-{version} is missing its structured \
+                 upstream metadata; re-sync it first"
+            ))
+        })?;
+        let meta: RpmPackageMetadata = serde_json::from_value(raw.clone()).map_err(|_| {
+            AppError::Validation(format!(
+                "Cannot create a version: package {name}-{version} has unreadable structured \
+                 metadata; re-sync it first"
+            ))
+        })?;
+        if meta.checksum.value.trim().is_empty() {
+            return Err(AppError::Validation(format!(
+                "Cannot create a version: package {name}-{version} has no checksum in its \
+                 structured metadata; re-sync it first"
+            )));
+        }
+        frozen.push((
+            *id,
+            meta.checksum.value.trim().to_string(),
+            upstream_path.clone(),
+            member_filename(&meta),
+        ));
     }
 
     let package_count = approved.len() as i64;
@@ -141,13 +180,18 @@ pub async fn create_version(
     .fetch_one(&mut *tx)
     .await?;
 
-    for (curation_package_id, _, _, _) in &approved {
+    for (curation_package_id, checksum, upstream_path, filename) in &frozen {
         sqlx::query(
-            r#"INSERT INTO repository_version_packages (version_id, curation_package_id)
-               VALUES ($1, $2)"#,
+            r#"INSERT INTO repository_version_packages
+                   (version_id, curation_package_id, frozen_checksum_sha256,
+                    frozen_upstream_path, frozen_filename)
+               VALUES ($1, $2, $3, $4, $5)"#,
         )
         .bind(version_id)
         .bind(curation_package_id)
+        .bind(checksum)
+        .bind(upstream_path)
+        .bind(filename)
         .execute(&mut *tx)
         .await?;
     }
@@ -192,7 +236,8 @@ pub async fn publish(
     }
 
     let members: Vec<MemberPackage> = sqlx::query_as(
-        r#"SELECT cp.primary_metadata, cp.package_name, cp.version
+        r#"SELECT cp.primary_metadata, cp.package_name, cp.version,
+                  rvp.frozen_checksum_sha256, rvp.frozen_filename
            FROM repository_version_packages rvp
            JOIN curation_packages cp ON cp.id = rvp.curation_package_id
            WHERE rvp.version_id = $1
@@ -240,6 +285,22 @@ pub async fn publish(
                 m.package_name, m.version
             ))
         })?;
+        // The signed document MUST attest exactly the identity frozen into the
+        // snapshot. `curation_packages` is live, so a re-sync between the
+        // snapshot and this publish could otherwise sign a checksum/filename the
+        // frozen membership does not carry — and the `@N` serve path (which
+        // trusts the FROZEN columns) would then reject every download. Fail
+        // closed and tell the operator to cut a fresh version instead.
+        if meta.checksum.value.trim() != m.frozen_checksum_sha256.trim()
+            || member_filename(&meta) != m.frozen_filename
+        {
+            return Err(AppError::Conflict(format!(
+                "Cannot publish: package {}-{} changed since the version was created \
+                 (its upstream metadata was re-synced). Create a new version to publish \
+                 the updated package.",
+                m.package_name, m.version
+            )));
+        }
         metas.push(meta);
     }
 
@@ -374,8 +435,16 @@ struct Repodata {
 /// (`https://evil/…`) or a traversal (`..`) into the signed document — those are
 /// impossible by construction.
 fn member_location(meta: &RpmPackageMetadata) -> String {
+    format!("packages/{}", member_filename(meta))
+}
+
+/// The canonical AK NEVRA filename for a member — the exact basename the signed
+/// `<location href>` carries, and the name the `@N` serve path resolves. Frozen
+/// into `repository_version_packages.frozen_filename` at snapshot time so the
+/// served name and the signed name are the same string by construction.
+fn member_filename(meta: &RpmPackageMetadata) -> String {
     format!(
-        "packages/{}-{}-{}.{}.rpm",
+        "{}-{}-{}.{}.rpm",
         meta.name, meta.version, meta.release, meta.arch
     )
 }
@@ -872,6 +941,162 @@ mod tests {
             ),
             other => panic!("expected Validation, got {other:?}"),
         }
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // A snapshot FREEZES the package identity (checksum + upstream path +
+    // published filename) into repository_version_packages. A later re-sync that
+    // rewrites the LIVE curation_packages row must not change what the frozen
+    // membership carries — that is what stops a published @N from serving bytes
+    // its own signed primary.xml does not attest.
+    #[tokio::test]
+    async fn test_create_version_freezes_package_identity_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
+
+        let v = create_version(&pool, staging, actor).await.expect("v1");
+
+        let (ck, up, fname): (String, String, String) = sqlx::query_as(
+            "SELECT frozen_checksum_sha256, frozen_upstream_path, frozen_filename \
+             FROM repository_version_packages WHERE version_id = $1",
+        )
+        .bind(v.id)
+        .fetch_one(&pool)
+        .await
+        .expect("frozen membership row");
+        // Frozen from the STRUCTURED metadata the signed primary.xml is built
+        // from, and the filename is exactly its <location href> basename.
+        assert_eq!(ck, "abc123");
+        assert_eq!(fname, "bash-1.0-1.el9.x86_64.rpm");
+        assert_eq!(up, "Packages/bash.rpm");
+
+        // Simulate the routine re-sync upserting the SAME live row with new
+        // bytes/identity (curation_service uses ON CONFLICT DO UPDATE).
+        sqlx::query(
+            "UPDATE curation_packages SET checksum_sha256 = $2, upstream_path = $3 \
+             WHERE staging_repo_id = $1",
+        )
+        .bind(staging)
+        .bind("e".repeat(64))
+        .bind("Packages/evil.rpm")
+        .execute(&pool)
+        .await
+        .expect("simulate re-sync");
+
+        let (ck2, up2, fname2): (String, String, String) = sqlx::query_as(
+            "SELECT frozen_checksum_sha256, frozen_upstream_path, frozen_filename \
+             FROM repository_version_packages WHERE version_id = $1",
+        )
+        .bind(v.id)
+        .fetch_one(&pool)
+        .await
+        .expect("frozen membership row");
+        assert_eq!(ck2, ck, "frozen checksum must survive a live re-sync");
+        assert_eq!(up2, up, "frozen upstream path must survive a live re-sync");
+        assert_eq!(fname2, fname, "frozen filename must survive a live re-sync");
+
+        tdh::cleanup(&pool, staging, actor).await;
+        tdh::cleanup(&pool, remote, actor).await;
+    }
+
+    // Publishing must fail closed if the live curation row drifted between the
+    // snapshot and the publish: the signed document has to attest exactly the
+    // identity the frozen membership (and hence the serve path) carries.
+    #[tokio::test]
+    async fn test_publish_rejects_drift_since_version_created_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::signing_service::{CreateKeyRequest, SigningService};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, _sk, dir) = tdh::create_repo(&pool, "staging", "rpm").await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "rpm").await;
+        let (actor, _n) = tdh::create_user(&pool).await;
+        seed_approved_pkg(
+            &pool,
+            staging,
+            remote,
+            "bash",
+            Some(sample_meta_json("bash")),
+        )
+        .await;
+
+        let signing = SigningService::new(pool.clone(), "test-encryption-key-2358");
+        let key = signing
+            .create_key(CreateKeyRequest {
+                repository_id: Some(staging),
+                name: "drift-key".to_string(),
+                key_type: "gpg".to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: None,
+                uid_email: None,
+                created_by: Some(actor),
+            })
+            .await
+            .expect("create signing key");
+        signing
+            .update_signing_config(staging, Some(key.id), true, false, false)
+            .await
+            .expect("set signing config");
+
+        let created = create_version(&pool, staging, actor)
+            .await
+            .expect("version");
+
+        // A re-sync rewrites the structured metadata (new checksum) AFTER the
+        // snapshot but BEFORE the publish.
+        let mut drifted = meta("bash", &"d".repeat(64));
+        drifted.version = "1.0".to_string();
+        sqlx::query(
+            "UPDATE curation_packages SET primary_metadata = $2 WHERE staging_repo_id = $1",
+        )
+        .bind(staging)
+        .bind(serde_json::to_value(&drifted).unwrap())
+        .execute(&pool)
+        .await
+        .expect("simulate re-sync");
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let backend: String =
+            sqlx::query_scalar("SELECT storage_backend FROM repositories WHERE id = $1")
+                .bind(staging)
+                .fetch_one(&pool)
+                .await
+                .expect("repo storage backend");
+        let storage = state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend,
+                path: dir.to_string_lossy().to_string(),
+            })
+            .expect("storage backend");
+
+        let res = publish(
+            &pool,
+            storage.as_ref(),
+            &signing,
+            staging,
+            created.version_number,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(AppError::Conflict(_))),
+            "a package that drifted since the snapshot must fail the publish closed: {res:?}"
+        );
+
         tdh::cleanup(&pool, staging, actor).await;
         tdh::cleanup(&pool, remote, actor).await;
     }

@@ -7,6 +7,7 @@
 --
 -- Reversible: the objects below drop cleanly in reverse order —
 --   ALTER TABLE repositories DROP COLUMN IF EXISTS active_publication_id;
+--   DROP INDEX IF EXISTS idx_repository_version_packages_filename;
 --   DROP TABLE IF EXISTS repository_version_packages;
 --   DROP TABLE IF EXISTS repository_versions;
 --   ALTER TABLE curation_packages DROP COLUMN IF EXISTS primary_metadata;
@@ -47,11 +48,32 @@ CREATE INDEX IF NOT EXISTS idx_repository_versions_repo
 
 -- 3. The membership of each snapshot: which curation packages were frozen into
 --    a version. CASCADE on the version so deleting a version drops its rows.
+--
+--    The package IDENTITY is frozen here, not read back from `curation_packages`
+--    at serve time. `curation_packages` is a LIVE table: a routine re-sync
+--    upserts the same row (ON CONFLICT DO UPDATE), so a post-publish sync — or a
+--    compromised upstream — would otherwise change the checksum/location that an
+--    already-published, signed `@N` serves, letting `@N` hand out bytes that
+--    contradict its own signed `primary.xml`. These columns are snapshotted from
+--    the `curation_packages` row AS IT EXISTS AT SNAPSHOT TIME, from the same
+--    state the signed metadata is generated from, so the frozen checksum always
+--    equals what the signed `primary.xml` attests.
 CREATE TABLE IF NOT EXISTS repository_version_packages (
     version_id          UUID NOT NULL REFERENCES repository_versions(id) ON DELETE CASCADE,
     curation_package_id UUID NOT NULL REFERENCES curation_packages(id) ON DELETE CASCADE,
+    -- The FROZEN package identity (never re-read from curation_packages).
+    frozen_checksum_sha256 TEXT NOT NULL,
+    frozen_upstream_path   TEXT NOT NULL,
+    -- The canonical AK NEVRA filename this member is served as under `@N`
+    -- (matches the `<location href>` the signed primary.xml emits), so the
+    -- serve path resolves a member by the exact name it published.
+    frozen_filename        TEXT NOT NULL,
     PRIMARY KEY (version_id, curation_package_id)
 );
+
+-- Serve-path lookup: resolve a member of version N by its published filename.
+CREATE INDEX IF NOT EXISTS idx_repository_version_packages_filename
+    ON repository_version_packages (version_id, frozen_filename);
 
 -- 4. The repository's currently-active publication (the version whose metadata
 --    the no-`@N` repodata routes serve). NULL keeps today's live-generation

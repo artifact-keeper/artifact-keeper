@@ -403,8 +403,9 @@ fn is_safe_upstream_rel_path(p: &str) -> bool {
 
 /// Stream an already-verified, frozen `@N` package from the immutable store
 /// (cache hit). Chunked (no `Content-Length`) so the whole `.rpm` is never
-/// buffered in memory when re-serving.
-fn stream_rpm_response(body: Body, filename: &str) -> Response {
+/// buffered in memory when re-serving. Advertises the FROZEN checksum, so what a
+/// client validates against is what `@N`'s signed metadata attests.
+fn stream_rpm_response(body: Body, filename: &str, checksum_sha256: &str) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/x-rpm")
@@ -412,6 +413,7 @@ fn stream_rpm_response(body: Body, filename: &str) -> Response {
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
+        .header("X-Checksum-SHA256", checksum_sha256.trim())
         .body(body)
         .unwrap()
 }
@@ -419,16 +421,27 @@ fn stream_rpm_response(body: Body, filename: &str) -> Response {
 /// Checksum-verified serving of a package under a published, immutable `@N`
 /// (#2358 A-hardened).
 ///
+/// Everything this path trusts comes from the **frozen** snapshot membership
+/// (`repository_version_packages.frozen_*`), never from the live
+/// `curation_packages` row. That distinction is the whole security property:
+/// `curation_packages` is mutable (a routine re-sync upserts the same row), so
+/// resolving the checksum/location live would let a post-publish sync — or a
+/// compromised upstream — change what an already-published, SIGNED `@N` serves,
+/// handing out bytes that contradict `@N`'s own signed `primary.xml`. The frozen
+/// checksum is snapshotted from the same state the signed metadata is generated
+/// from, so verified bytes always match what `@N` attests.
+///
 /// The package BYTES are resolved and served fail-closed:
-///   1. Cache hit — a previously verified+stored copy in the version's frozen
-///      store streams straight back (immutable `@N`; never re-fetched).
-///   2. Otherwise resolve the member within version N, fetch its bytes from the
-///      CURATION-CONFIG upstream (the curation source repo's `upstream_url` plus
-///      the stored `upstream_path`) — NEVER from `repo.upstream_url` and NEVER
-///      from any metadata blob — VERIFY `sha256 == checksum_sha256`, and only on
-///      a match cache the bytes into the frozen store and stream them. A missing
-///      member, missing upstream/checksum, or a checksum MISMATCH fails closed
-///      (404 / 502): a tampered upstream body is never served.
+///   1. Cache hit — a previously verified+stored copy in the version's immutable
+///      per-version store streams straight back (never re-fetched), advertising
+///      the FROZEN checksum.
+///   2. Otherwise fetch from the CURATION-CONFIG upstream (the curation source
+///      repo's `upstream_url` plus the FROZEN `upstream_path`) — NEVER from
+///      `repo.upstream_url` and NEVER from any metadata blob — VERIFY
+///      `sha256 == frozen_checksum_sha256`, and only on a match cache the bytes
+///      into the frozen store and stream them. A missing member, missing
+///      upstream, or a checksum MISMATCH fails closed (404 / 502): neither a
+///      tampered upstream body nor a post-publish live mutation is ever served.
 async fn serve_version_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -441,26 +454,19 @@ async fn serve_version_package(
         .map_err(|e| e.into_response())?;
     let cache_key = format!("{version_prefix}/packages/{filename}");
 
-    // 1. Cache-first: stream the frozen, already-verified copy.
-    if let Ok(stream) = storage.get_stream(&cache_key).await {
-        return Ok(stream_rpm_response(Body::from_stream(stream), filename));
-    }
-
-    // 2. Resolve the member within this PUBLISHED version plus its
-    //    curation-config upstream (source repo `upstream_url`), stored
-    //    `upstream_path`, and the frozen expected checksum. The member filename
-    //    is the canonical AK NEVRA filename the publish emitted as `<location>`.
-    let member = sqlx::query_as::<_, (Option<String>, String, Option<String>, uuid::Uuid, String)>(
-        "SELECT cp.checksum_sha256, cp.upstream_path, r.upstream_url, r.id, r.key \
+    // 1. Resolve the member from the FROZEN snapshot membership. The upstream
+    //    URL still comes from the curation source repo (that is config, not
+    //    package identity); the checksum and the relative path are frozen.
+    let member = sqlx::query_as::<_, (String, String, Option<String>, uuid::Uuid, String)>(
+        "SELECT rvp.frozen_checksum_sha256, rvp.frozen_upstream_path, \
+                r.upstream_url, r.id, r.key \
          FROM repository_version_packages rvp \
          JOIN repository_versions rv ON rv.id = rvp.version_id \
          JOIN curation_packages cp ON cp.id = rvp.curation_package_id \
          JOIN repositories r ON r.id = cp.remote_repo_id \
          WHERE rv.repository_id = $1 AND rv.version_number = $2 \
            AND rv.published_at IS NOT NULL \
-           AND (cp.package_name || '-' || cp.version || '-' \
-                || COALESCE(NULLIF(cp.release, ''), '1') || '.' \
-                || COALESCE(NULLIF(cp.architecture, ''), 'noarch') || '.rpm') = $3",
+           AND rvp.frozen_filename = $3",
     )
     .bind(repo.id)
     .bind(version_number)
@@ -470,12 +476,20 @@ async fn serve_version_package(
     .map_err(super::db_err)?;
 
     let (expected, upstream_path, upstream_url, remote_id, remote_key) = match member {
-        Some((Some(ck), up, Some(url), rid, rkey)) if !ck.trim().is_empty() => {
-            (ck, up, url, rid, rkey)
-        }
-        // No such member, or nothing to verify/fetch against -> fail closed.
+        Some((ck, up, Some(url), rid, rkey)) if !ck.trim().is_empty() => (ck, up, url, rid, rkey),
+        // No such member, or nothing to fetch against -> fail closed.
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
+
+    // 2. Cache-first: stream the already-verified copy from the immutable
+    //    per-version store, advertising the FROZEN checksum.
+    if let Ok(stream) = storage.get_stream(&cache_key).await {
+        return Ok(stream_rpm_response(
+            Body::from_stream(stream),
+            filename,
+            expected.trim(),
+        ));
+    }
 
     // The stored href is attacker-influenced: refuse to fetch anything that is
     // not a plain relative path under the curation upstream.
@@ -505,10 +519,13 @@ async fn serve_version_package(
     )
     .await?;
 
-    // VERIFY sha256 == the frozen checksum. FAIL CLOSED on mismatch.
+    // VERIFY sha256 == the FROZEN checksum. FAIL CLOSED on mismatch. This is what
+    // catches an upstream mirror that changed the bytes behind an already-
+    // published NEVRA, and a post-publish re-sync that rewrote the live curation
+    // row: neither can make `@N` serve bytes its signed metadata does not attest.
     if !sha256_hex(&bytes).eq_ignore_ascii_case(expected.trim()) {
         tracing::warn!(
-            "@{} package {} failed checksum verification against the frozen curation set; \
+            "@{} package {} failed verification against the FROZEN snapshot checksum; \
              refusing to serve",
             version_number,
             filename
