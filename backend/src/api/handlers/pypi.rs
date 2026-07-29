@@ -905,6 +905,13 @@ async fn simple_project(
 
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
+            // #2967 R4: true when the surfaced remote_response came from a
+            // SUPPRESSED member and has already been reduced to its
+            // ownership-filtered form by `case_a_filter_remote_body`. Such a body
+            // must never be re-run through `rewrite_upstream_urls` (which applies
+            // no ownership filter); the render path below splices locals straight
+            // into the filtered document instead.
+            let mut remote_case_a = false;
 
             // First pass: collect distributions from every local (hosted /
             // staging) member. We must know whether a local member owns the
@@ -1098,9 +1105,9 @@ async fn simple_project(
                         // entries (remote-only versions, same-platform rebuilds)
                         // are dropped here, mirroring the download gate below.
                         let content = if case_a_only {
+                            remote_case_a = true;
                             case_a_filter_remote_body(
                                 &content,
-                                &ct,
                                 &owned_profile,
                                 &repo_key,
                                 &normalized,
@@ -1147,6 +1154,69 @@ async fn simple_project(
                 }
                 (_, Some((content, content_type))) => {
                     let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+                    // #2967 R4: a SUPPRESSED member's body has already been reduced
+                    // to its ownership-filtered form — a rebuilt AK-pathed PEP 503
+                    // index or a fail-closed PEP 691 listing — by
+                    // `case_a_filter_remote_body`. It must NEVER reach the in-place
+                    // `rewrite_upstream_urls` rewriter (no ownership filter; its
+                    // `[^>]*?` can't cross a `>`, so an anchor whose `href` follows a
+                    // `>` inside an attribute would be left off-site → dependency
+                    // confusion). Classify by the FILTERED body's own bytes (never the
+                    // upstream's possibly-mislabeled Content-Type) and splice locals
+                    // straight in.
+                    if remote_case_a {
+                        return match sniff_simple_index(&content) {
+                            SniffedSimpleIndex::Json => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    &content,
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                            SniffedSimpleIndex::Html => {
+                                // The rebuild is already AK-pathed; splice locals
+                                // WITHOUT rewrite_upstream_urls.
+                                let merged = merge_local_into_remote_simple_html(
+                                    &String::from_utf8_lossy(&content),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                );
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    "text/html; charset=utf-8",
+                                    &headers,
+                                ))
+                            }
+                            // Fail closed: filter emitted nothing usable → empty
+                            // listing, never raw upstream bytes.
+                            SniffedSimpleIndex::Binary => {
+                                let merged = merge_local_into_remote_simple_json(
+                                    empty_pep691_listing(&normalized).as_bytes(),
+                                    &repo_key,
+                                    &normalized,
+                                    &local_artifacts,
+                                    &tracks,
+                                )
+                                .unwrap_or_else(|| empty_pep691_listing(&normalized));
+                                Ok(cacheable_response(
+                                    merged.into_bytes(),
+                                    PEP691_JSON_CONTENT_TYPE,
+                                    &headers,
+                                ))
+                            }
+                        };
+                    }
 
                     // JSON client + JSON upstream: rewrite the upstream download
                     // URLs and splice in local entries, preserving PEP 700
@@ -3445,45 +3515,61 @@ fn wheel_compat_tag(filename: &str) -> Option<String> {
 
 /// Narrow a suppressed Remote member's contribution to Case-A distributions
 /// (#2937): return a body containing only the entries `owned.admits` accepts.
-/// Handles the PEP 691 JSON, PEP 503 HTML, and Content-Type-mislabeled
-/// (sniffed) forms, mirroring the render dispatch. A body that parses as
-/// neither is replaced with an empty listing (fail closed — never surface an
-/// unfilterable remote body for a locally-owned name).
+///
+/// SECURITY (#2967 R4). The routing decision is made on the SNIFFED body, never
+/// the upstream `Content-Type`. A hostile / quirky upstream can label an HTML
+/// body `application/json` (or vice-versa); trusting the header let a mislabeled
+/// HTML index skip the ownership filter and fall through to the in-place
+/// `rewrite_upstream_urls` rewriter, delivering a raw off-site href to `pip`
+/// (dependency confusion for a locally-owned name). Sniffing the actual bytes
+/// picks the correct filter regardless of the header. Any body that is neither
+/// recognizable PEP 691 JSON nor PEP 503 HTML fails closed to an EMPTY PEP 691
+/// listing — never the raw upstream bytes.
 fn case_a_filter_remote_body(
     content: &[u8],
-    ct: &str,
     owned: &OwnedWheelProfile,
     repo_key: &str,
     normalized: &str,
 ) -> Bytes {
     let body = String::from_utf8_lossy(content);
-    let filtered = if ct.contains("json") {
-        filter_remote_case_a_json(&body, owned)
-    } else if ct.contains("text/html") {
-        filter_remote_case_a_html(&body, owned, repo_key, normalized)
-    } else {
-        match sniff_simple_index(content) {
-            SniffedSimpleIndex::Json => filter_remote_case_a_json(&body, owned),
-            SniffedSimpleIndex::Html => {
-                filter_remote_case_a_html(&body, owned, repo_key, normalized)
-            }
-            SniffedSimpleIndex::Binary => String::new(),
-        }
+    let filtered = match sniff_simple_index(content) {
+        SniffedSimpleIndex::Json => filter_remote_case_a_json(&body, owned, normalized),
+        SniffedSimpleIndex::Html => filter_remote_case_a_html(&body, owned, repo_key, normalized),
+        SniffedSimpleIndex::Binary => empty_pep691_listing(normalized),
     };
     Bytes::from(filtered)
 }
 
+/// An empty PEP 691 simple-index listing for `normalized` — the fail-closed body
+/// for a locally-owned name whose suppressed Remote member returned a body that
+/// could not be ownership-filtered (#2967 R4). Mirrors the PEP 691 shape the
+/// merge path expects (`meta`/`name`/`versions`/`files`) so the local splice
+/// still runs, and guarantees no raw upstream byte is ever surfaced.
+fn empty_pep691_listing(normalized: &str) -> String {
+    serde_json::json!({
+        "meta": {"api-version": "1.0"},
+        "name": normalized,
+        "versions": [],
+        "files": [],
+    })
+    .to_string()
+}
+
 /// Drop every file from a Remote member's PEP 691 JSON simple index that is not
 /// a Case-A union candidate, and re-advertise `versions` from the survivors so
-/// the listing never names a version no surviving file backs (#2937). Returns
-/// the input unchanged when it is not valid PEP 691 JSON (the caller's
-/// sniff/merge path then handles it).
-fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile) -> String {
+/// the listing never names a version no surviving file backs (#2937).
+///
+/// SECURITY (#2967 R4): FAILS CLOSED. A body that is not valid PEP 691 JSON (or
+/// carries no `files` array) yields an EMPTY listing — NEVER the verbatim input.
+/// Returning the raw body here was the bypass: an HTML index mislabeled
+/// `application/json` was echoed back unfiltered and then rewritten in place,
+/// leaking an off-site href for a locally-owned name.
+fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile, normalized: &str) -> String {
     let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(json) else {
-        return json.to_string();
+        return empty_pep691_listing(normalized);
     };
     let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
-        return json.to_string();
+        return empty_pep691_listing(normalized);
     };
     files.retain(|f| {
         f.get("filename")
@@ -3515,7 +3601,7 @@ fn filter_remote_case_a_json(json: &str, owned: &OwnedWheelProfile) -> String {
             ),
         );
     }
-    serde_json::to_string(&doc).unwrap_or_else(|_| json.to_string())
+    serde_json::to_string(&doc).unwrap_or_else(|_| empty_pep691_listing(normalized))
 }
 
 /// HTML sibling of [`filter_remote_case_a_json`] (#2937): reduce a suppressed
@@ -4650,7 +4736,7 @@ mod tests {
                  "hashes": {"sha256": "o"}}
             ]
         }"#;
-        let out = filter_remote_case_a_json(remote, &owned);
+        let out = filter_remote_case_a_json(remote, &owned, "pydantic-core");
         let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
         let files = doc["files"].as_array().unwrap();
         assert_eq!(files.len(), 1, "only the Case-A windows wheel survives");
@@ -4814,25 +4900,63 @@ mod tests {
         let owned = linux_owner_profile();
         let json = r#"{"meta":{"api-version":"1.1"},"name":"p","versions":["2.0"],
             "files":[{"filename":"pydantic_core-2.0-cp39-cp39-win_amd64.whl","url":"u","hashes":{"sha256":"w"}}]}"#;
-        // Mislabeled Content-Type: still sniffed to JSON and filtered.
-        let out = case_a_filter_remote_body(
-            json.as_bytes(),
-            "application/octet-stream",
-            &owned,
-            "virt",
-            "p",
-        );
+        // Genuine PEP 691 JSON is sniffed to JSON and filtered.
+        let out = case_a_filter_remote_body(json.as_bytes(), &owned, "virt", "p");
         let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(doc["files"].as_array().unwrap().len(), 1);
-        // Unparseable body -> empty listing (fail closed, never leak raw remote).
+        // Unparseable body -> empty PEP 691 listing (fail closed, never leak raw
+        // remote bytes).
+        let out = case_a_filter_remote_body(b"\x00\x01binary", &owned, "virt", "p");
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc["files"].as_array().unwrap().is_empty());
+        assert_eq!(doc["name"], "p");
+    }
+
+    // #2967 R4 (CRITICAL bypass): an HTML index MISLABELED
+    // `Content-Type: application/json`. The old code trusted `ct.contains("json")`
+    // and echoed the HTML body verbatim (`return json.to_string()`), which the
+    // render fallthrough then sniffed as HTML and served through the in-place
+    // `rewrite_upstream_urls` rewriter with NO ownership filter — leaking an
+    // off-site href for a locally-owned name. The dispatch now SNIFFS the body,
+    // routes the HTML through the ownership rebuild, and emits ONLY AK paths.
+    #[test]
+    fn test_case_a_filter_remote_body_mislabeled_json_html_body_is_ownership_filtered() {
+        let owned = linux_owner_profile(); // owns pydantic_core 2.0 linux
+        let html_labeled_json = concat!(
+            "<!DOCTYPE html><html><body>\n",
+            // Genuine Case-A: owned version 2.0, distinct win platform, href back to
+            // the mirror. Must UNION as an AK path.
+            "<a href=\"http://mirror/files/pydantic_core-2.0-cp39-cp39-win_amd64.whl#sha256=aa\">pydantic_core-2.0-cp39-cp39-win_amd64.whl</a><br/>\n",
+            // Off-site, remote-only Case-B (9.9) with a `>` INSIDE a prior `title`
+            // attribute — the exact anchor the in-place rewriter leaked verbatim
+            // (its `[^>]*?` stops before `href`). Must be dropped entirely.
+            "<a title=\"x>y\" href=\"https://evil.example/pydantic_core-9.9-cp39-cp39-win_amd64.whl#sha256=cc\">pydantic_core-9.9-cp39-cp39-win_amd64.whl</a><br/>\n",
+            "</body></html>\n"
+        );
         let out = case_a_filter_remote_body(
-            b"\x00\x01binary",
-            "application/octet-stream",
+            html_labeled_json.as_bytes(),
             &owned,
             "virt",
-            "p",
+            "pydantic-core",
         );
-        assert!(out.is_empty());
+        let out = String::from_utf8_lossy(&out);
+        // No off-site host survives, in any form.
+        assert!(!out.contains("evil.example"), "off-site href leaked: {out}");
+        assert!(!out.contains("mirror"), "off-site href leaked: {out}");
+        assert!(!out.contains("http://"), "absolute URL survived: {out}");
+        assert!(!out.contains("https://"), "absolute URL survived: {out}");
+        // Case-B remote-only version must not surface.
+        assert!(
+            !out.contains("9.9"),
+            "remote-only Case-B version leaked: {out}"
+        );
+        // The genuine Case-A wheel IS re-emitted as an AK path.
+        assert!(
+            out.contains(
+                "/pypi/virt/simple/pydantic-core/pydantic_core-2.0-cp39-cp39-win_amd64.whl"
+            ),
+            "Case-A wheel not re-emitted as AK path: {out}"
+        );
     }
 
     // MEDIUM regression (#2967 red-team): admits() must reject a universal
