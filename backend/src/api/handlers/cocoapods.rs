@@ -525,7 +525,7 @@ async fn push_pod(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "cocoapods", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;

@@ -373,7 +373,7 @@ async fn upload_cookbook(
     Path(repo_key): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "chef", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "chef", "write:artifacts")?.user_id;
     let repo = resolve_chef_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;

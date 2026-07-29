@@ -265,7 +265,7 @@ async fn publish_extension(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "vscode", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "vscode", "write:artifacts")?.user_id;
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;

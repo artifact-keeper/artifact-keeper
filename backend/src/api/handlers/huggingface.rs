@@ -1010,7 +1010,7 @@ async fn upload_file_impl(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "huggingface", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?.user_id;
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;

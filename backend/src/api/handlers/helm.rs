@@ -621,7 +621,7 @@ async fn upload_chart(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "helm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "helm", "write:artifacts")?.user_id;
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -905,7 +905,7 @@ async fn delete_chart(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "helm", "delete")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "helm", "delete:artifacts")?.user_id;
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Find the chart's artifacts. #2635: a signed chart owns TWO rows -- the

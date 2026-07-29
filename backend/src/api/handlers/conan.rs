@@ -1722,7 +1722,7 @@ async fn recipe_file_upload(
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
@@ -2522,7 +2522,7 @@ async fn package_file_upload(
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth_ext, "conan", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 

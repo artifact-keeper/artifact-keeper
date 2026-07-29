@@ -784,7 +784,7 @@ async fn publish_release_from_wildcard(
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "swift", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "swift", "write:artifacts")?.user_id;
     publish_release(
         state, repo_key, scope, name, version, user_id, headers, body,
     )

@@ -1098,7 +1098,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
@@ -1123,7 +1123,7 @@ async fn upload_package_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 

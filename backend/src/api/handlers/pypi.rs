@@ -3133,7 +3133,7 @@ async fn upload(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "pypi", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "pypi", "write:artifacts")?.user_id;
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos

@@ -2281,7 +2281,7 @@ async fn upload(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // this push endpoint. Require the write scope before doing any work.
-    let auth = require_auth_basic_scope(auth, "maven", "write")?;
+    let auth = require_auth_basic_scope(auth, "maven", "write:artifacts")?;
     let user_id = auth.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 

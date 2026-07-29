@@ -844,7 +844,7 @@ async fn upload_image(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -976,7 +976,7 @@ async fn delete_image(
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1067,7 +1067,7 @@ async fn start_chunked_upload(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let prefix = mount_prefix_from_uri(&original_uri);
 
@@ -1156,7 +1156,7 @@ async fn upload_chunk(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be driven via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -1209,7 +1209,7 @@ async fn complete_chunked_upload(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be finalized via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -1329,7 +1329,7 @@ async fn cancel_chunked_upload(
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be cancelled via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;

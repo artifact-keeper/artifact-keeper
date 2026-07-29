@@ -2755,7 +2755,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2783,7 +2783,7 @@ async fn upload_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2822,7 +2822,7 @@ async fn upload_package_put_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2853,7 +2853,7 @@ async fn upload_post_with_token(
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -3285,7 +3285,7 @@ async fn put_attestation(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
 }
@@ -3315,7 +3315,7 @@ async fn put_attestation_with_token(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = if auth.is_some() {
-        require_auth_basic_scope(auth, "conda", "write")?.user_id
+        require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };

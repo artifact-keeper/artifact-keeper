@@ -897,7 +897,7 @@ async fn create_modules(
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1061,7 +1061,7 @@ async fn upload(
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1522,7 +1522,7 @@ async fn create_or_update_labels(
     axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;

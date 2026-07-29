@@ -470,7 +470,7 @@ async fn upload_object(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -778,7 +778,7 @@ async fn create_lock(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: CreateLockRequest = serde_json::from_slice(&body).map_err(|e| {
@@ -950,7 +950,7 @@ async fn verify_locks(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Parse request body (optional, may be empty)
@@ -1030,7 +1030,7 @@ async fn delete_lock(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let force = if body.is_empty() {
