@@ -115,6 +115,69 @@ fn caller_owns_token(auth: &AuthExtension, created_by_user_id: Option<Uuid>) -> 
     auth.is_admin || created_by_user_id == Some(auth.user_id)
 }
 
+/// The repository action a non-admin caller must itself hold on the target
+/// repository in order to DELEGATE the given token scope by minting a
+/// repo-scoped token (#2603 G3). Delegation must not exceed the caller's own
+/// effective repository permission.
+///
+/// Admin-class scopes (`*`, `delete:artifacts`, …) are refused up front by
+/// `enforce_admin_only_scopes`, so the non-admin-mintable scopes that still
+/// confer a mutation are `write:artifacts` (needs the `write` action) and
+/// `write:repositories` (repository administration — needs `admin`). Read
+/// scopes and non-repository scopes require no mutation authority (`None`), so
+/// a member can always self-manage read-scoped tokens on a repo it can see.
+fn delegated_scope_repo_action(scope: &str) -> Option<&'static str> {
+    match scope {
+        "write:artifacts" => Some("write"),
+        "write:repositories" => Some("admin"),
+        _ => None,
+    }
+}
+
+/// Enforce the #2603 G3 delegation ceiling: for a non-admin caller, every
+/// requested token scope that confers a repository mutation must be one the
+/// caller already holds on `repo_id`, decided through the canonical
+/// `check_repository_action` choke-point. A caller lacking the required action
+/// is denied (`Authorization`), so a read-only member cannot mint a
+/// write-scoped token. Global admins bypass.
+async fn require_delegatable_scopes(
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    scopes: &[String],
+    permission_service: &crate::services::permission_service::PermissionService,
+) -> Result<()> {
+    if auth.is_admin {
+        return Ok(());
+    }
+    // Require the strongest action any requested scope needs (`admin` > `write`).
+    let needs_admin = scopes
+        .iter()
+        .any(|s| delegated_scope_repo_action(s) == Some("admin"));
+    let needs_write = scopes
+        .iter()
+        .any(|s| delegated_scope_repo_action(s) == Some("write"));
+    let required_action = if needs_admin {
+        Some("admin")
+    } else if needs_write {
+        Some("write")
+    } else {
+        None
+    };
+    if let Some(action) = required_action {
+        let holds = permission_service
+            .check_repository_action(auth.user_id, repo_id, action, auth.is_admin)
+            .await?;
+        if !holds {
+            return Err(AppError::Authorization(format!(
+                "Minting a token with the requested scopes requires the repository '{}' action; \
+                 a repo-scoped token cannot delegate access you do not hold",
+                action
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Require that the caller is authenticated and has write scope on repos
 /// (or is a global admin).
 fn require_repo_write(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -152,13 +215,17 @@ async fn authorize_repo_for_tokens(
         )));
     }
 
-    // Per-repo authorization (mirrors `require_visible` in the repositories
-    // handler). The `can_access_repo` check above only enforces the *token's*
-    // repo scope — a broad `write:repositories` token (`allowed_repo_ids =
-    // None`) passes it for ANY repo. Without this DB-level check, any
-    // authenticated user with the write scope could mint repo-scoped tokens on
-    // a PRIVATE repository they cannot see (#1783). A private repo is visible
-    // only to an admin or a user with a role assignment scoped to it.
+    // Existence hiding (mirrors `require_visible`): a private repository the
+    // caller cannot even see returns `NotFound`, not `Forbidden`, so this
+    // endpoint is not an existence oracle. The `can_access_repo` check above
+    // only enforces the *token's* repo scope — a broad `write:repositories`
+    // token (`allowed_repo_ids = None`) passes it for ANY repo — so this
+    // DB-level visibility check is still required (#1783).
+    //
+    // NB: this remains a VISIBILITY gate only. Whether a caller may DELEGATE a
+    // given capability by minting a token is enforced per-scope in
+    // `create_repo_token` (#2603 G3 delegation ceiling), so a read-only member
+    // can still self-manage read-scoped tokens on a repo it can see.
     if !repo.is_public
         && !auth.is_admin
         && !repo_service
@@ -319,6 +386,17 @@ pub async fn create_repo_token(
     // `token_service::ADMIN_ONLY_SCOPES` for the policy list and rationale.
     crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
         .map_err(AppError::Authorization)?;
+
+    // #2603 G3 — delegation ceiling. Minting a repo-scoped token is an act of
+    // DELEGATION: it must not hand out a capability the caller does not itself
+    // hold on this repository. Before this gate, a read-only `viewer` member
+    // (or, on a public repo, any authenticated user) could mint a
+    // `write:artifacts` token — delegating write access it never had. Route the
+    // required action through the same canonical `check_repository_action`
+    // choke-point as the artifact-write paths, so the ceiling is exactly what
+    // the holder could do directly. Global admins bypass; read-only scopes need
+    // no mutation authority; the admin-class scopes above are already refused.
+    require_delegatable_scopes(&auth, repo.id, &payload.scopes, &state.permission_service).await?;
 
     // Generate the token
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
@@ -614,6 +692,35 @@ mod tests {
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2603 G3 delegation ceiling: scope -> required repository action
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delegated_scope_repo_action_write_needs_write() {
+        assert_eq!(
+            delegated_scope_repo_action("write:artifacts"),
+            Some("write")
+        );
+    }
+
+    #[test]
+    fn test_delegated_scope_repo_action_write_repositories_needs_admin() {
+        assert_eq!(
+            delegated_scope_repo_action("write:repositories"),
+            Some("admin")
+        );
+    }
+
+    #[test]
+    fn test_delegated_scope_repo_action_read_needs_nothing() {
+        // Read scopes and unrelated scopes require no mutation authority, so a
+        // member can always self-manage read-scoped tokens on a visible repo.
+        assert_eq!(delegated_scope_repo_action("read:artifacts"), None);
+        assert_eq!(delegated_scope_repo_action("read:repositories"), None);
+        assert_eq!(delegated_scope_repo_action("read:users"), None);
     }
 
     #[test]
@@ -1088,6 +1195,76 @@ mod admin_scope_policy_tests {
             String::from_utf8_lossy(&body_bytes),
         );
 
+        cleanup(&pool, user_id, &repo_key).await;
+    }
+
+    /// #2603 G3 delegation ceiling. On a PUBLIC repo, a caller who does not hold
+    /// the `write` action (here: any authenticated non-member) must NOT be able
+    /// to mint a `write:artifacts` token — that would delegate write access it
+    /// never had — but MAY still mint a `read:artifacts` token (self-service on
+    /// a repo it can read). Granting the `write` action lets it mint the
+    /// write-scoped token. This is the exact viewer-mints-write escalation the
+    /// gap describes; coupled with G1 it keeps delegation within authority.
+    #[tokio::test]
+    async fn non_writer_cannot_mint_write_scoped_repo_token_but_can_mint_read() {
+        let Some((pool, state, user_id, username, repo_key)) = setup().await else {
+            return;
+        };
+        let repo_id: Uuid = sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .fetch_one(&pool)
+            .await
+            .expect("resolve repo id");
+
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_api_token = true;
+        auth.scopes = Some(vec!["write:repositories".to_string()]);
+
+        // (a) non-writer minting write:artifacts -> 403 (exceeds effective perm).
+        let (deny_status, deny_body) = tdh::send(
+            build_app(state.clone(), auth.clone()),
+            post_repo_token_request(&repo_key, "escalate", &["write:artifacts"]),
+        )
+        .await;
+        assert_eq!(
+            deny_status,
+            StatusCode::FORBIDDEN,
+            "non-writer minting a write-scoped token must be denied; got {} body: {}",
+            deny_status,
+            String::from_utf8_lossy(&deny_body),
+        );
+
+        // (b) same non-writer minting read:artifacts -> 200 (within authority).
+        let (read_status, _read_body) = tdh::send(
+            build_app(state.clone(), auth.clone()),
+            post_repo_token_request(&repo_key, "read-ok", &["read:artifacts"]),
+        )
+        .await;
+        assert_eq!(
+            read_status,
+            StatusCode::OK,
+            "a member must still self-manage a read-scoped token on a visible repo"
+        );
+
+        // (c) grant the write action (developer role) -> write token now allowed.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let (allow_status, allow_body) = tdh::send(
+            build_app(state, auth),
+            post_repo_token_request(&repo_key, "legit-write", &["write:artifacts"]),
+        )
+        .await;
+        assert_eq!(
+            allow_status,
+            StatusCode::OK,
+            "a write-holding member must be able to delegate write; got {} body: {}",
+            allow_status,
+            String::from_utf8_lossy(&allow_body),
+        );
+
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         cleanup(&pool, user_id, &repo_key).await;
     }
 }

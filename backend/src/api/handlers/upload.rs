@@ -21,7 +21,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers;
-use crate::api::handlers::repositories::require_repo_write_access;
+use crate::api::handlers::repositories::{require_repo_action, require_repo_write_access};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::services::package_service::PackageService;
@@ -128,46 +128,6 @@ pub struct CompleteResponse {
 // POST / -- Create upload session
 // ---------------------------------------------------------------------------
 
-/// Pure write-authorization decision for creating a chunked-upload session.
-///
-/// Mirrors the semantics `repo_visibility_middleware` enforces on every other
-/// repository write path, so the body-addressed `/uploads` flow is gated the
-/// same way the URL-addressed legacy artifact PUT is:
-///
-/// * **Token repo-scope (#504):** an API token restricted to a set of repos
-///   (`auth.can_access_repo`) may only target a repo in that set.
-/// * **Admin bypass:** admins skip the fine-grained checks entirely.
-/// * **No-rules fall-through:** a repo with no fine-grained permission rules
-///   keeps working under the default access model (`has_rules == false`).
-/// * **Fine-grained write (#817):** when rules exist, the caller must hold the
-///   `write` (or `admin`) action on the repo.
-///
-/// The permission-service lookups that produce `has_rules`/`has_write`/
-/// `has_admin` are done by the caller; keeping the decision pure makes it
-/// unit-testable without a database.
-fn session_write_authorized(
-    auth: &AuthExtension,
-    repo_id: Uuid,
-    has_rules: bool,
-    has_write: bool,
-    has_admin: bool,
-) -> bool {
-    // #504: token repository scope.
-    if !auth.can_access_repo(repo_id) {
-        return false;
-    }
-    // Admins bypass fine-grained permission checks.
-    if auth.is_admin {
-        return true;
-    }
-    // No fine-grained rules: fall through to the default access model.
-    if !has_rules {
-        return true;
-    }
-    // Rules exist: the caller must hold write (or admin) on this repo.
-    has_write || has_admin
-}
-
 #[utoipa::path(
     post,
     path = "/api/v1/uploads",
@@ -262,113 +222,22 @@ async fn create_session(
         return Err(rejection);
     }
 
-    // Repository write authorization (#817 parity).
-    //
-    // The chunked upload-session create path must enforce the same
-    // fine-grained RBAC write gate that `repo_visibility_middleware` applies to
-    // the rest of the artifact-write surface (see middleware/auth.rs): the
-    // /api/v1/uploads router is layered only with `auth_middleware`
-    // (authentication), so without this check any authenticated user could open
-    // a session against a release/promotion-only repository.
-    //
-    // Admins bypass the check. For a non-admin, if any permission rule exists
-    // for this repository the caller must hold the `write` action (or `admin`,
-    // which implies all actions); a repository with no rules falls through
-    // unchanged. A DB error on the rule lookup fails closed (503), mirroring the
-    // middleware. Authorized peer-replication identities hold write/admin on the
-    // target and continue to pass.
-    let has_rules = if auth.is_admin {
-        false
-    } else {
-        match state
-            .permission_service
-            .has_any_rules_for_target("repository", repo_id)
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::error!("permission check failed: database unreachable");
-                return Err(map_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "permission service temporarily unavailable",
-                ));
-            }
-        }
-    };
-    let (has_write, has_admin) = if !auth.is_admin && has_rules {
-        (
-            state
-                .permission_service
-                .check_permission(user_id, "repository", repo_id, "write", false)
-                .await
-                .unwrap_or(false),
-            state
-                .permission_service
-                .check_permission(user_id, "repository", repo_id, "admin", false)
-                .await
-                .unwrap_or(false),
-        )
-    } else {
-        (false, false)
-    };
-    if !upload_write_decision(auth.is_admin, has_rules, has_write, has_admin) {
-        return Err(map_err(
-            StatusCode::FORBIDDEN,
-            "You do not have permission to perform this action on this repository",
-        ));
-    }
-
-    // Repository write authorization.
+    // Repository write authorization (#2603 G1).
     //
     // The `/uploads` routes are nested under `auth_middleware` only, not
     // `repo_visibility_middleware`, and the target repo is named in the JSON
-    // body rather than the URL path -- so the repo-scope (#504) and
-    // fine-grained permission (#817) gates that protect every other write
-    // path never see this request. Apply the same decision here, at the single
-    // point where the cross-tenant write would originate, right after the repo
-    // is resolved (the 404-for-unknown-repo behaviour above is unchanged).
-    //
-    // Only consult the permission service for a non-admin caller that is in
-    // token scope for the repo; admins bypass and out-of-scope tokens are
-    // denied without a DB round-trip. Fail closed (503) on a permission lookup
-    // error, matching `repo_visibility_middleware`.
-    let (has_rules, has_write, has_admin) = if auth.is_admin || !auth.can_access_repo(repo.0) {
-        (false, false, false)
-    } else {
-        let has_rules = state
-            .permission_service
-            .has_any_rules_for_target("repository", repo.0)
-            .await
-            .map_err(|_| {
-                tracing::error!("permission check failed: database unreachable");
-                map_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "permission service temporarily unavailable",
-                )
-            })?;
-        if has_rules {
-            let has_write = state
-                .permission_service
-                .check_permission(auth.user_id, "repository", repo.0, "write", false)
-                .await
-                .unwrap_or(false);
-            let has_admin = state
-                .permission_service
-                .check_permission(auth.user_id, "repository", repo.0, "admin", false)
-                .await
-                .unwrap_or(false);
-            (true, has_write, has_admin)
-        } else {
-            (false, false, false)
-        }
-    };
-
-    if !session_write_authorized(&auth, repo.0, has_rules, has_write, has_admin) {
-        return Err(map_err(
-            StatusCode::FORBIDDEN,
-            "You do not have permission to perform this action on this repository",
-        ));
-    }
+    // body rather than the URL path -- so the repo-scope (#504) and per-action
+    // permission gates that protect every other write path never see this
+    // request. Route the `write` decision through the single canonical
+    // choke-point (`check_repository_action`), DENY-BY-DEFAULT: opening a
+    // session is a write, so `is_public` never satisfies it and a rules-less
+    // repository does not fall open — the caller must hold the `write` action
+    // (via role assignment, an allowing rule, or `admin`). Admins bypass inside
+    // the choke-point; the token repo-scope (#504) is enforced first. A DB
+    // error fails closed (503), matching `repo_visibility_middleware`.
+    require_repo_action(&auth, repo_id, "write", &state.permission_service)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     let is_replication = super::is_replication_request(&headers);
     let replication_metadata = replication_session_metadata_from_request(&headers, &req);
@@ -483,6 +352,20 @@ async fn upload_chunk(
     let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
+
+    // #2603 G1: re-check repository write authorization on every chunk. Session
+    // creation authorized the caller, but a role revocation (or a repo turning
+    // private) between `create_session` and the last chunk must stop further
+    // writes — the session owner cannot keep appending data it may no longer
+    // publish. Routed through the same canonical choke-point.
+    require_repo_action(
+        &auth,
+        session.repository_id,
+        "write",
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     let chunk_index = (start / session.chunk_size as i64) as i32;
 
@@ -626,6 +509,19 @@ async fn complete(
     let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
+
+    // #2603 G1: re-check repository write authorization before committing the
+    // artifact. Finalizing a session is the actual write, so access revoked
+    // after the chunks were staged must still block the commit. Routed through
+    // the same canonical choke-point.
+    require_repo_action(
+        &auth,
+        session.repository_id,
+        "write",
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
@@ -889,28 +785,6 @@ fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
         axum::Json(serde_json::json!({"error": e.to_string()})),
     )
         .into_response()
-}
-
-/// Pure authorization decision for chunked upload-session creation, mirroring
-/// the non-admin RBAC write gate enforced by `repo_visibility_middleware`.
-///
-/// - Admins always pass (any rules state).
-/// - Non-admins on a repository with no permission rules fall through (allowed).
-/// - Non-admins on a rules-bearing repository must hold the `write` action or
-///   the `admin` action (which implies all actions).
-fn upload_write_decision(
-    is_admin: bool,
-    has_rules: bool,
-    has_write: bool,
-    has_admin: bool,
-) -> bool {
-    if is_admin {
-        return true;
-    }
-    if !has_rules {
-        return true;
-    }
-    has_write || has_admin
 }
 
 /// Build the rejection for a direct upload-session create against a
@@ -1255,12 +1129,13 @@ fn replication_session_metadata_from_request<'a>(
 mod tests {
     use super::*;
 
-    /// Cross-tenant authz guard (xtenant-write-authz-systemic). `session_write_authorized`
-    /// (and `upload_write_decision`) fall OPEN when the target repo has no
-    /// fine-grained permission rules (`!has_rules`), so `create_session` must
-    /// ALSO enforce the rule-independent tenant gate `require_repo_write_access`
-    /// (is_public + role_assignments membership). String-grep because the handler
-    /// needs a real DB to run.
+    /// Cross-tenant authz guard (xtenant-write-authz-systemic). `create_session`
+    /// must enforce the tenant/token gate `require_repo_write_access` (visibility
+    /// plus role-assignment membership plus the #504 token scope) in addition to
+    /// the deny-by-default `require_repo_action` (#2603 G1) action choke-point,
+    /// so a non-member non-admin can never open a session against another
+    /// tenant's repository regardless of fine-grained rule existence. String-grep
+    /// because the handler needs a real DB to run.
     #[test]
     fn test_create_session_enforces_tenant_gate() {
         let source = include_str!("upload.rs");
@@ -1431,114 +1306,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // session_write_authorized (pure write-authorization decision)
+    // Repository write authorization for the chunked-upload path is now the
+    // single canonical `require_repo_action` -> `check_repository_action`
+    // choke-point (#2603 G1). Its per-action decision is unit-tested with a DB
+    // in `services::permission_service`, and the handler wiring is covered by
+    // the DB-backed `create_session_*` tests below.
     // -----------------------------------------------------------------------
-
-    /// Build an `AuthExtension` for the pure-helper tests. `allowed` is the
-    /// token repo-scope (`None` = unrestricted, matching a JWT login).
-    fn auth_for(is_admin: bool, allowed: Option<Vec<Uuid>>) -> AuthExtension {
-        AuthExtension {
-            user_id: Uuid::new_v4(),
-            username: "tester".to_string(),
-            email: "tester@example.test".to_string(),
-            is_admin,
-            is_api_token: allowed.is_some(),
-            is_service_account: false,
-            scopes: None,
-            allowed_repo_ids: crate::models::access_scope::AccessScope::from(allowed),
-            iat_ms: None,
-        }
-    }
-
-    #[test]
-    fn session_write_authorized_denies_token_scoped_out() {
-        let repo = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        // Token restricted to a different repo: denied before any rule check.
-        let auth = auth_for(false, Some(vec![other]));
-        assert!(!session_write_authorized(&auth, repo, false, false, false));
-        // Even an admin token is bound by its repo scope.
-        let admin = auth_for(true, Some(vec![other]));
-        assert!(!session_write_authorized(&admin, repo, false, false, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_admin() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(true, None);
-        // Admin bypasses fine-grained rules even when the user holds nothing.
-        assert!(session_write_authorized(&auth, repo, true, false, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_when_no_rules() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        // No fine-grained rules -> default access model (fall-through).
-        assert!(session_write_authorized(&auth, repo, false, false, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_with_write_grant() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        assert!(session_write_authorized(&auth, repo, true, true, false));
-    }
-
-    #[test]
-    fn session_write_authorized_allows_with_admin_action() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        assert!(session_write_authorized(&auth, repo, true, false, true));
-    }
-
-    #[test]
-    fn session_write_authorized_denies_rules_without_grant() {
-        let repo = Uuid::new_v4();
-        let auth = auth_for(false, None);
-        // Rules exist but the user holds neither write nor admin: denied.
-        assert!(!session_write_authorized(&auth, repo, true, false, false));
-    }
-
-    // -----------------------------------------------------------------------
-    // artifact_name_from_path
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // upload_write_decision (#817 parity with repo_visibility_middleware)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_upload_write_decision_admin_always_allowed() {
-        // Admins bypass the check regardless of rules/actions.
-        assert!(upload_write_decision(true, false, false, false));
-        assert!(upload_write_decision(true, true, false, false));
-        assert!(upload_write_decision(true, true, true, true));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_no_rules_allowed() {
-        // A repository with no permission rules falls through unchanged.
-        assert!(upload_write_decision(false, false, false, false));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_with_write_allowed() {
-        assert!(upload_write_decision(false, true, true, false));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_with_admin_action_allowed() {
-        // The `admin` action implies all actions (including write).
-        assert!(upload_write_decision(false, true, false, true));
-    }
-
-    #[test]
-    fn test_upload_write_decision_non_admin_rules_neither_denied() {
-        // Release/promotion-only repo: rules exist but caller holds neither
-        // write nor admin -> denied.
-        assert!(!upload_write_decision(false, true, false, false));
-    }
 
     // -----------------------------------------------------------------------
     // reject_session_if_promotion_only (#817 parity with direct upload path)
@@ -3164,12 +2937,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_denies_non_admin_without_grant_when_rules_exist() {
-        // (b) The exploit case: a non-admin whose target repo HAS fine-grained
-        // rules, but holds no grant for that user, is denied -> 403. (Mirrors a
-        // cross-tenant write attempt into a repo gated by permission rules.)
+        // (b) The exploit case: a NON-MEMBER (no role assignment, no rule for
+        // them) targeting a repo that has fine-grained rules for someone else is
+        // denied -> 403. Mirrors a cross-tenant write attempt. Under the
+        // deny-by-default `check_repository_action` choke-point (#2603 G1) a
+        // caller needs an action-granting role or an allowing rule; a rule for a
+        // different principal grants this caller nothing.
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
+        // Make the fixture user a pure non-member: drop the developer role
+        // assignment that `Fixture::setup` granted, so the only authz signal is
+        // the (absent) per-principal grant.
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
         // Rules exist for the repo, but they grant another principal, not the
         // caller.
         grant_repo_permission(&f.pool, f.repo_id, Uuid::new_v4(), &["read", "write"]).await;
@@ -3186,7 +2969,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "non-admin without a grant on a ruled repo must be denied"
+            "non-member on a ruled repo must be denied"
         );
         // No session must have been created for this repo.
         let count: i64 =

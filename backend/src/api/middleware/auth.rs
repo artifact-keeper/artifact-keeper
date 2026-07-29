@@ -1794,101 +1794,136 @@ pub async fn repo_visibility_middleware(
         }
     }
 
-    // #817: Fine-grained repository permission enforcement.
+    // Repository permission enforcement (#817 reads, #2603 G1 writes).
     //
     // If the authenticated user is an admin, skip permission checks entirely
     // to preserve backward compatibility and avoid unnecessary DB lookups.
-    //
-    // For non-admin users, check whether any permission rules exist for this
-    // repository. If no rules exist, fall through to the default access model
-    // (the visibility checks above are sufficient). If rules do exist, the
-    // user must hold the action that matches the HTTP method.
     if let Some(ref ext) = auth_ext {
         if !ext.is_admin {
-            let has_rules = match vis_state
-                .permission_service
-                .has_any_rules_for_target("repository", repo.id)
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    // DB error on permission check: fail closed.
-                    tracing::error!("permission check failed: database unreachable");
-                    return Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(axum::body::Body::from(
-                            "permission service temporarily unavailable",
-                        ))
-                        .unwrap();
-                }
-            };
+            let action = action_for_method(request.method());
 
-            if has_rules {
-                let action = action_for_method(request.method());
-                // #2329: On a *public* repository, reads are always allowed
-                // for anonymous callers (visibility check above), so an
-                // authenticated caller must not end up with *less* read
-                // access just because ACL rules exist. Grant the anonymous
-                // read baseline and skip the ACL for reads only; writes and
-                // deletes remain fully ACL-gated, and private repos never
-                // take this shortcut. Anonymous callers never reach this
-                // block at all (no `auth_ext`), so the existing
-                // anonymous-public contract is untouched.
-                if !public_read_satisfies_acl(is_public, action) {
-                    // Check for the specific action first, then fall back to
-                    // "admin" which implies all actions (#827 policy compat).
-                    // Both calls resolve from the same cached action set, so
-                    // the second call is essentially free.
-                    let allowed = vis_state
-                        .permission_service
-                        .check_permission(ext.user_id, "repository", repo.id, action, false)
-                        .await
-                        .unwrap_or(false)
-                        || vis_state
-                            .permission_service
-                            .check_permission(ext.user_id, "repository", repo.id, "admin", false)
-                            .await
-                            .unwrap_or(false);
-
-                    if !allowed {
-                        return forbidden_permission_response();
+            if is_write {
+                // #2603 G1: writes and deletes route through the single
+                // canonical action choke-point, DENY-BY-DEFAULT. `is_public`
+                // confers a read baseline only and never satisfies a write, and
+                // a repository with NO fine-grained rules does not fall open —
+                // the caller must hold a role assignment carrying the action
+                // (or an allowing fine-grained rule, or `admin`), for public
+                // and private repositories alike. This closes the rules-less
+                // public-repo write hole (any authed caller could PUT/DELETE)
+                // and the rules-less private-repo case (a read-only `viewer`
+                // member could write/delete). DB error fails closed (503).
+                match vis_state
+                    .permission_service
+                    .check_repository_action(ext.user_id, repo.id, action, false)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return forbidden_permission_response(),
+                    Err(_) => {
+                        tracing::error!("permission check failed: database unreachable");
+                        return service_unavailable_response();
                     }
                 }
-            } else if !is_public {
-                // A private repo with NO fine-grained permission rules must
-                // still not be readable by every authenticated user. Mirror
-                // the REST `require_visible` model: a non-admin needs a role
-                // assignment scoped to this repo (or a global assignment).
-                //
-                // Without this branch the native-protocol path default-ALLOWED
-                // rule-less private repos to any authenticated principal, while
-                // the REST download path denied the same caller (404) — a
-                // cross-tenant private-artifact leak (red-team round 2).
-                //
-                // Uses sqlx::query_scalar (not the macro) so no new entry in
-                // the sqlx offline-query cache is required, matching the rest
-                // of this middleware. Same predicate as
-                // RepositoryService::user_can_access_repo.
-                let granted = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM role_assignments ra \
-                         WHERE ra.user_id = $1 \
-                           AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-                     )",
-                )
-                .bind(ext.user_id)
-                .bind(repo.id)
-                .fetch_one(&vis_state.db)
-                .await;
-
-                match granted {
-                    Ok(true) => {}
-                    // Existence-hiding 404, matching REST `require_visible`.
-                    Ok(false) => return not_found_response(),
+            } else {
+                // Reads: preserve the public-anonymous baseline + private
+                // membership + fine-grained ACL model (#817 / #2329). For a
+                // non-admin user, check whether any permission rules exist for
+                // this repository. If no rules exist, fall through to the
+                // default access model (the visibility checks above are
+                // sufficient for public repos; private repos still require a
+                // role assignment). If rules do exist, the user must hold the
+                // read action.
+                let has_rules = match vis_state
+                    .permission_service
+                    .has_any_rules_for_target("repository", repo.id)
+                    .await
+                {
+                    Ok(v) => v,
                     Err(_) => {
-                        // DB error on access check: fail closed.
-                        tracing::error!("repo access check failed: database unreachable");
-                        return service_unavailable_response();
+                        // DB error on permission check: fail closed.
+                        tracing::error!("permission check failed: database unreachable");
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(axum::body::Body::from(
+                                "permission service temporarily unavailable",
+                            ))
+                            .unwrap();
+                    }
+                };
+
+                if has_rules {
+                    // #2329: On a *public* repository, reads are always allowed
+                    // for anonymous callers (visibility check above), so an
+                    // authenticated caller must not end up with *less* read
+                    // access just because ACL rules exist. Grant the anonymous
+                    // read baseline and skip the ACL for reads only; private
+                    // repos never take this shortcut. Anonymous callers never
+                    // reach this block at all (no `auth_ext`), so the existing
+                    // anonymous-public contract is untouched.
+                    if !public_read_satisfies_acl(is_public, action) {
+                        // Check for the specific action first, then fall back to
+                        // "admin" which implies all actions (#827 policy compat).
+                        // Both calls resolve from the same cached action set, so
+                        // the second call is essentially free.
+                        let allowed = vis_state
+                            .permission_service
+                            .check_permission(ext.user_id, "repository", repo.id, action, false)
+                            .await
+                            .unwrap_or(false)
+                            || vis_state
+                                .permission_service
+                                .check_permission(
+                                    ext.user_id,
+                                    "repository",
+                                    repo.id,
+                                    "admin",
+                                    false,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                        if !allowed {
+                            return forbidden_permission_response();
+                        }
+                    }
+                } else if !is_public {
+                    // A private repo with NO fine-grained permission rules must
+                    // still not be readable by every authenticated user. Mirror
+                    // the REST `require_visible` model: a non-admin needs a role
+                    // assignment scoped to this repo (or a global assignment).
+                    //
+                    // Without this branch the native-protocol path
+                    // default-ALLOWED rule-less private repos to any
+                    // authenticated principal, while the REST download path
+                    // denied the same caller (404) — a cross-tenant
+                    // private-artifact leak (red-team round 2).
+                    //
+                    // Uses sqlx::query_scalar (not the macro) so no new entry in
+                    // the sqlx offline-query cache is required, matching the rest
+                    // of this middleware. Same predicate as
+                    // RepositoryService::user_can_access_repo.
+                    let granted = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS ( \
+                             SELECT 1 FROM role_assignments ra \
+                             WHERE ra.user_id = $1 \
+                               AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                         )",
+                    )
+                    .bind(ext.user_id)
+                    .bind(repo.id)
+                    .fetch_one(&vis_state.db)
+                    .await;
+
+                    match granted {
+                        Ok(true) => {}
+                        // Existence-hiding 404, matching REST `require_visible`.
+                        Ok(false) => return not_found_response(),
+                        Err(_) => {
+                            // DB error on access check: fail closed.
+                            tracing::error!("repo access check failed: database unreachable");
+                            return service_unavailable_response();
+                        }
                     }
                 }
             }
