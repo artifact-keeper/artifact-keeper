@@ -984,13 +984,15 @@ impl LifecycleService {
         })?;
 
         // Find artifacts to remove: for each package/image, keep only the latest N.
-        // Docker manifest artifacts store the tag as part of `name`
+        // Docker manifest artifacts store a reference as part of `name`
         // (`namespace/image:tag`), while other formats store the package name
-        // independently from its version.  Partition Docker entries by the
-        // image reference without its final tag so version retention applies to
-        // all tags of one image.  `regexp_replace` removes only the final
-        // colon segment, preserving a registry port in e.g.
-        // `registry:5000/team/image:v1`.
+        // independently from its version. Partition Docker entries by image
+        // only when the suffix is a valid tag. A digest reference has the
+        // shape `image:<algorithm>:<encoded>` and must stay a distinct,
+        // full-name partition: children of a live multi-arch image can be
+        // stored by digest without an `oci_tags` row. The tag regex excludes
+        // `/`, so an untagged synthetic name with a registry port, such as
+        // `registry:5000/team/image`, cannot collapse to just `registry`.
         let matched = sqlx::query_as::<_, CountBytes>(
             r#"
             SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
@@ -1001,11 +1003,17 @@ impl LifecycleService {
               AND a.id NOT IN (
                   SELECT a2.id FROM artifacts a2
                   WHERE a2.repository_id = $1
-                    AND CASE WHEN r.format = 'docker'
-                        THEN regexp_replace(a2.name, ':[^:]+$', '')
+                    AND CASE
+                        WHEN r.format = 'docker'
+                          AND a2.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                          AND a2.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+                        THEN regexp_replace(a2.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
                         ELSE a2.name
-                    END = CASE WHEN r.format = 'docker'
-                        THEN regexp_replace(a.name, ':[^:]+$', '')
+                    END = CASE
+                        WHEN r.format = 'docker'
+                          AND a.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                          AND a.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+                        THEN regexp_replace(a.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
                         ELSE a.name
                     END
                     AND a2.is_deleted = false
@@ -1032,11 +1040,17 @@ impl LifecycleService {
                   AND a.id NOT IN (
                       SELECT a2.id FROM artifacts a2
                       WHERE a2.repository_id = $1
-                        AND CASE WHEN r.format = 'docker'
-                            THEN regexp_replace(a2.name, ':[^:]+$', '')
+                        AND CASE
+                            WHEN r.format = 'docker'
+                              AND a2.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                              AND a2.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+                            THEN regexp_replace(a2.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
                             ELSE a2.name
-                        END = CASE WHEN r.format = 'docker'
-                            THEN regexp_replace(a.name, ':[^:]+$', '')
+                        END = CASE
+                            WHEN r.format = 'docker'
+                              AND a.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                              AND a.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+                            THEN regexp_replace(a.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
                             ELSE a.name
                         END
                         AND a2.is_deleted = false
@@ -1480,6 +1494,153 @@ mod tests {
         let svc = make_service_for_validation();
         let config = json!({"keep": 7, "max_versions": -1});
         assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    // This is deliberately DB-backed rather than a mocked SQL assertion: the
+    // coverage job provisions Postgres and executes library tests, so it
+    // protects the Docker-specific partition key used by execute_max_versions.
+    // A Docker manifest stores its tag in `artifacts.name`; retaining one
+    // version must group `image:v1`, `image:v2`, and `image:v3` as one image,
+    // without grouping digest-reference or tagless artifacts.
+    #[tokio::test]
+    async fn test_max_versions_groups_docker_tags_by_image() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let repository_id = Uuid::new_v4();
+        let suffix = repository_id.simple();
+        let repository_key = format!("lifecycle-docker-tags-{suffix}");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'docker'::repository_format)",
+        )
+        .bind(repository_id)
+        .bind(&repository_key)
+        .bind(format!("/tmp/{repository_key}"))
+        .execute(&pool)
+        .await
+        .expect("insert docker repository");
+
+        let digest_a = format!("sha256:{}", "a".repeat(64));
+        let digest_b = format!("sha256:{}", "b".repeat(64));
+        let artifacts = vec![
+            (
+                "registry:5000/team/image:v1".to_string(),
+                "v1".to_string(),
+                7,
+            ),
+            (
+                "registry:5000/team/image:v2".to_string(),
+                "v2".to_string(),
+                6,
+            ),
+            (
+                "registry:5000/team/image:v3".to_string(),
+                "v3".to_string(),
+                5,
+            ),
+            (
+                "registry:5000/team/other:v1".to_string(),
+                "v1".to_string(),
+                1,
+            ),
+            (
+                format!("registry:5000/team/image:{digest_a}"),
+                digest_a.clone(),
+                10,
+            ),
+            (
+                format!("registry:5000/team/image:{digest_b}"),
+                digest_b.clone(),
+                9,
+            ),
+            (
+                "registry:5000/team/tagless-a".to_string(),
+                "untagged-a".to_string(),
+                11,
+            ),
+            (
+                "registry:5000/team/tagless-b".to_string(),
+                "untagged-b".to_string(),
+                8,
+            ),
+        ];
+        for (name, version, age_days) in artifacts {
+            let artifact_id = Uuid::new_v4();
+            let path = format!("v2/{name}/manifests/{version}");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, 100, $6,
+                        'application/vnd.oci.image.manifest.v1+json', $7, $8)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(repository_id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&version)
+            .bind("0".repeat(64))
+            .bind(format!("oci-manifests/{artifact_id}"))
+            .bind(Utc::now() - chrono::Duration::days(age_days))
+            .execute(&pool)
+            .await
+            .expect("insert docker manifest artifact");
+        }
+
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                repository_id: Some(repository_id),
+                name: format!("retain-latest-docker-tag-{suffix}"),
+                description: None,
+                policy_type: "max_versions".to_string(),
+                config: json!({"keep": 1}),
+                priority: None,
+                cron_schedule: None,
+            })
+            .await
+            .expect("create lifecycle policy");
+
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+        assert_eq!(execution.artifacts_matched, 2);
+        assert_eq!(execution.artifacts_removed, 2);
+
+        let states: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT name, is_deleted FROM artifacts \
+             WHERE repository_id = $1 ORDER BY name",
+        )
+        .bind(repository_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read lifecycle results");
+        let mut expected = vec![
+            ("registry:5000/team/image:v1".to_string(), true),
+            ("registry:5000/team/image:v2".to_string(), true),
+            ("registry:5000/team/image:v3".to_string(), false),
+            ("registry:5000/team/other:v1".to_string(), false),
+            (format!("registry:5000/team/image:{digest_a}"), false),
+            (format!("registry:5000/team/image:{digest_b}"), false),
+            ("registry:5000/team/tagless-a".to_string(), false),
+            ("registry:5000/team/tagless-b".to_string(), false),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(states, expected);
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup docker repository");
     }
 
     #[tokio::test]
