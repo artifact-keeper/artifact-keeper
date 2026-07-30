@@ -557,12 +557,93 @@ jobs:
       # SARIF uploads below also run on failure.
       # NOTE: trivy binary extracted from official GHCR image because the
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
+      #
+      # Network resilience (#2981, #2982): every network dependency of this
+      # gate (trivy binary pull, vulnerability-DB download, scan-target image
+      # pulls) happens in dedicated steps BEFORE the scans, wrapped in the
+      # same bounded retry-with-backoff the Docker Hub mirror step uses
+      # (5 attempts, n*10s sleep). The scan steps themselves then run with
+      # TRIVY_SKIP_DB_UPDATE=true against locally pulled images, so they do
+      # no DB network I/O at scan time: a red scan step means findings
+      # (CVEs), while an infra/network failure surfaces in the pre-steps
+      # with an explicit "(infra)" error annotation. Only idempotent
+      # pulls/downloads are retried; the scans themselves are never
+      # retried, so a finding can never be retried away.
       - name: Install Trivy
         run: |
+          set -euo pipefail
+          n=0; max=5
+          until docker pull -q ghcr.io/aquasecurity/trivy:0.69.3; do
+            n=$((n + 1))
+            if [[ "$n" -ge "$max" ]]; then
+              echo "::error title=Trivy install failed (infra)::Pulling ghcr.io/aquasecurity/trivy:0.69.3 failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
+              exit 1
+            fi
+            echo "Trivy image pull attempt ${n}/${max} failed; retrying in $((n * 10))s..."
+            sleep $((n * 10))
+          done
           CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version
+
+      # Cache the vulnerability DB across runs, keyed by date (the same key
+      # scheme trivy-action uses internally; its own cache step is disabled
+      # below via `cache: false` so this workflow owns the key). With a warm
+      # cache the pre-fetch below is a cheap freshness check; during an
+      # upstream DB-mirror outage a previous day's DB (restore-keys) still
+      # lets the gate scan instead of failing closed on infra (#2981).
+      - name: Compute Trivy DB cache key
+        id: trivy-db-date
+        run: echo "date=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Trivy DB cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.cache/trivy
+          key: cache-trivy-${{ steps.trivy-db-date.outputs.date }}
+          restore-keys: |
+            cache-trivy-
+
+      - name: Pre-fetch Trivy vulnerability DB
+        run: |
+          set -euo pipefail
+          CACHE_DIR="${GITHUB_WORKSPACE}/.cache/trivy"
+          n=0; max=5
+          until trivy image --download-db-only --cache-dir "${CACHE_DIR}"; do
+            n=$((n + 1))
+            if [[ "$n" -ge "$max" ]]; then
+              if [[ -f "${CACHE_DIR}/db/trivy.db" ]]; then
+                echo "::warning title=Trivy DB refresh failed (infra)::Vulnerability DB download failed after ${max} attempts; scanning with the cached DB from a previous run."
+                exit 0
+              fi
+              echo "::error title=Trivy DB fetch failed (infra)::Could not download the Trivy vulnerability DB after ${max} attempts and no cached DB is available. Infrastructure failure, not a vulnerability finding."
+              exit 1
+            fi
+            echo "Trivy DB fetch attempt ${n}/${max} failed; retrying in $((n * 10))s..."
+            sleep $((n * 10))
+          done
+
+      # Pre-pull the scan targets so the scan steps read from the local
+      # Docker daemon instead of hitting the registry mid-scan (#2982).
+      - name: Pre-pull scan target images
+        run: |
+          set -euo pipefail
+          pull_with_retry() {
+            local ref="$1" n=0 max=5
+            until docker pull -q "${ref}"; do
+              n=$((n + 1))
+              if [[ "$n" -ge "$max" ]]; then
+                echo "::error title=Scan image pull failed (infra)::docker pull ${ref} failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
+                return 1
+              fi
+              echo "Pull attempt ${n}/${max} for ${ref} failed; retrying in $((n * 10))s..."
+              sleep $((n * 10))
+            done
+          }
+          pull_with_retry "${{ steps.refs.outputs.backend }}"
+          pull_with_retry "${{ steps.refs.outputs.openscap }}"
+          pull_with_retry "${{ steps.refs.outputs.scanner-adapter }}"
 
       - name: Trivy scan - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
@@ -577,6 +658,11 @@ jobs:
           trivyignores: '.trivyignore'
           exit-code: '1'
           skip-setup-trivy: true
+          # DB caching is owned by the explicit steps above.
+          cache: 'false'
+        env:
+          # DB was pre-fetched (with retry) above; never download mid-scan.
+          TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Trivy scan - OpenSCAP
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
@@ -590,6 +676,9 @@ jobs:
           trivyignores: '.trivyignore'
           exit-code: '1'
           skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Trivy scan - Scanner Adapter
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
@@ -603,6 +692,9 @@ jobs:
           trivyignores: '.trivyignore'
           exit-code: '1'
           skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
 
       # Alpine scan skipped while alpine builds are suspended.
       - name: Trivy scan - Backend Alpine
@@ -617,6 +709,9 @@ jobs:
           trivyignores: '.trivyignore'
           exit-code: '1'
           skip-setup-trivy: true
+          cache: 'false'
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
         uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
