@@ -9,14 +9,17 @@ on:
       - '.beads/**'
       - 'LICENSE'
       - 'CLAUDE.md'
+  # No `paths-ignore` on pull_request: this workflow is the single owner of
+  # the branch-protection required contexts ("🦀 Check Rust", "🧪 Backend
+  # Unit Tests", "✅ CI Complete"), so it must trigger on every PR. The
+  # `changes` job below decides whether the change is docs-only; heavy jobs
+  # then skip via job-level `if`, which GitHub reports as success for
+  # required checks ("Handling skipped but required checks"). This replaces
+  # the docs-required-shim.yml workflow, which posted duplicate check runs
+  # under the same required context names on PRs touching both docs and
+  # code (#2923).
   pull_request:
     branches: [main, master, develop, 'release/**']
-    paths-ignore:
-      - 'site/**'
-      - '**/*.md'
-      - '.beads/**'
-      - 'LICENSE'
-      - 'CLAUDE.md'
   workflow_dispatch:
 
 permissions:
@@ -37,6 +40,61 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
+  # DOCS-ONLY GATE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Decides whether a PR touches anything beyond the docs paths that used to
+  # live in this workflow's `paths-ignore` (and in docs-required-shim.yml's
+  # `paths`). Replaces the shim: `paths` / `paths-ignore` cannot express
+  # "fire only when the other workflow does not" (paths-ignore skips only if
+  # ALL files match, paths fires if ANY file matches), so a PR touching a
+  # `.md` file plus code triggered both workflows and got every required
+  # context posted twice (#2923). Computing the decision here makes the two
+  # outcomes mutually exclusive by construction.
+  #
+  # Fails open: on push / workflow_dispatch, or if the PR file listing
+  # errors, `code` is "true" and full CI runs. Downstream jobs gate on
+  # `code != 'false'` so an empty output also runs full CI. The file list
+  # comes from the pulls/files API (server-side, same source GitHub's own
+  # path filtering uses) — not from attacker-influenced checkout content.
+  changes:
+    name: 🔍 Docs-Only Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Determine whether non-docs files changed
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
+            echo "PR file listing failed — failing open to full CI" >&2
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # Keep in sync with the `push` trigger's paths-ignore list above
+            # (CLAUDE.md is already covered by *.md).
+            case "$f" in
+              site/*|*.md|.beads/*|LICENSE) ;;
+              *) code=true ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "non-docs changes: $code"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -44,6 +102,10 @@ jobs:
     name: 🦀 Check Rust
     runs-on: ak-ci-runners
     timeout-minutes: 20
+    needs: changes
+    # Skip (reported as success for required checks) on docs-only PRs;
+    # `!cancelled()` + `!= 'false'` fails open if `changes` itself failed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Disable debuginfo to cut peak compile memory on the ARC runner. The
     # lib-test target compile was OOMing ("sccache: Compile terminated by
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
@@ -129,6 +191,9 @@ jobs:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
     timeout-minutes: 25
+    needs: changes
+    # Skip on docs-only PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
@@ -251,6 +316,9 @@ jobs:
   shell-tests:
     name: 🐚 Shell Tests
     runs-on: ubuntu-latest
+    needs: changes
+    # Skip on docs-only PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Self-contained bash + python3 regression tests for docker/ init scripts.
     # Runs in seconds and uses only the dependencies pre-installed on the
     # ubuntu-latest image (bash, python3, jq, curl). Kept off the Rust
@@ -269,6 +337,9 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
     timeout-minutes: 35
+    needs: changes
+    # Skip on docs-only PRs — see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -1074,6 +1145,11 @@ jobs:
     name: 🔒 Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: changes
+    # Skip on docs-only PRs — see check-rust. (Docs-only PRs never change
+    # Cargo.lock, and previously did not run this job either: ci.yml did not
+    # trigger at all.)
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -1095,7 +1171,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ak-ci-runners
     timeout-minutes: 15
-    needs: [check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -1105,6 +1181,14 @@ jobs:
 
           tier1_pass=true
 
+          # Docs-only PRs legitimately skip the Tier 1 jobs (see the
+          # `changes` job). Any other skip/failure of a Tier 1 job is fatal.
+          docs_only=false
+          if [[ "${{ needs.changes.outputs.code }}" == "false" ]]; then
+            docs_only=true
+            echo "📝 docs-only change — Tier 1 jobs skipped by design" >> $GITHUB_STEP_SUMMARY
+          fi
+
           # Tier 1 jobs (required)
           for job in check-rust test-backend-unit shell-tests; do
             result="${{ needs.check-rust.result }}"
@@ -1112,6 +1196,8 @@ jobs:
             [ "$job" = "shell-tests" ] && result="${{ needs.shell-tests.result }}"
             if [[ "$result" == "success" ]]; then
               echo "✅ $job" >> $GITHUB_STEP_SUMMARY
+            elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
+              echo "⏭️ $job (docs-only)" >> $GITHUB_STEP_SUMMARY
             else
               echo "❌ $job: $result" >> $GITHUB_STEP_SUMMARY
               tier1_pass=false
@@ -1161,9 +1247,11 @@ jobs:
             echo "⚠️ coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Security audit (blocking)
+          # Security audit (blocking; skipped by design on docs-only PRs)
           if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
             echo "✅ security-audit" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.security-audit.result }}" == "skipped" && "$docs_only" == "true" ]]; then
+            echo "⏭️ security-audit (docs-only)" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ security-audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
