@@ -78,15 +78,19 @@ pub const NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS: u64 = 86_400;
 /// identity/gzip) fit comfortably, while the cap bounds worst-case memory.
 pub const NPM_PACKUMENT_CACHE_MAX_ENTRIES: usize = 8_192;
 
-/// Namespace for Redis keys, so cache entries never collide with other users
-/// of a shared Redis database.
-const REDIS_KEY_NAMESPACE: &str = "ak:npm-packument:";
+/// Versioned namespace for encoded entries and their invalidation indexes.
+/// Keep this in sync with [`REDIS_ENTRY_VERSION`] so mixed-version replicas
+/// never reject and overwrite each other's values during rolling deploys.
+const REDIS_ENTRY_NAMESPACE: &str = "ak:npm-packument:v2:";
+
+/// Stable namespace for cross-replica coordination keys.
+const REDIS_COORDINATION_NAMESPACE: &str = "ak:npm-packument:";
 
 /// Namespace for single-flight lease keys on the shared proxy-hydration map
 /// (sibling of the proxy path's `proxy-cache:` / `proxy-stream:` prefixes).
 const FLIGHT_LEASE_NAMESPACE: &str = "npm-packument:";
 
-/// Key prefix (under [`REDIS_KEY_NAMESPACE`]) for cross-replica background
+/// Key prefix (under [`REDIS_COORDINATION_NAMESPACE`]) for cross-replica background
 /// refresh leases (#2248).
 const REFRESH_LEASE_KEY_PREFIX: &str = "refresh-lease:";
 
@@ -684,19 +688,19 @@ impl RedisPackumentCache {
     }
 
     fn namespaced(key: &str) -> String {
-        format!("{}{}", REDIS_KEY_NAMESPACE, key)
+        format!("{}{}", REDIS_ENTRY_NAMESPACE, key)
     }
 
     /// The per-package key-index `SET` used for scan-free invalidation.
     fn index_key(prefix: &str) -> String {
-        format!("{}idx:{}", REDIS_KEY_NAMESPACE, prefix)
+        format!("{}idx:{}", REDIS_ENTRY_NAMESPACE, prefix)
     }
 
     /// The cross-replica refresh-lease key for one flight (#2248).
     fn lease_key(flight_key: &str) -> String {
         format!(
             "{}{}{}",
-            REDIS_KEY_NAMESPACE, REFRESH_LEASE_KEY_PREFIX, flight_key
+            REDIS_COORDINATION_NAMESPACE, REFRESH_LEASE_KEY_PREFIX, flight_key
         )
     }
 }
@@ -1573,10 +1577,37 @@ mod tests {
     #[test]
     fn redis_index_key_is_namespaced_per_prefix() {
         let index = RedisPackumentCache::index_key(&invalidation_prefix("repo", "pkg"));
-        assert_eq!(index, "ak:npm-packument:idx:repo:pkg:");
+        assert_eq!(index, "ak:npm-packument:v2:idx:repo:pkg:");
+        assert_eq!(
+            RedisPackumentCache::namespaced("entry"),
+            "ak:npm-packument:v2:entry"
+        );
+        assert_eq!(
+            RedisPackumentCache::lease_key("flight"),
+            "ak:npm-packument:refresh-lease:flight"
+        );
         assert_ne!(
             index,
             RedisPackumentCache::index_key(&invalidation_prefix("repo", "other"))
+        );
+    }
+
+    /// The entry namespace must track [`REDIS_ENTRY_VERSION`]. The two are only
+    /// tied together by a comment, and bumping the version while leaving the
+    /// namespace behind silently reintroduces the rolling-deploy failure the
+    /// namespace exists to prevent: mixed-version replicas sharing entry keys,
+    /// each rejecting and overwriting the other's values.
+    #[test]
+    fn redis_entry_namespace_tracks_entry_version() {
+        assert!(
+            REDIS_ENTRY_NAMESPACE.ends_with(&format!("v{}:", REDIS_ENTRY_VERSION)),
+            "entry namespace {REDIS_ENTRY_NAMESPACE:?} must carry v{REDIS_ENTRY_VERSION}"
+        );
+        // Coordination keys must NOT be version-scoped, or single-flight stops
+        // deduplicating across versions mid-deploy.
+        assert!(
+            !REDIS_COORDINATION_NAMESPACE.contains(&format!("v{}:", REDIS_ENTRY_VERSION)),
+            "coordination namespace must stay stable across entry versions"
         );
     }
 
