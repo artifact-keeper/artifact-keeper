@@ -1,0 +1,194 @@
+name: Release Gate Rehearsal
+
+# On-demand rehearsal of the release gate (issue #2701).
+#
+# The gate itself is a reusable workflow in artifact-keeper-test
+# (release-gate.yml). It reads `secrets.GHCR_DOCKER_CONFIG` -- the registry
+# pull-secret its in-cluster deploys need for private candidate images -- but
+# that secret only resolves on the caller path: release.yml in THIS repo calls
+# the gate with `secrets: inherit`, and the secret is scoped to this repo's
+# context. A standalone `workflow_dispatch` of release-gate.yml runs in the
+# artifact-keeper-test context, where the secret is empty, so private pulls
+# fail with ImagePullBackOff and the gate -- including the pull-by-digest +
+# pod-imageID assertion added for #2696 -- could not be rehearsed without
+# cutting a real release.
+#
+# This workflow is the dispatch front door, relocated into the repo that holds
+# the secret: it mirrors the gate's input surface, resolves (or verifies) the
+# candidate digest exactly like release.yml's resolve-candidate-digest job,
+# and invokes the SAME reusable gate with the SAME `secrets: inherit`. Secret
+# exposure is therefore identical to the existing release path -- no secret is
+# copied to another repo, broadened in visibility, or printed.
+#
+# This is NOT a return of the workflow_dispatch trigger that was removed from
+# release.yml. That trigger was deleted because its free-text `version` input
+# could drift from the ref the gates tested while the run went on to PUBLISH a
+# release. This workflow publishes nothing: its inputs only select which
+# already-published image the gate deploys and tests, so there is no artifact
+# whose identity could drift. The tag-push release path is unchanged.
+on:
+  workflow_dispatch:
+    inputs:
+      backend_tag:
+        description: 'Backend image tag to rehearse against (e.g. 1.6.2, dev, sha-abc1234)'
+        required: true
+        type: string
+      backend_digest:
+        description: >-
+          Manifest-list digest (sha256:...) to pin the backend deploy to.
+          Empty = resolve the current digest of backend_tag from ghcr.io,
+          mirroring what resolve-candidate-digest does on a real release.
+        required: false
+        type: string
+        default: ''
+      web_tag:
+        description: Web image tag to test (web is a decoupled SDK consumer)
+        required: false
+        type: string
+        default: 'latest'
+      test_suite:
+        description: Test suite to run (a real release runs `all`)
+        required: false
+        type: choice
+        options:
+          - all
+          - formats
+          - repos
+          - promotion
+          - rbac
+          - lifecycle
+          - webhooks
+          - search
+          - platform
+          - auth
+          - stress
+          - resilience
+          - mesh
+          - security
+          - compatibility
+          - pullthrough
+        default: 'all'
+      iac_ref:
+        description: artifact-keeper-iac git ref for the Helm chart
+        required: false
+        type: string
+        default: 'main'
+      skip_teardown:
+        description: Skip teardown (for debugging)
+        required: false
+        type: boolean
+        default: false
+      run_smoke_with_deps:
+        description: >-
+          Also run the clean-install-smoke-with-deps variant
+          (artifact-keeper-test#53; needs a beefier runner pool).
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Rehearsals queue rather than stack: each gate run provisions multiple test
+# namespaces against the shared ARC cluster quota, so two concurrent full
+# suites would starve each other. Never cancel a running rehearsal -- a killed
+# run with skip_teardown would leak namespaces.
+concurrency:
+  group: release-gate-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  # Same tag->digest resolution as release.yml's resolve-candidate-digest, so
+  # the rehearsal exercises the digest-pinned deploy path (`name:tag@sha256:`)
+  # and the gate's pod-imageID assertion, not just a floating tag. Unlike the
+  # release path there is no 35-minute publish poll: a rehearsal targets an
+  # image that already exists, so a missing tag fails fast and red.
+  resolve-rehearsal-digest:
+    name: Resolve rehearsal image digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      backend_digest: ${{ steps.resolve.outputs.backend_digest }}
+    steps:
+      - name: Resolve or verify the backend digest on ghcr.io
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND_TAG: ${{ inputs.backend_tag }}
+          INPUT_DIGEST: ${{ inputs.backend_digest }}
+        run: |
+          set -euo pipefail
+          NAME="artifact-keeper/artifact-keeper-backend"
+
+          if [ -n "${INPUT_DIGEST}" ] && ! [[ "${INPUT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error title=Bad digest input::backend_digest must be 'sha256:<64 hex>' (got '${INPUT_DIGEST}')."
+            exit 1
+          fi
+
+          # Same ghcr token-exchange + Accept headers + HEAD request as
+          # release.yml's resolve-candidate-digest. --proto =https refuses
+          # HTTPS->HTTP redirects so the Bearer token can never leak over
+          # plaintext; awk keeps the LAST Docker-Content-Digest so a
+          # redirected response still yields the final digest.
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          resolve_ghcr_digest() {
+            local name="$1"; local ref="$2"
+            local token digest
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            digest=$(curl -sI --proto =https \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${ref}" \
+              | tr -d '\r' \
+              | awk 'tolower($1) == "docker-content-digest:" { d = $2 } END { print d }')
+            [ -n "${digest}" ] || return 1
+            printf '%s' "${digest}"
+          }
+
+          # Query by the reference we were pinned to: the explicit digest when
+          # given (existence check -- a typo'd digest should fail here, not as
+          # a confusing ImagePullBackOff mid-gate), else the tag.
+          QUERY_REF="${INPUT_DIGEST:-${BACKEND_TAG}}"
+          RESOLVED="$(resolve_ghcr_digest "${NAME}" "${QUERY_REF}" || true)"
+          if [ -z "${RESOLVED}" ]; then
+            echo "::error title=Candidate not found::ghcr.io has no ${NAME} manifest at '${QUERY_REF}'. A rehearsal targets an already-published image -- push/publish it first (docker-publish.yml), or fix the tag/digest input."
+            exit 1
+          fi
+
+          if [ -n "${INPUT_DIGEST}" ] && [ "${RESOLVED}" != "${INPUT_DIGEST}" ]; then
+            echo "::error title=Digest mismatch::ghcr resolved '${QUERY_REF}' to ${RESOLVED}, not the requested ${INPUT_DIGEST}."
+            exit 1
+          fi
+
+          echo "backend_digest=${RESOLVED}" >> "$GITHUB_OUTPUT"
+          echo "Rehearsal candidate: ${NAME}:${BACKEND_TAG}@${RESOLVED}"
+
+  # The same reusable gate the real release runs, with the same secrets
+  # plumbing. `secrets: inherit` resolves GHCR_DOCKER_CONFIG from this repo's
+  # context exactly as release.yml's release-gate job does; nothing downstream
+  # of the gate (build-binaries, verify-images-published, the Release object)
+  # exists here, so a rehearsal can never publish anything.
+  release-gate-rehearsal:
+    name: Release Gate (Rehearsal)
+    needs: [resolve-rehearsal-digest]
+    permissions:
+      contents: read
+      packages: read
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    with:
+      backend_tag: ${{ inputs.backend_tag }}
+      backend_digest: ${{ needs.resolve-rehearsal-digest.outputs.backend_digest }}
+      web_tag: ${{ inputs.web_tag }}
+      test_suite: ${{ inputs.test_suite }}
+      iac_ref: ${{ inputs.iac_ref }}
+      skip_teardown: ${{ inputs.skip_teardown }}
+      run_smoke_with_deps: ${{ inputs.run_smoke_with_deps }}
+    secrets: inherit
