@@ -880,9 +880,32 @@ impl ScanWorkspace {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
+        // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
+        // control files, the archive is unpacked into a dedicated subdirectory
+        // instead of the workspace root, so the archive's namespace and ours
+        // are disjoint. Without that separation a crafted archive could ship an
+        // entry at a control path (e.g. a regular file named
+        // `.ak-scan-shrinkwrap/package`, or a DIRECTORY where a control file
+        // goes) and make the control write fail — silently degrading the scan
+        // to whatever survived. Extraction already rejects `..`/absolute
+        // entries, so confinement here is total.
+        //
+        // Unpinned scans (every hosted upload) write no control files, have no
+        // collision surface, and keep the original flat layout exactly.
+        let extract_root = match pin {
+            Some(_) => {
+                let dir = workspace.join(SCAN_ARCHIVE_SUBDIR);
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                    AppError::Internal(format!("Failed to create scan archive dir: {}", e))
+                })?;
+                dir
+            }
+            None => workspace.clone(),
+        };
+
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
-        let artifact_path = workspace.join(&safe_filename);
+        let artifact_path = extract_root.join(&safe_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await
@@ -891,21 +914,22 @@ impl ScanWorkspace {
             })?;
 
         if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
+            if let Err(e) = Self::extract_archive(&artifact_path, &extract_root).await {
                 warn!(
                     "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
                 );
                 // A breached extraction may have written a partial (potentially
-                // large) tree before aborting. Reset the workspace to just the
-                // original archive so the raw-file fallback scan does not walk
-                // the partial tree (and a bomb cannot leave GiB on the PVC).
+                // large) tree before aborting. Reset the extraction dir to just
+                // the original archive so the raw-file fallback scan does not
+                // walk the partial tree (and a bomb cannot leave GiB on the
+                // PVC). Control files live outside it and are unaffected.
                 if let Err(reset_err) =
-                    Self::reset_workspace(&workspace, &artifact_path, content).await
+                    Self::reset_workspace(&extract_root, &artifact_path, content).await
                 {
                     warn!(
                         "Failed to reset scan workspace {} after extraction failure: {}",
-                        workspace.display(),
+                        extract_root.display(),
                         reset_err
                     );
                 }
@@ -913,7 +937,7 @@ impl ScanWorkspace {
         }
 
         if let Some(pin) = pin {
-            Self::write_component_pin(&workspace, pin).await?;
+            Self::write_component_pin(&workspace, &extract_root, pin).await?;
         }
 
         Ok(workspace)
@@ -932,9 +956,13 @@ impl ScanWorkspace {
     /// the caller a zero-finding "clean" scan of nothing, which is the exact
     /// failure this closes. (The caller's assessment gate would also catch it,
     /// but failing here keeps the reason precise.)
-    async fn write_component_pin(workspace: &Path, pin: &ExpectedComponent) -> Result<()> {
+    async fn write_component_pin(
+        workspace: &Path,
+        extract_root: &Path,
+        pin: &ExpectedComponent,
+    ) -> Result<()> {
         match pin.ecosystem {
-            ComponentEcosystem::Npm => Self::write_npm_lock_pin(workspace, pin).await,
+            ComponentEcosystem::Npm => Self::write_npm_lock_pin(workspace, extract_root, pin).await,
             // Python: syft catalogs `*.dist-info/METADATA` and
             // `*.egg-info/PKG-INFO`, but NOT the root `PKG-INFO` an sdist
             // ships — which is why an ordinary vulnerable sdist graded clean
@@ -985,8 +1013,12 @@ impl ScanWorkspace {
     /// The engine globs `package-lock.json` at any depth and grades every one
     /// it finds (verified: shipped lock + shrinkwrap copy + pin are all
     /// cataloged in a single scan), so the union of these is what gets graded.
-    async fn write_npm_lock_pin(workspace: &Path, pin: &ExpectedComponent) -> Result<()> {
-        Self::stage_shrinkwraps_for_grading(workspace).await;
+    async fn write_npm_lock_pin(
+        workspace: &Path,
+        extract_root: &Path,
+        pin: &ExpectedComponent,
+    ) -> Result<()> {
+        Self::stage_shrinkwraps_for_grading(workspace, extract_root).await?;
 
         // The pin lives in its own directory, so it never collides with a
         // shipped lockfile and never has to displace one.
@@ -1006,13 +1038,18 @@ impl ScanWorkspace {
     /// `package-lock.json` filename, so a vulnerable shrinkwrap graded as
     /// nothing at all. Copied byte-for-byte — no parse, no normalization, so
     /// there is no format for us to get wrong — under a per-source
-    /// subdirectory, because a tarball may ship both a root and a `package/`
-    /// shrinkwrap and they can legitimately differ.
+    /// subdirectory at the workspace ROOT, because a tarball may ship both a
+    /// root and a `package/` shrinkwrap and they can legitimately differ.
     ///
-    /// Best-effort by design: the original is never modified, and a copy that
-    /// fails leaves strictly less signal, never wrong signal. The top-level
-    /// pin (and the assessment gate behind it) is unaffected.
-    async fn stage_shrinkwraps_for_grading(workspace: &Path) {
+    /// FAIL-CLOSED (#3004 follow-up 3): a staging failure is a HARD error. It
+    /// used to warn-and-continue on the reasoning that a failed copy leaves
+    /// "less signal, never wrong signal" — that reasoning is false. The signal
+    /// being dropped is exactly the vulnerable shrinkwrap, and the assessment
+    /// gate only requires the identity PIN to be cataloged, so the scan would
+    /// still come back "clean" and get cached. Erroring here propagates as an
+    /// inconclusive scan (fail-closed 423), which is the honest outcome for
+    /// "we could not grade something this artifact ships".
+    async fn stage_shrinkwraps_for_grading(workspace: &Path, extract_root: &Path) -> Result<()> {
         // Generous vs any real lockfile; bounded so a hostile archive cannot
         // make us duplicate an enormous file into the workspace.
         const SHRINKWRAP_COPY_CAP: u64 = 64 * 1024 * 1024;
@@ -1022,34 +1059,37 @@ impl ScanWorkspace {
 
         for (label, dir) in SOURCES {
             let src = if dir.is_empty() {
-                workspace.join(NPM_SHRINKWRAP_NAME)
+                extract_root.join(NPM_SHRINKWRAP_NAME)
             } else {
-                workspace.join(dir).join(NPM_SHRINKWRAP_NAME)
+                extract_root.join(dir).join(NPM_SHRINKWRAP_NAME)
             };
             match tokio::fs::metadata(&src).await {
                 Ok(meta) if meta.is_file() && meta.len() <= SHRINKWRAP_COPY_CAP => {}
+                // Nothing shipped here (or something that is not a readable
+                // regular file, e.g. a directory of that name) — nothing to
+                // grade from this location.
                 _ => continue,
             }
             let dest_dir = workspace.join(NPM_SHRINKWRAP_SUBDIR).join(label);
-            if let Err(e) = tokio::fs::create_dir_all(&dest_dir).await {
-                warn!(
-                    "Failed to stage {} for grading ({}): {}",
+            tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to stage {} ({}) for grading: {}",
                     NPM_SHRINKWRAP_NAME,
                     dest_dir.display(),
                     e
-                );
-                continue;
-            }
+                ))
+            })?;
             let dest = dest_dir.join(NPM_LOCKFILE_NAME);
-            if let Err(e) = tokio::fs::copy(&src, &dest).await {
-                warn!(
+            tokio::fs::copy(&src, &dest).await.map_err(|e| {
+                AppError::Internal(format!(
                     "Failed to copy {} to {} for grading: {}",
                     src.display(),
                     dest.display(),
                     e
-                );
-            }
+                ))
+            })?;
         }
+        Ok(())
     }
 
     /// Write one pin file (creating parents), mapping IO failure onto the
@@ -1202,17 +1242,29 @@ impl ScanWorkspace {
 /// the preserve-fallback subdirectory pin gradeable.
 pub(crate) const NPM_LOCKFILE_NAME: &str = "package-lock.json";
 
-/// Where the top-level identity pin is written — always its own subdirectory,
-/// never a path an archive can occupy, so no shipped file is ever displaced.
+/// Where an archive's OWN bytes are unpacked when the scan also writes control
+/// files (#3004 follow-up 3).
+///
+/// Control files (the identity pin, staged shrinkwraps) live at the workspace
+/// ROOT; the archive is confined to this SIBLING subdirectory. Extraction
+/// already rejects `..`/absolute entries, so an archive can only ever create
+/// paths beneath here — it cannot pre-create, shadow, or collide with a
+/// control path. That containment is what makes the control writes reliable,
+/// rather than a list of names we hope no archive ships.
+pub(crate) const SCAN_ARCHIVE_SUBDIR: &str = "pkg";
+
+/// Where the top-level identity pin is written — its own subdirectory at the
+/// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`], so no shipped file can
+/// displace it.
 pub(crate) const NPM_PIN_SUBDIR: &str = ".ak-scan-pin";
 
 /// The lockfile npm HONORS over `package-lock.json` but the CVE engine does
 /// not catalog, so a vulnerable one was invisible until it is staged.
 pub(crate) const NPM_SHRINKWRAP_NAME: &str = "npm-shrinkwrap.json";
 
-/// Where shipped shrinkwraps are copied (verbatim) so they get graded. One
-/// subdirectory per source location, since a root and a `package/` shrinkwrap
-/// can legitimately differ.
+/// Where shipped shrinkwraps are copied (verbatim) so they get graded. At the
+/// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`]. One subdirectory per source
+/// location, since a root and a `package/` shrinkwrap can legitimately differ.
 pub(crate) const NPM_SHRINKWRAP_SUBDIR: &str = ".ak-scan-shrinkwrap";
 
 /// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
@@ -7911,7 +7963,9 @@ mod tests {
             .await
             .expect("prepare_pinned");
 
-            let kept = tokio::fs::read(workspace.join(path)).await.expect(path);
+            let kept = tokio::fs::read(workspace.join(SCAN_ARCHIVE_SUBDIR).join(path))
+                .await
+                .expect(path);
             assert_eq!(
                 kept,
                 &shipped[..],
@@ -7924,6 +7978,162 @@ mod tests {
 
             ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
         }
+    }
+
+    /// #3004 follow-up 3: THE collision class. An archive used to unpack into
+    /// the same directory the control files are written to, so an entry named
+    /// after a control path could make the control write fail. Shrinkwrap
+    /// staging was best-effort, so the failure silently degraded the scan to
+    /// "pin only" and a vulnerable shrinkwrap graded clean.
+    ///
+    /// Namespace isolation removes the collision entirely: the archive can only
+    /// write under its own subdirectory, so these entries land harmlessly there
+    /// and staging still succeeds.
+    #[tokio::test]
+    async fn test_prepare_pinned_archive_cannot_collide_with_control_paths() {
+        let sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
+        // Collision A: a regular FILE where the staging directory goes.
+        // Collision B: a file UNDER the pin's directory path.
+        // Collision C: a benign decoy at the pin's exact path.
+        type Entries<'a> = Vec<(&'a str, &'a [u8])>;
+        let shapes: Vec<(&str, Entries<'_>)> = vec![
+            (
+                "file-at-staging-dir",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (".ak-scan-shrinkwrap/package", b"collide".as_ref()),
+                ],
+            ),
+            (
+                "file-under-staging-path",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (
+                        ".ak-scan-shrinkwrap/package/package-lock.json/x",
+                        b"collide".as_ref(),
+                    ),
+                ],
+            ),
+            (
+                "decoy-at-pin-path",
+                vec![
+                    ("package/npm-shrinkwrap.json", sw.as_ref()),
+                    (
+                        ".ak-scan-pin/package-lock.json",
+                        br#"{"lockfileVersion":3,"packages":{"node_modules/widget":{"version":"0.0.1"}}}"#
+                            .as_ref(),
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, entries) in shapes {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let tgz = write_npm_tgz_with_entries(tmp.path(), "widget-1.0.0.tgz", &entries);
+            let content = Bytes::from(std::fs::read(&tgz).unwrap());
+            let artifact = test_helpers::make_test_artifact(
+                "widget-1.0.0.tgz",
+                "application/gzip",
+                "widget-1.0.0.tgz",
+            );
+            let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+            let base = tmp.path().join("ws-base");
+            let workspace = ScanWorkspace::prepare_pinned(
+                base.to_str().unwrap(),
+                None,
+                &artifact,
+                &content,
+                Some(&pin),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: prepare_pinned must succeed, got {e}"));
+
+            // The vulnerable shrinkwrap IS staged for grading...
+            let staged = tokio::fs::read(
+                workspace
+                    .join(NPM_SHRINKWRAP_SUBDIR)
+                    .join("package")
+                    .join(NPM_LOCKFILE_NAME),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: shrinkwrap must still be staged, got {e}"));
+            assert_eq!(staged, &sw[..], "{label}: staged verbatim");
+
+            // ...and the pin is OURS, at the authoritative version, not the
+            // decoy's.
+            let pinned =
+                tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: pin must exist, got {e}"));
+            let v: serde_json::Value = serde_json::from_str(&pinned).unwrap();
+            assert_eq!(
+                v["packages"]["node_modules/widget"]["version"], "1.0.0",
+                "{label}: the request coordinate must win over a shipped decoy"
+            );
+
+            // The colliding entries landed in the archive's own namespace.
+            assert!(
+                workspace.join(SCAN_ARCHIVE_SUBDIR).exists(),
+                "{label}: archive namespace"
+            );
+
+            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
+        }
+    }
+
+    /// Staging is FAIL-CLOSED: if a shipped shrinkwrap cannot be staged for
+    /// grading, `prepare_pinned` errors (-> inconclusive -> 423) instead of
+    /// returning a workspace whose scan would report a confident "clean".
+    /// Simulated by making the staging destination unwritable.
+    #[tokio::test]
+    async fn test_prepare_pinned_staging_failure_is_hard_error() {
+        let sw =
+            br#"{"lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.11"}}}"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_npm_tgz_with_entries(
+            tmp.path(),
+            "widget-1.0.0.tgz",
+            &[("npm-shrinkwrap.json", sw.as_ref())],
+        );
+        let content = Bytes::from(std::fs::read(&tgz).unwrap());
+        let artifact = test_helpers::make_test_artifact(
+            "widget-1.0.0.tgz",
+            "application/gzip",
+            "widget-1.0.0.tgz",
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::Npm, "widget", "1.0.0");
+
+        // Pre-create the workspace with the staging path occupied by a file the
+        // copy cannot overwrite (a directory in the destination's place).
+        let base = tmp.path().join("ws-base");
+        let workspace = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+        tokio::fs::create_dir_all(
+            workspace
+                .join(NPM_SHRINKWRAP_SUBDIR)
+                .join("root")
+                .join(NPM_LOCKFILE_NAME),
+        )
+        .await
+        .expect("occupy the staging destination with a directory");
+
+        let result = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            Some(&pin),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a shrinkwrap that cannot be staged must fail the scan closed, \
+             never yield a workspace that grades as clean"
+        );
+
+        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3004 follow-up 2, HIGH-2 regression: the CVE engine does not catalog
@@ -7986,11 +8196,15 @@ mod tests {
         .expect("package/ shrinkwrap must be staged for grading");
         assert_eq!(staged_pkg, &pkg_sw[..]);
 
-        // ...and the originals are untouched.
+        // ...and the originals are untouched, inside the archive's own namespace.
         assert_eq!(
-            tokio::fs::read(workspace.join(NPM_SHRINKWRAP_NAME))
-                .await
-                .unwrap(),
+            tokio::fs::read(
+                workspace
+                    .join(SCAN_ARCHIVE_SUBDIR)
+                    .join(NPM_SHRINKWRAP_NAME)
+            )
+            .await
+            .unwrap(),
             &root_sw[..]
         );
 
@@ -8063,6 +8277,13 @@ mod tests {
             !workspace.join("package-lock.json").exists(),
             "the pin must never occupy a path an archive could ship"
         );
+        // The archive's own bytes live in their own namespace, disjoint from
+        // every control path.
+        assert!(workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("package")
+            .join("package.json")
+            .exists());
 
         ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
