@@ -431,6 +431,7 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"{}"),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: "\"test-etag\"".to_string(),
         }
     }
 

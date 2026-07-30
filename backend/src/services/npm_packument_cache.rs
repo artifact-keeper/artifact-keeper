@@ -139,11 +139,18 @@ const REDIS_UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(5);
 /// reproduce the response. `content_encoding` is set (`gzip`) only when the
 /// bytes are gzip-compressed; the metadata compression layer passes through
 /// responses that already carry a `Content-Encoding` header.
+///
+/// `etag` is always computed from the *identity* (uncompressed) body, so the
+/// identity and gzip variants of one packument share a single ETag. A client's
+/// `If-None-Match` therefore revalidates successfully no matter which variant
+/// it holds, and no matter whether the response came from this cache or from
+/// the uncached per-request path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedPackument {
     pub bytes: Bytes,
     pub content_type: String,
     pub content_encoding: Option<String>,
+    pub etag: String,
 }
 
 /// A successful cache read: the entry plus its age, so freshness is always
@@ -451,7 +458,12 @@ impl PackumentCacheBackend for InProcessPackumentCache {
 
 /// Version tag leading every encoded Redis value, so a future layout change
 /// can never be misparsed as the current one.
-const REDIS_ENTRY_VERSION: u8 = 1;
+///
+/// Bumped to 2 when `etag` joined [`CachedPackument`]: a v1 value carries no
+/// ETag, so it is rejected by [`decode_redis_entry`] and surfaces as a miss
+/// that recomputes. That is the intended upgrade path — serving a v1 entry
+/// with a fabricated ETag would hand clients a tag that never revalidates.
+const REDIS_ENTRY_VERSION: u8 = 2;
 
 /// Milliseconds since the Unix epoch. Redis entries store their write time so
 /// freshness is computed client-side; wall-clock time (not `Instant`) because
@@ -465,7 +477,10 @@ fn now_unix_ms() -> u64 {
 
 /// Serialize an entry for Redis:
 /// `version(1) | stored_at_ms(8 BE) | ct_len(2 BE) | content_type |
-///  enc_len(1) | content_encoding | body`.
+///  enc_len(1) | content_encoding | etag_len(1) | etag | body`.
+///
+/// `etag` precedes the body for the same reason the other headers do: every
+/// field but the body is length-prefixed, so the body is whatever remains.
 fn encode_redis_entry(entry: &CachedPackument, stored_at_ms: u64) -> Vec<u8> {
     let ct = entry.content_type.as_bytes();
     let enc = entry
@@ -473,13 +488,16 @@ fn encode_redis_entry(entry: &CachedPackument, stored_at_ms: u64) -> Vec<u8> {
         .as_deref()
         .unwrap_or_default()
         .as_bytes();
-    let mut out = Vec::with_capacity(12 + ct.len() + enc.len() + entry.bytes.len());
+    let etag = entry.etag.as_bytes();
+    let mut out = Vec::with_capacity(13 + ct.len() + enc.len() + etag.len() + entry.bytes.len());
     out.push(REDIS_ENTRY_VERSION);
     out.extend_from_slice(&stored_at_ms.to_be_bytes());
     out.extend_from_slice(&(ct.len().min(u16::MAX as usize) as u16).to_be_bytes());
     out.extend_from_slice(&ct[..ct.len().min(u16::MAX as usize)]);
     out.push(enc.len().min(u8::MAX as usize) as u8);
     out.extend_from_slice(&enc[..enc.len().min(u8::MAX as usize)]);
+    out.push(etag.len().min(u8::MAX as usize) as u8);
+    out.extend_from_slice(&etag[..etag.len().min(u8::MAX as usize)]);
     out.extend_from_slice(&entry.bytes);
     out
 }
@@ -502,12 +520,21 @@ fn decode_redis_entry(raw: &[u8]) -> Option<(CachedPackument, u64)> {
     } else {
         Some(String::from_utf8(encoding.to_vec()).ok()?)
     };
-    let body = raw.get(enc_end..)?;
+    let etag_len = *raw.get(enc_end)? as usize;
+    let etag_end = enc_end.checked_add(1)?.checked_add(etag_len)?;
+    let etag = String::from_utf8(raw.get(enc_end + 1..etag_end)?.to_vec()).ok()?;
+    // An entry without an ETag could not be revalidated, so reject it rather
+    // than serve a response whose `If-None-Match` can never match.
+    if etag.is_empty() {
+        return None;
+    }
+    let body = raw.get(etag_end..)?;
     Some((
         CachedPackument {
             bytes: Bytes::copy_from_slice(body),
             content_type,
             content_encoding,
+            etag,
         },
         stored_at_ms,
     ))
@@ -1261,6 +1288,7 @@ mod tests {
             bytes: Bytes::from_static(body),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: "\"test-etag\"".to_string(),
         }
     }
 
@@ -1269,6 +1297,7 @@ mod tests {
             bytes: Bytes::from_static(body),
             content_type: "application/vnd.npm.install-v1+json".to_string(),
             content_encoding: Some("gzip".to_string()),
+            etag: "\"test-etag-gz\"".to_string(),
         }
     }
 
@@ -1507,9 +1536,23 @@ mod tests {
             bytes: Bytes::new(),
             content_type: "application/json".to_string(),
             content_encoding: None,
+            etag: "\"empty\"".to_string(),
         };
         let (decoded, _) = decode_redis_entry(&encode_redis_entry(&e, 7)).expect("decode");
         assert_eq!(decoded, e);
+    }
+
+    #[test]
+    fn redis_entry_decode_rejects_entry_without_etag() {
+        // A v1 layout (no ETag field) re-tagged as v2 must be rejected rather
+        // than decoded into an entry whose `If-None-Match` could never match.
+        let e = CachedPackument {
+            bytes: Bytes::from_static(b"{}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+            etag: String::new(),
+        };
+        assert!(decode_redis_entry(&encode_redis_entry(&e, 7)).is_none());
     }
 
     #[test]
