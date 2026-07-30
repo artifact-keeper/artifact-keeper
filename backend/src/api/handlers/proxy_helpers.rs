@@ -5055,13 +5055,44 @@ pub(crate) fn is_over_cap_error(e: &AppError) -> bool {
     matches!(e, AppError::BadGateway(m) if m.contains("exceeded") && m.contains("limit"))
 }
 
+/// HOW the inline proxy gate must scan the buffered bytes (#3003 PR-2).
+///
+/// The digest-verdict state machine ([`gate_proxy_scan_serve`]) is identical
+/// for every format; what differs is the scan invocation the bytes need:
+#[derive(Clone)]
+pub(crate) enum ProxyScanMode {
+    /// The bytes ARE the scannable unit (a PyPI wheel, an npm tarball):
+    /// file/archive scan over the synthetic artifact. Pre-#3003-PR-2 behavior.
+    File,
+    /// The bytes are an OCI IMAGE MANIFEST: the scannable unit is the whole
+    /// image (config + layers). The scan stages any missing blobs from
+    /// upstream into local storage (bounded by the shared byte cap) and runs
+    /// the CVE engine over a local `oci-dir:` reassembly — never a
+    /// `registry:` pull back through our own serve path.
+    OciImage(OciImageScanCtx),
+}
+
+/// Owned repository routing context for [`ProxyScanMode::OciImage`], carried
+/// into the async fail-open scan task (must be `'static`).
+#[derive(Clone)]
+pub(crate) struct OciImageScanCtx {
+    pub repo_id: Uuid,
+    pub repo_key: String,
+    pub repo_type: String,
+    pub location: crate::storage::StorageLocation,
+    /// Image name within the repository (upstream blob fetch path shape).
+    pub image: String,
+    pub upstream_url: Option<String>,
+}
+
 /// Run the leaf scanners over the buffered bytes within the inline budget and
 /// persist the digest-keyed verdict. The caller supplies the format-specific
 /// `synthetic` [`Artifact`](crate::models::artifact::Artifact) (filename /
-/// content-type drive scanner applicability + archive extraction). Returns the
-/// verdict, or `None` when the scan was inconclusive (no scanner configured,
-/// budget exceeded, or scanner error) — the caller maps `None` onto the
-/// fail-open/closed decision.
+/// content-type drive scanner applicability + archive extraction) and the
+/// [`ProxyScanMode`] selecting the scan invocation. Returns the verdict, or
+/// `None` when the scan was inconclusive (no scanner configured, budget
+/// exceeded, blob staging failed, or scanner error) — the caller maps `None`
+/// onto the fail-open/closed decision.
 pub(crate) async fn proxy_scan_and_record(
     state: &crate::api::SharedState,
     repo_id: Uuid,
@@ -5069,16 +5100,32 @@ pub(crate) async fn proxy_scan_and_record(
     synthetic: &crate::models::artifact::Artifact,
     bytes: &Bytes,
     expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    mode: &ProxyScanMode,
 ) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
     let scanner = state.scanner_service.as_ref()?;
     let filename = synthetic.name.clone();
-    let scan_fut = scanner.scan_content_expecting(synthetic, bytes, expected);
-    let verdict = match tokio::time::timeout(
-        crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
-        scan_fut,
-    )
-    .await
-    {
+    // The OCI budget is wider: blob staging (an upstream fetch the file
+    // formats pay BEFORE the gate) happens inside it.
+    let budget = match mode {
+        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::OciImage(_) => {
+            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
+        }
+    };
+    let scan_fut = async {
+        match mode {
+            ProxyScanMode::File => {
+                scanner
+                    .scan_content_expecting(synthetic, bytes, expected)
+                    .await
+            }
+            ProxyScanMode::OciImage(ctx) => {
+                crate::api::handlers::oci_v2::oci_stage_and_scan_image(state, ctx, synthetic, bytes)
+                    .await
+            }
+        }
+    };
+    let verdict = match tokio::time::timeout(budget, scan_fut).await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(
@@ -5172,6 +5219,7 @@ pub(crate) async fn gate_proxy_scan_serve(
     bytes: &Bytes,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     identity: ProxyScanIdentity,
+    mode: ProxyScanMode,
 ) -> ProxyScanServeOutcome {
     use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
 
@@ -5221,7 +5269,9 @@ pub(crate) async fn gate_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
-            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected).await {
+            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
+                .await
+            {
                 Some(verdict) if verdict.is_vulnerable() => {
                     tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
                     ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
@@ -5274,6 +5324,7 @@ pub(crate) async fn gate_proxy_scan_serve(
                     &synthetic,
                     &bytes_bg,
                     expected.as_ref(),
+                    &mode,
                 )
                 .await;
             });

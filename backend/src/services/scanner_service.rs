@@ -98,6 +98,18 @@ pub const PROXY_SCAN_MAX_BYTES: usize = 200 * 1024 * 1024;
 /// is treated as inconclusive (fail-open serves-with-pending, fail-closed 423).
 pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 
+/// Wall-clock budget for a single inline OCI image proxy scan (#3003 PR-2).
+///
+/// Wider than [`PROXY_SCAN_INLINE_BUDGET`] because the OCI manifest gate does
+/// strictly more inside the budget: on a cold proxy pull it eager-fetches the
+/// config + layer blobs from the upstream registry (bounded by
+/// [`PROXY_SCAN_MAX_BYTES`]) and reassembles an `oci-dir:` layout before Grype
+/// runs, whereas the file formats fetch their bytes BEFORE the gate. `docker
+/// pull` tolerates a slow manifest GET (no client-side per-request deadline by
+/// default), and budget-exceeded remains inconclusive (fail-open serves
+/// pending, fail-closed 423) — never an unscanned serve.
+pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
+
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
 /// multi-GiB artifacts off anon heap so the cgroup OOM killer leaves the
@@ -2279,6 +2291,20 @@ pub struct ScanTarget<'a> {
     /// identity. `None` (hosted upload scans, legacy callers, unit tests)
     /// keeps the prior behavior exactly.
     pub expected_component: Option<&'a ExpectedComponent>,
+    /// Require the CVE-authoritative engine to have CATALOGED at least one
+    /// gradeable component before a non-error verdict is trusted (#3003 PR-2,
+    /// the OCI image analogue of `expected_component`).
+    ///
+    /// A container image has no single `name@version` coordinate to pin, so
+    /// the file-format identity check does not apply — but the same blindness
+    /// does: an engine that ran over an image it could not unpack/grade
+    /// reports zero findings, indistinguishable from clean. When set,
+    /// [`run_inline_proxy_scanners_target`] treats "no catalog reported"
+    /// (`None`) and "cataloged nothing" (`Some(empty)`) both as INCONCLUSIVE,
+    /// so the caller's fail-closed branch withholds (423) instead of serving
+    /// a false clean. `false` (hosted upload scans, file formats, unit tests)
+    /// keeps prior behavior exactly.
+    pub require_nonempty_catalog: bool,
 }
 
 /// The package ecosystem an [`ExpectedComponent`] belongs to. Selects both the
@@ -2601,6 +2627,36 @@ async fn run_inline_proxy_scanners_target(
                     .to_string(),
             ));
         }
+    }
+
+    // #3003 PR-2 (OCI images): same blindness, different identity model. An
+    // image has no `name@version` coordinate to pin, so `expected_component`
+    // cannot apply — but a CVE engine that ran over an image it could not
+    // unpack/grade still reports zero findings, indistinguishable from clean.
+    // When the serve path demands it, require the engine to have actually
+    // cataloged SOMETHING for this image before a ZERO-FINDING result is
+    // trusted as clean. A verdict WITH findings is vulnerable regardless of
+    // the catalog side channel — blocking is never gated on it. Unlike the
+    // expected-component gate above, a `None` catalog is NOT "keep prior
+    // behavior" here: the OCI callers only set this flag on the inline proxy
+    // gate, where "the engine could not report what it graded" must fail
+    // closed, not serve clean.
+    if target.require_nonempty_catalog
+        && findings.is_empty()
+        && !cve_cataloged.as_ref().is_some_and(|c| !c.is_empty())
+    {
+        warn!(
+            artifact = %synthetic.name,
+            catalog_reported = cve_cataloged.is_some(),
+            "inline proxy scan: CVE engine cataloged no components for the served \
+             image; zero findings does not mean clean -> inconclusive"
+        );
+        return Err(AppError::Internal(
+            "CVE-authoritative scanner cataloged no gradeable component for the \
+             served image; verdict inconclusive (a zero-finding scan of nothing \
+             is not a clean verdict)"
+                .to_string(),
+        ));
     }
 
     Ok(aggregate_proxy_verdict(&findings, scanner_version))
@@ -4224,6 +4280,7 @@ impl ScannerService {
             storage: None,
             manifest_body: None,
             expected_component: expected,
+            require_nonempty_catalog: false,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -4415,6 +4472,7 @@ impl ScannerService {
             // manifest artifacts; the gate ignores it for everything else.
             manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         for scanner in &self.scanners {
@@ -7203,6 +7261,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(oci_target_is_scannable_image(&target));
     }
@@ -7222,6 +7281,7 @@ mod tests {
             storage: None,
             manifest_body: Some(HELM_OCI_MANIFEST_BODY),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(!oci_target_is_scannable_image(&target));
     }
@@ -14869,6 +14929,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         }
     }
 
@@ -14918,6 +14979,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: Some(expected),
+            require_nonempty_catalog: false,
         }
     }
 
@@ -15056,6 +15118,140 @@ mod tests {
                 .is_ok(),
             "callers that supply no coordinate keep the prior behavior exactly"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3003 PR-2: the OCI image analogue of the assessment gate.
+    // An image has no name@version coordinate to pin, so the serve path sets
+    // `require_nonempty_catalog` instead: the CVE engine must have actually
+    // cataloged SOMETHING for the image before a non-error verdict is
+    // trusted, and — unlike the file-format gate — "no catalog signal at
+    // all" (`None`) is ALSO inconclusive, because Grype's registry-mode
+    // fallback reports no catalog and must not pass as a graded clean.
+    // -----------------------------------------------------------------------
+
+    fn oci_image_artifact() -> Artifact {
+        test_helpers::make_test_artifact(
+            "library/debian:buster",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/debian/manifests/buster",
+        )
+    }
+
+    fn require_catalog_target(artifact: &Artifact) -> ScanTarget<'_> {
+        ScanTarget {
+            artifact,
+            repository_key: "docker-proxy",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: true,
+        }
+    }
+
+    /// THE OCI discriminator, half 1: the engine RAN `Ok` with zero findings
+    /// but cataloged NOTHING for the image. Zero findings over an image the
+    /// engine could not unpack/grade is not clean -> inconclusive (423 under
+    /// fail-closed).
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_empty_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "an engine that cataloged nothing for the image must be inconclusive"
+        );
+    }
+
+    /// THE OCI discriminator, half 2: NO catalog signal (`None`) is ALSO
+    /// inconclusive when the catalog is required. This is what keeps a
+    /// registry-mode fallback (which reports no catalog) or a broken BOM side
+    /// channel from silently passing as a graded clean.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_absent_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> =
+            vec![Arc::new(CatalogingCveScanner { cataloged: None })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "no catalog signal must be inconclusive when the caller requires a catalog"
+        );
+    }
+
+    /// The control that keeps the OCI gate honest: a genuinely clean image
+    /// the engine DID catalog stays clean — the hardening must not turn
+    /// every clean pull into a 423.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_cataloged_clean_stays_clean() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(vec![CatalogedComponent {
+                name: "base-files".into(),
+                version: "10.3+deb10u13".into(),
+            }]),
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("a cataloged, finding-free image scan is a clean verdict");
+        assert!(!verdict.is_vulnerable());
+    }
+
+    /// A verdict WITH findings is vulnerable regardless of the catalog side
+    /// channel: blocking (403) must never be downgraded to inconclusive (423)
+    /// just because the BOM was unavailable. The catalog requirement guards
+    /// only the zero-findings/false-clean direction.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_findings_block_even_without_catalog() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Critical,
+        })];
+        let artifact = oci_image_artifact();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("findings must yield a vulnerable verdict, not inconclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// Blast-radius control: with the flag OFF (hosted upload scans, file
+    /// formats), an absent/empty catalog keeps prior behavior exactly.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_oci_flag_off_keeps_prior_behavior() {
+        use std::sync::Arc;
+
+        for cataloged in [None, Some(Vec::new())] {
+            let scanners: Vec<Arc<dyn Scanner>> =
+                vec![Arc::new(CatalogingCveScanner { cataloged })];
+            let artifact = oci_image_artifact();
+            let target = inline_scan_target(&artifact);
+            assert!(
+                run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                    .await
+                    .is_ok(),
+                "callers that do not require a catalog keep the prior behavior exactly"
+            );
+        }
     }
 
     /// The #2954 gate still outranks the #3003 one: a Grype ERROR is
@@ -15669,6 +15865,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -15694,6 +15891,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         assert!(scanner.is_applicable_for_target(&target));

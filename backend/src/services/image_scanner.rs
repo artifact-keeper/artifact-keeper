@@ -1048,6 +1048,7 @@ mod tests {
             storage: None,
             manifest_body: Some(helm_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(!scanner.is_applicable_for_target(&target));
     }
@@ -1072,6 +1073,7 @@ mod tests {
             storage: None,
             manifest_body: Some(image_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(scanner.is_applicable_for_target(&target));
     }
@@ -1094,6 +1096,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(scanner.is_applicable_for_target(&target));
     }
@@ -1372,6 +1375,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         let result = scanner.scan_target(&target, None, &Bytes::new()).await;
         assert!(

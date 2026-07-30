@@ -2836,7 +2836,15 @@ async fn serve_scanned_pypi_file(
     // the #2954 fail-closed contract enforced inside the shared scanner loop.
     let synthetic = pypi_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
     match proxy_helpers::gate_proxy_scan_serve(
-        state, repo_id, filename, &digest, synthetic, &bytes, action, identity,
+        state,
+        repo_id,
+        filename,
+        &digest,
+        synthetic,
+        &bytes,
+        action,
+        identity,
+        proxy_helpers::ProxyScanMode::File,
     )
     .await
     {

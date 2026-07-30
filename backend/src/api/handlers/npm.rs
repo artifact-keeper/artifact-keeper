@@ -3295,7 +3295,15 @@ async fn serve_scanned_npm_tarball(
 
     let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
     match proxy_helpers::gate_proxy_scan_serve(
-        state, repo_id, filename, &digest, synthetic, &bytes, action, identity,
+        state,
+        repo_id,
+        filename,
+        &digest,
+        synthetic,
+        &bytes,
+        action,
+        identity,
+        proxy_helpers::ProxyScanMode::File,
     )
     .await
     {

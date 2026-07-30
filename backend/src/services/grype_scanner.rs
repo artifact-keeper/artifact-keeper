@@ -759,22 +759,30 @@ impl GrypeScanner {
 
         let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
         info!("Grype OCI local layout scan target: {}", grype_target);
-        // Local OCI layout: no registry pull, so no registry-auth env.
-        let result = match self.run_grype_target(&grype_target, &[]).await {
-            Ok(report) => {
+        // Keep the BOM out of the layout tree: grype scans the whole dir.
+        let bom_path = layout_dir.with_extension("grype-bom.json");
+        // Local OCI layout: no registry pull, so no registry-auth env. The
+        // catalog side channel (#3003 PR-2) rides the same single invocation
+        // so the inline OCI proxy gate can tell "clean" from "graded nothing".
+        let result = match self
+            .run_grype_with_catalog(&grype_target, &bom_path, &[])
+            .await
+        {
+            Ok((report, cataloged)) => {
                 let findings = Self::convert_findings(&report);
                 let packages = Self::convert_packages(&report);
                 info!(
-                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components",
+                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components, {} cataloged",
                     artifact.name,
                     findings.len(),
-                    packages.len()
+                    packages.len(),
+                    cataloged.as_ref().map_or(0, |c| c.len()),
                 );
                 Ok(ScanOutput {
                     findings,
                     packages,
                     scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
-                    cataloged: None,
+                    cataloged,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -1019,11 +1027,25 @@ impl GrypeScanner {
         // Keep the BOM out of the scanned tree: writing it inside `workspace`
         // would make the next catalog include our own artifact.
         let bom_path = workspace.with_extension("grype-bom.json");
+        self.run_grype_with_catalog(&dir_arg, &bom_path, &[]).await
+    }
 
+    /// Target-agnostic core of [`run_grype_dir_with_catalog`], shared with the
+    /// `oci-dir:` layout scan (#3003 PR-2) so the OCI inline proxy gate gets
+    /// the same catalog signal the file formats do. One grype subprocess per
+    /// scan: the json report and the cyclonedx BOM come from the SAME
+    /// invocation (a second scan would double the inline budget on every
+    /// proxy pull).
+    async fn run_grype_with_catalog(
+        &self,
+        scan_arg: &str,
+        bom_path: &Path,
+        auth_env: &[(&'static str, String)],
+    ) -> Result<(GrypeReport, Option<Vec<CatalogedComponent>>)> {
         let mut command = tokio::process::Command::new("grype");
         command
             .args([
-                dir_arg.as_str(),
+                scan_arg,
                 "-o",
                 "json",
                 "-o",
@@ -1032,6 +1054,12 @@ impl GrypeScanner {
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // Registry-auth env for a scoped private-repo pull (#2093). Applied as
+        // child-process env only — never persisted or logged. Empty for local
+        // (dir-mode / oci-dir-mode) and anonymous registry scans.
+        for (key, value) in auth_env {
+            command.env(key, value);
+        }
         let output = command
             .output()
             .await
@@ -1634,8 +1662,8 @@ mod tests {
     fn test_catalog_invocation_is_single_run_dual_output() {
         let src = include_str!("grype_scanner.rs");
         let start = src
-            .find("async fn run_grype_dir_with_catalog")
-            .expect("run_grype_dir_with_catalog must exist");
+            .find("async fn run_grype_with_catalog")
+            .expect("run_grype_with_catalog must exist");
         let body = &src[start..start + 2000];
         assert!(
             body.contains("\"-o\",\n                \"json\",") || body.contains("\"json\","),
@@ -2010,6 +2038,7 @@ mod tests {
             storage: None,
             manifest_body: Some(helm_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(
             !grype().is_applicable_for_target(&target),
@@ -2038,6 +2067,7 @@ mod tests {
             storage: None,
             manifest_body: Some(image_body),
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(grype().is_applicable_for_target(&target));
     }
@@ -2326,6 +2356,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -2373,6 +2404,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -2440,6 +2472,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let layout = scanner
@@ -2545,6 +2578,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let layout = scanner
@@ -2624,6 +2658,7 @@ mod tests {
             storage: Some(fx.state.storage.as_ref()),
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -2671,6 +2706,7 @@ mod tests {
             storage: None,
             manifest_body: None,
             expected_component: None,
+            require_nonempty_catalog: false,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 
