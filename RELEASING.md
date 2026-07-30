@@ -15,6 +15,19 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    issues you still intend to ship, and `main` is green (CI Complete on the
    release candidate commit).
 
+   Then run the **release preflight** and get a `READY` before you tag:
+
+   ```bash
+   scripts/ci/release-preflight.sh          # local (needs an authenticated gh)
+   # or, from the Actions UI: run the "Release Preflight" workflow
+   ```
+
+   It asserts main is actually releasable — `.trivyignore` covers every
+   active `release/*` branch's suppressions (the drift that stalled
+   v1.7.0-rc.1 at Security Scan, #3039), the version set is consistent, and
+   main's last Docker Publish cleanly published its manifest. A `NOT READY`
+   (exit 1) means fix main first; tagging over it costs a full re-cut cycle.
+
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
    all of them in one PR (or one PR per repo):
