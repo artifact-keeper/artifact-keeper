@@ -235,19 +235,91 @@ const NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS: [&str; 6] = [
     "wasm",                        // WASM module payload (application/wasm, ...+wasm)
 ];
 
+/// True when `media_type` is a real container **rootfs layer** — the thing a
+/// runtime actually unpacks into the filesystem it runs, and therefore the
+/// only kind of layer that can carry vulnerable content.
+///
+/// Deliberately shaped as "is a tar stream AND is not a known non-image
+/// payload" rather than an allow-list of exact strings, so the OCI/Docker
+/// variants (`tar`, `tar+gzip`, `tar+zstd`, `nondistributable`, Docker's
+/// `rootfs.diff.tar.gzip` / `foreign.diff.tar.gzip`) are all covered without
+/// enumerating them. The marker exclusion is what keeps a Helm chart payload
+/// (`vnd.cncf.helm.chart.content.v1.tar+gzip` — a tar, but not a rootfs)
+/// from counting.
+fn is_container_rootfs_layer(media_type: &str) -> bool {
+    let mt = media_type.to_ascii_lowercase();
+    mt.contains("tar")
+        && !NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
+            .iter()
+            .any(|marker| mt.contains(marker))
+}
+
+/// Would a container runtime RUN this manifest body as an image? (#3003 PR-2,
+/// round 2.)
+///
+/// This is the consumer-faithful predicate the inline proxy scan gate keys on.
+/// It answers exactly one question — "can these bytes become a running
+/// container?" — and it answers it from the two things a runtime actually
+/// requires:
+///
+///   1. an **image config** descriptor ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]),
+///      and
+///   2. at least one **real rootfs layer** ([`is_container_rootfs_layer`]).
+///
+/// Everything else in the body is ignored ON PURPOSE, because everything else
+/// is attacker-controllable decoration that does not change what runs:
+///
+/// * A co-present `manifests` array does NOT make it an index. A body with a
+///   real config + real layers *and* a cosmetic `"manifests": []` is still a
+///   runnable image; a classifier that checked `manifests` first would call it
+///   an index and wave it through unscanned.
+/// * A decoy non-image layer (a lone `vnd.dev.cosign…` / `…+wasm` /
+///   `spdx` descriptor sitting next to the real `tar+gzip` layer) does NOT
+///   make it a signature or an SBOM. The runtime still unpacks the real layer.
+///   The decoy layer is simply not a catalog source — it is not an exemption.
+///
+/// Both of those were live bypasses of the first cut of this gate: the
+/// vulnerable image was served `200` unscanned because the classifier
+/// disagreed with what `docker pull` would actually run.
+///
+/// Returns `false` for a pure index (no config of its own — the platform child
+/// the client resolves next re-enters this gate and IS scanned), for genuine
+/// non-image OCI artifacts (Helm charts, cosign signatures, SBOM/attestation,
+/// WASM modules — no image config and/or no rootfs layer), for an image config
+/// with no layers (nothing to unpack, nothing to grade), and for an
+/// unparseable body (not a consumable image; the cache path already refuses to
+/// tag one).
+pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
+    let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
+        return false;
+    };
+    let has_image_config = manifest.config.as_ref().is_some_and(|config| {
+        CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
+            .iter()
+            .any(|allowed| config.media_type == *allowed)
+    });
+    if !has_image_config {
+        return false;
+    }
+    manifest
+        .layers
+        .iter()
+        .any(|layer| is_container_rootfs_layer(&layer.media_type))
+}
+
 /// Decide whether an already-loaded OCI manifest `body` describes a real
 /// container image that the image-vuln scanners should run on.
 ///
 /// Default-DENY. Returns `true` only when:
-///   * the body is an image **index** / manifest list (top-level `manifests`
-///     array): indexes carry no config, and `resolve_scan_reference` (#1971,
-///     #1992, #2054) rewrites the reference to a concrete scannable child,
-///     so an index must NEVER be denied at the gate; OR
-///   * the body is a single manifest whose `config.mediaType` is a container
-///     image config ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]) AND none of its
-///     `layers[].mediaType` is a known non-image marker
-///     ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]) — the layer guard rejects
-///     cosign signatures, which reuse the standard image config.
+///   * the body is a **runnable image** ([`oci_manifest_is_runnable_image`]):
+///     an image config plus at least one real rootfs layer. A decoy
+///     non-image layer alongside a real one does NOT exempt it — the runtime
+///     still unpacks the real layer, so the scanners must still run (#3003
+///     round 2); OR
+///   * the body is a pure image **index** / manifest list (a `manifests` array
+///     and no image config of its own): indexes carry no rootfs, and
+///     `resolve_scan_reference` (#1971, #1992, #2054) rewrites the reference
+///     to a concrete scannable child, so an index must NEVER be denied here.
 ///
 /// Returns `false` for Helm OCI charts, WASM modules, SBOM/attestation/empty
 /// artifacts, and any manifest with an unknown or absent config — these are
@@ -261,7 +333,13 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         // Anomalous body on an OCI route: do not flip the path-based decision.
         return true;
     };
-    // Index / manifest list: no config, resolved to a child downstream. Allow.
+    // A runnable image is always scannable — checked FIRST so a co-present
+    // `manifests` array cannot route a real image down the index branch.
+    if oci_manifest_is_runnable_image(body) {
+        return true;
+    }
+    // Pure index / manifest list: no rootfs of its own, resolved to a child
+    // downstream. Allow.
     if !manifest.manifests.is_empty() {
         return true;
     }
@@ -277,7 +355,9 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         return false;
     }
     // Layer guard: reject cosign/in-toto/spdx/cyclonedx/helm/wasm payloads even
-    // when the config is the standard image config (cosign reuses it).
+    // when the config is the standard image config (cosign reuses it). Reached
+    // only when there is no real rootfs layer, so this can no longer be used to
+    // exempt a genuine image by bolting a decoy descriptor onto it.
     let has_non_image_layer = manifest.layers.iter().any(|layer| {
         let mt = layer.media_type.to_ascii_lowercase();
         NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
