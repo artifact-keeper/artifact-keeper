@@ -28,6 +28,62 @@ use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
 use crate::storage::keys::prefix_matches;
 
+/// Build a max-age query with a shared effective timestamp expression.
+///
+/// Mutable OCI tags reuse the same `artifacts` row for every manifest PUT.
+/// Their `created_at` therefore describes when the tag path was first seen,
+/// not when its current digest was pushed. `oci_tags.updated_at` is refreshed
+/// by every successful manifest PUT, so it is the authoritative age for an
+/// exact live `(repository, digest, image, tag)` mapping. All other artifacts
+/// retain the historical `created_at` behavior.
+///
+/// `MAX` makes the correlated subquery scalar even if malformed legacy data
+/// contains duplicate path-shaped rows. The normal schema-level
+/// `UNIQUE(repository_id, name, tag)` constraint means there is at most one.
+macro_rules! max_age_sql {
+    ($statement:literal, $repository_predicate:literal, $days_parameter:literal) => {
+        concat!(
+            $statement,
+            r#"
+WHERE
+    "#,
+            $repository_predicate,
+            r#"a.is_deleted = false
+    AND COALESCE(
+        (
+            SELECT MAX(ot.updated_at)
+            FROM oci_tags ot
+            WHERE ot.repository_id = a.repository_id
+              AND a.storage_key = 'oci-manifests/' || ot.manifest_digest
+              AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
+              AND a.version = ot.tag
+        ),
+        a.created_at
+    ) < NOW() - make_interval(days => "#,
+            $days_parameter,
+            "::INT)\n"
+        )
+    };
+}
+
+const MAX_AGE_SCOPED_SELECT_SQL: &str = max_age_sql!(
+    "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes\nFROM artifacts a",
+    "a.repository_id = $1\n    AND ",
+    "$2"
+);
+const MAX_AGE_GLOBAL_SELECT_SQL: &str = max_age_sql!(
+    "SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes\nFROM artifacts a",
+    "",
+    "$1"
+);
+const MAX_AGE_SCOPED_UPDATE_SQL: &str = max_age_sql!(
+    "UPDATE artifacts AS a SET is_deleted = true",
+    "a.repository_id = $1\n    AND ",
+    "$2"
+);
+const MAX_AGE_GLOBAL_UPDATE_SQL: &str =
+    max_age_sql!("UPDATE artifacts AS a SET is_deleted = true", "", "$1");
+
 /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
 ///
 /// Each row in `oci_tags` is matched to its source artifact via the
@@ -123,10 +179,11 @@ WHERE a.is_deleted = true
   )
 "#;
 
-/// Compile-time guard: the `'oci-manifests/'` literal embedded in
-/// [`CASCADE_OCI_TAGS_SQL`] must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
-/// Postgres cannot reference the Rust constant directly, so this keeps the
-/// SQL literal and the write-path constant from drifting (#1413).
+/// Compile-time guard: the `'oci-manifests/'` literals embedded in the max-age
+/// SQL and [`CASCADE_OCI_TAGS_SQL`] must match
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX).
+/// Postgres cannot reference the Rust constant directly, so this keeps the SQL
+/// literals and the write-path constant from drifting (#1413).
 const _: () = assert!(prefix_matches("oci-manifests/"));
 
 /// Scope of a lifecycle policy execution: either a specific repository or
@@ -898,63 +955,35 @@ impl LifecycleService {
         let days = parse_i64_field(&policy.config, PolicyType::MaxAgeDays.as_wire_str(), "days")?;
 
         let matched = if policy.repository_id.is_some() {
-            sqlx::query_as::<_, CountBytes>(
-                r#"
-                SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes
-                FROM artifacts
-                WHERE repository_id = $1
-                  AND is_deleted = false
-                  AND created_at < NOW() - make_interval(days => $2::INT)
-                "#,
-            )
-            .bind(policy.repository_id)
-            .bind(days as i32)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
+            sqlx::query_as::<_, CountBytes>(MAX_AGE_SCOPED_SELECT_SQL)
+                .bind(policy.repository_id)
+                .bind(days as i32)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
         } else {
-            sqlx::query_as::<_, CountBytes>(
-                r#"
-                SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0)::BIGINT as bytes
-                FROM artifacts
-                WHERE is_deleted = false
-                  AND created_at < NOW() - make_interval(days => $1::INT)
-                "#,
-            )
-            .bind(days as i32)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
+            sqlx::query_as::<_, CountBytes>(MAX_AGE_GLOBAL_SELECT_SQL)
+                .bind(days as i32)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
         };
 
         let mut removed = 0i64;
         if !dry_run && matched.count > 0 {
             let result = if policy.repository_id.is_some() {
-                sqlx::query(
-                    r#"
-                    UPDATE artifacts SET is_deleted = true
-                    WHERE repository_id = $1
-                      AND is_deleted = false
-                      AND created_at < NOW() - make_interval(days => $2::INT)
-                    "#,
-                )
-                .bind(policy.repository_id)
-                .bind(days as i32)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
+                sqlx::query(MAX_AGE_SCOPED_UPDATE_SQL)
+                    .bind(policy.repository_id)
+                    .bind(days as i32)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
             } else {
-                sqlx::query(
-                    r#"
-                    UPDATE artifacts SET is_deleted = true
-                    WHERE is_deleted = false
-                      AND created_at < NOW() - make_interval(days => $1::INT)
-                    "#,
-                )
-                .bind(days as i32)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
+                sqlx::query(MAX_AGE_GLOBAL_UPDATE_SQL)
+                    .bind(days as i32)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
             };
             removed = result.rows_affected() as i64;
         }
@@ -1360,6 +1389,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // validate_policy_config tests: max_age_days
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_age_timestamp_uses_exact_oci_tag_update_with_created_fallback() {
+        for sql in [
+            MAX_AGE_SCOPED_SELECT_SQL,
+            MAX_AGE_GLOBAL_SELECT_SQL,
+            MAX_AGE_SCOPED_UPDATE_SQL,
+            MAX_AGE_GLOBAL_UPDATE_SQL,
+        ] {
+            assert!(sql.contains("SELECT MAX(ot.updated_at)"));
+            assert!(sql.contains("ot.repository_id = a.repository_id"));
+            assert!(sql.contains("a.storage_key = 'oci-manifests/' || ot.manifest_digest"));
+            assert!(sql.contains("a.path = 'v2/' || ot.name || '/manifests/' || ot.tag"));
+            assert!(sql.contains("a.version = ot.tag"));
+            assert!(
+                sql.contains("a.created_at"),
+                "non-OCI artifacts must retain created_at age semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_age_sql_keeps_scope_specific_bind_positions() {
+        for sql in [MAX_AGE_SCOPED_SELECT_SQL, MAX_AGE_SCOPED_UPDATE_SQL] {
+            assert!(sql.contains("a.repository_id = $1"));
+            assert!(sql.contains("days => $2::INT"));
+        }
+        for sql in [MAX_AGE_GLOBAL_SELECT_SQL, MAX_AGE_GLOBAL_UPDATE_SQL] {
+            assert!(!sql.contains("a.repository_id = $1"));
+            assert!(sql.contains("days => $1::INT"));
+        }
+    }
 
     #[tokio::test]
     async fn test_validate_max_age_days_valid() {
