@@ -182,7 +182,7 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # docker v28.5.2; those residual CVEs have no fixed grype release yet and are
 # documented/suppressed in /.trivyignore rather than "bumped away".
 # Re-evaluate on every bump (#2391).
-FROM ghcr.io/anchore/grype:v0.116.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.116.1 AS grype-bin
 
 # ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted
