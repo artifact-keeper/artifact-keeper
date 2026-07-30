@@ -2756,6 +2756,11 @@ async fn serve_tarball(
                 .await
                 .unwrap_or(false)
             {
+                let action =
+                    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                        .proxy_scan_action(repo.id)
+                        .await
+                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
                 return serve_scanned_npm_tarball(
                     state,
                     proxy,
@@ -2765,6 +2770,7 @@ async fn serve_tarball(
                     package_name,
                     &fetch_path,
                     &response_filename,
+                    action,
                     ctx,
                 )
                 .await;
@@ -2910,6 +2916,63 @@ async fn serve_tarball(
                             npm_virtual_tarball_content_type(lkg.content_type),
                             lkg.content_length,
                         ));
+                    }
+                }
+            }
+        }
+
+        // #3023: apply the inline scan-and-block gate on the virtual npm path,
+        // the same gate the direct-Remote tarball path runs. For each eligible
+        // Remote member whose stricter-of-two policy (virtual OR member) enables
+        // scanning, buffer + gate the tarball through `serve_scanned_npm_tarball`
+        // under the MEMBER's context: a vulnerable digest is blocked (403/423)
+        // instead of streamed 200. A member that does not have the tarball
+        // (upstream 404) falls through to the next member; a scan block (403
+        // vulnerable / 423 inconclusive) is definitive. Members with scanning
+        // disabled fall through to the untouched shared streaming resolver below
+        // (no regression). The shared `resolve_virtual_download_from_members` is
+        // deliberately left untouched so maven/hex and other formats are
+        // unaffected.
+        if let Some(proxy) = proxy_for_virtual {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref member_upstream) = member.upstream_url else {
+                    continue;
+                };
+                let (enabled, action) =
+                    proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
+                        .await;
+                if !enabled {
+                    continue;
+                }
+                match serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    member.id,
+                    &member.key,
+                    member_upstream,
+                    package_name,
+                    &upstream_path,
+                    filename,
+                    action,
+                    ctx,
+                )
+                .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(resp) => {
+                        let status = resp.status();
+                        if status == StatusCode::FORBIDDEN || status == StatusCode::LOCKED {
+                            return Err(resp);
+                        }
+                        debug!(
+                            member_key = %member.key,
+                            status = %status,
+                            "scanned npm virtual member did not serve; trying next member"
+                        );
+                        continue;
                     }
                 }
             }
@@ -3172,13 +3235,9 @@ async fn serve_scanned_npm_tarball(
     package_name: &str,
     fetch_path: &str,
     filename: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .proxy_scan_action(repo_id)
-        .await
-        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
-
     // Buffered capped fetch (cache-first) under the SAME cache key as the
     // streaming path (`fetch_path`), so the cache stays warm across the two
     // paths and a repeat pull returns from cache with NO upstream fetch.
@@ -9314,6 +9373,165 @@ mod proxy_scan_block_tests {
             .execute(pool)
             .await
             .expect("cleanup proxy_scan_results");
+    }
+
+    /// Create a public Remote npm member pointing at `upstream`, attach it to
+    /// the `virtual_id` fixture repo, and return the member id.
+    async fn attach_remote_npm_member(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        upstream: &wiremock::MockServer,
+    ) -> (uuid::Uuid, std::path::PathBuf) {
+        let (member_id, _key, member_dir) = tdh::create_repo(pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(pool)
+            .await
+            .expect("configure npm member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("attach npm member");
+        (member_id, member_dir)
+    }
+
+    async fn cleanup_npm_member(pool: &sqlx::PgPool, member_id: uuid::Uuid, dir: &std::path::Path) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM scan_configs WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── #3023: the inline scan gate on the VIRTUAL npm tarball path ────────
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_blocks_vulnerable_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "vulnwidget";
+        let filename = "vulnwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b vulnwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b vulnwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, Some(1)).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        enable_proxy_scan(&fx.pool, member_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a vulnerable tarball through a virtual repo must be blocked (#3023), got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "vulnerable-via-virtual npm serve must be 403"
+            ),
+        }
+    }
+
+    /// Clean via virtual -> 200 (no over-block).
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_serves_clean_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "cleanwidget";
+        let filename = "cleanwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b cleanwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b cleanwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, None).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+        let status = result
+            .as_ref()
+            .map(|r| r.status())
+            .unwrap_or_else(|r| r.status());
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean tarball through a virtual repo must still serve 200 (no over-block)"
+        );
     }
 
     /// The synthetic scan identity for a proxied npm tarball: `.tgz` name +

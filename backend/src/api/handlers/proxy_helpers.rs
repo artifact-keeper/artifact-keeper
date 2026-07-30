@@ -2530,6 +2530,64 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
     }
 }
 
+/// Combine a virtual repo's own proxy-scan policy with a resolving member's
+/// into the STRICTER of the two (#3023).
+///
+/// `enabled = virtual || member`, and the action is fail-closed if EITHER side
+/// is fail-closed. This is the only combination that never lets aggregation
+/// weaken a block an operator configured anywhere in the chain: enabling
+/// scanning (or fail-closed) on the virtual — the single pane clients point at
+/// — OR on a member yields blocking, and a fail-closed member is never
+/// downgraded to fail-open by a fail-open virtual. Pure so the stricter-of-two
+/// logic is unit-testable without a DB.
+pub fn stricter_scan_policy(
+    virtual_enabled: bool,
+    virtual_action: crate::services::proxy_scan_service::ProxyScanAction,
+    member_enabled: bool,
+    member_action: crate::services::proxy_scan_service::ProxyScanAction,
+) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
+    use crate::services::proxy_scan_service::ProxyScanAction;
+    let enabled = virtual_enabled || member_enabled;
+    let action = if matches!(virtual_action, ProxyScanAction::FailClosed)
+        || matches!(member_action, ProxyScanAction::FailClosed)
+    {
+        ProxyScanAction::FailClosed
+    } else {
+        ProxyScanAction::FailOpen
+    };
+    (enabled, action)
+}
+
+/// The effective proxy-scan policy for a Virtual repo resolving an artifact
+/// from a member (#3023): the stricter-of-two over the virtual's own config and
+/// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
+/// `enabled` and thread the returned `action` into the per-format scan gate so
+/// the virtual path enforces the same digest-keyed verdict as a direct pull.
+pub async fn effective_virtual_scan_policy(
+    db: &PgPool,
+    virtual_id: Uuid,
+    member_id: Uuid,
+) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
+    use crate::services::proxy_scan_service::ProxyScanAction;
+    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
+    let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
+    let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
+    let virtual_action = svc
+        .proxy_scan_action(virtual_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    let member_action = svc
+        .proxy_scan_action(member_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    stricter_scan_policy(
+        virtual_enabled,
+        virtual_action,
+        member_enabled,
+        member_action,
+    )
+}
+
 /// Fetch virtual repository member repos sorted by priority.
 pub async fn fetch_virtual_members(
     db: &PgPool,
@@ -5339,6 +5397,74 @@ pub(crate) async fn gate_proxy_scan_serve(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── Stricter-of-two virtual scan policy (#3023) ──────────────────
+    //
+    // A Virtual repo aggregating a Remote member enforces the stricter of the
+    // virtual's own proxy-scan config and the member's, so aggregation can
+    // never weaken a block configured anywhere in the chain.
+    #[test]
+    fn stricter_scan_policy_enables_if_either_side_enables() {
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        // Neither enabled -> disabled.
+        let (enabled, _) = stricter_scan_policy(
+            false,
+            ProxyScanAction::FailOpen,
+            false,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(!enabled, "neither side enables scanning");
+
+        // Virtual enabled, member disabled -> enabled (the customer gap: clients
+        // point at the virtual, a member has scanning off).
+        let (enabled, _) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            false,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(enabled, "virtual enabling scanning is sufficient");
+
+        // Member enabled, virtual disabled -> enabled.
+        let (enabled, _) = stricter_scan_policy(
+            false,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(enabled, "member enabling scanning is sufficient");
+    }
+
+    #[test]
+    fn stricter_scan_policy_fail_closed_if_either_side_fail_closed() {
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        // A fail-closed member is never downgraded by a fail-open virtual.
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailClosed,
+        );
+        assert_eq!(action, ProxyScanAction::FailClosed);
+
+        // A fail-closed virtual is never downgraded by a fail-open member.
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailClosed,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert_eq!(action, ProxyScanAction::FailClosed);
+
+        // Both fail-open -> fail-open (no spurious tightening).
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert_eq!(action, ProxyScanAction::FailOpen);
+    }
 
     // ── Global buffered-metadata byte budget (#2665) ─────────────────
     //

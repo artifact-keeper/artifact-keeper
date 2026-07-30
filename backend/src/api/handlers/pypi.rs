@@ -1839,6 +1839,12 @@ async fn serve_file(
                     .await
                     .unwrap_or(false)
                     {
+                        let action = crate::services::scan_config_service::ScanConfigService::new(
+                            state.db.clone(),
+                        )
+                        .proxy_scan_action(repo.id)
+                        .await
+                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
                         return serve_scanned_pypi_file(
                             state,
                             proxy,
@@ -1847,6 +1853,7 @@ async fn serve_file(
                             upstream_url,
                             project,
                             filename,
+                            action,
                             ctx,
                         )
                         .await;
@@ -2103,6 +2110,51 @@ async fn serve_file(
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
+                            // #3023: gate this remote member's serve through the
+                            // inline scan-and-block path when the stricter-of-two
+                            // policy (virtual OR member) enables it, mirroring the
+                            // direct-Remote pypi path. A vulnerable digest is
+                            // blocked (403) / an inconclusive fail-closed is 423;
+                            // a not-found or other error falls through to the next
+                            // member. A member with scanning disabled keeps the
+                            // untouched streaming cache path below (no regression).
+                            let (scan_enabled, action) =
+                                proxy_helpers::effective_virtual_scan_policy(
+                                    &state.db, repo.id, member.id,
+                                )
+                                .await;
+                            if scan_enabled {
+                                match serve_scanned_pypi_file(
+                                    state,
+                                    proxy,
+                                    member.id,
+                                    &member.key,
+                                    upstream_url,
+                                    project,
+                                    filename,
+                                    action,
+                                    ctx,
+                                )
+                                .await
+                                {
+                                    Ok(resp) => return Ok(resp),
+                                    Err(resp) => {
+                                        let status = resp.status();
+                                        if status == StatusCode::FORBIDDEN
+                                            || status == StatusCode::LOCKED
+                                        {
+                                            return Err(resp);
+                                        }
+                                        debug!(
+                                            member_key = %member.key,
+                                            status = %status,
+                                            "scanned pypi virtual member did not serve; trying next member"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Check proxy cache first (same optimization as the
                             // direct Remote path). This avoids re-fetching the
                             // simple index from upstream when the file is already
@@ -2717,13 +2769,9 @@ async fn serve_scanned_pypi_file(
     upstream_url: &str,
     project: &str,
     filename: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .proxy_scan_action(repo_id)
-        .await
-        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
-
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let target = resolve_pypi_remote_fetch_target(
         proxy,
@@ -9438,6 +9486,153 @@ mod tests {
             )
             .mount(upstream)
             .await;
+    }
+
+    // ── #3023: the inline scan gate on the VIRTUAL pypi serve path ─────────
+    //
+    // A wheel whose digest carries a vulnerable verdict must be blocked when
+    // pulled through a Virtual repo that aggregates the Remote member, not just
+    // through the direct Remote path.
+    #[tokio::test]
+    async fn test_virtual_serve_file_blocks_vulnerable_member_wheel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "vulnpkg";
+        let filename = "vulnpkg-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 vulnpkg-wheel-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 vulnpkg-wheel-3023"));
+
+        let upstream = MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        // Scanning enabled on the MEMBER; the verdict mimics a prior remote scan.
+        enable_proxy_scan(&fx.pool, member_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a vulnerable wheel through a virtual repo must be blocked (#3023), got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "vulnerable-via-virtual pypi serve must be 403"
+            ),
+        }
+    }
+
+    /// Clean via virtual -> 200 (no over-block).
+    #[tokio::test]
+    async fn test_virtual_serve_file_serves_clean_member_wheel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "cleanpkg";
+        let filename = "cleanpkg-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 cleanpkg-wheel-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 cleanpkg-wheel-3023"));
+
+        let upstream = MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, &upstream.uri()).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result = super::serve_file(
+            &state,
+            &virtual_info,
+            &fx.repo_key,
+            project,
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await;
+        let status = result
+            .as_ref()
+            .map(|r| r.status())
+            .unwrap_or_else(|r| r.status());
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean wheel through a virtual repo must still serve 200 (no over-block)"
+        );
     }
 
     #[tokio::test]

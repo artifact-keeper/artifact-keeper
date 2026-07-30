@@ -2326,6 +2326,26 @@ struct OciRepoInfo {
     image: String,
 }
 
+/// Build an [`OciRepoInfo`] for a virtual repo's resolving MEMBER so the scan
+/// gate runs in the member's context (its id/key/upstream/storage), while the
+/// `image` path stays the pull's image name (#3023). Used only on the virtual
+/// manifest seam; the direct-Remote path keeps its own `resolve_repo`-built
+/// `OciRepoInfo`.
+fn oci_repo_info_from_member(
+    member: &crate::models::repository::Repository,
+    image: &str,
+) -> OciRepoInfo {
+    OciRepoInfo {
+        id: member.id,
+        key: member.key.clone(),
+        location: member.storage_location(),
+        repo_type: member.repo_type.as_str().to_string(),
+        upstream_url: member.upstream_url.clone(),
+        is_public: member.is_public,
+        image: image.to_string(),
+    }
+}
+
 /// Resolve the first path segment as a repository key and the rest as the
 /// image name within the repository.
 /// Read `AK_DEFAULT_DOCKER_MIRROR_REPO` once. Returns the configured proxy
@@ -2873,13 +2893,23 @@ pub async fn resolve_virtual_blob(
 /// Exposed as `pub` so the integration tests in
 /// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
 /// upstream HTTP path.
+///
+/// Returns the resolved `(manifest_digest, content_type, body, member)`; the
+/// resolving MEMBER `Repository` is returned so the caller can apply the same
+/// inline scan-and-block gate a direct Remote pull runs, keyed on the member's
+/// context (#3023).
 pub async fn resolve_virtual_manifest(
     state: &SharedState,
     repo_id: Uuid,
     image_name: &str,
     reference: &str,
     accept: Option<&str>,
-) -> Option<(String, Option<String>, Bytes)> {
+) -> Option<(
+    String,
+    Option<String>,
+    Bytes,
+    crate::models::repository::Repository,
+)> {
     let is_digest_ref = is_digest_reference(reference);
 
     // #1348 round 1, concern #2: same negative-cache short-circuit as
@@ -2925,7 +2955,7 @@ pub async fn resolve_virtual_manifest(
             let manifest_key = manifest_storage_key(&manifest_digest);
             if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
                 if let Ok(data) = storage.get(&manifest_key).await {
-                    return Some((manifest_digest, content_type, data));
+                    return Some((manifest_digest, content_type, data, member.clone()));
                 }
             }
         }
@@ -2968,7 +2998,9 @@ pub async fn resolve_virtual_manifest(
                         // `finalize_upstream_manifest` so it can be unit-
                         // tested without a wiremock upstream.
                         match finalize_upstream_manifest(reference, content, content_type) {
-                            Some(triple) => return Some(triple),
+                            Some((digest, ct, body)) => {
+                                return Some((digest, ct, body, member.clone()))
+                            }
                             None => {
                                 warn!(
                                     "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
@@ -4433,7 +4465,26 @@ async fn handle_get_blob(
     // fetch. Scanner-scoped pulls are exempt for the same reason the manifest
     // gate exempts them.
     if !oci_pull_is_scan_scoped(&claims) {
-        match blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await {
+        // #3023: for a Virtual repo the `manifest_blob_refs` are recorded under
+        // the resolving MEMBER (the virtual owns no refs), so the blocklist must
+        // span the virtual's member set. A direct Remote/Local repo keeps the
+        // single-id check verbatim. If the members cannot be enumerated we cannot
+        // prove the blob is safe -> fail closed (same posture as an unreadable
+        // verdict store below).
+        let blocklist = if repo.repo_type == RepositoryType::Virtual {
+            match proxy_helpers::fetch_virtual_members(&state.db, repo.id).await {
+                Ok(members) => {
+                    let ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
+                    blob_belongs_to_vulnerable_image_any(state, &ids, &lookup_digest).await
+                }
+                Err(_) => Err(sqlx::Error::Protocol(
+                    "virtual member enumeration failed during blob scan-verdict check".to_string(),
+                )),
+            }
+        } else {
+            blob_belongs_to_vulnerable_image(state, repo.id, &lookup_digest).await
+        };
+        match blocklist {
             Ok(true) => {
                 tracing::warn!(
                     repo = %repo.key, digest = %lookup_digest,
@@ -6689,7 +6740,10 @@ async fn handle_head_manifest(
     let client_accept = forwarded_accept_header(headers);
     let accept = manifest_accept_for_upstream(client_accept.as_deref());
     if repo.repo_type == RepositoryType::Virtual {
-        if let Some((manifest_digest, content_type, data)) =
+        // HEAD stays ungated — parity with the direct-Remote HEAD path; the
+        // resolving member (`_member`) is unused here. Actual bytes are still
+        // protected by the manifest GET gate and the blob blocklist (#3023).
+        if let Some((manifest_digest, content_type, data, _member)) =
             resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
         {
             return build_oci_proxy_response(
@@ -6950,6 +7004,43 @@ async fn blob_belongs_to_vulnerable_image(
         "#,
     )
     .bind(repo_id)
+    .bind(blob_digest)
+    .bind(proxy_helpers::PROXY_SCAN_TYPE)
+    .fetch_one(&state.db)
+    .await
+}
+
+/// Member-spanning sibling of [`blob_belongs_to_vulnerable_image`] for a
+/// Virtual repo (#3023). `manifest_blob_refs` are recorded under the resolving
+/// MEMBER's repo id (the virtual has none of its own), so a blob pulled through
+/// the virtual must be checked against ALL of the virtual's member ids, not the
+/// virtual's own id. The verdict join is unchanged — it is global by content
+/// digest. Widens the existing per-repository ANY-not-ALL scoping from one repo
+/// to the virtual's member set (a layer blocked by any member is blocked, the
+/// fail-closed direction). An empty `member_ids` returns `Ok(false)`.
+async fn blob_belongs_to_vulnerable_image_any(
+    state: &SharedState,
+    member_ids: &[Uuid],
+    blob_digest: &str,
+) -> Result<bool, sqlx::Error> {
+    if member_ids.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM manifest_blob_refs mbr
+            JOIN proxy_scan_results psr
+              ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
+             AND psr.scan_type = $3
+             AND psr.verdict = 'vulnerable'
+            WHERE mbr.repository_id = ANY($1)
+              AND mbr.blob_digest = $2
+        )
+        "#,
+    )
+    .bind(member_ids)
     .bind(blob_digest)
     .bind(proxy_helpers::PROXY_SCAN_TYPE)
     .fetch_one(&state.db)
@@ -7218,12 +7309,8 @@ async fn gate_oci_proxy_manifest_scan(
     reference: &str,
     manifest_body: &Bytes,
     manifest_content_type: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
 ) -> Result<bool, Response> {
-    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
-        .proxy_scan_action(repo.id)
-        .await
-        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
-
     // The verdict key is the CONTENT digest computed over the bytes being
     // served — the same digest `docker pull` pins — never anything the
     // upstream index advertised.
@@ -7298,7 +7385,19 @@ async fn maybe_gate_remote_manifest_scan(
     if !oci_manifest_requires_proxy_scan(manifest_body) {
         return Ok(false);
     }
-    gate_oci_proxy_manifest_scan(state, repo, reference, manifest_body, manifest_content_type).await
+    let action = crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+        .proxy_scan_action(repo.id)
+        .await
+        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+    gate_oci_proxy_manifest_scan(
+        state,
+        repo,
+        reference,
+        manifest_body,
+        manifest_content_type,
+        action,
+    )
+    .await
 }
 
 /// Attach the loud fail-open `X-AK-Scan: pending` header to a manifest
@@ -7490,15 +7589,51 @@ async fn handle_get_manifest(
     let client_accept = forwarded_accept_header(headers);
     let accept = manifest_accept_for_upstream(client_accept.as_deref());
     if repo.repo_type == RepositoryType::Virtual {
-        if let Some((manifest_digest, content_type, data)) =
+        if let Some((manifest_digest, content_type, data, member)) =
             resolve_virtual_manifest(state, repo.id, &repo.image, reference, Some(&accept)).await
         {
-            return build_oci_proxy_response(
-                &data,
-                content_type,
-                &manifest_digest,
-                "application/vnd.oci.image.manifest.v1+json",
-                true,
+            // #3023: a Virtual repo must enforce the same inline scan-and-block
+            // gate as a direct Remote pull. When the resolving member is a
+            // Remote (proxy) repo and the stricter-of-two policy (virtual OR
+            // member) enables scanning, gate the manifest through the MEMBER's
+            // context BEFORE serving. This both (a) blocks a cached-vulnerable
+            // manifest by digest and (b) on a cold pull runs `stage_proxy_image_blobs`
+            // under the member id, so the blob blocklist below has refs to find.
+            // Scanner-scoped pull tokens stay exempt, exactly as the Remote gate.
+            let mut scan_pending = false;
+            if member.repo_type == RepositoryType::Remote && !oci_pull_is_scan_scoped(&claims) {
+                let (enabled, action) =
+                    proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
+                        .await;
+                if enabled && oci_manifest_requires_proxy_scan(&data) {
+                    let member_repo = oci_repo_info_from_member(&member, &repo.image);
+                    let member_ct = content_type.clone().unwrap_or_else(|| {
+                        "application/vnd.oci.image.manifest.v1+json".to_string()
+                    });
+                    scan_pending = match gate_oci_proxy_manifest_scan(
+                        state,
+                        &member_repo,
+                        reference,
+                        &data,
+                        &member_ct,
+                        action,
+                    )
+                    .await
+                    {
+                        Ok(pending) => pending,
+                        Err(resp) => return resp,
+                    };
+                }
+            }
+            return with_scan_pending_header(
+                build_oci_proxy_response(
+                    &data,
+                    content_type,
+                    &manifest_digest,
+                    "application/vnd.oci.image.manifest.v1+json",
+                    true,
+                ),
+                scan_pending,
             );
         }
     }
@@ -25294,5 +25429,569 @@ mod proxy_scan_block_tests {
             .expect("lookup");
         fx.teardown().await;
         assert!(!blocked, "an unscanned blob must not be blocked");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3023: the inline scan-and-block gate on the VIRTUAL-repo OCI serve paths.
+// A digest that is blocked through a direct Remote repo must also be blocked
+// when pulled through a Virtual repo that aggregates that Remote as a member —
+// at the manifest seam AND the member-spanning blob blocklist.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test
+// assertions is not an artifact path (#1608).
+#[cfg(test)]
+mod virtual_scan_gate_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::sha256_hex;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+    use crate::services::proxy_scan_service::ProxyScanService;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const IMAGE_MANIFEST_MT: &str = "application/vnd.oci.image.manifest.v1+json";
+
+    fn image_manifest(config_bytes: &[u8], layer_bytes: &[u8]) -> (Bytes, String, String) {
+        let config_digest = compute_sha256(config_bytes);
+        let layer_digest = compute_sha256(layer_bytes);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer_bytes.len(),
+            }],
+        });
+        (
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+            config_digest,
+            layer_digest,
+        )
+    }
+
+    async fn insert_remote_member(pool: &sqlx::PgPool, upstream_url: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("vsg-rem-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/vsg-{id}"))
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert remote member");
+        (id, key)
+    }
+
+    async fn insert_virtual(pool: &sqlx::PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("vsg-virt-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/vsg-{id}"))
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        (id, key)
+    }
+
+    async fn link_member(pool: &sqlx::PgPool, virtual_id: Uuid, member_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+    }
+
+    async fn mount_manifest(upstream: &wiremock::MockServer, body: &Bytes, fetches: Option<u64>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mut mock = Mock::given(method("GET"))
+            .and(path("/v2/app/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("Content-Type", IMAGE_MANIFEST_MT),
+            );
+        if let Some(n) = fetches {
+            mock = mock.expect(n);
+        }
+        mock.mount(upstream).await;
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, ids: &[Uuid], digests: &[&str]) {
+        for d in digests {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(d)
+                .execute(pool)
+                .await;
+        }
+        for id in ids {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM manifest_blob_refs WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    async fn pull(state: &SharedState, image_name: &str, kind: &str, reference: &str) -> Response {
+        let app = tdh::router_anon(router(), state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{image_name}/{kind}/{reference}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot")
+    }
+
+    // ── oci_repo_info_from_member: field mapping (pure) ─────────────────────
+    #[test]
+    fn oci_repo_info_from_member_maps_member_context() {
+        use crate::models::repository::{
+            ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+        };
+        let now = chrono::Utc::now();
+        let member = Repository {
+            id: Uuid::new_v4(),
+            key: "member-key".to_string(),
+            name: "member".to_string(),
+            description: None,
+            format: RepositoryFormat::Docker,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/member".to_string(),
+            upstream_url: Some("https://registry.example.test".to_string()),
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Scheduled,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            versioning_enabled: false,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let info = oci_repo_info_from_member(&member, "org/app");
+        assert_eq!(info.id, member.id);
+        assert_eq!(info.key, "member-key");
+        assert_eq!(info.repo_type, "remote");
+        assert_eq!(
+            info.upstream_url.as_deref(),
+            Some("https://registry.example.test")
+        );
+        assert_eq!(
+            info.image, "org/app",
+            "image path is the pull's image, not the member key"
+        );
+        assert_eq!(info.location.path, "/data/member");
+    }
+
+    // ── blob_belongs_to_vulnerable_image_any: member-spanning scoping ───────
+    #[tokio::test]
+    async fn blob_any_spans_member_ids_and_empty_is_false() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, config_digest, _layer) = image_manifest(b"any-cfg", b"any-layer");
+        let manifest_digest = compute_sha256(&manifest);
+        let member_id = fx.repo_id; // reuse the fixture repo as the "member"
+        record_manifest_blob_refs(&fx.pool, member_id, &manifest_digest, &manifest)
+            .await
+            .expect("record refs under member");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                manifest_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        // Empty member set -> never blocks.
+        let empty = blob_belongs_to_vulnerable_image_any(&fx.state, &[], &config_digest)
+            .await
+            .expect("empty ids lookup");
+        assert!(!empty, "empty member_ids must return false");
+
+        // A member set NOT containing the recording member -> no refs -> false.
+        let other =
+            blob_belongs_to_vulnerable_image_any(&fx.state, &[Uuid::new_v4()], &config_digest)
+                .await
+                .expect("other ids lookup");
+        assert!(
+            !other,
+            "refs recorded under a different member must not match"
+        );
+
+        // The member set containing the recording member -> blocked.
+        let spanned = blob_belongs_to_vulnerable_image_any(
+            &fx.state,
+            &[Uuid::new_v4(), member_id],
+            &config_digest,
+        )
+        .await
+        .expect("spanning lookup");
+        assert!(
+            spanned,
+            "a member-owned vulnerable ref must block within the span"
+        );
+
+        cleanup_refs(&fx.pool, member_id, &manifest_digest).await;
+        fx.teardown().await;
+    }
+
+    async fn cleanup_refs(pool: &sqlx::PgPool, repo_id: Uuid, manifest_digest: &str) {
+        let _ = sqlx::query("DELETE FROM manifest_blob_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(manifest_digest.strip_prefix("sha256:").unwrap())
+            .execute(pool)
+            .await;
+    }
+
+    // ── Manifest seam: vulnerable via virtual -> 403 (was 200) ──────────────
+    #[tokio::test]
+    async fn manifest_via_virtual_blocks_vulnerable() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"v-cfg", b"v-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        // expect(1): the block happens on the cold pull without a second fetch.
+        mount_manifest(&upstream, &manifest, Some(1)).await;
+
+        let tmp = std::env::temp_dir().join(format!("vsg-mvv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_member(&pool, &upstream.uri()).await;
+        let (virt_id, virt_key) = insert_virtual(&pool).await;
+        link_member(&pool, virt_id, member_id).await;
+        // Scanning enabled on the MEMBER; the verdict is a prior remote scan.
+        enable_proxy_scan(&pool, member_id, "fail_closed").await;
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let resp = pull(&state, &format!("{virt_key}/app"), "manifests", "latest").await;
+        let status = resp.status();
+
+        drop(upstream);
+        cleanup(&pool, &[virt_id, member_id], &[&digest]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a vulnerable manifest pulled through a virtual repo must be blocked (#3023)"
+        );
+    }
+
+    // ── Manifest seam: clean via virtual -> 200 (no over-block) ─────────────
+    #[tokio::test]
+    async fn manifest_via_virtual_serves_clean() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"c-cfg", b"c-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_manifest(&upstream, &manifest, None).await;
+
+        let tmp = std::env::temp_dir().join(format!("vsg-mvc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_member(&pool, &upstream.uri()).await;
+        let (virt_id, virt_key) = insert_virtual(&pool).await;
+        link_member(&pool, virt_id, member_id).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&pool, member_id, "fail_open").await;
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let resp = pull(&state, &format!("{virt_key}/app"), "manifests", "latest").await;
+        let status = resp.status();
+
+        drop(upstream);
+        cleanup(&pool, &[virt_id, member_id], &[&digest]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean manifest through a virtual repo must still serve 200 (no over-block)"
+        );
+    }
+
+    // ── Stricter-of-two: scanning enabled+fail_closed on the VIRTUAL only ───
+    //    (member scan disabled) must still block a vulnerable digest (Option C).
+    #[tokio::test]
+    async fn manifest_via_virtual_stricter_of_two_blocks_with_member_scan_off() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(b"s-cfg", b"s-layer");
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_manifest(&upstream, &manifest, Some(1)).await;
+
+        let tmp = std::env::temp_dir().join(format!("vsg-mst-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_member(&pool, &upstream.uri()).await;
+        let (virt_id, virt_key) = insert_virtual(&pool).await;
+        link_member(&pool, virt_id, member_id).await;
+        // Scanning enabled ONLY on the virtual (the single pane clients point at);
+        // the member has NO scan_config row (disabled). Stricter-of-two must
+        // still enforce the block.
+        enable_proxy_scan(&pool, virt_id, "fail_closed").await;
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                2,
+                1,
+                1,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let resp = pull(&state, &format!("{virt_key}/app"), "manifests", "latest").await;
+        let status = resp.status();
+
+        drop(upstream);
+        cleanup(&pool, &[virt_id, member_id], &[&digest]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "virtual-enabled scanning must block even when the member has scanning off (stricter-of-two, #3023)"
+        );
+    }
+
+    // ── Blob seam: member-spanning blocklist blocks a vulnerable image's ────
+    //    config/layer blob pulled by digest through the virtual, but not a
+    //    clean sibling's (cold path: refs recorded under the member).
+    #[tokio::test]
+    async fn blob_via_virtual_blocks_vulnerable_but_not_clean() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("vsg-bvv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_member(&pool, "https://unused.example.test").await;
+        // Point the member's storage at tmp so a served blob resolves locally.
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+            .bind(tmp.to_str().unwrap())
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("member storage");
+        let (virt_id, virt_key) = insert_virtual(&pool).await;
+        link_member(&pool, virt_id, member_id).await;
+
+        let (vuln_manifest, vuln_cfg, _vuln_layer) = image_manifest(b"bad-cfg", b"bad-layer");
+        let (clean_manifest, clean_cfg, _clean_layer) = image_manifest(b"ok-cfg", b"ok-layer");
+        let vuln_mdigest = compute_sha256(&vuln_manifest);
+        let clean_mdigest = compute_sha256(&clean_manifest);
+
+        for (m, body) in [
+            (&vuln_mdigest, &vuln_manifest),
+            (&clean_mdigest, &clean_manifest),
+        ] {
+            record_manifest_blob_refs(&pool, member_id, m, body)
+                .await
+                .expect("record refs under member");
+        }
+        // Put the actual blobs into the member's storage so a non-blocked pull 200s.
+        let storage = state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: tmp.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        for (d, bytes) in [
+            (&vuln_cfg, b"bad-cfg".to_vec()),
+            (&clean_cfg, b"ok-cfg".to_vec()),
+        ] {
+            let key = blob_storage_key(d);
+            storage
+                .put(&key, Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(member_id)
+            .bind(d)
+            .bind(bytes.len() as i64)
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                vuln_mdigest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+        ProxyScanService::new(pool.clone())
+            .record_verdict(
+                clean_mdigest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let image = format!("{virt_key}/app");
+        let vuln_status = pull(&state, &image, "blobs", &vuln_cfg).await.status();
+        let clean_status = pull(&state, &image, "blobs", &clean_cfg).await.status();
+
+        drop(state);
+        cleanup(
+            &pool,
+            &[virt_id, member_id],
+            &[
+                vuln_mdigest.strip_prefix("sha256:").unwrap(),
+                clean_mdigest.strip_prefix("sha256:").unwrap(),
+            ],
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+            .bind(member_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            vuln_status,
+            StatusCode::FORBIDDEN,
+            "a vulnerable image's blob-by-digest through the virtual must be blocked (#3023)"
+        );
+        assert_eq!(
+            clean_status,
+            StatusCode::OK,
+            "a clean image's blob through the virtual must still serve (no over-block)"
+        );
     }
 }
