@@ -79,8 +79,8 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    and re-cut the tag) rather than publishing the draft by hand.
 
 7. **Post-release checks.** Confirm the GitHub Release is published (not
-   draft), release notes are auto-generated (do not hardcode static
-   notes), `:latest` moved only if this is a stable release, and the demo
+   draft), release notes are the curated per-version body (see "Release-notes
+   style" below), not the raw auto-generated PR list, `:latest` moved only if this is a stable release, and the demo
    or any pinned environments are updated intentionally (see
    "Infrastructure & Cost Rules" in CLAUDE.md).
 
@@ -90,7 +90,37 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
   `## [X.Y.Z]` section in `CHANGELOG.md`. Enforced by
   `version-set-integrity` (artifact-keeper-test release gate) and
   `release.yml` `verify-images-published`.
-- Release notes on GitHub are auto-generated; recognition sections
-  (Sponsors, Thank You) follow the CLAUDE.md policy.
+- The GitHub Release body is a curated high-level paraphrase of the
+  version's `## [X.Y.Z]` CHANGELOG section (see "Release-notes style"),
+  NOT the raw auto-generated PR list; recognition sections (Sponsors,
+  Thank You) follow the CLAUDE.md policy.
 - Prerelease tags (`-rc.N`, `-beta.N`) are exempt from the CHANGELOG
   entry requirement; final releases are not.
+
+
+## Release-notes style
+
+The GitHub Release body is **not** the raw auto-generated PR list.
+`generate_release_notes` produces an unscoped PR dump -- and when
+intermediate prereleases did not publish a Release object it reaches back
+into prior minor lines -- which buries the value. Instead the body is a
+curated **high-level paraphrase of THIS version's `## [X.Y.Z]` CHANGELOG
+section**:
+
+- Lead with the big-ticket epics / security themes so the value lands in
+  the first few lines.
+- Keep the intro human-skimmable: group and paraphrase, do not reproduce
+  every PR.
+- Point to the full `## [X.Y.Z]` CHANGELOG section for depth (both the
+  skimming reader and the auditing reader are served).
+- Prepend the required `### Sponsors` and `### Thank You` recognition
+  sections (see CLAUDE.md "Changelog and Release Notes").
+- Scope strictly to X.Y.Z -- only changes since the previous minor/patch,
+  never a multi-version diff.
+
+Mechanics: author the body as `.github/release-notes/<version>.md` and
+commit it in the same PR as the CHANGELOG promotion. `release.yml`'s
+"Resolve release notes" step uses that file as the Release `body_path`
+when present, and falls back to `generate_release_notes` only for versions
+without a curated file (e.g. `-rc.N` prereleases). Security hotfix releases
+use the tighter "am I affected" table format instead.

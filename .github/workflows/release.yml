@@ -706,6 +706,26 @@ jobs:
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
           ls -la release-assets/
 
+      - name: Resolve release notes
+        id: notes
+        # Prefer a curated per-version notes body (.github/release-notes/<version>.md):
+        # a high-level paraphrase of the CHANGELOG, not the raw PR dump (see
+        # RELEASING.md "Release-notes style"). Fall back to GitHub's auto-generated
+        # notes only when no curated file exists (e.g. -rc/-beta prereleases).
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          F=".github/release-notes/${VER}.md"
+          if [ -f "$F" ]; then
+            echo "Using curated release notes: $F"
+            echo "body_path=$F" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No curated notes for ${VER}; using GitHub auto-generated notes."
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v2
         with:
@@ -717,7 +737,8 @@ jobs:
           # the head of the default branch.
           target_commitish: ${{ github.sha }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*

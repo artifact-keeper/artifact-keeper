@@ -5,6 +5,167 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.7.0] - 2026-07-31
+
+A supply-chain-enforcement and release-assurance release closing the 1.7.0 milestone. The headline is that scan and curation policy now *block at serve time*: an inline scan-and-block gate rejects vulnerable artifacts on download across proxy and hosted repositories (PyPI, npm, Docker/OCI) and the virtual repos that aggregate them, while a new typed curation engine adds publisher-trust and popularity/typo-squat rules — including Unicode-confusable (homoglyph) and affix detection — that stop suspect packages before they reach a client. Underneath the features, the release re-architects the release pipeline into a real assurance gate (blocking security suite, DTF gate against the candidate digest, promote-by-digest, dispatch-rehearsable dry runs), makes the repository usage ledger authoritative to enable O(1) quota admission, and lands a broad performance pass (keyset pagination, GIN-indexed full-text search, off-hot-path side effects). It also closes a cluster of token, refresh, and federated-admin authorization gaps (several with GHSA advisories) and a deep set of cloud-storage, migration, and native-format fidelity fixes.
+
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- Ash A. ([@dragonpaw](https://github.com/dragonpaw))
+- Gabriel Rodriguez ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+Huge thanks to the external contributors and issue reporters who shaped this release:
+
+- **[@rockdrilla](https://github.com/rockdrilla)** — contributed exposing the APT repository GPG public key at the repository root for a more natural keyring URI, and reported the underlying request (#2694).
+- **[@ThaSami](https://github.com/ThaSami)** — contributed the Maven `files[]` camelCase `storageKey` attribution fix (#2706) and the ledger-first metadata-files attribution index (#2942), and reported the npm hosted-publish packument staleness across replicas (#2490).
+- **[@nicola-preda](https://github.com/nicola-preda)** — contributed immutable membership on SSO-synced groups (#2874), Nexus source-version resolution on connection test, and blocking a disabled format's aliases.
+- **[@valfon1393](https://github.com/valfon1393)** — contributed the durable repository-owner capability (#2666).
+- **[@StringKe](https://github.com/StringKe)** — contributed applying OpenSearch Basic auth in the health-monitor probes (#2945).
+- **[@sergeishestakov-gh](https://github.com/sergeishestakov-gh)** — contributed omitting empty `shasums_url`/`shasums_signature_url` from the Terraform provider download response (#2934).
+- **[@Mo0rBy](https://github.com/Mo0rBy)** — contributed the fix to get `docker-compose.local-dev.yml` working again (#2909).
+- **[@ijustworkhereshrug](https://github.com/ijustworkhereshrug)** — reported first-time-setup admin-login lockout (#2492), the non-functional LDAP test-connection (#2486), the SSO local-login button not showing (#2621), and requested per-repository backup exclusions (#2772).
+- **[@major-sam](https://github.com/major-sam)** — reported the empty Packages tab after Nexus migration (#2676) and Active Directory group sync failing (#2468).
+- **[@BonjeBongo](https://github.com/BonjeBongo)** — requested custom S3 paths (#2508) and separate S3 buckets for storage and backups (#2507).
+- **[@dsiebel](https://github.com/dsiebel)** — reported GCS Workload Identity failing `docker push` with an HTTP 500 from a dropped metadata-server connection (#2611).
+- **[@TheClonker](https://github.com/TheClonker)** — reported valid Composer metadata being stripped on upload (#2846).
+- **[@kochetkovSergeY](https://github.com/kochetkovSergeY)** — reported `maven-metadata.xml` not being cleared when an artifact is deleted from the web UI (#2845).
+- **[@IButakov](https://github.com/IButakov)** — reported Composer v1-protocol upstreams returning 404 (#2693).
+- **[@Tartanpion27](https://github.com/Tartanpion27)** — reported S3 object keys not carrying a repository identifier (#2624).
+
+### Security
+
+- **Inline scan-and-block on download** — vulnerable artifacts are now blocked at serve time on proxy-PyPI and hosted repositories, enforcing scan results and policy on the download path rather than only at ingestion (#2954).
+- **Scan-and-block extended to npm and Docker/OCI proxy pulls**, over a shared scan-gate core, reaching parity with proxy-PyPI (#3003).
+- **The inline scan-and-block gate now covers virtual-repo serves** (OCI/npm/PyPI), closing the aggregation bypass where a blocked artifact served 200-unscanned through a virtual repo (#3023).
+- **Curation block rules are enforced on proxy pulls** across npm, Docker, Maven, Cargo, and NuGet — previously `curation_enabled` was settable but silently inert on 26 of 27 proxy formats (#2930).
+- **Scan policy, admin quarantine transitions, and curation are enforced on PyPI proxies** (#2930).
+- **Container publication enforces the stated Trivy CRITICAL/HIGH scan policy** instead of merely reporting findings (#2609).
+- **Refresh-token consume-and-rotate is now atomic**, closing a token-replay race (GHSA-qxxr, #2813).
+- **Effective admin is scope-gated for token principals** so a scoped token can no longer act with full admin authority (GHSA-vvc3, #2814).
+- **Chunked-upload verbs enforce token write/delete scope** (GHSA-5f2q, #2812).
+- **Webhook management requires admin and no longer returns the rotated secret** in responses (GHSA-qcmj, #2818).
+- **Peer-announcement UPSERTs are atomic** (GHSA-gw36, #2816), and **peer data-plane management routes require admin** (#2815).
+- **The first-run admin password file is written atomically at `0o600` and is no longer logged by default** (GHSA-8523, #2817).
+- **Federated admin mapping requires an explicit admin group** — a fuzzy/substring group match can no longer auto-grant admin (#2759).
+- **Startup admin provisioning no longer hijacks a federated identity** that shares the `admin` username (#2875).
+- **Token minting validates and bounds requested scopes at the choke-point** — enforcing an allowed-scope set, a scope ceiling, and the admin-only-mint boundary (#2996).
+- **Upload paths accept the colon-form `write:artifacts` scope** so least-privilege repo-scoped tokens stop 403-ing on upload (#2989), and **OCI write/delete paths require the colon-form artifact scope** (#3053).
+- **The `/api/v1` Basic-auth boundary is enforced** — API tokens are accepted as a Basic password on format endpoints but rejected on the management API (#2809).
+- **Cross-repository writes in the promotion and approval copy paths are guarded** on cloud storage (#2511).
+- **Maven first-publish TOCTOU on a shared cloud flat namespace is closed structurally** via repo-scoped object keys (#2586).
+- **Maven and sbt objects use repo-scoped cloud-storage keys**, so S3 keys carry a repository identifier and cross-repo reads are impossible (#2624).
+- **Virtual PyPI local-ownership is guarded at distribution granularity** instead of coarsely by name, without suppressing remote platform-specific wheels (#2937).
+- **Virtual Debian repos enforce each member's dist/component/architecture filter** (#2727).
+- **RPM keyless sync defaults to fail-closed**, requiring a configured trusted GPG key (#2569).
+- **The npm scope-policy allowlist fails closed** on a DB error or corrupt config (#2726), and **the Debian proxy filter fails closed** when it cannot be loaded (#2672).
+- **Encoded `%2f`/`%5c` path separators are rejected** in the Debian proxy filter and proxy paths as defense-in-depth, reconciled to a uniform 400 (#2562, #2770).
+- **`Content-Disposition` filenames are sanitized per RFC 6266**, removing a header-injection and panic surface (#2654).
+- **PyPI simple-index responses are sniffed rather than trusting the upstream `Content-Type`**, and un-rewritten upstream URLs are never served (#2807).
+- **NuGet remote proxying pins upstream credentials to the configured upstream host** rather than a host named by the upstream's own service index (#2925).
+- **Diagnostic URL redaction strips userinfo**, so upstream credentials no longer leak in 502 bodies (#2926).
+- **Updating a repository's security scan config requires repository admin** (#2750), as do the **repository-configuration subresources** (#2603).
+- **Mutation paths enforce action-specific repository authorization** (#2987), and **migration source/job routes require global admin** (#2979).
+- **The migration referenced-content walker is byte-capped** per blob and per image, tied to repo quota (#2575).
+- **The repository scan-config `severity_threshold` is validated and normalized**, returning 400 instead of 500 on a non-lowercase value (#2953).
+- **The scan tenant-refcount is registered inside its RAII guard**, closing a refcount leak on future cancellation (#2595).
+- **Bundled Grype updated to v0.116.0** to clear CVE-2026-56852, with a non-reachable bundled-gRPC advisory suppressed (#2777).
+
+### Added
+
+- **Typed curation policy engine** — publisher-trust and popularity evaluators with global scope and decision dispatch, forming the base for allow/flag/block curation rules (#2947).
+- **Typo-squat detection** — popularity-threshold rules plus Unicode-confusable (homoglyph) and affix-based typo-squat detection (#2956).
+- **RPM curated snapshots** — versioned publications with signed, immutable `@N` snapshot serving (#2358).
+- **Durable repository-owner capability**, so repository owners carry a real, persisted permission grant (#2666).
+- **Per-artifact quarantine state is surfaced in the artifact listing** (#2940).
+- **Age-gate reviews can be reopened and re-decided** instead of being terminal once approved or rejected (#2939).
+- **Per-prefix folder-tree storage rollup with a `/storage/tree` endpoint** for deduplicated per-folder usage (#2601).
+- **Browseable folder tree for generic proxy download recording and analytics** — generic-path proxy downloads are recorded and proxy counts are surfaced (#2705).
+- **APT repositories expose the GPG public key at the repository root** for a natural keyring URI (#2694).
+- **RPM/generic packages get header metadata extracted** so generically-pushed RPMs carry real `Source:` and related fields (#2588).
+- **SSO-synced group membership can be made immutable**, blocking manual member edits on externally-sourced groups (#2874).
+- **More OIDC configuration via environment variables**, including provider toggles for bootstrap (#2792).
+- **Server version and git SHA are logged at startup** so support log dumps identify the running release (#2597).
+- **Configurable first-run admin-password retrieval hint** (#2804).
+- **Backup enhancements** — custom archive name (#2790), per-repository exclusions (#2772), incremental backup from a given date (#2789), a configurable `BACKUP_S3_PREFIX`, and a separate S3 bucket for backup archives (#2507).
+- **Custom GCS endpoint support** for emulator-based E2E (#2646).
+- **Release binaries are published by a standalone, gate-independent workflow** when the release gate is waived (#2719).
+
+### Changed
+
+- **Per-tenant fairness for the concurrent-decode cap** during ingestion extraction, so one tenant cannot starve decoding (#2598).
+- **Web image release is decoupled from the backend release** in CI (#2709).
+- **Releases are announced to the community Discord** on publish (#2690).
+- **Added `ARCHITECTURE.md`** maintainer documentation (#2739).
+
+### Fixed
+
+- **npm hosted-publish packument invalidation fans out to all replicas**, fixing stale dist-tags and split `npm pack` filename/bytes across a cluster (#2490).
+- **Composer preserves all valid `composer.json` properties on upload** (#2846) and **resolves packages from Composer v1-protocol upstreams** (#2693).
+- **Maven/Gradle grouped listings normalize `packages.name` to `groupId:artifactId`** (#2723), and **`maven-metadata.xml` is cleared when an artifact is deleted** (#2845).
+- **Hex serves a consumable registry as an upstream pass-through after first cache** (#2658) and **reconciles case-variant releases** so advertised tarballs download (#2674).
+- **NuGet and Chocolatey remote pull-through proxying works** (#2779).
+- **Remote Cargo crate downloads stream** instead of buffering at the metadata cap (#2918).
+- **conda-forge and Hugging Face pull-through proxies are fixed**, preserving `Content-Length` on compressed upstreams (#2915).
+- **PyPI simple-index responses gain HTTP caching** (ETag/`Cache-Control`/304) (#2780).
+- **Terraform advertises stored provider platforms** (#2661), **excludes held packages from mirror index and versions** (#2662), and **omits empty checksum URLs** from provider responses (#2934).
+- **RPM excludes non-`.rpm` objects from repodata listings** (#2590).
+- **Helm advertises the stored chart filename in `index.yaml`** for bare-path uploads (#2753).
+- **CRAN and RubyGems advertise stored-filename coordinates** for bare-path uploads (#2754), and **suffix-resolved formats advertise the stored basename** in download URLs (#2589).
+- **Azure Shared Key requests are signed correctly for path-style endpoints** (#2649).
+- **GCS metadata-server token fetches use a dedicated HTTP client**, fixing dropped Workload Identity connections on `docker push` (#2611).
+- **Blob garbage collection reclaims row-less Maven sidecar and metadata objects** (#2668).
+- **First-time-setup admin login works** — peer replicas unlock after the admin password change without a restart (#2492).
+- **The admin LDAP test-connection performs a real bind** (#2486), with **per-provider LDAPS TLS skip-verify and custom-CA options** (#2796).
+- **Active Directory groups sync to local groups on login** (#2468).
+- **The local-login button shows in the UI when SSO is enabled** and local admin login is allowed (#2621).
+- **OIDC group memberships resolve from candidate claims and userinfo** (GitLab `groups_direct`/inherited), including group claims emitted as a delimited string (#2833).
+- **The federated group reconciler no longer over-grants** by attaching SSO/LDAP users to operator-managed groups by name alone (#2759).
+- **Nexus migration populates the Packages catalog** for imported artifacts (#2676), **repairs hollow Docker repos on re-migration** (#2596), **creates rows for by-digest child manifests** (#2576), **migrates Go and APT repos** (#2797), **correlates group members to virtual-repo members** (#2799), **populates `upstream_url` for remote/proxy repos** (#2822), **skips artifact transfer for virtual (group) repos** (#2821), and **resolves the source version instead of reporting "unknown"** (#2872).
+- **Dependency-Track integration resolves its API key file at use time** so a post-boot bootstrap needs no restart (#2975), with the **provisioned key file owned by the backend UID** (#2865).
+- **Virtual-repo total aggregation is corrected and member edits are allowed** (#2795).
+- **Large virtual-repo delete storage cleanup is deferred off the request path** (#2778).
+- **Backup archive storage is reclaimed in retention cleanup** (#2800).
+- **Health-monitor probes apply OpenSearch Basic auth** (#2945).
+- **API tokens are accepted as the Basic-auth password on the generic API** (#2798).
+- **A disabled format's aliases are blocked** (#2867).
+- **The `docker-compose.local-dev.yml` stack works again** (#2909).
+- **OpenAPI tags the artifact-signing operation** so SDK generation stops emitting empty `tags[]` (#2721).
+
+### Performance
+
+- **O(1) quota admission** — uploads no longer scan all live artifact sizes twice; admission reads maintained usage-ledger counters (#2523), and **the usage ledger is kept authoritative via row-level triggers** on the source tables (#2992).
+- **Common upload routes stream** instead of buffering artifacts up to the 10 GiB limit (#2517), with **upload over-admission closed by a serialized usage ledger** (#2523).
+- **Full-text search is backed by a GIN-indexed `search_vector`** instead of recomputing `to_tsvector` per row (#2871).
+- **Keyset pagination** replaces full materialization for flat catalog listings and substring search (#2518), remote-cache browsing (#2519), grouped Docker/Maven listings past the 10k bound (#2520), and Maven hosted/virtual grouped listings with catalog-name backfill (#2723).
+- **RPM repodata is served from a fingerprint-validated cached render** (#2521).
+- **Download-path stats and audit writes move off the hot path** (#2522), with the **download side-effect dispatch bounded** by a queue plus flush-worker pool (#2522).
+- **Metadata-files attribution consults an indexed claims ledger first** (#2942).
+- **Buffered proxy metadata is bounded across Debian/npm/Composer/Maven/PyPI** against a shared byte budget (#2684), and **concurrent quality checks are bounded** to a shared capacity budget (#2522).
+
+### CI / Release Assurance
+
+- **The release security suite is blocking and the fake-green SAML oracle is fixed** (#2700).
+- **The Deployment Test Framework runs as a required release gate against the candidate digest** (#2697).
+- **Promote-by-digest** — `:VERSION`/`:latest` publish only after the gate passes, with a digest-aware republish guard and idempotent mirror (#2698).
+- **Release-gate `resolve-candidate-digest` waits on the docker-publish run** instead of a 35-minute clock (#2711).
+- **The release gate is dispatch-rehearsable** as a dry run (#2701), with a **pre-tag release-preflight check** to catch main-vs-release drift (#3042).
+- **DB-backed tests fail loudly when the database is unreachable** instead of reporting fiction-green (#2924), and **the lib suite is green and hang-proof without `DATABASE_URL`** (#2986).
+- **`ci.yml` is the sole owner of the required check contexts**, removing the duplicate docs-only shim (#2923).
+- **The smoke E2E gate reflects every suite's exit code** (#2985), the **mesh E2E gate is dropped from the release path on main** (#2980), and the **docker-publish Security Scan gate is hardened against transient network failures** (#2982).
+- **The migration-ledger gate retries transient git failures and separates infra exit codes** from genuine divergence (#2984), fixing the "shallow file has changed" flake (#2902).
+- **Format tests drive advertised download/content URLs through the real router** (#2657), and **test-module builder copies are promoted into production** so literal-pinned tests catch format drift (#2657).
+- Routine dependency and CI-toolchain bumps (serde_json, serde_with, Grype, and several GitHub Actions) (#2673, #2854).
+
 ## [1.6.0] - TBD
 
 A security- and correctness-hardening release closing the 1.6.0 milestone: 24 security fixes, 9 features and enhancements, and 47 bug fixes, spanning multi-tenant isolation, supply-chain signing, ingestion/scan resource limits, native-client format fidelity across a dozen ecosystems, proxy/cache accounting, and SSO group mapping. It also folds in the cross-repository Maven flat-key attribution hardening and the npm replication-feed and webhook cluster-safety fixes carried over from the 1.5.x hotfix line. In-place upgrade from 1.5.x is automatic — a startup migration-ledger reconciliation resolves the history divergence with no operator action (#2686). The release date is stamped at cut.
