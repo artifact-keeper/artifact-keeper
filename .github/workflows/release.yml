@@ -267,14 +267,15 @@ jobs:
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
 
-  e2e-gate:
-    name: 🚦 E2E Gate
-    needs: [release-preflight]
-    uses: ./.github/workflows/e2e.yml
-    with:
-      profile: smoke
-      include_stress: false
-      include_failure: false
+  # The legacy e2e-gate (e2e.yml profile:smoke = Setup PKI + Native Client
+  # smoke) was RETIRED from the release path (#3062): the DTF release-gate
+  # (artifact-keeper-test Full Suite) covers the same ground via its digest-
+  # pinned smoke / real-flow-smoke / clean-install-smoke tiers, and the old
+  # gate rebuilt the backend image + pulled the UBI base from
+  # brew.registry.redhat.io -- a flaky external dependency that 401'd and
+  # blocked the v1.7.0 cut on a non-code issue. e2e.yml itself stays (used by
+  # concurrency-e2e.yml and CI); only its use as a REQUIRED release gate is
+  # dropped. build-binaries now gates on release-gate (the DTF jobs) alone.
 
   # NOTE: `mesh-e2e-gate` was removed from the release path (first on 1.6.x,
   # commit 919439bb; cherry-picked to main for #2980). It called
@@ -317,7 +318,7 @@ jobs:
     # Both gates must be green. That is the default `success()` behaviour for
     # `needs`, so no `if:` is needed -- and an `always()` here would only be a
     # way to lose it again.
-    needs: [e2e-gate, release-gate]
+    needs: [release-gate]
     strategy:
       fail-fast: false
       matrix:
