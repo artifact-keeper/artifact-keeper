@@ -4650,8 +4650,8 @@ async fn handle_start_upload(
         };
     // GHSA-vvc3-h39c-mrq5: a read-scoped API token must not be accepted
     // for an OCI blob upload (`docker push`). Enforce the write scope.
-    if !oci_scopes_grant(&token_scopes, "write") {
-        return oci_forbidden_scope("write");
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -4975,8 +4975,8 @@ async fn handle_patch_upload(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
-    if !oci_scopes_grant(&token_scopes, "write") {
-        return oci_forbidden_scope("write");
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
     }
 
     let session_id: Uuid = match uuid_str.parse() {
@@ -5224,8 +5224,8 @@ async fn handle_cancel_upload(
             Ok(c) => c,
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
-    if !oci_scopes_grant(&token_scopes, "write") {
-        return oci_forbidden_scope("write");
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
     }
 
     let session_id: Uuid = match uuid_str.parse() {
@@ -5444,8 +5444,8 @@ async fn handle_complete_upload(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
-    if !oci_scopes_grant(&token_scopes, "write") {
-        return oci_forbidden_scope("write");
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
     }
 
     let requested_digest = match digest_query {
@@ -7842,8 +7842,8 @@ async fn handle_put_manifest(
             Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PUT manifest is the final step of `docker push`.
-    if !oci_scopes_grant(&token_scopes, "write") {
-        return oci_forbidden_scope("write");
+    if !oci_scopes_grant(&token_scopes, "write:artifacts") {
+        return oci_forbidden_scope("write:artifacts");
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -8863,8 +8863,8 @@ async fn handle_delete_manifest(
         };
     // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
     // delete scope on API tokens. JWT/password callers pass through.
-    if !oci_scopes_grant(&token_scopes, "delete") {
-        return oci_forbidden_scope("delete");
+    if !oci_scopes_grant(&token_scopes, "delete:artifacts") {
+        return oci_forbidden_scope("delete:artifacts");
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -9858,6 +9858,47 @@ mod tests {
     fn test_oci_scopes_grant_empty_scopes_rejected() {
         let scopes = Some(vec![]);
         assert!(!oci_scopes_grant(&scopes, "write"));
+    }
+
+    // #3053: the OCI write/delete gates require the colon-form artifact
+    // scopes (`write:artifacts` / `delete:artifacts`), aligned with the #2993
+    // migration of the format handlers. A least-privilege granular token —
+    // the only kind of write token mintable since #2996 — must pass, and a
+    // read-only granular token must still be denied.
+    #[test]
+    fn test_oci_write_gate_accepts_granular_write_artifacts_token() {
+        let scopes = Some(vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+        ]);
+        assert!(oci_scopes_grant(&scopes, "write:artifacts"));
+        // Write does not imply delete.
+        assert!(!oci_scopes_grant(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_oci_write_gate_rejects_read_only_granular_token() {
+        let scopes = Some(vec!["read:artifacts".to_string()]);
+        assert!(!oci_scopes_grant(&scopes, "write:artifacts"));
+        assert!(!oci_scopes_grant(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_oci_write_gate_broad_parent_still_covers_colon_form() {
+        // #2989 parent rule: a broad bare-action scope covers its colon-form
+        // children, so legacy `write`/`delete` tokens keep working.
+        let scopes = Some(vec!["write".to_string(), "delete".to_string()]);
+        assert!(oci_scopes_grant(&scopes, "write:artifacts"));
+        assert!(oci_scopes_grant(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_oci_write_gate_wildcard_and_admin_cover_colon_form() {
+        for wildcard in ["*", "admin"] {
+            let scopes = Some(vec![wildcard.to_string()]);
+            assert!(oci_scopes_grant(&scopes, "write:artifacts"));
+            assert!(oci_scopes_grant(&scopes, "delete:artifacts"));
+        }
     }
 
     // #1316: `oci_scopes_grant` now delegates the wildcard decision to the
