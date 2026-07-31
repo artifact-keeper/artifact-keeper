@@ -63,20 +63,44 @@ const OWNER_BY_ARTIFACT_ROW_SQL: &str = "SELECT DISTINCT a.repository_id FROM ar
 /// for the same ambiguity test.
 ///
 /// The GAV-grouped upload handler has always serialized `files[]` entries with
-/// camelCase keys (`"storageKey"`, since #418) -- matching on snake_case
-/// `storage_key` alone never hits real data, which silently disabled this
-/// whole layer (and migration 163's `metadata_files` backfill). COALESCE
-/// accepts both spellings so any hand-repaired snake_case rows keep working.
+/// camelCase keys (`"storageKey"`, since #418); snake_case `storage_key` is
+/// accepted as a fallback spelling so hand-repaired rows keep working (#2706).
+///
+/// Both spellings are matched with jsonb containment (`@>`) rather than a
+/// per-row `EXISTS` over `jsonb_array_elements`, because containment is the
+/// only form a GIN index can serve (#2942). The previous `EXISTS` predicate
+/// was evaluated per row with no index path available, so every flat-key read
+/// that reached this layer scanned all of `artifact_metadata` -- unavoidable
+/// for keys the ledger has never seen, which on a virtual-repository read is
+/// every local-member probe for an artifact that actually lives upstream.
+///
+/// **No migration ships with this change on the 1.6.x line.** The index that
+/// makes the rewrite pay off is deliberately left to the operator, so a patch
+/// release never performs a write-blocking in-transaction index build:
+///
+/// ```sql
+/// CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_artifact_metadata_files_gin
+///   ON artifact_metadata USING gin ((metadata->'files') jsonb_path_ops);
+/// ```
+///
+/// Deployments that skip it are unaffected -- without an index this query
+/// performs the same class of sequential scan as the `EXISTS` form it
+/// replaces. Deployments that create it get the indexed plan (a BitmapOr of
+/// two index probes, one per spelling) with no downtime and no upgrade
+/// coupling. The index name and definition match migration 179 on `main`, and
+/// that migration is `IF NOT EXISTS`, so a later move to the 1.7 line adopts
+/// the hand-built index as a no-op.
+///
+/// Containment against an array operand is false for non-array values, so the
+/// explicit `jsonb_typeof` guard the `EXISTS` form needed is implicit here.
 const OWNER_BY_METADATA_FILES_SQL: &str = "SELECT DISTINCT a.repository_id \
      FROM artifact_metadata am \
      JOIN artifacts a ON a.id = am.artifact_id \
      JOIN repositories r ON r.id = a.repository_id \
      WHERE a.is_deleted = false \
        AND r.storage_backend = $2 \
-       AND jsonb_typeof(am.metadata->'files') = 'array' \
-       AND EXISTS ( \
-         SELECT 1 FROM jsonb_array_elements(am.metadata->'files') f \
-         WHERE COALESCE(f->>'storageKey', f->>'storage_key') = $1) \
+       AND (am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storageKey', $1::text)) \
+         OR am.metadata->'files' @> jsonb_build_array(jsonb_build_object('storage_key', $1::text))) \
      LIMIT 2";
 
 /// The attribution table (backfilled legacy keys + write-time claims). The

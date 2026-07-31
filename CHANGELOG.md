@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The Maven flat-key metadata-files owner lookup is now indexable** (#2942, #3046): the layer that derives ownership from a parent artifact's `files[]` array matched with a per-row `EXISTS` over `jsonb_array_elements`, which no index can serve. Every flat-key read that reached that layer therefore scanned all of `artifact_metadata`. #2946 removed the scan for keys the claims ledger already knows, but a key the ledger has *never* seen still falls through -- and on a virtual-repository read that is every cloud-backed local-member probe for an artifact that actually lives upstream, i.e. every cache-missing public dependency of a build. Measured on a deployment with ~1.9M `artifact_metadata` rows (91% carrying a `files[]` array), one such lookup costs ~2.8s of pure buffer churn with all pages already cached, and concurrent dependency resolution then queues on the connection pool.
+
+  The lookup is rewritten to jsonb containment (`@>`), preserving both accepted key spellings (#2706) as a two-branch predicate. **No migration is added on the 1.6.x line**: the GIN index that makes the rewrite pay off is left to the operator, precisely so a patch release never performs a write-blocking in-transaction index build (the reason the rewrite was held back from 1.6.4 in the first place). Operators who need the speedup create it with no downtime:
+
+  ```sql
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_artifact_metadata_files_gin
+    ON artifact_metadata USING gin ((metadata->'files') jsonb_path_ops);
+  ```
+
+  Deployments that skip it are unaffected -- without an index the containment form performs the same class of sequential scan as the predicate it replaces. The index name and definition match migration 179 on `main`, and that migration is `IF NOT EXISTS`, so a later move to the 1.7 line adopts a hand-built index as a no-op. Adding the migration to this branch was rejected on purpose: `main` has already consumed versions 176-178, so a branch-local number would collide on checksum for any deployment upgrading from 1.6.x to 1.7.x.
+
 ## [1.6.4] - 2026-07-28
 
 A security patch for the 1.6.0 line, hardening Maven flat-key tenant isolation on cloud storage backends. In-place upgrade from any 1.6.x is a drop-in image swap with no database migration.
