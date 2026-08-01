@@ -158,6 +158,9 @@ pub struct RepoInfo {
     pub promotion_only: bool,
     pub age_gate_enabled: bool,
     pub age_gate_min_age_days: i32,
+    /// Age-source mode wire value (migration 191); parsed by
+    /// [`age_gate_params`]. Defaults to `upstream_publish_time`.
+    pub age_gate_mode: String,
     pub curation_enabled: bool,
     pub curation_default_action: String,
 }
@@ -200,7 +203,7 @@ pub async fn resolve_repo_by_key(
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
-         age_gate_enabled, age_gate_min_age_days, \
+         age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
          curation_enabled, curation_default_action \
          FROM repositories WHERE key = $1",
     )
@@ -237,6 +240,9 @@ pub async fn resolve_repo_by_key(
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
         age_gate_enabled: repo.try_get("age_gate_enabled").unwrap_or(false),
         age_gate_min_age_days: repo.try_get("age_gate_min_age_days").unwrap_or(7),
+        age_gate_mode: repo
+            .try_get("age_gate_mode")
+            .unwrap_or_else(|_| "upstream_publish_time".to_string()),
         curation_enabled: repo.try_get("curation_enabled").unwrap_or(false),
         curation_default_action: repo
             .try_get("curation_default_action")
@@ -2525,6 +2531,11 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         promotion_only: m.promotion_only,
         age_gate_enabled: m.age_gate_enabled,
         age_gate_min_age_days: m.age_gate_min_age_days,
+        // `age_gate_mode` is deliberately NOT on the Repository model; this
+        // default is a placeholder. The age-gate wrappers DB-resolve the
+        // authoritative (mode, upstream) policy by id once the cheap
+        // enabled-check passes, so a member's mode is never read from here.
+        age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: m.curation_enabled,
         curation_default_action: m.curation_default_action.clone(),
     }
@@ -4760,18 +4771,28 @@ pub(crate) fn build_download_response(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
-/// Build age-gate params from a resolved repository descriptor.
-pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
-    use crate::models::repository::{RepositoryFormat, RepositoryType};
-    use crate::services::age_gate_service::AgeGateRepoParams;
-
-    let repo_type = match info.repo_type.as_str() {
+/// Map a `repositories.repo_type` string onto the typed enum for age-gate
+/// params, defaulting unknown values to `Local` (never gated).
+pub(crate) fn age_gate_repo_type_from_str(
+    repo_type: &str,
+) -> crate::models::repository::RepositoryType {
+    use crate::models::repository::RepositoryType;
+    match repo_type {
         "remote" => RepositoryType::Remote,
         "virtual" => RepositoryType::Virtual,
         "staging" => RepositoryType::Staging,
         _ => RepositoryType::Local,
-    };
-    let format = match info.format.to_lowercase().as_str() {
+    }
+}
+
+/// Map a `repositories.format` string onto the age-gate format alias space:
+/// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
+/// everything else as `Generic` (not in the enforceable matrix).
+pub(crate) fn age_gate_format_from_str(
+    format: &str,
+) -> crate::models::repository::RepositoryFormat {
+    use crate::models::repository::RepositoryFormat;
+    match format.to_lowercase().as_str() {
         "npm" => RepositoryFormat::Npm,
         "pypi" => RepositoryFormat::Pypi,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
@@ -4779,15 +4800,24 @@ pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::Ag
         }
         other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
         _ => RepositoryFormat::Generic,
-    };
+    }
+}
+
+/// Build age-gate params from a resolved repository descriptor. The mode
+/// wire value is CHECK-constrained by migration 191, so the parse fallback
+/// to the default mode is unreachable in practice.
+pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
+    use crate::services::age_gate_service::{AgeGateMode, AgeGateRepoParams};
 
     AgeGateRepoParams::from_parts(
         info.id,
         info.key.clone(),
-        repo_type,
-        format,
+        age_gate_repo_type_from_str(&info.repo_type),
+        age_gate_format_from_str(&info.format),
         info.age_gate_enabled,
         info.age_gate_min_age_days,
+        AgeGateMode::parse(&info.age_gate_mode).unwrap_or_default(),
+        info.upstream_url.clone(),
     )
 }
 
@@ -4987,6 +5017,102 @@ pub async fn enforce_curation_lookup(
         default_action: &default_action,
     };
     enforce_curation(db, target, package, version).await
+}
+
+/// 503 response when a repository's age gate is enabled but cannot be
+/// evaluated (service unwired, config unreadable, or no evidence resolution
+/// at the calling seam). The age gate fails CLOSED (#2264): an evaluation
+/// error must refuse the download rather than impersonate a disabled gate —
+/// the deliberate divergence from the curation seam above, which fails open.
+pub fn age_gate_unavailable_response(repo_key: &str, package: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "age_gate_unavailable",
+        "repository": repo_key,
+        "package": package,
+        "message": "The age gate is enabled for this repository but could not be evaluated; refusing the download (fail closed)"
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Enforce a repository's publish-age gate on a supported proxy
+/// pull/download (#2264).
+///
+/// The caller supplies the identity it already parses (the same convention as
+/// the curation seam) plus the upstream publish evidence its format resolves;
+/// this core owns applicability, the decision, review-row recording (via
+/// [`AgeGateService::check`]), and the terminal 451.
+///
+/// Outcome mapping:
+/// * `Ok(None)` — allowed: gate off / repository-format not in the
+///   enforceable matrix / version meets the threshold / sticky approval.
+/// * `Ok(Some(blocked))` — blocked, but a last-known-good version exists; the
+///   caller substitutes its format-specific LKG response (npm rebuilds a
+///   tarball path, pypi a wheel filename) so LKG construction stays with the
+///   format that understands it. The outcome retains the real review id for
+///   protocols such as Go that intentionally do not substitute an LKG.
+/// * `Err(451)` — blocked with no LKG: structured `age_gate_blocked` body,
+///   review row created/bumped.
+/// * `Err(5xx)` — the check itself failed. Unlike the curation seam, the age
+///   gate fails CLOSED; see [`age_gate_unavailable_response`].
+///
+/// [`AgeGateService`]: crate::services::age_gate_service::AgeGateService
+#[derive(Debug)]
+pub struct AgeGateSubstitution {
+    pub review_id: Uuid,
+    pub last_known_good: crate::services::age_gate_service::LastKnownGood,
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn enforce_age_gate(
+    svc: Option<&crate::services::age_gate_service::AgeGateService>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<AgeGateSubstitution>, Response> {
+    use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+
+    if !AgeGateService::gating_requested(params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(params).map_err(|e| e.into_response())?;
+    // Applicability established: from here every non-allow path fails closed.
+    let Some(svc) = svc else {
+        return Err(age_gate_unavailable_response(&params.key, package));
+    };
+    match svc
+        .check(params, package, version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: Some(lkg),
+        } => Ok(Some(AgeGateSubstitution {
+            review_id,
+            last_known_good: lkg,
+        })),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
+            Err(age_gate_blocked_response(
+                review_id,
+                package,
+                version,
+                params.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
 }
 
 /// Build a minimal `Repository` model for proxy operations.
@@ -6250,6 +6376,7 @@ mod tests {
             promotion_only,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         }
@@ -6955,6 +7082,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -8924,6 +9052,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9045,6 +9174,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9213,6 +9343,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9263,6 +9394,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9314,6 +9446,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9366,6 +9499,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9432,6 +9566,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -9499,6 +9634,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -11316,6 +11452,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: true,
             age_gate_min_age_days: 14,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -11704,6 +11841,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 0,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled,
             curation_default_action: "allow".to_string(),
         }
@@ -11792,5 +11930,140 @@ mod tests {
         );
 
         curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_age_gate seam (#2264): the age-gate twin of the curation seam
+    // above, landing at the same call sites. Pins the outcome mapping
+    // (allow / LKG hand-back / terminal 451) and the deliberate divergence
+    // from curation: every non-allow evaluation failure fails CLOSED.
+    // -----------------------------------------------------------------------
+
+    fn age_gate_params_for(
+        id: uuid::Uuid,
+        key: &str,
+        repo_type: &str,
+        format: &str,
+        enabled: bool,
+        min_age_days: i32,
+    ) -> crate::services::age_gate_service::AgeGateRepoParams {
+        crate::services::age_gate_service::AgeGateRepoParams::from_parts(
+            id,
+            key.to_string(),
+            age_gate_repo_type_from_str(repo_type),
+            age_gate_format_from_str(format),
+            enabled,
+            min_age_days,
+            Default::default(),
+            None,
+        )
+    }
+
+    fn age_gate_svc(pool: sqlx::PgPool) -> crate::services::age_gate_service::AgeGateService {
+        use crate::services::event_bus::EventBus;
+        crate::services::age_gate_service::AgeGateService::new(
+            pool,
+            std::sync::Arc::new(EventBus::new(4)),
+        )
+    }
+
+    async fn response_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_not_applicable_allows_without_service() {
+        // Gate disabled / hosted repo: gating not requested -> allowed,
+        // and the absence of a wired service must not matter.
+        for (repo_type, format, enabled) in [
+            ("remote", "npm", false),
+            ("local", "npm", true),
+            ("local", "maven", true),
+        ] {
+            let params = age_gate_params_for(
+                uuid::Uuid::new_v4(),
+                "ag-seam",
+                repo_type,
+                format,
+                enabled,
+                7,
+            );
+            let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
+            assert!(
+                matches!(out, Ok(None)),
+                "({repo_type}, {format}, enabled={enabled}) must be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_applicable_without_service_fails_closed() {
+        // An enabled, applicable gate with no wired service must refuse the
+        // download (503), never impersonate a disabled gate. Divergence from
+        // the curation seam, which fails open — deliberate (#2264).
+        let params = age_gate_params_for(uuid::Uuid::new_v4(), "ag-seam", "remote", "npm", true, 7);
+        let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
+        let resp = out.expect_err("must fail closed");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(resp).await;
+        assert_eq!(body["error"], "age_gate_unavailable");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_blocks_young_and_allows_old_db() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, key, _) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 30 \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("enable age gate");
+        let svc = age_gate_svc(pool.clone());
+        let params = age_gate_params_for(repo_id, &key, "remote", "npm", true, 30);
+
+        // Young version, no LKG on record: terminal 451 with the structured
+        // body, and a pending review row recorded by the check.
+        let young = chrono::Utc::now() - chrono::Duration::days(1);
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "2.0.0", Some(young)).await;
+        let resp = out.expect_err("young version must block");
+        assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let body = response_json(resp).await;
+        assert_eq!(body["error"], "age_gate_blocked");
+        assert_eq!(body["package"], "seam-pkg");
+        assert_eq!(body["min_age_days"], 30);
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM age_gate_reviews \
+             WHERE repository_id = $1 AND package_name = 'seam-pkg' AND status = 'pending'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count review rows");
+        assert_eq!(count, 1, "the block must record a pending review row");
+
+        // A version past the threshold is allowed.
+        let old = chrono::Utc::now() - chrono::Duration::days(365);
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "1.0.0", Some(old)).await;
+        assert!(matches!(out, Ok(None)), "old version must be allowed");
+
+        // Missing publish evidence counts as not meeting the threshold (#2066
+        // fail-closed carried through the seam).
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "3.0.0", None).await;
+        assert!(out.is_err(), "missing publish evidence must block");
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 }

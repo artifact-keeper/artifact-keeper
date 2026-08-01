@@ -2714,6 +2714,7 @@ pub async fn create_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;
@@ -3637,6 +3638,7 @@ pub async fn update_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;
@@ -4175,6 +4177,7 @@ pub async fn delete_repository(
                 visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
+                age_gate_mode: None,
             }),
     )
     .await;

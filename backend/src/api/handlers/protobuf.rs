@@ -441,6 +441,7 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         format: "generic".to_string(),
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: false,
         curation_default_action: "allow".to_string(),
     })

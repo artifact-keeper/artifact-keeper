@@ -305,3 +305,81 @@ pub fn list_core_formats() -> Vec<&'static str> {
         "lxc",
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Age-gate capability registry (#2264)
+// ---------------------------------------------------------------------------
+
+/// Per-format age-gate capability spec: the single registry every age-gate
+/// capability decision derives from.
+///
+/// One spec per protocol family owns:
+///   * the canonical format aliases collapse onto (`canonical`);
+///   * the bounded metrics label (`label`);
+///   * whether the upstream treats a published coordinate as immutable
+///     (`immutable_coordinates`) — the trust prerequisite for `first_seen`:
+///     a registry that permits overwrite or delete-and-republish can
+///     substitute new content under an aged coordinate; and
+///   * whether this server can resolve upstream publish times for the format
+///     (`publish_time_resolver`) — the prerequisite for
+///     `upstream_publish_time`.
+///
+/// Mode support follows from capabilities
+/// (`AgeGateService::supports_format_mode`); the config endpoint and the
+/// enforcement seam both read this registry, so there is no second
+/// hand-maintained matrix to drift. Package identity is NOT derived here —
+/// per the #2962 seam convention, each format's download handler passes the
+/// identity it already parses.
+pub struct AgeGateFormatSpec {
+    pub canonical: RepositoryFormat,
+    pub label: &'static str,
+    pub immutable_coordinates: bool,
+    pub publish_time_resolver: bool,
+}
+
+static NPM_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Npm,
+    label: "npm",
+    // npm forbids republishing a (name, version) once published (even after
+    // unpublish, the version number is burned).
+    immutable_coordinates: true,
+    // Packument `time` map.
+    publish_time_resolver: true,
+};
+
+static PYPI_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Pypi,
+    label: "pypi",
+    // PyPI forbids re-uploading a distribution filename once uploaded.
+    immutable_coordinates: true,
+    // Warehouse JSON `upload-time`.
+    publish_time_resolver: true,
+};
+
+static GO_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Go,
+    label: "go",
+    // Module proxies serve immutable, checksum-database-pinned versions: a
+    // published (module, version) cannot be replaced with different content
+    // without breaking go.sum verification.
+    immutable_coordinates: true,
+    // `.info` timestamps are VCS tag times the publisher controls — advisory
+    // at best — so there is no trustworthy publish-time resolver; `first_seen`
+    // is the only supported age source.
+    publish_time_resolver: false,
+};
+
+/// Look up the age-gate capability spec for a repository format, collapsing
+/// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
+/// canonical format that owns their policy. `None` means the format has no
+/// age-gate support; the config endpoint rejects attempts to enable it.
+pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormatSpec> {
+    match format {
+        RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
+            Some(&NPM_AGE_GATE_SPEC)
+        }
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry => Some(&PYPI_AGE_GATE_SPEC),
+        RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
+        _ => None,
+    }
+}
