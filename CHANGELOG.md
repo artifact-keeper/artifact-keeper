@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Scheduled backups claim one durable run per due occurrence** (#2219): multi-replica schedulers no longer create duplicate archives for the same schedule tick. Long runs renew their token-fenced claim, and run finalization plus advancement of the unchanged schedule occurrence is transactional. A schedule whose cron expression has no further occurrence is now disabled with a warning instead of being left permanently due, where it consumed a due-schedule slot and could starve other schedules.
 - **Password-expiry notifications are claimed before SMTP** (#2219): concurrent replicas no longer email the same password-version warning in one scheduler tick. Failed attempts observe a retry delay, stale account/password candidates are rejected at claim time, and usernames are escaped in HTML mail.
+- **Generic chunked uploads take a completion lease before finalizing** (#2219): a duplicate `complete` no longer re-checksums, re-copies, and re-upserts the same session, and a failed storage copy no longer leaves a session marked `completed` with no artifact. `cancel` can no longer delete the temp file out from under a live committer, and the expired-session reaper claims its cancels instead of racing them. Chunk uploads are rejected once a session is committing, and a `complete` that fails its authorization re-check releases the lease so the session stays retryable.
 
 ## [1.7.0] - 2026-07-31
 
