@@ -371,7 +371,11 @@ pub async fn get_repo_age_gate(
     Path(key): Path<String>,
 ) -> Result<Json<AgeGateConfigResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    // Admin-only, for parity with the PUT below and the /admin review routes:
+    // gate posture (enabled + threshold) is operator configuration, not
+    // package metadata (#2264). Blocked download callers still learn
+    // `min_age_days` from the structured 451 body, which is intended.
+    auth.require_admin()?;
     let service = RepoSvc::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
@@ -579,5 +583,96 @@ mod tests {
         assert_eq!(resp.repository_key, "");
         assert_eq!(resp.package_name, "lodash");
         assert_eq!(resp.status, "pending");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2264 low-sev disclosure: GET /repositories/{key}/age-gate is admin-only
+    // (parity with the PUT and the /admin review routes). Previously any
+    // authenticated caller with the "read" scope could read gate posture for
+    // any repository. DB-backed: skips without DATABASE_URL; the CI coverage
+    // job runs these against Postgres. The external-vantage twin lives in
+    // tests/security_regression_tests.rs.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn config_app(state: SharedState, caller: AuthExtension) -> axum::Router {
+        tdh::router_with_auth(repo_config_routes(), state, caller)
+    }
+
+    /// The exact pre-fix caller: an authenticated API token carrying only the
+    /// "read" scope, which passed the old `require_scope("read")` gate.
+    fn read_scope_token() -> AuthExtension {
+        AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["read".to_string()]),
+            ..auth(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_read_scope_token_forbidden_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = read_scope_token();
+        let caller_id = caller.user_id;
+        let (status, body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            !body.contains("min_age_days") && !body.contains("enabled"),
+            "403 body must not leak gate config: {body}"
+        );
+        tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_non_admin_user_forbidden_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Non-admin session user with unrestricted repo access: repo-access
+        // bits must not grant config reads either.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = auth(false);
+        let caller_id = caller.user_id;
+        let (status, _body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    #[tokio::test]
+    async fn get_repo_age_gate_admin_ok_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let caller = auth(true);
+        let caller_id = caller.user_id;
+        let (status, body) = tdh::send(
+            config_app(state, caller),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).expect("valid config body");
+        assert_eq!(cfg.repository_key, key);
+        // Column defaults from migration 146: disabled, 7-day threshold.
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.min_age_days, 7);
+        tdh::cleanup(&pool, repo_id, caller_id).await;
     }
 }
