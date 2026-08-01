@@ -256,26 +256,33 @@ impl SchedulerLease {
         self.lease_expires_at
     }
 
+    /// Keep this scheduler lease alive until the returned guard is dropped.
+    ///
+    /// This is for singleton jobs whose side effects may run longer than one
+    /// fixed TTL (large lifecycle cycles, curation syncs, bootstrap
+    /// reindexes). The guard aborts the heartbeat on drop; the caller still
+    /// releases (or lets the TTL lapse) through its own path.
+    pub fn spawn_renewal(&self, db: PgPool, ttl_secs: f64) -> RenewalGuard {
+        let job_name = self.job_name.clone();
+        let claim_token = self.claim_token;
+        spawn_renewal_loop(format!("scheduler lease {job_name}"), ttl_secs, move || {
+            let db = db.clone();
+            let job_name = job_name.clone();
+            async move {
+                renew_scheduler_lease_by_token(&db, &job_name, claim_token, ttl_secs)
+                    .await
+                    .map(|expires| expires.is_some())
+                    .map_err(|e| e.to_string())
+            }
+        })
+    }
+
     /// Extend the lease by `ttl_secs` from now. Returns `false` (and stops
     /// being the holder) if the lease was lost — expired and re-claimed by
     /// another replica — in which case the caller should stop side effects.
     pub async fn renew(&mut self, db: &PgPool, ttl_secs: f64) -> Result<bool> {
-        let renewed: Option<DateTime<Utc>> = sqlx::query_scalar(
-            r#"
-            UPDATE scheduler_leases
-            SET lease_expires_at = NOW() + make_interval(secs => $3),
-                updated_at = NOW()
-            WHERE job_name = $1
-              AND claim_token = $2
-            RETURNING lease_expires_at
-            "#,
-        )
-        .bind(&self.job_name)
-        .bind(self.claim_token)
-        .bind(ttl_secs)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let renewed =
+            renew_scheduler_lease_by_token(db, &self.job_name, self.claim_token, ttl_secs).await?;
 
         match renewed {
             Some(expires) => {
@@ -307,6 +314,30 @@ impl SchedulerLease {
             tracing::debug!(job = %self.job_name, error = %e, "scheduler lease release failed");
         }
     }
+}
+
+async fn renew_scheduler_lease_by_token(
+    db: &PgPool,
+    job_name: &str,
+    claim_token: Uuid,
+    ttl_secs: f64,
+) -> Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        r#"
+        UPDATE scheduler_leases
+        SET lease_expires_at = NOW() + make_interval(secs => $3),
+            updated_at = NOW()
+        WHERE job_name = $1
+          AND claim_token = $2
+        RETURNING lease_expires_at
+        "#,
+    )
+    .bind(job_name)
+    .bind(claim_token)
+    .bind(ttl_secs)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Try to claim the named singleton job lease for `ttl_secs`.

@@ -23,6 +23,13 @@ use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
 
+/// TTL for the lifecycle-cycle singleton lease. Bounds a crashed holder; a
+/// live holder heartbeats it for as long as the cycle runs.
+const LIFECYCLE_LEASE_TTL_SECS: f64 = 3600.0;
+/// TTL for the curation-sync singleton lease (#2357 S11), kept slightly above
+/// the 300s tick so the job stays pinned to its current holder between ticks.
+const CURATION_SYNC_LEASE_TTL_SECS: f64 = 360.0;
+
 /// Database gauge stats for Prometheus metrics.
 #[derive(Debug, sqlx::FromRow)]
 struct GaugeStats {
@@ -163,16 +170,34 @@ pub fn spawn_all(
     }
 
     // Health monitoring (every 60 seconds)
+    //
+    // Singleton lease (cluster_work): without it every replica writes a
+    // health-log row per interval and the alert_state upsert advances
+    // consecutive_failures by replica count. Holding (not releasing) the
+    // lease pins the job to one healthy replica — the same owner renews on
+    // each 60s tick — while the 90s TTL hands the job over within ~30s of
+    // that replica dying.
     {
         let db = db.clone();
         let config_clone = config.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            let monitor = HealthMonitorService::new(db, MonitorConfig::default());
+            tokio::time::sleep(jittered_startup_delay(15)).await;
+            let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
             let mut ticker = interval(Duration::from_secs(60));
 
             loop {
                 ticker.tick().await;
+                let Some(_lease) =
+                    crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                        &db,
+                        "health_monitor",
+                        90.0,
+                    )
+                    .await
+                else {
+                    tracing::debug!("Another replica owns the health monitor lease; skipping");
+                    continue;
+                };
                 match monitor.check_all_services(&config_clone).await {
                     Ok(results) => {
                         for entry in &results {
@@ -195,17 +220,39 @@ pub fn spawn_all(
     }
 
     // Lifecycle policy execution (configurable check interval)
+    //
+    // Singleton lease (cluster_work): every replica evaluates the same due
+    // policies from last_run_at, so without coordination each due policy
+    // executes once per replica (duplicate soft-delete scans, metrics, and
+    // last_run bookkeeping). The lease is released after the tick — the
+    // fresh last_run_at then gates the next replica's is_policy_due check —
+    // and the 1h TTL bounds a crashed mid-execution holder.
     {
         let db = db.clone();
         let check_secs = config.lifecycle_check_interval_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            let service = LifecycleService::new(db);
+            tokio::time::sleep(jittered_startup_delay(60)).await;
+            let service = LifecycleService::new(db.clone());
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
                 ticker.tick().await;
                 tracing::debug!("Checking for due lifecycle policies");
+
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "lifecycle_policy_execution",
+                    LIFECYCLE_LEASE_TTL_SECS,
+                )
+                .await
+                else {
+                    tracing::debug!("Another replica owns the lifecycle lease; skipping tick");
+                    continue;
+                };
+                // A cycle over many policies can outlive the fixed TTL, which
+                // would let a second replica start a duplicate cycle. Keep the
+                // lease alive for as long as this one runs.
+                let lease_renewal = lease.spawn_renewal(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
 
                 match service.execute_due_policies().await {
                     Ok(results) => {
@@ -225,6 +272,9 @@ pub fn spawn_all(
                         tracing::warn!("Lifecycle policy execution failed: {}", e);
                     }
                 }
+
+                drop(lease_renewal);
+                lease.release(&db).await;
             }
         });
     }
@@ -672,7 +722,7 @@ pub fn spawn_all(
                 let lease = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                     &db,
                     "curation_sync",
-                    360.0,
+                    CURATION_SYNC_LEASE_TTL_SECS,
                 )
                 .await;
                 if lease.is_none() {
@@ -682,10 +732,19 @@ pub fn spawn_all(
                     continue;
                 }
 
+                // A sweep over many staging repos can outlive the TTL (each
+                // repo is an upstream fetch + evaluate), which would let a
+                // second replica start a duplicate cycle while this one is
+                // still running. Heartbeat the lease for the whole cycle.
+                let renewal = lease
+                    .as_ref()
+                    .map(|l| l.spawn_renewal(db.clone(), CURATION_SYNC_LEASE_TTL_SECS));
+
                 if let Err(e) = run_curation_sync_cycle(&db, None).await {
                     tracing::warn!("Curation sync cycle failed: {}", e);
                 }
 
+                drop(renewal);
                 if let Some(lease) = lease {
                     lease.release(&db).await;
                 }
@@ -1430,6 +1489,14 @@ pub(crate) async fn run_curation_sync_cycle(
     // Find repos due for sync. `trusted_gpg_key` (#2357) is read from the remote
     // so the RPM path can authenticate repomd.xml before ingest. The optional
     // `only_repo` filter scopes the sweep to one repo for the manual trigger.
+    //
+    // `curation_sync_interval_secs` is now honored via
+    // `curation_last_synced_at`: the interval was previously read into the
+    // row and never used, so every enabled staging repo re-fetched upstream
+    // metadata on every 5-minute tick regardless of its configuration. The
+    // 60s floor keeps a misconfigured interval from turning the tick into a
+    // hot loop against the upstream. The manual single-repo trigger bypasses
+    // the interval — an operator asking for a sync gets one.
     let repos: Vec<CurationSyncRow> = sqlx::query_as(
         r#"SELECT r.id, r.format::text, r.curation_source_repo_id, remote.upstream_url,
                       r.curation_default_action, r.curation_sync_interval_secs,
@@ -1440,7 +1507,14 @@ pub(crate) async fn run_curation_sync_cycle(
                  AND r.curation_source_repo_id IS NOT NULL
                  AND r.repo_type = 'staging'
                  AND remote.upstream_url IS NOT NULL
-                 AND ($1::uuid IS NULL OR r.id = $1)"#,
+                 AND ($1::uuid IS NULL OR r.id = $1)
+                 AND (
+                    $1::uuid IS NOT NULL
+                    OR r.curation_last_synced_at IS NULL
+                    OR r.curation_last_synced_at
+                       + make_interval(secs => GREATEST(r.curation_sync_interval_secs, 60)::double precision)
+                       <= NOW()
+                 )"#,
     )
     .bind(only_repo)
     .fetch_all(db)
@@ -1784,6 +1858,15 @@ pub(crate) async fn run_curation_sync_cycle(
                 }
             }
         }
+
+        // Successful fetch+evaluate: stamp the bookkeeping so this repo is
+        // not due again until its configured interval elapses. Failed
+        // fetches `continue` above without stamping and retry next tick.
+        let _ =
+            sqlx::query("UPDATE repositories SET curation_last_synced_at = NOW() WHERE id = $1")
+                .bind(staging_id)
+                .execute(db)
+                .await;
     }
 
     Ok(())
