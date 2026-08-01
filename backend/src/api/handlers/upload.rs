@@ -793,23 +793,10 @@ async fn complete(
     // took longer than the 6h staleness window and a newer complete request
     // reclaimed the session — the artifact upsert above is idempotent, so
     // the only consequence is that the newer owner also finalizes.
-    match UploadService::finalize_completed(&state.db, &session).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                session = %session_id,
-                "chunked upload finalized but its completion lease was lost; \
-                 a newer complete request owns the session"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                session = %session_id,
-                error = %e,
-                "failed to mark upload session completed"
-            );
-        }
-    }
+    let finalize_result = UploadService::finalize_completed(&state.db, &session).await;
+    settle_completed_session(&state.db, &session, finalize_result)
+        .await
+        .map_err(map_upload_err)?;
     drop(commit_renewal);
 
     tracing::info!(
@@ -928,6 +915,43 @@ fn map_upload_err(e: UploadError) -> Response {
     super::with_retry_after_on_503(
         (status, axum::Json(serde_json::json!({"error": msg}))).into_response(),
     )
+}
+
+/// Finish the post-artifact session transition without reporting success while
+/// the session still appears active. A database failure here happens after the
+/// artifact transaction committed and the temp file was removed, so replay is
+/// no longer safe: token-fence the session to `failed`, matching the existing
+/// post-commit metadata-failure policy, and propagate the database error.
+async fn settle_completed_session(
+    db: &sqlx::PgPool,
+    session: &upload_service::UploadSession,
+    finalize_result: Result<bool, UploadError>,
+) -> Result<(), UploadError> {
+    match finalize_result {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!(
+                session = %session.id,
+                "chunked upload finalized but its completion lease was lost; \
+                 a newer complete request owns the session"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %session.id,
+                error = %e,
+                "failed to mark upload session completed"
+            );
+            UploadService::fail_committing(
+                db,
+                session,
+                &format!("artifact committed but session completion update failed: {e}"),
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// Map any displayable error to an HTTP error response.
@@ -3358,6 +3382,74 @@ mod tests {
         .expect("insert staged session");
 
         (session_id, temp_path)
+    }
+
+    /// A database error from the final `committing -> completed` update happens
+    /// after the artifact is durable and the temp file is gone. It must produce
+    /// a non-success response and leave a terminal session instead of logging
+    /// the error and returning 200 with the row still `committing`.
+    #[tokio::test]
+    async fn finalize_database_error_marks_committing_session_failed() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"post-artifact-finalize-db-error";
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let session = UploadService::complete_session(&f.pool, session_id, f.user_id)
+            .await
+            .expect("claim completion lease");
+
+        // Synthesize the error result from finalize_completed while keeping the
+        // fixture pool healthy so the token-fenced failure transition itself is
+        // observable.
+        let err = settle_completed_session(
+            &f.pool,
+            &session,
+            Err(UploadError::Database(sqlx::Error::PoolClosed)),
+        )
+        .await
+        .expect_err("a failed terminal update must not report success");
+        assert_eq!(
+            map_upload_err(err).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the handler must not return 200 after losing the terminal update"
+        );
+
+        let (status, token, deadline, message): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at, error_message \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read terminal session state");
+        assert_eq!(status, "failed");
+        assert!(
+            token.is_none(),
+            "terminal failure must clear the lease token"
+        );
+        assert!(
+            deadline.is_none(),
+            "terminal failure must clear the lease deadline"
+        );
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("session completion update failed")),
+            "terminal failure must explain the post-artifact database error"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
     }
 
     fn complete_req(session_id: Uuid) -> axum::http::Request<axum::body::Body> {
