@@ -3145,12 +3145,30 @@ pub async fn local_fetch_or_redirect(
         };
         let redirect = match &proxy_cache_backend {
             Some(b) => {
+                // The artifacts row alone does not prove the cached object
+                // still exists: retention tooling (e.g. an object-store
+                // lifecycle policy expiring cache entries by age) deletes
+                // proxy-cache objects without updating the database. A
+                // redirect signed for a missing key 404s at the object store,
+                // where the client is beyond any fallback we control — and the
+                // row keeps serving dead redirects until manual repair. So
+                // honor `try_proxy_cache_redirect`'s contract (caller performs
+                // a metadata-only freshness check first, as
+                // `proxy_fetch_or_redirect` does via `is_cache_fresh`): probe
+                // existence through the same no-prefix handle before signing.
+                // Capability check first, mirroring #1555 — never pay the
+                // probe on a backend that cannot redirect anyway. On a miss
+                // fall through to the buffered read below, whose NotFound lets
+                // virtual-member resolution continue to the remote member's
+                // upstream re-fetch, repopulating the cache.
+                let object_present = b.supports_redirect()
+                    && matches!(b.exists(&artifact.storage_key).await, Ok(true));
                 try_proxy_cache_redirect(
                     b.as_ref(),
                     &artifact.storage_key,
                     /* presigned_enabled = */ true,
                     expiry,
-                    /* cache_is_fresh = */ true,
+                    /* cache_is_fresh = */ object_present,
                 )
                 .await
             }
