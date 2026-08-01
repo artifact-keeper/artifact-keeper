@@ -51,6 +51,7 @@ use crate::formats::incus::IncusHandler;
 /// worker (#1512) so the per-task memory budget is uniform across upload
 /// surfaces.
 const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
+const INCUS_FINALIZE_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -146,6 +147,55 @@ async fn append_body_to_file(body: Body, path: &Path) -> Result<i64, Response> {
     file.sync_all().await.map_err(|e| fs_err("sync file", e))?;
 
     Ok(bytes_written)
+}
+
+/// Make a reclaimed finalize idempotent against a crashed predecessor's
+/// append: truncate the staged file back to the session's persisted
+/// `bytes_received` before appending the final body.
+///
+/// A prior finalize attempt may have appended final body bytes and died
+/// before persisting the new offset (that durable update happens only after
+/// append/checksum), so the file can legitimately be LONGER than the
+/// persisted offset — the unrecorded tail is dropped and re-appended by the
+/// current owner. A file SHORTER than the persisted offset means staged data
+/// was lost (different pod's filesystem, manual cleanup); extending it with
+/// zeros would corrupt the artifact, so that case fails the request instead.
+async fn truncate_staged_file_to_offset(path: &Path, persisted: u64) -> Result<(), Response> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|e| fs_err("open temp file for truncate", e))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| fs_err("stat temp file", e))?
+        .len();
+
+    if len < persisted {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Staged file is {} bytes but the session has {} bytes recorded; \
+                 staged data is missing on this replica",
+                len, persisted
+            ),
+        )
+            .into_response());
+    }
+    if len > persisted {
+        tracing::warn!(
+            path = %path.display(),
+            file_len = len,
+            persisted,
+            "staged file has an unrecorded tail from a crashed finalize; truncating"
+        );
+        file.set_len(persisted)
+            .await
+            .map_err(|e| fs_err("truncate temp file", e))?;
+        file.sync_all().await.map_err(|e| fs_err("sync file", e))?;
+    }
+    Ok(())
 }
 
 /// Compute SHA256 of a file by streaming through it in 64 KB blocks.
@@ -898,12 +948,17 @@ async fn upload_image(
     // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`.
     let storage_key = build_storage_key(&repo.id, &artifact_path);
     let session_id = Uuid::new_v4();
+    // Fresh session, but it still carries a finalize lease so the background
+    // finalizer's terminal updates are token-guarded like the chunked path.
+    let finalize_token = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO incus_upload_sessions
             (id, repository_id, user_id, artifact_path, product, version,
-             filename, bytes_received, storage_temp_path, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'finalizing')
+             filename, bytes_received, storage_temp_path, status,
+             finalize_token, finalize_claimed_until)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'finalizing',
+                $10, NOW() + make_interval(secs => $11))
         "#,
     )
     .bind(session_id)
@@ -915,6 +970,8 @@ async fn upload_image(
     .bind(&filename)
     .bind(size_bytes)
     .bind(temp_path.to_string_lossy().as_ref())
+    .bind(finalize_token)
+    .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
     .execute(&state.db)
     .await
     .map_err(db_err)?;
@@ -939,6 +996,7 @@ async fn upload_image(
             user_id,
             metadata,
             temp_path: temp_path.clone(),
+            finalize_token,
         },
     ));
 
@@ -1164,19 +1222,57 @@ async fn upload_chunk(
     let temp_path = PathBuf::from(&session.storage_temp_path);
     let prefix = mount_prefix_from_uri(&original_uri);
 
+    // Only a session still receiving may be appended to. A straggler or
+    // retried PATCH arriving after `complete` claimed the finalize lease would
+    // otherwise append bytes while the finalizer is checksumming the staged
+    // file, and overwrite `bytes_received` — which the truncate-on-reclaim
+    // arithmetic treats as the authoritative persisted offset.
+    if session.status != "receiving" {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Upload session is '{}': it no longer accepts chunks",
+                session.status
+            ),
+        )
+            .into_response());
+    }
+
     // Append body to temp file (no read-back of existing data)
     let bytes_written = append_body_to_file(body, &temp_path).await?;
     let new_total = session.bytes_received + bytes_written;
 
-    // Update session
-    sqlx::query(
-        "UPDATE incus_upload_sessions SET bytes_received = $2, updated_at = NOW() WHERE id = $1",
+    // Record the new offset only while the session is still 'receiving'. The
+    // status can change between the check above and here (a `complete` on any
+    // replica claims the lease with a guarded UPDATE), so this predicate — not
+    // the pre-read — is what keeps `bytes_received` owned by one writer.
+    let updated = sqlx::query(
+        "UPDATE incus_upload_sessions SET bytes_received = $2, updated_at = NOW() \
+         WHERE id = $1 AND status = 'receiving'",
     )
     .bind(session_id)
     .bind(new_total)
     .execute(&state.db)
     .await
     .map_err(db_err)?;
+
+    if updated.rows_affected() != 1 {
+        // A finalize claimed the session while this body was streaming. The
+        // offset is deliberately NOT advanced: the finalize owner re-reads the
+        // persisted `bytes_received` under its lease and truncates the staged
+        // file back to it, dropping this unrecorded append.
+        tracing::warn!(
+            session_id = %session_id,
+            bytes_written,
+            "Incus chunk PATCH raced a finalize claim; append discarded by the \
+             finalize truncate"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session entered finalize while this chunk was uploading".to_string(),
+        )
+            .into_response());
+    }
 
     tracing::debug!(
         "Chunk uploaded for session {}: +{} bytes (total: {})",
@@ -1201,6 +1297,106 @@ async fn upload_chunk(
 // PUT /uploads/{uuid} -- Complete chunked upload
 // ---------------------------------------------------------------------------
 
+/// Atomically claim the finalize lease on a chunked upload session
+/// (StateMachineLease, see [`crate::services::cluster_work`]).
+///
+/// Transitions `receiving -> finalizing` and stamps a fresh token; returns
+/// `None` when the session is owned by another live finalize (or already
+/// terminal) — the caller maps that to `409 CONFLICT`. A `finalizing`
+/// session whose lease deadline passed (crashed finalizer; the COALESCE
+/// covers pre-migration rows with no deadline) is reclaimable in place.
+async fn claim_incus_finalize_lease(
+    db: &PgPool,
+    session_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let finalize_token = Uuid::new_v4();
+    let claimed = sqlx::query(
+        r#"
+        UPDATE incus_upload_sessions
+        SET status = 'finalizing',
+            finalize_token = $2,
+            finalize_claimed_until = NOW() + make_interval(secs => $3),
+            updated_at = NOW()
+        WHERE id = $1
+          AND (
+            status = 'receiving'
+            OR (
+                status = 'finalizing'
+                AND COALESCE(finalize_claimed_until, updated_at + make_interval(secs => $3)) <= NOW()
+            )
+          )
+        "#,
+    )
+    .bind(session_id)
+    .bind(finalize_token)
+    .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
+    .execute(db)
+    .await?;
+
+    Ok((claimed.rows_affected() == 1).then_some(finalize_token))
+}
+
+/// Token-guarded heartbeat for a finalizing Incus upload.
+async fn renew_incus_finalize_lease(
+    db: &PgPool,
+    session_id: Uuid,
+    finalize_token: Uuid,
+    ttl_secs: f64,
+) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(
+        "UPDATE incus_upload_sessions \
+         SET finalize_claimed_until = NOW() + make_interval(secs => $3), updated_at = NOW() \
+         WHERE id = $1 AND status = 'finalizing' AND finalize_token = $2",
+    )
+    .bind(session_id)
+    .bind(finalize_token)
+    .bind(ttl_secs)
+    .execute(db)
+    .await?;
+
+    Ok(renewed.rows_affected() == 1)
+}
+
+fn spawn_incus_finalize_lease_renewal(
+    db: PgPool,
+    session_id: Uuid,
+    finalize_token: Uuid,
+) -> crate::services::cluster_work::RenewalGuard {
+    crate::services::cluster_work::spawn_renewal_loop(
+        format!("incus finalize {session_id}"),
+        INCUS_FINALIZE_LEASE_TTL_SECS,
+        move || {
+            let db = db.clone();
+            async move {
+                renew_incus_finalize_lease(
+                    &db,
+                    session_id,
+                    finalize_token,
+                    INCUS_FINALIZE_LEASE_TTL_SECS,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        },
+    )
+}
+
+/// Token-guarded release of a finalize lease back to 'receiving', for
+/// retryable failures between the claim and the spawned finalizer (body
+/// append or checksum-pass errors). The client can re-issue the complete.
+async fn release_incus_finalize_lease(db: &PgPool, session_id: Uuid, finalize_token: Uuid) {
+    let _ = sqlx::query(
+        "UPDATE incus_upload_sessions \
+         SET status = 'receiving', finalize_token = NULL, finalize_claimed_until = NULL, \
+             updated_at = NOW() \
+         WHERE id = $1 AND status = 'finalizing' AND finalize_token = $2",
+    )
+    .bind(session_id)
+    .bind(finalize_token)
+    .execute(db)
+    .await;
+}
+
 async fn complete_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1216,23 +1412,82 @@ async fn complete_chunked_upload(
     let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
 
-    // Append any final body data
-    let final_bytes = append_body_to_file(body, &temp_path).await?;
-    let total_bytes = session.bytes_received + final_bytes;
+    // Claim the finalize lease BEFORE touching the temp file: the guarded
+    // 'receiving' -> 'finalizing' transition is what stops a duplicate
+    // complete request (possibly on another replica) from appending to the
+    // staged file and spawning a second finalizer for the same session.
+    let finalize_token = claim_incus_finalize_lease(&state.db, session_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "Upload session is '{}': finalize already in progress or finished",
+                    session.status
+                ),
+            )
+                .into_response()
+        })?;
+
+    // The persisted offset re-read UNDER the lease is the authoritative file
+    // length: the pre-claim `session` read can be stale, and a crashed
+    // predecessor may have appended final bytes without recording them.
+    // Truncating any unrecorded tail before appending makes a reclaimed
+    // finalize idempotent instead of double-appending the final body.
+    let persisted_bytes: i64 =
+        match sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&state.db)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+                return Err(db_err(e));
+            }
+        };
+    if let Err(resp) = truncate_staged_file_to_offset(&temp_path, persisted_bytes as u64).await {
+        release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+        return Err(resp);
+    }
+
+    // Append any final body data. A transient failure here (or in the
+    // checksum pass below) must release the lease back to 'receiving' —
+    // otherwise the session would be wedged in 'finalizing' with no
+    // finalizer until the 6h lease lapses.
+    let final_bytes = match append_body_to_file(body, &temp_path).await {
+        Ok(n) => n,
+        Err(resp) => {
+            release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+            return Err(resp);
+        }
+    };
+    let total_bytes = persisted_bytes + final_bytes;
 
     // Compute SHA256 by streaming through the file
-    let checksum = compute_sha256_from_file(&temp_path).await?;
+    let checksum = match compute_sha256_from_file(&temp_path).await {
+        Ok(c) => c,
+        Err(resp) => {
+            release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+            return Err(resp);
+        }
+    };
 
     // Verify client-provided checksum if present
     if let Some(expected) = headers.get("X-Checksum-Sha256") {
         let expected = expected.to_str().unwrap_or("");
         if expected != checksum {
-            // Checksum mismatch — clean up
+            // Checksum mismatch — clean up (token-guarded: only the lease
+            // owner may delete the session out from under other requests)
             let _ = tokio::fs::remove_file(&temp_path).await;
-            let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
-                .bind(session_id)
-                .execute(&state.db)
-                .await;
+            let _ = sqlx::query(
+                "DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2",
+            )
+            .bind(session_id)
+            .bind(finalize_token)
+            .execute(&state.db)
+            .await;
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -1254,24 +1509,24 @@ async fn complete_chunked_upload(
     .flatten()
     .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
 
-    // Finalize asynchronously: mark the session `finalizing`, push to the
-    // StorageBackend on a background task, and return 202. The assembled
-    // multi-GiB push can outlive an L7 gateway timeout the same way the
-    // monolithic PUT can, so the `complete` request must not block on it
-    // (#1471/#1494). The session row is retained (not deleted) so the client
-    // can poll `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`; the
+    // Finalize asynchronously: push to the StorageBackend on a background
+    // task and return 202. The assembled multi-GiB push can outlive an L7
+    // gateway timeout the same way the monolithic PUT can, so the `complete`
+    // request must not block on it (#1471/#1494). The session row is
+    // retained (not deleted) so the client can poll
+    // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`; the
     // stale-session reaper cleans terminal rows after `max_age_hours`.
     let storage_key = build_storage_key(&session.repository_id, &session.artifact_path);
-    sqlx::query(
+    let _ = sqlx::query(
         "UPDATE incus_upload_sessions \
-         SET status = 'finalizing', bytes_received = $2, updated_at = NOW() \
-         WHERE id = $1",
+         SET bytes_received = $2, updated_at = NOW() \
+         WHERE id = $1 AND finalize_token = $3",
     )
     .bind(session_id)
     .bind(total_bytes)
+    .bind(finalize_token)
     .execute(&state.db)
-    .await
-    .map_err(db_err)?;
+    .await;
 
     tokio::spawn(finalize_upload(
         state.clone(),
@@ -1288,6 +1543,7 @@ async fn complete_chunked_upload(
             user_id: session.user_id,
             metadata,
             temp_path: temp_path.clone(),
+            finalize_token,
         },
     ));
 
@@ -1390,27 +1646,41 @@ async fn get_upload_progress(
 
 /// Delete upload sessions that haven't been updated in `max_age_hours`.
 /// Returns the number of sessions cleaned up.
+///
+/// The row DELETE is the claim: candidates are taken with FOR UPDATE SKIP
+/// LOCKED and removed *before* the temp-file delete, so concurrent replicas
+/// sweep disjoint sessions. Sessions in 'finalizing' with a live lease are
+/// skipped — the reaper must not remove a temp file a live finalizer is
+/// still streaming to the storage backend.
 pub async fn cleanup_stale_sessions(db: &PgPool, max_age_hours: i64) -> Result<i64, String> {
     let stale = sqlx::query_as::<_, (Uuid, String)>(
         r#"
-        SELECT id, storage_temp_path
-        FROM incus_upload_sessions
-        WHERE updated_at < NOW() - make_interval(hours => $1::int)
+        WITH candidate AS (
+            SELECT id
+            FROM incus_upload_sessions
+            WHERE updated_at < NOW() - make_interval(hours => $1::int)
+              AND (
+                status != 'finalizing'
+                OR finalize_claimed_until IS NULL
+                OR finalize_claimed_until <= NOW()
+              )
+            FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM incus_upload_sessions s
+        USING candidate
+        WHERE s.id = candidate.id
+        RETURNING s.id, s.storage_temp_path
         "#,
     )
     .bind(max_age_hours as i32)
     .fetch_all(db)
     .await
-    .map_err(|e| format!("Failed to query stale sessions: {}", e))?;
+    .map_err(|e| format!("Failed to reap stale sessions: {}", e))?;
 
     let count = stale.len() as i64;
 
     for (id, temp_path) in &stale {
         let _ = tokio::fs::remove_file(temp_path).await;
-        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
-            .bind(id)
-            .execute(db)
-            .await;
         tracing::info!("Cleaned up stale upload session {}", id);
     }
 
@@ -1548,6 +1818,10 @@ struct FinalizeParams {
     user_id: Uuid,
     metadata: serde_json::Value,
     temp_path: PathBuf,
+    /// Finalize-lease token stamped when the session entered 'finalizing'.
+    /// The finalizer's terminal updates must present it, so a finalizer whose
+    /// lease expired and was reclaimed cannot clobber the new owner's state.
+    finalize_token: Uuid,
 }
 
 /// Push the staged temp file to the repo's StorageBackend, create the
@@ -1622,6 +1896,11 @@ async fn run_finalize(
 /// exists.
 async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizeParams) {
     let session_id = params.session_id;
+    // Keep the finalize lease renewed for the whole multi-GiB backend push
+    // AND the terminal token-guarded update below; the staged temp file is
+    // still removed before the status flips (see ordering note above).
+    let finalize_renewal =
+        spawn_incus_finalize_lease_renewal(state.db.clone(), session_id, params.finalize_token);
     let outcome = run_finalize(&state, &repo, &params).await;
     let _ = tokio::fs::remove_file(&params.temp_path).await;
     match outcome {
@@ -1633,16 +1912,26 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
                 params.artifact_path,
                 params.size_bytes
             );
-            let _ = sqlx::query(
+            let result = sqlx::query(
                 "UPDATE incus_upload_sessions \
                  SET status = 'completed', artifact_id = $2, finalize_error = NULL, \
-                     updated_at = NOW() \
-                 WHERE id = $1",
+                     finalize_claimed_until = NULL, updated_at = NOW() \
+                 WHERE id = $1 AND status = 'finalizing' AND finalize_token = $3",
             )
             .bind(session_id)
             .bind(artifact_id)
+            .bind(params.finalize_token)
             .execute(&state.db)
             .await;
+            if let Ok(r) = result {
+                if r.rows_affected() != 1 {
+                    tracing::warn!(
+                        session = %session_id,
+                        "finalize succeeded but its lease was lost (expired and re-claimed); \
+                         leaving session state to the new owner"
+                    );
+                }
+            }
         }
         Err(msg) => {
             tracing::error!(
@@ -1653,15 +1942,18 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
             );
             let _ = sqlx::query(
                 "UPDATE incus_upload_sessions \
-                 SET status = 'failed', finalize_error = $2, updated_at = NOW() \
-                 WHERE id = $1",
+                 SET status = 'failed', finalize_error = $2, \
+                     finalize_claimed_until = NULL, updated_at = NOW() \
+                 WHERE id = $1 AND status = 'finalizing' AND finalize_token = $3",
             )
             .bind(session_id)
             .bind(&msg)
+            .bind(params.finalize_token)
             .execute(&state.db)
             .await;
         }
     }
+    drop(finalize_renewal);
 }
 
 // ===========================================================================
@@ -3678,17 +3970,22 @@ mod streaming_pipeline_regression_tests {
         // fails when it tries to reopen it for streaming.
         let bogus_temp = std::env::temp_dir().join(format!("ak-incus-missing-{session_id}"));
 
+        let finalize_token = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO incus_upload_sessions \
              (id, repository_id, user_id, artifact_path, product, version, filename, \
-              bytes_received, storage_temp_path, status) \
-             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 0, $5, 'finalizing')",
+              bytes_received, storage_temp_path, status, finalize_token, \
+              finalize_claimed_until) \
+             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 0, $5, 'finalizing', $6, \
+                     NOW() + make_interval(secs => $7))",
         )
         .bind(session_id)
         .bind(f.repo_id)
         .bind(f.user_id)
         .bind(&artifact_path)
         .bind(bogus_temp.to_string_lossy().as_ref())
+        .bind(finalize_token)
+        .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
         .execute(&f.pool)
         .await
         .expect("insert finalizing session");
@@ -3723,6 +4020,7 @@ mod streaming_pipeline_regression_tests {
                 user_id: f.user_id,
                 metadata: serde_json::json!({ "file_type": "unknown" }),
                 temp_path: bogus_temp,
+                finalize_token,
             },
         )
         .await;
@@ -3742,6 +4040,531 @@ mod streaming_pipeline_regression_tests {
             err.is_some(),
             "a failed finalize must record an observable error string"
         );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Finalize lease (Tier-2: no-op without DATABASE_URL)
+    // -----------------------------------------------------------------------
+
+    async fn insert_receiving_session(f: &tdh::Fixture) -> Uuid {
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status) \
+             VALUES ($1, $2, $3, $4, 'ubuntu', '1', 'incus.tar.xz', 0, $5, 'receiving')",
+        )
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(build_artifact_path("ubuntu", "1", "incus.tar.xz"))
+        .bind(
+            std::env::temp_dir()
+                .join(format!("ak-incus-lease-{session_id}"))
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .execute(&f.pool)
+        .await
+        .expect("insert receiving session");
+        session_id
+    }
+
+    /// The receiving -> finalizing transition is exclusive while the lease is
+    /// live, reclaimable once it lapses, and a stale finalizer's terminal
+    /// update is fenced by the token.
+    #[tokio::test]
+    async fn finalize_lease_is_exclusive_and_fences_stale_finalizer() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+
+        // First complete claims; a duplicate complete gets no lease (=> 409).
+        let stale_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("receiving session must be claimable");
+        assert!(
+            claim_incus_finalize_lease(&f.pool, session_id)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a live finalize lease must not be claimable again"
+        );
+
+        // Crashed finalizer: the lease lapses and a new complete reclaims.
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+        let fresh_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("expired finalize lease must be reclaimable");
+        assert_ne!(stale_token, fresh_token);
+
+        // The stale finalizer comes back (its storage push fails on the
+        // missing temp file) — its token-guarded failure update must NOT
+        // clobber the new owner's in-flight finalize.
+        let repo = RepoInfo {
+            id: f.repo_id,
+            key: f.repo_key.clone(),
+            storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            format: "incus".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        };
+        let artifact_path = build_artifact_path("ubuntu", "1", "incus.tar.xz");
+        finalize_upload(
+            f.state.clone(),
+            repo,
+            FinalizeParams {
+                session_id,
+                repo_id: f.repo_id,
+                artifact_path: artifact_path.clone(),
+                product: "ubuntu".to_string(),
+                version: "1".to_string(),
+                size_bytes: 0,
+                checksum: "0".repeat(64),
+                storage_key: build_storage_key(&f.repo_id, &artifact_path),
+                user_id: f.user_id,
+                metadata: serde_json::json!({ "file_type": "unknown" }),
+                temp_path: std::env::temp_dir().join(format!("ak-incus-missing-{session_id}")),
+                finalize_token: stale_token,
+            },
+        )
+        .await;
+
+        let (status, err): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, finalize_error FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(
+            status, "finalizing",
+            "a stale finalizer must not overwrite the new owner's session state"
+        );
+        assert!(err.is_none(), "stale finalizer must not record its error");
+
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// A reclaimed finalize must be idempotent against a predecessor that
+    /// appended final body bytes and crashed BEFORE persisting the new
+    /// offset: the staged file's unrecorded tail is truncated back to the
+    /// session's persisted `bytes_received`, and a staged file SHORTER than
+    /// the persisted offset (lost data) refuses to finalize rather than
+    /// zero-extending.
+    #[tokio::test]
+    async fn reclaimed_finalize_truncates_unrecorded_append_tail() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+
+        // Stage a real temp file with 6 recorded bytes.
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"123456")
+            .await
+            .expect("stage file");
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 6 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+
+        // Owner A claims, appends the 4-byte final body, and "crashes" before
+        // the durable bytes_received update; its lease then lapses.
+        let _stale_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("claimable");
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&temp_path)
+                .await
+                .expect("open for crashed append");
+            file.write_all(b"TAIL").await.expect("append tail");
+            file.sync_all().await.expect("sync");
+        }
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        // Owner B reclaims and truncates the unrecorded tail before its own
+        // append — the file is back at the persisted 6 bytes, so re-sending
+        // the same final body cannot double-append.
+        let _fresh_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("expired lease must be reclaimable");
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read persisted offset");
+        assert_eq!(
+            persisted, 6,
+            "crashed append must not have moved the offset"
+        );
+        truncate_staged_file_to_offset(&temp_path, persisted as u64)
+            .await
+            .expect("truncate unrecorded tail");
+        assert_eq!(
+            tokio::fs::read(&temp_path).await.expect("read staged file"),
+            b"123456",
+            "unrecorded tail must be dropped"
+        );
+
+        // A staged file SHORTER than the persisted offset is lost data and
+        // must fail instead of being zero-extended.
+        assert!(
+            truncate_staged_file_to_offset(&temp_path, 99)
+                .await
+                .is_err(),
+            "a too-short staged file must refuse to finalize"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// A straggler chunk PATCH that arrives after `complete` claimed the
+    /// finalize lease must be refused: appending to the staging file mid
+    /// checksum would make the stored blob diverge from the recorded checksum,
+    /// and advancing `bytes_received` would poison the truncate-on-reclaim
+    /// arithmetic that treats it as the authoritative persisted offset.
+    #[tokio::test]
+    async fn chunk_patch_is_rejected_once_the_session_is_finalizing() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"123456")
+            .await
+            .expect("stage file");
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 6 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+        let before: i64 = 6;
+
+        // A `complete` on any replica claims the finalize lease.
+        claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("receiving session must be claimable");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(b"straggler-chunk".to_vec()))
+            .expect("build PATCH request");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a PATCH during finalize must be refused with 409"
+        );
+
+        let after: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read offset after refused PATCH");
+        assert_eq!(
+            after, before,
+            "a refused PATCH must not move the persisted offset"
+        );
+        let status_after: String =
+            sqlx::query_scalar("SELECT status FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read status after refused PATCH");
+        assert_eq!(
+            status_after, "finalizing",
+            "a refused PATCH must leave the finalize lease intact"
+        );
+        assert_eq!(
+            tokio::fs::read(&temp_path).await.expect("read staged file"),
+            b"123456",
+            "a refused PATCH must not append to the file being checksummed"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// The status check at the top of the handler cannot cover a PATCH whose
+    /// body is still streaming when a finalize claims the session, so the
+    /// `bytes_received` write carries the same predicate. This drives that
+    /// exact interleaving deterministically: the body stream signals once the
+    /// handler has read past the status check, the test claims the finalize
+    /// lease, and only then does the body complete.
+    #[tokio::test]
+    async fn chunk_patch_racing_a_finalize_claim_does_not_move_the_offset() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"123456")
+            .await
+            .expect("stage file");
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 6 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        // The first poll of this stream happens inside `append_body_to_file`,
+        // i.e. strictly after the handler's status check passed.
+        let body = Body::from_stream(futures::stream::once(async move {
+            let _ = started_tx.send(());
+            let _ = go_rx.await;
+            Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(b"racing-bytes"))
+        }));
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(body)
+            .expect("build PATCH request");
+        let request = tokio::spawn(async move { tdh::send(app, req).await });
+
+        started_rx.await.expect("handler must reach the body read");
+        claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("a receiving session must still be claimable mid-PATCH");
+        let _ = go_tx.send(());
+
+        let (status, _) = request.await.expect("request task");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a PATCH that lost the race to a finalize claim must 409"
+        );
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read persisted offset");
+        assert_eq!(
+            persisted, 6,
+            "the losing PATCH must not move the offset the finalizer reads"
+        );
+
+        // The append itself did land (it had already started), so the staged
+        // file now carries an unrecorded tail — exactly the shape the finalize
+        // owner's truncate-to-persisted-offset pass reconciles.
+        assert!(
+            tokio::fs::metadata(&temp_path)
+                .await
+                .expect("stat staged file")
+                .len()
+                > persisted as u64,
+            "the raced append leaves an unrecorded tail"
+        );
+        truncate_staged_file_to_offset(&temp_path, persisted as u64)
+            .await
+            .expect("finalize owner truncates the unrecorded tail");
+        assert_eq!(
+            tokio::fs::read(&temp_path).await.expect("read staged file"),
+            b"123456",
+            "the finalizer recovers the exact bytes it accounted for"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// A live finalizer can renew before a duplicate complete request
+    /// reclaims the session; once a newer token owns it, the stale token is
+    /// fenced out of renewal.
+    #[tokio::test]
+    async fn finalize_lease_renewal_blocks_reclaim_and_fences_stale_owner() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+
+        let stale_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("receiving session must be claimable");
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        assert!(
+            renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                stale_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "live owner must be able to extend its token"
+        );
+        assert!(
+            claim_incus_finalize_lease(&f.pool, session_id)
+                .await
+                .expect("claim query ok")
+                .is_none(),
+            "a renewed finalize lease must block duplicate completion"
+        );
+
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire renewed lease");
+        let fresh_token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("expired finalize lease must be reclaimable");
+
+        assert!(
+            !renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                stale_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "stale token must not renew after a reclaim"
+        );
+        assert!(
+            renew_incus_finalize_lease(
+                &f.pool,
+                session_id,
+                fresh_token,
+                INCUS_FINALIZE_LEASE_TTL_SECS,
+            )
+            .await
+            .expect("renew query ok"),
+            "fresh token must be able to renew"
+        );
+
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// The stale-session reaper must skip a finalizing session whose lease is
+    /// live (a finalizer may still be streaming its temp file), then reap it
+    /// once the lease lapses.
+    #[tokio::test]
+    async fn stale_reaper_skips_live_finalize_lease() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let _token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("claim");
+
+        // Age the session past the reap threshold while its lease is live.
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET updated_at = NOW() - INTERVAL '48 hours' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("age session");
+
+        cleanup_stale_sessions(&f.pool, 24).await.expect("sweep ok");
+        let survives: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incus_upload_sessions WHERE id = $1)")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("existence check");
+        assert!(survives, "reaper must not delete a live finalize lease");
+
+        // Lapse the lease; now the reaper may claim-and-delete it.
+        sqlx::query(
+            "UPDATE incus_upload_sessions \
+             SET finalize_claimed_until = NOW() - INTERVAL '1 minute', \
+                 updated_at = NOW() - INTERVAL '48 hours' \
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+        cleanup_stale_sessions(&f.pool, 24).await.expect("sweep ok");
+        let survives: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incus_upload_sessions WHERE id = $1)")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("existence check");
+        assert!(!survives, "reaper must reap once the finalize lease lapsed");
 
         f.teardown().await;
     }
