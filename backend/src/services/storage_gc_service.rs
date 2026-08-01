@@ -405,7 +405,40 @@ impl StorageGcService {
     /// transaction so the row lock prevents any racing writer from
     /// resurrecting the rows before they are hard-deleted.
     pub async fn run_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
-        let orphans = self.select_orphans().await?;
+        self.run_gc_inner(None, dry_run).await
+    }
+
+    /// Repository-scoped variant of [`Self::run_gc`] (web #708).
+    ///
+    /// Every candidate scan is filtered to rows owned by `repository_id`:
+    /// soft-deleted artifacts in this repository (main sweep), this
+    /// repository's abandoned OCI upload sessions, its orphaned upload
+    /// cleanup keys, and its orphaned Maven flat-object attribution rows.
+    ///
+    /// The orphan *predicates* are deliberately NOT narrowed: a storage key
+    /// is only ever reclaimed when no live artifact, tag, blob, or manifest
+    /// reference exists for it anywhere on the instance. A dry run therefore
+    /// reports "bytes reclaimable now, attributable to this repository" —
+    /// honest under cross-repo dedup because a shared blob still referenced
+    /// by another repository never appears in the candidate set. On a shared
+    /// (cloud) backend a live (non-dry-run) run hard-deletes every
+    /// repository's soft-deleted rows for a reclaimed key — exactly what the
+    /// instance-wide pass would do for the same key — so per-repo scoping
+    /// can never strand or prematurely delete another tenant's data.
+    pub async fn run_gc_for_repository(
+        &self,
+        repository_id: Uuid,
+        dry_run: bool,
+    ) -> Result<StorageGcResult> {
+        self.run_gc_inner(Some(repository_id), dry_run).await
+    }
+
+    async fn run_gc_inner(
+        &self,
+        repo_scope: Option<Uuid>,
+        dry_run: bool,
+    ) -> Result<StorageGcResult> {
+        let orphans = self.select_orphans(repo_scope).await?;
 
         let mut result = empty_gc_result(dry_run);
 
@@ -578,7 +611,7 @@ impl StorageGcService {
         // own setup query (e.g. the candidate SELECT) the same way instead
         // of `?`-propagating out of run_gc and aborting later sweeps.
         if let Err(e) = self
-            .cleanup_abandoned_oci_uploads(dry_run, &mut result)
+            .cleanup_abandoned_oci_uploads(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -590,7 +623,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .cleanup_unreferenced_oci_upload_keys(dry_run, &mut result)
+            .cleanup_unreferenced_oci_upload_keys(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -602,7 +635,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .reap_pending_oci_upload_cleanup_keys(dry_run, &mut result)
+            .reap_pending_oci_upload_cleanup_keys(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -614,7 +647,7 @@ impl StorageGcService {
             result.errors.push(msg);
         }
         if let Err(e) = self
-            .cleanup_orphan_maven_flat_objects(dry_run, &mut result)
+            .cleanup_orphan_maven_flat_objects(repo_scope, dry_run, &mut result)
             .await
         {
             let msg = format_gc_error(
@@ -1158,7 +1191,14 @@ impl StorageGcService {
     /// share the same Postgres database, and a peer test's in-flight
     /// orphan row would inflate that counter. Asserting per-key against
     /// this candidate list keeps each test isolated from its neighbors.
-    pub(crate) async fn select_orphans(&self) -> Result<Vec<sqlx::postgres::PgRow>> {
+    /// `repo_scope` (`Some(id)`) restricts the scan to soft-deleted artifacts
+    /// owned by that repository (web #708); the orphan predicate itself stays
+    /// instance-wide, so a scoped scan can only ever *narrow* the candidate
+    /// set, never admit a key the instance-wide scan would protect.
+    pub(crate) async fn select_orphans(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql = format!(
             r#"
             SELECT a.storage_key, r.storage_backend, r.storage_path,
@@ -1167,11 +1207,17 @@ impl StorageGcService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE {predicate}
+              {scope}
             GROUP BY a.storage_key, r.storage_backend, r.storage_path
             "#,
             predicate = ORPHAN_PREDICATE_SQL,
+            scope = repo_scope_clause("a.repository_id", 1, repo_scope),
         );
-        sqlx::query(&sql)
+        let mut query = sqlx::query(&sql);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        query
             .fetch_all(&self.db)
             .await
             .map_err(|e| crate::error::AppError::Database(e.to_string()))
@@ -1304,10 +1350,13 @@ impl StorageGcService {
 
     async fn cleanup_abandoned_oci_uploads(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let session_ids = self.select_abandoned_oci_upload_session_ids().await?;
+        let session_ids = self
+            .select_abandoned_oci_upload_session_ids(repo_scope)
+            .await?;
         let mut sessions_removed = 0_i64;
         let mut upload_keys_deleted = 0_i64;
 
@@ -1443,19 +1492,27 @@ impl StorageGcService {
         Ok(())
     }
 
-    async fn select_abandoned_oci_upload_session_ids(&self) -> Result<Vec<Uuid>> {
+    async fn select_abandoned_oci_upload_session_ids(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<Uuid>> {
         let sql = format!(
             r#"
             SELECT id
             FROM oci_upload_sessions
             WHERE updated_at < NOW() - {ttl}
+              {scope}
             ORDER BY updated_at ASC
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(ABANDONED_OCI_UPLOAD_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1470,10 +1527,13 @@ impl StorageGcService {
 
     async fn cleanup_unreferenced_oci_upload_keys(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let cleanup_keys = self.select_unreferenced_oci_upload_cleanup_keys().await?;
+        let cleanup_keys = self
+            .select_unreferenced_oci_upload_cleanup_keys(repo_scope)
+            .await?;
         let mut cleanup_rows_removed = 0_i64;
 
         for cleanup_key in cleanup_keys {
@@ -1576,6 +1636,7 @@ impl StorageGcService {
 
     async fn select_unreferenced_oci_upload_cleanup_keys(
         &self,
+        repo_scope: Option<Uuid>,
     ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
@@ -1584,6 +1645,7 @@ impl StorageGcService {
             JOIN repositories r ON r.id = c.repository_id
             WHERE c.storage_write_completed_at IS NOT NULL
               AND c.storage_write_completed_at < NOW() - {ttl}
+              {scope}
               -- See the matching DELETE: a committed key (part/final/completion
               -- temp) is intentionally reapable even while its session lives,
               -- so this is NOT guarded by `s.id = c.upload_session_id`.
@@ -1607,9 +1669,13 @@ impl StorageGcService {
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1640,10 +1706,13 @@ impl StorageGcService {
     /// that may be marking the row complete concurrently.
     async fn reap_pending_oci_upload_cleanup_keys(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let cleanup_keys = self.select_pending_oci_upload_cleanup_keys().await?;
+        let cleanup_keys = self
+            .select_pending_oci_upload_cleanup_keys(repo_scope)
+            .await?;
         let mut cleanup_rows_removed = 0_i64;
 
         for cleanup_key in cleanup_keys {
@@ -1740,7 +1809,10 @@ impl StorageGcService {
         Ok(())
     }
 
-    async fn select_pending_oci_upload_cleanup_keys(&self) -> Result<Vec<OciUploadCleanupKey>> {
+    async fn select_pending_oci_upload_cleanup_keys(
+        &self,
+        repo_scope: Option<Uuid>,
+    ) -> Result<Vec<OciUploadCleanupKey>> {
         let sql = format!(
             r#"
             SELECT c.id, c.storage_key, r.storage_backend, r.storage_path
@@ -1748,6 +1820,7 @@ impl StorageGcService {
             JOIN repositories r ON r.id = c.repository_id
             WHERE c.storage_write_completed_at IS NULL
               AND c.created_at < NOW() - {ttl}
+              {scope}
               AND NOT EXISTS (
                 SELECT 1 FROM oci_upload_sessions s
                 WHERE s.id = c.upload_session_id
@@ -1769,9 +1842,13 @@ impl StorageGcService {
             LIMIT $1
             "#,
             ttl = ABANDONED_OCI_UPLOAD_TTL_SQL,
+            scope = repo_scope_clause("c.repository_id", 2, repo_scope),
         );
-        let rows = sqlx::query(&sql)
-            .bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(OCI_UPLOAD_CLEANUP_KEY_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        let rows = query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1810,10 +1887,11 @@ impl StorageGcService {
     /// repository deletion.
     async fn cleanup_orphan_maven_flat_objects(
         &self,
+        repo_scope: Option<Uuid>,
         dry_run: bool,
         result: &mut StorageGcResult,
     ) -> Result<()> {
-        let candidates = self.select_orphan_maven_flat_objects().await?;
+        let candidates = self.select_orphan_maven_flat_objects(repo_scope).await?;
         let mut objects_removed = 0_i64;
 
         for row in candidates {
@@ -1946,6 +2024,7 @@ impl StorageGcService {
     /// (#1493 pattern).
     pub(crate) async fn select_orphan_maven_flat_objects(
         &self,
+        repo_scope: Option<Uuid>,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
         let sql = format!(
             r#"
@@ -1953,13 +2032,18 @@ impl StorageGcService {
             FROM maven_flat_object_owner o
             JOIN repositories r ON r.id = o.repository_id
             WHERE {predicate}
+              {scope}
             ORDER BY o.storage_key
             LIMIT $1
             "#,
             predicate = ORPHAN_MAVEN_FLAT_PREDICATE_SQL,
+            scope = repo_scope_clause("o.repository_id", 2, repo_scope),
         );
-        sqlx::query(&sql)
-            .bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT)
+        let mut query = sqlx::query(&sql).bind(ORPHAN_MAVEN_FLAT_SCAN_LIMIT);
+        if let Some(id) = repo_scope {
+            query = query.bind(id);
+        }
+        query
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))
@@ -2354,6 +2438,21 @@ pub(crate) fn record_gc_success(result: &mut StorageGcResult, bytes: i64, count:
 /// Format a GC error message for a specific operation and storage key.
 pub(crate) fn format_gc_error(operation: &str, storage_key: &str, error: &str) -> String {
     format!("Failed to {} for key {}: {}", operation, storage_key, error)
+}
+
+/// SQL clause restricting a GC candidate scan to one repository (#708).
+///
+/// Returns `AND <column> = $<param>` when `repo_scope` is `Some`, or an empty
+/// string for the instance-wide scan. `param` is the 1-based placeholder
+/// index the clause should use — one past the number of binds the unscoped
+/// query already has — and the caller must bind the scoped id in that
+/// position. Extracted as a pure helper so the clause shape (and its bind
+/// arithmetic) is unit-testable without a database.
+fn repo_scope_clause(column: &str, param: usize, repo_scope: Option<Uuid>) -> String {
+    match repo_scope {
+        Some(_) => format!("AND {column} = ${param}"),
+        None => String::new(),
+    }
 }
 
 /// Decoded global aggregate values for the OCI blob footprint report.
@@ -3023,6 +3122,109 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // repo_scope_clause (web #708)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_scope_clause_unscoped_is_empty() {
+        assert_eq!(repo_scope_clause("a.repository_id", 1, None), "");
+    }
+
+    #[test]
+    fn test_repo_scope_clause_scoped_renders_and_predicate() {
+        assert_eq!(
+            repo_scope_clause("a.repository_id", 1, Some(Uuid::new_v4())),
+            "AND a.repository_id = $1"
+        );
+    }
+
+    #[test]
+    fn test_repo_scope_clause_uses_supplied_param_index() {
+        // Selects that already bind a LIMIT at $1 must place the scope bind
+        // at $2; the index is the caller's, not the helper's.
+        assert_eq!(
+            repo_scope_clause("c.repository_id", 2, Some(Uuid::new_v4())),
+            "AND c.repository_id = $2"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_gc_for_repository (web #708)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_gc_for_repository_returns_error_when_db_unreachable() {
+        let service = make_service("filesystem");
+        let result = service.run_gc_for_repository(Uuid::new_v4(), false).await;
+        assert!(
+            result.is_err(),
+            "repo-scoped run_gc should fail without a database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_gc_for_repository_dry_run_returns_error_when_db_unreachable() {
+        let service = make_service("s3");
+        let result = service.run_gc_for_repository(Uuid::new_v4(), true).await;
+        assert!(
+            result.is_err(),
+            "repo-scoped dry run should also fail without a database"
+        );
+    }
+
+    /// A soft-deleted, unreferenced artifact is an orphan candidate for its
+    /// OWN repository's scoped scan, but must never appear in a scan scoped
+    /// to a different repository — per-key assertions keep this isolated
+    /// from concurrent tests sharing the database (#1493 pattern).
+    #[tokio::test]
+    async fn test_select_orphans_repo_scope_filters_to_target_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fixture) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let uid = Uuid::new_v4().simple().to_string();
+        let storage_key = format!("maven/com/acme/{uid}/gc-scope-1.0.jar");
+        insert_maven_artifact_row(
+            &fixture.pool,
+            fixture.repo_id,
+            fixture.user_id,
+            &storage_key,
+            true,
+        )
+        .await;
+
+        let service =
+            StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
+        let own_repo = service.select_orphans(Some(fixture.repo_id)).await;
+        let other_repo = service.select_orphans(Some(Uuid::new_v4())).await;
+
+        let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
+        fixture.teardown().await;
+
+        let key_present = |orphans: &[sqlx::postgres::PgRow]| {
+            orphans.iter().any(|row| {
+                let key: String = row.try_get("storage_key").unwrap_or_default();
+                let path: String = row.try_get("storage_path").unwrap_or_default();
+                key == storage_key && path == storage_path_str
+            })
+        };
+
+        let own_repo = own_repo.expect("own-repo scoped scan succeeds");
+        assert!(
+            key_present(&own_repo),
+            "scan scoped to the owning repository must include its orphan key"
+        );
+        let other_repo = other_repo.expect("other-repo scoped scan succeeds");
+        assert!(
+            !key_present(&other_repo),
+            "scan scoped to a different repository must not include the key"
+        );
+    }
+
     /// Reference kind for [`insert_referenced_soft_deleted_artifact`].
     enum RefKind {
         /// Insert an `oci_tags` row pointing at the digest.
@@ -3179,7 +3381,7 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let orphans = service.select_orphans().await;
+        let orphans = service.select_orphans(None).await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
         fixture.teardown().await;
@@ -3213,7 +3415,7 @@ mod tests {
 
         let service =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
-        let orphans = service.select_orphans().await;
+        let orphans = service.select_orphans(None).await;
 
         let storage_path_str = fixture.storage_dir.to_string_lossy().into_owned();
         fixture.teardown().await;
@@ -4960,7 +5162,7 @@ mod tests {
 
             // Step 1: call the outer SELECT directly through the same
             // service instance so we can signal afterwards.
-            let orphans = service.select_orphans().await.expect("select orphans");
+            let orphans = service.select_orphans(None).await.expect("select orphans");
             assert!(
                 orphans.iter().any(|r| {
                     let key: String = r.try_get("storage_key").unwrap_or_default();

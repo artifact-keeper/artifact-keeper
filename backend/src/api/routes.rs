@@ -500,6 +500,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             "/repositories",
             handlers::repositories::router()
                 .merge(handlers::age_gate::repo_config_routes())
+                // Per-repo storage GC (web #708): the UI's per-repo storage
+                // panel calls POST /repositories/{key}/storage-gc. Admin-gated
+                // inside the handler.
+                .merge(handlers::storage_gc::repo_router())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,

@@ -1,6 +1,6 @@
 //! Storage garbage collection API handler.
 
-use axum::extract::{Extension, Query};
+use axum::extract::{Extension, Path, Query};
 use axum::{
     extract::State,
     routing::{get, post},
@@ -12,13 +12,14 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::repository_service::RepositoryService;
 use crate::services::storage_gc_service::{
     OciBlobFootprintReport, OciBlobRepoFootprint, StorageGcResult, StorageGcService,
 };
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(run_storage_gc, oci_blob_report),
+    paths(run_storage_gc, run_repository_storage_gc, oci_blob_report),
     components(schemas(
         StorageGcRequest,
         StorageGcResult,
@@ -32,6 +33,19 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", post(run_storage_gc))
         .route("/oci-blob-report", get(oci_blob_report))
+}
+
+/// Per-repository GC route, merged into the repositories router so the web
+/// UI's per-repo storage panel can reach it at
+/// `/api/v1/repositories/{key}/storage-gc` (web #708).
+///
+/// Kept out of [`router()`] because that router is nested under
+/// `/api/v1/admin/storage-gc`; this endpoint lives in the
+/// `/api/v1/repositories` namespace and goes through its
+/// `optional_auth_middleware`, so the handler takes
+/// `Extension<Option<AuthExtension>>` and authenticates explicitly.
+pub fn repo_router() -> Router<SharedState> {
+    Router::new().route("/:key/storage-gc", post(run_repository_storage_gc))
 }
 
 /// Request body for storage GC.
@@ -98,6 +112,81 @@ fn require_admin(is_admin: bool) -> Result<()> {
             "Admin privileges required".to_string(),
         ))
     }
+}
+
+/// Unwrap the optional auth extension produced by the repositories router's
+/// `optional_auth_middleware`, failing closed when no credentials were
+/// presented (mirrors the fail-closed `AuthExtension::default` invariant).
+fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    auth.ok_or_else(|| AppError::Unauthorized("Authentication required".to_string()))
+}
+
+/// POST /api/v1/repositories/{key}/storage-gc
+///
+/// Repository-scoped storage garbage collection (web #708): the endpoint the
+/// web UI's per-repo storage panel calls with `{dry_run: true}` for its
+/// "reclaimable now" estimate.
+///
+/// Semantics: every candidate sweep of [`StorageGcService::run_gc`] is
+/// restricted to rows owned by this repository (soft-deleted artifacts,
+/// abandoned OCI upload sessions, orphaned upload cleanup keys, and orphaned
+/// Maven flat-object attribution rows), while the orphan *predicates* stay
+/// instance-wide — a storage key is only reclaimed (or counted, on a dry
+/// run) when no live artifact, tag, blob, or manifest reference exists for
+/// it anywhere on the instance. The dry-run estimate is therefore
+/// dedup-aware: bytes still shared with another repository are never
+/// reported as reclaimable. On shared (cloud) backends a live run
+/// hard-deletes every repository's soft-deleted rows for a reclaimed key,
+/// exactly as the instance-wide pass would. Admin-gated like the
+/// instance-wide endpoint.
+#[utoipa::path(
+    post,
+    path = "/{key}/storage-gc",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    operation_id = "run_repository_storage_gc",
+    params(("key" = String, Path, description = "Repository key")),
+    request_body = StorageGcRequest,
+    responses(
+        (status = 200, description = "GC result", body = StorageGcResult),
+        (status = 401, description = "Authentication required, or admin privileges required"),
+        (status = 404, description = "Repository not found"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn run_repository_storage_gc(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<StorageGcRequest>,
+) -> Result<Json<StorageGcResult>> {
+    let auth = require_auth(auth)?;
+    // Admin gate BEFORE the repository lookup so a non-admin cannot probe
+    // repository existence through the 404-vs-401 distinction.
+    require_admin(auth.is_admin)?;
+
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+
+    let service = StorageGcService::new(state.db.clone(), state.storage_registry.clone());
+    let result = service
+        .run_gc_for_repository(repo.id, payload.dry_run)
+        .await?;
+
+    // Mirror the admin endpoint (#2056/#2601): settle the materialized
+    // storage stats after a live pass instead of leaving them stale until
+    // the next cron tick. Best-effort — the GC already ran.
+    if !payload.dry_run {
+        let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+            state.db.clone(),
+            &state.config.storage_backend,
+        );
+        if let Err(e) = stats_service.recompute_all().await {
+            tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+        }
+    }
+
+    Ok(Json(result))
 }
 
 /// Resolve the effective grace-window argument for the blob report from the
@@ -325,8 +414,9 @@ mod tests {
     #[test]
     fn test_openapi_doc_has_post_run_and_get_report() {
         // The merged doc keys paths by their full context path, so match by
-        // suffix: there must be exactly one POST-bearing path (run GC) and
-        // exactly one GET-bearing path ending in /oci-blob-report.
+        // suffix: there must be exactly two POST-bearing paths (instance-wide
+        // run GC + per-repository run GC, #708) and exactly one GET-bearing
+        // path ending in /oci-blob-report.
         let doc = StorageGcApiDoc::openapi();
         let post_paths = doc
             .paths
@@ -340,7 +430,10 @@ mod tests {
             .iter()
             .filter(|(path, item)| path.ends_with("/oci-blob-report") && item.get.is_some())
             .count();
-        assert_eq!(post_paths, 1, "exactly one POST path (run GC) expected");
+        assert_eq!(
+            post_paths, 2,
+            "exactly two POST paths (instance + per-repo run GC) expected"
+        );
         assert_eq!(
             report_get, 1,
             "exactly one GET /oci-blob-report path expected"
@@ -352,6 +445,85 @@ mod tests {
     #[test]
     fn test_router_returns_valid_router() {
         let _router = router();
+    }
+
+    #[test]
+    fn test_repo_router_returns_valid_router() {
+        let _router = repo_router();
+    }
+
+    // -- require_auth (repositories-nest optional auth) --
+
+    #[test]
+    fn test_require_auth_unwraps_present_extension() {
+        let auth = AuthExtension {
+            is_admin: true,
+            ..Default::default()
+        };
+        let unwrapped = require_auth(Some(auth)).expect("present auth must pass");
+        assert!(unwrapped.is_admin);
+    }
+
+    #[test]
+    fn test_require_auth_rejects_absent_extension() {
+        let err = require_auth(None).unwrap_err();
+        match err {
+            AppError::Unauthorized(msg) => {
+                assert!(
+                    msg.contains("Authentication required"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    // -- Per-repository storage-gc endpoint (web #708) --
+
+    #[test]
+    fn test_openapi_doc_includes_repository_storage_gc_operation() {
+        let doc = StorageGcApiDoc::openapi();
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(
+            json.contains("run_repository_storage_gc"),
+            "OpenAPI doc should contain operation ID 'run_repository_storage_gc'"
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_repository_storage_gc_path() {
+        // The exact path the web UI has called since the panel shipped —
+        // a rename here silently re-breaks web #708.
+        let doc = StorageGcApiDoc::openapi();
+        let (path, item) = doc
+            .paths
+            .paths
+            .iter()
+            .find(|(path, _)| path.ends_with("/repositories/{key}/storage-gc"))
+            .expect("doc must contain /api/v1/repositories/{key}/storage-gc");
+        assert_eq!(path, "/api/v1/repositories/{key}/storage-gc");
+        assert!(item.post.is_some(), "per-repo storage-gc must be a POST");
+    }
+
+    #[test]
+    fn test_openapi_doc_repository_storage_gc_request_body_and_response() {
+        let doc = StorageGcApiDoc::openapi();
+        let json = serde_json::to_string(&doc).unwrap();
+        // Same request/response contract as the instance-wide endpoint:
+        // StorageGcRequest in, StorageGcResult out — the web client depends
+        // on `bytes_freed` / `storage_keys_deleted` / `dry_run` / `errors`.
+        let op_start = json
+            .find("run_repository_storage_gc")
+            .expect("operation present");
+        let op_region = &json[op_start..];
+        assert!(
+            op_region.contains("StorageGcRequest"),
+            "per-repo endpoint must accept StorageGcRequest"
+        );
+        assert!(
+            op_region.contains("StorageGcResult"),
+            "per-repo endpoint must return StorageGcResult"
+        );
     }
 
     // -- OciBlobReportQuery deserialization (issue #1408) --
