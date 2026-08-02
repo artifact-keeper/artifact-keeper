@@ -120,12 +120,27 @@ async fn stream_body_to_file(body: Body, path: &Path) -> Result<(i64, String), R
 }
 
 /// Append a request body to an existing file. Returns bytes written.
+///
+/// The open is deliberately `append`-without-`create`: once a finalize has
+/// sealed the staging file (renamed it out from under the session's
+/// `storage_temp_path`), this open fails with `ENOENT`, which is reported as
+/// `409 CONFLICT` — a session that entered finalize no longer accepts chunks.
 async fn append_body_to_file(body: Body, path: &Path) -> Result<i64, Response> {
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(path)
         .await
-        .map_err(|e| fs_err("open temp file for append", e))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                (
+                    StatusCode::CONFLICT,
+                    "Upload session is finalizing: it no longer accepts chunks".to_string(),
+                )
+                    .into_response()
+            } else {
+                fs_err("open temp file for append", e)
+            }
+        })?;
 
     let mut bytes_written: i64 = 0;
 
@@ -198,28 +213,88 @@ async fn truncate_staged_file_to_offset(path: &Path, persisted: u64) -> Result<(
     Ok(())
 }
 
-/// Compute SHA256 of a file by streaming through it in 64 KB blocks.
-async fn compute_sha256_from_file(path: &Path) -> Result<String, Response> {
-    use tokio::io::AsyncReadExt;
+/// Suffix of the file a finalize seals the staged chunks into.
+const SEALED_FILE_SUFFIX: &str = ".seal";
+/// Suffix of the finalize-private file holding the completing request's body.
+const FINAL_BODY_FILE_SUFFIX: &str = ".final";
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| fs_err("open file for checksum", e))?;
+fn suffixed_path(base: &Path, suffix: &str) -> PathBuf {
+    let mut name = base.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| fs_err("read file for checksum", e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+/// Path the staged chunks are sealed into when a finalize claims the session.
+///
+/// Keeps the `ak-incus-upload-` prefix (it is the temp path plus a suffix) so
+/// [`is_staging_file`] recognises it and the age-based orphan sweep reaps it.
+pub(crate) fn sealed_upload_path(temp: &Path) -> PathBuf {
+    suffixed_path(temp, SEALED_FILE_SUFFIX)
+}
+
+/// Path the completing request's trailing body is streamed into. Isolated
+/// from the sealed file so nothing is ever appended to the staged chunks
+/// during finalize (a reclaimed finalize rewrites this file instead of
+/// appending the body a second time). Same prefix, so the sweep reaps it.
+pub(crate) fn final_upload_path(temp: &Path) -> PathBuf {
+    suffixed_path(temp, FINAL_BODY_FILE_SUFFIX)
+}
+
+/// Seal the staged chunks to the finalize lease by renaming them out of the
+/// session's `storage_temp_path`.
+///
+/// The rename is atomic, so after it returns the staged bytes are reachable
+/// only through the sealed path, which no PATCH can name: a chunk arriving
+/// after the seal opens `temp` and gets `ENOENT` -> 409.
+///
+/// Idempotent, because the sealed name is derived from the session's temp
+/// path and therefore identical for every finalize attempt on the session:
+///   * `sealed` already present -> a predecessor sealed it; reuse it (its
+///     content is the committed prefix, and only a lease release un-seals).
+///   * otherwise rename `temp` -> `sealed`.
+///   * neither present -> the staged data is not on this replica; fail the
+///     request rather than publish a truncated artifact (mirrors
+///     [`truncate_staged_file_to_offset`]'s short-file behaviour).
+async fn seal_staging_file(temp: &Path, sealed: &Path) -> Result<(), Response> {
+    if tokio::fs::metadata(sealed).await.is_ok() {
+        tracing::warn!(
+            sealed = %sealed.display(),
+            "staged file was already sealed by a previous finalize attempt; reusing it"
+        );
+        return Ok(());
     }
+    match tokio::fs::rename(temp, sealed).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Staged upload data is missing on this replica (expected {})",
+                temp.display()
+            ),
+        )
+            .into_response()),
+        Err(e) => Err(fs_err("seal staged file", e)),
+    }
+}
 
-    Ok(format!("{:x}", hasher.finalize()))
+/// Best-effort removal of every file a session may have staged: the chunk
+/// file plus the sealed / final-body sidecars a finalize creates. Callers
+/// that retire a session (cancel, checksum-mismatch, the reaper) use this so
+/// a session that died mid-finalize cannot leave a sidecar behind.
+async fn remove_staging_files(temp: &Path, sealed: &Path, final_path: &Path) {
+    let _ = tokio::fs::remove_file(temp).await;
+    let _ = tokio::fs::remove_file(sealed).await;
+    let _ = tokio::fs::remove_file(final_path).await;
+}
+
+/// Undo [`seal_staging_file`] so a session released back to `receiving`
+/// resumes cleanly: the staged chunks return to the path a follow-up PATCH
+/// opens, and the abandoned final-body file is dropped.
+async fn unseal_staging_file(temp: &Path, sealed: &Path, final_path: &Path) {
+    let _ = tokio::fs::remove_file(final_path).await;
+    if tokio::fs::metadata(sealed).await.is_ok() {
+        let _ = tokio::fs::rename(sealed, temp).await;
+    }
 }
 
 /// Compute the on-disk path for a storage key (mirrors FilesystemStorage::key_to_path).
@@ -323,23 +398,68 @@ impl Drop for StagedTempFile {
     }
 }
 
-/// Open the staged upload temp file as a `BoxStream<Result<Bytes>>` ready
+/// Shorthand for the staged-data streams fed to `StorageBackend::put_stream`.
+type StagedStream = futures::stream::BoxStream<'static, crate::error::Result<Bytes>>;
+
+/// Open at most `limit` bytes of `path` as a `BoxStream<Result<Bytes>>` ready
 /// to feed `StorageBackend::put_stream`. Uses a `STREAM_CHUNK_BUDGET`
 /// buffered `ReaderStream` so the upload from local disk to the storage
 /// backend stays memory-bounded (S3 multipart, GCS resumable, filesystem
 /// temp-and-rename all consume this stream natively after #1512).
-async fn open_temp_file_as_stream(
-    path: &Path,
-) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, std::io::Error> {
-    use tokio::io::BufReader;
+///
+/// The bound is what keeps a finalize's view of the staged file fixed at the
+/// committed offset: bytes written past it (by a chunk whose fd was opened
+/// before the seal) are outside every read this handler performs, so they can
+/// reach neither the checksum nor the stored object.
+async fn open_bounded_file_stream(path: &Path, limit: u64) -> Result<StagedStream, std::io::Error> {
+    use tokio::io::{AsyncReadExt, BufReader};
     use tokio_util::io::ReaderStream;
 
     let file = tokio::fs::File::open(path).await?;
-    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file);
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file).take(limit);
     let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_BUDGET);
     let mapped = stream
         .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("temp file read: {e}"))));
     Ok(Box::pin(mapped))
+}
+
+/// Build the deterministic byte view of a finalizing upload:
+/// `sealed[0..committed] ++ final`.
+///
+/// This is the single definition of "what this upload is". Both the checksum
+/// pass and the `put_stream` push read through it, so the recorded digest,
+/// the recorded size and the stored object are derived from the exact same
+/// bytes, and re-running a reclaimed finalize re-derives them identically
+/// (the sealed prefix is immutable and the final body is rewritten, never
+/// appended).
+async fn open_finalize_stream(
+    sealed: &Path,
+    committed: u64,
+    final_path: Option<&Path>,
+) -> Result<StagedStream, std::io::Error> {
+    let head = open_bounded_file_stream(sealed, committed).await?;
+    let Some(final_path) = final_path else {
+        return Ok(head);
+    };
+    let tail = open_bounded_file_stream(final_path, u64::MAX).await?;
+    Ok(Box::pin(head.chain(tail)))
+}
+
+/// Hash a staged-data stream (see [`open_finalize_stream`]) in place, so the
+/// checksum is computed over the same bounded view that is stored.
+async fn compute_sha256_over_stream(mut stream: StagedStream) -> Result<String, Response> {
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read staged data for checksum: {e}"),
+            )
+                .into_response()
+        })?;
+        hasher.update(&chunk);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Determine the content type for an Incus artifact based on its path.
@@ -995,7 +1115,11 @@ async fn upload_image(
             storage_key,
             user_id,
             metadata,
-            temp_path: temp_path.clone(),
+            // The monolithic body was staged in one shot, so the staged file
+            // IS the artifact and there is no trailing-body part.
+            sealed_path: temp_path.clone(),
+            committed_offset: size_bytes,
+            final_path: None,
             finalize_token,
         },
     ));
@@ -1238,29 +1362,39 @@ async fn upload_chunk(
             .into_response());
     }
 
-    // Append body to temp file (no read-back of existing data)
+    // Append body to temp file (no read-back of existing data). Once a
+    // finalize has sealed the staging file this open fails with ENOENT and is
+    // reported as 409, so a chunk arriving after the claim cannot write bytes
+    // the finalizer is already hashing.
     let bytes_written = append_body_to_file(body, &temp_path).await?;
-    let new_total = session.bytes_received + bytes_written;
 
     // Record the new offset only while the session is still 'receiving'. The
     // status can change between the check above and here (a `complete` on any
     // replica claims the lease with a guarded UPDATE), so this predicate — not
     // the pre-read — is what keeps `bytes_received` owned by one writer.
+    //
+    // The offset is advanced DB-side (`bytes_received + $2`) rather than from
+    // the pre-read `session.bytes_received`: a read-modify-write loses one of
+    // two concurrent chunk updates, and this counter is the authoritative
+    // committed offset the finalize bounds its read to, so a lost update would
+    // silently drop committed bytes from the artifact.
     let updated = sqlx::query(
-        "UPDATE incus_upload_sessions SET bytes_received = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = 'receiving'",
+        "UPDATE incus_upload_sessions SET bytes_received = bytes_received + $2, \
+         updated_at = NOW() \
+         WHERE id = $1 AND status = 'receiving' RETURNING bytes_received",
     )
     .bind(session_id)
-    .bind(new_total)
-    .execute(&state.db)
+    .bind(bytes_written)
+    .fetch_optional(&state.db)
     .await
     .map_err(db_err)?;
 
-    if updated.rows_affected() != 1 {
+    let Some(row) = updated else {
         // A finalize claimed the session while this body was streaming. The
         // offset is deliberately NOT advanced: the finalize owner re-reads the
-        // persisted `bytes_received` under its lease and truncates the staged
-        // file back to it, dropping this unrecorded append.
+        // persisted `bytes_received` under its lease and bounds every read of
+        // the sealed file to it, so these bytes reach neither the recorded
+        // checksum nor the stored object.
         tracing::warn!(
             session_id = %session_id,
             bytes_written,
@@ -1272,7 +1406,8 @@ async fn upload_chunk(
             "Upload session entered finalize while this chunk was uploading".to_string(),
         )
             .into_response());
-    }
+    };
+    let new_total: i64 = row.try_get("bytes_received").map_err(db_err)?;
 
     tracing::debug!(
         "Chunk uploaded for session {}: +{} bytes (total: {})",
@@ -1397,28 +1532,78 @@ async fn release_incus_finalize_lease(db: &PgPool, session_id: Uuid, finalize_to
     .await;
 }
 
-/// Persist the assembled byte count only while this finalize token still
-/// owns the session. A `false` result means the lease expired and was
-/// reclaimed (or the row became terminal/deleted), so the caller must not
-/// start side effects under the stale token.
-async fn persist_incus_finalize_offset(
+/// Re-assert that this finalize token still owns the session, immediately
+/// before the handler starts background side effects. A `false` result means
+/// the lease expired and was reclaimed (or the row became terminal/deleted),
+/// so the caller must not spawn its finalizer.
+///
+/// Deliberately does NOT write `bytes_received`: that column is the durable
+/// *pre-final* offset owned by the PATCH path, and a reclaimed finalize
+/// re-derives the artifact as `sealed[0..bytes_received] ++ final`. Folding
+/// the final body into the column would make the reclaim's bounded read
+/// include bytes that are also in the final file, i.e. count them twice.
+async fn assert_incus_finalize_lease_live(
     db: &PgPool,
     session_id: Uuid,
     finalize_token: Uuid,
-    total_bytes: i64,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE incus_upload_sessions \
-         SET bytes_received = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = 'finalizing' AND finalize_token = $3",
+         SET updated_at = NOW() \
+         WHERE id = $1 AND status = 'finalizing' AND finalize_token = $2",
     )
     .bind(session_id)
-    .bind(total_bytes)
     .bind(finalize_token)
     .execute(db)
     .await?;
 
     Ok(updated.rows_affected() == 1)
+}
+
+/// Release a finalize lease taken by a request that then failed, restoring
+/// both halves of the session state: the staged chunks go back to the path a
+/// resumed PATCH opens, and the row goes back to `receiving`.
+///
+/// Order matters — the file is un-sealed first, so a PATCH that observes
+/// `receiving` always finds the staging file already in place.
+async fn abort_incus_finalize(
+    db: &PgPool,
+    session_id: Uuid,
+    finalize_token: Uuid,
+    temp: &Path,
+    sealed: &Path,
+    final_path: &Path,
+) {
+    unseal_staging_file(temp, sealed, final_path).await;
+    release_incus_finalize_lease(db, session_id, finalize_token).await;
+}
+
+/// Assemble the finalize's input under an already-claimed lease and hash it.
+/// Returns `(final_body_bytes, checksum_of_the_whole_artifact)`.
+///
+/// Every step is idempotent, so a finalize reclaiming a crashed
+/// predecessor's lease re-derives the exact same artifact:
+///   1. seal — rename `temp` -> `sealed`, or reuse an existing `sealed`;
+///   2. truncate `sealed` back to the committed offset;
+///   3. write the completing request's body to `final` with create+truncate,
+///      never appending it to `sealed`;
+///   4. hash the bounded `sealed[0..committed] ++ final` view — the same view
+///      the storage push later streams.
+async fn stage_finalize_input(
+    body: Body,
+    temp: &Path,
+    sealed: &Path,
+    final_path: &Path,
+    committed: u64,
+) -> Result<(i64, String), Response> {
+    seal_staging_file(temp, sealed).await?;
+    truncate_staged_file_to_offset(sealed, committed).await?;
+    let (final_bytes, _) = stream_body_to_file(body, final_path).await?;
+    let stream = open_finalize_stream(sealed, committed, Some(final_path))
+        .await
+        .map_err(|e| fs_err("open staged data for checksum", e))?;
+    let checksum = compute_sha256_over_stream(stream).await?;
+    Ok((final_bytes, checksum))
 }
 
 async fn complete_chunked_upload(
@@ -1435,6 +1620,11 @@ async fn complete_chunked_upload(
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let session = get_session(&state.db, session_id, repo.id).await?;
     let temp_path = PathBuf::from(&session.storage_temp_path);
+    // Both derived from the session's temp path, so every finalize attempt on
+    // this session — including one reclaiming a crashed predecessor's lease —
+    // names the exact same pair of files.
+    let sealed_path = sealed_upload_path(&temp_path);
+    let final_path = final_upload_path(&temp_path);
 
     // Claim the finalize lease BEFORE touching the temp file: the guarded
     // 'receiving' -> 'finalizing' transition is what stops a duplicate
@@ -1454,11 +1644,10 @@ async fn complete_chunked_upload(
                 .into_response()
         })?;
 
-    // The persisted offset re-read UNDER the lease is the authoritative file
-    // length: the pre-claim `session` read can be stale, and a crashed
-    // predecessor may have appended final bytes without recording them.
-    // Truncating any unrecorded tail before appending makes a reclaimed
-    // finalize idempotent instead of double-appending the final body.
+    // The persisted offset re-read UNDER the lease is the authoritative
+    // committed length: the pre-claim `session` read can be stale, and the
+    // PATCH path only advances this column while the session is 'receiving'.
+    // Every read this finalize performs is bounded to it.
     let persisted_bytes: i64 =
         match sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
             .bind(session_id)
@@ -1467,36 +1656,47 @@ async fn complete_chunked_upload(
         {
             Ok(n) => n,
             Err(e) => {
-                release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+                abort_incus_finalize(
+                    &state.db,
+                    session_id,
+                    finalize_token,
+                    &temp_path,
+                    &sealed_path,
+                    &final_path,
+                )
+                .await;
                 return Err(db_err(e));
             }
         };
-    if let Err(resp) = truncate_staged_file_to_offset(&temp_path, persisted_bytes as u64).await {
-        release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
-        return Err(resp);
-    }
 
-    // Append any final body data. A transient failure here (or in the
-    // checksum pass below) must release the lease back to 'receiving' —
-    // otherwise the session would be wedged in 'finalizing' with no
-    // finalizer until the 6h lease lapses.
-    let final_bytes = match append_body_to_file(body, &temp_path).await {
-        Ok(n) => n,
+    // Seal the staged chunks, stage the trailing body, and hash the result.
+    // Any failure in there releases the lease back to 'receiving' (and
+    // un-seals) — otherwise the session would be wedged in 'finalizing' with
+    // no finalizer until the 6h lease lapses.
+    let (final_bytes, checksum) = match stage_finalize_input(
+        body,
+        &temp_path,
+        &sealed_path,
+        &final_path,
+        persisted_bytes as u64,
+    )
+    .await
+    {
+        Ok(v) => v,
         Err(resp) => {
-            release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+            abort_incus_finalize(
+                &state.db,
+                session_id,
+                finalize_token,
+                &temp_path,
+                &sealed_path,
+                &final_path,
+            )
+            .await;
             return Err(resp);
         }
     };
     let total_bytes = persisted_bytes + final_bytes;
-
-    // Compute SHA256 by streaming through the file
-    let checksum = match compute_sha256_from_file(&temp_path).await {
-        Ok(c) => c,
-        Err(resp) => {
-            release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
-            return Err(resp);
-        }
-    };
 
     // Verify client-provided checksum if present
     if let Some(expected) = headers.get("X-Checksum-Sha256") {
@@ -1504,7 +1704,7 @@ async fn complete_chunked_upload(
         if expected != checksum {
             // Checksum mismatch — clean up (token-guarded: only the lease
             // owner may delete the session out from under other requests)
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            remove_staging_files(&temp_path, &sealed_path, &final_path).await;
             let _ = sqlx::query(
                 "DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2",
             )
@@ -1526,8 +1726,18 @@ async fn complete_chunked_upload(
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
     // artifact is already staged, so a saturated server skips this best-effort
     // extraction rather than shedding the upload.
+    //
+    // The artifact is split across two files, so read from whichever holds
+    // its head: the sealed chunks when any were committed, else the
+    // completing request's body (a client that sent everything in the final
+    // PUT). Extraction is best-effort either way.
+    let metadata_source = if persisted_bytes > 0 {
+        &sealed_path
+    } else {
+        &final_path
+    };
     let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
-        IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path).ok()
+        IncusHandler::parse_metadata_from_file(&session.artifact_path, metadata_source).ok()
     })
     .ok()
     .flatten()
@@ -1541,24 +1751,32 @@ async fn complete_chunked_upload(
     // `GET /incus/{repo}/uploads/{id}` for `completed`/`failed`; the
     // stale-session reaper cleans terminal rows after `max_age_hours`.
     let storage_key = build_storage_key(&session.repository_id, &session.artifact_path);
-    let offset_persisted =
-        match persist_incus_finalize_offset(&state.db, session_id, finalize_token, total_bytes)
-            .await
-        {
-            Ok(persisted) => persisted,
+    let lease_live =
+        match assert_incus_finalize_lease_live(&state.db, session_id, finalize_token).await {
+            Ok(live) => live,
             Err(e) => {
-                // The final body is an unrecorded tail. Releasing the lease makes
-                // a retry truncate back to the old durable offset before it
-                // appends that body again.
-                release_incus_finalize_lease(&state.db, session_id, finalize_token).await;
+                // Nothing durable was changed: `bytes_received` still holds the
+                // committed offset and the sealed/final pair is rebuilt from
+                // scratch by whichever finalize runs next.
+                abort_incus_finalize(
+                    &state.db,
+                    session_id,
+                    finalize_token,
+                    &temp_path,
+                    &sealed_path,
+                    &final_path,
+                )
+                .await;
                 return Err(db_err(e));
             }
         };
-    if !offset_persisted {
+    if !lease_live {
         // The lease expired and another request reclaimed it while this
-        // handler was appending or hashing. Do not spawn a stale finalizer:
+        // handler was staging or hashing. Do not spawn a stale finalizer:
         // its terminal update would be fenced, but its storage write,
-        // artifact upsert, and temp-file removal happen before that check.
+        // artifact upsert, and staging cleanup happen before that check.
+        // The sealed/final files are deliberately left in place — they are
+        // named after the session, so the new owner reuses/rewrites them.
         return Err((
             StatusCode::CONFLICT,
             "Upload finalize lease was lost or superseded".to_string(),
@@ -1580,7 +1798,9 @@ async fn complete_chunked_upload(
             storage_key,
             user_id: session.user_id,
             metadata,
-            temp_path: temp_path.clone(),
+            sealed_path: sealed_path.clone(),
+            committed_offset: persisted_bytes,
+            final_path: Some(final_path.clone()),
             finalize_token,
         },
     ));
@@ -1623,21 +1843,72 @@ async fn cancel_chunked_upload(
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be cancelled via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let session = get_session(&state.db, session_id, repo.id).await?;
 
-    // Delete temp file
-    let _ = tokio::fs::remove_file(&session.storage_temp_path).await;
+    // Only the client that started the upload may cancel it. Defence in depth
+    // behind the token scope + random session id.
+    if session.user_id != user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Upload session belongs to another user".to_string(),
+        )
+            .into_response());
+    }
 
-    // Delete session
-    sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
-        .bind(session_id)
-        .execute(&state.db)
-        .await
-        .map_err(db_err)?;
+    // Cancel is claim-aware like every other transition on this row. A
+    // session that already entered finalize is owned by that finalize: it is
+    // streaming the staged data to the storage backend and will publish an
+    // artifact, so deleting the row (and its staged file) out from under it
+    // would both corrupt that push and leave a published artifact with no
+    // session. Refuse instead of racing it.
+    if session.status != "receiving" {
+        let detail = if session.status == "finalizing" {
+            "finalize is already in progress"
+        } else {
+            "the upload has already finished"
+        };
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Cannot cancel upload session: {}", detail),
+        )
+            .into_response());
+    }
+
+    // The guarded DELETE is the claim: it closes the window between the read
+    // above and the delete, so a `complete` that claims the lease in that gap
+    // wins and this cancel reports 409 rather than deleting a row a live
+    // finalizer owns. The staged files are only touched once the claim is won.
+    let claimed = sqlx::query(
+        "DELETE FROM incus_upload_sessions \
+         WHERE id = $1 AND user_id = $2 AND status = 'receiving' \
+         RETURNING storage_temp_path",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_err)?;
+
+    let Some(row) = claimed else {
+        return Err((
+            StatusCode::CONFLICT,
+            "Cannot cancel upload session: finalize is already in progress".to_string(),
+        )
+            .into_response());
+    };
+
+    let staged: String = row.try_get("storage_temp_path").map_err(db_err)?;
+    let temp_path = PathBuf::from(staged);
+    remove_staging_files(
+        &temp_path,
+        &sealed_upload_path(&temp_path),
+        &final_upload_path(&temp_path),
+    )
+    .await;
 
     tracing::info!("Cancelled chunked upload session {}", session_id);
 
@@ -1718,7 +1989,13 @@ pub async fn cleanup_stale_sessions(db: &PgPool, max_age_hours: i64) -> Result<i
     let count = stale.len() as i64;
 
     for (id, temp_path) in &stale {
-        let _ = tokio::fs::remove_file(temp_path).await;
+        let temp_path = Path::new(temp_path);
+        remove_staging_files(
+            temp_path,
+            &sealed_upload_path(temp_path),
+            &final_upload_path(temp_path),
+        )
+        .await;
         tracing::info!("Cleaned up stale upload session {}", id);
     }
 
@@ -1800,7 +2077,7 @@ async fn ensure_parent_dirs(path: &Path) -> Result<(), Response> {
 ///
 /// Retained as a building block for callers that still need an in-place
 /// rename (currently none in the upload path). Real uploads route the
-/// staged temp file through `put_temp_file_to_storage` so cloud-backed
+/// staged temp file through `put_staged_upload_to_storage` so cloud-backed
 /// repos actually persist to the configured bucket (#1471).
 #[allow(dead_code)]
 async fn finalize_temp_file(temp_path: &Path, final_path: &Path) -> Result<(), Response> {
@@ -1811,28 +2088,36 @@ async fn finalize_temp_file(temp_path: &Path, final_path: &Path) -> Result<(), R
     Ok(())
 }
 
-/// Push a staged temp file into the repo's configured StorageBackend via
+/// Push the staged upload into the repo's configured StorageBackend via
 /// `put_stream`. Peak memory is bounded to `STREAM_CHUNK_BUDGET` thanks to
-/// the ReaderStream chunking in `open_temp_file_as_stream`.
+/// the ReaderStream chunking in [`open_bounded_file_stream`].
+///
+/// The object streamed is [`open_finalize_stream`]'s deterministic
+/// `sealed[0..committed] ++ final` view — byte-for-byte the input the
+/// recorded checksum was computed over, and identical on every re-run, so a
+/// finalize that reclaims a crashed predecessor overwrites the storage key
+/// with the same object instead of assembling a longer one.
 ///
 /// This is the contract that makes Incus uploads durable on S3/GCS-backed
 /// deployments. Before #1471 both upload paths called `tokio::fs::rename`
 /// onto the server-local STORAGE_PATH unconditionally, so the bytes never
 /// reached the bucket the repo was configured to use; downloads worked
 /// only as long as the same ingest pod also served the GET.
-async fn put_temp_file_to_storage(
+async fn put_staged_upload_to_storage(
     state: &SharedState,
     repo: &RepoInfo,
     storage_key: &str,
-    temp_path: &Path,
+    sealed_path: &Path,
+    committed: u64,
+    final_path: Option<&Path>,
 ) -> Result<(), String> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| format!("storage backend resolution failed: {e}"))?;
 
-    let stream = open_temp_file_as_stream(temp_path)
+    let stream = open_finalize_stream(sealed_path, committed, final_path)
         .await
-        .map_err(|e| format!("reopen temp for streaming put: {e}"))?;
+        .map_err(|e| format!("reopen staged data for streaming put: {e}"))?;
 
     storage
         .put_stream(storage_key, stream)
@@ -1855,7 +2140,20 @@ struct FinalizeParams {
     storage_key: String,
     user_id: Uuid,
     metadata: serde_json::Value,
-    temp_path: PathBuf,
+    /// Staged file holding the artifact's first [`committed_offset`] bytes.
+    /// For a chunked upload this is the sealed chunk file; for a monolithic
+    /// upload it is the single staged body.
+    ///
+    /// [`committed_offset`]: FinalizeParams::committed_offset
+    sealed_path: PathBuf,
+    /// How much of `sealed_path` belongs to the artifact. Bytes past it (an
+    /// append by a chunk request whose fd predates the seal) are excluded
+    /// from both the checksum and the stored object.
+    committed_offset: i64,
+    /// Finalize-private file holding the completing request's trailing body,
+    /// concatenated after `sealed_path[..committed_offset]`. `None` for the
+    /// monolithic path, which has no trailing body.
+    final_path: Option<PathBuf>,
     /// Finalize-lease token stamped when the session entered 'finalizing'.
     /// The finalizer's terminal updates must present it, so a finalizer whose
     /// lease expired and was reclaimed cannot clobber the new owner's state.
@@ -1875,7 +2173,15 @@ async fn run_finalize(
     repo: &RepoInfo,
     p: &FinalizeParams,
 ) -> Result<Uuid, String> {
-    put_temp_file_to_storage(state, repo, &p.storage_key, &p.temp_path).await?;
+    put_staged_upload_to_storage(
+        state,
+        repo,
+        &p.storage_key,
+        &p.sealed_path,
+        p.committed_offset as u64,
+        p.final_path.as_deref(),
+    )
+    .await?;
 
     let artifact_id = upsert_artifact(UpsertArtifactParams {
         db: &state.db,
@@ -1940,7 +2246,10 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
     let finalize_renewal =
         spawn_incus_finalize_lease_renewal(state.db.clone(), session_id, params.finalize_token);
     let outcome = run_finalize(&state, &repo, &params).await;
-    let _ = tokio::fs::remove_file(&params.temp_path).await;
+    let _ = tokio::fs::remove_file(&params.sealed_path).await;
+    if let Some(final_path) = &params.final_path {
+        let _ = tokio::fs::remove_file(final_path).await;
+    }
     match outcome {
         Ok(artifact_id) => {
             tracing::info!(
@@ -1950,15 +2259,21 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
                 params.artifact_path,
                 params.size_bytes
             );
+            // `bytes_received` is only now advanced to the artifact's full
+            // size, so `GET /uploads/{id}` reports it. Safe at this point and
+            // only at this point: the row becomes terminal in the same
+            // statement, and a terminal row is never reclaimed, so no later
+            // finalize can mistake the total for a committed chunk offset.
             let result = sqlx::query(
                 "UPDATE incus_upload_sessions \
                  SET status = 'completed', artifact_id = $2, finalize_error = NULL, \
-                     finalize_claimed_until = NULL, updated_at = NOW() \
+                     bytes_received = $4, finalize_claimed_until = NULL, updated_at = NOW() \
                  WHERE id = $1 AND status = 'finalizing' AND finalize_token = $3",
             )
             .bind(session_id)
             .bind(artifact_id)
             .bind(params.finalize_token)
+            .bind(params.size_bytes)
             .execute(&state.db)
             .await;
             if let Ok(r) = result {
@@ -3258,7 +3573,7 @@ mod tests {
             last_key: last_key.clone(),
         };
 
-        let stream = open_temp_file_as_stream(&path)
+        let stream = open_bounded_file_stream(&path, u64::MAX)
             .await
             .expect("open staged temp as stream");
         let storage_key = "incus/00000000-0000-0000-0000-000000000000/ubuntu/20240215/incus.tar.gz";
@@ -3299,7 +3614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_temp_file_as_stream_roundtrip() {
+    async fn test_open_bounded_file_stream_roundtrip() {
         // Sanity: the bytes the streaming helper yields exactly match the
         // bytes on disk. Guards against an off-by-one chunk-boundary bug
         // that would silently corrupt incus uploads.
@@ -3308,7 +3623,9 @@ mod tests {
         let path = tmp.path().join("payload.bin");
         tokio::fs::write(&path, &payload).await.unwrap();
 
-        let mut stream = open_temp_file_as_stream(&path).await.expect("open stream");
+        let mut stream = open_bounded_file_stream(&path, u64::MAX)
+            .await
+            .expect("open stream");
         let mut collected: Vec<u8> = Vec::with_capacity(payload.len());
         while let Some(chunk) = stream.next().await {
             collected.extend_from_slice(&chunk.expect("chunk ok"));
@@ -3690,7 +4007,7 @@ mod streaming_pipeline_regression_tests {
     }
 
     /// PUT a monolithic image, then GET it back. Exercises `upload_image`'s
-    /// stream-to-temp-file → `put_temp_file_to_storage` → `put_stream`
+    /// stream-to-temp-file → `put_staged_upload_to_storage` → `put_stream`
     /// pipeline and the matching `download_image` → `get_stream` →
     /// streaming response body path.
     #[tokio::test]
@@ -3886,7 +4203,7 @@ mod streaming_pipeline_regression_tests {
     /// Drive a full chunked upload (POST start → PATCH chunk → PUT complete)
     /// and confirm the assembled blob is downloadable via `get_stream`.
     /// Exercises `complete_chunked_upload`'s new
-    /// `put_temp_file_to_storage` call site and temp-file cleanup.
+    /// `put_staged_upload_to_storage` call site and staging cleanup.
     #[tokio::test]
     async fn chunked_upload_complete_then_download_roundtrip() {
         let Some(f) = tdh::Fixture::setup("local", "incus").await else {
@@ -4057,7 +4374,9 @@ mod streaming_pipeline_regression_tests {
                 storage_key: build_storage_key(&f.repo_id, &artifact_path),
                 user_id: f.user_id,
                 metadata: serde_json::json!({ "file_type": "unknown" }),
-                temp_path: bogus_temp,
+                sealed_path: bogus_temp,
+                committed_offset: 0,
+                final_path: None,
                 finalize_token,
             },
         )
@@ -4180,7 +4499,9 @@ mod streaming_pipeline_regression_tests {
                 storage_key: build_storage_key(&f.repo_id, &artifact_path),
                 user_id: f.user_id,
                 metadata: serde_json::json!({ "file_type": "unknown" }),
-                temp_path: std::env::temp_dir().join(format!("ak-incus-missing-{session_id}")),
+                sealed_path: std::env::temp_dir().join(format!("ak-incus-missing-{session_id}")),
+                committed_offset: 0,
+                final_path: None,
                 finalize_token: stale_token,
             },
         )
@@ -4700,6 +5021,795 @@ mod streaming_pipeline_regression_tests {
                 .expect("existence check");
         assert!(!survives, "reaper must reap once the finalize lease lapsed");
 
+        f.teardown().await;
+    }
+
+    // =======================================================================
+    // Finalize-seal regression suite
+    //
+    // The finalize lease fences the session ROW; these cover the fencing of
+    // the staged FILE that goes with it: the staged chunks are sealed to the
+    // lease at claim time, the completing request's body is staged in its own
+    // file, and the artifact is a deterministic bounded concatenation of the
+    // two. Together they pin idempotent reclaim, exclusion of post-seal
+    // writes, claim-aware cancel, and the DB-side chunk offset.
+    // =======================================================================
+
+    /// Seed a session parked in `finalizing` with a lapsed lease, staged the
+    /// way a finalize that died mid storage-push leaves it: the committed
+    /// chunks sealed at `committed`, plus whatever the dead attempt had
+    /// written to the final-body file. Returns `(session_id, temp_path)`.
+    async fn seed_crashed_finalize(
+        f: &tdh::Fixture,
+        artifact_path: &str,
+        committed: &[u8],
+        stale_final: Option<&[u8]>,
+    ) -> (Uuid, PathBuf) {
+        let session_id = Uuid::new_v4();
+        let temp_path = temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id);
+        ensure_parent_dirs(&temp_path).await.expect("staging dir");
+        tokio::fs::write(sealed_upload_path(&temp_path), committed)
+            .await
+            .expect("write sealed chunks");
+        if let Some(partial) = stale_final {
+            tokio::fs::write(final_upload_path(&temp_path), partial)
+                .await
+                .expect("write stale final body");
+        }
+        sqlx::query(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status, finalize_token, \
+              finalize_claimed_until) \
+             VALUES ($1, $2, $3, $4, 'alpine', '3.20', 'rootfs.tar.gz', $5, $6, 'finalizing', \
+                     $7, NOW() - INTERVAL '1 minute')",
+        )
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(artifact_path)
+        .bind(committed.len() as i64)
+        .bind(temp_path.to_string_lossy().as_ref())
+        .bind(Uuid::new_v4())
+        .execute(&f.pool)
+        .await
+        .expect("insert crashed finalizing session");
+        (session_id, temp_path)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn put_complete(
+        f: &tdh::Fixture,
+        session_id: Uuid,
+        body: Vec<u8>,
+    ) -> (StatusCode, Bytes) {
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(body))
+            .expect("build complete request");
+        tdh::send(app, req).await
+    }
+
+    async fn download(f: &tdh::Fixture, path: &str) -> axum::response::Response {
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/images/{}", f.repo_key, path))
+            .body(Body::empty())
+            .expect("build download request");
+        app.oneshot(req).await.expect("download oneshot")
+    }
+
+    /// (1) HIGH-3b. A finalize that died after staging its input and while
+    /// pushing to the storage backend is retried by the client. The retry
+    /// must re-derive the SAME artifact — committed chunks plus the resent
+    /// body, once — instead of accumulating the body a second time.
+    ///
+    /// The completing body is re-staged with create+truncate, so the stale
+    /// partial the dead attempt left behind is overwritten rather than kept,
+    /// and the sealed chunks are never appended to.
+    #[tokio::test]
+    async fn reclaim_finalize_does_not_double_append() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        let committed = vec![b'A'; 1000];
+        let final_body = vec![b'B'; 200 * 1024];
+        let mut expected = committed.clone();
+        expected.extend_from_slice(&final_body);
+        let expected_sha = sha256_hex(&expected);
+        let artifact_path = build_artifact_path("alpine", "3.20", "rootfs.tar.gz");
+
+        // The dead attempt had already staged the whole body and was pushing
+        // it to the storage backend when it died — the window that used to
+        // make the retry store the body twice.
+        let (session_id, temp_path) =
+            seed_crashed_finalize(&f, &artifact_path, &committed, Some(&final_body)).await;
+
+        let (status, body) = put_complete(&f, session_id, final_body.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "reclaiming a lapsed finalize must be accepted: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse complete JSON");
+        assert_eq!(
+            json["size"].as_i64(),
+            Some(expected.len() as i64),
+            "the retry must report the committed chunks plus ONE copy of the resent body"
+        );
+        assert_eq!(
+            json["sha256"].as_str(),
+            Some(expected_sha.as_str()),
+            "the retry must re-derive the same checksum, not one over a doubled body"
+        );
+
+        let progress = await_finalize(&f, session_id).await;
+        assert_eq!(
+            progress["status"].as_str(),
+            Some("completed"),
+            "reclaimed finalize must complete: {}",
+            progress
+        );
+
+        let (size_bytes, checksum): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(&artifact_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(
+            size_bytes,
+            expected.len() as i64,
+            "recorded size must be committed + one body, not committed + two"
+        );
+        assert_eq!(checksum, expected_sha, "recorded checksum must match");
+
+        // Stored object == recorded == served.
+        let resp = download(&f, "alpine/3.20/rootfs.tar.gz").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let served_hdr = resp
+            .headers()
+            .get("X-Checksum-Sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let served = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("download body");
+        assert_eq!(served.as_ref(), expected.as_slice(), "served bytes");
+        assert_eq!(sha256_hex(&served), expected_sha, "served digest");
+        assert_eq!(served_hdr, expected_sha, "advertised digest");
+
+        // Both staging halves are gone once the finalize is done.
+        assert!(
+            !sealed_upload_path(&temp_path).exists(),
+            "sealed file leaked"
+        );
+        assert!(!final_upload_path(&temp_path).exists(), "final file leaked");
+
+        // A completed session is terminal: it is never reclaimed, so a
+        // further retry cannot re-run any of this.
+        let (status, _) = put_complete(&f, session_id, final_body).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a completed session must never be reclaimed"
+        );
+
+        f.teardown().await;
+    }
+
+    /// (2) HIGH-3a, deterministic. The finalize's view of the staged data is
+    /// bounded to the committed offset, so bytes appended past it — by a
+    /// chunk whose fd was opened before the seal — are in neither the
+    /// checksum nor the stored object. An unbounded read-to-EOF would
+    /// include them.
+    #[tokio::test]
+    async fn finalize_stream_excludes_post_seal_tail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sealed = tmp.path().join("ak-incus-upload-x.seal");
+        let final_path = tmp.path().join("ak-incus-upload-x.final");
+
+        let committed = vec![b'A'; 300 * 1024];
+        let post_seal_tail = vec![b'X'; 64 * 1024];
+        let final_body = vec![b'B'; 5000];
+
+        let mut on_disk = committed.clone();
+        on_disk.extend_from_slice(&post_seal_tail);
+        tokio::fs::write(&sealed, &on_disk)
+            .await
+            .expect("write sealed");
+        tokio::fs::write(&final_path, &final_body)
+            .await
+            .expect("write final");
+
+        let mut expected = committed.clone();
+        expected.extend_from_slice(&final_body);
+
+        let mut stream = open_finalize_stream(&sealed, committed.len() as u64, Some(&final_path))
+            .await
+            .expect("open finalize stream");
+        let mut collected: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.expect("chunk ok"));
+        }
+        assert_eq!(
+            collected.len(),
+            expected.len(),
+            "finalize stream must yield committed + final, excluding the post-seal tail"
+        );
+        assert_eq!(collected, expected, "finalize stream bytes");
+
+        let stream = open_finalize_stream(&sealed, committed.len() as u64, Some(&final_path))
+            .await
+            .expect("reopen finalize stream");
+        assert_eq!(
+            compute_sha256_over_stream(stream)
+                .await
+                .expect("hash finalize stream"),
+            sha256_hex(&expected),
+            "checksum must be computed over the same bounded view that is stored"
+        );
+
+        // Same builder with no trailing body (the monolithic shape).
+        let stream = open_finalize_stream(&sealed, committed.len() as u64, None)
+            .await
+            .expect("open bodyless finalize stream");
+        assert_eq!(
+            compute_sha256_over_stream(stream)
+                .await
+                .expect("hash bodyless stream"),
+            sha256_hex(&committed),
+        );
+    }
+
+    /// (3) HIGH-3a, end to end. A chunk request whose append fd was opened
+    /// before the finalize claim keeps writing to the staged inode after the
+    /// seal. Its bytes must be excluded from the artifact — recorded size,
+    /// recorded checksum, the stored object and the served body must all
+    /// agree — and the chunk itself must be refused.
+    #[tokio::test]
+    async fn patch_after_finalize_claim_is_fenced() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+
+        let product = "debian";
+        let version = "12";
+        let filename = "rootfs.tar.gz";
+        let committed = vec![b'A'; 256 * 1024];
+        let expected_sha = sha256_hex(&committed);
+
+        // POST start stages the committed bytes.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/images/{}/{}/{}/uploads",
+                f.repo_key, product, version, filename
+            ))
+            .body(Body::from(committed.clone()))
+            .expect("build POST start");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "POST start must be 202");
+        let session_id: Uuid = serde_json::from_slice::<serde_json::Value>(&body)
+            .expect("parse start JSON")["session_id"]
+            .as_str()
+            .expect("session_id")
+            .parse()
+            .expect("uuid");
+        let temp_path = temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id);
+
+        // A chunk request that has passed its status check and holds an open
+        // append fd, paused before it writes.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let straggler = vec![b'X'; 128 * 1024];
+        let straggler_body = Body::from_stream(futures::stream::once(async move {
+            let _ = started_tx.send(());
+            let _ = go_rx.await;
+            Ok::<Bytes, std::io::Error>(Bytes::from(straggler))
+        }));
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(straggler_body)
+            .expect("build straggler PATCH");
+        let straggler_req = tokio::spawn(async move { tdh::send(app, req).await });
+        started_rx.await.expect("straggler must open its append fd");
+
+        // Finalize claims the session and seals the staged chunks.
+        let (status, body) = put_complete(&f, session_id, Vec::new()).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "complete must be accepted: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse complete JSON");
+        assert_eq!(json["size"].as_i64(), Some(committed.len() as i64));
+        assert_eq!(json["sha256"].as_str(), Some(expected_sha.as_str()));
+
+        // Release the straggler: it writes through its pre-seal fd, then
+        // finds the session is no longer receiving.
+        let _ = go_tx.send(());
+        let (straggler_status, _) = straggler_req.await.expect("straggler task");
+        assert_eq!(
+            straggler_status,
+            StatusCode::CONFLICT,
+            "a chunk racing the finalize claim must be refused"
+        );
+
+        let progress = await_finalize(&f, session_id).await;
+        assert_eq!(progress["status"].as_str(), Some("completed"));
+
+        let (size_bytes, checksum): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(build_artifact_path(product, version, filename))
+        .fetch_one(&f.pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(size_bytes, committed.len() as i64, "recorded size");
+        assert_eq!(checksum, expected_sha, "recorded checksum");
+
+        let resp = download(&f, "debian/12/rootfs.tar.gz").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let served_hdr = resp
+            .headers()
+            .get("X-Checksum-Sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let served = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("download body");
+        // recorded == on-disk == served, all three.
+        assert_eq!(
+            served.len(),
+            size_bytes as usize,
+            "served length vs recorded"
+        );
+        assert_eq!(sha256_hex(&served), checksum, "served digest vs recorded");
+        assert_eq!(served_hdr, checksum, "advertised digest vs recorded");
+        assert!(
+            !sealed_upload_path(&temp_path).exists(),
+            "sealed file leaked"
+        );
+        assert!(!final_upload_path(&temp_path).exists(), "final file leaked");
+
+        f.teardown().await;
+    }
+
+    /// (3, direct) A chunk that arrives after the staged file was sealed —
+    /// even before the row read observes the new status — cannot write: the
+    /// append open finds nothing at the session's staging path and the
+    /// request is refused rather than failing as a server error or landing
+    /// bytes the finalize is already hashing.
+    #[tokio::test]
+    async fn chunk_append_after_seal_is_refused() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        let sealed = sealed_upload_path(&temp_path);
+        tokio::fs::write(&temp_path, b"123456")
+            .await
+            .expect("stage file");
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 6 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+
+        // Seal, leaving the row readable as 'receiving' — the exact window a
+        // chunk request that pre-read the row is in.
+        seal_staging_file(&temp_path, &sealed)
+            .await
+            .expect("seal staged file");
+        assert!(!temp_path.exists(), "seal must move the staged file");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(vec![b'X'; 512]))
+            .expect("build PATCH");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a chunk on a sealed session must be refused with 409"
+        );
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read offset");
+        assert_eq!(persisted, 6, "a refused chunk must not move the offset");
+        assert_eq!(
+            tokio::fs::metadata(&sealed)
+                .await
+                .expect("sealed stat")
+                .len(),
+            6,
+            "a refused chunk must not reach the sealed data"
+        );
+
+        // Un-sealing restores the staged file so a released session resumes.
+        unseal_staging_file(&temp_path, &sealed, &final_upload_path(&temp_path)).await;
+        assert!(temp_path.exists(), "unseal must restore the staged file");
+        assert!(!sealed.exists(), "unseal must consume the sealed file");
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// (4a) MED-3c. Cancelling a session that already entered finalize must
+    /// be refused: that session is owned by a finalize which is streaming the
+    /// staged data out and will publish an artifact. The row and its staged
+    /// data must survive the refused cancel.
+    #[tokio::test]
+    async fn cancel_rejects_finalizing_session() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"staged-bytes")
+            .await
+            .expect("stage file");
+        let token = claim_incus_finalize_lease(&f.pool, session_id)
+            .await
+            .expect("claim query ok")
+            .expect("claimable");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "cancelling a finalizing session must be refused"
+        );
+
+        let (still_there, owner): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finalize_token FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row must survive a refused cancel");
+        assert_eq!(still_there, "finalizing");
+        assert_eq!(owner, Some(token), "the finalize must keep its lease");
+        assert!(
+            temp_path.exists(),
+            "a refused cancel must not touch data a live finalize owns"
+        );
+
+        // A terminal session is equally not cancellable.
+        sqlx::query("UPDATE incus_upload_sessions SET status = 'completed' WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("mark completed");
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "cancelling a finished session must be refused"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// (4b) Cancelling a session that is still receiving is the supported
+    /// case: the row goes away and every staged file with it.
+    #[tokio::test]
+    async fn cancel_receiving_happy_path() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        let sealed = sealed_upload_path(&temp_path);
+        let final_path = final_upload_path(&temp_path);
+        tokio::fs::write(&temp_path, b"staged")
+            .await
+            .expect("stage");
+        tokio::fs::write(&sealed, b"seal-leftover")
+            .await
+            .expect("stage sealed leftover");
+        tokio::fs::write(&final_path, b"final-leftover")
+            .await
+            .expect("stage final leftover");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "cancel must be 204");
+
+        let gone: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS(SELECT 1 FROM incus_upload_sessions WHERE id = $1)",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("existence check");
+        assert!(gone, "cancel must delete the session row");
+        assert!(!temp_path.exists(), "cancel must remove the staged file");
+        assert!(!sealed.exists(), "cancel must remove a sealed leftover");
+        assert!(!final_path.exists(), "cancel must remove a final leftover");
+
+        f.teardown().await;
+    }
+
+    /// (4c) Cancel is owner-scoped: another account that holds the delete
+    /// scope and learns the session id cannot retire someone else's upload.
+    #[tokio::test]
+    async fn cancel_enforces_owner() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"staged")
+            .await
+            .expect("stage");
+
+        // Re-point the session at a different owner, then drive the cancel as
+        // the fixture user.
+        let other_owner = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash) \
+             VALUES ($1, $2, $3, 'x')",
+        )
+        .bind(other_owner)
+        .bind(format!("owner-{}", other_owner))
+        .bind(format!("owner-{}@test.local", other_owner))
+        .execute(&f.pool)
+        .await
+        .expect("insert other owner");
+        sqlx::query("UPDATE incus_upload_sessions SET user_id = $2 WHERE id = $1")
+            .bind(session_id)
+            .bind(other_owner)
+            .execute(&f.pool)
+            .await
+            .expect("re-point owner");
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::empty())
+            .expect("build DELETE");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a non-owner must not cancel someone else's upload"
+        );
+
+        let survives: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incus_upload_sessions WHERE id = $1)")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("existence check");
+        assert!(survives, "a refused cancel must leave the session intact");
+        assert!(temp_path.exists(), "a refused cancel must not remove data");
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(other_owner)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// (5) The committed offset is advanced DB-side, so two chunk requests
+    /// that overlap both count. A read-modify-write from each request's own
+    /// pre-read would lose one of them, and the finalize bounds its read to
+    /// this counter — a lost update silently drops committed bytes from the
+    /// artifact.
+    #[tokio::test]
+    async fn concurrent_patch_offset_is_additive() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"base").await.expect("stage");
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 4 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+
+        // Both requests are held open until each has read the session row and
+        // opened its append fd, so their offset updates genuinely overlap.
+        let mut gates = Vec::new();
+        let mut tasks = Vec::new();
+        for len in [700usize, 300usize] {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+            let body = Body::from_stream(futures::stream::once(async move {
+                let _ = started_tx.send(());
+                let _ = go_rx.await;
+                Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'C'; len]))
+            }));
+            let app = f.router_with_auth(router());
+            let req = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+                .body(body)
+                .expect("build PATCH");
+            tasks.push(tokio::spawn(async move { tdh::send(app, req).await }));
+            started_rx.await.expect("chunk must reach its body read");
+            gates.push(go_tx);
+        }
+        for gate in gates {
+            let _ = gate.send(());
+        }
+        for task in tasks {
+            let (status, _) = task.await.expect("chunk task");
+            assert_eq!(status, StatusCode::ACCEPTED, "both chunks must be accepted");
+        }
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("read offset");
+        assert_eq!(
+            persisted, 1004,
+            "overlapping chunks must both count toward the committed offset"
+        );
+        assert_eq!(
+            tokio::fs::metadata(&temp_path)
+                .await
+                .expect("staged stat")
+                .len(),
+            1004,
+            "the committed offset must match the bytes actually on disk"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
+
+    /// A finalize that claims the lease and then fails while staging its
+    /// input must leave the session exactly as it found it: back in
+    /// `receiving`, with the staged chunks restored to the path a resumed
+    /// chunk request opens and no finalize sidecars left behind. Otherwise
+    /// the session would be wedged in `finalizing` until the lease lapses,
+    /// and a resumed chunk would find nothing to append to.
+    #[tokio::test]
+    async fn failed_finalize_unseals_and_releases_the_session() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let session_id = insert_receiving_session(&f).await;
+        let temp_path = std::env::temp_dir().join(format!("ak-incus-lease-{session_id}"));
+        tokio::fs::write(&temp_path, b"123456")
+            .await
+            .expect("stage file");
+        // Recorded offset beyond what is staged: the staged data is not on
+        // this replica, which must fail the finalize rather than publish a
+        // short artifact.
+        sqlx::query("UPDATE incus_upload_sessions SET bytes_received = 99 WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await
+            .expect("record offset");
+
+        let (status, _) = put_complete(&f, session_id, b"TAIL".to_vec()).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a finalize whose staged data is missing must fail"
+        );
+
+        let (session_status, token): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finalize_token FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(
+            session_status, "receiving",
+            "a failed finalize must release the lease so the client can retry"
+        );
+        assert!(token.is_none(), "the released lease must drop its token");
+        assert!(
+            temp_path.exists(),
+            "a failed finalize must restore the staged file for a resumed chunk"
+        );
+        assert_eq!(
+            tokio::fs::read(&temp_path).await.expect("read staged"),
+            b"123456",
+            "restored staged data must be intact"
+        );
+        assert!(
+            !sealed_upload_path(&temp_path).exists(),
+            "a failed finalize must not leave a sealed file"
+        );
+        assert!(
+            !final_upload_path(&temp_path).exists(),
+            "a failed finalize must not leave a final-body file"
+        );
+
+        // The session really is resumable.
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/uploads/{}", f.repo_key, session_id))
+            .body(Body::from(b"789".to_vec()))
+            .expect("build PATCH");
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a released session must accept chunks again"
+        );
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
         f.teardown().await;
     }
 }
