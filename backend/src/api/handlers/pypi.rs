@@ -233,6 +233,10 @@ pub(crate) fn version_from_pypi_filename(filename: &str) -> Option<String> {
     None
 }
 
+fn pypi_distribution_filename(filename: &str) -> &str {
+    filename.strip_suffix(".metadata").unwrap_or(filename)
+}
+
 /// Curation gate for PyPI proxy requests (#2912). Returns
 /// `Err(403 response)` when a block rule matches.
 ///
@@ -1535,7 +1539,7 @@ async fn download_or_metadata(
     // exact- and range-constrained rules apply on this path; an unrecognized
     // filename shape yields `None`, which matches on name only.
     let normalized = normalize_pep503(&project);
-    let requested_version = version_from_pypi_filename(&filename);
+    let requested_version = version_from_pypi_filename(pypi_distribution_filename(&filename));
     enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
     // PEP 658: serve metadata from the remote upstream when possible. If the
@@ -4119,6 +4123,17 @@ mod tests {
     use super::*;
     use crate::api::handlers::proxy_helpers::scan_blocked_response;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn metadata_filename_uses_distribution_version_for_curation() {
+        let wheel = "demo-1.2.3-py3-none-any.whl";
+        let metadata = format!("{wheel}.metadata");
+        assert_eq!(
+            version_from_pypi_filename(wheel),
+            version_from_pypi_filename(pypi_distribution_filename(&metadata))
+        );
+        assert_eq!(version_from_pypi_filename(wheel).as_deref(), Some("1.2.3"));
+    }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
