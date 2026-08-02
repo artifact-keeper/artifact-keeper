@@ -207,10 +207,32 @@ async fn remote_pypi_proxy_serves_pep691_json_with_upload_time() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
 async fn remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     probe.connect("8.8.8.8:80").unwrap();
     let bind_ip = probe.local_addr().unwrap().ip();
-    std::env::set_var(
+    let _ssrf_allowlist = EnvVarGuard::set(
         "AK_SSRF_ALLOW_PRIVATE_CIDRS",
         format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
     );
@@ -223,8 +245,8 @@ async fn remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("demo-1.0.dist-info/METADATA", options)
             .unwrap();
         zip.write_all(b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n")
@@ -233,7 +255,7 @@ async fn remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
         cursor.into_inner()
     };
     let index = format!(
-        "<html><body><a href=\"/packages/{wheel}\" data-dist-info-metadata=\"deadbeef\">{wheel}</a></body></html>"
+        "<html><body><a href=\"/packages/{wheel}\" data-dist-info-metadata=\"sha256=deadbeef\">{wheel}</a></body></html>"
     );
 
     Mock::given(method("GET"))

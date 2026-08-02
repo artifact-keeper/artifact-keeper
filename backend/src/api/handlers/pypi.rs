@@ -1611,7 +1611,7 @@ async fn serve_remote_metadata(
     );
 
     match proxy
-        .fetch_upstream_direct(&remote_repo, &target.fetch_path)
+        .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
         .await
     {
         Ok((content, content_type, _)) => {
@@ -1648,7 +1648,11 @@ async fn serve_remote_metadata(
                 )
                 .await
                 .map_err(|e| e.into_response())?;
-            let metadata = extract_metadata_from_wheel(&wheel).ok_or_else(|| {
+            let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+                extract_metadata_from_wheel(&wheel)
+            })
+            .map_err(|e| e.into_response())?
+            .ok_or_else(|| {
                 AppError::NotFound("Metadata not available".to_string()).into_response()
             })?;
             Ok(Response::builder()
