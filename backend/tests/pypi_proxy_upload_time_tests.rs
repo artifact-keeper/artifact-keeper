@@ -27,7 +27,7 @@ use axum::Extension;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use artifact_keeper_backend::api::handlers::pypi;
@@ -198,110 +198,4 @@ async fn remote_pypi_proxy_serves_pep691_json_with_upload_time() {
     // PEP 658/714 metadata signal is preserved so clients can request the
     // upstream .metadata resource through the proxy.
     assert_eq!(file["core-metadata"]["sha256"], "deadbeefcafe");
-}
-
-/// A remote index may advertise PEP 658 metadata even when the corresponding
-/// `.whl.metadata` resource is unavailable upstream. The proxy must preserve
-/// the advertised attributes without turning pip's metadata request into a
-/// hard 404: extract the metadata from the upstream wheel instead.
-#[tokio::test]
-#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
-async fn remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: String) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    probe.connect("8.8.8.8:80").unwrap();
-    let bind_ip = probe.local_addr().unwrap().ip();
-    let _ssrf_allowlist = EnvVarGuard::set(
-        "AK_SSRF_ALLOW_PRIVATE_CIDRS",
-        format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
-    );
-    let listener = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
-    let upstream = MockServer::builder().listener(listener).start().await;
-    let project = "demo";
-    let wheel = "demo-1.0-py3-none-any.whl";
-    let wheel_bytes = {
-        use std::io::Write;
-
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        zip.start_file("demo-1.0.dist-info/METADATA", options)
-            .unwrap();
-        zip.write_all(b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n")
-            .unwrap();
-        zip.finish().unwrap();
-        cursor.into_inner()
-    };
-    let index = format!(
-        "<html><body><a href=\"/packages/{wheel}\" data-dist-info-metadata=\"sha256=deadbeef\">{wheel}</a></body></html>"
-    );
-
-    Mock::given(method("GET"))
-        .and(path(format!("/simple/{project}/")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(index))
-        .mount(&upstream)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/packages/{wheel}.metadata")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&upstream)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/packages/{wheel}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel_bytes))
-        .mount(&upstream)
-        .await;
-
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
-    let storage_path = format!("/tmp/pypi-proxy-metadata-{}", Uuid::new_v4());
-    std::fs::create_dir_all(&storage_path).unwrap();
-    let (repo_id, repo_key) = create_remote_pypi_repo(&pool, &upstream.uri()).await;
-    let state = build_state(pool.clone(), &storage_path);
-    let app = pypi::router()
-        .with_state(state)
-        .layer(Extension::<Option<AuthExtension>>(None));
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/{}/simple/{project}/{wheel}.metadata", repo_key))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let body_text = String::from_utf8_lossy(&body);
-
-    cleanup(&pool, repo_id).await;
-    let _ = std::fs::remove_dir_all(&storage_path);
-
-    assert_eq!(status, StatusCode::OK, "response body: {body_text}");
-    assert_eq!(
-        body.as_ref(),
-        b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n"
-    );
 }

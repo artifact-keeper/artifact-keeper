@@ -8866,6 +8866,229 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // -----------------------------------------------------------------------
+    // PEP 658 remote `.metadata` serving (`serve_remote_metadata`). These live
+    // in-crate (not `backend/tests/`) so the coverage `--lib` run exercises
+    // the async handler body: upstream 200 → serve verbatim; upstream 404 →
+    // extract METADATA from the wheel instead of surfacing a hard failure.
+    // -----------------------------------------------------------------------
+
+    /// Serializes the `.metadata` tests' `AK_SSRF_ALLOW_PRIVATE_CIDRS`
+    /// mutation. Under nextest each test is its own process, but under plain
+    /// `cargo test` parallel threads share the environment, so the guard's
+    /// set/restore must not interleave.
+    static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SsrfEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl SsrfEnvGuard {
+        const KEY: &'static str = "AK_SSRF_ALLOW_PRIVATE_CIDRS";
+
+        fn set(value: String) -> Self {
+            let lock = SSRF_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(Self::KEY).ok();
+            std::env::set_var(Self::KEY, value);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SsrfEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(Self::KEY, value),
+                None => std::env::remove_var(Self::KEY),
+            }
+        }
+    }
+
+    /// Start a wiremock upstream on a **non-loopback** local address and
+    /// allowlist that address for SSRF. Required because the index-anchor URL
+    /// resolved by `resolve_pypi_remote_fetch_target` is run through
+    /// `validate_outbound_url`, which hard-blocks loopback (so a plain
+    /// `MockServer::start()` upstream would be rejected before the fetch).
+    async fn non_loopback_upstream() -> (wiremock::MockServer, SsrfEnvGuard) {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind probe socket");
+        probe.connect("8.8.8.8:80").expect("route probe");
+        let bind_ip = probe.local_addr().expect("probe local addr").ip();
+        let guard = SsrfEnvGuard::set(format!(
+            "{bind_ip}/{}",
+            if bind_ip.is_ipv4() { 32 } else { 128 }
+        ));
+        let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind mock listener");
+        let upstream = wiremock::MockServer::builder()
+            .listener(listener)
+            .start()
+            .await;
+        (upstream, guard)
+    }
+
+    /// Simple-index HTML advertising PEP 658 metadata for `wheel`.
+    fn pep658_index_html(wheel: &str) -> String {
+        format!(
+            "<html><body><a href=\"/packages/{wheel}\" \
+             data-dist-info-metadata=\"sha256=deadbeef\">{wheel}</a></body></html>"
+        )
+    }
+
+    /// Minimal wheel (stored zip) whose only entry is `*.dist-info/METADATA`.
+    fn wheel_with_metadata(metadata: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("demo-1.0.dist-info/METADATA", options)
+            .expect("start METADATA entry");
+        zip.write_all(metadata).expect("write METADATA");
+        zip.finish().expect("finish wheel zip");
+        cursor.into_inner()
+    }
+
+    /// A remote index may advertise PEP 658 metadata even when the
+    /// corresponding `.whl.metadata` resource is unavailable upstream. The
+    /// proxy must not turn pip's metadata request into a hard 404: it falls
+    /// back to fetching the wheel and extracting METADATA from it
+    /// (the `Err(AppError::NotFound)` arm of `serve_remote_metadata`).
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_404_falls_back_to_wheel_metadata() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel_with_metadata(metadata)))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 404 on .whl.metadata must fall back to wheel extraction; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "served metadata must be the wheel's METADATA bytes"
+        );
+    }
+
+    /// The common real-world path: the upstream serves `.whl.metadata` with
+    /// 200, and the proxy returns it verbatim with the upstream content-type
+    /// (the `Ok` arm of `serve_remote_metadata`). No wheel mock is mounted, so
+    /// the test also proves the fallback does not fire spuriously.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_200_served_directly() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(metadata),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let resp = app
+            .oneshot(tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )))
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream 200 on .whl.metadata must be served; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            &body[..],
+            metadata,
+            "upstream metadata must be served verbatim"
+        );
+        assert_eq!(
+            content_type, "text/plain",
+            "upstream content-type must be forwarded"
+        );
+    }
+
     #[test]
     fn test_serve_file_presign_redirect_precedes_streaming_1555() {
         // #1555: on a fresh proxy-cache hit, the PyPI remote download path must
