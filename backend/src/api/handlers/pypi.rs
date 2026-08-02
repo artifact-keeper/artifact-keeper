@@ -233,8 +233,20 @@ pub(crate) fn version_from_pypi_filename(filename: &str) -> Option<String> {
     None
 }
 
+/// The distribution a request ultimately refers to, with any PEP 658
+/// `.metadata` suffix removed.
+///
+/// ALL trailing `.metadata` suffixes are stripped, not just one. The serve path
+/// resolves a metadata request back to a distribution the same way, and the
+/// curation gate must evaluate the distribution that will actually be served:
+/// when the two disagree, a request naming the same wheel through a different
+/// suffix shape (`…-1.0-py3-none-any.whl.metadata.metadata`) is version-parsed
+/// as `None` — which skips version-constrained rules — while still resolving to
+/// the blocked wheel, serving a blocked version's metadata. Both callers in
+/// `download_or_metadata` share one call to this function so they cannot drift
+/// apart again.
 fn pypi_distribution_filename(filename: &str) -> &str {
-    filename.strip_suffix(".metadata").unwrap_or(filename)
+    filename.trim_end_matches(".metadata")
 }
 
 /// Curation gate for PyPI proxy requests (#2912). Returns
@@ -1538,8 +1550,14 @@ async fn download_or_metadata(
     // either branch below. The version is parsed from the distribution filename so
     // exact- and range-constrained rules apply on this path; an unrecognized
     // filename shape yields `None`, which matches on name only.
+    //
+    // `distribution` is resolved ONCE and reused by the metadata branch below:
+    // the gate must evaluate exactly the distribution the serve path resolves,
+    // or a suffix shape that parses to a different (or no) version slips past a
+    // version-constrained rule and is then served anyway.
     let normalized = normalize_pep503(&project);
-    let requested_version = version_from_pypi_filename(pypi_distribution_filename(&filename));
+    let distribution = pypi_distribution_filename(&filename);
+    let requested_version = version_from_pypi_filename(distribution);
     enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
     // PEP 658: serve metadata from the remote upstream when possible. If the
@@ -1547,7 +1565,18 @@ async fn download_or_metadata(
     // from the wheel so clients do not see the hard failure that motivated
     // stripping these attributes in the first place.
     if filename.ends_with(".metadata") {
-        let real_filename = filename.trim_end_matches(".metadata");
+        // PEP 658 names exactly one metadata resource per distribution,
+        // `<distribution>.metadata`; a stacked suffix names none. Refusing the
+        // shape outright keeps a request that is not a metadata request from
+        // resolving back to a distribution at all — defence in depth behind the
+        // shared `distribution` above, which is what actually gates curation.
+        if filename
+            .strip_suffix(".metadata")
+            .is_some_and(|rest| rest.ends_with(".metadata"))
+        {
+            return Err(AppError::NotFound(format!("File not found: {}", filename)).into_response());
+        }
+        let real_filename = distribution;
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
                 return serve_remote_metadata(
@@ -1618,14 +1647,17 @@ async fn serve_remote_metadata(
         .fetch_upstream_direct_with_link(&remote_repo, &target.fetch_path)
         .await
     {
-        Ok((content, content_type, _)) => {
-            let mut response = Response::builder().status(StatusCode::OK);
-            if let Some(content_type) = content_type {
-                response = response.header(CONTENT_TYPE, content_type);
-            } else {
-                response = response.header(CONTENT_TYPE, "text/plain; charset=utf-8");
-            }
-            Ok(response.body(Body::from(content)).unwrap())
+        Ok((content, _content_type, _)) => {
+            // The content-type is fixed, never relayed from upstream: a PEP 658
+            // metadata resource is always the plain-text METADATA file, so a
+            // hostile or misconfigured upstream labelling it `text/html` must
+            // not get that type echoed back under this origin. Matches the
+            // wheel-extraction arm below.
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(content))
+                .unwrap())
         }
         Err(AppError::NotFound(_)) => {
             let wheel_target = resolve_pypi_remote_fetch_target(
@@ -4133,6 +4165,34 @@ mod tests {
             version_from_pypi_filename(pypi_distribution_filename(&metadata))
         );
         assert_eq!(version_from_pypi_filename(wheel).as_deref(), Some("1.2.3"));
+    }
+
+    /// A stacked `.metadata` suffix names the same distribution, so the
+    /// curation gate must parse the same version from it. Stripping only one
+    /// suffix yields `…whl.metadata`, whose version parses as `None` — and a
+    /// `None` version skips version-constrained rules, which is exactly the
+    /// bypass this resolver has to foreclose.
+    #[test]
+    fn stacked_metadata_suffix_resolves_to_the_same_distribution() {
+        let wheel = "demo-1.0-py3-none-any.whl";
+        for suffix in [
+            "",
+            ".metadata",
+            ".metadata.metadata",
+            ".metadata.metadata.metadata",
+        ] {
+            let requested = format!("{wheel}{suffix}");
+            assert_eq!(
+                pypi_distribution_filename(&requested),
+                wheel,
+                "'{requested}' must resolve to the distribution the serve path fetches"
+            );
+            assert_eq!(
+                version_from_pypi_filename(pypi_distribution_filename(&requested)).as_deref(),
+                Some("1.0"),
+                "'{requested}' must version-parse as 1.0 so `==1.0` rules apply"
+            );
+        }
     }
 
     fn headers_with_replication(value: &str) -> HeaderMap {
@@ -8938,15 +8998,16 @@ mod tests {
         )
     }
 
-    /// Minimal wheel (stored zip) whose only entry is `*.dist-info/METADATA`.
-    fn wheel_with_metadata(metadata: &[u8]) -> Vec<u8> {
+    /// Minimal wheel (stored zip) whose only entry is
+    /// `{dist_info}.dist-info/METADATA`.
+    fn wheel_with_metadata(dist_info: &str, metadata: &[u8]) -> Vec<u8> {
         use std::io::Write;
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut cursor);
         let options: zip::write::FileOptions<'_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        zip.start_file("demo-1.0.dist-info/METADATA", options)
+        zip.start_file(format!("{dist_info}.dist-info/METADATA"), options)
             .expect("start METADATA entry");
         zip.write_all(metadata).expect("write METADATA");
         zip.finish().expect("finish wheel zip");
@@ -8985,7 +9046,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/packages/{wheel}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel_with_metadata(metadata)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(wheel_with_metadata("demo-1.0", metadata)),
+            )
             .mount(&upstream)
             .await;
 
@@ -9016,9 +9080,14 @@ mod tests {
     }
 
     /// The common real-world path: the upstream serves `.whl.metadata` with
-    /// 200, and the proxy returns it verbatim with the upstream content-type
-    /// (the `Ok` arm of `serve_remote_metadata`). No wheel mock is mounted, so
-    /// the test also proves the fallback does not fire spuriously.
+    /// 200 and the proxy returns that body (the `Ok` arm of
+    /// `serve_remote_metadata`). No wheel mock is mounted, so the test also
+    /// proves the fallback does not fire spuriously.
+    ///
+    /// The upstream deliberately labels the metadata `text/html`: a PEP 658
+    /// metadata resource is always the plain-text METADATA file, and relaying a
+    /// hostile upstream's content-type would let it choose how this origin
+    /// renders the response. The served type must be pinned to `text/plain`.
     #[tokio::test]
     async fn test_remote_pypi_metadata_200_served_directly() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -9044,7 +9113,7 @@ mod tests {
             .and(path(format!("/packages/{wheel}.metadata")))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
+                    .insert_header("content-type", "text/html")
                     .set_body_bytes(metadata),
             )
             .mount(&upstream)
@@ -9084,8 +9153,117 @@ mod tests {
             "upstream metadata must be served verbatim"
         );
         assert_eq!(
-            content_type, "text/plain",
-            "upstream content-type must be forwarded"
+            content_type, "text/plain; charset=utf-8",
+            "the served content-type must be pinned to text/plain, not relayed \
+             from the upstream (which answered text/html here)"
+        );
+    }
+
+    /// Curation must gate every spelling of a metadata request, not just the
+    /// canonical one. A version-constrained block rule is evaluated against the
+    /// version parsed from the requested distribution, so a request that names
+    /// the blocked wheel through a stacked `.metadata` suffix must resolve to
+    /// the same distribution and be blocked identically — otherwise the version
+    /// parses as `None`, the version-constrained rule is skipped, and the
+    /// blocked version's metadata is served anyway.
+    #[tokio::test]
+    async fn test_curation_blocks_every_metadata_suffix_shape() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let blocked_wheel = "demo-1.0-py3-none-any.whl";
+        let allowed_wheel = "demo-2.0-py3-none-any.whl";
+        let blocked_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let allowed_metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 2.0\n";
+
+        // The upstream would happily serve both versions: only curation may
+        // withhold 1.0, so a 403 here cannot come from an unreachable mock.
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{}{}",
+                pep658_index_html(blocked_wheel),
+                pep658_index_html(allowed_wheel)
+            )))
+            .mount(&upstream)
+            .await;
+        for (wheel, metadata) in [
+            (blocked_wheel, blocked_metadata),
+            (allowed_wheel, allowed_metadata),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}.metadata")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&upstream)
+                .await;
+            let dist_info = wheel.split('-').take(2).collect::<Vec<_>>().join("-");
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{wheel}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(wheel_with_metadata(&dist_info, metadata)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+
+        // `=1.0`, not `==1.0`: `version_matches` strips a single leading `=`,
+        // so the PEP 440 spelling would leave the target as `=1.0` and match
+        // nothing — which would make this test vacuously green.
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "demo*", "=1.0").await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let request = |suffix: &str| {
+            let state = state.clone();
+            let uri = format!("/{}/simple/{project}/{suffix}", fx.repo_key);
+            async move { tdh::send(tdh::router_anon(super::router(), state), tdh::get(uri)).await }
+        };
+
+        let (canonical_status, canonical_body) =
+            request(&format!("{blocked_wheel}.metadata")).await;
+        let (stacked_status, stacked_body) =
+            request(&format!("{blocked_wheel}.metadata.metadata")).await;
+        let (allowed_status, allowed_body) = request(&format!("{allowed_wheel}.metadata")).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            canonical_status,
+            StatusCode::FORBIDDEN,
+            "the canonical metadata request for a blocked version must 403; body: {}",
+            String::from_utf8_lossy(&canonical_body)
+        );
+        assert_eq!(
+            stacked_status,
+            StatusCode::FORBIDDEN,
+            "a stacked .metadata suffix names the same blocked distribution and \
+             must 403 identically; body: {}",
+            String::from_utf8_lossy(&stacked_body)
+        );
+        // The strongest discriminator: pre-fix this response was a 200 whose
+        // body was the blocked version's real METADATA.
+        assert_ne!(
+            &stacked_body[..],
+            blocked_metadata,
+            "a blocked version's metadata must never be served through any suffix shape"
+        );
+        assert_eq!(
+            allowed_status,
+            StatusCode::OK,
+            "a version the rule does not constrain must still be served; body: {}",
+            String::from_utf8_lossy(&allowed_body)
+        );
+        assert_eq!(
+            &allowed_body[..],
+            allowed_metadata,
+            "the unblocked version must serve its own METADATA"
         );
     }
 
