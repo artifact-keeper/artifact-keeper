@@ -1538,9 +1538,26 @@ async fn download_or_metadata(
     let requested_version = version_from_pypi_filename(&filename);
     enforce_pypi_curation(&state, &repo, &normalized, requested_version.as_deref()).await?;
 
-    // PEP 658: if filename ends with .metadata, serve extracted METADATA
+    // PEP 658: serve metadata from the remote upstream when possible. If the
+    // upstream advertises metadata but returns 404, fall back to extracting it
+    // from the wheel so clients do not see the hard failure that motivated
+    // stripping these attributes in the first place.
     if filename.ends_with(".metadata") {
         let real_filename = filename.trim_end_matches(".metadata");
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+                return serve_remote_metadata(
+                    &state,
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    &project,
+                    real_filename,
+                )
+                .await;
+            }
+        }
         return serve_metadata(
             &state,
             &state.db,
@@ -1562,6 +1579,86 @@ async fn download_or_metadata(
         &ctx,
     )
     .await
+}
+
+async fn serve_remote_metadata(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let metadata_filename = format!("{}.metadata", filename);
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        &metadata_filename,
+        &index_path,
+    )
+    .await?;
+
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        &target.fetch_base,
+        RepositoryFormat::Pypi,
+    );
+
+    match proxy
+        .fetch_upstream_direct(&remote_repo, &target.fetch_path)
+        .await
+    {
+        Ok((content, content_type, _)) => {
+            let mut response = Response::builder().status(StatusCode::OK);
+            if let Some(content_type) = content_type {
+                response = response.header(CONTENT_TYPE, content_type);
+            } else {
+                response = response.header(CONTENT_TYPE, "text/plain; charset=utf-8");
+            }
+            Ok(response.body(Body::from(content)).unwrap())
+        }
+        Err(AppError::NotFound(_)) => {
+            let wheel_target = resolve_pypi_remote_fetch_target(
+                proxy,
+                repo_id,
+                repo_key,
+                upstream_url,
+                project,
+                filename,
+                &index_path,
+            )
+            .await?;
+            let wheel_repo = proxy_helpers::build_remote_repo_with_format(
+                repo_id,
+                repo_key,
+                &wheel_target.fetch_base,
+                RepositoryFormat::Pypi,
+            );
+            let (wheel, _) = proxy
+                .fetch_artifact_with_cache_path(
+                    &wheel_repo,
+                    &wheel_target.fetch_path,
+                    &wheel_target.cache_path,
+                )
+                .await
+                .map_err(|e| e.into_response())?;
+            let metadata = extract_metadata_from_wheel(&wheel).ok_or_else(|| {
+                AppError::NotFound("Metadata not available".to_string()).into_response()
+            })?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(metadata))
+                .unwrap())
+        }
+        Err(error) => Err(error.into_response()),
+    }
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -2510,7 +2607,8 @@ async fn resolve_pypi_remote_fetch_target(
     // index request, and the relative paths in the HTML are relative to
     // the final serving URL, not the originally requested URL.
     let full_index_url = effective_url;
-    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
+    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
+        .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
 
     let fallback = || {
         let (base, path) = pypi_upstream_url_and_path(
@@ -3327,9 +3425,6 @@ static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 
-static METADATA_ATTR_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap());
-
 /// Split a URL into its base (scheme + host) and path components.
 ///
 /// For example, `https://files.pythonhosted.org/packages/ab/cd/file.whl` splits
@@ -3401,6 +3496,25 @@ fn find_upstream_url_for_file(
     None
 }
 
+/// Resolve a PEP 658 metadata filename from the corresponding wheel URL.
+/// PyPI advertises the metadata hash on the wheel anchor but usually does not
+/// include a separate `.whl.metadata` anchor in the Simple API page.
+fn find_upstream_metadata_url(
+    index_html: &str,
+    filename: &str,
+    index_url: Option<&str>,
+) -> Option<String> {
+    let wheel_filename = filename.strip_suffix(".metadata")?;
+    if !wheel_filename.ends_with(".whl") {
+        return None;
+    }
+
+    let wheel_url = find_upstream_url_for_file(index_html, wheel_filename, index_url)?;
+    let mut url = url::Url::parse(&wheel_url).ok()?;
+    url.set_path(&format!("{}.metadata", url.path()));
+    Some(url.into())
+}
+
 /// Rewrite download URLs in upstream PyPI simple index HTML to route through
 /// Artifact Keeper's proxy endpoint.
 ///
@@ -3416,11 +3530,9 @@ fn find_upstream_url_for_file(
 /// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
 ///
 /// PEP 658 metadata attributes (`data-dist-info-metadata` and
-/// `data-core-metadata`) are stripped from rewritten links because the proxy
-/// cannot serve `.metadata` files for packages it has not stored locally.
-/// Keeping these attributes would cause pip to request a `.metadata` URL that
-/// returns 404, which pip treats as a hard error since the index promised the
-/// metadata was available.
+/// `data-core-metadata`) are preserved on rewritten links. The download path
+/// resolves `.metadata` filenames through the same upstream Simple API page,
+/// so removing these attributes would prevent installers from using PEP 658.
 /// Classification of a proxied PyPI simple-index body sniffed from its
 /// content, used when the upstream `Content-Type` is neither PEP 691 JSON nor
 /// PEP 503 HTML. See #2801: corporate outbound proxies / quirky mirrors
@@ -3513,16 +3625,7 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
                 repo_key, normalized, filename, fragment
             );
 
-            // Strip PEP 658 metadata attributes. The proxy does not cache or
-            // serve .metadata files, so advertising them causes pip to fail
-            // with a 404 when it tries to fetch the promised metadata.
-            let before_cleaned = METADATA_ATTR_RE.replace_all(before_href, "");
-            let after_cleaned = METADATA_ATTR_RE.replace_all(after_href, "");
-
-            format!(
-                "<a {}href=\"{}\"{}>",
-                before_cleaned, rewritten, after_cleaned
-            )
+            format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
         })
         .into_owned()
 }
@@ -3532,9 +3635,10 @@ const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
 /// Rewrite the `files[].url` of a parsed PEP 691 JSON simple index to route
 /// downloads through Artifact Keeper's proxy, mirroring `rewrite_upstream_urls`
-/// for the HTML form, and strip the PEP 658/714 metadata signals the proxy
-/// cannot serve (`core-metadata`, `data-dist-info-metadata`). PEP 700
-/// `upload-time` and every other field are preserved untouched.
+/// for the HTML form. PEP 658/714 metadata signals (`core-metadata`,
+/// `data-dist-info-metadata`) are preserved so installers can request the
+/// corresponding `.metadata` file through the proxy. PEP 700 `upload-time`
+/// and every other field are preserved untouched.
 fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normalized: &str) {
     let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
         return;
@@ -3557,11 +3661,6 @@ fn rewrite_simple_json_files(doc: &mut serde_json::Value, repo_key: &str, normal
                 repo_key, normalized, filename
             )),
         );
-        // The proxy cannot serve `.metadata` for distributions it has not
-        // cached, so drop the PEP 658/714 metadata signals — the JSON analogue
-        // of the `data-*-metadata` stripping in `rewrite_upstream_urls`.
-        obj.remove("core-metadata");
-        obj.remove("data-dist-info-metadata");
     }
 }
 
@@ -4616,10 +4715,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_strips_data_dist_info_metadata() {
+    fn test_rewrite_preserves_data_dist_info_metadata() {
         // Real PyPI HTML includes data-dist-info-metadata on .whl links.
-        // The proxy cannot serve .metadata files, so these attributes must
-        // be stripped to prevent pip from requesting them and getting 404.
+        // The metadata URL is proxied through the same upstream Simple API,
+        // so its hash must remain attached to the rewritten wheel link.
         let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=8abb" data-requires-python="&gt;=2.7" data-dist-info-metadata="sha256=5507" data-core-metadata="sha256=5507">six-1.16.0-py2.py3-none-any.whl</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
         assert!(result.contains(
@@ -4627,13 +4726,12 @@ mod tests {
         ));
         // data-requires-python should be preserved
         assert!(result.contains(r#"data-requires-python="&gt;=2.7""#));
-        // PEP 658 metadata attributes must be stripped
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5507""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5507""#));
     }
 
     #[test]
-    fn test_rewrite_strips_metadata_attrs_from_real_pypi_html() {
+    fn test_rewrite_preserves_metadata_attrs_from_real_pypi_html() {
         // Simulates the actual HTML returned by pypi.org for the `six` package
         let html = r#"<!DOCTYPE html>
 <html>
@@ -4659,9 +4757,9 @@ mod tests {
         // data-requires-python should be preserved on both links
         assert!(result.contains("data-requires-python"));
 
-        // PEP 658 metadata attributes must be stripped from the .whl link
-        assert!(!result.contains("data-dist-info-metadata"));
-        assert!(!result.contains("data-core-metadata"));
+        // PEP 658 metadata hashes must be preserved on the .whl link
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=5620""#));
+        assert!(result.contains(r#"data-core-metadata="sha256=5620""#));
 
         // Structure should be preserved
         assert!(result.contains("<h1>Links for six</h1>"));
@@ -4672,7 +4770,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_upload_time_strips_metadata() {
+    fn test_rewrite_upstream_simple_json_rewrites_urls_preserves_metadata() {
         // Shape mirrors a real pypi.org PEP 691 JSON file object.
         let upstream = r#"{
             "meta": {"api-version": "1.1"},
@@ -4709,9 +4807,8 @@ mod tests {
         assert_eq!(file["hashes"]["sha256"], "deadbeef");
         assert_eq!(file["requires-python"], ">=3.7");
 
-        // PEP 658/714 metadata signals stripped — the proxy can't serve `.metadata`.
-        assert!(file.get("core-metadata").is_none());
-        assert!(file.get("data-dist-info-metadata").is_none());
+        assert_eq!(file["core-metadata"]["sha256"], "abc");
+        assert_eq!(file["data-dist-info-metadata"]["sha256"], "abc");
     }
 
     #[test]
@@ -5263,22 +5360,22 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_strips_metadata_attr_before_href() {
+    fn test_rewrite_preserves_metadata_attr_before_href() {
         // Edge case: metadata attribute appears before href
         let html = r#"<a data-dist-info-metadata="sha256=abc" href="https://example.com/pkg-1.0.whl#sha256=def">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=def""#));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=abc""#));
     }
 
     #[test]
     fn test_rewrite_preserves_non_metadata_attrs() {
-        // Only PEP 658 attrs should be stripped; other data-* attrs remain
+        // PEP 658 and other data-* attrs should remain intact
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=abc" data-requires-python="&gt;=3.8" data-dist-info-metadata="sha256=def" data-gpg-sig="true">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert!(result.contains("data-requires-python"));
         assert!(result.contains("data-gpg-sig"));
-        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(result.contains(r#"data-dist-info-metadata="sha256=def""#));
     }
 
     #[test]
@@ -5335,6 +5432,20 @@ mod tests {
             result,
             Some(
                 "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_metadata_url_derives_from_wheel_url() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=abc" data-dist-info-metadata="sha256=metadata">six-1.16.0-py2.py3-none-any.whl</a>"#;
+        let result =
+            find_upstream_metadata_url(html, "six-1.16.0-py2.py3-none-any.whl.metadata", None);
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl.metadata"
                     .to_string()
             )
         );
