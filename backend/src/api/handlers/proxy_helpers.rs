@@ -4787,7 +4787,8 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// everything else as `Generic` (not in the enforceable matrix).
+/// Go gates as Go, and everything else as `Generic` (not in the enforceable
+/// matrix).
 pub(crate) fn age_gate_format_from_str(
     format: &str,
 ) -> crate::models::repository::RepositoryFormat {
@@ -4795,6 +4796,7 @@ pub(crate) fn age_gate_format_from_str(
     match format.to_lowercase().as_str() {
         "npm" => RepositoryFormat::Npm,
         "pypi" => RepositoryFormat::Pypi,
+        "go" => RepositoryFormat::Go,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -11460,6 +11462,18 @@ mod tests {
         assert!(params.age_gate_enabled);
         assert_eq!(params.age_gate_min_age_days, 14);
         assert_eq!(params.key, "npm-remote");
+    }
+
+    #[test]
+    fn age_gate_format_mapping_includes_go_capability() {
+        use crate::models::repository::RepositoryFormat;
+
+        assert_eq!(age_gate_format_from_str("go"), RepositoryFormat::Go);
+        assert_eq!(age_gate_format_from_str("GO"), RepositoryFormat::Go);
+        assert_eq!(
+            age_gate_format_from_str("unsupported"),
+            RepositoryFormat::Generic
+        );
     }
 
     #[test]

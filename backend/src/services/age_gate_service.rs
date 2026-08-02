@@ -1972,16 +1972,13 @@ pub(crate) fn apply_pypi_simple_json_blocks(
     }
 }
 
-/// Map a repository format to the bounded Prometheus label used on age-gate
-/// metrics. [`AgeGateService::is_applicable`] restricts the gate to npm/PyPI, so
-/// other formats are never expected here; they collapse to `"other"` rather than
-/// widening the label set.
+/// Map a repository format to the bounded Prometheus label owned by the
+/// age-gate capability registry. Unsupported formats collapse to `"other"`
+/// rather than widening the label set.
 fn format_label(format: &RepositoryFormat) -> &'static str {
-    match format {
-        RepositoryFormat::Npm => "npm",
-        RepositoryFormat::Pypi => "pypi",
-        _ => "other",
-    }
+    crate::formats::age_gate_spec(format)
+        .map(|spec| spec.label)
+        .unwrap_or("other")
 }
 
 /// Drop any `dist-tags` entry whose target version is no longer present in the
@@ -2647,6 +2644,9 @@ mod tests {
     fn format_label_maps_to_bounded_set() {
         assert_eq!(format_label(&RepositoryFormat::Npm), "npm");
         assert_eq!(format_label(&RepositoryFormat::Pypi), "pypi");
+        assert_eq!(format_label(&RepositoryFormat::Go), "go");
+        assert_eq!(format_label(&RepositoryFormat::Yarn), "npm");
+        assert_eq!(format_label(&RepositoryFormat::Poetry), "pypi");
         // Anything outside the gate's supported formats collapses to "other"
         // so the metric label set stays bounded.
         assert_eq!(format_label(&RepositoryFormat::Generic), "other");

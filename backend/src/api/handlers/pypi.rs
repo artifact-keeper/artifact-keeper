@@ -1580,10 +1580,11 @@ fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> Stri
 /// index (#1944). The JSON and HTML representations of one index must
 /// withhold the same young versions, or a JSON-negotiating client (modern
 /// pip) sees everything the HTML filter hides. Mirrors the HTML hook in
-/// `simple_project`: a filter failure serves the unfiltered listing rather
-/// than failing the request — the download path re-checks every version
-/// independently and fails closed, so enforcement never rests on this
-/// listing-side filter.
+/// `simple_project`: an evaluation/filter failure serves the unfiltered
+/// listing rather than failing the request, while an authoritative policy
+/// resolution failure returns a structurally valid empty listing. The
+/// download path re-checks every version independently and fails closed, so
+/// enforcement never rests on this listing-side filter.
 async fn filter_pypi_simple_json_response(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1596,8 +1597,8 @@ async fn filter_pypi_simple_json_response(
     };
     // Quick struct-derived check, then DB-resolve the authoritative policy
     // (mode + upstream identity) — a virtual member's RepoInfo carries a
-    // defaulted mode (#2264). A resolve failure serves the unfiltered
-    // listing; the download path re-checks fail-closed.
+    // defaulted mode (#2264). A resolve failure suppresses the listing with a
+    // valid PEP 691 empty response; the download path re-checks fail-closed.
     if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return json;
     }
@@ -1607,7 +1608,7 @@ async fn filter_pypi_simple_json_response(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, repo_key = %repo.key, "Failed to resolve age-gate params for PyPI simple JSON response; suppressing listing");
-            return "{\"files\":[]}".to_string();
+            return empty_pep691_listing(project);
         }
     };
     let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -3859,11 +3860,13 @@ fn case_a_filter_remote_body(
     Bytes::from(filtered)
 }
 
-/// An empty PEP 691 simple-index listing for `normalized` — the fail-closed body
-/// for a locally-owned name whose suppressed Remote member returned a body that
-/// could not be ownership-filtered (#2967 R4). Mirrors the PEP 691 shape the
-/// merge path expects (`meta`/`name`/`versions`/`files`) so the local splice
-/// still runs, and guarantees no raw upstream byte is ever surfaced.
+/// A structurally valid empty PEP 691 simple-index listing for `normalized`.
+/// Used whenever a listing must fail closed without breaking JSON-simple
+/// clients: for a locally-owned name whose suppressed Remote member returned a
+/// body that could not be ownership-filtered (#2967 R4), and for an age-gate
+/// policy-resolution failure. Mirrors the shape the merge path expects
+/// (`meta`/`name`/`versions`/`files`) and guarantees no raw upstream byte is
+/// surfaced.
 fn empty_pep691_listing(normalized: &str) -> String {
     serde_json::json!({
         "meta": {"api-version": "1.0"},
@@ -4749,6 +4752,17 @@ mod tests {
     #[test]
     fn test_rewrite_upstream_simple_json_returns_none_for_non_json() {
         assert!(rewrite_upstream_simple_json(b"<!DOCTYPE html><html></html>", "r", "p").is_none());
+    }
+
+    #[test]
+    fn test_empty_pep691_listing_preserves_required_project_shape() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&empty_pep691_listing("my-package")).unwrap();
+
+        assert_eq!(doc["meta"]["api-version"], "1.0");
+        assert_eq!(doc["name"], "my-package");
+        assert_eq!(doc["versions"], serde_json::json!([]));
+        assert_eq!(doc["files"], serde_json::json!([]));
     }
 
     // -----------------------------------------------------------------------
