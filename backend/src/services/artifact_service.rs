@@ -922,26 +922,36 @@ impl ArtifactService {
             // (replication / migration / generic push) to match instead of
             // persisting the bare artifactId or filename, which would split a
             // single component across multiple grouped rows.
-            let package_name = match self.repo_service.get_by_id(artifact.repository_id).await {
-                Ok(repo)
-                    if matches!(
-                        repo.format,
-                        RepositoryFormat::Maven | RepositoryFormat::Gradle
-                    ) =>
-                {
-                    crate::formats::maven::MavenHandler::grouped_package_name(
-                        &artifact.path,
-                        &artifact.name,
-                    )
-                }
-                _ => artifact.name.clone(),
-            };
+            //
+            // #3064: the catalog `package_versions.version` must come from the
+            // same GAV coordinates as the name. `artifact.version` on this path
+            // is a naive path segment (e.g. the first groupId component), which
+            // no grouped listing row ever matches.
+            let (package_name, package_version) =
+                match self.repo_service.get_by_id(artifact.repository_id).await {
+                    Ok(repo)
+                        if matches!(
+                            repo.format,
+                            RepositoryFormat::Maven | RepositoryFormat::Gradle
+                        ) =>
+                    {
+                        match crate::formats::maven::MavenHandler::parse_coordinates(&artifact.path)
+                        {
+                            Ok(coords) => (
+                                format!("{}:{}", coords.group_id, coords.artifact_id),
+                                coords.version,
+                            ),
+                            Err(_) => (artifact.name.clone(), ver.clone()),
+                        }
+                    }
+                    _ => (artifact.name.clone(), ver.clone()),
+                };
             let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
                     artifact.repository_id,
                     &package_name,
-                    ver,
+                    &package_version,
                     artifact.size_bytes,
                     &artifact.checksum_sha256,
                     None,
@@ -3617,6 +3627,88 @@ mod tests {
             .bind(artifact.id)
             .execute(&pool)
             .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---- #3064 catalog coordinates on the generic finalize path -----------
+
+    /// #3064: a generic push into a Maven-format repo must key the catalog
+    /// `packages`/`package_versions` rows on the GAV coordinates derived from
+    /// the artifact path (`com.example.demo:app` / `1.2.3`), not on the naive
+    /// path-segment name/version the generic handler computes. An unparseable
+    /// path keeps the bare-name fallback. Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_generic_push_into_maven_repo_records_gav_catalog_entry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+
+        // The generic PUT handler derives name/version as naive path segments
+        // (segments[0]/segments[1]); mirror that call shape here.
+        svc.upload(
+            repo_id,
+            "com/example/demo/app/1.2.3/app-1.2.3.jar",
+            "com",
+            Some("example"),
+            "application/java-archive",
+            Bytes::from_static(b"gav-jar"),
+            Some(user_id),
+        )
+        .await
+        .expect("gav upload succeeds");
+
+        let (name,): (String,) =
+            sqlx::query_as("SELECT name FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("packages row");
+        assert_eq!(name, "com.example.demo:app");
+
+        let (version,): (String,) = sqlx::query_as(
+            "SELECT pv.version FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("package_versions row");
+        assert_eq!(version, "1.2.3");
+
+        // Unparseable Maven path (< 4 segments): bare name/version fallback.
+        svc.upload(
+            repo_id,
+            "misc/tools/tool.bin",
+            "misc",
+            Some("tools"),
+            "application/octet-stream",
+            Bytes::from_static(b"fallback-bin"),
+            Some(user_id),
+        )
+        .await
+        .expect("fallback upload succeeds");
+
+        let (fallback_version,): (String,) = sqlx::query_as(
+            "SELECT pv.version FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = 'misc'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fallback package_versions row");
+        assert_eq!(fallback_version, "tools");
+
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
