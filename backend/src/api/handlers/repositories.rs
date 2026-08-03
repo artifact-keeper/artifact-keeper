@@ -8199,14 +8199,27 @@ pub struct AddVirtualMemberRequest {
     pub priority: Option<i32>,
 }
 
+/// Full-set replace of a virtual repository's members (PR #2795, issue #2785;
+/// ratified in issue #2899).
+///
+/// This body is the COMPLETE desired member list, not a partial patch. Any
+/// current member whose key is absent from `members` is removed; keys present
+/// are inserted or have their priority updated. An empty `members` array
+/// removes every member.
+///
+/// WARNING: sending a partial list to reorder priorities deletes the omitted
+/// members. Clients must always send the full member list.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateVirtualMembersRequest {
+    /// The complete desired member set. Members not listed here are removed.
     pub members: Vec<VirtualMemberPriority>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct VirtualMemberPriority {
+    /// Key of the member repository. Inserted if it is not already a member.
     pub member_key: String,
+    /// Resolution priority. Lower values are searched first.
     pub priority: i32,
 }
 
@@ -8454,17 +8467,38 @@ pub async fn remove_virtual_member(
 
 /// Replace the full member set of a virtual repository (add / remove / reorder).
 ///
-/// #2785: this is the "edit the members after creation" operation. The body is
-/// the complete desired member list; members not listed are removed, listed
-/// members that are not yet present are added, and priorities are refreshed.
-/// The prior implementation only reordered members that already existed and
-/// returned 404 for any member not already present, so adding a member through
-/// an edit form failed.
+/// This is a FULL-SET REPLACE, not a partial update. The request body is the
+/// complete desired member list:
+///
+///   * any existing member NOT present in the body is REMOVED;
+///   * a member present in the body that is not yet a member is INSERTED;
+///   * a member present in the body that already exists has its priority
+///     UPDATED to the supplied value;
+///   * an empty `members` array removes every member.
+///
+/// WARNING: sending a partial list to reorder priorities will DELETE the
+/// members you omitted. Always send the complete member list, including the
+/// members whose priority is unchanged.
+///
+/// PR #2795 (issue #2785) introduced these semantics so that the members of a
+/// virtual repository are editable after creation: the prior implementation only
+/// reordered members that already existed and returned 404 for any member not
+/// already present, so adding a member through an edit form failed. The change
+/// in request semantics was ratified in #2899.
 #[utoipa::path(
     put,
     path = "/{key}/members",
     context_path = "/api/v1/repositories",
     tag = "repositories",
+    description = "Replace the full member set of a virtual repository. \
+        This is a full-set replace, not a partial update: the request body is the \
+        complete desired member list. Any existing member that is not present in the \
+        body is removed. Members present in the body are inserted if missing, or have \
+        their priority updated if already present. An empty `members` array removes \
+        every member. Warning: sending a partial list in order to reorder priorities \
+        will delete the members omitted from that list, so clients must always send \
+        the complete member list. These semantics were introduced in PR #2795 \
+        (issue #2785) and ratified in issue #2899.",
     params(
         ("key" = String, Path, description = "Repository key"),
     ),

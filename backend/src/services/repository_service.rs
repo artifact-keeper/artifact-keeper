@@ -1792,21 +1792,38 @@ impl RepositoryService {
     /// Reconcile the FULL member set of a virtual repository to exactly
     /// `desired` (issue #2785 defect B).
     ///
-    /// Editing a virtual repository after creation must be able to add and
-    /// remove members, not merely reorder the ones added at create time. This
-    /// replaces the membership with exactly the `(member_repo_id, priority)`
-    /// pairs in `desired`, in a single transaction guarded by the same
-    /// process-wide member-graph advisory lock that `add_virtual_member` and
+    /// # Contract: full-set replace, not a partial update
+    ///
+    /// `desired` is the COMPLETE desired membership. This replaces the
+    /// membership with exactly the `(member_repo_id, priority)` pairs it
+    /// contains, in a single transaction guarded by the same process-wide
+    /// member-graph advisory lock that `add_virtual_member` and
     /// `update_virtual_member_priorities` take (so it never contends with a
     /// concurrent membership mutation):
     ///
-    ///   * members not present in `desired` are removed;
-    ///   * members already present have their priority updated;
-    ///   * new members are inserted.
+    ///   * members NOT present in `desired` are REMOVED;
+    ///   * members already present have their priority UPDATED;
+    ///   * members present in `desired` but not yet in the table are INSERTED;
+    ///   * an empty `desired` removes every member.
     ///
-    /// An empty `desired` removes every member. Caller-side authorization
-    /// (repo-admin on the virtual parent + token-scope / cycle / format checks
-    /// per member) is enforced by the handler before this runs.
+    /// This is destructive by design. A caller that passes a partial list in
+    /// order to reorder priorities will DELETE the members it omitted, so
+    /// callers must always assemble the full member list first.
+    ///
+    /// Editing a virtual repository after creation must be able to add and
+    /// remove members, not merely reorder the ones added at create time, which
+    /// is why PR #2795 (issue #2785) changed
+    /// `PUT /api/v1/repositories/{key}/members` from a priorities-only
+    /// update to this replace. Issue #2899 reviewed the
+    /// resulting breaking API-semantics change and RATIFIED it: replace
+    /// semantics are the intended, supported contract of this function and of
+    /// that endpoint. Do not narrow it back to a priorities-only update; the
+    /// removal arm is covered by
+    /// `test_set_virtual_members_edits_after_create_2785`.
+    ///
+    /// Caller-side authorization (repo-admin on the virtual parent +
+    /// token-scope / cycle / format checks per member) is enforced by the
+    /// handler before this runs.
     pub async fn set_virtual_members(
         &self,
         virtual_repo_id: Uuid,
@@ -5169,6 +5186,16 @@ mod tests {
         /// creation — `set_virtual_members` adds, removes, and reorders members
         /// to match exactly the supplied set (the pre-fix PUT endpoint only
         /// reordered members that already existed).
+        ///
+        /// #2899 ratified the resulting full-set REPLACE semantics as the
+        /// intended contract of `PUT /api/v1/repositories/{key}/members`.
+        /// This test pins that contract: a call whose `desired` list omits a
+        /// current member REMOVES that member. That is destructive on purpose,
+        /// so the removal arm is asserted explicitly here (members A, B, C then
+        /// a reconcile with only [A, B] must leave exactly A and B). If a
+        /// future change reverts to a priorities-only update, or makes the
+        /// reconcile merge rather than replace, this test must fail rather than
+        /// be relaxed.
         #[tokio::test]
         async fn test_set_virtual_members_edits_after_create_2785() {
             let Some(pool) = tdh::try_pool().await else {
@@ -5223,6 +5250,36 @@ mod tests {
                 ids(&service.get_virtual_members(virt.id).await.expect("list")),
                 vec![b.id, a.id],
                 "B (prio 2) then A (prio 5) after add + reprioritise"
+            );
+
+            // #2899 replace semantics, the destructive arm. Bring the set to
+            // exactly {A, B, C}, then reconcile with a PARTIAL list [A, B].
+            // C is absent from the request, so C must be removed: a caller
+            // that sends a subset to reorder loses the members it omitted.
+            service
+                .set_virtual_members(virt.id, &[(a.id, 1), (b.id, 2), (c.id, 3)])
+                .await
+                .expect("reconcile to A, B, C");
+            assert_eq!(
+                ids(&service.get_virtual_members(virt.id).await.expect("list")),
+                vec![a.id, b.id, c.id],
+                "precondition: membership is exactly {{A, B, C}}"
+            );
+
+            service
+                .set_virtual_members(virt.id, &[(a.id, 1), (b.id, 2)])
+                .await
+                .expect("reconcile to the partial list A, B");
+            let after_partial = service.get_virtual_members(virt.id).await.expect("list");
+            assert_eq!(
+                ids(&after_partial),
+                vec![a.id, b.id],
+                "PUT with only [A, B] leaves exactly A and B: C, omitted from the \
+                 request, is REMOVED (full-set replace, #2795/#2899)"
+            );
+            assert!(
+                !ids(&after_partial).contains(&c.id),
+                "C is gone, not merely reordered behind A and B"
             );
 
             // Edit: replace the whole set with C only (removes A and B).

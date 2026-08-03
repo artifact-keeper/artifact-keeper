@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING API SEMANTICS: `PUT /api/v1/repositories/{key}/members` (virtual repository members) is a full-set replace** (#2795, ratified in #2899): as of #2795 the request body is the *complete* desired member list, not a partial update. Any existing member whose key is absent from the body is **removed**; members present in the body are inserted if missing, or have their priority updated if already present; an empty `members` array removes every member. Previously the endpoint only reordered members that already existed and returned 404 for a member that was not already present, which made it impossible to add or remove a member when editing a virtual repository after creation. **API clients that send a partial member list in order to reorder priorities will now delete the members they omit** and must be updated to always send the complete member list. The web UI (`virtual-members-panel.tsx` move-up/move-down) and the CLI (`members reorder`, documented as a bulk full-set operation) already send the full list and are unaffected. The behavior is now stated in the OpenAPI operation description and pinned by a regression test.
+
 ### Fixed
 
 - **Scheduled backups claim one durable run per due occurrence** (#2219): multi-replica schedulers no longer create duplicate archives for the same schedule tick. Long runs renew their token-fenced claim, and run finalization plus advancement of the unchanged schedule occurrence is transactional. A schedule whose cron expression has no further occurrence is now disabled with a warning instead of being left permanently due, where it consumed a due-schedule slot and could starve other schedules.
