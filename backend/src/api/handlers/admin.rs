@@ -789,8 +789,8 @@ pub struct SystemStats {
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
-    /// Proxy-cached (pull-through) objects. They have no `artifacts` row, so
-    /// they're excluded from the totals above and reported separately here.
+    /// Proxy-cached (pull-through) objects, tracked in `proxy_cache_artifacts`
+    /// rather than `artifacts`, so they are reported separately here.
     pub proxy_artifact_count: i64,
     pub proxy_storage_bytes: i64,
 }
@@ -1751,6 +1751,119 @@ mod tests {
         assert_eq!(json["total_users"], 25);
         assert_eq!(json["proxy_artifact_count"], 12);
         assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
+    }
+
+    /// DB-backed (skips without `DATABASE_URL`): `get_system_stats` must
+    /// surface `proxy_cache_artifacts` rows through `proxy_artifact_count` /
+    /// `proxy_storage_bytes`.
+    ///
+    /// The endpoint aggregates the WHOLE table and the test database is
+    /// shared across concurrently running test processes, so assert on the
+    /// exact DELTA produced by this test's rows rather than on absolute
+    /// totals. A bounded retry absorbs the rare interleaving where another
+    /// test mutates the table between the two handler calls; a real wiring
+    /// bug fails every attempt.
+    #[tokio::test]
+    async fn test_get_system_stats_reports_proxy_cache_totals_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-proxy-stats");
+
+        let sizes: [i64; 2] = [1_234, 8_766];
+        let mut matched = false;
+        for _attempt in 0..3 {
+            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
+
+            for (i, size) in sizes.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO proxy_cache_artifacts \
+                     (repository_id, path, storage_key, metadata_key, size_bytes) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(repo_id)
+                .bind(format!("stats/pkg-{i}.whl"))
+                .bind(format!(
+                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__content__"
+                ))
+                .bind(format!(
+                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__cache_meta__.json"
+                ))
+                .bind(size)
+                .execute(&pool)
+                .await
+                .expect("seed proxy cache row");
+            }
+
+            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
+
+            // Remove this attempt's rows before deciding, so a retry
+            // re-seeds from a clean slate (`(repository_id, path)` is
+            // unique).
+            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("cleanup proxy cache rows");
+
+            if after.proxy_artifact_count == before.proxy_artifact_count + sizes.len() as i64
+                && after.proxy_storage_bytes
+                    == before.proxy_storage_bytes + sizes.iter().sum::<i64>()
+            {
+                matched = true;
+                break;
+            }
+        }
+        assert!(
+            matched,
+            "get_system_stats never reflected the seeded proxy_cache_artifacts \
+             rows (+{} rows / +{} bytes)",
+            sizes.len(),
+            sizes.iter().sum::<i64>()
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// DB-backed (skips without `DATABASE_URL`): the proxy-cache aggregate
+    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty table,
+    /// since the handler decodes the column as a non-nullable BIGINT
+    /// (`"size!"`). The shared test database can hold rows from concurrent
+    /// tests, so the empty-table shape is forced inside a transaction: the
+    /// DELETE is rolled back and never observed by other tests.
+    #[tokio::test]
+    async fn test_proxy_cache_stats_query_empty_table_coalesces_to_zero_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        sqlx::query("DELETE FROM proxy_cache_artifacts")
+            .execute(&mut *tx)
+            .await
+            .expect("clear proxy cache rows inside transaction");
+        let (count, size): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT FROM proxy_cache_artifacts",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("aggregate over empty proxy cache table");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            size, 0,
+            "COALESCE must map SUM's NULL to 0 on an empty table"
+        );
     }
 
     // -----------------------------------------------------------------------
