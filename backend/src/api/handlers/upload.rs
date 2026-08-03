@@ -780,7 +780,7 @@ async fn complete(
             .try_create_or_update_from_artifact(
                 session.repository_id,
                 &package_name,
-                package_version,
+                &package_version,
                 session.total_size,
                 &session.checksum_sha256,
                 completed_package_description(&session),
@@ -1143,17 +1143,40 @@ fn maven_package_metadata_from_artifact_metadata(
     Some(catalog)
 }
 
-fn completed_package_catalog_entry<'a>(
-    session: &'a upload_service::UploadSession,
+fn completed_package_catalog_entry(
+    session: &upload_service::UploadSession,
     format: &crate::models::repository::RepositoryFormat,
-) -> Option<(String, &'a str)> {
-    let version = completed_artifact_version(session)?;
+) -> Option<(String, String)> {
+    use crate::models::repository::RepositoryFormat;
     // #2723: Maven/Gradle grouped listings key the catalog `packages` row on
     // `groupId:artifactId`. Prefer the replicated POM metadata's coordinates;
     // otherwise, for a Maven/Gradle repo, derive the grouped name from the
     // artifact path so a generically-pushed asset joins the same component
     // instead of landing under a bare artifactId/filename.
-    let name = replicated_maven_artifact_metadata(session)
+    //
+    // #3064: for Maven/Gradle repos the catalog `package_versions.version`
+    // must come from the same GAV coordinates as the name — the replicated POM
+    // metadata's version when present, else the version segment of the
+    // artifact path. Requiring an explicit create-session version dropped
+    // chunked Maven uploads that carry their coordinates only in the path.
+    let metadata = replicated_maven_artifact_metadata(session);
+    let maven_layout = matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle);
+    let version = if maven_layout {
+        metadata
+            .and_then(|m| m.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                crate::formats::maven::MavenHandler::parse_coordinates(&session.artifact_path)
+                    .ok()
+                    .map(|coords| coords.version)
+            })
+            .or_else(|| completed_artifact_version(session).map(str::to_string))
+    } else {
+        completed_artifact_version(session).map(str::to_string)
+    }?;
+    let name = metadata
         .and_then(maven_package_name_from_metadata)
         .or_else(|| maven_grouped_name_for_format(session, format))
         .unwrap_or_else(|| completed_artifact_name(session).to_string());
@@ -1660,7 +1683,7 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("large-check".to_string(), "20260603T082854Z"))
+            Some(("large-check".to_string(), "20260603T082854Z".to_string()))
         );
     }
 
@@ -1677,12 +1700,56 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         // A non-Maven repo keeps the bare artifact name.
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
-            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0"))
+            Some(("ak-core-1.0.0.jar".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_derives_version_from_gav_path() {
+        // #3064: a chunked Maven upload without an explicit create-session
+        // version must still produce a catalog row — name AND version come
+        // from the GAV path.
+        let session = test_upload_session("com/example/demo/app/1.2.3/app-1.2.3.jar", None, None);
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // A Generic repo keeps the legacy behaviour: no explicit version, no
+        // catalog row.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            None
+        );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_path_version_beats_explicit_for_maven() {
+        // #3064: for Maven/Gradle repos the GAV path is the authoritative
+        // coordinate; an explicit create-session version that disagrees with
+        // the path must not split the component across two version rows.
+        let session = test_upload_session(
+            "com/example/demo/app/1.2.3/app-1.2.3.jar",
+            Some("app"),
+            Some("example"),
+        );
+
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+            Some(("com.example.demo:app".to_string(), "1.2.3".to_string()))
+        );
+        // Non-Maven formats keep the explicit version as-is.
+        assert_eq!(
+            completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
+            Some(("app".to_string(), "example".to_string()))
         );
     }
 
@@ -1708,7 +1775,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(
             completed_package_description(&session),
@@ -1740,7 +1810,10 @@ mod tests {
 
         assert_eq!(
             completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
-            Some(("org.example.ak.maven:ak-core".to_string(), "1.0.0"))
+            Some((
+                "org.example.ak.maven:ak-core".to_string(),
+                "1.0.0".to_string()
+            ))
         );
         assert_eq!(completed_package_description(&session), None);
         assert_eq!(completed_package_metadata(&session), None);

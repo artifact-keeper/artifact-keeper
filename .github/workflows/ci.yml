@@ -1024,9 +1024,13 @@ jobs:
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
-    runs-on: ak-e2e-runners
-    needs: [test-backend-unit, build-backend-image]
-    if: needs.build-backend-image.result == 'success'
+    runs-on: ubuntu-24.04
+    # Depend on the required fast-CI gates as well as the image build so a
+    # known-red Check Rust or unit-test run never launches smoke. Smoke only
+    # runs when all three succeeded; if the backend image was skipped (no
+    # backend changes) or an upstream gate failed, smoke is skipped.
+    needs: [check-rust, test-backend-unit, build-backend-image]
+    if: needs.check-rust.result == 'success' && needs.test-backend-unit.result == 'success' && needs.build-backend-image.result == 'success'
     permissions:
       contents: read
       packages: read
@@ -1133,7 +1137,7 @@ jobs:
 
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ak-ci-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
       contents: read
@@ -1284,17 +1288,33 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ak-ci-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
+        # Results are passed through the environment rather than interpolated
+        # directly into the script body so a job result string can never alter
+        # the shell control flow.
+        env:
+          RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_UNIT: ${{ needs.test-backend-unit.result }}
+          RESULT_SHELL: ${{ needs.shell-tests.result }}
+          RESULT_COVERAGE: ${{ needs.coverage.result }}
+          RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
+          RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
+          RESULT_BUILD_BACKEND: ${{ needs.build-backend-image.result }}
+          RESULT_BUILD_OPENSCAP: ${{ needs.build-openscap-image.result }}
+          RESULT_SECURITY: ${{ needs.security-audit.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
-          echo "## CI Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          echo "## CI Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          tier1_pass=true
+          failed=false
 
           # Docs-only PRs legitimately skip the Tier 1 jobs (see the
           # `changes` job). Version-bump-only release PRs legitimately skip
@@ -1303,96 +1323,79 @@ jobs:
           # `release-bump` job). Any other skip/failure of a Tier 1 job is
           # fatal.
           docs_only=false
-          if [[ "${{ needs.changes.outputs.code }}" == "false" ]]; then
+          if [[ "$CODE_CHANGED" == "false" ]]; then
             docs_only=true
-            echo "📝 docs-only change — Tier 1 jobs skipped by design" >> $GITHUB_STEP_SUMMARY
+            echo "📝 docs-only change — Tier 1 jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
           fi
           bump_only=false
-          if [[ "${{ needs.release-bump.outputs.bump_only }}" == "true" ]]; then
+          if [[ "$BUMP_ONLY" == "true" ]]; then
             bump_only=true
-            echo "🔖 version-bump-only release PR — heavy Rust jobs skipped by design" >> $GITHUB_STEP_SUMMARY
+            echo "🔖 version-bump-only release PR — heavy Rust jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Tier 1 jobs (required)
-          for job in check-rust test-backend-unit shell-tests; do
-            result="${{ needs.check-rust.result }}"
-            [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
-            [ "$job" = "shell-tests" ] && result="${{ needs.shell-tests.result }}"
+          # Required jobs run on every event. Anything other than success,
+          # including a skip or a cancellation, is a hard failure so an
+          # unexpected non-run can never be reported as green — except on a
+          # docs-only change, where these jobs are skipped by design.
+          require_success() {
+            local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
-              echo "✅ $job" >> $GITHUB_STEP_SUMMARY
+              echo "✅ $name" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
-              echo "⏭️ $job (docs-only)" >> $GITHUB_STEP_SUMMARY
-            elif [[ "$result" == "skipped" && "$bump_only" == "true" && "$job" != "shell-tests" ]]; then
-              echo "⏭️ $job (version-bump-only release PR)" >> $GITHUB_STEP_SUMMARY
+              echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$result" == "skipped" && "$bump_only" == "true" \
+                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+              # Only the two heavy Rust jobs are skippable on the bump path.
+              # shell-tests and security-audit still run and must succeed.
+              echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "❌ $job: $result" >> $GITHUB_STEP_SUMMARY
-              tier1_pass=false
+              echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
+              failed=true
             fi
-          done
+          }
 
-          # Smoke E2E (skipped when backend image build is skipped due to no changes)
-          smoke_result="${{ needs.smoke-e2e.result }}"
-          if [[ "$smoke_result" == "success" ]]; then
-            echo "✅ smoke-e2e" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$smoke_result" == "skipped" ]]; then
-            echo "⏭️ smoke-e2e (no backend changes)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ smoke-e2e: $smoke_result" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
-          # Integration tests (main push only, skip check on PRs)
-          integ_result="${{ needs.test-backend-integration.result }}"
-          if [[ "$integ_result" == "success" ]]; then
-            echo "✅ integration-tests" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$integ_result" == "skipped" ]]; then
-            echo "⏭️ integration-tests (PR — skipped)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ integration-tests: $integ_result" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
-          # Container builds (PR only, skipped on push or when files unchanged)
-          for img in backend openscap; do
-            result="${{ needs.build-backend-image.result }}"
-            [ "$img" = "openscap" ] && result="${{ needs.build-openscap-image.result }}"
+          # Conditionally-required jobs are legitimately skipped in some events
+          # (no backend changes, PR-only skips). A skip passes, but a failure or
+          # cancellation fails so an aborted upstream job is never masked.
+          allow_skip() {
+            local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
-              echo "✅ build-${img}-image" >> $GITHUB_STEP_SUMMARY
+              echo "✅ $name" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" ]]; then
-              echo "⏭️ build-${img}-image (no changes)" >> $GITHUB_STEP_SUMMARY
+              echo "⏭️ $name (skipped)" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "❌ build-${img}-image: $result" >> $GITHUB_STEP_SUMMARY
-              tier1_pass=false
+              echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
+              failed=true
             fi
-          done
+          }
 
-          # Coverage (non-blocking)
-          if [[ "${{ needs.coverage.result }}" == "success" ]]; then
-            echo "✅ coverage" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ needs.coverage.result }}" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
-            echo "⏭️ coverage (skipped by gate)" >> $GITHUB_STEP_SUMMARY
+          require_success "check-rust" "$RESULT_CHECK_RUST"
+          require_success "test-backend-unit" "$RESULT_UNIT"
+          require_success "shell-tests" "$RESULT_SHELL"
+          require_success "security-audit" "$RESULT_SECURITY"
+
+          allow_skip "smoke-e2e" "$RESULT_SMOKE"
+          allow_skip "integration-tests" "$RESULT_INTEGRATION"
+          allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
+          allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
+
+          # Coverage is non-blocking.
+          if [[ "$RESULT_COVERAGE" == "success" ]]; then
+            echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
+            echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "⚠️ coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Security audit (blocking; skipped by design on docs-only PRs)
-          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
-            echo "✅ security-audit" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ needs.security-audit.result }}" == "skipped" && "$docs_only" == "true" ]]; then
-            echo "⏭️ security-audit (docs-only)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ security-audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "$tier1_pass" != "true" ]]; then
-            echo "❌ **CI Failed**" >> $GITHUB_STEP_SUMMARY
+          if [[ "$failed" == "true" ]]; then
+            echo "❌ **CI Failed**" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          echo "✅ **CI Passed**" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **CI Passed**" >> "$GITHUB_STEP_SUMMARY"
 
   # ════════════════════════════════════════════════════════════════════════════
   # WINDOWS DEV BUILD (main push only)

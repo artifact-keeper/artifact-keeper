@@ -1977,6 +1977,14 @@ impl RepositoryService {
     /// GC. The background reconciler ([`Self::reconcile_usage_ledger`])
     /// remains as a drift safety net only.
     ///
+    /// NOTE on migration 182's header comment (#3080): it claims
+    /// "`check_quota_locked` still reads the authoritative live sum". That
+    /// was true when 182 shipped but is stale — quota admission has read the
+    /// `repository_usage_ledger` row under `FOR UPDATE` (the query below)
+    /// since #2516/#2992. The migration file cannot be corrected because
+    /// sqlx validates checksums of applied migrations, so THIS comment is
+    /// the authoritative statement of how admission reads usage.
+    ///
     /// Usage at the target `path` is netted out (unique-index lookup on
     /// `(repository_id, path)`), so an in-place overwrite is charged only its
     /// size delta rather than double-counting the bytes it replaces.

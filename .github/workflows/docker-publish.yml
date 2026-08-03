@@ -9,6 +9,18 @@ on:
       - '.beads/**'
       - 'LICENSE'
       - 'CLAUDE.md'
+  # Keep the registry layer cache warm (#3044). The amd64 backend build takes
+  # ~60-90 min when the :buildcache-amd64 registry cache is cold or stale
+  # (arm64 stays ~9 min), so a release tag cut after a quiet spell on main
+  # pays that full cost. A scheduled main build re-runs the normal publish
+  # pipeline, refreshing the buildcache-* cache tags (cache-to mode=max) so a
+  # subsequent tag cut hits warm cache. On a schedule event github.ref is
+  # refs/heads/main, so docker/metadata-action produces exactly the main-push
+  # tag set (main, dev, sha-<sha>) — the release-facing tags (semver, latest)
+  # are gated on refs/tags/v* and cannot fire, and the tag-push/dispatch
+  # guards in publish-preflight are skipped for schedule events.
+  schedule:
+    - cron: '23 5 * * 1,4'  # Mon/Thu 05:23 UTC
   workflow_dispatch:
     inputs:
       tag:
@@ -55,6 +67,12 @@ jobs:
   publish-preflight:
     name: Publish identity preflight
     runs-on: ubuntu-latest
+    # Scheduled cache-warm runs (#3044) only make sense in the canonical repo:
+    # forks have no business refreshing our ghcr buildcache and would just
+    # burn runner minutes. Every other job needs this one (directly or
+    # transitively) without a status-check override, so skipping it skips the
+    # whole run; the always()-gated summary job carries the same guard.
+    if: ${{ github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper' }}
     permissions:
       contents: read
     outputs:
@@ -158,7 +176,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -196,6 +214,26 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+
+      # The backend image compiles Rust inside Docker, which can exhaust the
+      # ~14GB free disk on a stock hosted amd64 runner. Reclaim the large
+      # preinstalled toolchains we do not use before building. amd64 only:
+      # the arm64 runner layout differs and its build is unaffected. If the
+      # hosted disk still proves insufficient, the fallback per the CI
+      # reliability plan is a dedicated image-builder scale set, not a return
+      # to the shared Rust runner path.
+      - name: Free disk space
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          echo "Disk after cleanup:"
+          df -h /
 
       - name: Build and push by digest
         id: build
@@ -253,7 +291,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -335,7 +373,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ak-ci-runners
+            runner: ubuntu-24.04
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -1912,7 +1950,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     needs: [merge-backend, merge-openscap, merge-scanner-adapter]
-    if: always()
+    # always() would otherwise run this even when the fork guard on
+    # publish-preflight skipped everything else; mirror that guard here.
+    if: ${{ always() && (github.event_name != 'schedule' || github.repository == 'artifact-keeper/artifact-keeper') }}
     steps:
       - name: Summary
         run: |
