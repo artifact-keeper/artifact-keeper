@@ -84,7 +84,7 @@ FROM alpine:3.24 AS runtime
 # current errata on every image build; the targeted `add` keeps the install
 # set explicit.
 RUN apk upgrade --no-cache && \
-    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs curl
+    apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs xz curl
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 
