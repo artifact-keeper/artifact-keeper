@@ -789,6 +789,10 @@ pub struct SystemStats {
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
+    /// Proxy-cached (pull-through) objects. They have no `artifacts` row, so
+    /// they're excluded from the totals above and reported separately here.
+    pub proxy_artifact_count: i64,
+    pub proxy_storage_bytes: i64,
 }
 
 /// Get system statistics
@@ -816,6 +820,18 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
             COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
         FROM artifacts
         WHERE is_deleted = false
+        "#
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let proxy_stats = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "count!",
+            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
+        FROM proxy_cache_artifacts
         "#
     )
     .fetch_one(&state.db)
@@ -855,6 +871,8 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
+        proxy_artifact_count: proxy_stats.count,
+        proxy_storage_bytes: proxy_stats.size,
     }))
 }
 
@@ -1722,6 +1740,8 @@ mod tests {
             total_users: 25,
             active_peers: 3,
             pending_sync_tasks: 0,
+            proxy_artifact_count: 12,
+            proxy_storage_bytes: 2_000_000,
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["total_repositories"], 10);
@@ -1729,6 +1749,8 @@ mod tests {
         assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);
         assert_eq!(json["total_downloads"], 5000);
         assert_eq!(json["total_users"], 25);
+        assert_eq!(json["proxy_artifact_count"], 12);
+        assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
     }
 
     // -----------------------------------------------------------------------
