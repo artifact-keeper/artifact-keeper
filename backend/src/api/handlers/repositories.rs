@@ -2218,35 +2218,28 @@ pub async fn list_repositories(
     let repo_ids: Vec<Uuid> = repos.iter().map(|r| r.id).collect();
     let storage_map: std::collections::HashMap<Uuid, i64> = if !repo_ids.is_empty() {
         sqlx::query_as::<_, (Uuid, i64)>(
-            // #2218: per-repo storage now UNIONs the persisted proxy-cache
-            // catalog so remote (proxy) repos count their cached bytes (was 0 —
-            // proxy objects carry no `artifacts` row since #1280). Legacy
-            // pre-#1280 `proxy-cache/%` leftovers in `artifacts` are excluded so
-            // an object that is also lazily backfilled into the catalog is not
-            // summed twice. Hosted repos have no `proxy-cache/%` keys and an
-            // empty catalog, so their totals are unchanged.
+            // #3078: read the trigger-maintained `repository_usage_ledger`
+            // (migrations 171/182) instead of recomputing the 3-way live SUM
+            // over `artifacts` + `proxy_cache_artifacts` + `oci_blobs` on
+            // every listing request — the live SUM's cost scales with total
+            // artifact count, not page size. The ledger is byte-for-byte
+            // equivalent to that SUM: 182's row-level AFTER triggers charge
+            // `hosted_bytes` under the identical predicate the old query used
+            // (`is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`,
+            // the #2218 rules), `proxy_bytes`/`oci_bytes` count their tables
+            // whole, and the `pending_delete_at` mark-and-sweep marker is a
+            // deliberate zero-delta no-op. `RepositoryService::get_storage_usage`
+            // stays the live-SUM oracle (reconciler / quota fallback).
             //
-            // OCI layer/config blobs live in `oci_blobs` (`artifacts` only
-            // holds manifests), so docker repos need the third branch or the
-            // listing shows KiBs for repos holding GiBs of layers. Must stay
-            // in lockstep with `RepositoryService::get_storage_usage`.
+            // A repo with no ledger row (created after 182 with zero writes)
+            // is simply absent from this result set and renders 0 via the
+            // `unwrap_or(0)` below — triggers self-seed a row only on growth,
+            // so "no row" means "no counted bytes"; the reconciler re-seeds
+            // rows lost to manual surgery.
             r#"
-            SELECT repository_id, COALESCE(SUM(bytes), 0)::BIGINT
-            FROM (
-                SELECT repository_id, size_bytes AS bytes
-                  FROM artifacts
-                 WHERE repository_id = ANY($1) AND is_deleted = false
-                   AND storage_key NOT LIKE 'proxy-cache/%'
-                UNION ALL
-                SELECT repository_id, size_bytes AS bytes
-                  FROM proxy_cache_artifacts
-                 WHERE repository_id = ANY($1)
-                UNION ALL
-                SELECT repository_id, size_bytes AS bytes
-                  FROM oci_blobs
-                 WHERE repository_id = ANY($1)
-            ) t
-            GROUP BY repository_id
+            SELECT repository_id, (hosted_bytes + proxy_bytes + oci_bytes)::BIGINT
+              FROM repository_usage_ledger
+             WHERE repository_id = ANY($1)
             "#,
         )
         .bind(&repo_ids)
@@ -2259,17 +2252,31 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    // #2785: the batched per-repo SUM above keys off `repository_id`, which is
-    // (near) empty for a virtual repo — it owns no artifact rows, only member
-    // links. Overwrite each virtual repo's figure with the union of its
-    // resolvable members so the listing total matches the child repos. Virtual
-    // repos are rare, so this touches at most a handful of rows per page.
+    // #2785: the batched per-repo figure above keys off `repository_id`, which
+    // is (near) empty for a virtual repo — it owns no artifact rows, only
+    // member links. Overwrite each virtual repo's figure with the union of its
+    // resolvable members so the listing total matches the child repos.
+    //
+    // #3078: resolve every virtual on the page in ONE query (the old shape
+    // called `get_virtual_storage_usage` once per virtual — an N+1 that
+    // re-scanned every reachable member's artifact rows per call). Seeding 0
+    // first preserves the old always-overwrite semantics: a virtual with no
+    // resolvable members has no row in the batch result and must render 0.
     let mut storage_map = storage_map;
-    for r in &repos {
-        if r.repo_type == RepositoryType::Virtual {
-            let combined = service.get_virtual_storage_usage(r.id).await?;
-            storage_map.insert(r.id, combined);
+    let virtual_ids: Vec<Uuid> = repos
+        .iter()
+        .filter(|r| r.repo_type == RepositoryType::Virtual)
+        .map(|r| r.id)
+        .collect();
+    if !virtual_ids.is_empty() {
+        for id in &virtual_ids {
+            storage_map.insert(*id, 0);
         }
+        storage_map.extend(
+            service
+                .get_virtual_storage_usage_batch(&virtual_ids)
+                .await?,
+        );
     }
 
     // Batch fetch which repos have a trusted GPG key configured (#2568) so the
@@ -20803,5 +20810,238 @@ mod apt_validation_tests {
         let err = ensure_single_line("line1\rline2", "apt_release_version").unwrap_err();
         assert!(err.to_string().contains("apt_release_version"));
         assert!(err.to_string().contains("single-line"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #3078: GET /api/v1/repositories reads `storage_used_bytes` from the
+    // trigger-maintained `repository_usage_ledger` instead of recomputing the
+    // 3-way live SUM per request. The equivalence matrix below seeds the
+    // SOURCE tables (so migration 182's triggers do the charging) and asserts
+    // the listing's ledger-backed figure equals the live-SUM oracle
+    // (`RepositoryService::get_storage_usage` / `get_virtual_storage_usage`,
+    // both deliberately left live) for every seeded shape.
+    // -----------------------------------------------------------------------
+
+    /// Create a repo via the shared fixture helper, then re-key it under the
+    /// caller's unique run prefix so one `?q=<prefix>` listing call returns
+    /// exactly this test's repositories.
+    async fn seeded_repo_3078(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        tag: &str,
+        repo_type: &str,
+    ) -> Uuid {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (id, _key, _dir) = tdh::create_repo(pool, repo_type, "generic").await;
+        let key = format!("{prefix}-{tag}");
+        sqlx::query("UPDATE repositories SET key = $1, name = $1 WHERE id = $2")
+            .bind(&key)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("re-key repo under run prefix");
+        id
+    }
+
+    /// End-to-end equivalence matrix for the ledger-backed listing (#3078):
+    /// hosted bytes counted; a soft-deleted artifact excluded (seeded live,
+    /// then flipped, so the trigger's decrement is exercised); a legacy
+    /// `proxy-cache/%`-keyed `artifacts` row excluded; `proxy_cache_artifacts`
+    /// and `oci_blobs` counted, including a `pending_delete_at`-marked blob
+    /// (zero-delta no-op); an empty repo with no ledger row renders 0 without
+    /// vanishing from the response; a virtual renders the union of its
+    /// members; a memberless virtual renders 0.
+    #[tokio::test]
+    async fn test_listing_storage_matches_live_sum_oracle_3078() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let _serial = tdh::usage_ledger_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let prefix = format!("lg3078{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let hosted = seeded_repo_3078(&pool, &prefix, "hosted", "local").await;
+        let proxied = seeded_repo_3078(&pool, &prefix, "proxied", "remote").await;
+        let oci = seeded_repo_3078(&pool, &prefix, "oci", "local").await;
+        let empty = seeded_repo_3078(&pool, &prefix, "empty", "local").await;
+        let virt = seeded_repo_3078(&pool, &prefix, "virt", "virtual").await;
+        let hollow = seeded_repo_3078(&pool, &prefix, "hollow", "virtual").await;
+
+        // hosted: one live artifact (counted), one soft-deleted (seeded live
+        // then flipped — trigger must decrement), one legacy proxy-cache-keyed
+        // row (trigger must never charge it).
+        let art = |repo: Uuid, key: String, size: i64, deleted: bool| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                     checksum_sha256, content_type, storage_key, is_deleted) \
+                     VALUES ($1, $2, $3, $3, $4, repeat('b', 64), 'application/octet-stream', \
+                     $5, $6)",
+                )
+                .bind(id)
+                .bind(repo)
+                .bind(format!("p/{id}"))
+                .bind(size)
+                .bind(key)
+                .bind(deleted)
+                .execute(&pool)
+                .await
+                .expect("insert artifact row");
+                id
+            }
+        };
+        art(hosted, format!("cas/00/{}", Uuid::new_v4()), 1_000, false).await;
+        let doomed = art(hosted, format!("cas/01/{}", Uuid::new_v4()), 4_000, false).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(doomed)
+            .execute(&pool)
+            .await
+            .expect("soft-delete artifact");
+        art(
+            hosted,
+            format!("proxy-cache/{hosted}/x/__content__"),
+            9_999,
+            false,
+        )
+        .await;
+
+        // proxied: a proxy-cache catalog row (counted whole-table).
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (id, repository_id, path, storage_key, \
+             metadata_key, size_bytes) VALUES ($1, $2, 'c/pkg.tgz', $3, $4, 2500)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(proxied)
+        .bind(format!("proxy-cache/{proxied}/c/pkg.tgz/__content__"))
+        .bind(format!(
+            "proxy-cache/{proxied}/c/pkg.tgz/__cache_meta__.json"
+        ))
+        .execute(&pool)
+        .await
+        .expect("insert proxy cache row");
+
+        // oci: one plain blob + one later marked pending_delete_at (the
+        // mark-and-sweep marker is a zero-delta no-op: still counted).
+        let blob = |repo: Uuid, size: i64| {
+            let pool = pool.clone();
+            async move {
+                let digest = format!("sha256:{}", Uuid::new_v4().simple());
+                sqlx::query(
+                    "INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(Uuid::new_v4())
+                .bind(repo)
+                .bind(&digest)
+                .bind(size)
+                .bind(format!("oci-blobs/{digest}"))
+                .execute(&pool)
+                .await
+                .expect("insert oci blob row");
+                digest
+            }
+        };
+        blob(oci, 500_000).await;
+        let marked = blob(oci, 250_000).await;
+        sqlx::query(
+            "UPDATE oci_blobs SET pending_delete_at = NOW() \
+             WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(oci)
+        .bind(&marked)
+        .execute(&pool)
+        .await
+        .expect("mark blob pending delete");
+
+        // empty: force the missing-ledger-row shape even if something seeded it.
+        sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+            .bind(empty)
+            .execute(&pool)
+            .await
+            .expect("drop empty repo ledger row");
+
+        // virt: union of hosted + oci members.
+        for (member, prio) in [(hosted, 1), (oci, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt)
+            .bind(member)
+            .bind(prio)
+            .execute(&pool)
+            .await
+            .expect("add virtual member");
+        }
+
+        // One listing call scoped to this run's repos, as an admin (sees all).
+        let state = tdh::build_state(pool.clone(), "/tmp/lg3078-unused");
+        let auth = tdh::admin_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+        let (status, body) = tdh::send(router, tdh::get(format!("/?q={prefix}&per_page=50"))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "listing failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+        let listed: std::collections::HashMap<String, i64> = json["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .map(|item| {
+                (
+                    item["key"].as_str().expect("key").to_string(),
+                    item["storage_used_bytes"].as_i64().expect("storage figure"),
+                )
+            })
+            .collect();
+
+        let service = RepositoryService::new(pool.clone());
+        // (id, tag, live-SUM oracle expectation)
+        let matrix = [
+            (hosted, "hosted", 1_000),
+            (proxied, "proxied", 2_500),
+            (oci, "oci", 750_000),
+            (empty, "empty", 0),
+            (virt, "virt", 751_000),
+            (hollow, "hollow", 0),
+        ];
+        for (id, tag, expected) in matrix {
+            let oracle = if tag == "virt" || tag == "hollow" {
+                service
+                    .get_virtual_storage_usage(id)
+                    .await
+                    .expect("virtual oracle")
+            } else {
+                service
+                    .get_storage_usage(id)
+                    .await
+                    .expect("live-SUM oracle")
+            };
+            assert_eq!(
+                oracle, expected,
+                "live-SUM oracle drifted from the seeded expectation for {tag}"
+            );
+            assert_eq!(
+                listed.get(&format!("{prefix}-{tag}")).copied(),
+                Some(expected),
+                "ledger-backed listing figure must equal the live-SUM oracle for {tag}"
+            );
+        }
+
+        for id in [virt, hollow, hosted, proxied, oci, empty] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }
