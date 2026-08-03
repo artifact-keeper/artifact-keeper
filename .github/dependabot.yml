@@ -8,7 +8,7 @@ updates:
       - "artifact-keeper/maintainers"
     labels:
       - "dependencies"
-      - "docker"
+      - "registry/docker"
     commit-message:
       prefix: "chore"
 
@@ -30,7 +30,7 @@ updates:
       interval: "weekly"
     labels:
       - "dependencies"
-      - "cargo"
+      - "registry/cargo"
     commit-message:
       prefix: "chore"
     # The RustCrypto digest 0.10 -> 0.11 ecosystem migration is mid-flight.

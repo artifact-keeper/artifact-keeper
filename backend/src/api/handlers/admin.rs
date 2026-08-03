@@ -250,6 +250,13 @@ pub struct CreateBackupRequest {
     /// also supplied the excluded ids are removed from that include list;
     /// otherwise every repository except the excluded ones is backed up.
     pub exclude_repositories: Option<Vec<Uuid>>,
+    /// Optional RFC3339 lower bound on artifact modification time (#2789).
+    ///
+    /// When set, the (typically incremental) backup includes only artifacts
+    /// whose `updated_at` is at or after this timestamp, capturing just the
+    /// changes made from the given date/time to now. When omitted every
+    /// artifact is included, so backup behavior is unchanged.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional custom name/label for the backup archive (#2790).
     ///
     /// When provided it becomes the identifying part of the archive
@@ -424,6 +431,7 @@ pub async fn create_backup(
             backup_type,
             repository_ids: payload.repository_ids,
             exclude_repository_ids: payload.exclude_repositories,
+            since: payload.since,
             created_by: Some(auth.user_id),
             name: payload.name,
         })
@@ -466,7 +474,9 @@ pub async fn execute_backup(
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let backup = service.execute(id).await?;
 
@@ -526,7 +536,9 @@ pub async fn restore_backup(
             .await
             .map_err(|e: AppError| e)?,
     );
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
@@ -594,7 +606,9 @@ pub async fn delete_backup(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     service.delete(id).await?;
     Ok(())
@@ -775,6 +789,10 @@ pub struct SystemStats {
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
+    /// Proxy-cached (pull-through) objects, tracked in `proxy_cache_artifacts`
+    /// rather than `artifacts`, so they are reported separately here.
+    pub proxy_artifact_count: i64,
+    pub proxy_storage_bytes: i64,
 }
 
 /// Get system statistics
@@ -802,6 +820,18 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
             COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
         FROM artifacts
         WHERE is_deleted = false
+        "#
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let proxy_stats = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "count!",
+            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
+        FROM proxy_cache_artifacts
         "#
     )
     .fetch_one(&state.db)
@@ -841,6 +871,8 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
+        proxy_artifact_count: proxy_stats.count,
+        proxy_storage_bytes: proxy_stats.size,
     }))
 }
 
@@ -1125,7 +1157,10 @@ pub async fn run_cleanup(
 
     if request.cleanup_old_backups.unwrap_or(false) {
         let storage = Arc::new(StorageService::from_config(&state.config).await?);
-        let backup_service = BackupService::new(state.db.clone(), storage);
+        let archive_storage =
+            StorageService::backup_archive_from_config(&state.config, &storage).await?;
+        let backup_service =
+            BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
         result.backups_deleted = backup_service
             .cleanup(settings.backup_retention_count, settings.retention_days)
             .await? as i64;
@@ -1705,6 +1740,8 @@ mod tests {
             total_users: 25,
             active_peers: 3,
             pending_sync_tasks: 0,
+            proxy_artifact_count: 12,
+            proxy_storage_bytes: 2_000_000,
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["total_repositories"], 10);
@@ -1712,6 +1749,121 @@ mod tests {
         assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);
         assert_eq!(json["total_downloads"], 5000);
         assert_eq!(json["total_users"], 25);
+        assert_eq!(json["proxy_artifact_count"], 12);
+        assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
+    }
+
+    /// DB-backed (skips without `DATABASE_URL`): `get_system_stats` must
+    /// surface `proxy_cache_artifacts` rows through `proxy_artifact_count` /
+    /// `proxy_storage_bytes`.
+    ///
+    /// The endpoint aggregates the WHOLE table and the test database is
+    /// shared across concurrently running test processes, so assert on the
+    /// exact DELTA produced by this test's rows rather than on absolute
+    /// totals. A bounded retry absorbs the rare interleaving where another
+    /// test mutates the table between the two handler calls; a real wiring
+    /// bug fails every attempt.
+    #[tokio::test]
+    async fn test_get_system_stats_reports_proxy_cache_totals_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-proxy-stats");
+
+        let sizes: [i64; 2] = [1_234, 8_766];
+        let mut matched = false;
+        for _attempt in 0..3 {
+            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
+
+            for (i, size) in sizes.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO proxy_cache_artifacts \
+                     (repository_id, path, storage_key, metadata_key, size_bytes) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(repo_id)
+                .bind(format!("stats/pkg-{i}.whl"))
+                .bind(format!(
+                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__content__"
+                ))
+                .bind(format!(
+                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__cache_meta__.json"
+                ))
+                .bind(size)
+                .execute(&pool)
+                .await
+                .expect("seed proxy cache row");
+            }
+
+            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
+
+            // Remove this attempt's rows before deciding, so a retry
+            // re-seeds from a clean slate (`(repository_id, path)` is
+            // unique).
+            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("cleanup proxy cache rows");
+
+            if after.proxy_artifact_count == before.proxy_artifact_count + sizes.len() as i64
+                && after.proxy_storage_bytes
+                    == before.proxy_storage_bytes + sizes.iter().sum::<i64>()
+            {
+                matched = true;
+                break;
+            }
+        }
+        assert!(
+            matched,
+            "get_system_stats never reflected the seeded proxy_cache_artifacts \
+             rows (+{} rows / +{} bytes)",
+            sizes.len(),
+            sizes.iter().sum::<i64>()
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// DB-backed (skips without `DATABASE_URL`): the proxy-cache aggregate
+    /// must COALESCE `SUM(size_bytes)` to 0 — not NULL — over an empty table,
+    /// since the handler decodes the column as a non-nullable BIGINT
+    /// (`"size!"`). The shared test database can hold rows from concurrent
+    /// tests, so the empty-table shape is forced inside a transaction: the
+    /// DELETE is rolled back and never observed by other tests.
+    #[tokio::test]
+    async fn test_proxy_cache_stats_query_empty_table_coalesces_to_zero_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        sqlx::query("DELETE FROM proxy_cache_artifacts")
+            .execute(&mut *tx)
+            .await
+            .expect("clear proxy cache rows inside transaction");
+        let (count, size): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::BIGINT FROM proxy_cache_artifacts",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("aggregate over empty proxy cache table");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            size, 0,
+            "COALESCE must map SUM's NULL to 0 on an empty table"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1800,6 +1952,25 @@ mod tests {
         let json = r#"{"type": "full"}"#;
         let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
         assert!(req.name.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_since_defaults_none() {
+        // #2789: without `since` the backup keeps its default (all artifacts).
+        let json = r#"{"type": "incremental"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert!(req.since.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_parses_rfc3339_since() {
+        // #2789: an RFC3339 timestamp is accepted and parsed to a UTC instant.
+        let json = r#"{"type": "incremental", "since": "2026-01-15T12:30:00Z"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(req.since, Some(expected));
     }
 
     #[test]
@@ -1978,6 +2149,12 @@ mod tests {
         };
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
+        // #2522: the two INSERTs are now spawned off the hot path — wait for
+        // both rows to land before asserting on them.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 2).await,
+            2
+        );
 
         // Filter by artifact: both rows.
         let by_artifact = query_downloads(
@@ -2080,6 +2257,11 @@ mod tests {
 
         crate::services::artifact_service::record_download(&pool, artifact_id, &Default::default())
             .await;
+        // #2522: the INSERT is now spawned — wait for the row before reading it.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 1).await,
+            1
+        );
 
         let (ip, uid): (Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT ip_address, user_id FROM download_statistics WHERE artifact_id = $1",

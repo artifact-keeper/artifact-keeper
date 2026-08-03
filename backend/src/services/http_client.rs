@@ -61,7 +61,61 @@ pub fn base_client_builder() -> ClientBuilder {
 
     let builder = reqwest::Client::builder()
         .redirect(ssrf_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver());
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
+        // This crate's own `Cargo.toml` requests only `["json", "stream",
+        // "form"]`, but Cargo unifies features for a single resolved
+        // `reqwest` version across the whole build: the `opensearch` crate
+        // (full-text search) pulls in `reqwest` with its `gzip` feature
+        // enabled, which silently switches EVERY `reqwest::Client` in this
+        // binary — including this one — into auto content-negotiation mode.
+        // That makes the client add `Accept-Encoding: gzip` to outbound
+        // upstream requests and, on any response upstream compresses,
+        // transparently decode the body AND strip both `Content-Encoding`
+        // and `Content-Length` from `response.headers()` before this proxy's
+        // header-capture code ever sees them. A CDN that compresses
+        // responses above a size threshold (observed live against
+        // huggingface.co's CloudFront) then reaches the client with no
+        // Content-Length, which `huggingface_hub`'s HEAD-based metadata
+        // check hard-requires (`FileMetadataError: Distant resource does not
+        // have a Content-Length`) — small responses stay under the
+        // threshold and are unaffected, which is why this only shows up on
+        // larger upstream files. `no_gzip`/`no_brotli`/`no_deflate`/
+        // `no_zstd` are documented by reqwest to exist for exactly this
+        // "another dependency enabled it" scenario: they stop the
+        // auto-negotiation (no automatic `Accept-Encoding`, no automatic
+        // decode) regardless of which decompression features happen to be
+        // compiled in, so every proxied format's Content-Length survives
+        // intact.
+        //
+        // Only `gzip` is actually in the resolved feature set today; the other
+        // three are defensive, so a future dependency enabling brotli/zstd
+        // cannot silently re-introduce the same bug.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        // Disabling the codecs makes reqwest/tower-http send *no*
+        // `Accept-Encoding` at all, and RFC 9110 §12.5.3 reads an absent
+        // header as "any content coding is acceptable" — the opposite of what
+        // this client can handle now that nothing decodes. Advertise identity
+        // explicitly so a compliant upstream does not elect a coding we would
+        // then pass through to the client. This is belt-and-braces with the
+        // `content_encoding` plumbing in `proxy_service`: object stores
+        // (notably S3) return a stored `Content-Encoding` regardless of what
+        // the request advertised, so the header must still be forwarded
+        // faithfully when it does appear.
+        //
+        // Composes with tower-http's decompression layer, which only inserts
+        // `Accept-Encoding` when the entry is vacant — this explicit value
+        // wins.
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            headers
+        });
 
     apply_custom_ca_cert(builder)
 }
@@ -657,7 +711,17 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    /// The clock starts UNPAUSED here (#2974): under `start_paused = true`
+    /// the very first `advance()` raced the real loopback TCP handshake —
+    /// the handshake progresses in wall-clock time while `connect_timeout`
+    /// is measured in virtual time, so jumping the clock 20s could expire
+    /// the 10s connect timeout before the socket ever became writable
+    /// (deterministic on some platforms). Instead, the connect and the
+    /// response headers complete under real time; only then is the clock
+    /// paused and advanced, so the sole outstanding timers are the server's
+    /// mid-body delay and any total timeout the builder might (wrongly)
+    /// apply — which is exactly what this test exists to detect.
+    #[tokio::test]
     async fn test_large_object_client_builder_does_not_apply_total_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -697,19 +761,27 @@ mod tests {
                 .build()
                 .expect("build large-object client")
         };
+        let (headers_received_tx, headers_received_rx) = tokio::sync::oneshot::channel::<()>();
         let request = tokio::spawn(async move {
-            client
+            let response = client
                 .post(&url)
                 .body("request body")
                 .send()
                 .await
-                .expect("send request")
-                .bytes()
-                .await
-                .expect("read response")
+                .expect("send request");
+            // Response headers are in: connect (and its timeout timer) are
+            // fully behind us, under real time. Tell the test it is now safe
+            // to pause the clock and jump past the server's mid-body delay.
+            headers_received_tx
+                .send(())
+                .expect("signal headers received");
+            response.bytes().await.expect("read response")
         });
 
-        tokio::task::yield_now().await;
+        headers_received_rx
+            .await
+            .expect("request task reached response headers");
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(20)).await;
 
         assert_eq!(request.await.expect("request task").as_ref(), b"OK");

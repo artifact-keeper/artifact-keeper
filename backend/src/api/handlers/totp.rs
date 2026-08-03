@@ -1578,8 +1578,10 @@ mod totp_audit_tests {
         )
         .await;
 
-        let enabled = tdh::audit_count(&pool, user_id, "TOTP_ENABLED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let enabled = tdh::audit_count_eventually(&pool, user_id, "TOTP_ENABLED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1620,8 +1622,10 @@ mod totp_audit_tests {
         )
         .await;
 
-        let disabled = tdh::audit_count(&pool, user_id, "TOTP_DISABLED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let disabled = tdh::audit_count_eventually(&pool, user_id, "TOTP_DISABLED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1669,8 +1673,9 @@ mod totp_audit_tests {
         )
         .await;
 
-        let logins = tdh::audit_count(&pool, user_id, "LOGIN").await;
-        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let logins = tdh::audit_count_eventually(&pool, user_id, "LOGIN", 1).await;
+        let failed = tdh::audit_count_eventually(&pool, user_id, "LOGIN_FAILED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1713,7 +1718,8 @@ mod totp_audit_tests {
         )
         .await;
 
-        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for it.
+        let failed = tdh::audit_count_eventually(&pool, user_id, "LOGIN_FAILED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 

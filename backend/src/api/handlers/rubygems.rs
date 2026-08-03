@@ -108,8 +108,7 @@ async fn gem_info(
             .unwrap_or("")
             .to_string();
 
-        let gem_filename = format!("{}-{}.gem", gem_name, version);
-        let gem_uri = format!("/gems/{}/gems/{}", repo_key, gem_filename);
+        let gem_uri = gem_download_uri(&repo_key, &artifact.path, gem_name, &version);
 
         let json = serde_json::json!({
             "name": gem_name,
@@ -177,14 +176,12 @@ async fn gem_versions(
                 .unwrap_or("")
                 .to_string();
 
-            let gem_filename = format!("{}-{}.gem", gem_name, version);
-
             serde_json::json!({
                 "number": version,
                 "summary": description,
                 "platform": "ruby",
                 "sha": a.checksum_sha256,
-                "gem_uri": format!("/gems/{}/gems/{}", repo_key, gem_filename),
+                "gem_uri": gem_download_uri(&repo_key, &a.path, gem_name, &version),
                 "downloads_count": 0,
             })
         })
@@ -288,7 +285,7 @@ async fn push_gem(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rubygems", "write:artifacts")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -451,6 +448,23 @@ fn spec_index_coordinates(path: &str, name: String, version: String) -> (String,
         .filter(|f| !f.is_empty())
         .and_then(crate::formats::rubygems::coordinates_from_gem_filename)
         .unwrap_or((name, version))
+}
+
+/// Build the `gem_uri` advertised in the JSON gem/version API.
+///
+/// The download route (`GET /gems/{repo}/gems/{file}`) resolves a hosted gem by
+/// its trailing filename suffix (#2587), so the advertised URI must carry the
+/// artifact's actual stored basename. Natively pushed gems are stored at
+/// `{name}-{version}/{name}-{version}.gem`, whose basename equals the
+/// reconstructed `{name}-{version}.gem` — byte-identical for them. A gem pushed
+/// through the generic upload flow is stored at its bare path with
+/// generically-derived coordinates, so reconstructing `{name}-{version}.gem`
+/// would advertise a path the download route cannot resolve (the RubyGems
+/// analogue of the RPM `<location>` fix, #2587 / #2589).
+fn gem_download_uri(repo_key: &str, path: &str, name: &str, version: &str) -> String {
+    let filename =
+        proxy_helpers::advertised_download_filename(path, &format!("{}-{}.gem", name, version));
+    format!("/gems/{}/gems/{}", repo_key, filename)
 }
 
 /// Query gem specs from all local (non-remote) virtual members.
@@ -993,6 +1007,31 @@ mod tests {
         assert_eq!(version, "sha256-deadbeef");
     }
 
+    #[test]
+    fn test_gem_download_uri_native_path_is_byte_identical() {
+        // Native push: basename already equals `{name}-{version}.gem`.
+        assert_eq!(
+            gem_download_uri("rg", "rails/7.0.8/rails-7.0.8.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/rails-7.0.8.gem"
+        );
+    }
+
+    #[test]
+    fn test_gem_download_uri_bare_path_advertises_stored_basename() {
+        // Generic upload stored at a bare/arbitrary path: the advertised
+        // gem_uri must carry the real basename so the suffix download route
+        // (with #2587 exact-path fallback) resolves it — not the reconstructed
+        // `{name}-{version}.gem` that would 404.
+        assert_eq!(
+            gem_download_uri("rg", "blob.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/blob.gem"
+        );
+        assert_eq!(
+            gem_download_uri("rg", "uploads/x/pkg.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/pkg.gem"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // DependencyQuery deserialization
     // -----------------------------------------------------------------------
@@ -1097,6 +1136,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");

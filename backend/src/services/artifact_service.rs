@@ -1469,13 +1469,17 @@ impl ArtifactService {
 
         // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
         // per-access record auditors need to answer "who fetched this artifact,
-        // and when?". Fire-and-forget: a download must never fail because the
-        // audit table is unavailable, mirroring the download-statistics write
-        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        // and when?". Routed through the bounded download-event dispatcher
+        // (#2522) rather than a per-request spawn: a download must never fail
+        // (or slow) because the audit table is unavailable, and a flood must
+        // never grow tasks/connections without bound — mirroring the
+        // download-statistics write above. Only this download hot-path emitter
+        // uses the dispatcher; the non-hot-path `audit_fire_and_forget` call
+        // sites (auth/user/token lifecycle) keep their existing spawn. The IP
+        // is parsed leniently; a malformed value is simply omitted.
         {
-            use crate::services::audit_service::{
-                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
-            };
+            use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+            use crate::services::download_event_dispatch::{try_enqueue, DownloadEvent};
             let mut entry =
                 AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
                     .resource(artifact_id)
@@ -1495,7 +1499,7 @@ impl ArtifactService {
             if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
                 entry = entry.ip(ip);
             }
-            audit_fire_and_forget(self.db.clone(), entry).await;
+            let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
 
         // Trigger AfterDownload hooks (non-blocking)
@@ -1955,6 +1959,12 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;
 
+        // The soft-delete's usage-ledger decrement is applied by migration
+        // 182's row-level trigger in this statement's own transaction
+        // (is_deleted false -> true releases the bytes; re-flipping an
+        // already-deleted row is a zero-delta no-op), so freed space is
+        // admissible by the very next quota-checked upload with no manual
+        // ledger write here.
         let result = sqlx::query!(
             "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1",
             id
@@ -2313,7 +2323,12 @@ pub async fn guard_foreign_storage_key_for_backend(
 ///
 /// Call this only after a **local** artifact row has been resolved; remote
 /// pass-through proxy fetches are not our artifacts and stay unrecorded.
-pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+///
+/// The pool parameter is retained (underscore-bound) purely for call-site
+/// stability: the ~45 format/generic/OCI call sites keep compiling unchanged
+/// while the bounded dispatcher's flush workers own the only side-effect DB
+/// connections (#2522).
+pub async fn record_download(_db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
     // A HEAD request serves no body — it must never write a download row
     // (#2260 §5). This is the single choke point every serving path funnels
     // through (hosted stream, presigned redirect, virtual-member local resolve,
@@ -2324,19 +2339,26 @@ pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadConte
     if ctx.is_head {
         return;
     }
-    if let Err(e) = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(artifact_id)
-    .bind(ctx.user_id)
-    .bind(ctx.client_ip.map(|ip| ip.to_string()))
-    .bind(ctx.user_agent.as_deref())
-    .execute(db)
-    .await
-    {
-        warn!(%artifact_id, error = %e, "failed to record download statistics");
-    }
+    // Route the statistics write through the BOUNDED download-event dispatcher
+    // (#2522). The first #2522 slice moved this INSERT off the byte plane with
+    // a per-request `tokio::spawn`, which left task + pool-connection growth
+    // unbounded under a download flood with a slow event store. `try_enqueue`
+    // never blocks, awaits, or spawns: the event is queued for a fixed pool of
+    // batch-flush workers, shed (dropped + counted) on overflow, and silently
+    // skipped when no dispatcher is installed (tests) — statistics must never
+    // block or fail the download itself. Attribution (trusted-proxy client IP,
+    // user, user-agent) is captured HERE, at request time, so it cannot drift
+    // across the async hop. The `is_head` "no body ⇒ no row" contract is
+    // preserved (checked synchronously above).
+    use crate::services::download_event_dispatch::{
+        try_enqueue, DownloadEvent, DownloadStatsEvent,
+    };
+    let _ = try_enqueue(DownloadEvent::Stats(DownloadStatsEvent {
+        artifact_id,
+        user_id: ctx.user_id,
+        ip_address: ctx.client_ip.map(|ip| ip.to_string()),
+        user_agent: ctx.user_agent.clone(),
+    }));
 }
 
 /// URL fields commonly found in package metadata across all formats.
@@ -2449,6 +2471,58 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed artifact");
+    }
+
+    /// #2940: `list_page` must keep selecting the quarantine columns so the
+    /// listing handler can surface per-artifact quarantine state. Guards
+    /// against a future refactor dropping them from the SELECT (which would
+    /// silently report every artifact as unquarantined again).
+    #[tokio::test]
+    async fn test_list_page_carries_quarantine_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let held_key = format!("generic/{}", Uuid::new_v4());
+        let clean_key = format!("generic/{}", Uuid::new_v4());
+        seed_artifact(&pool, repo_id, "held/pkg-1.0.0.bin", &held_key).await;
+        seed_artifact(&pool, repo_id, "clean/pkg-1.0.0.bin", &clean_key).await;
+
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = $2 \
+             WHERE repository_id = $1 AND path = 'held/pkg-1.0.0.bin'",
+        )
+        .bind(repo_id)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .expect("apply quarantine");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let page = service
+            .list_page(repo_id, None, None, None, 0, 50)
+            .await
+            .expect("list page");
+
+        let held = page
+            .iter()
+            .find(|a| a.path == "held/pkg-1.0.0.bin")
+            .expect("held artifact listed");
+        assert_eq!(held.quarantine_status.as_deref(), Some("quarantined"));
+        assert!(held.quarantine_until.is_some());
+
+        let clean = page
+            .iter()
+            .find(|a| a.path == "clean/pkg-1.0.0.bin")
+            .expect("clean artifact listed");
+        assert!(clean.quarantine_status.is_none());
+        assert!(clean.quarantine_until.is_none());
     }
 
     #[tokio::test]
@@ -3455,9 +3529,32 @@ mod tests {
     /// by the shared service-layer choke points (`finalize_upload`,
     /// `finish_download`, `delete_with_sync_options`). The download event also
     /// carries the client IP and acting user. Skips without `DATABASE_URL`.
+    ///
+    /// Since #2522 the audit writes are fire-and-forget (spawned, not awaited),
+    /// so each event count is polled with a short bounded retry rather than
+    /// asserted synchronously.
     #[tokio::test]
     async fn test_artifact_lifecycle_emits_audit_events_db() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        /// Poll `audit_count` for `(artifact_id, action)` until it reaches
+        /// `expected` or the bounded budget is exhausted (#2522 async audit).
+        async fn poll_audit_count(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            action: &str,
+            expected: i64,
+        ) -> i64 {
+            let mut last = -1;
+            for _ in 0..50 {
+                last = tdh::audit_count(pool, artifact_id, action).await;
+                if last >= expected {
+                    return last;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            last
+        }
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -3470,8 +3567,9 @@ mod tests {
         );
         let svc = ArtifactService::new(pool.clone(), storage);
 
-        // Upload -> ARTIFACT_UPLOADED (audit write is awaited inside
-        // finalize_upload, so it has landed by the time upload() returns).
+        // Upload -> ARTIFACT_UPLOADED. The audit write is spawned fire-and-forget
+        // inside finalize_upload (#2522), so poll for it rather than assert it
+        // has already landed by the time upload() returns.
         let artifact = svc
             .upload(
                 repo_id,
@@ -3485,7 +3583,7 @@ mod tests {
             .await
             .expect("upload succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED", 1).await,
             1,
             "upload emits exactly one ARTIFACT_UPLOADED event"
         );
@@ -3502,7 +3600,7 @@ mod tests {
             .await
             .expect("download succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED", 1).await,
             1,
             "download emits exactly one ARTIFACT_DOWNLOADED event"
         );
@@ -3510,7 +3608,7 @@ mod tests {
         // Delete -> ARTIFACT_DELETED.
         svc.delete(artifact.id).await.expect("delete succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DELETED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DELETED", 1).await,
             1,
             "delete emits exactly one ARTIFACT_DELETED event"
         );
@@ -3979,5 +4077,197 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -- #2522 download-statistics write moved OFF the synchronous hot path -----
+    // `record_download` now SPAWNS the `download_statistics` INSERT instead of
+    // awaiting it, so the byte stream returns without blocking on the catalog
+    // pool. These tests assert the eventual-write contract (poll with a bounded
+    // retry, matching the async-timing caveat) and that the HEAD "no body ⇒ no
+    // row" guard still holds synchronously.
+
+    /// Seed a live artifact row and return its id (self-contained, `RETURNING`).
+    #[cfg(test)]
+    async fn seed_dl_artifact(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+        let key = format!("dl/{}", Uuid::new_v4());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, $3, 'application/octet-stream', $4) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind("0".repeat(64))
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact returning id")
+    }
+
+    /// Poll `download_statistics` for `artifact_id` until it reaches `expected`
+    /// or the bounded retry budget is exhausted; returns the last observed count.
+    #[cfg(test)]
+    async fn poll_dl_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..50 {
+            last = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn test_record_download_eventually_writes_row_off_hot_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/dl-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: "203.0.113.7".parse().ok(),
+            user_id: None,
+            user_agent: Some("unit-test/1.0".to_string()),
+            is_head: false,
+        };
+        // Returns without awaiting the INSERT (enqueued to the bounded
+        // dispatcher `tdh::try_pool` installed); the batch flush lands the row
+        // shortly after. The count must still reach 1 — the eventual-write
+        // contract survives the spawn -> bounded-dispatch change (#2522).
+        record_download(&pool, artifact_id, &ctx).await;
+        let count = poll_dl_count(&pool, artifact_id, 1).await;
+        assert_eq!(
+            count, 1,
+            "dispatched download_statistics write must eventually land"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_download_head_writes_no_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/head-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: true,
+        };
+        record_download(&pool, artifact_id, &ctx).await;
+        // Give any (erroneous) spawned write time to land, then assert none did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count download_statistics");
+        assert_eq!(count, 0, "a HEAD serves no body and must never write a row");
+    }
+
+    /// #2516 S2: the service delete's soft-delete releases the artifact's
+    /// bytes from the usage ledger in the same transaction (migration 182's
+    /// trigger fires on the `is_deleted` flip), so freed space is admissible
+    /// by the very next upload — no reconciler pass needed. End-state
+    /// assertions only: the ledger must equal the live sum after each step.
+    #[tokio::test]
+    async fn test_delete_releases_ledger_bytes_immediately() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        // A 600-byte artifact; the insert trigger charges the ledger.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'rel/big.bin', 'big.bin', 600, repeat('a', 64), \
+                     'application/octet-stream', 'keys/rel/big.bin')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(pool.clone());
+
+        let artifact_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = 'rel/big.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        // Another 600 bytes cannot be admitted while the first artifact holds
+        // its quota share.
+        assert!(!repo_service
+            .check_quota(repo_id, 600)
+            .await
+            .expect("preflight"));
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete");
+
+        let hosted = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row");
+        assert_eq!(
+            hosted, 0,
+            "delete must release the bytes in the same transaction"
+        );
+        assert!(
+            repo_service
+                .check_quota(repo_id, 600)
+                .await
+                .expect("preflight after delete"),
+            "freed space must be admissible by the very next upload"
+        );
+        // Idempotence: re-deleting maps to NotFound, and re-flipping an
+        // already-deleted row is a zero-delta no-op for the trigger — the
+        // same bytes are never released twice.
+        assert!(service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .is_err());
+        let hosted_after = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row after re-delete");
+        assert_eq!(hosted_after, 0, "re-delete must not decrement again");
     }
 }

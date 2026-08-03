@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"live_rpm_count!\", MAX(a.updated_at) AS latest_update\n        FROM artifacts a\n        WHERE a.repository_id = ANY($1) AND a.is_deleted = false\n          AND a.path LIKE '%.rpm'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live_rpm_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "latest_update",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "b27f5013af43d7ffbf97be0e9ff0f8f8940b46cff8a980ef1cd22e79ff825533"
+}

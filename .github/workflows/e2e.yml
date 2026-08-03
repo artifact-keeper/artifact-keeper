@@ -113,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Build backend image (cached)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -147,9 +147,40 @@ jobs:
           echo "Running native client tests with profile: $PROFILE"
 
           if [ "$PROFILE" = "smoke" ] || [ -z "$PROFILE" ]; then
-            # Default smoke tests run without a profile flag
-            docker compose -f docker-compose.test.yml --profile smoke up \
-              --abort-on-container-exit
+            # Start the smoke stack detached and wait for every test suite to
+            # run to completion, then inspect each suite's exit code. Do NOT
+            # use `--abort-on-container-exit` here: it stops all remaining
+            # containers as soon as the first one exits and returns only that
+            # container's exit code, so the fastest suite (or a support
+            # container) decides the verdict and failures in the slower
+            # suites go green. Mirrors the smoke-e2e job in ci.yml.
+            docker compose -f docker-compose.test.yml --profile smoke up -d
+
+            echo "Waiting for test containers to finish..."
+            timeout 1500 docker wait e2e-test-pypi e2e-test-npm e2e-test-cargo e2e-test-proxy-virtual || {
+              echo "ERROR: Tests timed out. Container statuses:"
+              docker ps -a --filter "name=e2e-test" --format "table {{.Names}}\t{{.Status}}"
+              echo ""
+              echo "Backend logs (last 50 lines):"
+              docker logs e2e-test-backend --tail 50 2>&1 || true
+              exit 1
+            }
+
+            failed=false
+            for test in pypi npm cargo proxy-virtual; do
+              container="e2e-test-${test}"
+              exit_code=$(docker inspect --format='{{.State.ExitCode}}' "$container" 2>/dev/null || echo "N/A")
+              echo ""
+              echo "═══════════════════════════════════════════"
+              echo "  ${test} — Exit Code: $exit_code"
+              echo "═══════════════════════════════════════════"
+              docker logs "$container" 2>&1 || true
+              if [ "$exit_code" != "0" ]; then failed=true; fi
+            done
+            if [ "$failed" = "true" ]; then
+              echo "One or more smoke test suites failed."
+              exit 1
+            fi
           else
             docker compose -f docker-compose.test.yml --profile "$PROFILE" up \
               --abort-on-container-exit

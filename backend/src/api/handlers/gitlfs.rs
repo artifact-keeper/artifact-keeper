@@ -28,6 +28,7 @@ use tracing::info;
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::repositories::require_repo_action;
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -229,6 +230,9 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
         format: "generic".to_string(),
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        age_gate_mode: "upstream_publish_time".to_string(),
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     })
 }
 
@@ -294,9 +298,33 @@ async fn batch(
         ));
     }
 
-    // Upload requires authentication
+    // Upload requires authentication AND repository write authorization.
+    //
+    // `repo_visibility_middleware` routes the batch POST through the read path
+    // because it is the download/upload *negotiation* (a read-only member and a
+    // public-repo non-member must be able to `git lfs pull`). That means the
+    // upload branch is responsible for its own write gate: authentication alone
+    // is not sufficient — a read-only member / public-repo non-member must not
+    // be able to negotiate an upload. Route the check through the canonical
+    // deny-by-default action choke-point (#2603 G1) shared with the artifact
+    // write handlers; the subsequent object `PUT` is independently write-gated
+    // by the same middleware.
     let auth_header = if request.operation == "upload" {
-        let _user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+        let ext = require_auth_basic(auth, "git-lfs")?;
+        require_repo_action(&ext, repo.id, "write", &state.permission_service)
+            .await
+            .map_err(|e| {
+                let status = match &e {
+                    crate::error::AppError::ServiceUnavailable(_) => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    _ => StatusCode::FORBIDDEN,
+                };
+                lfs_error_response(
+                    status,
+                    "You do not have permission to upload to this repository",
+                )
+            })?;
         // Pass auth header through to action hrefs
         headers
             .get(axum::http::header::AUTHORIZATION)
@@ -443,7 +471,7 @@ async fn upload_object(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -751,7 +779,7 @@ async fn create_lock(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: CreateLockRequest = serde_json::from_slice(&body).map_err(|e| {
@@ -923,7 +951,7 @@ async fn verify_locks(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Parse request body (optional, may be empty)
@@ -1003,7 +1031,7 @@ async fn delete_lock(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete:artifacts")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let force = if body.is_empty() {
@@ -1434,6 +1462,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

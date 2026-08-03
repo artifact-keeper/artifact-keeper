@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO proxy_scan_results (\n                checksum_sha256, scan_type, verdict,\n                findings_count, critical_count, high_count, medium_count, low_count,\n                max_severity, scanner_version, repository_id, scanned_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())\n            ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET\n                verdict = EXCLUDED.verdict,\n                findings_count = EXCLUDED.findings_count,\n                critical_count = EXCLUDED.critical_count,\n                high_count = EXCLUDED.high_count,\n                medium_count = EXCLUDED.medium_count,\n                low_count = EXCLUDED.low_count,\n                max_severity = EXCLUDED.max_severity,\n                scanner_version = EXCLUDED.scanner_version,\n                repository_id = EXCLUDED.repository_id,\n                scanned_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "57a50434fce558cdc24ebae014ae48808372189a073ab859e93cbdd71d67e66d"
+}

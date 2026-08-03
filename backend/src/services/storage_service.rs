@@ -541,6 +541,54 @@ impl StorageService {
         Ok(Self { backend })
     }
 
+    /// Resolve the dedicated S3 bucket that backup archives should be routed
+    /// to, or `None` to reuse the primary storage bucket (#2507).
+    ///
+    /// Only applies to the S3 backend — `BACKUP_S3_BUCKET` is meaningless for
+    /// filesystem/GCS/Azure, so those always fall back to primary storage. An
+    /// empty/whitespace value behaves like unset, keeping the default (unset)
+    /// behavior byte-identical to before this feature.
+    pub fn resolve_backup_bucket(config: &Config) -> Option<String> {
+        if config.storage_backend != "s3" {
+            return None;
+        }
+        config
+            .backup_s3_bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Build the [`StorageService`] used for backup **archives** (#2507).
+    ///
+    /// When `BACKUP_S3_BUCKET` is configured (S3 backend only) this returns a
+    /// handle pointing at that separate bucket, built from the same env-derived
+    /// S3 config as primary storage with only the bucket overridden. Otherwise
+    /// it returns a clone of the primary handle, so the default (unset) path is
+    /// byte-identical and never opens a second S3 client.
+    ///
+    /// Only the backup **archive** read/write path is routed here; source
+    /// artifact reads (and artifact restores) continue to use primary storage,
+    /// so a separate backup bucket never changes where artifacts live.
+    pub async fn backup_archive_from_config(
+        config: &Config,
+        primary: &Arc<StorageService>,
+    ) -> Result<Arc<StorageService>> {
+        match Self::resolve_backup_bucket(config) {
+            Some(bucket) => {
+                let mut s3_config = crate::storage::s3::S3Config::from_env()?;
+                s3_config.prefix = None;
+                s3_config.bucket = bucket;
+                let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
+                Ok(Arc::new(StorageService::new(Arc::new(S3BackendWrapper {
+                    inner,
+                }))))
+            }
+            None => Ok(primary.clone()),
+        }
+    }
+
     /// Create with a specific backend (for testing)
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
         Self { backend }
@@ -1087,6 +1135,95 @@ mod tests {
         assert!(
             result.is_err(),
             "from_config must fail for azure until #1555 wires an Azure proxy arm"
+        );
+    }
+
+    // -- Separate backup S3 bucket (#2507) -----------------------------------
+
+    #[test]
+    fn resolve_backup_bucket_unset_falls_back_to_primary() {
+        // No BACKUP_S3_BUCKET => backups stay in the primary storage bucket.
+        let mut config = minimal_config("s3");
+        config.backup_s3_bucket = None;
+        assert_eq!(StorageService::resolve_backup_bucket(&config), None);
+    }
+
+    #[test]
+    fn resolve_backup_bucket_set_on_s3_routes_to_separate_bucket() {
+        // With BACKUP_S3_BUCKET set on an S3 deployment, archives target the
+        // dedicated bucket.
+        let mut config = minimal_config("s3");
+        config.backup_s3_bucket = Some("ak-backups-cold".to_string());
+        assert_eq!(
+            StorageService::resolve_backup_bucket(&config),
+            Some("ak-backups-cold".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_backup_bucket_ignored_for_non_s3_backends() {
+        // BACKUP_S3_BUCKET is an S3-only concept; filesystem/gcs ignore it.
+        for backend in ["filesystem", "gcs", "azure"] {
+            let mut config = minimal_config(backend);
+            config.backup_s3_bucket = Some("ak-backups-cold".to_string());
+            assert_eq!(
+                StorageService::resolve_backup_bucket(&config),
+                None,
+                "backend {backend} must ignore BACKUP_S3_BUCKET"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_backup_bucket_empty_value_behaves_like_unset() {
+        for raw in ["", "   ", "\t"] {
+            let mut config = minimal_config("s3");
+            config.backup_s3_bucket = Some(raw.to_string());
+            assert_eq!(
+                StorageService::resolve_backup_bucket(&config),
+                None,
+                "raw = {raw:?} must behave like unset"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_archive_from_config_reuses_primary_when_unset() {
+        // Default (unset) path must be byte-identical: the archive handle is
+        // the very same Arc as primary storage, so no second client is built.
+        let temp_dir = TempDir::new().unwrap();
+        let primary: Arc<StorageService> = Arc::new(StorageService::new(Arc::new(
+            FilesystemBackend::new(temp_dir.path().to_path_buf()),
+        )));
+
+        let mut config = minimal_config("s3");
+        config.backup_s3_bucket = None;
+        let archive = StorageService::backup_archive_from_config(&config, &primary)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&primary, &archive),
+            "unset BACKUP_S3_BUCKET must reuse the primary storage handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_archive_from_config_reuses_primary_on_non_s3() {
+        // Even with BACKUP_S3_BUCKET set, a non-S3 backend keeps archives on
+        // primary storage (the var only applies to S3).
+        let temp_dir = TempDir::new().unwrap();
+        let primary: Arc<StorageService> = Arc::new(StorageService::new(Arc::new(
+            FilesystemBackend::new(temp_dir.path().to_path_buf()),
+        )));
+
+        let mut config = minimal_config("filesystem");
+        config.backup_s3_bucket = Some("ak-backups-cold".to_string());
+        let archive = StorageService::backup_archive_from_config(&config, &primary)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&primary, &archive),
+            "non-S3 backend must ignore BACKUP_S3_BUCKET and reuse primary"
         );
     }
 

@@ -526,13 +526,7 @@ async fn package_info(
         .iter()
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-
-            serde_json::json!({
-                "version": version,
-                "url": tarball_url,
-                "checksum": a.checksum_sha256,
-            })
+            build_hex_release_entry(&repo_key, &name, &version, Some(&a.checksum_sha256))
         })
         .collect();
 
@@ -797,7 +791,7 @@ async fn publish_package(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "hex", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "hex", "write:artifacts")?.user_id;
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -862,14 +856,14 @@ async fn publish_package(
             .into_response());
     }
 
-    let filename = format!("{}-{}.tar", pkg_name, pkg_version);
+    let filename = build_hex_filename(&pkg_name, &pkg_version);
 
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
-    let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
+    let artifact_path = build_hex_artifact_path(&pkg_name, &pkg_version);
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -879,7 +873,7 @@ async fn publish_package(
     )
     .await?;
 
-    let storage_key = format!("hex/{}/{}/{}", pkg_name, pkg_version, filename);
+    let storage_key = build_hex_storage_key(&pkg_name, &pkg_version);
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     // Record the facts the signed registry has to advertise for this release:
@@ -894,12 +888,7 @@ async fn publish_package(
     })
     .map_err(|e| e.into_response())?;
 
-    let mut hex_metadata = serde_json::json!({
-        "format": "hex",
-        "name": pkg_name,
-        "version": pkg_version,
-        "filename": filename,
-    });
+    let mut hex_metadata = build_hex_metadata(&pkg_name, &pkg_version);
     match registry_facts {
         Ok(facts) => {
             if let Some(obj) = hex_metadata.as_object_mut() {
@@ -950,11 +939,7 @@ async fn publish_package(
         pkg_name, pkg_version, filename, repo_key
     );
 
-    let response_json = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "url": format!("/hex/{}/tarballs/{}", repo_key, filename),
-    });
+    let response_json = build_hex_publish_response(&repo_key, &pkg_name, &pkg_version);
 
     Ok(Response::builder()
         .status(StatusCode::CREATED)
@@ -1440,12 +1425,7 @@ fn build_package_info_json(
         .iter()
         .map(|(version, checksum)| {
             let v = version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", virtual_repo_key, name, v);
-            serde_json::json!({
-                "version": v,
-                "url": tarball_url,
-                "checksum": checksum,
-            })
+            build_hex_release_entry(virtual_repo_key, name, &v, Some(checksum))
         })
         .collect();
     serde_json::json!({
@@ -1704,6 +1684,68 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Path/URL builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the standard hex tarball filename: `{name}-{version}.tar`
+fn build_hex_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar", name, version)
+}
+
+/// Build the artifact storage path: `{name}/{version}/{name}-{version}.tar`
+fn build_hex_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
+fn build_hex_storage_key(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("hex/{}/{}/{}", name, version, filename)
+}
+
+/// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
+fn build_hex_tarball_url(repo_key: &str, name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("/hex/{}/tarballs/{}", repo_key, filename)
+}
+
+/// Build hex metadata JSON for a package.
+fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
+    let filename = build_hex_filename(name, version);
+    serde_json::json!({
+        "format": "hex",
+        "name": name,
+        "version": version,
+        "filename": filename,
+    })
+}
+
+/// Build the JSON publish response.
+fn build_hex_publish_response(repo_key: &str, name: &str, version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+    })
+}
+
+/// Build a release entry for the package info endpoint.
+fn build_hex_release_entry(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    checksum: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+        "checksum": checksum,
+    })
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -2284,67 +2326,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the standard hex tarball filename: `{name}-{version}.tar`
-    fn build_hex_filename(name: &str, version: &str) -> String {
-        format!("{}-{}.tar", name, version)
-    }
-
-    /// Build the artifact storage path: `{name}/{version}/{name}-{version}.tar`
-    fn build_hex_artifact_path(name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
-    fn build_hex_storage_key(name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("hex/{}/{}/{}", name, version, filename)
-    }
-
-    /// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
-    fn build_hex_tarball_url(repo_key: &str, name: &str, version: &str) -> String {
-        let filename = build_hex_filename(name, version);
-        format!("/hex/{}/tarballs/{}", repo_key, filename)
-    }
-
-    /// Build hex metadata JSON for a package.
-    fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
-        let filename = build_hex_filename(name, version);
-        serde_json::json!({
-            "format": "hex",
-            "name": name,
-            "version": version,
-            "filename": filename,
-        })
-    }
-
-    /// Build the JSON publish response.
-    fn build_hex_publish_response(repo_key: &str, name: &str, version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "url": build_hex_tarball_url(repo_key, name, version),
-        })
-    }
-
-    /// Build a release entry for the package info endpoint.
-    fn build_hex_release_entry(
-        repo_key: &str,
-        name: &str,
-        version: &str,
-        checksum: Option<&str>,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "version": version,
-            "url": build_hex_tarball_url(repo_key, name, version),
-            "checksum": checksum,
-        })
-    }
-
-    // -----------------------------------------------------------------------
     // extract_credentials
     // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
@@ -2677,6 +2658,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -2695,6 +2679,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.upstream_url.as_deref(), Some("https://repo.hex.pm"));
     }
@@ -2743,6 +2730,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_ne!(repo.repo_type, "remote");
         assert_ne!(repo.repo_type, "virtual");
@@ -2762,6 +2752,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());
@@ -2782,6 +2775,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_none());
@@ -2801,6 +2797,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "virtual");
     }
@@ -3099,6 +3098,122 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"hex-tar");
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `build_hex_tarball_url` unit tests prove the builder emits a string;
+    // only routing the URL the `/packages/{name}` document actually advertises
+    // against the REAL router (mounted where `api::routes` nests it) proves a
+    // hex client can fetch the published tarball. A wrongly-shaped or
+    // wrongly-prefixed release `url` passes every builder test yet 404s on
+    // `mix deps.get`.
+    // -----------------------------------------------------------------------
+
+    /// The hex routes mounted exactly where `api::routes` nests them. The
+    /// advertised release `url` is root-absolute and carries the `/hex` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/hex", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// The tarball `url` the `/packages/{name}` document advertises (the JSON
+    /// release resource a Virtual hex repo serves) must resolve against the real
+    /// download route and serve the published tarball bytes. The advertised url
+    /// carries the VIRTUAL repo key, so a client following it lands back on the
+    /// same virtual repo, which serves the local member's bytes.
+    #[tokio::test]
+    async fn test_advertised_release_url_resolves_against_real_router() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (local_repo_id, _local_key, local_storage_dir) =
+            tdh::create_repo(&pool, "local", "hex").await;
+        let (virtual_repo_id, virtual_key, _virtual_storage_dir) =
+            tdh::create_repo(&pool, "virtual", "hex").await;
+        let state = tdh::build_state(pool.clone(), local_storage_dir.to_str().unwrap());
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_repo_id)
+        .bind(local_repo_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+
+        let name = "jason";
+        let version = "1.4.1";
+        let tarball: &[u8] = b"hex-tarball-bytes-for-advertised-url";
+        let local_repo =
+            tdh::make_repo_info(local_repo_id, "local-hex", &local_storage_dir, "hex", None);
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &local_repo,
+            &format!("hex/{name}/{version}/{name}-{version}.tar"),
+            &format!("{name}/{version}/{name}-{version}.tar"),
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from_static(tarball),
+            user_id,
+        )
+        .await;
+
+        // Read the release `url` the package-info document advertises.
+        let meta_path = format!("/hex/{virtual_key}/packages/{name}");
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(meta_path),
+        )
+        .await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let advertised = meta["releases"][0]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if advertised.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&meta_doc_url, &advertised);
+            tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        tdh::cleanup(&pool, virtual_repo_id, user_id).await;
+        tdh::cleanup(&pool, local_repo_id, user_id).await;
+
+        assert_eq!(meta_status, StatusCode::OK, "package-info document");
+        assert!(
+            !advertised.is_empty(),
+            "package-info must advertise a release url"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised release url ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tarball,
+            "the advertised release url must serve the published tarball bytes"
+        );
     }
 
     #[tokio::test]

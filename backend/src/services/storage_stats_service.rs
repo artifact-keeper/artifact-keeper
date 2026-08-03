@@ -72,6 +72,55 @@ const REPO_OBJECT_UNION_SQL: &str = r#"
       FROM proxy_cache_artifacts
 "#;
 
+/// The *path-bearing* subset of the repo-object union (#2601): one row per
+/// reference that has a logical `path`, projected to
+/// `(repository_id, path, dedup_key, size_bytes)`.
+///
+/// `oci_blobs` is deliberately absent: layer blobs carry no logical path (the
+/// blob→image-name edge only exists inside manifest content, not the catalog),
+/// so their bytes cannot be placed in the tree. They are surfaced separately
+/// as the root node's `unattributed_bytes` so `root.logical_bytes +
+/// unattributed_bytes` still reconciles with the repo-level logical total.
+/// OCI *manifests* do have paths (`v2/<image>/manifests/<ref>` artifact rows),
+/// so the tree still groups per image name at `v2/<image>/`.
+const PATH_REF_UNION_SQL: &str = r#"
+    SELECT repository_id, path, storage_key AS dedup_key, size_bytes
+      FROM artifacts
+     WHERE is_deleted = false
+       AND storage_key NOT LIKE 'proxy-cache/%'
+    UNION ALL
+    SELECT repository_id, path, storage_key AS dedup_key, size_bytes
+      FROM proxy_cache_artifacts
+"#;
+
+/// Maximum directory depth materialized into `repository_path_storage_stats`.
+///
+/// Caps the row-explosion factor of the prefix explode (each reference emits
+/// one row per ancestor level): a pathological 1000-segment path contributes
+/// to at most this many prefix nodes instead of 1000. Deeper files still
+/// roll up into every ancestor at or above this depth; only nodes *below* it
+/// are not individually materialized.
+pub const MAX_MATERIALIZED_PATH_DEPTH: i32 = 16;
+
+// The cap bounds the explode factor; keep it positive and small relative to
+// real repo layouts (deepest common layouts are ~6-8 levels).
+const _: () = assert!(MAX_MATERIALIZED_PATH_DEPTH >= 8 && MAX_MATERIALIZED_PATH_DEPTH <= 64);
+
+/// Normalize a caller-supplied tree prefix to the canonical stored form:
+/// no leading/trailing `/`, `''` = repository root.
+pub fn normalize_prefix(raw: &str) -> String {
+    raw.trim().trim_matches('/').to_string()
+}
+
+/// Number of path segments in a canonical prefix (`''` = 0, the root).
+pub fn prefix_depth(prefix: &str) -> i32 {
+    if prefix.is_empty() {
+        0
+    } else {
+        prefix.split('/').count() as i32
+    }
+}
+
 /// Backend-aware deduplication scope. `filesystem` shards physical objects
 /// per repository; cloud backends share one object instance-wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,11 +324,126 @@ impl StorageStatsService {
     }
 
     /// Full refresh: recompute every repository's footprint + the instance
-    /// total and upsert them. Run on the scheduler cadence and after GC.
+    /// total and upsert them, then refresh the per-path-prefix tree rollup
+    /// (#2601). Run on the scheduler cadence and after GC.
     pub async fn recompute_all(&self) -> Result<()> {
         let rows = self.load_repo_object_rows().await?;
         let computed = compute_stats(&rows, self.scope);
-        self.persist(&computed).await
+        self.persist(&computed).await?;
+        self.recompute_path_stats().await
+    }
+
+    /// Rebuild `repository_path_storage_stats` (#2601): one row per
+    /// (repository, path prefix) with logical/physical/file/blob figures.
+    ///
+    /// Runs entirely set-based in Postgres — the path-bearing union is
+    /// exploded into its ancestor prefixes (capped at
+    /// [`MAX_MATERIALIZED_PATH_DEPTH`]) with a `generate_series` lateral,
+    /// deduplicated per `(repo, prefix, dedup_key)`, aggregated per node, and
+    /// inserted in one statement. Nothing is shipped to the app; API reads are
+    /// then index lookups on the materialized rows (#2516 readiness).
+    ///
+    /// Delete + reinsert inside one transaction: readers never observe a
+    /// partially-rebuilt tree, and pruned paths cannot leave stale rows. A
+    /// transaction-scoped advisory lock serializes concurrent rebuilds (the
+    /// cron tick can overlap a GC-triggered refresh) — the loser simply
+    /// rebuilds again, which is idempotent. An incremental (trigger-maintained)
+    /// variant is the deferred 1.7.0 perf follow-up alongside the P1 keyset
+    /// recompute (#2056).
+    pub async fn recompute_path_stats(&self) -> Result<()> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Serialize whole-table rebuilds: without this, two overlapping
+        // refreshers both DELETE against the same snapshot and then collide on
+        // the PK during reinsert. Released automatically at commit/rollback.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('repository_path_storage_stats_rebuild'))",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("DELETE FROM repository_path_storage_stats")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Explode each path-bearing reference into its ancestor prefixes:
+        // depth 0 is the root (''), depth g is the first g segments joined by
+        // '/'. The file's own full path is never a prefix node (g stops at
+        // cardinality - 1), so leaves aggregate into their parent directory.
+        let insert_sql = format!(
+            r#"
+            WITH path_ref AS ({union}),
+            exploded AS (
+                SELECT pr.repository_id,
+                       pr.dedup_key,
+                       pr.size_bytes,
+                       g.depth,
+                       CASE WHEN g.depth = 0 THEN ''
+                            ELSE array_to_string((pr.segs)[1:g.depth], '/')
+                       END AS prefix
+                  FROM (SELECT repository_id, dedup_key, size_bytes,
+                               string_to_array(trim(leading '/' from path), '/') AS segs
+                          FROM path_ref) pr
+                 CROSS JOIN LATERAL generate_series(
+                     0, LEAST(cardinality(pr.segs) - 1, {max_depth})
+                 ) AS g(depth)
+            ),
+            per_prefix_key AS (
+                SELECT repository_id, prefix, depth, dedup_key,
+                       MAX(size_bytes) AS size_bytes,
+                       COUNT(*)        AS ref_count,
+                       SUM(size_bytes) AS logical_bytes
+                  FROM exploded
+                 GROUP BY repository_id, prefix, depth, dedup_key
+            )
+            INSERT INTO repository_path_storage_stats
+                (repository_id, prefix, depth, logical_bytes, physical_bytes,
+                 file_count, blob_count, unattributed_bytes, computed_at)
+            SELECT repository_id, prefix, depth,
+                   COALESCE(SUM(logical_bytes), 0)::BIGINT,
+                   COALESCE(SUM(size_bytes), 0)::BIGINT,
+                   COALESCE(SUM(ref_count), 0)::BIGINT,
+                   COUNT(*)::BIGINT,
+                   0, now()
+              FROM per_prefix_key
+             GROUP BY repository_id, prefix, depth
+            "#,
+            union = PATH_REF_UNION_SQL,
+            max_depth = MAX_MATERIALIZED_PATH_DEPTH,
+        );
+        sqlx::query(&insert_sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // OCI layer bytes have no logical path; record them on the root row so
+        // the tree total still reconciles with the repo-level logical total.
+        // The upsert also creates the root row for blob-only repositories.
+        sqlx::query(
+            r#"
+            INSERT INTO repository_path_storage_stats
+                (repository_id, prefix, depth, unattributed_bytes, computed_at)
+            SELECT repository_id, '', 0, SUM(size_bytes)::BIGINT, now()
+              FROM oci_blobs
+             GROUP BY repository_id
+            ON CONFLICT (repository_id, prefix) DO UPDATE
+               SET unattributed_bytes = EXCLUDED.unattributed_bytes,
+                   computed_at        = EXCLUDED.computed_at
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Persist a computed snapshot: upsert every repo row, prune repos that no
@@ -479,10 +643,436 @@ mod tests {
     }
 
     #[test]
+    fn normalize_prefix_strips_slashes_and_whitespace() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("a/b"), "a/b");
+        assert_eq!(normalize_prefix("/a/b/"), "a/b");
+        assert_eq!(normalize_prefix("  /a/b/  "), "a/b");
+        assert_eq!(normalize_prefix("///"), "");
+    }
+
+    #[test]
+    fn prefix_depth_counts_segments() {
+        assert_eq!(prefix_depth(""), 0);
+        assert_eq!(prefix_depth("a"), 1);
+        assert_eq!(prefix_depth("a/b"), 2);
+        assert_eq!(prefix_depth("v2/library/nginx"), 3);
+    }
+
+    #[test]
+    fn path_union_excludes_pathless_oci_blobs() {
+        // The tree union must never include oci_blobs (no logical path): those
+        // bytes are surfaced as root `unattributed_bytes` instead. Guard the
+        // SQL fragment against a drive-by "add the third source for parity".
+        assert!(!PATH_REF_UNION_SQL.contains("oci_blobs"));
+        assert!(PATH_REF_UNION_SQL.contains("FROM artifacts"));
+        assert!(PATH_REF_UNION_SQL.contains("proxy_cache_artifacts"));
+    }
+
+    #[test]
     fn oci_blob_prefix_never_collides_with_manifests() {
         // OCI layer keys are namespaced away from artifacts.storage_key
         // (`oci-manifests/…`) so the union cannot merge distinct objects.
         assert!(OCI_BLOB_DEDUP_PREFIX.starts_with("oci-blobs/"));
         assert!(!"oci-manifests/abc".starts_with(OCI_BLOB_DEDUP_PREFIX));
+    }
+}
+
+/// DB-backed tests for `recompute_path_stats` / `recompute_all` (#2601):
+/// seed the three physical sources against a real Postgres and assert the
+/// materialized `repository_path_storage_stats` rows. Each test creates its
+/// own uniquely-keyed repository, so the whole-table rebuild (serialized by
+/// the advisory lock, reading committed data) converges to the same rows for
+/// this repo regardless of concurrently running peers. Skips cleanly when no
+/// `DATABASE_URL` is configured; under [`crate::testing::REQUIRE_DB_ENV`]
+/// (CI) an unreachable database fails loudly instead (#2924).
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use sqlx::PgPool;
+
+    async fn try_pool() -> Option<PgPool> {
+        crate::testing::try_pool_with(3).await
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!("{}-{}", prefix, &Uuid::new_v4().to_string()[..8])
+    }
+
+    async fn insert_repo(pool: &PgPool, backend: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = unique("pstats-repo");
+        sqlx::query(
+            r#"
+            INSERT INTO repositories (id, key, name, format, repo_type, storage_backend, storage_path, is_public)
+            VALUES ($1, $2, $2, 'generic'::repository_format, 'local'::repository_type, $3, $4, true)
+            "#,
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(backend)
+        .bind(format!("/data/{key}"))
+        .execute(pool)
+        .await
+        .expect("failed to insert repository");
+        id
+    }
+
+    async fn insert_artifact(pool: &PgPool, repo: Uuid, path: &str, storage_key: &str, size: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key, is_deleted)
+            VALUES ($1, $2, $3, $3, $4, repeat('a', 64), 'application/octet-stream', $5, false)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(path)
+        .bind(size)
+        .bind(storage_key)
+        .execute(pool)
+        .await
+        .expect("failed to insert artifact");
+    }
+
+    async fn insert_oci_blob(pool: &PgPool, repo: Uuid, digest: &str, size: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO oci_blobs (id, repository_id, digest, size_bytes, storage_key)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(digest)
+        .bind(size)
+        .bind(format!("oci-blobs/{digest}"))
+        .execute(pool)
+        .await
+        .expect("failed to insert oci blob");
+    }
+
+    async fn insert_proxy_cache(pool: &PgPool, repo: Uuid, path: &str, size: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_cache_artifacts
+                (id, repository_id, path, storage_key, metadata_key, size_bytes)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(path)
+        .bind(format!("proxy-cache/{}/{}/__content__", repo, path))
+        .bind(format!("proxy-cache/{}/{}/__cache_meta__.json", repo, path))
+        .bind(size)
+        .execute(pool)
+        .await
+        .expect("failed to insert proxy cache row");
+    }
+
+    #[derive(Debug)]
+    struct Node {
+        depth: i32,
+        logical: i64,
+        physical: i64,
+        files: i64,
+        blobs: i64,
+        unattributed: i64,
+    }
+
+    async fn read_node(pool: &PgPool, repo: Uuid, prefix: &str) -> Option<Node> {
+        sqlx::query_as::<_, (i32, i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT depth, logical_bytes, physical_bytes, file_count, blob_count,
+                   unattributed_bytes
+              FROM repository_path_storage_stats
+             WHERE repository_id = $1 AND prefix = $2
+            "#,
+        )
+        .bind(repo)
+        .bind(prefix)
+        .fetch_optional(pool)
+        .await
+        .expect("query path stats")
+        .map(
+            |(depth, logical, physical, files, blobs, unattributed)| Node {
+                depth,
+                logical,
+                physical,
+                files,
+                blobs,
+                unattributed,
+            },
+        )
+    }
+
+    /// Rebuild only the per-prefix tree (the function under test here).
+    async fn recompute_tree(pool: &PgPool) {
+        tdh::recompute_storage_stats_with_retry(pool, false).await;
+    }
+
+    async fn cleanup(pool: &PgPool, repo: Uuid) {
+        // `repository_path_storage_stats` cascades from `repositories`.
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn nested_prefixes_roll_up_every_ancestor_level_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        insert_artifact(&pool, repo, "libs/app/a.jar", &unique("cas/k"), 100).await;
+        insert_artifact(&pool, repo, "libs/app/b.jar", &unique("cas/k"), 50).await;
+        insert_artifact(&pool, repo, "libs/core/c.jar", &unique("cas/k"), 25).await;
+        insert_artifact(&pool, repo, "top.txt", &unique("cas/k"), 10).await;
+
+        // Full pipeline once: `recompute_all` chains the repo-level persist
+        // AND the path rollup (#2601's change to it).
+        tdh::recompute_storage_stats_with_retry(&pool, true).await;
+
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.depth, 0);
+        assert_eq!(root.logical, 185, "root sums every reference");
+        assert_eq!(root.files, 4);
+        assert_eq!(root.blobs, 4);
+
+        let libs = read_node(&pool, repo, "libs").await.expect("libs node");
+        assert_eq!(libs.depth, 1);
+        assert_eq!(libs.logical, 175);
+        assert_eq!(libs.files, 3);
+
+        let app = read_node(&pool, repo, "libs/app").await.expect("app node");
+        assert_eq!(app.depth, 2);
+        assert_eq!(app.logical, 150);
+        assert_eq!(app.files, 2);
+
+        let core = read_node(&pool, repo, "libs/core")
+            .await
+            .expect("core node");
+        assert_eq!(core.logical, 25);
+        assert_eq!(core.files, 1);
+
+        // A file's full path is never itself a prefix node.
+        assert!(read_node(&pool, repo, "top.txt").await.is_none());
+        assert!(read_node(&pool, repo, "libs/app/a.jar").await.is_none());
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn shared_object_counts_once_at_common_ancestor_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        // One CAS object referenced from two sibling subtrees (x twice, y once).
+        let key = format!("cas/aa/bb/{}", Uuid::new_v4());
+        insert_artifact(&pool, repo, "x/one.bin", &key, 1000).await;
+        insert_artifact(&pool, repo, "x/two.bin", &key, 1000).await;
+        insert_artifact(&pool, repo, "y/three.bin", &key, 1000).await;
+
+        recompute_tree(&pool).await;
+
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.logical, 3000, "logical = every reference");
+        assert_eq!(root.physical, 1000, "one physical object at the root");
+        assert_eq!(root.files, 3);
+        assert_eq!(root.blobs, 1);
+
+        let x = read_node(&pool, repo, "x").await.expect("x node");
+        assert_eq!(x.logical, 2000);
+        assert_eq!(x.physical, 1000, "the object counts once within x");
+        assert_eq!(x.blobs, 1);
+
+        let y = read_node(&pool, repo, "y").await.expect("y node");
+        assert_eq!(y.logical, 1000);
+        assert_eq!(y.physical, 1000);
+
+        // The dedup signal: children's physical sums past the parent's because
+        // the shared object appears in both subtrees but once at the ancestor.
+        assert!(x.physical + y.physical > root.physical);
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn oci_layer_bytes_land_in_root_unattributed_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        // Manifests are path-bearing artifact rows; layers have no logical path.
+        insert_artifact(
+            &pool,
+            repo,
+            "v2/library/nginx/manifests/latest",
+            &format!("oci-manifests/{}", Uuid::new_v4()),
+            512,
+        )
+        .await;
+        let layer = format!("sha256:{}", Uuid::new_v4().simple());
+        insert_oci_blob(&pool, repo, &layer, 4096).await;
+
+        recompute_tree(&pool).await;
+
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.logical, 512, "tree covers path-bearing rows only");
+        assert_eq!(
+            root.unattributed, 4096,
+            "layer bytes surface as unattributed on the root"
+        );
+        // logical + unattributed reconciles with the repo-level logical total.
+        assert_eq!(root.logical + root.unattributed, 512 + 4096);
+
+        // The image still groups by name through its manifest path.
+        let image = read_node(&pool, repo, "v2/library/nginx")
+            .await
+            .expect("image node");
+        assert_eq!(image.logical, 512);
+        assert_eq!(image.unattributed, 0, "unattributed is a root-only figure");
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn blob_only_repo_gets_a_root_row_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        insert_oci_blob(
+            &pool,
+            repo,
+            &format!("sha256:{}", Uuid::new_v4().simple()),
+            2048,
+        )
+        .await;
+
+        recompute_tree(&pool).await;
+
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.logical, 0);
+        assert_eq!(root.unattributed, 2048);
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn proxy_cache_rows_are_path_attributed_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        insert_proxy_cache(&pool, repo, "simple/click/click-8.0.0.whl", 300).await;
+
+        recompute_tree(&pool).await;
+
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.logical, 300);
+        let simple = read_node(&pool, repo, "simple").await.expect("simple node");
+        assert_eq!(simple.logical, 300);
+        let pkg = read_node(&pool, repo, "simple/click")
+            .await
+            .expect("package node");
+        assert_eq!(pkg.logical, 300);
+        assert_eq!(pkg.files, 1);
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn recompute_prunes_stale_prefixes_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        insert_artifact(&pool, repo, "old/tree/file.bin", &unique("cas/k"), 100).await;
+
+        recompute_tree(&pool).await;
+        assert!(read_node(&pool, repo, "old/tree").await.is_some());
+
+        // Soft-delete (the artifact-delete path): the reference must drop out
+        // of the tree on the next rebuild, not linger as a stale row.
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("soft-delete artifacts");
+
+        recompute_tree(&pool).await;
+        assert!(
+            read_node(&pool, repo, "old/tree").await.is_none(),
+            "stale prefix rows must be pruned by the rebuild"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn pathological_deep_paths_are_depth_capped_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        // 40 segments: d1/d2/.../d40 — well past the materialization cap.
+        let deep: Vec<String> = (1..=40).map(|i| format!("d{i}")).collect();
+        insert_artifact(&pool, repo, &deep.join("/"), &unique("cas/k"), 100).await;
+
+        recompute_tree(&pool).await;
+
+        // Materialized exactly at the cap...
+        let at_cap = deep[..MAX_MATERIALIZED_PATH_DEPTH as usize].join("/");
+        let node = read_node(&pool, repo, &at_cap).await.expect("cap node");
+        assert_eq!(node.depth, MAX_MATERIALIZED_PATH_DEPTH);
+        assert_eq!(node.logical, 100, "deep file rolls up into the cap node");
+
+        // ...but not below it.
+        let below_cap = deep[..(MAX_MATERIALIZED_PATH_DEPTH as usize + 1)].join("/");
+        assert!(read_node(&pool, repo, &below_cap).await.is_none());
+
+        // Root still accounts for the file once.
+        let root = read_node(&pool, repo, "").await.expect("root node");
+        assert_eq!(root.logical, 100);
+        assert_eq!(root.files, 1);
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    async fn leading_slash_paths_normalize_into_the_same_tree_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+        let repo = insert_repo(&pool, "filesystem").await;
+        insert_artifact(&pool, repo, "/abs/one.bin", &unique("cas/k"), 40).await;
+        insert_artifact(&pool, repo, "abs/two.bin", &unique("cas/k"), 60).await;
+
+        recompute_tree(&pool).await;
+
+        let abs = read_node(&pool, repo, "abs").await.expect("abs node");
+        assert_eq!(
+            abs.logical, 100,
+            "leading-slash and bare paths share one node"
+        );
+        assert_eq!(abs.files, 2);
+
+        cleanup(&pool, repo).await;
     }
 }

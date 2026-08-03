@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        UPDATE refresh_token_jti\n                        SET superseded_by = $2\n                        WHERE jti = $1\n                        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5ec2346103a6e6c9ff731b156d5578b117dab7b86a4edfd9fb213d7be233ade0"
+}

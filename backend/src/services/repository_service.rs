@@ -21,10 +21,12 @@ use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument}
 pub struct QuotaAdmission {
     /// Whether the upload is permitted under the repository's storage quota.
     pub allowed: bool,
-    /// The repository's live usage EXCLUDING the row currently being written
-    /// at the target path (so an overwrite is charged only its net size
-    /// delta). `None` when the repository has no finite quota, in which case
-    /// usage is neither computed nor enforced.
+    /// The repository's ledger-tracked usage (`hosted + proxy + oci`
+    /// counters from `repository_usage_ledger`, read under the admission
+    /// row lock) EXCLUDING the row currently being written at the target
+    /// path (so an overwrite is charged only its net size delta). `None`
+    /// when the repository has no finite quota, in which case usage is
+    /// neither computed nor enforced.
     pub base_usage: Option<i64>,
 }
 
@@ -73,9 +75,9 @@ pub struct CreateRepositoryRequest {
     /// legacy unverified-ingest behavior. Persisted in the create tx.
     pub curation_allow_unverified: Option<bool>,
     /// User who is creating this repository. When set, the repository records
-    /// this user as `created_by` and the creator is auto-granted the
-    /// `developer` role scoped to the new repository (owner auto-grant), so the
-    /// creator retains access under per-repo authorization.
+    /// this user as `created_by` and the creator is auto-granted the durable
+    /// `repository-owner` role scoped to the new repository. The legacy
+    /// `developer` grant is retained during the staged authorization rollout.
     pub created_by: Option<Uuid>,
 }
 
@@ -108,6 +110,16 @@ pub struct UpdateRepositoryRequest {
     /// `None` leaves it unchanged. `Some(false)` restores the fail-closed
     /// default; `Some(true)` opts into legacy unverified ingest.
     pub curation_allow_unverified: Option<bool>,
+    /// When `Some`, enables/disables curation-rule enforcement on this
+    /// repository's proxy paths (#2912); `None` leaves it
+    /// unchanged.
+    pub curation_enabled: Option<bool>,
+    /// When `Some`, sets the default curation action applied when no rule
+    /// matches (`allow` or `review`; `block` is rejected by the handler
+    /// since the DB CHECK constraint from migration 071 does not allow it
+    /// as a default action). `None` leaves it unchanged. Validated by the
+    /// handler before it reaches the service.
+    pub curation_default_action: Option<String>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -290,6 +302,26 @@ pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
         RepositoryFormat::Lxc => "lxc",
     }
     .to_string()
+}
+
+/// Handler key a format gates on; aliases collapse to their core handler (mirrors get_handler_for_format).
+pub(crate) fn format_handler_key(format: &RepositoryFormat) -> String {
+    let key = match format {
+        RepositoryFormat::Gradle => "maven",
+        RepositoryFormat::Yarn | RepositoryFormat::Bower | RepositoryFormat::Pnpm => "npm",
+        RepositoryFormat::Poetry | RepositoryFormat::Conda => "pypi",
+        RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => "nuget",
+        RepositoryFormat::Docker
+        | RepositoryFormat::Podman
+        | RepositoryFormat::Buildx
+        | RepositoryFormat::Oras
+        | RepositoryFormat::WasmOci
+        | RepositoryFormat::HelmOci => "oci",
+        RepositoryFormat::Opentofu => "terraform",
+        RepositoryFormat::Lxc => "incus",
+        other => return derive_format_key(other),
+    };
+    key.to_string()
 }
 
 /// Build a SQL LIKE search pattern from a user query string.
@@ -714,7 +746,7 @@ impl RepositoryService {
         let format_key = req
             .format_key
             .clone()
-            .unwrap_or_else(|| derive_format_key(&req.format));
+            .unwrap_or_else(|| format_handler_key(&req.format));
         let format_enabled: Option<bool> =
             sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
                 .bind(&format_key)
@@ -821,10 +853,9 @@ impl RepositoryService {
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
                 }
-                // Owner auto-grant: record the creator and grant them the
-                // `developer` role scoped to this repository, so the creator
-                // retains access under per-repo authorization. Runs inside the
-                // same tx as the INSERT so creator-grant is atomic with create.
+                // Owner auto-grant: dual-write the durable repository-owner
+                // and legacy developer roles during the staged rollout. Both
+                // grants land in the same transaction as the repository.
                 if let Some(creator_id) = req.created_by {
                     sqlx::query("UPDATE repositories SET created_by = $1 WHERE id = $2")
                         .bind(creator_id)
@@ -834,7 +865,8 @@ impl RepositoryService {
                         .map_err(|e| AppError::Database(e.to_string()))?;
                     sqlx::query(
                         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-                         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                         SELECT $1, r.id, $2 FROM roles r \
+                         WHERE r.name IN ('repository-owner', 'developer') \
                          ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
                     )
                     .bind(creator_id)
@@ -1111,6 +1143,8 @@ impl RepositoryService {
                 promotion_only = COALESCE($8, promotion_only),
                 versioning_enabled = COALESCE($9, versioning_enabled),
                 project_id = COALESCE($10, project_id),
+                curation_enabled = COALESCE($11, curation_enabled),
+                curation_default_action = COALESCE($12, curation_default_action),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -1135,6 +1169,8 @@ impl RepositoryService {
             req.promotion_only,
             req.versioning_enabled,
             req.project_id.flatten(),
+            req.curation_enabled,
+            req.curation_default_action,
         )
         .fetch_optional(&self.db)
         .await
@@ -1176,6 +1212,28 @@ impl RepositoryService {
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        // #2516 S2: quota admission trusts the usage-ledger counters. While a
+        // repository sits at unlimited quota the admission fast path never
+        // touches the ledger, so its counters can be stale when a finite
+        // quota is first configured. True the ledger up synchronously so
+        // enforcement starts from the live figure instead of waiting for the
+        // background reconciler's next pass. Best-effort: the repository
+        // update above has already committed, so a reconcile failure must not
+        // fail the request — the background reconciler repairs the row on its
+        // interval.
+        if let Some(Some(quota)) = req.quota_bytes {
+            if quota > 0 {
+                if let Err(e) = self.reconcile_usage_ledger(id).await {
+                    tracing::warn!(
+                        repository_id = %id,
+                        error = %e,
+                        "failed to reconcile usage ledger after quota change; \
+                         background reconciler will repair it"
+                    );
+                }
+            }
         }
 
         // Index updated repository in search engine (non-blocking)
@@ -1663,6 +1721,74 @@ impl RepositoryService {
         Ok(usage)
     }
 
+    /// Batched sibling of [`Self::get_virtual_storage_usage`] for the listing
+    /// endpoint (issue #3078): resolve the reachable non-virtual leaves of
+    /// EVERY requested virtual root in ONE query (the listing used to call the
+    /// per-repo method once per virtual on the page — an N+1 whose every call
+    /// also re-scanned every reachable member's artifact rows).
+    ///
+    /// The recursion is the per-repo CTE with the root id threaded through it,
+    /// so roots stay independent: two virtuals sharing a leaf each count it,
+    /// under their own root. `UNION` (not `UNION ALL`) plus the
+    /// `depth < MAX_VIRTUAL_DEPTH` bound keeps the same cycle/nesting
+    /// termination, and `SELECT DISTINCT root_id, repo_id` keeps the #2785
+    /// union semantics — a leaf reachable through two paths under one root is
+    /// counted once.
+    ///
+    /// Per-leaf bytes come from the trigger-maintained
+    /// `repository_usage_ledger` (migrations 171/182), which is byte-for-byte
+    /// equivalent to the live 3-way SUM the per-repo method computes (same
+    /// `is_deleted` / `proxy-cache/%` predicates in 182's triggers), so the
+    /// aggregation input shrinks from O(artifacts under all members) to
+    /// O(member repositories). `LEFT JOIN` + `COALESCE` make a leaf with no
+    /// ledger row contribute 0 rather than poisoning the SUM with NULL. A root
+    /// with no resolvable members has no row in the returned map — the caller
+    /// renders 0 for it.
+    pub async fn get_virtual_storage_usage_batch(
+        &self,
+        virtual_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>> {
+        if virtual_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            WITH RECURSIVE reachable(root_id, repo_id, depth) AS (
+                SELECT vrm.virtual_repo_id, vrm.member_repo_id, 1
+                  FROM virtual_repo_members vrm
+                 WHERE vrm.virtual_repo_id = ANY($1)
+              UNION
+                SELECT reachable.root_id, vrm.member_repo_id, reachable.depth + 1
+                  FROM reachable
+                  JOIN repositories parent
+                    ON parent.id = reachable.repo_id
+                   AND parent.repo_type = 'virtual'
+                  JOIN virtual_repo_members vrm
+                    ON vrm.virtual_repo_id = reachable.repo_id
+                 WHERE reachable.depth < $2
+            ),
+            leaves AS (
+                SELECT DISTINCT reachable.root_id AS root_id, reachable.repo_id AS id
+                  FROM reachable
+                  JOIN repositories leaf ON leaf.id = reachable.repo_id
+                 WHERE leaf.repo_type <> 'virtual'
+            )
+            SELECT leaves.root_id,
+                   COALESCE(SUM(l.hosted_bytes + l.proxy_bytes + l.oci_bytes), 0)::BIGINT
+              FROM leaves
+              LEFT JOIN repository_usage_ledger l ON l.repository_id = leaves.id
+             GROUP BY leaves.root_id
+            "#,
+        )
+        .bind(virtual_ids)
+        .bind(MAX_VIRTUAL_DEPTH as i32)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().collect())
+    }
+
     /// Reconcile the FULL member set of a virtual repository to exactly
     /// `desired` (issue #2785 defect B).
     ///
@@ -1754,20 +1880,43 @@ impl RepositoryService {
     ///   zero-byte hard cap silently rejected *every* write to the repo,
     ///   surfacing as a `507 QUOTA_EXCEEDED` on the very first non-empty
     ///   upload even though the host had ample free disk.)
-    /// * `quota_bytes > 0`     -> a real, finite limit that is enforced against
-    ///   the live `SUM(size_bytes)` of non-deleted artifacts (so the accounting
-    ///   self-heals on delete and never drifts).
+    /// * `quota_bytes > 0`     -> a real, finite limit, checked against the
+    ///   repository's usage-ledger counters (#2516 S2) — an O(1) read that is
+    ///   invariant to repository size. This is the unlocked best-effort
+    ///   preflight; the authoritative, race-free admission is
+    ///   [`Self::check_quota_locked`].
     pub async fn check_quota(&self, repo_id: Uuid, additional_bytes: i64) -> Result<bool> {
         let repo = self.get_by_id(repo_id).await?;
         Ok(Self::quota_allows(
             repo.quota_bytes,
             // Only hit the DB for usage when a finite quota is actually set.
             match repo.quota_bytes {
-                Some(quota) if quota > 0 => self.get_storage_usage(repo_id).await?,
+                Some(quota) if quota > 0 => self.get_ledger_usage(repo_id).await?,
                 _ => 0,
             },
             additional_bytes,
         ))
+    }
+
+    /// Unlocked O(1) usage read for quota preflight (#2516 S2): the sum of
+    /// the `repository_usage_ledger` counters, falling back to the live
+    /// 3-way SUM ([`Self::get_storage_usage`]) only when the repository has
+    /// no ledger row yet (pre-ledger repo whose first quota-checked upload
+    /// has not lazily seeded it). Display paths keep using the live
+    /// [`Self::get_storage_usage`] figure.
+    async fn get_ledger_usage(&self, repo_id: Uuid) -> Result<i64> {
+        let total: Option<i64> = sqlx::query_scalar!(
+            r#"SELECT (hosted_bytes + proxy_bytes + oci_bytes)::BIGINT as "total!"
+                 FROM repository_usage_ledger WHERE repository_id = $1"#,
+            repo_id
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        match total {
+            Some(total) => Ok(total),
+            None => self.get_storage_usage(repo_id).await,
+        }
     }
 
     /// Pure quota-admission decision, factored out so it can be unit-tested
@@ -1793,20 +1942,47 @@ impl RepositoryService {
     /// This closes the over-admission race (#2523). `check_quota` alone reads
     /// the live sum without any lock, so two concurrent near-limit uploads can
     /// both read the pre-upload usage and both be admitted beyond the quota.
-    /// Here we INSERT (if absent) and then `SELECT ... FOR UPDATE` the
-    /// repository's `repository_usage_ledger` row, so uploads into the same
-    /// repository serialize on that row. Because the caller performs the
-    /// artifact INSERT in the *same* transaction, the second admission observes
-    /// the first upload's committed bytes and is rejected when the quota would
-    /// be exceeded.
+    /// Here we `SELECT ... FOR UPDATE` the repository's
+    /// `repository_usage_ledger` row, so uploads into the same repository
+    /// serialize on that row. Because the caller performs the artifact INSERT
+    /// in the *same* transaction, the second admission observes the first
+    /// upload's committed bytes and is rejected when the quota would be
+    /// exceeded.
     ///
-    /// Usage is read from the authoritative live source tables (the same 3-way
-    /// sum the quota gate has always used) net of any existing row at `path`,
-    /// so an in-place overwrite is charged only its size delta rather than
-    /// double-counting the bytes it replaces.
+    /// O(1) admission (#2516 S2): usage is read from the locked ledger row's
+    /// maintained counters (`hosted_bytes + proxy_bytes + oci_bytes`) instead
+    /// of re-aggregating the live source tables under the lock, so the work
+    /// inside the critical section is a primary-key lookup plus one
+    /// unique-index lookup — invariant to repository size. The previous
+    /// implementation re-ran the full 3-way `SUM` while holding the row lock,
+    /// which was exact but O(repository rows) per upload and serialized every
+    /// same-repo upload behind that scan (#2516 F1). This function does NOT
+    /// charge the ledger itself: migration 182's row-level triggers on the
+    /// source tables apply the delta when the caller performs its artifact
+    /// INSERT, inside this same transaction. Because the caller's INSERT runs
+    /// while the `FOR UPDATE` lock taken here is still held, commit applies
+    /// the trigger's charge together with the artifact row and rollback
+    /// discards both — a subsequent admission that waited on the lock always
+    /// observes the charge. Callers must therefore keep the INSERT in the
+    /// same transaction as this admission check.
+    ///
+    /// Counter coverage / freshness contract: the ledger tracks all three
+    /// usage components (hosted, proxy-cache, OCI blobs), so nothing is
+    /// dropped from enforcement. Migration 182's triggers maintain every
+    /// component on every INSERT/UPDATE/DELETE of the source tables
+    /// (`artifacts`, `proxy_cache_artifacts`, `oci_blobs`) in the mutating
+    /// statement's own transaction, so the counters read here are exact for
+    /// all write paths — including format handlers inserting `artifacts` rows
+    /// directly, proxy-cache fills, OCI blob pushes, deletes, lifecycle and
+    /// GC. The background reconciler ([`Self::reconcile_usage_ledger`])
+    /// remains as a drift safety net only.
+    ///
+    /// Usage at the target `path` is netted out (unique-index lookup on
+    /// `(repository_id, path)`), so an in-place overwrite is charged only its
+    /// size delta rather than double-counting the bytes it replaces.
     ///
     /// A `None`/non-positive quota means unlimited: the call returns
-    /// `allowed = true` without locking or scanning.
+    /// `allowed = true` without locking or touching the ledger.
     pub async fn check_quota_locked(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1834,51 +2010,33 @@ impl RepositoryService {
             }
         };
 
-        // Serialize same-repo admissions on the ledger row: create it if the
-        // repository predates the ledger, then take a row lock held until the
-        // caller commits (after its artifact INSERT).
-        sqlx::query!(
-            "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) \
-             ON CONFLICT (repository_id) DO NOTHING",
+        // Serialize same-repo admissions on the ledger row and read the
+        // maintained counters under that lock: a primary-key lookup, O(1) in
+        // repository size. The lock is held until the caller commits (after
+        // its artifact INSERT).
+        let locked = sqlx::query!(
+            "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+               FROM repository_usage_ledger \
+              WHERE repository_id = $1 FOR UPDATE",
             repo_id
         )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        sqlx::query_scalar!(
-            "SELECT hosted_bytes FROM repository_usage_ledger \
-             WHERE repository_id = $1 FOR UPDATE",
-            repo_id
-        )
-        .fetch_one(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Authoritative live usage: the same components the quota aggregate
-        // summed (artifacts + proxy_cache_artifacts + oci_blobs).
-        let total: i64 = sqlx::query_scalar!(
-            r#"
-            SELECT COALESCE(SUM(bytes), 0)::BIGINT as "usage!"
-            FROM (
-                SELECT size_bytes AS bytes
-                  FROM artifacts
-                 WHERE repository_id = $1 AND is_deleted = false
-                   AND storage_key NOT LIKE 'proxy-cache/%'
-                UNION ALL
-                SELECT size_bytes AS bytes
-                  FROM proxy_cache_artifacts
-                 WHERE repository_id = $1
-                UNION ALL
-                SELECT size_bytes AS bytes
-                  FROM oci_blobs
-                 WHERE repository_id = $1
-            ) t
-            "#,
-            repo_id
-        )
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let total: i64 = match locked {
+            Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
+            // Pre-ledger repository (no row yet): lazy-create it seeded from
+            // the authoritative live sums, NOT from column defaults — a
+            // zero-seeded row would admit everything until the first
+            // reconcile pass. One-time O(rows) for the first quota-checked
+            // upload; every later admission takes the O(1) branch above. The
+            // helper locks the row first and leaves it locked in `tx`.
+            None => {
+                let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
+                hosted + proxy + oci
+            }
+        };
 
         // Net-delta accounting for overwrites: subtract the bytes already
         // charged for the (repository_id, path) row we are about to replace.
@@ -1897,17 +2055,51 @@ impl RepositoryService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let base_usage = total - existing_at_path;
+        let allowed = Self::quota_allows(Some(quota), base_usage, new_size);
+        // No manual charge here: the caller's artifact INSERT (same
+        // transaction, made while the row lock taken above is still held)
+        // fires migration 182's trigger, which applies the exact delta to
+        // `hosted_bytes` before the transaction commits.
         Ok(QuotaAdmission {
-            allowed: base_usage + new_size <= quota,
+            allowed,
             base_usage: Some(base_usage),
         })
     }
 
     /// Recompute one repository's usage-ledger components from the
-    /// authoritative source tables and upsert them. Returns the reconciled
-    /// total (`hosted + proxy + oci`). Used by the background reconciler, by
-    /// lazy row creation, and by tests.
-    pub async fn reconcile_usage_ledger(&self, repo_id: Uuid) -> Result<i64> {
+    /// authoritative source tables and write them, inside `tx`, holding the
+    /// ledger row's `FOR UPDATE` lock for the remainder of the transaction.
+    /// Creates the row if the repository predates the ledger.
+    ///
+    /// Lock ordering matters: the row is locked BEFORE the source tables are
+    /// read. Locking first blocks behind any in-flight quota admission, so
+    /// the sums computed here include that admission's committed rows;
+    /// computing the sums first and upserting after (as the pre-#2516
+    /// reconciler did, unlocked on the pool) could overwrite a concurrent
+    /// admission's just-committed charge with stale values.
+    ///
+    /// Returns the reconciled `(hosted, proxy, oci)` components.
+    async fn reconcile_usage_ledger_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: Uuid,
+    ) -> Result<(i64, i64, i64)> {
+        sqlx::query!(
+            "INSERT INTO repository_usage_ledger (repository_id) VALUES ($1) \
+             ON CONFLICT (repository_id) DO NOTHING",
+            repo_id
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query_scalar!(
+            "SELECT hosted_bytes FROM repository_usage_ledger \
+             WHERE repository_id = $1 FOR UPDATE",
+            repo_id
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         let hosted: i64 = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "bytes!"
@@ -1917,7 +2109,7 @@ impl RepositoryService {
             "#,
             repo_id
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         let proxy: i64 = sqlx::query_scalar!(
@@ -1925,7 +2117,7 @@ impl RepositoryService {
                  FROM proxy_cache_artifacts WHERE repository_id = $1"#,
             repo_id
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         let oci: i64 = sqlx::query_scalar!(
@@ -1933,28 +2125,44 @@ impl RepositoryService {
                  FROM oci_blobs WHERE repository_id = $1"#,
             repo_id
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         sqlx::query!(
-            "INSERT INTO repository_usage_ledger \
-                 (repository_id, hosted_bytes, proxy_bytes, oci_bytes, updated_at) \
-             VALUES ($1, $2, $3, $4, now()) \
-             ON CONFLICT (repository_id) DO UPDATE SET \
-                 hosted_bytes = EXCLUDED.hosted_bytes, \
-                 proxy_bytes  = EXCLUDED.proxy_bytes, \
-                 oci_bytes    = EXCLUDED.oci_bytes, \
-                 updated_at   = now()",
+            "UPDATE repository_usage_ledger \
+                SET hosted_bytes = $2, proxy_bytes = $3, oci_bytes = $4, \
+                    updated_at = now() \
+              WHERE repository_id = $1",
             repo_id,
             hosted,
             proxy,
             oci
         )
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok((hosted, proxy, oci))
+    }
+
+    /// Recompute one repository's usage-ledger components from the
+    /// authoritative source tables and upsert them, in a transaction that
+    /// takes the same per-repository ledger-row lock quota admission holds
+    /// (see [`Self::reconcile_usage_ledger_in_tx`] for the lock-ordering
+    /// rationale). Returns the reconciled total (`hosted + proxy + oci`).
+    /// Used by the background reconciler, by quota configuration, and by
+    /// tests.
+    pub async fn reconcile_usage_ledger(&self, repo_id: Uuid) -> Result<i64> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(&mut tx, repo_id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(hosted + proxy + oci)
     }
 
@@ -2280,6 +2488,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -2303,6 +2513,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -2324,6 +2536,8 @@ mod tests {
             project_id: None,
             trusted_gpg_key: None,
             curation_allow_unverified: None,
+            curation_enabled: None,
+            curation_default_action: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -2645,6 +2859,36 @@ mod tests {
         ];
         for (format, expected) in cases {
             assert_eq!(derive_format_key(&format), expected, "Format {:?}", format);
+        }
+    }
+
+    #[test]
+    fn test_format_handler_key_collapses_aliases_to_core_handler() {
+        // Aliases gate on their core handler's key (see get_handler_for_format).
+        let cases = [
+            (RepositoryFormat::Docker, "oci"),
+            (RepositoryFormat::Podman, "oci"),
+            (RepositoryFormat::Oras, "oci"),
+            (RepositoryFormat::WasmOci, "oci"),
+            (RepositoryFormat::HelmOci, "oci"),
+            (RepositoryFormat::Gradle, "maven"),
+            (RepositoryFormat::Yarn, "npm"),
+            (RepositoryFormat::Bower, "npm"),
+            (RepositoryFormat::Pnpm, "npm"),
+            (RepositoryFormat::Poetry, "pypi"),
+            (RepositoryFormat::Conda, "pypi"),
+            (RepositoryFormat::Chocolatey, "nuget"),
+            (RepositoryFormat::Powershell, "nuget"),
+            (RepositoryFormat::Opentofu, "terraform"),
+            (RepositoryFormat::Lxc, "incus"),
+            // 1:1 formats gate on their own key.
+            (RepositoryFormat::Maven, "maven"),
+            (RepositoryFormat::Npm, "npm"),
+            (RepositoryFormat::Pypi, "pypi"),
+            (RepositoryFormat::Generic, "generic"),
+        ];
+        for (f, expected) in cases {
+            assert_eq!(format_handler_key(&f), expected, "{:?}", f);
         }
     }
 
@@ -3594,6 +3838,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: Some(None),
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, clear_req).await.expect("clear gpg");
             assert!(
@@ -3614,6 +3860,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: Some(Some(TEST_TRUSTED_PUB_KEY.to_string())),
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, set_req).await.expect("set gpg");
             assert_eq!(
@@ -3635,6 +3883,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
             };
             service.update(repo.id, noop_req).await.expect("noop gpg");
             assert_eq!(
@@ -3693,6 +3943,8 @@ mod tests {
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: flag,
+                curation_enabled: None,
+                curation_default_action: None,
             };
 
             // Update -> Some(true) opts into unverified ingest.
@@ -3810,7 +4062,25 @@ mod tests {
             req.created_by = Some(owner_id);
             let repo = service.create(req).await.expect("create private repo");
 
-            // Owner (auto-granted developer role scoped to the repo) -> allowed.
+            let creator_roles: Vec<String> = sqlx::query_scalar(
+                "SELECT r.name::text FROM role_assignments ra \
+                 JOIN roles r ON r.id = ra.role_id \
+                 WHERE ra.user_id = $1 AND ra.repository_id = $2 \
+                   AND r.name IN ('developer', 'repository-owner') \
+                 ORDER BY r.name",
+            )
+            .bind(owner_id)
+            .bind(repo.id)
+            .fetch_all(&pool)
+            .await
+            .expect("creator role lookup");
+            assert_eq!(
+                creator_roles,
+                vec!["developer", "repository-owner"],
+                "creator must receive owner and retain developer during staged rollout"
+            );
+
+            // Owner (auto-granted repository-owner role) -> allowed.
             assert!(
                 service
                     .user_can_access_repo(repo.id, owner_id)
@@ -4659,6 +4929,234 @@ mod tests {
             cleanup_repo(&pool, leaf.id).await;
         }
 
+        /// #3078: the batched ledger-backed virtual read
+        /// (`get_virtual_storage_usage_batch`) must agree exactly with the
+        /// per-repo live-SUM walk (`get_virtual_storage_usage`, the oracle)
+        /// for every root: a diamond overlap is counted once, a nested virtual
+        /// (depth 2) contributes its leaves, and two independent roots sharing
+        /// a leaf each count it under their own root. The leaves are seeded by
+        /// real source-table INSERTs so migration 182's triggers populate the
+        /// ledger — the test exercises trigger↔read equivalence end-to-end.
+        #[tokio::test]
+        async fn test_virtual_storage_batch_matches_live_oracle_3078() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            // leaf1: 1_000 hosted + 2_500 proxy-cached. leaf2: 500_000 OCI.
+            let leaf1 = service
+                .create(make_create_req(
+                    &format!("{suffix}l1"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf1");
+            let leaf2 = service
+                .create(make_create_req(
+                    &format!("{suffix}l2"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf2");
+            insert_artifact(
+                &pool,
+                leaf1.id,
+                "p/1",
+                &format!("cas/aa/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            insert_proxy_cache(&pool, leaf1.id, "cached/x.tgz", 2_500).await;
+            insert_oci_blob(
+                &pool,
+                leaf2.id,
+                &format!("sha256:{}", Uuid::new_v4().simple()),
+                500_000,
+            )
+            .await;
+
+            // Diamond: v -> a -> leaf1 and v -> leaf1 (leaf1 reachable twice
+            // under v, and a is a nested virtual member at depth 2).
+            let a = service
+                .create(make_virtual_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let v = service
+                .create(make_virtual_req(
+                    &format!("{suffix}v"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create v");
+            // Independent root sharing leaf1 with the diamond, plus leaf2.
+            let w = service
+                .create(make_virtual_req(
+                    &format!("{suffix}w"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create w");
+            // No resolvable members: must be ABSENT from the batch result.
+            let hollow = service
+                .create(make_virtual_req(
+                    &format!("{suffix}h"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create hollow");
+            service
+                .add_virtual_member(a.id, leaf1.id, Some(1))
+                .await
+                .expect("a->leaf1");
+            service
+                .add_virtual_member(v.id, a.id, Some(1))
+                .await
+                .expect("v->a");
+            service
+                .add_virtual_member(v.id, leaf1.id, Some(2))
+                .await
+                .expect("v->leaf1");
+            service
+                .add_virtual_member(w.id, leaf1.id, Some(1))
+                .await
+                .expect("w->leaf1");
+            service
+                .add_virtual_member(w.id, leaf2.id, Some(2))
+                .await
+                .expect("w->leaf2");
+
+            let roots = [v.id, a.id, w.id, hollow.id];
+            let batch = service
+                .get_virtual_storage_usage_batch(&roots)
+                .await
+                .expect("batch read");
+            for (label, root) in [("v", v.id), ("a", a.id), ("w", w.id)] {
+                let oracle = service
+                    .get_virtual_storage_usage(root)
+                    .await
+                    .expect("per-repo oracle");
+                assert_eq!(
+                    batch.get(&root).copied(),
+                    Some(oracle),
+                    "batched ledger read must equal the live-SUM oracle for {label}"
+                );
+            }
+            assert_eq!(
+                batch[&v.id], 3_500,
+                "diamond: leaf1 reachable via two paths counts ONCE under v"
+            );
+            assert_eq!(
+                batch[&w.id], 503_500,
+                "independent roots each count a shared leaf under their own root"
+            );
+            assert!(
+                !batch.contains_key(&hollow.id),
+                "root with no resolvable members is absent (caller renders 0)"
+            );
+            assert!(
+                service
+                    .get_virtual_storage_usage_batch(&[])
+                    .await
+                    .expect("empty batch")
+                    .is_empty(),
+                "empty input short-circuits to an empty map"
+            );
+
+            for repo in [v, a, w, hollow, leaf1, leaf2] {
+                cleanup_repo(&pool, repo.id).await;
+            }
+        }
+
+        /// #3078: an A→B→A membership cycle (forced via direct INSERTs — the
+        /// API's cycle guard refuses to create one) must terminate under the
+        /// depth-bounded `UNION` recursion and count each reachable leaf once,
+        /// with the batched ledger read agreeing with the per-repo live-SUM
+        /// oracle for both roots.
+        #[tokio::test]
+        async fn test_virtual_storage_batch_cycle_terminates_3078() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+
+            let leaf = service
+                .create(make_create_req(
+                    &format!("{suffix}cl"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create leaf");
+            insert_artifact(
+                &pool,
+                leaf.id,
+                "c/1",
+                &format!("cas/cc/{}", Uuid::new_v4()),
+                1_000,
+            )
+            .await;
+            let a = service
+                .create(make_virtual_req(
+                    &format!("{suffix}ca"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create a");
+            let b = service
+                .create(make_virtual_req(
+                    &format!("{suffix}cb"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create b");
+            service
+                .add_virtual_member(a.id, b.id, Some(1))
+                .await
+                .expect("a->b");
+            service
+                .add_virtual_member(b.id, leaf.id, Some(1))
+                .await
+                .expect("b->leaf");
+            // Close the cycle behind the API's guard.
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 9)",
+            )
+            .bind(b.id)
+            .bind(a.id)
+            .execute(&pool)
+            .await
+            .expect("force b->a cycle edge");
+
+            let batch = service
+                .get_virtual_storage_usage_batch(&[a.id, b.id])
+                .await
+                .expect("batch read under cycle");
+            for (label, root) in [("a", a.id), ("b", b.id)] {
+                let oracle = service
+                    .get_virtual_storage_usage(root)
+                    .await
+                    .expect("per-repo oracle under cycle");
+                assert_eq!(oracle, 1_000, "cycle walk reaches the leaf once ({label})");
+                assert_eq!(
+                    batch.get(&root).copied(),
+                    Some(oracle),
+                    "batched read equals the oracle under a cycle ({label})"
+                );
+            }
+
+            for repo in [a, b, leaf] {
+                cleanup_repo(&pool, repo.id).await;
+            }
+        }
+
         /// #2785 defect B: a virtual repository's member list is editable after
         /// creation — `set_virtual_members` adds, removes, and reorders members
         /// to match exactly the supplied set (the pre-fix PUT endpoint only
@@ -4755,6 +5253,7 @@ mod tests {
         /// the correct per-component columns.
         #[tokio::test]
         async fn test_usage_ledger_reconcile_matches_union() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -4807,6 +5306,7 @@ mod tests {
         /// bad ledger value is repaired back to the true sum and reported.
         #[tokio::test]
         async fn test_usage_ledger_reconciler_repairs_drift() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -4859,6 +5359,852 @@ mod tests {
             assert_eq!(hosted, 7_000, "drift repaired back to the true sum");
 
             cleanup_repo(&pool, repo.id).await;
+        }
+
+        // =================================================================
+        // #2992: trigger-maintained usage ledger (migration 183). Every
+        // INSERT/UPDATE/DELETE on artifacts / proxy_cache_artifacts /
+        // oci_blobs must charge or decrement the matching ledger component
+        // inside the mutating statement's own transaction, with no
+        // application code involved.
+        // =================================================================
+
+        async fn ledger_row(pool: &PgPool, repo: Uuid) -> (i64, i64, i64) {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+                 FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo)
+            .fetch_optional(pool)
+            .await
+            .expect("ledger query")
+            .unwrap_or((0, 0, 0))
+        }
+
+        /// F1 (#2992): a raw `INSERT INTO artifacts` — the shape every format
+        /// handler that bypasses the enforced admission path uses — must
+        /// charge `hosted_bytes` immediately (trigger, same tx), and the next
+        /// enforced admission must observe the real usage. On pre-183 code
+        /// the ledger stays 0 here until the background reconciler runs.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_charges_bypassing_artifact_insert() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(CreateRepositoryRequest {
+                    quota_bytes: Some(1_000),
+                    ..make_create_req(&suffix, RepositoryFormat::Generic)
+                })
+                .await
+                .expect("create repo");
+
+            // No admission call, no reconcile: the trigger alone must charge.
+            insert_artifact(
+                &pool,
+                repo.id,
+                "bypass/a-1.0.jar",
+                &format!("cas/aa/{}", Uuid::new_v4()),
+                5_000,
+            )
+            .await;
+            let (hosted, _, _) = ledger_row(&pool, repo.id).await;
+            assert_eq!(
+                hosted, 5_000,
+                "bypassing insert must be charged by the trigger in its own tx"
+            );
+
+            // Enforced admission (unchanged behaviour) sees the usage and
+            // rejects a further upload over the 1000-byte quota.
+            let mut tx = pool.begin().await.expect("begin");
+            let admission = service
+                .check_quota_locked(&mut tx, repo.id, "p2", 300)
+                .await
+                .expect("admission");
+            tx.rollback().await.expect("rollback");
+            assert!(
+                !admission.allowed,
+                "admission after the bypassing insert must see 5000 used"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// F2 (#2992): deletes return the ledger to its prior value exactly.
+        /// A soft-delete decrements once; a later hard DELETE of the already
+        /// soft-deleted row must not decrement again; and the counter is
+        /// floored at zero even against injected under-count drift.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_delete_returns_to_prior_value() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "f2/a", "cas/f2/a", 600).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 600);
+
+            // Soft-delete (the dominant delete shape in the handlers).
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("f2/a")
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "soft-delete must decrement exactly the charged bytes"
+            );
+
+            // Hard-deleting the already soft-deleted row contributes nothing
+            // (old contribution is 0), so no double decrement.
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/a")
+                .execute(&pool)
+                .await
+                .expect("hard delete of soft-deleted row");
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 0);
+
+            // Hard delete of a live row decrements exactly its size.
+            insert_artifact(&pool, repo.id, "f2/b", "cas/f2/b", 400).await;
+            insert_artifact(&pool, repo.id, "f2/c", "cas/f2/c", 250).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 650);
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/b")
+                .execute(&pool)
+                .await
+                .expect("hard delete");
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 250);
+
+            // Injected under-count drift: the floor keeps the counter at 0
+            // rather than going negative (phantom free quota).
+            sqlx::query(
+                "UPDATE repository_usage_ledger SET hosted_bytes = 0 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject drift");
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo.id)
+                .bind("f2/c")
+                .execute(&pool)
+                .await
+                .expect("hard delete under drift");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "decrement must clamp at zero, never negative"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: the charge lives in the mutation's own transaction, so a
+        /// rolled-back INSERT leaves the ledger unchanged (inside the tx the
+        /// charge is visible; after ROLLBACK it is gone).
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_rollback_uncharges() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "rb/base", "cas/rb/base", 300).await;
+            assert_eq!(ledger_row(&pool, repo.id).await.0, 300);
+
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'rb/tx', 'rb/tx', 900, repeat('a', 64), \
+                         'application/octet-stream', 'cas/rb/tx', false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo.id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert inside tx");
+            let in_tx: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ledger inside tx");
+            assert_eq!(in_tx, 1_200, "charge is visible inside the transaction");
+            tx.rollback().await.expect("rollback");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                300,
+                "ROLLBACK must un-charge the aborted insert"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: in-place overwrites (the `ON CONFLICT (repository_id, path)
+        /// DO UPDATE` upsert shape) charge the net size delta, and a
+        /// reclassification to a proxy-cache storage key removes the row from
+        /// `hosted_bytes` entirely.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_update_charges_net_delta() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "ow/a", "cas/ow/a", 900).await;
+            sqlx::query(
+                "UPDATE artifacts SET size_bytes = 1000 \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("ow/a")
+            .execute(&pool)
+            .await
+            .expect("overwrite size");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                1_000,
+                "overwrite must charge the +100 delta, not another +1000"
+            );
+
+            sqlx::query(
+                "UPDATE artifacts SET storage_key = 'proxy-cache/x/__content__' \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind("ow/a")
+            .execute(&pool)
+            .await
+            .expect("reclassify to proxy-cache key");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                0,
+                "proxy-cache-keyed rows must not count toward hosted_bytes"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: each source table feeds exactly its own ledger component;
+        /// the OCI dedup re-push upsert (`DO UPDATE SET pending_delete_at =
+        /// NULL`) is a zero-delta no-op; deletes drain each component back to
+        /// zero.
+        #[tokio::test]
+        async fn test_usage_ledger_trigger_components_isolated() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            insert_proxy_cache(&pool, repo.id, "cached/pkg.tgz", 2_500).await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 0));
+
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 500_000).await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 500_000));
+
+            // Dedup re-push of the same blob: fires only the
+            // pending_delete_at column, so the trigger must not run and the
+            // blob stays counted exactly once.
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (repository_id, digest) DO UPDATE SET pending_delete_at = NULL",
+            )
+            .bind(repo.id)
+            .bind(&digest)
+            .bind(500_000_i64)
+            .bind(format!("oci-blobs/{digest}"))
+            .execute(&pool)
+            .await
+            .expect("dedup re-push upsert");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (0, 2_500, 500_000),
+                "dedup re-push must not double-count the blob"
+            );
+
+            // artifacts rows carrying a proxy-cache storage key contribute 0.
+            insert_artifact(
+                &pool,
+                repo.id,
+                "legacy/proxy-row",
+                &format!("proxy-cache/{}/legacy/__content__", repo.id),
+                700,
+            )
+            .await;
+            assert_eq!(ledger_row(&pool, repo.id).await, (0, 2_500, 500_000));
+
+            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("proxy invalidate");
+            sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("oci purge");
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (0, 0, 0),
+                "component deletes must drain exactly their own counters"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #2992: migration 183's one-time true-up sets every ledger row to
+        /// the authoritative live sums (DO UPDATE, unlike 171's DO NOTHING),
+        /// erasing pre-trigger drift. Exercises the same statement scoped to
+        /// one repository so concurrently running DB tests are untouched.
+        #[tokio::test]
+        async fn test_usage_ledger_migration_true_up_repairs_drift() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+
+            insert_artifact(&pool, repo.id, "tu/a", "cas/tu/a", 1_000).await;
+            insert_proxy_cache(&pool, repo.id, "tu/p.tgz", 2_500).await;
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 4_000).await;
+
+            // Simulate pre-trigger drift the migration must erase.
+            sqlx::query(
+                "UPDATE repository_usage_ledger \
+                 SET hosted_bytes = 1, proxy_bytes = 2, oci_bytes = 3 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject drift");
+
+            // The 183 true-up statement, scoped to this repository.
+            sqlx::query(
+                "INSERT INTO repository_usage_ledger \
+                     (repository_id, hosted_bytes, proxy_bytes, oci_bytes, updated_at) \
+                 SELECT r.id, \
+                     COALESCE((SELECT SUM(a.size_bytes) FROM artifacts a \
+                                WHERE a.repository_id = r.id AND a.is_deleted = false \
+                                  AND a.storage_key NOT LIKE 'proxy-cache/%'), 0), \
+                     COALESCE((SELECT SUM(p.size_bytes) FROM proxy_cache_artifacts p \
+                                WHERE p.repository_id = r.id), 0), \
+                     COALESCE((SELECT SUM(o.size_bytes) FROM oci_blobs o \
+                                WHERE o.repository_id = r.id), 0), \
+                     now() \
+                 FROM repositories r WHERE r.id = $1 \
+                 ON CONFLICT (repository_id) DO UPDATE SET \
+                     hosted_bytes = EXCLUDED.hosted_bytes, \
+                     proxy_bytes  = EXCLUDED.proxy_bytes, \
+                     oci_bytes    = EXCLUDED.oci_bytes, \
+                     updated_at   = now()",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("true-up");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await,
+                (1_000, 2_500, 4_000),
+                "true-up must restore the exact live sums"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // O(1) ledger-based quota admission (#2516 S2)
+        // -------------------------------------------------------------------
+
+        async fn set_quota(pool: &PgPool, repo: Uuid, quota: Option<i64>) {
+            sqlx::query("UPDATE repositories SET quota_bytes = $1 WHERE id = $2")
+                .bind(quota)
+                .bind(repo)
+                .execute(pool)
+                .await
+                .expect("set quota");
+        }
+
+        async fn ledger_hosted(pool: &PgPool, repo: Uuid) -> Option<i64> {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repo)
+            .fetch_optional(pool)
+            .await
+            .expect("ledger query")
+        }
+
+        /// Mimic `finalize_upload`'s admission flow: check quota under the
+        /// ledger-row lock and, when admitted, perform the artifact upsert in
+        /// the SAME transaction and commit. A rejected admission drops the
+        /// transaction (rollback), exactly like the production caller.
+        async fn admit_and_insert(
+            service: &RepositoryService,
+            pool: &PgPool,
+            repo: Uuid,
+            path: &str,
+            size: i64,
+        ) -> bool {
+            let mut tx = pool.begin().await.expect("begin");
+            let adm = service
+                .check_quota_locked(&mut tx, repo, path, size)
+                .await
+                .expect("admission");
+            if adm.allowed {
+                sqlx::query(
+                    "INSERT INTO artifacts \
+                       (repository_id, path, name, size_bytes, checksum_sha256, \
+                        content_type, storage_key) \
+                     VALUES ($1, $2, $2, $3, repeat('a', 64), \
+                             'application/octet-stream', $4) \
+                     ON CONFLICT (repository_id, path) DO UPDATE SET \
+                         size_bytes = EXCLUDED.size_bytes, \
+                         storage_key = EXCLUDED.storage_key, \
+                         is_deleted = false, updated_at = now()",
+                )
+                .bind(repo)
+                .bind(path)
+                .bind(size)
+                .bind(format!("keys/{path}"))
+                .execute(&mut *tx)
+                .await
+                .expect("artifact upsert");
+                tx.commit().await.expect("commit");
+            }
+            adm.allowed
+        }
+
+        /// (a)/(b): an under-quota upload is admitted, an upload that would
+        /// exceed the quota is rejected, and the admission path keeps the
+        /// ledger counters exact along the way.
+        #[tokio::test]
+        async fn test_quota_admission_o1_under_then_over() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+
+            assert!(admit_and_insert(&service, &pool, repo.id, "q/a", 600).await);
+            assert!(
+                !admit_and_insert(&service, &pool, repo.id, "q/b", 600).await,
+                "600 committed + 600 new must exceed the 1000-byte quota"
+            );
+            assert!(admit_and_insert(&service, &pool, repo.id, "q/b", 300).await);
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                Some(900),
+                "hosted_bytes must end exact (600 + 300), charged once by the \
+                 insert trigger — not double-counted by admission"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// (c): two concurrent uploads that would jointly exceed the quota —
+        /// exactly one succeeds. The first admission holds the ledger-row
+        /// `FOR UPDATE` lock; the second blocks on it and, once the first
+        /// commits, observes the charged bytes and is rejected.
+        #[tokio::test]
+        async fn test_quota_admission_concurrent_joint_excess_admits_exactly_one() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+            let repo_id = repo.id;
+
+            // First admission: take and HOLD the ledger-row lock.
+            let mut tx1 = pool.begin().await.expect("begin tx1");
+            let adm1 = service
+                .check_quota_locked(&mut tx1, repo_id, "race/one", 600)
+                .await
+                .expect("admission 1");
+            assert!(adm1.allowed);
+
+            // Second admission starts while the first still holds the lock,
+            // so it must wait for tx1's commit and then see its bytes.
+            let pool2 = pool.clone();
+            let contender = tokio::spawn(async move {
+                let service2 = RepositoryService::new(pool2.clone());
+                admit_and_insert(&service2, &pool2, repo_id, "race/two", 600).await
+            });
+
+            // Give the contender time to reach (and block on) the row lock,
+            // then land the first upload.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key) \
+                 VALUES ($1, $2, $2, $3, repeat('a', 64), \
+                         'application/octet-stream', $4)",
+            )
+            .bind(repo_id)
+            .bind("race/one")
+            .bind(600_i64)
+            .bind("keys/race/one")
+            .execute(&mut *tx1)
+            .await
+            .expect("artifact insert tx1");
+            tx1.commit().await.expect("commit tx1");
+
+            let second_allowed = contender.await.expect("contender task");
+            assert!(
+                !second_allowed,
+                "the second of two jointly-over-quota concurrent uploads must be rejected"
+            );
+
+            let live: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+            assert_eq!(live, 1, "exactly one upload may land");
+            assert_eq!(ledger_hosted(&pool, repo_id).await, Some(600));
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// (d): freed space becomes admissible immediately — a delete outside
+        /// the admission path (lifecycle/GC/handlers) is decremented by
+        /// migration 182's trigger in the delete's own transaction, so the
+        /// ledger returns to the exact live value (no reconcile pass needed)
+        /// and never drops below reality (no phantom free space).
+        #[tokio::test]
+        async fn test_quota_admission_frees_space_after_delete() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+
+            assert!(admit_and_insert(&service, &pool, repo.id, "gc/full", 900).await);
+            assert!(!admit_and_insert(&service, &pool, repo.id, "gc/next", 600).await);
+
+            // Delete outside the admission path (as lifecycle/GC/handlers do).
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path = 'gc/full'",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+
+            // The trigger decremented exactly the deleted bytes: the ledger
+            // matches the live sum (0), no more and no less.
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                Some(0),
+                "delete must return the ledger to the exact live value"
+            );
+
+            // Freed space is admissible by the very next upload; the ledger
+            // ends at exactly the newly-admitted bytes (no phantom credit).
+            assert!(admit_and_insert(&service, &pool, repo.id, "gc/next", 600).await);
+            assert_eq!(ledger_hosted(&pool, repo.id).await, Some(600));
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// (e): proxy-cache and OCI-blob bytes keep counting against the
+        /// quota (they did before, via the live 3-way SUM; now via the
+        /// ledger's `proxy_bytes`/`oci_bytes` components).
+        #[tokio::test]
+        async fn test_quota_admission_counts_proxy_and_oci_components() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Docker))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+
+            insert_proxy_cache(&pool, repo.id, "prox/pkg.tgz", 300).await;
+            let digest = format!("sha256:{}", Uuid::new_v4().simple());
+            insert_oci_blob(&pool, repo.id, &digest, 300).await;
+            service
+                .reconcile_usage_ledger(repo.id)
+                .await
+                .expect("reconcile");
+
+            assert!(
+                !admit_and_insert(&service, &pool, repo.id, "img/manifest", 500).await,
+                "300 proxy + 300 oci + 500 hosted must exceed the 1000-byte quota"
+            );
+            assert!(admit_and_insert(&service, &pool, repo.id, "img/manifest", 300).await);
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// A pre-ledger repository (no `repository_usage_ledger` row) must
+        /// have its row lazy-created FROM THE LIVE SUMS, not from zero
+        /// defaults — a zero-seeded row would admit everything until the
+        /// first reconcile pass.
+        #[tokio::test]
+        async fn test_quota_admission_lazy_seed_reads_live_sums_not_zero() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+
+            // Bytes landed via a path that never touched the ledger, and no
+            // ledger row exists at all.
+            insert_artifact(&pool, repo.id, "seed/big", "keys/seed/big", 900).await;
+            sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .expect("drop ledger row");
+
+            assert!(
+                !admit_and_insert(&service, &pool, repo.id, "seed/next", 600).await,
+                "lazy-seeded admission must see the 900 live bytes, not zero"
+            );
+            assert!(admit_and_insert(&service, &pool, repo.id, "seed/next", 50).await);
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                Some(950),
+                "seed (900) + admitted charge (50)"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Overwrites are charged only their net size delta (no
+        /// double-counting of the bytes they replace).
+        #[tokio::test]
+        async fn test_quota_admission_overwrite_charges_net_delta() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+            set_quota(&pool, repo.id, Some(1000)).await;
+
+            assert!(admit_and_insert(&service, &pool, repo.id, "ow/a", 800).await);
+            // Overwriting the same path with 900 nets out the existing 800:
+            // base usage 0 + 900 <= 1000.
+            assert!(admit_and_insert(&service, &pool, repo.id, "ow/a", 900).await);
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                Some(900),
+                "the overwrite must be charged +100, not +900"
+            );
+            assert!(!admit_and_insert(&service, &pool, repo.id, "ow/b", 200).await);
+            assert!(admit_and_insert(&service, &pool, repo.id, "ow/b", 100).await);
+            assert_eq!(ledger_hosted(&pool, repo.id).await, Some(1000));
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// The unlimited-quota fast path stays lock-free: no ledger row is
+        /// created or locked, and no usage is computed.
+        #[tokio::test]
+        async fn test_quota_admission_unlimited_skips_ledger() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            for quota in [None, Some(0_i64), Some(-1_i64)] {
+                set_quota(&pool, repo.id, quota).await;
+                let mut tx = pool.begin().await.expect("begin");
+                let adm = service
+                    .check_quota_locked(&mut tx, repo.id, "unl/x", i64::MAX / 2)
+                    .await
+                    .expect("admission");
+                assert!(adm.allowed, "quota {quota:?} means unlimited");
+                assert_eq!(adm.base_usage, None, "unlimited computes no usage");
+                drop(tx);
+            }
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                None,
+                "the unlimited fast path must never create the ledger row"
+            );
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// Configuring a finite quota on `update()` synchronously trues up
+        /// the ledger, so enforcement starts from the live figure instead of
+        /// stale counters accumulated while the repository was unlimited.
+        #[tokio::test]
+        async fn test_update_with_finite_quota_reconciles_ledger() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Generic))
+                .await
+                .expect("create repo");
+
+            // 900 live bytes, then inject under-count drift directly into the
+            // ledger row (a direct ledger write bypasses the source-table
+            // triggers, mimicking pre-182 counters or manual surgery): the
+            // quota update below must not begin enforcement from the stale
+            // zero.
+            insert_artifact(&pool, repo.id, "stale/one", "keys/stale/one", 900).await;
+            sqlx::query(
+                "UPDATE repository_usage_ledger SET hosted_bytes = 0 \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo.id)
+            .execute(&pool)
+            .await
+            .expect("inject stale ledger row");
+
+            service
+                .update(
+                    repo.id,
+                    UpdateRepositoryRequest {
+                        key: None,
+                        name: None,
+                        description: None,
+                        is_public: None,
+                        quota_bytes: Some(Some(1000)),
+                        upstream_url: None,
+                        promotion_only: None,
+                        versioning_enabled: None,
+                        project_id: None,
+                        trusted_gpg_key: None,
+                        curation_allow_unverified: None,
+                        curation_enabled: None,
+                        curation_default_action: None,
+                    },
+                )
+                .await
+                .expect("update quota");
+
+            assert_eq!(
+                ledger_hosted(&pool, repo.id).await,
+                Some(900),
+                "setting a finite quota must true the ledger up synchronously"
+            );
+            assert!(!admit_and_insert(&service, &pool, repo.id, "stale/two", 200).await);
+            assert!(admit_and_insert(&service, &pool, repo.id, "stale/two", 100).await);
+
+            cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// O(1) contract pin (#2516 S2): the admission critical section must
+        /// not re-aggregate the live source tables. The 3-way UNION aggregate
+        /// (`artifacts` + `proxy_cache_artifacts` + `oci_blobs`) is the
+        /// O(repository rows) shape this slice removed; reintroducing it
+        /// inside `check_quota_locked` re-serializes every same-repo upload
+        /// behind a full scan. The per-path netting SUM (unique-index lookup)
+        /// and the ledger-row lock are expected to remain.
+        #[test]
+        fn test_check_quota_locked_has_no_live_union_aggregate() {
+            let src = include_str!("repository_service.rs");
+            let fn_start = src
+                .find("pub async fn check_quota_locked(")
+                .expect("check_quota_locked must exist");
+            let fn_end_rel = src[fn_start..]
+                .find("async fn reconcile_usage_ledger_in_tx(")
+                .expect("reconcile_usage_ledger_in_tx must follow check_quota_locked");
+            let body = &src[fn_start..fn_start + fn_end_rel];
+
+            // Built at runtime so this test's own text does not match.
+            let union_aggregate = format!("{} {}", "UNION", "ALL");
+            assert!(
+                !body.contains(&union_aggregate),
+                "check_quota_locked must stay O(1): read the locked \
+                 repository_usage_ledger counters, never re-run the live \
+                 3-way aggregate under the admission lock (#2516 F1)"
+            );
+            assert!(
+                body.contains("repository_usage_ledger") && body.contains("FOR UPDATE"),
+                "admission must keep serializing on the locked ledger row"
+            );
         }
     }
 }

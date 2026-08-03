@@ -784,7 +784,7 @@ async fn publish_release_from_wildcard(
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "swift", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "swift", "write:artifacts")?.user_id;
     publish_release(
         state, repo_key, scope, name, version, user_id, headers, body,
     )
@@ -1186,6 +1186,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.storage_path, "/data/swift-repo");
@@ -1206,6 +1209,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(

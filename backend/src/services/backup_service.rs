@@ -96,6 +96,14 @@ pub struct CreateBackupRequest {
     /// removed from it; otherwise every repository except the excluded ones
     /// is backed up.
     pub exclude_repository_ids: Option<Vec<Uuid>>,
+    /// Optional lower bound on artifact modification time (#2789).
+    ///
+    /// When set, only artifacts whose `updated_at >= since` are included in the
+    /// backup, letting operators capture just the changes made from a given
+    /// date/timestamp to now (an incremental "since this point" backup). When
+    /// `None` every artifact is included, so full and incremental backups behave
+    /// exactly as before.
+    pub since: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
     /// Optional operator-supplied name/label for the archive (#2790).
     ///
@@ -108,7 +116,15 @@ pub struct CreateBackupRequest {
 /// Backup service
 pub struct BackupService {
     db: PgPool,
+    /// Primary storage: where source artifacts are read from during a backup
+    /// and restored to during a restore. Always the deployment's main storage
+    /// bucket.
     storage: Arc<StorageService>,
+    /// Storage for backup **archives** (`.tar.gz`). Defaults to `storage`, but
+    /// points at a separate bucket when `BACKUP_S3_BUCKET` is configured
+    /// (#2507). Only the archive read/write path uses this handle, so a
+    /// dedicated backup bucket never changes where artifacts live.
+    archive_storage: Arc<StorageService>,
     active_backup: Arc<Mutex<Option<Uuid>>>,
 }
 
@@ -341,11 +357,48 @@ fn resolve_effective_repository_ids(
     }
 }
 
+/// Read the optional `since` cutoff (#2789) from a backup's stored metadata.
+///
+/// Returns `None` when no cutoff was recorded (the key is absent or JSON null),
+/// which preserves the historical "every artifact" behavior. A malformed value
+/// is treated as no cutoff rather than failing the backup.
+fn parse_since_filter(metadata: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    metadata
+        .and_then(|m| m.get("since"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+        // Default: backup archives live in the same bucket as artifacts, so
+        // the archive handle is just a clone of primary storage. This keeps
+        // behavior byte-identical when `BACKUP_S3_BUCKET` is unset (#2507).
+        let archive_storage = storage.clone();
         Self {
             db,
             storage,
+            archive_storage,
+            active_backup: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct a backup service whose **archives** are read from/written to a
+    /// dedicated storage handle, separate from the artifact storage (#2507).
+    ///
+    /// Callers resolve `archive_storage` via
+    /// [`StorageService::backup_archive_from_config`]; when `BACKUP_S3_BUCKET`
+    /// is unset it is a clone of `storage`, so this is equivalent to
+    /// [`BackupService::new`].
+    pub fn with_archive_storage(
+        db: PgPool,
+        storage: Arc<StorageService>,
+        archive_storage: Arc<StorageService>,
+    ) -> Self {
+        Self {
+            db,
+            storage,
+            archive_storage,
             active_backup: Arc::new(Mutex::new(None)),
         }
     }
@@ -378,6 +431,7 @@ impl BackupService {
             serde_json::json!({
                 "repository_ids": req.repository_ids,
                 "exclude_repository_ids": req.exclude_repository_ids,
+                "since": req.since,
                 "name": req.name,
             })
         )
@@ -522,13 +576,20 @@ impl BackupService {
             .effective_repository_filter(backup.metadata.as_ref())
             .await?;
 
+        // Optional "changes since" cutoff (#2789). When present only artifacts
+        // modified at-or-after this timestamp are dumped, so an incremental
+        // backup can capture just the delta from a given date to now. `None`
+        // keeps every artifact, preserving the historical behavior.
+        let since_filter = parse_since_filter(backup.metadata.as_ref());
+
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
             // The `artifacts` table is the only per-repository table exported,
             // so when a repository filter is in effect an excluded repository's
             // artifact rows are kept out of the dump too (not just its bytes).
             let json_data = if *table == "artifacts" {
-                self.export_artifacts(repository_filter.as_deref()).await?
+                self.export_artifacts(repository_filter.as_deref(), since_filter)
+                    .await?
             } else {
                 self.export_table(table).await?
             };
@@ -538,7 +599,7 @@ impl BackupService {
 
         // Fetch artifact storage keys and content
         let storage_keys = self
-            .artifact_storage_keys(repository_filter.as_deref())
+            .artifact_storage_keys(repository_filter.as_deref(), since_filter)
             .await?;
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
         for key in storage_keys {
@@ -576,7 +637,9 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        self.storage
+        // The archive itself is written to the (optionally separate) backup
+        // bucket; the source artifacts read above stay on primary storage.
+        self.archive_storage
             .put(storage_path, Bytes::from(tar_buffer.clone()))
             .await?;
 
@@ -653,48 +716,59 @@ impl BackupService {
     }
 
     /// List the artifact storage keys to include in a backup, honoring the
-    /// resolved repository filter (`None` => every artifact).
+    /// resolved repository filter (`None` => every repository) and the optional
+    /// `since` cutoff (#2789; `None` => every modification time). Both
+    /// predicates are null-guarded so passing `None`/`None` returns every
+    /// artifact exactly as before.
     async fn artifact_storage_keys(
         &self,
         repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<String>> {
-        let keys: Vec<String> = if let Some(repo_ids) = repository_filter {
-            sqlx::query_scalar!(
-                "SELECT storage_key FROM artifacts WHERE repository_id = ANY($1)",
-                repo_ids
-            )
-            .fetch_all(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        } else {
-            sqlx::query_scalar!("SELECT storage_key FROM artifacts")
-                .fetch_all(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
-        };
+        // Runtime (non-macro) query so no offline `.sqlx` prepare is needed and
+        // both optional predicates live in a single statement.
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        let keys: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT storage_key FROM artifacts
+            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))
+              AND ($2::timestamptz IS NULL OR updated_at >= $2)
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(since)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(keys)
     }
 
     /// Export the `artifacts` table as a JSON array, honoring the resolved
-    /// repository filter (#2772).
+    /// repository filter (#2772) and the optional `since` cutoff (#2789).
     ///
-    /// When `repository_filter` is `None` this is identical to
-    /// `export_table("artifacts")`, so unfiltered backups are unchanged. When a
-    /// filter is present only the covered repositories' artifact rows are
-    /// dumped, keeping an excluded repository entirely out of the archive.
+    /// When both filters are `None` this returns every artifact row, identical
+    /// to `export_table("artifacts")`, so unfiltered backups are unchanged. A
+    /// repository filter keeps only the covered repositories' rows; a `since`
+    /// cutoff keeps only rows with `updated_at >= since`, so an incremental
+    /// backup dumps just the metadata changed after the given timestamp.
     async fn export_artifacts(
         &self,
         repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<serde_json::Value> {
-        let Some(repo_ids) = repository_filter else {
-            return self.export_table("artifacts").await;
-        };
-
+        // Runtime (non-macro) query so no offline `.sqlx` prepare is needed and
+        // both optional predicates live in a single statement.
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT row_to_json(t) FROM artifacts t WHERE repository_id = ANY($1)",
+            r#"
+            SELECT row_to_json(t) FROM artifacts t
+            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))
+              AND ($2::timestamptz IS NULL OR updated_at >= $2)
+            "#,
         )
         .bind(repo_ids)
+        .bind(since)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -764,7 +838,8 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        let tar_data = self.storage.get(storage_path).await?;
+        // Read the archive back from the (optionally separate) backup bucket.
+        let tar_data = self.archive_storage.get(storage_path).await?;
 
         // Phase 1: Extract all entries synchronously (tar::Archive is !Send)
         let entries = Self::extract_entries(&tar_data)?;
@@ -933,10 +1008,10 @@ impl BackupService {
     pub async fn delete(&self, backup_id: Uuid) -> Result<()> {
         let backup = self.get_by_id(backup_id).await?;
 
-        // Delete from storage if path exists
+        // Delete the archive from the (optionally separate) backup bucket.
         if let Some(storage_path) = &backup.storage_path {
-            if self.storage.exists(storage_path).await? {
-                self.storage.delete(storage_path).await?;
+            if self.archive_storage.exists(storage_path).await? {
+                self.archive_storage.delete(storage_path).await?;
             }
         }
 
@@ -1009,9 +1084,9 @@ impl BackupService {
             // removal fails, keep the row so a later retention run retries
             // rather than silently orphaning the archive.
             if let Some(path) = storage_path.as_deref() {
-                match self.storage.exists(path).await {
+                match self.archive_storage.exists(path).await {
                     Ok(true) => {
-                        if let Err(e) = self.storage.delete(path).await {
+                        if let Err(e) = self.archive_storage.delete(path).await {
                             tracing::warn!(
                                 backup_id = %id,
                                 storage_path = path,
@@ -1626,12 +1701,14 @@ mod tests {
             backup_type: BackupType::Full,
             repository_ids: Some(vec![Uuid::new_v4()]),
             exclude_repository_ids: None,
+            since: None,
             created_by: Some(Uuid::new_v4()),
             name: None,
         };
         assert_eq!(req.backup_type, BackupType::Full);
         assert!(req.repository_ids.is_some());
         assert!(req.created_by.is_some());
+        assert!(req.since.is_none());
     }
 
     #[test]
@@ -1640,12 +1717,31 @@ mod tests {
             backup_type: BackupType::Metadata,
             repository_ids: None,
             exclude_repository_ids: None,
+            since: None,
             created_by: None,
             name: None,
         };
         assert_eq!(req.backup_type, BackupType::Metadata);
         assert!(req.repository_ids.is_none());
         assert!(req.created_by.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_with_since_cutoff() {
+        // #2789: an incremental "changes since" backup carries an RFC3339 cutoff.
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let req = CreateBackupRequest {
+            backup_type: BackupType::Incremental,
+            repository_ids: None,
+            exclude_repository_ids: None,
+            since: Some(cutoff),
+            created_by: None,
+            name: None,
+        };
+        assert_eq!(req.backup_type, BackupType::Incremental);
+        assert_eq!(req.since, Some(cutoff));
     }
 
     // -----------------------------------------------------------------------
@@ -1893,6 +1989,50 @@ mod tests {
         assert_eq!(out, Some(vec![]));
     }
 
+    // -----------------------------------------------------------------------
+    // parse_since_filter tests (#2789 incremental "changes since" cutoff)
+    // -----------------------------------------------------------------------
+
+    /// Build the same metadata JSON that `create()` persists for a backup.
+    fn backup_metadata(since: Option<DateTime<Utc>>) -> serde_json::Value {
+        serde_json::json!({
+            "repository_ids": Option::<Vec<Uuid>>::None,
+            "exclude_repository_ids": Option::<Vec<Uuid>>::None,
+            "since": since,
+            "name": Option::<String>::None,
+        })
+    }
+
+    #[test]
+    fn test_parse_since_absent_metadata_is_none() {
+        // No metadata at all => no cutoff, back up every artifact (unchanged).
+        assert!(parse_since_filter(None).is_none());
+    }
+
+    #[test]
+    fn test_parse_since_unset_is_none() {
+        // A backup created without `since` stores JSON null => no cutoff.
+        let meta = backup_metadata(None);
+        assert!(parse_since_filter(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_parse_since_roundtrips_through_create_metadata() {
+        // The cutoff persisted by create() is read back verbatim by do_backup.
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-15T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let meta = backup_metadata(Some(cutoff));
+        assert_eq!(parse_since_filter(Some(&meta)), Some(cutoff));
+    }
+
+    #[test]
+    fn test_parse_since_malformed_is_treated_as_none() {
+        // A non-timestamp value must not fail the backup; it means "no cutoff".
+        let meta = serde_json::json!({ "since": "not-a-timestamp" });
+        assert!(parse_since_filter(Some(&meta)).is_none());
+    }
+
     /// Verify every table in ALLOWED_EXPORT_TABLES is a known migration table.
     /// This prevents future mismatches by listing all valid tables.
     #[test]
@@ -1924,5 +2064,124 @@ mod tests {
                 table
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2789: end-to-end "changes since" filtering against a real database.
+    // Skips cleanly when `DATABASE_URL` is unset (the CI coverage job seeds
+    // Postgres, so it is exercised there). Everything is scoped to a unique
+    // repository id so parallel test processes never see each other's rows.
+    // -----------------------------------------------------------------------
+
+    /// Build a backup service backed by `pool` with a throwaway filesystem
+    /// storage handle (the artifact-enumeration paths under test never read
+    /// bytes, so the backend is only needed to satisfy the constructor).
+    fn service_for(pool: PgPool) -> BackupService {
+        use crate::services::storage_service::FilesystemBackend;
+        let dir = std::env::temp_dir().join(format!("bk-since-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let backend = Arc::new(FilesystemBackend::new(dir));
+        let storage = Arc::new(StorageService::new(backend));
+        BackupService::new(pool, storage)
+    }
+
+    /// Insert an artifact row with an explicit `updated_at` and return its key.
+    async fn insert_artifact_at(
+        pool: &PgPool,
+        repo_id: Uuid,
+        label: &str,
+        updated_at: DateTime<Utc>,
+    ) -> String {
+        let key = format!("since-test/{}-{}", label, Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key, updated_at)
+            VALUES ($1, $2, $3, 10, $4, 'application/octet-stream', $5, $6)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(format!("path/{}", key))
+        .bind(label)
+        .bind("0".repeat(64))
+        .bind(&key)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("insert artifact");
+        key
+    }
+
+    #[tokio::test]
+    async fn test_since_filter_excludes_older_includes_newer_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let old_at = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let new_at = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cutoff = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let old_key = insert_artifact_at(&pool, repo_id, "old", old_at).await;
+        let new_key = insert_artifact_at(&pool, repo_id, "new", new_at).await;
+
+        let service = service_for(pool.clone());
+        let repo_filter = [repo_id];
+
+        // With a `since` cutoff only the artifact modified after it is included.
+        let keys = service
+            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("storage keys with since");
+        assert_eq!(
+            keys,
+            vec![new_key.clone()],
+            "since keeps only the newer key"
+        );
+        assert!(!keys.contains(&old_key), "older artifact is excluded");
+
+        // The exported metadata rows honor the same cutoff.
+        let exported = service
+            .export_artifacts(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("export with since");
+        let rows = exported.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "only the newer artifact row is exported");
+        assert_eq!(rows[0]["storage_key"], serde_json::json!(new_key));
+
+        // Boundary: an artifact modified exactly at the cutoff is included
+        // (predicate is `updated_at >= since`).
+        let edge_key = insert_artifact_at(&pool, repo_id, "edge", cutoff).await;
+        let keys_edge = service
+            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("storage keys with since (edge)");
+        assert!(
+            keys_edge.contains(&edge_key),
+            "artifact at exactly the cutoff is included"
+        );
+
+        // No cutoff (`None`) => every artifact in the repo, unchanged behavior.
+        let keys_all = service
+            .artifact_storage_keys(Some(&repo_filter), None)
+            .await
+            .expect("storage keys without since");
+        assert_eq!(keys_all.len(), 3, "unset since includes every artifact");
+
+        // Cleanup: dropping the repo cascades to its artifacts.
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

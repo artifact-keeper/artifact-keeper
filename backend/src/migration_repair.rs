@@ -287,6 +287,13 @@ pub async fn repair_release_1_1_9_divergence(db: &PgPool) -> Result<()> {
         .execute(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    // Migration 178's column. The enforcement paths write it with runtime queries
+    // rather than the checked macros, so a repaired install missing this column
+    // would fail at request time rather than at build time (#2912).
+    sqlx::query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS quarantine_reason TEXT")
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_artifacts_quarantine_until \
              ON artifacts (quarantine_until) \

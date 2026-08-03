@@ -1,6 +1,6 @@
 name: Feature Request
 description: Suggest a new feature or enhancement for Artifact Keeper
-labels: ["enhancement", "needs-triage"]
+labels: ["type:enhancement", "needs-triage"]
 body:
   - type: markdown
     attributes:

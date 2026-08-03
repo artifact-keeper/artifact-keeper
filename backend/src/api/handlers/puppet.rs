@@ -54,6 +54,25 @@ async fn resolve_puppet_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["puppet"], "a Puppet").await
 }
 
+/// Build the `file_uri` advertised in the Forge module/release metadata.
+///
+/// The download route (`GET /puppet/{repo}/v3/files/{file}`) resolves a hosted
+/// module by its trailing filename suffix (#2587), so the advertised URI must
+/// carry the artifact's actual stored basename. A module published through the
+/// native Forge upload is stored at `{owner}-{name}-{version}.tar.gz`,
+/// byte-identical to the reconstructed filename; one pushed through the generic
+/// upload flow is stored at its bare path with generically-derived coordinates,
+/// so reconstructing the canonical filename would advertise a path the download
+/// route cannot resolve (the Puppet analogue of the RPM `<location>` fix,
+/// #2587 / #2589).
+fn release_file_uri(repo_key: &str, path: &str, owner: &str, name: &str, version: &str) -> String {
+    let filename = proxy_helpers::advertised_download_filename(
+        path,
+        &format!("{}-{}-{}.tar.gz", owner, name, version),
+    );
+    format!("/puppet/{}/v3/files/{}", repo_key, filename)
+}
+
 /// Parse an "owner-name" string into (owner, name) by splitting on the first hyphen.
 #[allow(clippy::result_large_err)]
 fn parse_owner_name(s: &str) -> Result<(String, String), Response> {
@@ -150,10 +169,7 @@ async fn module_info(
         "current_release": {
             "version": current_version,
             "slug": format!("{}-{}-{}", owner, name, current_version),
-            "file_uri": format!(
-                "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-                repo_key, owner, name, current_version
-            ),
+            "file_uri": release_file_uri(&repo_key, &artifact.path, &owner, &name, &current_version),
         },
         "releases": [],
     });
@@ -186,10 +202,7 @@ async fn release_list(
             serde_json::json!({
                 "slug": format!("{}-{}-{}", owner, name, version),
                 "version": version,
-                "file_uri": format!(
-                    "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-                    repo_key, owner, name, version
-                ),
+                "file_uri": release_file_uri(&repo_key, &a.path, &owner, &name, &version),
                 "file_size": a.size_bytes,
                 "file_sha256": a.checksum_sha256,
                 "metadata": a.metadata.clone().unwrap_or(serde_json::json!({})),
@@ -248,10 +261,7 @@ async fn release_info(
             "name": name,
             "owner": { "slug": owner, "username": owner },
         },
-        "file_uri": format!(
-            "/puppet/{}/v3/files/{}-{}-{}.tar.gz",
-            repo_key, owner, name, version
-        ),
+        "file_uri": release_file_uri(&repo_key, &artifact.path, &owner, &name, &version),
         "file_size": artifact.size_bytes,
         "file_sha256": artifact.checksum_sha256,
         "downloads": download_count,
@@ -327,7 +337,7 @@ async fn publish_module(
     Path(repo_key): Path<String>,
     multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "puppet", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "puppet", "write:artifacts")?.user_id;
     let repo = resolve_puppet_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -457,6 +467,35 @@ mod tests {
         let (owner, name) = result.unwrap();
         assert_eq!(owner, "puppetlabs");
         assert_eq!(name, "stdlib");
+    }
+
+    #[test]
+    fn test_release_file_uri_native_path_is_byte_identical() {
+        assert_eq!(
+            release_file_uri(
+                "pf",
+                "puppetlabs-stdlib-9.0.0.tar.gz",
+                "puppetlabs",
+                "stdlib",
+                "9.0.0"
+            ),
+            "/puppet/pf/v3/files/puppetlabs-stdlib-9.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_release_file_uri_bare_path_advertises_stored_basename() {
+        // Generic upload at a bare/arbitrary path: advertise the real basename
+        // so the suffix download route (with #2587 exact-path fallback) serves
+        // it, instead of the canonical filename that would 404.
+        assert_eq!(
+            release_file_uri("pf", "blob.tar.gz", "puppetlabs", "stdlib", "9.0.0"),
+            "/puppet/pf/v3/files/blob.tar.gz"
+        );
+        assert_eq!(
+            release_file_uri("pf", "uploads/x/m.tar.gz", "puppetlabs", "stdlib", "9.0.0"),
+            "/puppet/pf/v3/files/m.tar.gz"
+        );
     }
 
     #[test]

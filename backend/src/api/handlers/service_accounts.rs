@@ -2092,24 +2092,15 @@ mod audit_db_tests {
             .layer(AxumExtension::<AuthExtension>(auth))
     }
 
-    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
-        )
-        .bind(token_id)
-        .bind(action)
-        .fetch_one(pool)
-        .await
-        .expect("audit_log count query")
-    }
-
     async fn mint_service_account_token(
         state: SharedState,
         auth: AuthExtension,
         service_account_id: Uuid,
         name: &str,
     ) -> Uuid {
-        let body = json!({ "name": name, "scopes": ["read"] }).to_string();
+        // Canonical vocabulary: bare `read` is rejected by the mint-primitive
+        // scope backstop (#2996).
+        let body = json!({ "name": name, "scopes": ["read:artifacts"] }).to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/{service_account_id}/tokens"))
@@ -2223,7 +2214,9 @@ mod audit_db_tests {
             .await
             .expect("create service account");
 
-        let body = json!({ "name": "sa-audit", "scopes": ["read"] }).to_string();
+        // Canonical vocabulary: bare `read` is rejected by the mint-primitive
+        // scope backstop (#2996).
+        let body = json!({ "name": "sa-audit", "scopes": ["read:artifacts"] }).to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/{}/tokens", sa.id))
@@ -2240,8 +2233,9 @@ mod audit_db_tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
 
+        // #2522: audit write is fire-and-forget (spawned) — poll for the row.
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_CREATED", 1).await,
             1,
             "SA mint MUST write one API_TOKEN_CREATED row"
         );
@@ -2255,7 +2249,7 @@ mod audit_db_tests {
         assert!(status.is_success(), "SA revoke should succeed: {status}");
 
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_REVOKED", 1).await,
             1,
             "SA revoke MUST write one API_TOKEN_REVOKED row"
         );

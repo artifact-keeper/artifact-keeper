@@ -73,12 +73,14 @@ jobs:
           .github/scripts/assert-release-absent.sh "${GITHUB_REF_NAME}"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # RESOLVE CANDIDATE IMAGE DIGEST  (issue #2696)
+  # RESOLVE CANDIDATE IMAGE DIGEST  (issues #2696, #2711)
   #
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
-  # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. Nothing
-  # connects the two workflows except this poll of the registry. Once
-  # merge-backend has pushed the tag, the digest-aware republish guard
+  # ghcr.io/.../artifact-keeper-backend:${VERSION} as a manifest list. A
+  # cross-workflow `needs:` is impossible, so this job is the explicit gate:
+  # it follows the docker-publish RUN for this exact commit+tag to completion
+  # via the Actions API, then resolves the published digest from the registry.
+  # Once merge-backend has pushed the tag, the digest-aware republish guard
   # (`assert-version-digest-consistent`) in docker-publish.yml guarantees it can
   # never be re-pointed to DIFFERENT content -- only re-applied to the same
   # digest, a no-op -- so the tag->digest binding is stable the moment it first
@@ -91,27 +93,86 @@ jobs:
   # half-published image set. web is a decoupled SDK consumer and is no
   # longer part of the backend release's version set (issue #2708).
   #
-  # Ordering (A5): preflight -> resolve (blocks <=35 min on the publish) ->
-  # release-gate/mesh -> build-binaries -> verify-images-published -> release.
-  # The GitHub Release object still publishes strictly last; this job only
-  # moves the gate's START to after the candidate bytes exist.
+  # Ordering (A5): preflight -> resolve (follows the docker-publish run to
+  # completion, then captures the digest) -> release-gate ->
+  # build-binaries -> verify-images-published -> release. The GitHub Release
+  # object still publishes strictly last; this job only moves the gate's START
+  # to after the candidate bytes exist.
   # ════════════════════════════════════════════════════════════════════════════
 
   resolve-candidate-digest:
     name: Resolve candidate image digest
     needs: [release-preflight]
     runs-on: ubuntu-latest
-    # docker-publish's multi-arch build + cosign + provenance takes 15-25 min
-    # (see verify-images-published comment below); poll with a 35-min internal
-    # deadline inside a 40-min job timeout.
-    timeout-minutes: 40
+    # docker-publish's wall time is dominated by the amd64 backend image build
+    # on the self-hosted runners: with a cold buildx cache it legitimately
+    # takes 60-90 min (arm64 finishes in ~9 min on GitHub-native runners).
+    # A previous fixed 35-min poll deadline here raced that build and failed
+    # releases that were merely slow, not broken (issue #2711). The wait below
+    # is now event-driven -- it follows the docker-publish run for this exact
+    # commit to completion -- so this job timeout is only a hard ceiling
+    # against a genuinely hung publish: cold-cache amd64 worst case (~90 min)
+    # + runner queue + cosign/provenance + margin.
+    timeout-minutes: 130
     permissions:
       packages: read
+      actions: read # to follow the docker-publish run for this commit
     outputs:
       backend_digest: ${{ steps.resolve.outputs.backend_digest }}   # sha256:...
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - name: Wait for docker-publish to publish :$VERSION and capture its digest
+      - name: Wait for the docker-publish run for this commit to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Locating the docker-publish run for ${GITHUB_REF_NAME}@${GITHUB_SHA}"
+
+          # The same tag push triggers docker-publish.yml independently; find
+          # ITS run for this exact commit+tag. Webhook fan-out can lag, so
+          # allow up to 15 minutes for the run to appear before declaring
+          # docker-publish dead (a dead publish must fail this job RED rather
+          # than let a skipped gate slip the release through).
+          APPEAR_DEADLINE=$(($(date +%s) + 15*60))
+          RUN_ID=""
+          while true; do
+            RUN_ID=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?event=push&head_sha=${GITHUB_SHA}&per_page=20" \
+              --jq '.workflow_runs' 2>/dev/null \
+              | jq -r --arg ref "${GITHUB_REF_NAME}" \
+                  '[.[] | select(.head_branch == $ref)][0].id // empty' || true)
+            [ -n "${RUN_ID}" ] && break
+            if [ "$(date +%s)" -ge "${APPEAR_DEADLINE}" ]; then
+              echo "::error title=docker-publish never started::No docker-publish.yml run found for ${GITHUB_REF_NAME}@${GITHUB_SHA} after 15m. Release blocked."
+              exit 1
+            fi
+            echo "  no docker-publish run visible yet, waiting 30s..."
+            sleep 30
+          done
+          echo "  following docker-publish run ${RUN_ID}"
+
+          # Follow the run to completion. Deliberately NO fixed clock here --
+          # the job-level timeout-minutes above is the only ceiling, sized for
+          # the cold-cache amd64 build (issue #2711). Transient API errors
+          # yield STATUS=unknown and the loop just keeps polling.
+          while true; do
+            STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+              --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || echo "unknown -")
+            STATUS="${STATE%% *}"
+            CONCLUSION="${STATE#* }"
+            if [ "${STATUS}" = "completed" ]; then
+              if [ "${CONCLUSION}" = "success" ]; then
+                echo "  docker-publish run ${RUN_ID} completed successfully."
+                break
+              fi
+              echo "::error title=docker-publish failed::docker-publish run ${RUN_ID} completed with conclusion '${CONCLUSION}'. Release blocked; fix and re-run docker-publish, then re-run this workflow."
+              exit 1
+            fi
+            echo "  docker-publish run ${RUN_ID}: ${STATUS}; waiting 60s..."
+            sleep 60
+          done
+
+      - name: Capture the published :$VERSION digest
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -152,9 +213,11 @@ jobs:
             printf '%s' "${digest}"
           }
 
-          # Poll for up to 35 minutes; a dead docker-publish must fail this job
-          # RED (exit 1) rather than let a skipped gate slip the release through.
-          DEADLINE=$(($(date +%s) + 35*60))
+          # The previous step already followed the docker-publish run to a
+          # successful completion, so the manifests exist; this short deadline
+          # only covers registry propagation/read-path flakes, not the build
+          # (which is what the old fixed 35-min clock raced -- issue #2711).
+          DEADLINE=$(($(date +%s) + 10*60))
 
           BACKEND_DIGEST=""
           echo ""
@@ -166,7 +229,7 @@ jobs:
               break
             fi
             if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-              echo "::error title=Candidate not published::backend:${VERSION} not on ghcr.io after 35m -- docker-publish.yml did not finish. Release blocked."
+              echo "::error title=Candidate not resolvable::docker-publish reported success but backend:${VERSION} is not resolvable on ghcr.io after 10m. Release blocked."
               exit 1
             fi
             echo "  not yet present, waiting 30s..."
@@ -187,7 +250,7 @@ jobs:
                 break
               fi
               if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-                echo "::error title=Candidate not published::${extra}:${VERSION} not on ghcr.io after 35m. Release blocked."
+                echo "::error title=Candidate not resolvable::docker-publish reported success but ${extra}:${VERSION} is not resolvable on ghcr.io after 10m. Release blocked."
                 exit 1
               fi
               echo "  not yet present, waiting 30s..."
@@ -204,24 +267,28 @@ jobs:
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
 
-  e2e-gate:
-    name: 🚦 E2E Gate
-    needs: [release-preflight]
-    uses: ./.github/workflows/e2e.yml
-    with:
-      profile: smoke
-      include_stress: false
-      include_failure: false
+  # The legacy e2e-gate (e2e.yml profile:smoke = Setup PKI + Native Client
+  # smoke) was RETIRED from the release path (#3062): the DTF release-gate
+  # (artifact-keeper-test Full Suite) covers the same ground via its digest-
+  # pinned smoke / real-flow-smoke / clean-install-smoke tiers, and the old
+  # gate rebuilt the backend image + pulled the UBI base from
+  # brew.registry.redhat.io -- a flaky external dependency that 401'd and
+  # blocked the v1.7.0 cut on a non-code issue. e2e.yml itself stays (used by
+  # concurrency-e2e.yml and CI); only its use as a REQUIRED release gate is
+  # dropped. build-binaries now gates on release-gate (the DTF jobs) alone.
 
-  mesh-e2e-gate:
-    name: Mesh Replication E2E (optional)
-    # Advisory, but it was the last `dev` literal on the release path; run it
-    # against the published candidate tag like everything else.
-    needs: [release-preflight, resolve-candidate-digest]
-    uses: ./.github/workflows/mesh-e2e.yml
-    with:
-      image_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
-    secrets: inherit
+  # NOTE: `mesh-e2e-gate` was removed from the release path (first on 1.6.x,
+  # commit 919439bb; cherry-picked to main for #2980). It called
+  # ./.github/workflows/mesh-e2e.yml, which patches the ArgoCD Applications
+  # ak-mesh-main / ak-mesh-peer-{1,2,3}. Those Applications are not present on
+  # the cluster (the artifact-keeper-mesh-test ApplicationSet is not applied),
+  # so the job failed with `applications.argoproj.io "ak-mesh-main" not found`
+  # on every recent run on main and every 1.6.x tag (v1.6.0, v1.6.2, v1.6.3),
+  # marking each release run
+  # red. It never blocked publication -- the `release` job below deliberately
+  # did not require it -- so the only effect was a permanently failing advisory
+  # gate on the release path. mesh-e2e.yml is retained and still runnable via
+  # workflow_dispatch once the mesh ApplicationSet is restored.
 
   release-gate:
     name: Release Gate (Full Suite)
@@ -251,7 +318,7 @@ jobs:
     # Both gates must be green. That is the default `success()` behaviour for
     # `needs`, so no `if:` is needed -- and an `always()` here would only be a
     # way to lose it again.
-    needs: [e2e-gate, release-gate]
+    needs: [release-gate]
     strategy:
       fail-fast: false
       matrix:
@@ -592,10 +659,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, release-gate, mesh-e2e-gate, verify-images-published]
-    # `mesh-e2e-gate` is advisory, so this cannot fall back to the default
-    # `success()` -- it has to name the gates it requires. `!cancelled()` rather
-    # than `always()`: with `always()`, cancelling the run does not stop the
+    needs: [build-binaries, release-gate, verify-images-published]
+    # Every named gate is now required, but the condition stays explicit rather
+    # than falling back to the default `success()`. `!cancelled()` rather than
+    # `always()`: with `always()`, cancelling the run does not stop the
     # publication, because the gates it names have already reported success.
     if: |
       !cancelled() &&
@@ -640,6 +707,26 @@ jobs:
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
           ls -la release-assets/
 
+      - name: Resolve release notes
+        id: notes
+        # Prefer a curated per-version notes body (.github/release-notes/<version>.md):
+        # a high-level paraphrase of the CHANGELOG, not the raw PR dump (see
+        # RELEASING.md "Release-notes style"). Fall back to GitHub's auto-generated
+        # notes only when no curated file exists (e.g. -rc/-beta prereleases).
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          F=".github/release-notes/${VER}.md"
+          if [ -f "$F" ]; then
+            echo "Using curated release notes: $F"
+            echo "body_path=$F" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No curated notes for ${VER}; using GitHub auto-generated notes."
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v2
         with:
@@ -651,7 +738,8 @@ jobs:
           # the head of the default branch.
           target_commitish: ${{ github.sha }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*

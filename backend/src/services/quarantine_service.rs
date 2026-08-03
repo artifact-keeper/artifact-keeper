@@ -150,6 +150,14 @@ pub fn quarantine_until_from_release(
 ///
 /// Returns `Ok(())` if the download is allowed, or `Err` with a 409 Conflict
 /// if the artifact is still quarantined.
+///
+/// Deliberately does **not** include `quarantine_reason` in the error message.
+/// Format download routes sit behind `repo_visibility_middleware`, which permits
+/// anonymous reads of public repositories, so anything interpolated here is
+/// world-readable — and the reason carries internal policy names, per-artifact
+/// finding counts, and free-text admin incident notes (#2912). Authorized
+/// callers read the reason from `GET /api/v1/quarantine/{artifact_id}` instead,
+/// which is authenticated and repository-visibility checked.
 pub fn check_download_allowed(
     quarantine_status: Option<&str>,
     quarantine_until_ts: Option<DateTime<Utc>>,
@@ -264,20 +272,36 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
 }
 
 /// Set quarantine status and expiry on an artifact.
+///
+/// Guarded so an upload-time hold can never *downgrade* a stronger state. The
+/// artifact upsert reuses the same row id for a re-upload to an existing path,
+/// and versioning-enabled formats deliberately allow that re-upload, so without
+/// this guard a writer could overwrite a permanent admin- or policy-set
+/// quarantine (`quarantine_until IS NULL`) — or a `rejected` artifact — with an
+/// expiring hold that then lapses into downloadable (#2912). Mirrors the guard
+/// on the scanner's failed-scan write.
+///
+/// Returns `true` when the row was updated and `false` when the guard held, so
+/// callers do not log a hold they did not actually apply.
 pub async fn set_quarantine(
     db: &PgPool,
     artifact_id: Uuid,
     status: &str,
     until: Option<DateTime<Utc>>,
-) -> Result<()> {
-    sqlx::query("UPDATE artifacts SET quarantine_status = $2, quarantine_until = $3 WHERE id = $1")
-        .bind(artifact_id)
-        .bind(status)
-        .bind(until)
-        .execute(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = $3 \
+         WHERE id = $1 AND is_deleted = false \
+           AND (quarantine_status IS NULL \
+                OR quarantine_status IN ('clean', 'flagged', 'unscanned', 'released'))",
+    )
+    .bind(artifact_id)
+    .bind(status)
+    .bind(until)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Apply the upload-time quarantine hold to a freshly-uploaded artifact.
@@ -307,10 +331,17 @@ pub async fn apply_upload_hold(db: &PgPool, repository_id: Uuid, artifact_id: Uu
     )
     .await
     {
-        Ok(()) => tracing::info!(
+        Ok(true) => tracing::info!(
             artifact_id = %artifact_id,
             quarantine_until = %until,
             "Artifact quarantined on upload"
+        ),
+        // The guard in `set_quarantine` held: the artifact is already under a
+        // permanent quarantine or has been rejected, and an upload hold must not
+        // weaken that.
+        Ok(false) => tracing::info!(
+            artifact_id = %artifact_id,
+            "Upload hold not applied; artifact is already quarantined or rejected"
         ),
         Err(e) => tracing::error!(
             artifact_id = %artifact_id,
@@ -357,7 +388,15 @@ async fn repo_is_hosted(db: &PgPool, repository_id: Uuid) -> bool {
 /// Only the transition `quarantined -> released` or `quarantined -> rejected`
 /// is allowed. Returns 409 Conflict if the artifact is not currently
 /// quarantined (e.g. already released or rejected).
-pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineState) -> Result<()> {
+/// `reason` is persisted on a rejection (so the admin's stated rejection reason
+/// is the one stored, rather than whatever the earlier quarantine recorded) and
+/// ignored on a release, which clears the reason outright.
+pub async fn transition(
+    db: &PgPool,
+    artifact_id: Uuid,
+    new_status: QuarantineState,
+    reason: Option<&str>,
+) -> Result<()> {
     // Validate: only quarantined -> released/rejected is allowed
     match new_status {
         QuarantineState::Released | QuarantineState::Rejected => {}
@@ -370,15 +409,31 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
 
     // Use conditional UPDATE to ensure the artifact is currently quarantined.
     // This also prevents race conditions where a scanner tries to overwrite
-    // a rejection set by an admin.
-    let result = sqlx::query(
-        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
-         WHERE id = $1 AND quarantine_status = 'quarantined'",
-    )
-    .bind(artifact_id)
-    .bind(new_status.as_str())
-    .execute(db)
-    .await
+    // a rejection set by an admin. Release clears quarantine_reason (the hold
+    // is over); reject keeps it so the reason remains visible for the
+    // rejected artifact.
+    let result = if matches!(new_status, QuarantineState::Released) {
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
+             quarantine_reason = NULL \
+             WHERE id = $1 AND quarantine_status = 'quarantined'",
+        )
+        .bind(artifact_id)
+        .bind(new_status.as_str())
+        .execute(db)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
+             quarantine_reason = COALESCE($3, quarantine_reason) \
+             WHERE id = $1 AND quarantine_status = 'quarantined'",
+        )
+        .bind(artifact_id)
+        .bind(new_status.as_str())
+        .bind(reason)
+        .execute(db)
+        .await
+    }
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     if result.rows_affected() == 0 {
@@ -390,7 +445,63 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
     Ok(())
 }
 
-/// Fetch the raw `(quarantine_status, quarantine_until)` for a live artifact.
+/// Pure legality check for the admin quarantine-now action (#2912).
+pub fn admin_quarantine_allowed(current: Option<&str>) -> bool {
+    !matches!(current, Some("rejected"))
+}
+
+/// Admin-initiated quarantine (#2912).
+///
+/// Idempotent, but idempotent *by writing*, not by returning early. `quarantined`
+/// covers two materially different states: an expiring upload hold
+/// (`quarantine_until` set, applied by [`apply_upload_hold`]) and a permanent
+/// block (`quarantine_until` NULL). Short-circuiting on the status alone would
+/// leave a timed hold untouched — the admin would get a 200 for a block that
+/// silently lapses when the hold expires, and on an already-expired hold
+/// ([`check_download_allowed`] treats `('quarantined', past)` as downloadable)
+/// the artifact would stay downloadable outright. So the write always runs: it
+/// clears `quarantine_until`, making the hold unconditional, and refreshes the
+/// reason.
+pub async fn quarantine_now(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<String>,
+) -> Result<&'static str> {
+    let Some((status, _until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? else {
+        return Err(AppError::NotFound(format!(
+            "Artifact {artifact_id} not found"
+        )));
+    };
+    if !admin_quarantine_allowed(status.as_deref()) {
+        return Err(AppError::Conflict(
+            "Artifact was rejected during security review; cannot re-quarantine".to_string(),
+        ));
+    }
+    let reason = reason.unwrap_or_else(|| "Quarantined by administrator".to_string());
+    // Re-check `rejected` in the statement as well: the read above and this write
+    // are not atomic, so a concurrent admin reject must not be downgraded.
+    let result = sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+         quarantine_reason = $2 \
+         WHERE id = $1 AND is_deleted = false \
+           AND quarantine_status IS DISTINCT FROM 'rejected'",
+    )
+    .bind(artifact_id)
+    .bind(reason)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict(
+            "Artifact was rejected during security review; cannot re-quarantine".to_string(),
+        ));
+    }
+    Ok("quarantined")
+}
+
+/// Fetch the raw `(quarantine_status, quarantine_until, quarantine_reason)`
+/// for a live artifact.
 ///
 /// Returns `Ok(None)` when no matching (non-deleted) row exists. Shared by
 /// [`get_status`] and [`check_artifact_download`] so the identical SELECT is
@@ -398,41 +509,35 @@ pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineSt
 async fn fetch_quarantine_fields(
     db: &PgPool,
     artifact_id: Uuid,
-) -> Result<Option<(Option<String>, Option<DateTime<Utc>>)>> {
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>, Option<String>)>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         quarantine_status: Option<String>,
         quarantine_until: Option<DateTime<Utc>>,
+        quarantine_reason: Option<String>,
     }
 
     let row = sqlx::query_as::<_, Row>(
-        "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1 AND is_deleted = false",
+        "SELECT quarantine_status, quarantine_until, quarantine_reason \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
     )
     .bind(artifact_id)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until)))
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.quarantine_reason)))
 }
 
-/// Fetch the current quarantine status and expiry for an artifact.
-pub async fn get_status(
+/// Fetch the quarantine status/expiry AND the owning repository_id in one query
+/// (#2954). The download gate needs the repository_id to evaluate scan policy;
+/// folding it into the same SELECT the quarantine check already runs keeps the
+/// gate to a single read on the hot download path. Returns `Ok(None)` when no
+/// matching (non-deleted) row exists, so an absent artifact stays a no-op.
+async fn fetch_quarantine_fields_with_repo(
     db: &PgPool,
     artifact_id: Uuid,
-) -> Result<(Option<String>, Option<DateTime<Utc>>)> {
-    fetch_quarantine_fields(db, artifact_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))
-}
-
-/// Fetch quarantine status along with the artifact's repository_id.
-///
-/// Used by the quarantine status endpoint to enforce repository visibility.
-pub async fn get_status_with_repo(
-    db: &PgPool,
-    artifact_id: Uuid,
-) -> Result<(Option<String>, Option<DateTime<Utc>>, Uuid)> {
+) -> Result<Option<(Option<String>, Option<DateTime<Utc>>, Uuid)>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         quarantine_status: Option<String>,
@@ -447,14 +552,62 @@ pub async fn get_status_with_repo(
     .bind(artifact_id)
     .fetch_optional(db)
     .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| (r.quarantine_status, r.quarantine_until, r.repository_id)))
+}
+
+/// Fetch the current quarantine status and expiry for an artifact.
+pub async fn get_status(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<(Option<String>, Option<DateTime<Utc>>)> {
+    let (status, until, _reason) = fetch_quarantine_fields(db, artifact_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    Ok((status, until))
+}
+
+/// Quarantine state for the status endpoint: status, expiry, reason, and the
+/// owning repository (needed to enforce visibility before disclosing the reason).
+pub struct QuarantineStatusRow {
+    pub quarantine_status: Option<String>,
+    pub quarantine_until: Option<DateTime<Utc>>,
+    pub quarantine_reason: Option<String>,
+    pub repository_id: Uuid,
+}
+
+/// Fetch quarantine status along with the artifact's repository_id.
+///
+/// Used by the quarantine status endpoint to enforce repository visibility.
+/// Includes `quarantine_reason`: this is the authenticated, visibility-checked
+/// read path, and is deliberately the *only* place the reason is disclosed (see
+/// [`check_download_allowed`]).
+pub async fn get_status_with_repo(db: &PgPool, artifact_id: Uuid) -> Result<QuarantineStatusRow> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        quarantine_reason: Option<String>,
+        repository_id: Uuid,
+    }
+
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT quarantine_status, quarantine_until, quarantine_reason, repository_id \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-    Ok((
-        row.quarantine_status,
-        row.quarantine_until,
-        row.repository_id,
-    ))
+    Ok(QuarantineStatusRow {
+        quarantine_status: row.quarantine_status,
+        quarantine_until: row.quarantine_until,
+        quarantine_reason: row.quarantine_reason,
+        repository_id: row.repository_id,
+    })
 }
 
 /// Check quarantine status for an artifact before serving it.
@@ -462,12 +615,68 @@ pub async fn get_status_with_repo(
 /// This is the common quarantine gate for all download paths. It queries the
 /// artifact's quarantine fields and returns an error if the artifact is
 /// quarantined (409 Conflict) or rejected (403 Forbidden).
+///
+/// As of #2954 this delegates to [`enforce_download_gate`], which additionally
+/// consults the repository's scan policy after the quarantine check. Repos with
+/// no enabled scan policy are unaffected: `PolicyService::evaluate_artifact`
+/// no-ops to `allowed` when no policy matches, so today's behavior is preserved
+/// for operators who have not opted in.
 pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
-    if let Some((status, until)) = fetch_quarantine_fields(db, artifact_id).await? {
-        check_download_allowed(status.as_deref(), until, Utc::now())?;
-    }
+    enforce_download_gate(db, artifact_id).await
+}
 
-    Ok(())
+/// The shared download choke point (#2954): enforce quarantine THEN scan policy.
+///
+/// This folds `PolicyService::evaluate_artifact` — which enforces
+/// `block_unscanned` / `block_on_fail` / `max_severity`
+/// (`block_on_policy_violation`) and previously only ran on the promotion gate —
+/// into the single function every ~30 per-format download handler already calls,
+/// so scan-policy blocking lights up on the raw download path for all formats at
+/// once (it was a false affordance before: a hosted artifact with CVE findings
+/// was downloadable unless a scan happened to auto-quarantine it).
+///
+/// Ordering is deliberate: the quarantine state is checked FIRST (a quarantined
+/// artifact is a 409 before any policy consideration), then the scan policy. A
+/// disallowed policy result maps to 403.
+///
+/// Guardrail: when the artifact row is absent (deleted / never existed) this is
+/// a no-op `Ok(())`, exactly as the pre-#2954 quarantine-only check was, and
+/// when no enabled scan policy matches the repo the policy evaluation returns
+/// `allowed` — so a repo without a scan policy sees NO change.
+pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()> {
+    let Some((status, until, repository_id)) =
+        fetch_quarantine_fields_with_repo(db, artifact_id).await?
+    else {
+        // Artifact absent: preserve the pre-#2954 no-op behavior.
+        return Ok(());
+    };
+
+    // Quarantine gate first (409 quarantined / 403 rejected).
+    check_download_allowed(status.as_deref(), until, Utc::now())?;
+
+    // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.
+    let policy_result = crate::services::policy_service::PolicyService::new(db.clone())
+        .evaluate_artifact(artifact_id, repository_id)
+        .await?;
+    policy_gate_result(policy_result.allowed)
+}
+
+/// Map a scan-policy `allowed` decision onto the download gate result (#2954).
+///
+/// Split out from [`enforce_download_gate`] so the "disallowed → 403 with a
+/// neutral, non-disclosing message" contract is pure and unit-testable. The
+/// message deliberately omits the violated policy names / per-artifact finding
+/// counts: the download route is anonymous-readable for public repos, so those
+/// details must not leak here (mirrors [`check_download_allowed`]). Authorized
+/// callers read specifics from the authenticated security endpoints.
+fn policy_gate_result(allowed: bool) -> Result<()> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Artifact download is blocked by the repository's scan policy".to_string(),
+        ))
+    }
 }
 
 /// Validate that a quarantine duration is at least 1 minute.
@@ -487,6 +696,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // should_quarantine
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // policy_gate_result (#2954 hosted download gate)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_gate_allowed_is_ok() {
+        // No-policy repos / clean-and-scanned artifacts evaluate to allowed:
+        // the gate must be a pass-through (the regression guardrail).
+        assert!(policy_gate_result(true).is_ok());
+    }
+
+    #[test]
+    fn test_policy_gate_disallowed_is_403() {
+        // A blocking policy maps to 403 Forbidden (AppError::Authorization) with
+        // a non-disclosing message.
+        let err = policy_gate_result(false).unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "disallowed policy must be a 403 Authorization error"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scan policy"),
+            "message should name the scan policy generically: {msg}"
+        );
+        // Must NOT leak specific policy names or finding counts.
+        assert!(
+            !msg.contains("critical"),
+            "must not disclose finding detail"
+        );
+    }
 
     #[test]
     fn test_should_quarantine_enabled() {
@@ -639,6 +880,30 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_message_is_generic() {
+        // Download routes are reachable anonymously on public repositories, so the
+        // blocked-download message must stay generic. The reason (policy names,
+        // finding counts, admin incident notes) is disclosed only by the
+        // authenticated, visibility-checked status endpoint (#2912).
+        let err = check_download_allowed(Some("quarantined"), None, Utc::now()).unwrap_err();
+        let msg = match err {
+            AppError::Conflict(m) => m,
+            other => panic!("expected Conflict, got {other:?}"),
+        };
+        assert_eq!(
+            msg, "Artifact is quarantined and pending security review",
+            "message must not carry per-artifact detail"
+        );
+
+        let err = check_download_allowed(Some("rejected"), None, Utc::now()).unwrap_err();
+        let msg = match err {
+            AppError::Authorization(m) => m,
+            other => panic!("expected Authorization, got {other:?}"),
+        };
+        assert_eq!(msg, "Artifact was rejected during security review");
+    }
+
+    #[test]
     fn test_download_blocked_rejected() {
         let now = Utc::now();
         let result = check_download_allowed(Some("rejected"), None, now);
@@ -735,6 +1000,22 @@ mod tests {
             crate::error::AppError::Conflict(_) => {}
             other => panic!("Expected Conflict error, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // admin_quarantine_allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_admin_quarantine_legality() {
+        assert!(admin_quarantine_allowed(None));
+        assert!(admin_quarantine_allowed(Some("clean")));
+        assert!(admin_quarantine_allowed(Some("flagged")));
+        assert!(admin_quarantine_allowed(Some("unscanned")));
+        assert!(admin_quarantine_allowed(Some("released")));
+        assert!(!admin_quarantine_allowed(Some("rejected")));
+        // already quarantined is a no-op handled by the caller, not an error
+        assert!(admin_quarantine_allowed(Some("quarantined")));
     }
 
     // -----------------------------------------------------------------------
@@ -906,5 +1187,110 @@ mod tests {
         );
         assert_eq!(until, None);
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_download_gate (#2954): quarantine THEN scan policy at the shared
+    // download choke point. DB-backed; no-op without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_absent_artifact_is_noop() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        // A deleted / never-existing artifact preserves the pre-#2954 no-op.
+        let result = enforce_download_gate(&fx.pool, Uuid::new_v4()).await;
+        fx.teardown().await;
+        assert!(result.is_ok(), "absent artifact must stay a no-op Ok");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_no_policy_allows_then_quarantine_blocks() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/g/1.0/g-1.0.jar").await;
+
+        // Regression guardrail: no quarantine + no enabled scan policy => the
+        // gate is a pass-through (repos that never opted in see NO change).
+        let clean = enforce_download_gate(&fx.pool, aid).await;
+
+        // Quarantined (unexpired hold): 409 Conflict BEFORE any policy logic.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                 quarantine_until = NOW() + INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(aid)
+        .execute(&fx.pool)
+        .await
+        .expect("set quarantined");
+        let quarantined = enforce_download_gate(&fx.pool, aid).await;
+
+        // Rejected: 403.
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1")
+            .bind(aid)
+            .execute(&fx.pool)
+            .await
+            .expect("set rejected");
+        let rejected = enforce_download_gate(&fx.pool, aid).await;
+
+        fx.teardown().await;
+
+        assert!(clean.is_ok(), "no hold + no policy must allow: {clean:?}");
+        assert!(
+            matches!(quarantined, Err(AppError::Conflict(_))),
+            "active quarantine must be a 409 Conflict, got {quarantined:?}"
+        );
+        assert!(
+            matches!(rejected, Err(AppError::Authorization(_))),
+            "rejected artifact must be a 403, got {rejected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_download_gate_blocks_unscanned_via_scan_policy() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/h/1.0/h-1.0.jar").await;
+
+        // A repo-scoped enabled policy with block_unscanned: the seeded
+        // artifact has no completed scan, so the policy evaluation disallows
+        // and the download gate must 403 — the exact false affordance #2954
+        // closes (scan policy previously only ran on the promotion gate).
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', true, true, true)",
+        )
+        .bind(format!("gate-2954-{}", fx.repo_id))
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+
+        let result = enforce_download_gate(&fx.pool, aid).await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("scan policy"),
+                    "gate message names the scan policy generically: {msg}"
+                );
+                // Anonymous-readable route: no policy names / finding counts.
+                assert!(!msg.contains("gate-2954"), "must not leak policy names");
+            }
+            other => panic!("unscanned artifact under block_unscanned must 403, got {other:?}"),
+        }
     }
 }

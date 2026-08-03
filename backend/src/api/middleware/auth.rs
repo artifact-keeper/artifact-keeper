@@ -149,6 +149,33 @@ impl AuthExtension {
         }
     }
 
+    /// Delegation ceiling for token minting (#2996): a non-admin caller may
+    /// not mint a token carrying a scope its own presenting credential does
+    /// not hold. `scopes: None` (interactive/UI/CI login) is
+    /// action-unrestricted, so this is a no-op for those principals and never
+    /// affects the console mint flow; it only constrains a scoped API token
+    /// (or a JWT exchanged from one, #2430) attempting to mint a token that
+    /// exceeds its own authority — e.g. a `read:artifacts` token minting
+    /// `write:artifacts`.
+    ///
+    /// The per-scope decision is delegated to `has_scope` →
+    /// `scopes_grant_access`, so the wildcard (`*`/`admin`) and bare-parent
+    /// coverage semantics stay in the one canonical helper (#1316).
+    pub fn enforce_mint_ceiling(&self, requested: &[String]) -> crate::error::Result<()> {
+        if self.is_admin {
+            return Ok(());
+        }
+        for s in requested {
+            if !self.has_scope(s) {
+                return Err(AppError::Authorization(format!(
+                    "Cannot mint a token with scope '{s}': it exceeds the scopes of the \
+                     presenting credential",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Fold the effective-admin decision at construction time so every
     /// downstream `is_admin` read (both `require_admin` and the ~34 raw
     /// `if !auth.is_admin` handler checks) inherits scope awareness from a
@@ -1469,6 +1496,55 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
+/// Is `path` a POST route that is *not* a repository mutation despite using a
+/// write HTTP method?
+///
+/// A handful of format endpoints are `POST` by protocol but are negotiation /
+/// credential-exchange steps rather than artifact writes. The method-based
+/// mutation gate in [`repo_visibility_middleware`] (#2603 G1) would otherwise
+/// reject them with 403 for any caller lacking the repository `write` action,
+/// which breaks legitimate reads/logins:
+///
+/// * **git-lfs batch** — `POST /lfs/<repo_key>/objects/batch` is the mandatory
+///   download/upload negotiation. `git lfs pull` issues an `{"operation":
+///   "download"}` batch, so a read-only member or a public-repo non-member must
+///   be able to reach it. The `batch` handler self-gates uploads: an
+///   `{"operation":"upload"}` batch is authorized as a repository `write`
+///   in-handler, and the subsequent object `PUT` is write-gated by this same
+///   middleware, so exempting the batch POST does not open an upload hole.
+/// * **conan authenticate** — `POST /conan/<repo_key>/v2/users/authenticate` is
+///   a Basic→JWT credential exchange, not a write. The handler requires a valid
+///   credential and mints a scope-ceilinged token; no repository `write` is
+///   needed or implied.
+///
+/// The `#508` write-auth requirement (writes require authentication; anonymous
+/// callers get 401) still applies to these paths independently, so this
+/// exemption never loosens the anonymous contract — it only routes the
+/// *authenticated* caller through the read/visibility path instead of the
+/// deny-by-default write choke-point.
+fn is_non_mutating_format_post(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    match segments.next() {
+        // /lfs/<repo_key>/objects/batch
+        Some("lfs") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("objects")
+                && segments.next() == Some("batch")
+                && segments.next().is_none()
+        }
+        // /conan/<repo_key>/v2/users/authenticate
+        Some("conan") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("v2")
+                && segments.next() == Some("users")
+                && segments.next() == Some("authenticate")
+                && segments.next().is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
 /// and Bearer schemes.  Package manager clients use the challenge to decide
 /// how to retry with credentials.
@@ -1794,108 +1870,164 @@ pub async fn repo_visibility_middleware(
         }
     }
 
-    // #817: Fine-grained repository permission enforcement.
+    // Repository permission enforcement (#817 reads, #2603 G1 writes).
     //
     // If the authenticated user is an admin, skip permission checks entirely
     // to preserve backward compatibility and avoid unnecessary DB lookups.
-    //
-    // For non-admin users, check whether any permission rules exist for this
-    // repository. If no rules exist, fall through to the default access model
-    // (the visibility checks above are sufficient). If rules do exist, the
-    // user must hold the action that matches the HTTP method.
     if let Some(ref ext) = auth_ext {
         if !ext.is_admin {
-            let has_rules = match vis_state
-                .permission_service
-                .has_any_rules_for_target("repository", repo.id)
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    // DB error on permission check: fail closed.
-                    tracing::error!("permission check failed: database unreachable");
-                    return Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(axum::body::Body::from(
-                            "permission service temporarily unavailable",
-                        ))
-                        .unwrap();
-                }
+            // A few POST routes are negotiation / credential-exchange steps, not
+            // repository mutations, even though the HTTP method is a write (see
+            // `is_non_mutating_format_post`). Classify them as reads so a
+            // read-only member or a public-repo non-member can still perform
+            // download negotiation / token exchange. The #508 write-auth gate
+            // above (401 for anonymous) is unaffected, and actual LFS uploads
+            // remain write-gated by the batch handler and the object-PUT path.
+            let non_mutating_post = is_non_mutating_format_post(&path);
+            let action = if non_mutating_post {
+                "read"
+            } else {
+                action_for_method(request.method())
             };
 
-            if has_rules {
-                let action = action_for_method(request.method());
-                // #2329: On a *public* repository, reads are always allowed
-                // for anonymous callers (visibility check above), so an
-                // authenticated caller must not end up with *less* read
-                // access just because ACL rules exist. Grant the anonymous
-                // read baseline and skip the ACL for reads only; writes and
-                // deletes remain fully ACL-gated, and private repos never
-                // take this shortcut. Anonymous callers never reach this
-                // block at all (no `auth_ext`), so the existing
-                // anonymous-public contract is untouched.
-                if !public_read_satisfies_acl(is_public, action) {
-                    // Check for the specific action first, then fall back to
-                    // "admin" which implies all actions (#827 policy compat).
-                    // Both calls resolve from the same cached action set, so
-                    // the second call is essentially free.
-                    let allowed = vis_state
-                        .permission_service
-                        .check_permission(ext.user_id, "repository", repo.id, action, false)
-                        .await
-                        .unwrap_or(false)
-                        || vis_state
-                            .permission_service
-                            .check_permission(ext.user_id, "repository", repo.id, "admin", false)
-                            .await
-                            .unwrap_or(false);
-
-                    if !allowed {
-                        return forbidden_permission_response();
+            if is_write && !non_mutating_post {
+                // #2603 G1: writes and deletes route through the single
+                // canonical action choke-point, DENY-BY-DEFAULT. `is_public`
+                // confers a read baseline only and never satisfies a write, and
+                // a repository with NO fine-grained rules does not fall open —
+                // the caller must hold a role assignment carrying the action
+                // (or an allowing fine-grained rule, or `admin`), for public
+                // and private repositories alike. This closes the rules-less
+                // public-repo write hole (any authed caller could PUT/DELETE)
+                // and the rules-less private-repo case (a read-only `viewer`
+                // member could write/delete). DB error fails closed (503).
+                match vis_state
+                    .permission_service
+                    .check_repository_action(ext.user_id, repo.id, action, false)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return forbidden_permission_response(),
+                    Err(_) => {
+                        tracing::error!("permission check failed: database unreachable");
+                        return service_unavailable_response();
                     }
                 }
-            } else if !is_public {
-                // A private repo with NO fine-grained permission rules must
-                // still not be readable by every authenticated user. Mirror
-                // the REST `require_visible` model: a non-admin needs a role
-                // assignment scoped to this repo (or a global assignment).
-                //
-                // Without this branch the native-protocol path default-ALLOWED
-                // rule-less private repos to any authenticated principal, while
-                // the REST download path denied the same caller (404) — a
-                // cross-tenant private-artifact leak (red-team round 2).
-                //
-                // Uses sqlx::query_scalar (not the macro) so no new entry in
-                // the sqlx offline-query cache is required, matching the rest
-                // of this middleware. Same predicate as
-                // RepositoryService::user_can_access_repo.
-                let granted = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM role_assignments ra \
-                         WHERE ra.user_id = $1 \
-                           AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-                     )",
-                )
-                .bind(ext.user_id)
-                .bind(repo.id)
-                .fetch_one(&vis_state.db)
-                .await;
-
-                match granted {
-                    Ok(true) => {}
-                    // Existence-hiding 404, matching REST `require_visible`.
-                    Ok(false) => return not_found_response(),
+            } else {
+                // Reads: preserve the public-anonymous baseline + private
+                // membership + fine-grained ACL model (#817 / #2329). For a
+                // non-admin user, check whether any permission rules exist for
+                // this repository. If no rules exist, fall through to the
+                // default access model (the visibility checks above are
+                // sufficient for public repos; private repos still require a
+                // role assignment). If rules do exist, the user must hold the
+                // read action.
+                let has_rules = match vis_state
+                    .permission_service
+                    .has_any_rules_for_target("repository", repo.id)
+                    .await
+                {
+                    Ok(v) => v,
                     Err(_) => {
-                        // DB error on access check: fail closed.
-                        tracing::error!("repo access check failed: database unreachable");
-                        return service_unavailable_response();
+                        // DB error on permission check: fail closed.
+                        tracing::error!("permission check failed: database unreachable");
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(axum::body::Body::from(
+                                "permission service temporarily unavailable",
+                            ))
+                            .unwrap();
+                    }
+                };
+
+                if has_rules {
+                    // #2329: On a *public* repository, reads are always allowed
+                    // for anonymous callers (visibility check above), so an
+                    // authenticated caller must not end up with *less* read
+                    // access just because ACL rules exist. Grant the anonymous
+                    // read baseline and skip the ACL for reads only; private
+                    // repos never take this shortcut. Anonymous callers never
+                    // reach this block at all (no `auth_ext`), so the existing
+                    // anonymous-public contract is untouched.
+                    if !public_read_satisfies_acl(is_public, action) {
+                        // Check for the specific action first, then fall back to
+                        // "admin" which implies all actions (#827 policy compat).
+                        // Both calls resolve from the same cached action set, so
+                        // the second call is essentially free.
+                        let allowed = vis_state
+                            .permission_service
+                            .check_permission(ext.user_id, "repository", repo.id, action, false)
+                            .await
+                            .unwrap_or(false)
+                            || vis_state
+                                .permission_service
+                                .check_permission(
+                                    ext.user_id,
+                                    "repository",
+                                    repo.id,
+                                    "admin",
+                                    false,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                        if !allowed {
+                            return forbidden_permission_response();
+                        }
+                    }
+                } else if !is_public {
+                    // A private repo with NO fine-grained permission rules must
+                    // still not be readable by every authenticated user. Mirror
+                    // the REST `require_visible` model: a non-admin needs a role
+                    // assignment scoped to this repo (or a global assignment).
+                    //
+                    // Without this branch the native-protocol path
+                    // default-ALLOWED rule-less private repos to any
+                    // authenticated principal, while the REST download path
+                    // denied the same caller (404) — a cross-tenant
+                    // private-artifact leak (red-team round 2).
+                    //
+                    // Uses sqlx::query_scalar (not the macro) so no new entry in
+                    // the sqlx offline-query cache is required, matching the rest
+                    // of this middleware. Same predicate as
+                    // RepositoryService::user_can_access_repo.
+                    let granted = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS ( \
+                             SELECT 1 FROM role_assignments ra \
+                             WHERE ra.user_id = $1 \
+                               AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                         )",
+                    )
+                    .bind(ext.user_id)
+                    .bind(repo.id)
+                    .fetch_one(&vis_state.db)
+                    .await;
+
+                    match granted {
+                        Ok(true) => {}
+                        // Existence-hiding 404, matching REST `require_visible`.
+                        Ok(false) => return not_found_response(),
+                        Err(_) => {
+                            // DB error on access check: fail closed.
+                            tracing::error!("repo access check failed: database unreachable");
+                            return service_unavailable_response();
+                        }
                     }
                 }
             }
         }
     }
 
-    next.run(request).await
+    // #2598: attribute every downstream ingestion/serve archive decode to this
+    // repository so the per-tenant fairness sub-limit applies. This is the
+    // single seam that resolves the repo id for all format routes, so scoping
+    // here gives every extractor call site per-tenant fairness without any
+    // per-handler plumbing.
+    crate::util::bounded_archive::run_with_tenant_scope(
+        crate::util::bounded_archive::TenantKey::Repo(repo.id),
+        next.run(request),
+    )
+    .await
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -2559,6 +2691,89 @@ mod tests {
         assert!(ext.has_scope("delete:artifacts"));
     }
 
+    // -----------------------------------------------------------------------
+    // AuthExtension::enforce_mint_ceiling (#2996)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_ceiling_interactive_none_scopes_unrestricted() {
+        // Interactive/UI/CI principals (`scopes: None`) are action-unrestricted:
+        // the ceiling never bites, so console token minting is unaffected.
+        let ext = AuthExtension::from(claims_with(false, None));
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_ok());
+        assert!(ext
+            .enforce_mint_ceiling(&["read:repositories".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_scoped_token_cannot_exceed_itself() {
+        // A read-scoped API token may re-mint its own scope but not escalate
+        // to a scope it does not hold.
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext
+            .enforce_mint_ceiling(&["read:artifacts".to_string()])
+            .is_ok());
+        let err = ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .expect_err("read token must not mint write");
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_mint_ceiling_exchanged_jwt_inherits_token_ceiling() {
+        // A JWT exchanged from a read-scoped API token (#2430) carries
+        // `is_api_token = false` but `Some(scopes)`: the ceiling still binds.
+        let ext = AuthExtension::from(claims_with(false, Some(vec!["read:artifacts".to_string()])));
+        assert!(!ext.is_api_token);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_wildcard_and_admin_scope_cover_everything() {
+        let star = make_api_token_ext(vec!["*".to_string()], None);
+        assert!(star
+            .enforce_mint_ceiling(&["write:artifacts".to_string(), "read:users".to_string()])
+            .is_ok());
+        let admin_scope = make_api_token_ext(vec!["admin".to_string()], None);
+        assert!(admin_scope
+            .enforce_mint_ceiling(&["delete:artifacts".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_effective_admin_bypasses() {
+        // An effective admin (admin owner + admin-granting credential) is not
+        // held to the ceiling.
+        let ext = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:users".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_admin_owned_narrow_token_still_bound() {
+        // GHSA-vvc3 interaction: an admin-OWNED but narrowly-scoped token has
+        // `is_admin = false` after the scope-gated fold, so it is held to its
+        // token's ceiling rather than laundered up to the owner's admin.
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(!ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_empty_request_ok() {
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext.enforce_mint_ceiling(&[]).is_ok());
+    }
+
     // #1316: pin the authorization decision now that `has_scope` delegates to
     // the canonical `token_service::scopes_grant_access` helper instead of an
     // inline `== "admin"` string match. Behavior must be identical: an
@@ -3153,6 +3368,62 @@ mod tests {
     #[test]
     fn test_is_write_method_options_is_not_write() {
         assert!(!is_write_method(&Method::OPTIONS));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_non_mutating_format_post
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_mutating_lfs_batch_is_exempt() {
+        assert!(is_non_mutating_format_post("/lfs/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_authenticate_is_exempt() {
+        assert!(is_non_mutating_format_post(
+            "/conan/myrepo/v2/users/authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_object_put_is_not_exempt() {
+        // The actual object upload (PUT /lfs/<repo>/objects/<oid>) is a real
+        // write and must NOT be exempted from the mutation gate.
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/abcdef0123456789"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_verify_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs/myrepo/verify"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_missing_repo_key_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs//objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_upload_is_not_exempt() {
+        // A conan artifact upload path must remain write-gated.
+        assert!(!is_non_mutating_format_post(
+            "/conan/myrepo/v2/conans/pkg/1.0/user/channel/upload_urls"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_other_format_batch_is_not_exempt() {
+        // The exemption is scoped to the git-lfs and conan prefixes only.
+        assert!(!is_non_mutating_format_post("/npm/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_trailing_segment_is_not_exempt() {
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/batch/extra"
+        ));
     }
 
     // -----------------------------------------------------------------------

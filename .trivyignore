@@ -85,6 +85,36 @@ CVE-2026-50162
 GHSA-vh4v-2xq2-g5cg
 
 # ---------------------------------------------------------------------------
+# trivy 0.72.0 binary (scanner-adapter image): golang.org/x/text @ v0.38.0
+# Fixed in x/text 0.39.0. trivy 0.72.0 is the latest upstream release and has
+# not been rebuilt against it, so there is no tool version to bump to. Drops
+# off when Aqua ships a trivy release built on x/text >= 0.39.0.
+#
+# Scope verified on 2026-07-29 (v1.6.4 scan): this CVE is present ONLY in the
+# vendored trivy CLI. The scanner-adapter's own binary cannot carry it, since
+# docker/scanner-adapter/go.mod declares no dependencies at all (stdlib only).
+# The backend and openscap images scan clean at 0 findings and do not bundle
+# trivy (#1544), so nothing in the network-reachable service surface is
+# affected. No reachability argument is claimed for the x/text code path
+# itself; the justification here is vendored-binary scope plus the absence of
+# any fixed tool release.
+CVE-2026-56852
+
+# ---------------------------------------------------------------------------
+# trivy 0.72.0 binary (scanner-adapter image): golang.org/x/net @ v0.55.0
+# Same vendored-binary scope as the x/text entry above: present only in the
+# bundled trivy CLI, not in the adapter's own binary (no dependencies) and not
+# in the backend or openscap images (0 findings, no bundled trivy, #1544).
+#
+# Note on severity, learned the hard way on the v1.6.4 cut: this CVE exports
+# to SARIF as UNKNOWN/note, so it looks non-gating in the code-scanning UI.
+# It DOES gate. Trivy filters on the vendor severity, not the NVD one, and
+# logs "Using severities from other vendors for some vulnerabilities"; under
+# `severity: CRITICAL,HIGH` this entry still failed the scan. Do not assume an
+# UNKNOWN/note alert is harmless: check whether the scan step actually failed.
+CVE-2026-46600
+
+# ---------------------------------------------------------------------------
 # trivy 0.72.0 binary (scanner-adapter image) — sigstore verification stack
 # github.com/sigstore/sigstore-go @ v1.1.4 (fixed 1.2.0) and
 # github.com/sigstore/timestamp-authority/v2 @ v2.0.6 (fixed 2.1.0); trivy

@@ -278,6 +278,7 @@ mod tests {
                     visibility: Some("private".into()),
                     age_gate_enabled: None,
                     age_gate_min_age_days: None,
+                    age_gate_mode: None,
                 }),
         ];
         for entry in &entries {
@@ -344,6 +345,7 @@ mod tests {
                 visibility: Some("private".into()),
                 age_gate_enabled: Some(true),
                 age_gate_min_age_days: Some(14),
+                age_gate_mode: None,
             })
             .unwrap(),
         );

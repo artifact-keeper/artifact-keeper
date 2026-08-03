@@ -40,6 +40,11 @@ pub struct UploadSession {
     pub temp_file_path: String,
     pub status: String,
     pub error_message: Option<String>,
+    /// Completion-lease token, set while `status = 'committing'`. Terminal
+    /// transitions (`completed`/`failed`) must present it.
+    pub state_token: Option<Uuid>,
+    /// Committing-lease deadline; an expired lease is reclaimable.
+    pub committing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
@@ -209,6 +214,7 @@ const MIN_CHUNK_SIZE: i64 = 1_048_576; // 1 MB
 const MAX_CHUNK_SIZE: i64 = 268_435_456; // 256 MB
 const DEFAULT_CHUNK_SIZE: i32 = 8_388_608; // 8 MB
 const SHA256_BUF_SIZE: usize = 64 * 1024; // 64 KB read buffer for checksums
+pub const COMMIT_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
 // ---------------------------------------------------------------------------
 // Service
@@ -380,7 +386,18 @@ impl UploadService {
     ) -> Result<ChunkResult, UploadError> {
         let session = Self::get_session(db, session_id, Some(user_id)).await?;
 
-        if session.status == "completed" || session.status == "cancelled" {
+        // Only a session still accepting data may be written to. `committing`
+        // is the fence that matters for correctness: once a completer holds
+        // the lease it has read the chunk set and is streaming the temp file
+        // to storage, so a straggler or retried PATCH landing here would
+        // mutate the bytes being checksummed and copied. `failed` is
+        // unrecoverable (a `committing` session only reaches it on a terminal
+        // checksum mismatch, and `complete_session` will never claim it
+        // again), so accepting more chunks into one is pointless.
+        if matches!(
+            session.status.as_str(),
+            "completed" | "cancelled" | "committing" | "failed"
+        ) {
             return Err(UploadError::InvalidStatus(session.status));
         }
 
@@ -571,16 +588,28 @@ impl UploadService {
         Ok(session)
     }
 
-    /// Finalize an upload session: verify all chunks, compute full-file SHA256,
-    /// and move the temp file to final storage. Returns the artifact ID.
+    /// Begin finalizing an upload session: take the completion lease, then
+    /// verify all chunks, size, and the full-file SHA256.
     ///
-    /// The caller is responsible for creating the artifact record after this
-    /// method returns the verified file data.
+    /// This is the StateMachineLease pattern (see
+    /// [`crate::services::cluster_work`]), mirroring the OCI upload
+    /// completion flow: the session atomically transitions
+    /// `pending`/`in_progress` -> `committing` with a fresh `state_token`
+    /// BEFORE any verification or storage work, so duplicate complete
+    /// requests — including ones routed to a different replica — get a
+    /// conflict instead of a second checksum/copy/upsert. A `committing`
+    /// lease whose deadline passed (crashed replica) is reclaimed in place.
+    ///
+    /// The returned session is in `committing` state and carries the token;
+    /// the caller must finish with [`Self::finalize_completed`] (success),
+    /// [`Self::fail_committing`] (terminal failure), or
+    /// [`Self::release_commit_lease`] (retryable failure).
     pub async fn complete_session(
         db: &PgPool,
         session_id: Uuid,
         user_id: Uuid,
     ) -> Result<UploadSession, UploadError> {
+        // Pre-read for ownership and precise error mapping.
         let session = Self::get_session(db, session_id, Some(user_id)).await?;
 
         if session.status == "completed" {
@@ -590,15 +619,53 @@ impl UploadService {
             return Err(UploadError::InvalidStatus("cancelled".into()));
         }
 
-        // Verify all chunks are completed
-        let incomplete: i64 = sqlx::query_scalar(
+        // Take the completion lease.
+        let claimed: Option<UploadSession> = sqlx::query_as(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'committing',
+                state_token = $3,
+                committing_expires_at = NOW() + make_interval(secs => $4),
+                updated_at = NOW()
+            WHERE id = $1
+              AND user_id = $2
+              AND (
+                status IN ('pending', 'in_progress')
+                OR (status = 'committing' AND committing_expires_at <= NOW())
+              )
+            RETURNING *
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(Uuid::new_v4())
+        .bind(COMMIT_LEASE_TTL_SECS)
+        .fetch_optional(db)
+        .await?;
+
+        let session = claimed
+            .ok_or_else(|| UploadError::InvalidStatus("completion already in progress".into()))?;
+
+        // Verify all chunks are completed. Every failure from here on is
+        // *after* the claim, so it must release the lease rather than leave
+        // the session wedged in `committing` until the TTL lapses — including
+        // a transient database error on the check itself.
+        let incomplete: i64 = match sqlx::query_scalar(
             "SELECT COUNT(*) FROM upload_chunks WHERE session_id = $1 AND status != 'completed'",
         )
         .bind(session_id)
         .fetch_one(db)
-        .await?;
+        .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                Self::release_commit_lease(db, &session).await;
+                return Err(UploadError::Database(e));
+            }
+        };
 
         if incomplete > 0 {
+            Self::release_commit_lease(db, &session).await;
             return Err(UploadError::IncompleteChunks {
                 completed: session.completed_chunks,
                 total: session.total_chunks,
@@ -607,8 +674,15 @@ impl UploadService {
 
         // Verify total file size
         let temp_path = PathBuf::from(&session.temp_file_path);
-        let file_meta = tokio::fs::metadata(&temp_path).await?;
+        let file_meta = match tokio::fs::metadata(&temp_path).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                Self::release_commit_lease(db, &session).await;
+                return Err(UploadError::Io(e));
+            }
+        };
         if file_meta.len() != session.total_size as u64 {
+            Self::release_commit_lease(db, &session).await;
             return Err(UploadError::SizeMismatch {
                 expected: session.total_size,
                 actual: file_meta.len() as i64,
@@ -616,18 +690,23 @@ impl UploadService {
         }
 
         // Compute full-file SHA256 by streaming in 64 KB blocks
-        let actual_checksum = compute_file_sha256(&temp_path).await?;
+        let actual_checksum = match compute_file_sha256(&temp_path).await {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                Self::release_commit_lease(db, &session).await;
+                return Err(UploadError::Io(e));
+            }
+        };
         if actual_checksum != session.checksum_sha256 {
-            // Mark session as failed
-            let _ = sqlx::query(
-                "UPDATE upload_sessions SET status = 'failed', error_message = $2, updated_at = NOW() WHERE id = $1",
+            // Terminal: the assembled bytes are wrong; retrying won't help.
+            Self::fail_committing(
+                db,
+                &session,
+                &format!(
+                    "checksum mismatch: expected {}, got {}",
+                    session.checksum_sha256, actual_checksum
+                ),
             )
-            .bind(session_id)
-            .bind(format!(
-                "checksum mismatch: expected {}, got {}",
-                session.checksum_sha256, actual_checksum
-            ))
-            .execute(db)
             .await;
 
             return Err(UploadError::ChecksumMismatch {
@@ -636,15 +715,136 @@ impl UploadService {
             });
         }
 
-        // Mark session as completed
-        sqlx::query(
-            "UPDATE upload_sessions SET status = 'completed', updated_at = NOW() WHERE id = $1",
+        // Leave the session in 'committing': the caller streams the temp file
+        // to final storage and upserts the artifact under this lease, then
+        // finalizes by token.
+        Ok(session)
+    }
+
+    /// Extend a live completion lease. Returns `false` when the token no
+    /// longer owns the committing session.
+    pub async fn renew_commit_lease(
+        db: &PgPool,
+        session: &UploadSession,
+        ttl_secs: f64,
+    ) -> Result<bool, UploadError> {
+        Self::renew_commit_lease_by_token(db, session.id, session.state_token, ttl_secs).await
+    }
+
+    async fn renew_commit_lease_by_token(
+        db: &PgPool,
+        session_id: Uuid,
+        state_token: Option<Uuid>,
+        ttl_secs: f64,
+    ) -> Result<bool, UploadError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE upload_sessions
+            SET committing_expires_at = NOW() + make_interval(secs => $3),
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'committing'
+              AND state_token = $2
+            "#,
         )
         .bind(session_id)
+        .bind(state_token)
+        .bind(ttl_secs)
         .execute(db)
         .await?;
 
-        Ok(session)
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Keep a commit lease alive while the handler streams to final storage
+    /// and records artifact metadata.
+    pub fn spawn_commit_lease_renewal(
+        db: PgPool,
+        session: &UploadSession,
+    ) -> crate::services::cluster_work::RenewalGuard {
+        let session_id = session.id;
+        let state_token = session.state_token;
+        crate::services::cluster_work::spawn_renewal_loop(
+            format!("upload session commit {session_id}"),
+            COMMIT_LEASE_TTL_SECS,
+            move || {
+                let db = db.clone();
+                async move {
+                    Self::renew_commit_lease_by_token(
+                        &db,
+                        session_id,
+                        state_token,
+                        COMMIT_LEASE_TTL_SECS,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                }
+            },
+        )
+    }
+
+    /// Token-guarded terminal transition `committing -> completed`. Returns
+    /// `false` when the lease was lost (expired and reclaimed by a newer
+    /// complete request), in which case the newer owner drives the session's
+    /// fate.
+    pub async fn finalize_completed(
+        db: &PgPool,
+        session: &UploadSession,
+    ) -> Result<bool, UploadError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'completed', state_token = NULL, committing_expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'committing'
+              AND state_token = $2
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.state_token)
+        .execute(db)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Token-guarded terminal transition `committing -> failed`.
+    pub async fn fail_committing(db: &PgPool, session: &UploadSession, error: &str) {
+        let _ = sqlx::query(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'failed', error_message = $3,
+                state_token = NULL, committing_expires_at = NULL, updated_at = NOW()
+            WHERE id = $1
+              AND status = 'committing'
+              AND state_token = $2
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.state_token)
+        .bind(error)
+        .execute(db)
+        .await;
+    }
+
+    /// Token-guarded release for retryable failures (incomplete chunks,
+    /// transient storage errors): puts the session back to `in_progress` so
+    /// the client can PATCH remaining chunks or re-issue the complete.
+    pub async fn release_commit_lease(db: &PgPool, session: &UploadSession) {
+        let _ = sqlx::query(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'in_progress',
+                state_token = NULL, committing_expires_at = NULL, updated_at = NOW()
+            WHERE id = $1
+              AND status = 'committing'
+              AND state_token = $2
+            "#,
+        )
+        .bind(session.id)
+        .bind(session.state_token)
+        .execute(db)
+        .await;
     }
 
     /// Cancel an upload session. Deletes the temp file and marks the session
@@ -666,16 +866,53 @@ impl UploadService {
             return Err(UploadError::NotFound);
         }
 
-        // Delete temp file (best-effort)
-        let temp_path = PathBuf::from(&session.temp_file_path);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-
-        sqlx::query(
-            "UPDATE upload_sessions SET status = 'cancelled', updated_at = NOW() WHERE id = $1",
+        // Claim the cancel transition BEFORE touching the temp file: a cancel
+        // racing a live `committing` lease must not delete the temp file out
+        // from under the finalizer that is still streaming/verifying it, and
+        // must not move the row so the token-guarded terminal transition
+        // records a lost lease. Only pending/in_progress sessions — or a
+        // `committing` session whose lease already lapsed (crashed finalizer)
+        // — may cancel.
+        let cancelled = sqlx::query(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'cancelled', updated_at = NOW(),
+                state_token = NULL, committing_expires_at = NULL
+            WHERE id = $1
+              AND (
+                status IN ('pending', 'in_progress')
+                OR (
+                  status = 'committing'
+                  AND (committing_expires_at IS NULL OR committing_expires_at <= NOW())
+                )
+              )
+            "#,
         )
         .bind(session_id)
         .execute(db)
-        .await?;
+        .await?
+        .rows_affected();
+
+        if cancelled == 0 {
+            // Re-read to say why: an already-cancelled session stays an
+            // idempotent no-op (the temp file is already gone or owned by
+            // nobody); anything else — completed, failed, or a live
+            // committing lease — refuses to cancel and preserves the file.
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+                    .bind(session_id)
+                    .fetch_optional(db)
+                    .await?;
+            return match status.as_deref() {
+                None => Err(UploadError::NotFound),
+                Some("cancelled") => Ok(()),
+                Some(other) => Err(UploadError::InvalidStatus(other.to_string())),
+            };
+        }
+
+        // Delete temp file (best-effort) only after winning the cancel claim.
+        let temp_path = PathBuf::from(&session.temp_file_path);
+        let _ = tokio::fs::remove_file(&temp_path).await;
 
         tracing::info!("Cancelled upload session {}", session_id);
         Ok(())
@@ -683,13 +920,36 @@ impl UploadService {
 
     /// Delete expired sessions and their temp files.
     /// Returns the number of sessions cleaned up.
+    ///
+    /// The cancel transition is the claim: rows are flipped `-> cancelled`
+    /// with FOR UPDATE SKIP LOCKED *before* the temp-file delete, so
+    /// concurrent replicas running the hourly sweep claim disjoint sessions
+    /// instead of racing the same ones. Sessions in `committing` are skipped
+    /// while their completion lease is live — a reaper on pod A must not
+    /// remove a temp file that a finalizer on pod A is still streaming
+    /// (each pod only sees its own temp files, so only same-pod races are
+    /// physically possible, but the guard is cheap and universal).
     pub async fn cleanup_expired(db: &PgPool) -> Result<i64, UploadError> {
         let expired = sqlx::query_as::<_, (Uuid, String)>(
             r#"
-            SELECT id, temp_file_path
-            FROM upload_sessions
-            WHERE expires_at < NOW()
-              AND status NOT IN ('completed', 'cancelled')
+            WITH candidate AS (
+                SELECT id
+                FROM upload_sessions
+                WHERE expires_at < NOW()
+                  AND status NOT IN ('completed', 'cancelled')
+                  AND (
+                    status != 'committing'
+                    OR committing_expires_at IS NULL
+                    OR committing_expires_at <= NOW()
+                  )
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE upload_sessions s
+            SET status = 'cancelled', error_message = 'expired',
+                state_token = NULL, committing_expires_at = NULL, updated_at = NOW()
+            FROM candidate
+            WHERE s.id = candidate.id
+            RETURNING s.id, s.temp_file_path
             "#,
         )
         .fetch_all(db)
@@ -699,13 +959,6 @@ impl UploadService {
 
         for (id, temp_path) in &expired {
             let _ = tokio::fs::remove_file(temp_path).await;
-            sqlx::query(
-                "UPDATE upload_sessions SET status = 'cancelled', error_message = 'expired', updated_at = NOW() WHERE id = $1",
-            )
-            .bind(id)
-            .execute(db)
-            .await?;
-
             tracing::info!("Cleaned up expired upload session {}", id);
         }
 
@@ -1515,6 +1768,8 @@ mod tests {
             temp_file_path: "/tmp/.uploads/some-id".into(),
             status: "pending".into(),
             error_message: None,
+            state_token: None,
+            committing_expires_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -1550,6 +1805,8 @@ mod tests {
             temp_file_path: "/tmp/x".into(),
             status: "pending".into(),
             error_message: Some("test error".into()),
+            state_token: None,
+            committing_expires_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
@@ -2085,5 +2342,542 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion lease (Tier-2: no-op without DATABASE_URL)
+    // -----------------------------------------------------------------------
+
+    struct LeaseFixture {
+        pool: PgPool,
+        user_id: Uuid,
+        repo_id: Uuid,
+        session_id: Uuid,
+        temp_path: PathBuf,
+    }
+
+    /// Session whose temp file exists on disk with a matching size/checksum,
+    /// so `complete_session` can run its verification steps for real.
+    async fn setup_lease_fixture() -> Option<LeaseFixture> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::try_pool().await?;
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let payload: &[u8] = b"completion-lease-test-bytes";
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        let dir = std::env::temp_dir().join("ak_upload_lease_test");
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let temp_path = dir.join(format!("lease-{}", Uuid::new_v4()));
+        tokio::fs::write(&temp_path, payload).await.expect("write");
+
+        let session_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO upload_sessions
+                (user_id, repository_id, repository_key, artifact_path,
+                 total_size, chunk_size, total_chunks, completed_chunks,
+                 bytes_received, checksum_sha256, temp_file_path, status)
+            VALUES ($1, $2, $3, 'lease-test/file.bin',
+                    $4, 1048576, 1, 1, $4, $5, $6, 'in_progress')
+            RETURNING id
+            "#,
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(&repo_key)
+        .bind(payload.len() as i64)
+        .bind(&checksum)
+        .bind(temp_path.to_string_lossy().as_ref())
+        .fetch_one(&pool)
+        .await
+        .expect("insert session");
+
+        Some(LeaseFixture {
+            pool,
+            user_id,
+            repo_id,
+            session_id,
+            temp_path,
+        })
+    }
+
+    async fn teardown_lease_fixture(f: &LeaseFixture) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await;
+        tdh::cleanup(&f.pool, f.repo_id, f.user_id).await;
+        let _ = tokio::fs::remove_file(&f.temp_path).await;
+    }
+
+    async fn session_status(pool: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch status")
+    }
+
+    async fn session_claim_state(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (String, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>) {
+        sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("fetch claim state")
+    }
+
+    /// A second complete request conflicts while a live commit lease exists —
+    /// the double-checksum/copy/upsert window this change closes.
+    #[tokio::test]
+    async fn complete_session_conflicts_while_commit_lease_is_live() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("first complete claims the lease");
+        assert_eq!(session.status, "committing");
+        assert!(session.state_token.is_some(), "lease must carry a token");
+
+        let dup = UploadService::complete_session(&f.pool, f.session_id, f.user_id).await;
+        assert!(
+            matches!(dup, Err(UploadError::InvalidStatus(_))),
+            "a concurrent complete must conflict, got {dup:?}"
+        );
+
+        // Owner finishes; terminal state is visible.
+        assert!(UploadService::finalize_completed(&f.pool, &session)
+            .await
+            .expect("finalize query ok"));
+        assert_eq!(session_status(&f.pool, f.session_id).await, "completed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A live committer can renew before another complete request reclaims
+    /// the session; once a newer token owns the session, the stale token is
+    /// fenced out of renewal.
+    #[tokio::test]
+    async fn commit_lease_renewal_blocks_reclaim_and_fences_stale_owner() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let stale = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim");
+        sqlx::query(
+            "UPDATE upload_sessions SET committing_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        assert!(
+            UploadService::renew_commit_lease(&f.pool, &stale, COMMIT_LEASE_TTL_SECS)
+                .await
+                .expect("renew query ok"),
+            "live owner must be able to extend its token"
+        );
+        assert!(
+            matches!(
+                UploadService::complete_session(&f.pool, f.session_id, f.user_id).await,
+                Err(UploadError::InvalidStatus(_))
+            ),
+            "a renewed commit lease must block duplicate completion"
+        );
+
+        sqlx::query(
+            "UPDATE upload_sessions SET committing_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire renewed lease");
+        let fresh = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("expired lease must be reclaimable");
+
+        assert!(
+            !UploadService::renew_commit_lease(&f.pool, &stale, COMMIT_LEASE_TTL_SECS)
+                .await
+                .expect("renew query ok"),
+            "stale token must not renew after a reclaim"
+        );
+        assert!(
+            UploadService::renew_commit_lease(&f.pool, &fresh, COMMIT_LEASE_TTL_SECS)
+                .await
+                .expect("renew query ok"),
+            "fresh token must be able to renew"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// Missing temp file after claiming the commit lease is retryable: the
+    /// session returns to `in_progress` instead of waiting out the full TTL.
+    #[tokio::test]
+    async fn complete_session_releases_lease_when_temp_file_missing() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+        tokio::fs::remove_file(&f.temp_path)
+            .await
+            .expect("remove temp file");
+
+        let err = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect_err("missing file should fail verification");
+        assert!(matches!(err, UploadError::Io(_)), "got {err:?}");
+
+        let (status, token, expires) = session_claim_state(&f.pool, f.session_id).await;
+        assert_eq!(status, "in_progress");
+        assert!(token.is_none(), "retryable IO failure must clear token");
+        assert!(
+            expires.is_none(),
+            "retryable IO failure must clear deadline"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A local read error during checksum streaming is also retryable and must
+    /// release the commit lease immediately.
+    #[tokio::test]
+    async fn complete_session_releases_lease_when_checksum_read_fails() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let bad_dir = std::env::temp_dir().join(format!("ak-upload-bad-dir-{}", f.session_id));
+        tokio::fs::create_dir_all(&bad_dir).await.expect("mkdir");
+        let dir_size = tokio::fs::metadata(&bad_dir)
+            .await
+            .expect("dir metadata")
+            .len() as i64;
+        sqlx::query(
+            "UPDATE upload_sessions \
+             SET temp_file_path = $2, total_size = $3, bytes_received = $3 \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .bind(bad_dir.to_string_lossy().as_ref())
+        .bind(dir_size)
+        .execute(&f.pool)
+        .await
+        .expect("point session at unreadable temp path");
+
+        let err = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect_err("directory checksum read should fail");
+        assert!(matches!(err, UploadError::Io(_)), "got {err:?}");
+
+        let (status, token, expires) = session_claim_state(&f.pool, f.session_id).await;
+        assert_eq!(status, "in_progress");
+        assert!(token.is_none(), "retryable IO failure must clear token");
+        assert!(
+            expires.is_none(),
+            "retryable IO failure must clear deadline"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&bad_dir).await;
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// An expired committing lease (crashed replica) is reclaimable, and the
+    /// stale owner's token can no longer finalize.
+    #[tokio::test]
+    async fn expired_commit_lease_is_reclaimable_and_fences_stale_owner() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        // First owner claims, then "crashes": force its lease to expire.
+        let stale = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim");
+        sqlx::query(
+            "UPDATE upload_sessions SET committing_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        // A new complete request reclaims the session in place.
+        let fresh = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("expired lease must be reclaimable");
+        assert_ne!(stale.state_token, fresh.state_token);
+
+        // Stale owner is fenced out of the terminal transition.
+        assert!(!UploadService::finalize_completed(&f.pool, &stale)
+            .await
+            .expect("finalize query ok"));
+        assert_eq!(session_status(&f.pool, f.session_id).await, "committing");
+
+        // The rightful owner completes.
+        assert!(UploadService::finalize_completed(&f.pool, &fresh)
+            .await
+            .expect("finalize query ok"));
+        assert_eq!(session_status(&f.pool, f.session_id).await, "completed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// The expired-session reaper must not cancel a session whose commit
+    /// lease is live (a finalizer is still streaming its temp file), but
+    /// reaps it once the lease lapses.
+    #[tokio::test]
+    async fn cleanup_expired_skips_live_committing_lease() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        // Claim the lease, then age the session past its expiry.
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim");
+        sqlx::query(
+            "UPDATE upload_sessions SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("age session");
+
+        UploadService::cleanup_expired(&f.pool)
+            .await
+            .expect("cleanup ok");
+        assert_eq!(
+            session_status(&f.pool, f.session_id).await,
+            "committing",
+            "reaper must not cancel a session with a live commit lease"
+        );
+
+        // Once the lease lapses the reaper may cancel it.
+        sqlx::query(
+            "UPDATE upload_sessions SET committing_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+        UploadService::cleanup_expired(&f.pool)
+            .await
+            .expect("cleanup ok");
+        assert_eq!(session_status(&f.pool, f.session_id).await, "cancelled");
+
+        let _ = session;
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A user cancel racing a live `committing` lease must conflict and
+    /// preserve the temp file the finalizer is still streaming — the
+    /// cancel-vs-commit race this change closes.
+    #[tokio::test]
+    async fn cancel_conflicts_with_live_commit_lease_and_preserves_temp_file() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim the commit lease");
+
+        let denied = UploadService::cancel_session(&f.pool, f.session_id, f.user_id).await;
+        assert!(
+            matches!(denied, Err(UploadError::InvalidStatus(_))),
+            "cancel must conflict with a live commit lease, got {denied:?}"
+        );
+        assert!(
+            tokio::fs::try_exists(&f.temp_path).await.unwrap_or(false),
+            "a denied cancel must not delete the temp file"
+        );
+        assert_eq!(session_status(&f.pool, f.session_id).await, "committing");
+
+        // The owner still holds a valid lease and completes normally.
+        assert!(UploadService::finalize_completed(&f.pool, &session)
+            .await
+            .expect("finalize query ok"));
+        assert_eq!(session_status(&f.pool, f.session_id).await, "completed");
+
+        // Terminal states also refuse to flip to cancelled.
+        let post_terminal = UploadService::cancel_session(&f.pool, f.session_id, f.user_id).await;
+        assert!(
+            matches!(post_terminal, Err(UploadError::InvalidStatus(_))),
+            "cancel of a completed session must not rewrite it, got {post_terminal:?}"
+        );
+        assert_eq!(session_status(&f.pool, f.session_id).await, "completed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A chunk PATCH must be refused while a completion lease is live: the
+    /// committer has already read the chunk set and is checksumming and
+    /// copying the temp file, so a straggler write would change the bytes
+    /// under it. Once the lease is released the session accepts chunks again.
+    #[tokio::test]
+    async fn upload_chunk_is_refused_while_a_commit_lease_is_live() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim the commit lease");
+
+        let refused = UploadService::upload_chunk(
+            &f.pool,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(b"straggler"),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(UploadError::InvalidStatus(ref s)) if s == "committing"),
+            "a chunk write during commit must be refused, got {refused:?}"
+        );
+
+        // Releasing the lease (retryable failure) lifts the fence: the status
+        // check no longer rejects the request.
+        UploadService::release_commit_lease(&f.pool, &session).await;
+        assert_eq!(session_status(&f.pool, f.session_id).await, "in_progress");
+        let after_release = UploadService::upload_chunk(
+            &f.pool,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(b"retry"),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            !matches!(after_release, Err(UploadError::InvalidStatus(_))),
+            "a released session must not be status-fenced, got {after_release:?}"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// Terminal `failed` sessions can never be completed again (the claim
+    /// predicate only admits `pending`/`in_progress`/expired `committing`), so
+    /// they must not keep accepting chunk writes either.
+    #[tokio::test]
+    async fn upload_chunk_is_refused_for_a_failed_session() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        sqlx::query("UPDATE upload_sessions SET status = 'failed' WHERE id = $1")
+            .bind(f.session_id)
+            .execute(&f.pool)
+            .await
+            .expect("mark session failed");
+
+        let refused = UploadService::upload_chunk(
+            &f.pool,
+            f.session_id,
+            0,
+            0,
+            bytes::Bytes::from_static(b"late"),
+            f.user_id,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(UploadError::InvalidStatus(ref s)) if s == "failed"),
+            "a chunk write to a failed session must be refused, got {refused:?}"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// A failure between taking the commit lease and finishing the commit
+    /// must leave the session retryable rather than wedged in `committing`
+    /// for the full lease TTL — the shape every post-claim failure path
+    /// (including the handler's authorization re-check) relies on.
+    #[tokio::test]
+    async fn released_commit_lease_leaves_the_session_completable_again() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim the commit lease");
+        UploadService::release_commit_lease(&f.pool, &session).await;
+
+        let (status, token, expires) = session_claim_state(&f.pool, f.session_id).await;
+        assert_eq!(status, "in_progress");
+        assert!(token.is_none(), "release must clear the token");
+        assert!(expires.is_none(), "release must clear the deadline");
+
+        // Not wedged: a retry claims a fresh lease instead of getting
+        // "completion already in progress".
+        let retry = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("a released session must be completable again");
+        assert_eq!(retry.status, "committing");
+        assert_ne!(
+            retry.state_token, session.state_token,
+            "the retry must own a fresh token"
+        );
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// Once a committing lease has lapsed (crashed finalizer), the user's
+    /// cancel may reclaim the session and remove the temp file.
+    #[tokio::test]
+    async fn cancel_reclaims_expired_commit_lease() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let _stale = UploadService::complete_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("claim");
+        sqlx::query(
+            "UPDATE upload_sessions SET committing_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(f.session_id)
+        .execute(&f.pool)
+        .await
+        .expect("expire lease");
+
+        UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("cancel must reclaim an expired commit lease");
+        assert_eq!(session_status(&f.pool, f.session_id).await, "cancelled");
+        assert!(
+            !tokio::fs::try_exists(&f.temp_path).await.unwrap_or(true),
+            "a successful cancel removes the temp file"
+        );
+
+        // Repeated cancel is an idempotent no-op.
+        UploadService::cancel_session(&f.pool, f.session_id, f.user_id)
+            .await
+            .expect("cancel of a cancelled session is a no-op");
+
+        teardown_lease_fixture(&f).await;
     }
 }

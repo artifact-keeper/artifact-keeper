@@ -158,6 +158,11 @@ pub struct RepoInfo {
     pub promotion_only: bool,
     pub age_gate_enabled: bool,
     pub age_gate_min_age_days: i32,
+    /// Age-source mode wire value (migration 191); parsed by
+    /// [`age_gate_params`]. Defaults to `upstream_publish_time`.
+    pub age_gate_mode: String,
+    pub curation_enabled: bool,
+    pub curation_default_action: String,
 }
 
 impl RepoInfo {
@@ -198,7 +203,8 @@ pub async fn resolve_repo_by_key(
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
-         age_gate_enabled, age_gate_min_age_days \
+         age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+         curation_enabled, curation_default_action \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -234,6 +240,13 @@ pub async fn resolve_repo_by_key(
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
         age_gate_enabled: repo.try_get("age_gate_enabled").unwrap_or(false),
         age_gate_min_age_days: repo.try_get("age_gate_min_age_days").unwrap_or(7),
+        age_gate_mode: repo
+            .try_get("age_gate_mode")
+            .unwrap_or_else(|_| "upstream_publish_time".to_string()),
+        curation_enabled: repo.try_get("curation_enabled").unwrap_or(false),
+        curation_default_action: repo
+            .try_get("curation_default_action")
+            .unwrap_or_else(|_| "allow".to_string()),
     })
 }
 
@@ -656,6 +669,34 @@ pub async fn proxy_fetch_capped_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
+/// `Content-Encoding` for handlers that forward the buffered bytes to the client
+/// and must declare the coding — see
+/// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
+pub async fn proxy_fetch_capped_budgeted_with_encoding(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let (content, content_type, content_encoding) =
+        proxy_fetch_capped_with_cache_key_and_accept_encoded(
+            proxy_service,
+            repo_id,
+            repo_key,
+            upstream_url,
+            path,
+            path,
+            None,
+            max,
+        )
+        .await?;
+    Ok((content, content_type, content_encoding, permit))
+}
+
 /// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
 /// (#2684). See [`proxy_fetch_capped_budgeted`] for the reservation semantics;
 /// used by the PyPI simple-index proxy, which negotiates the PEP 691 JSON
@@ -890,6 +931,31 @@ pub(crate) fn build_streaming_response_with_disposition(
     if let Some(len) = result.content_length {
         builder = builder.header("content-length", len);
     }
+    if let Some(ref etag) = result.etag {
+        builder = builder.header("etag", etag);
+    }
+    // The proxy no longer decodes upstream bodies (see
+    // `http_client::base_client_builder`), so a content-coded body must be
+    // declared as such or the client silently writes compressed bytes to disk.
+    // `content_length` above is the coded length, which is what the client needs
+    // to read the transfer.
+    if let Some(ref encoding) = result.content_encoding {
+        builder = builder.header("content-encoding", encoding);
+    }
+    // Upstream's `X-Repo-Commit`, forwarded with the bytes it describes.
+    // `huggingface_hub` requires it on a resolve and names the snapshot directory
+    // from it, so it must be the commit these bytes came from — which is why it
+    // travels through the cache sidecar rather than being looked up separately.
+    // `HeaderValue` parsing rejects CR/LF, so an upstream cannot inject a header
+    // here; a malformed value is dropped rather than failing the download.
+    if let Some(ref sha) = result.commit_sha {
+        if let Ok(value) = axum::http::HeaderValue::from_str(sha) {
+            builder = builder.header(
+                crate::services::proxy_service::UPSTREAM_COMMIT_HEADER,
+                value,
+            );
+        }
+    }
     if let Some(fname) = filename {
         builder = builder.header("content-disposition", content_disposition_attachment(fname));
     }
@@ -1082,11 +1148,13 @@ pub async fn proxy_check_cache(
     repo_key: &str,
     path: &str,
 ) -> Option<(Bytes, Option<String>)> {
+    // Callers here parse the cached body rather than forwarding it, so the
+    // upstream coding is not part of this helper's contract.
     match proxy_service
         .get_cached_artifact_by_path(repo_key, path)
         .await
     {
-        Ok(result) => result,
+        Ok(result) => result.map(|(content, content_type, _encoding)| (content, content_type)),
         Err(e) => {
             tracing::debug!(
                 "Cache lookup failed for {}/{}, treating as miss: {}",
@@ -1322,6 +1390,37 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept(
     accept: Option<&str>,
     max: usize,
 ) -> Result<(Bytes, Option<String>), Response> {
+    let (content, content_type, _encoding) = proxy_fetch_capped_with_cache_key_and_accept_encoded(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        accept,
+        max,
+    )
+    .await?;
+    Ok((content, content_type))
+}
+
+/// As [`proxy_fetch_capped_with_cache_key_and_accept`], but also reports the
+/// upstream `Content-Encoding` so a handler that forwards the buffered bytes can
+/// declare the coding. Needed because the shared HTTP client no longer lets
+/// reqwest decode upstream bodies, so a buffered metadata document may arrive
+/// content coded (object stores return a stored coding regardless of
+/// `Accept-Encoding`).
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept_encoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -2258,7 +2357,7 @@ where
             // (warm path never fans out) while a held entry is skipped rather
             // than served raw. A fresh hit is transformed into the response.
             match proxy.cached_metadata_if_servable(member, path).await {
-                Ok(Some((bytes, _ct))) => match transform(bytes, member.key.clone()).await {
+                Ok(Some((bytes, _ct, _enc))) => match transform(bytes, member.key.clone()).await {
                     Ok(response) => (MemberCacheClass::DefiniteHit, Some(response)),
                     // The cached bytes failed to transform (e.g. corrupt cached
                     // metadata). Don't treat the member as a definite miss —
@@ -2412,7 +2511,8 @@ where
 /// helpers on their virtual-resolution loops (#2066) that the direct-Remote
 /// branches already use, without teaching those helpers about the full model
 /// type. `fetch_virtual_members` already SELECTs `age_gate_enabled` /
-/// `age_gate_min_age_days`, so the gate columns survive the conversion.
+/// `age_gate_min_age_days` (and, likewise, `curation_enabled` /
+/// `curation_default_action`), so the gate columns survive the conversion.
 ///
 /// The `format` string is produced lowercase to match what
 /// [`age_gate_params`] parses (it lower-cases and matches the `npm`/`pypi`
@@ -2431,7 +2531,72 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         promotion_only: m.promotion_only,
         age_gate_enabled: m.age_gate_enabled,
         age_gate_min_age_days: m.age_gate_min_age_days,
+        // `age_gate_mode` is deliberately NOT on the Repository model; this
+        // default is a placeholder. The age-gate wrappers DB-resolve the
+        // authoritative (mode, upstream) policy by id once the cheap
+        // enabled-check passes, so a member's mode is never read from here.
+        age_gate_mode: "upstream_publish_time".to_string(),
+        curation_enabled: m.curation_enabled,
+        curation_default_action: m.curation_default_action.clone(),
     }
+}
+
+/// Combine a virtual repo's own proxy-scan policy with a resolving member's
+/// into the STRICTER of the two (#3023).
+///
+/// `enabled = virtual || member`, and the action is fail-closed if EITHER side
+/// is fail-closed. This is the only combination that never lets aggregation
+/// weaken a block an operator configured anywhere in the chain: enabling
+/// scanning (or fail-closed) on the virtual — the single pane clients point at
+/// — OR on a member yields blocking, and a fail-closed member is never
+/// downgraded to fail-open by a fail-open virtual. Pure so the stricter-of-two
+/// logic is unit-testable without a DB.
+pub fn stricter_scan_policy(
+    virtual_enabled: bool,
+    virtual_action: crate::services::proxy_scan_service::ProxyScanAction,
+    member_enabled: bool,
+    member_action: crate::services::proxy_scan_service::ProxyScanAction,
+) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
+    use crate::services::proxy_scan_service::ProxyScanAction;
+    let enabled = virtual_enabled || member_enabled;
+    let action = if matches!(virtual_action, ProxyScanAction::FailClosed)
+        || matches!(member_action, ProxyScanAction::FailClosed)
+    {
+        ProxyScanAction::FailClosed
+    } else {
+        ProxyScanAction::FailOpen
+    };
+    (enabled, action)
+}
+
+/// The effective proxy-scan policy for a Virtual repo resolving an artifact
+/// from a member (#3023): the stricter-of-two over the virtual's own config and
+/// the member's (see [`stricter_scan_policy`]). Callers gate on the returned
+/// `enabled` and thread the returned `action` into the per-format scan gate so
+/// the virtual path enforces the same digest-keyed verdict as a direct pull.
+pub async fn effective_virtual_scan_policy(
+    db: &PgPool,
+    virtual_id: Uuid,
+    member_id: Uuid,
+) -> (bool, crate::services::proxy_scan_service::ProxyScanAction) {
+    use crate::services::proxy_scan_service::ProxyScanAction;
+    let svc = crate::services::scan_config_service::ScanConfigService::new(db.clone());
+    let virtual_enabled = svc.is_proxy_scan_enabled(virtual_id).await.unwrap_or(false);
+    let member_enabled = svc.is_proxy_scan_enabled(member_id).await.unwrap_or(false);
+    let virtual_action = svc
+        .proxy_scan_action(virtual_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    let member_action = svc
+        .proxy_scan_action(member_id)
+        .await
+        .unwrap_or(ProxyScanAction::FailOpen);
+    stricter_scan_policy(
+        virtual_enabled,
+        virtual_action,
+        member_enabled,
+        member_action,
+    )
 }
 
 /// Fetch virtual repository member repos sorted by priority.
@@ -2708,12 +2873,15 @@ async fn read_local_stream(
         Err(e) => return Err(map_storage_err(e)),
     };
     Ok(StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
         // Local artifact row resolved: surface its id so the virtual-member
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 
@@ -3799,9 +3967,38 @@ pub struct ArtifactWithMetadata {
     pub id: Uuid,
     pub name: String,
     pub version: Option<String>,
+    /// The artifact's actual stored `path`. Index/metadata generators advertise
+    /// its basename as the download filename so the advertised URL resolves to
+    /// the same object the download route serves (#2587 / #2589).
+    pub path: String,
     pub size_bytes: Option<i64>,
     pub checksum_sha256: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// The filename to advertise in a generated index/metadata document so a client
+/// that follows the advertised download URL resolves the same object the
+/// download route serves.
+///
+/// Format download routes resolve a hosted artifact by its trailing filename
+/// suffix, with an exact-path fallback for artifacts stored at their bare (root)
+/// path (see [`resolve_local_artifact_by_suffix`], #2587). An index that
+/// reconstructs `{name}-{version}.<ext>` from coordinates therefore advertises a
+/// path the download route cannot resolve whenever the artifact was pushed
+/// through the generic upload flow and stored at a bare/arbitrary path with
+/// generically-derived coordinates. Preferring the artifact's real stored
+/// basename keeps the advertised URL coherent with the served route for both
+/// upload flows — the generalisation of the RPM `primary.xml` `<location>` fix
+/// (#2587) to other suffix-resolved formats (#2589).
+///
+/// `reconstructed` is used only when `path` has no usable basename (e.g. a
+/// remote upstream entry with no local stored object).
+pub fn advertised_download_filename(path: &str, reconstructed: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| reconstructed.to_string())
 }
 
 /// Look up an artifact by case-insensitive name AND exact version.
@@ -3815,7 +4012,7 @@ pub async fn find_artifact_by_name_version(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3836,6 +4033,7 @@ pub async fn find_artifact_by_name_version(
         id: r.try_get("id").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
+        path: r.try_get("path").unwrap_or_default(),
         size_bytes: r.try_get("size_bytes").ok(),
         checksum_sha256: r.try_get("checksum_sha256").ok(),
         metadata: r.try_get("metadata").ok(),
@@ -3856,7 +4054,7 @@ pub async fn find_artifact_by_name_lowercase(
 ) -> Result<Option<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3876,6 +4074,7 @@ pub async fn find_artifact_by_name_lowercase(
         id: r.try_get("id").unwrap_or_default(),
         name: r.try_get("name").unwrap_or_default(),
         version: r.try_get("version").ok(),
+        path: r.try_get("path").unwrap_or_default(),
         size_bytes: r.try_get("size_bytes").ok(),
         checksum_sha256: r.try_get("checksum_sha256").ok(),
         metadata: r.try_get("metadata").ok(),
@@ -3896,7 +4095,7 @@ pub async fn list_artifacts_by_name_lowercase(
 ) -> Result<Vec<ArtifactWithMetadata>, Response> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+        "SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, \
                 am.metadata \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
@@ -3917,6 +4116,7 @@ pub async fn list_artifacts_by_name_lowercase(
             id: r.try_get("id").unwrap_or_default(),
             name: r.try_get("name").unwrap_or_default(),
             version: r.try_get("version").ok(),
+            path: r.try_get("path").unwrap_or_default(),
             size_bytes: r.try_get("size_bytes").ok(),
             checksum_sha256: r.try_get("checksum_sha256").ok(),
             metadata: r.try_get("metadata").ok(),
@@ -4571,34 +4771,55 @@ pub(crate) fn build_download_response(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
-/// Build age-gate params from a resolved repository descriptor.
-pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
-    use crate::models::repository::{RepositoryFormat, RepositoryType};
-    use crate::services::age_gate_service::AgeGateRepoParams;
-
-    let repo_type = match info.repo_type.as_str() {
+/// Map a `repositories.repo_type` string onto the typed enum for age-gate
+/// params, defaulting unknown values to `Local` (never gated).
+pub(crate) fn age_gate_repo_type_from_str(
+    repo_type: &str,
+) -> crate::models::repository::RepositoryType {
+    use crate::models::repository::RepositoryType;
+    match repo_type {
         "remote" => RepositoryType::Remote,
         "virtual" => RepositoryType::Virtual,
         "staging" => RepositoryType::Staging,
         _ => RepositoryType::Local,
-    };
-    let format = match info.format.to_lowercase().as_str() {
+    }
+}
+
+/// Map a `repositories.format` string onto the age-gate format alias space:
+/// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
+/// Go gates as Go, and everything else as `Generic` (not in the enforceable
+/// matrix).
+pub(crate) fn age_gate_format_from_str(
+    format: &str,
+) -> crate::models::repository::RepositoryFormat {
+    use crate::models::repository::RepositoryFormat;
+    match format.to_lowercase().as_str() {
         "npm" => RepositoryFormat::Npm,
         "pypi" => RepositoryFormat::Pypi,
+        "go" => RepositoryFormat::Go,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
         other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
         _ => RepositoryFormat::Generic,
-    };
+    }
+}
+
+/// Build age-gate params from a resolved repository descriptor. The mode
+/// wire value is CHECK-constrained by migration 191, so the parse fallback
+/// to the default mode is unreachable in practice.
+pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
+    use crate::services::age_gate_service::{AgeGateMode, AgeGateRepoParams};
 
     AgeGateRepoParams::from_parts(
         info.id,
         info.key.clone(),
-        repo_type,
-        format,
+        age_gate_repo_type_from_str(&info.repo_type),
+        age_gate_format_from_str(&info.format),
         info.age_gate_enabled,
         info.age_gate_min_age_days,
+        AgeGateMode::parse(&info.age_gate_mode).unwrap_or_default(),
+        info.upstream_url.clone(),
     )
 }
 
@@ -4642,6 +4863,258 @@ pub fn age_gate_blocked_response(
         body.to_string(),
     )
         .into_response()
+}
+
+/// 403 response for a curation-rule block on a proxy request.
+pub fn curation_blocked_response(package: &str, reason: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "curation_blocked",
+        "package": package,
+        "reason": reason,
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// The repository fields curation enforcement needs, decoupled from any one
+/// handler's repo struct so every proxy format can reach the shared seam.
+///
+/// Most format handlers carry a [`RepoInfo`] (which converts for free via
+/// `From`); the OCI/Docker handler carries its own `OciRepoInfo`, so it builds
+/// this borrow-only view by hand.
+pub struct CurationTarget<'a> {
+    pub id: Uuid,
+    pub key: &'a str,
+    pub repo_type: &'a str,
+    pub curation_enabled: bool,
+    pub default_action: &'a str,
+}
+
+impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
+    fn from(repo: &'a RepoInfo) -> Self {
+        CurationTarget {
+            id: repo.id,
+            key: &repo.key,
+            repo_type: &repo.repo_type,
+            curation_enabled: repo.curation_enabled,
+            default_action: &repo.curation_default_action,
+        }
+    }
+}
+
+/// Enforce a repository's curation rules on a proxy pull/download for ANY
+/// format (#2930).
+///
+/// This is the format-agnostic generalization of the pypi-specific
+/// `enforce_pypi_curation` seam. PyPI historically enforced curation on its
+/// simple-index and download paths, but every other proxy format left
+/// `curation_enabled` settable yet inert — a `block` rule was silently ignored
+/// on npm / docker / maven / cargo / nuget / … pulls. Each format handler now
+/// calls this at its download seam with the package identity it already parses
+/// (npm package name, OCI image, `groupId:artifactId`, crate name, nuget id).
+///
+/// No-op unless the repository has curation enabled AND is a `remote` /
+/// `virtual` proxy repo: curation rules describe what may be pulled from
+/// upstream, so applying them to a hosted (`local` / `staging`) repo would 403
+/// that repository's own published packages. On a rule-evaluation error it
+/// fails OPEN (logged with repo + package so the unenforced request is
+/// greppable) rather than taking the proxy down — identical to the pypi seam.
+///
+/// Only `pattern` rules are consulted here (via
+/// [`CurationService::evaluate_pep503_package`]), matching the pypi seam
+/// exactly; typed `publisher_trust` / `popularity` rules run on the
+/// staging/sync path, not on the hot download path.
+#[allow(clippy::result_large_err)]
+pub async fn enforce_curation<'a>(
+    db: &PgPool,
+    target: impl Into<CurationTarget<'a>>,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), Response> {
+    let target = target.into();
+    if !target.curation_enabled || !matches!(target.repo_type, "remote" | "virtual") {
+        return Ok(());
+    }
+    let svc = crate::services::curation_service::CurationService::new(db.clone());
+    let eval = svc
+        .evaluate_pep503_package(target.id, target.default_action, package, version)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                repo_id = %target.id,
+                repo_key = %target.key,
+                package = %package,
+                error = %e,
+                "curation evaluation failed; failing open"
+            );
+        })
+        .ok();
+    if let Some(eval) = eval {
+        if eval.action == "block" {
+            return Err(curation_blocked_response(package, &eval.reason));
+        }
+    }
+    Ok(())
+}
+
+/// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
+/// the curation columns (the cargo handler's private `RepoInfo`, the OCI
+/// handler's `OciRepoInfo`). Looks the two columns up by id, then defers to
+/// [`enforce_curation`].
+///
+/// The lookup is skipped entirely for hosted repos: `repo_type` is already in
+/// hand, so a `local` / `staging` pull costs no extra query. On the
+/// remote/virtual path it is one small primary-key SELECT, comparable to the
+/// per-request repo resolution these handlers already perform. A lookup error
+/// fails OPEN (logged), matching the evaluation-error stance of the seam.
+#[allow(clippy::result_large_err)]
+pub async fn enforce_curation_lookup(
+    db: &PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    repo_type: &str,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), Response> {
+    if !matches!(repo_type, "remote" | "virtual") {
+        return Ok(());
+    }
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT curation_enabled, curation_default_action FROM repositories WHERE id = $1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await;
+    let (curation_enabled, default_action) = match row {
+        Ok(Some(r)) => (
+            r.try_get::<bool, _>("curation_enabled").unwrap_or(false),
+            r.try_get::<String, _>("curation_default_action")
+                .unwrap_or_else(|_| "allow".to_string()),
+        ),
+        // Row missing or query failed: fail open (the pull proceeds unenforced),
+        // logged so the gap is greppable — never take the proxy down on a
+        // curation-config read error.
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id,
+                repo_key = %repo_key,
+                package = %package,
+                error = %e,
+                "curation config lookup failed; failing open"
+            );
+            return Ok(());
+        }
+    };
+    let target = CurationTarget {
+        id: repo_id,
+        key: repo_key,
+        repo_type,
+        curation_enabled,
+        default_action: &default_action,
+    };
+    enforce_curation(db, target, package, version).await
+}
+
+/// 503 response when a repository's age gate is enabled but cannot be
+/// evaluated (service unwired, config unreadable, or no evidence resolution
+/// at the calling seam). The age gate fails CLOSED (#2264): an evaluation
+/// error must refuse the download rather than impersonate a disabled gate —
+/// the deliberate divergence from the curation seam above, which fails open.
+pub fn age_gate_unavailable_response(repo_key: &str, package: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "age_gate_unavailable",
+        "repository": repo_key,
+        "package": package,
+        "message": "The age gate is enabled for this repository but could not be evaluated; refusing the download (fail closed)"
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Enforce a repository's publish-age gate on a supported proxy
+/// pull/download (#2264).
+///
+/// The caller supplies the identity it already parses (the same convention as
+/// the curation seam) plus the upstream publish evidence its format resolves;
+/// this core owns applicability, the decision, review-row recording (via
+/// [`AgeGateService::check`]), and the terminal 451.
+///
+/// Outcome mapping:
+/// * `Ok(None)` — allowed: gate off / repository-format not in the
+///   enforceable matrix / version meets the threshold / sticky approval.
+/// * `Ok(Some(blocked))` — blocked, but a last-known-good version exists; the
+///   caller substitutes its format-specific LKG response (npm rebuilds a
+///   tarball path, pypi a wheel filename) so LKG construction stays with the
+///   format that understands it. The outcome retains the real review id for
+///   protocols such as Go that intentionally do not substitute an LKG.
+/// * `Err(451)` — blocked with no LKG: structured `age_gate_blocked` body,
+///   review row created/bumped.
+/// * `Err(5xx)` — the check itself failed. Unlike the curation seam, the age
+///   gate fails CLOSED; see [`age_gate_unavailable_response`].
+///
+/// [`AgeGateService`]: crate::services::age_gate_service::AgeGateService
+#[derive(Debug)]
+pub struct AgeGateSubstitution {
+    pub review_id: Uuid,
+    pub last_known_good: crate::services::age_gate_service::LastKnownGood,
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn enforce_age_gate(
+    svc: Option<&crate::services::age_gate_service::AgeGateService>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<AgeGateSubstitution>, Response> {
+    use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+
+    if !AgeGateService::gating_requested(params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(params).map_err(|e| e.into_response())?;
+    // Applicability established: from here every non-allow path fails closed.
+    let Some(svc) = svc else {
+        return Err(age_gate_unavailable_response(&params.key, package));
+    };
+    match svc
+        .check(params, package, version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: Some(lkg),
+        } => Ok(Some(AgeGateSubstitution {
+            review_id,
+            last_known_good: lkg,
+        })),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
+            Err(age_gate_blocked_response(
+                review_id,
+                package,
+                version,
+                params.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
 }
 
 /// Build a minimal `Repository` model for proxy operations.
@@ -4701,12 +5174,425 @@ pub(crate) fn build_remote_repo_with_format(
     }
 }
 
+// ---------------------------------------------------------------------------
+// #2954/#3003: shared inline scan-and-block glue for proxy downloads.
+//
+// The verdict STATE MACHINE lives in `proxy_scan_service::decide_serve` and
+// the scanner loop (with the #2954 fail-closed gate) in
+// `scanner_service::run_inline_proxy_scanners[_target]`; this section is the
+// handler-side plumbing every format shares — digesting, the scan-or-lookup
+// orchestration, and the block/lock response shapes — so per-format serve
+// paths (pypi.rs, npm.rs) are thin fetch + response-builder call-sites and
+// cannot drift on the carried defenses.
+// ---------------------------------------------------------------------------
+
+/// The scan_type stored for the Grype CVE scanner in `proxy_scan_results`.
+pub(crate) const PROXY_SCAN_TYPE: &str = "grype";
+
+/// SHA-256 hex of the fetched bytes. The verdict cache is keyed on the CONTENT
+/// digest we compute ourselves — never an index-advertised digest — so a lying
+/// upstream index cannot bind a clean verdict to malicious bytes (#2954 inv 4).
+pub(crate) fn sha256_hex(bytes: &Bytes) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// A 403 for a proxy pull blocked by a vulnerable inline-scan verdict. Body is
+/// neutral: it names the file, not the specific CVEs (the download route is
+/// anonymous-readable for public repos).
+pub(crate) fn scan_blocked_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_blocked",
+        "file": filename,
+        "reason": "blocked by inline vulnerability scan policy",
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// A 423 Locked for the fail-closed inconclusive branch (over-cap / budget /
+/// scan error): the object could not be scanned inline and fail-closed must
+/// NEVER serve unscanned bytes.
+pub(crate) fn scan_pending_locked_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_pending",
+        "file": filename,
+        "reason": "artifact is being scanned; retry shortly",
+    });
+    (
+        StatusCode::LOCKED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Classify a buffered-fetch error as the byte-cap-exceeded case (vs a genuine
+/// upstream 404 / 5xx). Over-cap is the only error the fail-open/closed
+/// inconclusive branch handles specially; every other error is propagated as-is
+/// so a 404 stays a 404.
+pub(crate) fn is_over_cap_error(e: &AppError) -> bool {
+    matches!(e, AppError::BadGateway(m) if m.contains("exceeded") && m.contains("limit"))
+}
+
+/// HOW the inline proxy gate must scan the buffered bytes (#3003 PR-2).
+///
+/// The digest-verdict state machine ([`gate_proxy_scan_serve`]) is identical
+/// for every format; what differs is the scan invocation the bytes need:
+#[derive(Clone)]
+pub(crate) enum ProxyScanMode {
+    /// The bytes ARE the scannable unit (a PyPI wheel, an npm tarball):
+    /// file/archive scan over the synthetic artifact. Pre-#3003-PR-2 behavior.
+    File,
+    /// The bytes are an OCI IMAGE MANIFEST: the scannable unit is the whole
+    /// image (config + layers). The scan stages any missing blobs from
+    /// upstream into local storage (bounded by the shared byte cap) and runs
+    /// the CVE engine over a local `oci-dir:` reassembly — never a
+    /// `registry:` pull back through our own serve path.
+    OciImage(OciImageScanCtx),
+}
+
+/// Owned repository routing context for [`ProxyScanMode::OciImage`], carried
+/// into the async fail-open scan task (must be `'static`).
+#[derive(Clone)]
+pub(crate) struct OciImageScanCtx {
+    pub repo_id: Uuid,
+    pub repo_key: String,
+    pub repo_type: String,
+    pub location: crate::storage::StorageLocation,
+    /// Image name within the repository (upstream blob fetch path shape).
+    pub image: String,
+    pub upstream_url: Option<String>,
+}
+
+/// Run the leaf scanners over the buffered bytes within the inline budget and
+/// persist the digest-keyed verdict. The caller supplies the format-specific
+/// `synthetic` [`Artifact`](crate::models::artifact::Artifact) (filename /
+/// content-type drive scanner applicability + archive extraction) and the
+/// [`ProxyScanMode`] selecting the scan invocation. Returns the verdict, or
+/// `None` when the scan was inconclusive (no scanner configured, budget
+/// exceeded, blob staging failed, or scanner error) — the caller maps `None`
+/// onto the fail-open/closed decision.
+pub(crate) async fn proxy_scan_and_record(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    mode: &ProxyScanMode,
+) -> Option<crate::services::scanner_service::ProxyScanVerdict> {
+    let scanner = state.scanner_service.as_ref()?;
+    let filename = synthetic.name.clone();
+    // The OCI budget is wider: blob staging (an upstream fetch the file
+    // formats pay BEFORE the gate) happens inside it.
+    let budget = match mode {
+        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::OciImage(_) => {
+            crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
+        }
+    };
+    let scan_fut = async {
+        match mode {
+            ProxyScanMode::File => {
+                scanner
+                    .scan_content_expecting(synthetic, bytes, expected)
+                    .await
+            }
+            ProxyScanMode::OciImage(ctx) => {
+                crate::api::handlers::oci_v2::oci_stage_and_scan_image(state, ctx, synthetic, bytes)
+                    .await
+            }
+        }
+    };
+    let verdict = match tokio::time::timeout(budget, scan_fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, error = %e,
+                "inline proxy scan failed; treating as inconclusive"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename,
+                "inline proxy scan exceeded the budget; treating as inconclusive"
+            );
+            return None;
+        }
+    };
+
+    let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    if let Err(e) = pss
+        .record_verdict(
+            digest,
+            PROXY_SCAN_TYPE,
+            verdict.verdict_token(),
+            verdict.findings_count,
+            verdict.critical_count,
+            verdict.high_count,
+            verdict.medium_count,
+            verdict.low_count,
+            verdict.max_severity_token(),
+            verdict.scanner_version.as_deref(),
+            Some(repo_id),
+        )
+        .await
+    {
+        tracing::warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
+    }
+    Some(verdict)
+}
+
+/// What the serve path was able to establish about WHAT these bytes are being
+/// served as, before any scanning (#3003).
+///
+/// The CVE engine grades a component identity, not a blob, so a scan is only
+/// meaningful once the identity is known — and an engine with nothing to grade
+/// reports zero findings, which is indistinguishable from clean. Formats
+/// therefore state explicitly whether they could establish the coordinate.
+pub(crate) enum ProxyScanIdentity {
+    /// The coordinate these bytes are served as, derived from the REQUEST (not
+    /// from upstream-controlled bytes) and agreed to by the artifact itself.
+    /// Turns on the assessment gate: the engine must actually catalog this
+    /// identity before a `clean` verdict is trusted.
+    Established(crate::services::scanner_service::ExpectedComponent),
+    /// The format expects a coordinate but could NOT establish one for these
+    /// bytes (identity absent, unusable, or disagreeing with the coordinate
+    /// they are served at). Nothing a scanner returned could be vouched for,
+    /// so this is inconclusive — fail-closed withholds, fail-open serves loudly
+    /// pending, exactly like any other inconclusive scan.
+    Unestablished,
+    /// This format does not supply a coordinate. Pre-#3003 behavior, unchanged.
+    NotApplicable,
+}
+
+/// Outcome of [`gate_proxy_scan_serve`], mapped by the caller onto its
+/// format-specific 200 response (`pending` selects the `X-AK-Scan` header
+/// value) or returned as the block/lock response as-is.
+pub(crate) enum ProxyScanServeOutcome {
+    /// Serve the buffered bytes; `pending: true` means fail-open served
+    /// before a verdict (loud `X-AK-Scan: pending`, async scan running).
+    Serve { pending: bool },
+    /// The pull is blocked (403 vulnerable) or locked (423 inconclusive
+    /// under fail-closed); the response is fully built.
+    Deny(Response),
+}
+
+/// The shared digest-verdict gate for a buffered proxy download: lookup →
+/// [`crate::services::proxy_scan_service::decide_serve`] → scan-inline /
+/// async-scan per the repo action, persisting verdicts via
+/// [`proxy_scan_and_record`]. Every format serve path calls this after its
+/// buffered capped fetch, so the #2954 fail-closed contract and the #2976
+/// freshness gate are exercised through ONE implementation.
+///
+/// `synthetic` is the format-specific scan identity for these bytes; it is
+/// also what the async fail-open scan runs over.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn gate_proxy_scan_serve(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    synthetic: crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    identity: ProxyScanIdentity,
+    mode: ProxyScanMode,
+) -> ProxyScanServeOutcome {
+    use crate::services::proxy_scan_service::{decide_serve, ProxyScanService, ServeDecision};
+
+    let pss = ProxyScanService::new(state.db.clone());
+    let row = pss
+        .lookup_verdict(digest, PROXY_SCAN_TYPE)
+        .await
+        .ok()
+        .flatten();
+    // #2976: compare the verdict's stored provenance against the LIVE
+    // CVE-scanner version (VersionCache-backed — a memory read on the hot
+    // path, never a per-download subprocess). Only probed when a row exists,
+    // exactly as the pre-refactor PyPI path did.
+    let current_version = match (&row, state.scanner_service.as_deref()) {
+        (Some(_), Some(scanner)) => scanner.cve_scanner_version().await,
+        _ => None,
+    };
+
+    match decide_serve(
+        row.as_ref(),
+        current_version.as_deref(),
+        action,
+        crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
+        Utc::now(),
+    ) {
+        ServeDecision::BlockCached => {
+            tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
+            ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+        }
+        ServeDecision::ServeCached => ProxyScanServeOutcome::Serve { pending: false },
+        ServeDecision::ScanInline => {
+            // Fail-closed: scan inline before serving a single byte.
+            //
+            // An artifact whose identity could not be established is withheld
+            // WITHOUT scanning: the scan could only produce a zero-finding
+            // result over content the engine cannot grade, and reporting that
+            // as clean is precisely the hole this closes.
+            let expected = match &identity {
+                ProxyScanIdentity::Unestablished => {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename, digest = %digest,
+                        "cannot establish what these bytes are served as; \
+                         fail-closed -> withholding rather than reporting clean"
+                    );
+                    return ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename));
+                }
+                ProxyScanIdentity::Established(e) => Some(e),
+                ProxyScanIdentity::NotApplicable => None,
+            };
+            match proxy_scan_and_record(state, repo_id, digest, &synthetic, bytes, expected, &mode)
+                .await
+            {
+                Some(verdict) if verdict.is_vulnerable() => {
+                    tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
+                    ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+                }
+                Some(_) => ProxyScanServeOutcome::Serve { pending: false },
+                // Inconclusive under fail-closed => 423, never unscanned bytes.
+                None => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
+            }
+        }
+        ServeDecision::ServePendingScanAsync => {
+            // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
+            // asynchronously so the NEXT pull of this SAME digest is blocked
+            // if bad.
+            //
+            // Honest caveat (#2954, Finding 2): the block is keyed strictly on
+            // the CONTENT digest. That is correct and cannot be relaxed —
+            // binding a verdict to anything an untrusted upstream controls
+            // (filename, index digest) would let a lying index attach a
+            // `clean` verdict to malicious bytes. But it means fail-open does
+            // NOT block an ADAPTIVE upstream that returns byte-varying
+            // vulnerable payloads: each pull is a new digest, hence a fresh
+            // "first pull", served 200 `X-AK-Scan: pending` indefinitely.
+            // This is by-design for the latency-first fail-open posture and is
+            // LOUD — every such serve emits the warn below plus the pending
+            // header. Operators who cannot tolerate serving an unscanned byte
+            // must use `proxy_scan_action=fail_closed`. Do NOT "fix" this by
+            // turning fail-open into fail-closed here.
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                "fail-open proxy scan: serving unscanned bytes with X-AK-Scan: pending; scanning async"
+            );
+            let state_bg = state.clone();
+            let digest_bg = digest.to_string();
+            let bytes_bg = bytes.clone();
+            let expected = match identity {
+                // Nothing to assess: serve loudly pending (fail-open's
+                // posture) but do not run a scan whose only possible result
+                // would be an unfounded `clean` row for this digest.
+                ProxyScanIdentity::Unestablished => {
+                    return ProxyScanServeOutcome::Serve { pending: true }
+                }
+                ProxyScanIdentity::Established(e) => Some(e),
+                ProxyScanIdentity::NotApplicable => None,
+            };
+            tokio::spawn(async move {
+                let _ = proxy_scan_and_record(
+                    &state_bg,
+                    repo_id,
+                    &digest_bg,
+                    &synthetic,
+                    &bytes_bg,
+                    expected.as_ref(),
+                    &mode,
+                )
+                .await;
+            });
+            ProxyScanServeOutcome::Serve { pending: true }
+        }
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── Stricter-of-two virtual scan policy (#3023) ──────────────────
+    //
+    // A Virtual repo aggregating a Remote member enforces the stricter of the
+    // virtual's own proxy-scan config and the member's, so aggregation can
+    // never weaken a block configured anywhere in the chain.
+    #[test]
+    fn stricter_scan_policy_enables_if_either_side_enables() {
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        // Neither enabled -> disabled.
+        let (enabled, _) = stricter_scan_policy(
+            false,
+            ProxyScanAction::FailOpen,
+            false,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(!enabled, "neither side enables scanning");
+
+        // Virtual enabled, member disabled -> enabled (the customer gap: clients
+        // point at the virtual, a member has scanning off).
+        let (enabled, _) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            false,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(enabled, "virtual enabling scanning is sufficient");
+
+        // Member enabled, virtual disabled -> enabled.
+        let (enabled, _) = stricter_scan_policy(
+            false,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert!(enabled, "member enabling scanning is sufficient");
+    }
+
+    #[test]
+    fn stricter_scan_policy_fail_closed_if_either_side_fail_closed() {
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        // A fail-closed member is never downgraded by a fail-open virtual.
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailClosed,
+        );
+        assert_eq!(action, ProxyScanAction::FailClosed);
+
+        // A fail-closed virtual is never downgraded by a fail-open member.
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailClosed,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert_eq!(action, ProxyScanAction::FailClosed);
+
+        // Both fail-open -> fail-open (no spurious tightening).
+        let (_, action) = stricter_scan_policy(
+            true,
+            ProxyScanAction::FailOpen,
+            true,
+            ProxyScanAction::FailOpen,
+        );
+        assert_eq!(action, ProxyScanAction::FailOpen);
+    }
 
     // ── Global buffered-metadata byte budget (#2665) ─────────────────
     //
@@ -5294,10 +6180,13 @@ mod tests {
 
     fn empty_stream_result() -> StreamingFetchResult {
         StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: Box::pin(futures::stream::empty()),
             content_type: None,
             content_length: Some(0),
             artifact_id: None,
+            etag: None,
         }
     }
 
@@ -5489,6 +6378,9 @@ mod tests {
             promotion_only,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -6192,6 +7084,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -7101,12 +7996,14 @@ mod tests {
             id,
             name: "ggplot2".to_string(),
             version: Some("3.4.0".to_string()),
+            path: "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz".to_string(),
             size_bytes: Some(1024),
             checksum_sha256: Some("def".to_string()),
             metadata: Some(serde_json::json!({"depends": "R (>= 3.5.0)"})),
         };
         assert_eq!(m.id, id);
         assert_eq!(m.name, "ggplot2");
+        assert_eq!(m.path, "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz");
         assert_eq!(m.version.as_deref(), Some("3.4.0"));
         assert_eq!(m.size_bytes, Some(1024));
         assert_eq!(m.checksum_sha256.as_deref(), Some("def"));
@@ -7119,6 +8016,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "lonely".to_string(),
             version: None,
+            path: "lonely.tar.gz".to_string(),
             size_bytes: None,
             checksum_sha256: None,
             metadata: None,
@@ -7128,6 +8026,34 @@ mod tests {
         assert!(m.checksum_sha256.is_none());
         assert!(m.metadata.is_none());
         assert_eq!(m.name, "lonely");
+    }
+
+    #[test]
+    fn test_advertised_download_filename_prefers_stored_basename() {
+        // Native layout: basename already equals the reconstructed filename.
+        assert_eq!(
+            advertised_download_filename("rails/7.0.0/rails-7.0.0.gem", "rails-7.0.0.gem"),
+            "rails-7.0.0.gem"
+        );
+        // Bare/arbitrary generic-upload path: advertise the real basename, NOT
+        // the reconstructed coordinates the download route could not resolve.
+        assert_eq!(
+            advertised_download_filename("blob.gem", "rails-7.0.0.gem"),
+            "blob.gem"
+        );
+        assert_eq!(
+            advertised_download_filename("uploads/2026/x.tar.gz", "acme-mod-1.0.0.tar.gz"),
+            "x.tar.gz"
+        );
+        // No usable basename (empty / trailing slash) -> reconstructed fallback.
+        assert_eq!(
+            advertised_download_filename("", "acme-mod-1.0.0.tar.gz"),
+            "acme-mod-1.0.0.tar.gz"
+        );
+        assert_eq!(
+            advertised_download_filename("dir/", "acme-mod-1.0.0.tar.gz"),
+            "acme-mod-1.0.0.tar.gz"
+        );
     }
 
     // ── DownloadResponseOpts / VirtualLookup tests ──────────────────────
@@ -7433,13 +8359,10 @@ mod tests {
         use crate::config::Config;
 
         pub async fn try_pool() -> Option<PgPool> {
-            let url = std::env::var("DATABASE_URL").ok()?;
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(3)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&url)
-                .await
-                .ok()
+            // Skip only when no DB is configured/reachable AND not required; a
+            // connect failure under AK_TESTS_REQUIRE_DB panics (no fiction-green,
+            // #2924).
+            crate::testing::try_pool_with(3).await
         }
 
         fn test_config(storage_path: &str) -> Config {
@@ -7451,6 +8374,7 @@ mod tests {
                 environment: "development".into(),
                 storage_path: storage_path.into(),
                 s3_bucket: None,
+                backup_s3_bucket: None,
                 gcs_bucket: None,
                 s3_region: None,
                 s3_endpoint: None,
@@ -8130,6 +9054,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -8179,6 +9106,12 @@ mod tests {
         let cd = resp.headers().get("Content-Disposition").unwrap();
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
 
+        // #2522: the stats INSERT is now spawned off the hot path — wait for it.
+        assert_eq!(
+            crate::api::handlers::test_db_helpers::download_count_eventually(&pool, artifact_id, 1)
+                .await,
+            1
+        );
         // #2365: the download must be attributed to the real client, not the
         // historical '0.0.0.0' sentinel with no user.
         let (ip, ua, uid): (Option<String>, Option<String>, Option<Uuid>) = sqlx::query_as(
@@ -8243,6 +9176,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let payload = b"streamed-artifact-body".repeat(64);
@@ -8409,6 +9345,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let opts = DownloadResponseOpts {
@@ -8457,6 +9396,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -8506,6 +9448,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         let opts = DownloadResponseOpts {
@@ -8556,6 +9501,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
@@ -8620,6 +9568,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"rpmbytes");
         put_artifact_bytes(&state, &repo, "rpm/ab.rpm", bytes.clone())
@@ -8685,6 +9636,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let bytes = Bytes::from_static(b"dirbytes");
         put_artifact_bytes(&state, &repo, "rpm/packages/hello.rpm", bytes.clone())
@@ -8824,10 +9778,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_uses_upstream_content_type_when_set() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/java-archive".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -8844,10 +9801,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_falls_back_to_default_when_upstream_omits() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -8866,10 +9826,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_sets_content_length_when_upstream_advertises_it() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -8889,10 +9852,13 @@ mod tests {
         // Chunked-transfer-encoding case: upstream omits Content-Length,
         // outbound response also omits it so axum falls back to TE: chunked.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -8906,10 +9872,13 @@ mod tests {
     #[test]
     fn test_build_streaming_response_status_is_200() {
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -8922,10 +9891,13 @@ mod tests {
         // string as-is, not lowercase / normalize / sniff.
         let weird = "application/vnd.android.package-archive";
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -8943,10 +9915,13 @@ mod tests {
         // underlying builder: upstream content-type wins, content-length is set
         // when known, and a filename produces a Content-Disposition.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: Some("application/zip".to_string()),
             content_length: Some(1234),
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -8971,10 +9946,13 @@ mod tests {
         // No upstream content-type, no length, no filename: default type is
         // used and neither content-length nor content-disposition is emitted.
         let result = StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
             body: empty_body(),
             content_type: None,
             content_length: None,
             artifact_id: None,
+            etag: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
@@ -9464,6 +10442,8 @@ mod tests {
         async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             if key.ends_with("__cache_meta__.json") {
                 let meta = crate::services::proxy_service::CacheMetadata {
+                    upstream_commit_sha: None,
+                    content_encoding: None,
                     cached_at: Utc::now(),
                     upstream_etag: None,
                     storage_etag: None,
@@ -9650,6 +10630,8 @@ mod tests {
         async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
             if key.ends_with("__cache_meta__.json") {
                 let meta = crate::services::proxy_service::CacheMetadata {
+                    upstream_commit_sha: None,
+                    content_encoding: None,
                     cached_at: Utc::now(),
                     upstream_etag: None,
                     storage_etag: None,
@@ -9982,6 +10964,22 @@ mod tests {
         .expect("count download_statistics rows")
     }
 
+    /// Poll [`download_stats_count_for_repo`] until it reaches `expected` (or a
+    /// bounded ~2s budget is exhausted). Since #2522 `record_download` SPAWNS the
+    /// `download_statistics` INSERT off the hot path, so these repo-scoped count
+    /// assertions must tolerate the detached write's async timing.
+    async fn poll_repo_download_count(pool: &PgPool, repo_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = download_stats_count_for_repo(pool, repo_id).await;
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     /// #2260: a HOSTED (non-proxy-cache) local artifact served through
     /// `local_fetch_or_redirect` on a filesystem backend (streaming fallback,
     /// no presign) records exactly ONE download-statistics row — and a second
@@ -10043,7 +11041,8 @@ mod tests {
         )
         .await
         .expect("first hosted fetch must succeed");
-        let after_one = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        // #2522: the stats INSERT is spawned off the hot path — wait for it.
+        let after_one = poll_repo_download_count(&fx.pool, fx.repo_id, 1).await;
 
         super::local_fetch_or_redirect(
             &fx.pool,
@@ -10055,7 +11054,7 @@ mod tests {
         )
         .await
         .expect("second hosted fetch must succeed");
-        let after_two = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        let after_two = poll_repo_download_count(&fx.pool, fx.repo_id, 2).await;
 
         fx.teardown().await;
 
@@ -10148,7 +11147,8 @@ mod tests {
         )
         .await
         .expect("GET serve must succeed");
-        let after_get = download_stats_count_for_repo(&fx.pool, fx.repo_id).await;
+        // #2522: the GET's stats INSERT is spawned off the hot path — wait for it.
+        let after_get = poll_repo_download_count(&fx.pool, fx.repo_id, 1).await;
 
         fx.teardown().await;
 
@@ -10240,7 +11240,9 @@ mod tests {
         )
         .await;
 
-        let recorded = download_stats_count_for_repo(&pool, member_id).await;
+        // #2522: the stats INSERT is spawned off the hot path — wait for it
+        // before cleanup deletes the rows.
+        let recorded = poll_repo_download_count(&pool, member_id, 1).await;
 
         db_helpers::cleanup(&pool, member_id, user_id).await;
         db_helpers::cleanup(&pool, virtual_id, user_id).await;
@@ -10452,11 +11454,26 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: true,
             age_gate_min_age_days: 14,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         let params = age_gate_params(&info);
         assert!(params.age_gate_enabled);
         assert_eq!(params.age_gate_min_age_days, 14);
         assert_eq!(params.key, "npm-remote");
+    }
+
+    #[test]
+    fn age_gate_format_mapping_includes_go_capability() {
+        use crate::models::repository::RepositoryFormat;
+
+        assert_eq!(age_gate_format_from_str("go"), RepositoryFormat::Go);
+        assert_eq!(age_gate_format_from_str("GO"), RepositoryFormat::Go);
+        assert_eq!(
+            age_gate_format_from_str("unsupported"),
+            RepositoryFormat::Generic
+        );
     }
 
     #[test]
@@ -10545,6 +11562,22 @@ mod tests {
             .expect("count download_statistics")
     }
 
+    /// Poll [`download_stat_count`] until it reaches `expected` (or a bounded
+    /// ~2s budget is exhausted). Since #2522 `record_download` SPAWNS the
+    /// `download_statistics` INSERT off the hot path, so these artifact-scoped
+    /// count assertions must tolerate the detached write's async timing.
+    async fn poll_artifact_download_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..100 {
+            last = download_stat_count(pool, artifact_id).await;
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
     fn ctx_for(
         user_id: Uuid,
         is_head: bool,
@@ -10593,7 +11626,8 @@ mod tests {
         )
         .await;
 
-        let after_get = download_stat_count(&pool, artifact_id).await;
+        // #2522: the GET's stats INSERT is spawned off the hot path — wait for it.
+        let after_get = poll_artifact_download_count(&pool, artifact_id, 1).await;
 
         // HEAD on the same redirect-eligible .jar: still 302 (headers only) but
         // records +0 — the canonical record_download honours ctx.is_head
@@ -10750,5 +11784,300 @@ mod tests {
 
         assert!(out.is_none(), "feature disabled must stream, not 302");
         assert_eq!(presign_calls, 0, "no presign when the feature is off");
+    }
+
+    // ── Cross-format curation enforcement (#2930) ────────────────────────
+    //
+    // The shared `enforce_curation` seam must block a proxy pull whose package
+    // matches a `block` rule on a curation-enabled remote/virtual repo, and be
+    // an inert no-op otherwise — hosted repos, curation disabled, or a
+    // non-matching package. These pin the behaviour every format handler now
+    // depends on. DB-backed; skip silently when `DATABASE_URL` is unset so
+    // offline `cargo test --lib` stays usable.
+
+    /// Create a repo of `repo_type`, set `curation_enabled`, and (optionally)
+    /// insert a `block` rule for `blocked_pkg`. Returns (user_id, repo_id, key).
+    async fn seed_curated_repo(
+        pool: &sqlx::PgPool,
+        repo_type: &str,
+        curation_enabled: bool,
+        blocked_pkg: Option<&str>,
+    ) -> (uuid::Uuid, uuid::Uuid, String) {
+        let user_id = db_helpers::create_user(pool).await;
+        let (repo_id, key, _) = db_helpers::create_repo(pool, repo_type, "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = $2, curation_default_action = 'allow' \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .bind(curation_enabled)
+        .execute(pool)
+        .await
+        .expect("enable curation");
+        if let Some(pkg) = blocked_pkg {
+            sqlx::query(
+                "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+                 architecture, action, priority, reason, created_by) \
+                 VALUES ($1, $2, '*', '*', 'block', 100, '#2930 test block', $3)",
+            )
+            .bind(repo_id)
+            .bind(pkg)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert block rule");
+        }
+        (user_id, repo_id, key)
+    }
+
+    async fn curation_cleanup(pool: &sqlx::PgPool, repo_id: uuid::Uuid, user_id: uuid::Uuid) {
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        db_helpers::cleanup(pool, repo_id, user_id).await;
+    }
+
+    fn repo_info_for(
+        id: uuid::Uuid,
+        key: &str,
+        repo_type: &str,
+        curation_enabled: bool,
+    ) -> RepoInfo {
+        RepoInfo {
+            id,
+            key: key.to_string(),
+            storage_path: "/tmp/ph-curation".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: repo_type.to_string(),
+            format: "npm".to_string(),
+            upstream_url: Some("https://upstream.example.test".to_string()),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_blocks_matching_and_passes_others_remote() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", true, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+
+        // Matching package -> blocked (403).
+        let blocked = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        let resp = blocked.expect_err("blocked package must 403");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // A different package on the same repo is unaffected.
+        let allowed = enforce_curation(&pool, &repo, "some-other-pkg", None).await;
+        assert!(allowed.is_ok(), "non-matching package must pass through");
+
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_noop_when_disabled() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // Rule present but curation_enabled = false: the block must NOT fire.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", false, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "remote", false);
+        let out = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        assert!(
+            out.is_ok(),
+            "curation disabled must be a no-op even with a block rule"
+        );
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_noop_on_hosted_repo() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // Hosted (local) repo: curation describes upstream pulls, so a hosted
+        // repo's own published package must never be 403'd.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "local", true, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "local", true);
+        let out = enforce_curation(&pool, &repo, "blocked-pkg", None).await;
+        assert!(
+            out.is_ok(),
+            "hosted repo pulls must never be curation-blocked"
+        );
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_enforce_curation_lookup_blocks_and_skips_hosted() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        // The by-id lookup path (cargo/oci handlers) resolves the curation
+        // columns itself and blocks a matching pull on a remote repo.
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", true, Some("blocked-pkg")).await;
+        let blocked =
+            enforce_curation_lookup(&pool, repo_id, &key, "remote", "blocked-pkg", None).await;
+        assert_eq!(
+            blocked
+                .expect_err("lookup path must 403 a blocked pull")
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // A hosted repo_type short-circuits before any lookup.
+        let hosted =
+            enforce_curation_lookup(&pool, repo_id, &key, "local", "blocked-pkg", None).await;
+        assert!(
+            hosted.is_ok(),
+            "hosted repo must skip curation lookup entirely"
+        );
+
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_age_gate seam (#2264): the age-gate twin of the curation seam
+    // above, landing at the same call sites. Pins the outcome mapping
+    // (allow / LKG hand-back / terminal 451) and the deliberate divergence
+    // from curation: every non-allow evaluation failure fails CLOSED.
+    // -----------------------------------------------------------------------
+
+    fn age_gate_params_for(
+        id: uuid::Uuid,
+        key: &str,
+        repo_type: &str,
+        format: &str,
+        enabled: bool,
+        min_age_days: i32,
+    ) -> crate::services::age_gate_service::AgeGateRepoParams {
+        crate::services::age_gate_service::AgeGateRepoParams::from_parts(
+            id,
+            key.to_string(),
+            age_gate_repo_type_from_str(repo_type),
+            age_gate_format_from_str(format),
+            enabled,
+            min_age_days,
+            Default::default(),
+            None,
+        )
+    }
+
+    fn age_gate_svc(pool: sqlx::PgPool) -> crate::services::age_gate_service::AgeGateService {
+        use crate::services::event_bus::EventBus;
+        crate::services::age_gate_service::AgeGateService::new(
+            pool,
+            std::sync::Arc::new(EventBus::new(4)),
+        )
+    }
+
+    async fn response_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_not_applicable_allows_without_service() {
+        // Gate disabled / hosted repo: gating not requested -> allowed,
+        // and the absence of a wired service must not matter.
+        for (repo_type, format, enabled) in [
+            ("remote", "npm", false),
+            ("local", "npm", true),
+            ("local", "maven", true),
+        ] {
+            let params = age_gate_params_for(
+                uuid::Uuid::new_v4(),
+                "ag-seam",
+                repo_type,
+                format,
+                enabled,
+                7,
+            );
+            let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
+            assert!(
+                matches!(out, Ok(None)),
+                "({repo_type}, {format}, enabled={enabled}) must be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_applicable_without_service_fails_closed() {
+        // An enabled, applicable gate with no wired service must refuse the
+        // download (503), never impersonate a disabled gate. Divergence from
+        // the curation seam, which fails open — deliberate (#2264).
+        let params = age_gate_params_for(uuid::Uuid::new_v4(), "ag-seam", "remote", "npm", true, 7);
+        let out = enforce_age_gate(None, &params, "left-pad", "1.0.0", None).await;
+        let resp = out.expect_err("must fail closed");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(resp).await;
+        assert_eq!(body["error"], "age_gate_unavailable");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_age_gate_blocks_young_and_allows_old_db() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, key, _) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 30 \
+             WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("enable age gate");
+        let svc = age_gate_svc(pool.clone());
+        let params = age_gate_params_for(repo_id, &key, "remote", "npm", true, 30);
+
+        // Young version, no LKG on record: terminal 451 with the structured
+        // body, and a pending review row recorded by the check.
+        let young = chrono::Utc::now() - chrono::Duration::days(1);
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "2.0.0", Some(young)).await;
+        let resp = out.expect_err("young version must block");
+        assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let body = response_json(resp).await;
+        assert_eq!(body["error"], "age_gate_blocked");
+        assert_eq!(body["package"], "seam-pkg");
+        assert_eq!(body["min_age_days"], 30);
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM age_gate_reviews \
+             WHERE repository_id = $1 AND package_name = 'seam-pkg' AND status = 'pending'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count review rows");
+        assert_eq!(count, 1, "the block must record a pending review row");
+
+        // A version past the threshold is allowed.
+        let old = chrono::Utc::now() - chrono::Duration::days(365);
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "1.0.0", Some(old)).await;
+        assert!(matches!(out, Ok(None)), "old version must be allowed");
+
+        // Missing publish evidence counts as not meeting the threshold (#2066
+        // fail-closed carried through the seam).
+        let out = enforce_age_gate(Some(&svc), &params, "seam-pkg", "3.0.0", None).await;
+        assert!(out.is_err(), "missing publish evidence must block");
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 }

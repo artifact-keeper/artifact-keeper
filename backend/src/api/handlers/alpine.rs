@@ -1114,7 +1114,7 @@ async fn download_package(
 
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
 
-    let artifact_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+    let artifact_path = build_alpine_artifact_path(&branch, &repository, &arch, &filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -1322,7 +1322,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "alpine", "write:artifacts")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1356,7 +1356,7 @@ async fn upload_package_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "alpine", "write:artifacts")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1457,7 +1457,7 @@ async fn store_apk(
         );
     }
 
-    let artifact_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+    let artifact_path = build_alpine_artifact_path(branch, repository, arch, filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1476,7 +1476,7 @@ async fn store_apk(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = format!("alpine/{}/{}", repo.id, artifact_path);
+    let storage_key = build_alpine_storage_key(repo.id, &artifact_path);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -1561,15 +1561,15 @@ async fn store_apk(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "arch": arch,
-                "branch": branch,
-                "repository": repository,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_alpine_upload_response(
+                &pkg_name,
+                &pkg_version,
+                arch,
+                branch,
+                repository,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
@@ -1653,6 +1653,46 @@ fn apk_info_metadata_fields(
 /// For example, `v3.22/main/x86_64/APKINDEX.tar.gz`.
 fn build_apk_index_upstream_path(branch: &str, repository: &str, arch: &str) -> String {
     format!("{}/{}/{}/APKINDEX.tar.gz", branch, repository, arch)
+}
+
+/// Build the artifact path for an Alpine package.
+///
+/// Unit tests pin this (and the builders below) against hardcoded literals so a
+/// format change here fails the tests (#2657).
+fn build_alpine_artifact_path(
+    branch: &str,
+    repository: &str,
+    arch: &str,
+    filename: &str,
+) -> String {
+    format!("{}/{}/{}/{}", branch, repository, arch, filename)
+}
+
+/// Build the storage key for an Alpine package.
+fn build_alpine_storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
+    format!("alpine/{}/{}", repo_id, artifact_path)
+}
+
+/// Build the JSON upload response for an Alpine package.
+#[allow(clippy::too_many_arguments)]
+fn build_alpine_upload_response(
+    pkg_name: &str,
+    pkg_version: &str,
+    arch: &str,
+    branch: &str,
+    repository: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": pkg_name,
+        "version": pkg_version,
+        "arch": arch,
+        "branch": branch,
+        "repository": repository,
+        "sha256": sha256,
+        "size": size,
+    })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -2345,68 +2385,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
+    // Test-local helper. KNOWN RESIDUAL (#2657): duplicates the inline
+    // Content-Disposition parsing in production upload handlers.
     // -----------------------------------------------------------------------
-
-    /// Build the artifact path for an Alpine package.
-    fn build_alpine_artifact_path(
-        branch: &str,
-        repository: &str,
-        arch: &str,
-        filename: &str,
-    ) -> String {
-        format!("{}/{}/{}/{}", branch, repository, arch, filename)
-    }
-
-    /// Build the storage key for an Alpine package.
-    fn build_alpine_storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
-        format!("alpine/{}/{}", repo_id, artifact_path)
-    }
-
-    /// Build Alpine-specific metadata JSON.
-    fn build_alpine_metadata(
-        pkg_name: &str,
-        pkg_version: &str,
-        arch: &str,
-        branch: &str,
-        repository: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "arch": arch,
-            "branch": branch,
-            "repository": repository,
-            "filename": filename,
-        })
-    }
-
-    /// Build the JSON upload response for an Alpine package.
-    fn build_alpine_upload_response(
-        pkg_name: &str,
-        pkg_version: &str,
-        arch: &str,
-        branch: &str,
-        repository: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": pkg_name,
-            "version": pkg_version,
-            "arch": arch,
-            "branch": branch,
-            "repository": repository,
-            "sha256": sha256,
-            "size": size,
-        })
-    }
-
-    /// Build the path prefix used for listing Alpine artifacts.
-    fn build_alpine_path_prefix(branch: &str, repository: &str, arch: &str) -> String {
-        format!("{}/{}/{}/", branch, repository, arch)
-    }
 
     /// Extract filename from a Content-Disposition header value.
     fn extract_filename_from_content_disposition(value: &str) -> Option<String> {
@@ -2585,18 +2566,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_alpine_metadata
+    // build_alpine_artifact_metadata (production builder; no apk control data)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_alpine_metadata_basic() {
-        let meta = build_alpine_metadata(
+        let meta = build_alpine_artifact_metadata(
             "curl",
             "8.5.0-r0",
             "x86_64",
             "edge",
             "main",
             "curl-8.5.0-r0.apk",
+            None,
         );
         assert_eq!(meta["name"], "curl");
         assert_eq!(meta["version"], "8.5.0-r0");
@@ -2608,13 +2590,14 @@ mod tests {
 
     #[test]
     fn test_build_alpine_metadata_different_arch() {
-        let meta = build_alpine_metadata(
+        let meta = build_alpine_artifact_metadata(
             "nginx",
             "1.25.4-r0",
             "aarch64",
             "v3.19",
             "community",
             "nginx-1.25.4-r0.apk",
+            None,
         );
         assert_eq!(meta["arch"], "aarch64");
         assert_eq!(meta["branch"], "v3.19");
@@ -2666,21 +2649,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_alpine_path_prefix
+    // escape_path_prefix (production LIKE-prefix; the old test-local
+    // build_alpine_path_prefix ignored LIKE escaping — it claimed the listing
+    // prefix for x86_64 is `edge/main/x86_64/`, but production escapes the `_`
+    // for the SQL LIKE query)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_alpine_path_prefix_basic() {
         assert_eq!(
-            build_alpine_path_prefix("edge", "main", "x86_64"),
-            "edge/main/x86_64/"
+            crate::api::handlers::escape_path_prefix(&["edge", "main", "x86_64"]),
+            "edge/main/x86\\_64/"
         );
     }
 
     #[test]
     fn test_build_alpine_path_prefix_versioned() {
         assert_eq!(
-            build_alpine_path_prefix("v3.18", "community", "aarch64"),
+            crate::api::handlers::escape_path_prefix(&["v3.18", "community", "aarch64"]),
             "v3.18/community/aarch64/"
         );
     }
@@ -3170,6 +3156,65 @@ mod db_cov_tests {
         assert!(text.contains("P:dtf-marker\n"));
         assert!(!text.contains("I:0\n"));
         fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // apk-tools does not read a download URL out of the APKINDEX: it downloads
+    // `{P}-{V}.apk` from the SAME arch directory the index was fetched from.
+    // The `build_alpine_artifact_path` unit tests prove that path is a string;
+    // only reconstructing the filename from the `P:`/`V:` the REAL index
+    // advertises and fetching it against the download route proves an `apk add`
+    // of an indexed package resolves. A `P:`/`V:` pair whose `{P}-{V}.apk` the
+    // download route 404s passes every builder test yet breaks `apk add`.
+    // -----------------------------------------------------------------------
+
+    /// Read the first value of a single-letter APKINDEX field (`P:`, `V:`).
+    fn apkindex_field(text: &str, key: char) -> String {
+        let prefix = format!("{key}:");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_indexed_package_apk_resolves_against_download_route() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let text = publish_marker_and_fetch_index(&fx).await;
+
+        // Reconstruct the download filename exactly as apk-tools does from the
+        // `P:`/`V:` the index advertises: `{name}-{version}.apk`, fetched from
+        // the same `{branch}/{repository}/{arch}` directory as APKINDEX.tar.gz.
+        let name = apkindex_field(&text, 'P');
+        let version = apkindex_field(&text, 'V');
+        assert_eq!(name, "dtf-marker", "index must advertise P:");
+        assert!(!version.is_empty(), "index must advertise V:");
+        let advertised_filename = format!("{name}-{version}.apk");
+
+        let k = fx.repo_key.clone();
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{k}/v3.21/main/aarch64/{advertised_filename}")),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the package the index advertises ({advertised_filename}) must resolve, not 404"
+        );
+        assert_eq!(
+            &body[..],
+            super::MARKER_APK,
+            "the advertised .apk must serve the published package bytes"
+        );
     }
 
     /// A package stored before the apk checksum was recorded is backfilled from

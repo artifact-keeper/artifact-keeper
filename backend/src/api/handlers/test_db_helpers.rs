@@ -32,19 +32,45 @@ use crate::api::{AppState, SharedState};
 use crate::config::Config;
 use crate::models::user::User;
 
-/// Connect to the test database. Returns `None` when `DATABASE_URL` is
-/// unset or unreachable so suites no-op gracefully.
+/// Connect to the test database.
+///
+/// Returns `None` only when no database is configured/reachable **and** the DB
+/// is not required, so DB-free local runs no-op gracefully. When the CI
+/// require-DB signal ([`crate::testing::REQUIRE_DB_ENV`]) is set, a missing
+/// `DATABASE_URL` or a connect failure PANICS instead of skipping, so an
+/// unreachable database can no longer silently "fiction-green" the suite
+/// (#2924).
 pub async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        // llvm-cov + nextest runs DB-backed lib tests in parallel processes.
-        // Keep each per-test pool small, but give Postgres pressure a chance
-        // to clear instead of turning transient contention into PoolTimedOut.
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&url)
+    crate::testing::try_pool_with(3).await
+}
+
+/// Open a dedicated Postgres session and take `pg_advisory_lock(lock_key)`,
+/// blocking until the lock is free. Returns `None` — which the `*_serial_lock`
+/// guards below surface as an inert guard — when no database is configured or
+/// the session cannot be established, mirroring [`try_pool`] so DB-free
+/// environments no-op cleanly.
+///
+/// The connect itself is HARD-BOUNDED (#2986): unlike the pooled path in
+/// [`crate::testing::try_pool_with`], whose `acquire_timeout` bounds
+/// connection establishment, a raw `PgConnection::connect` has no client-side
+/// timeout. A listener that accepts TCP but never completes the Postgres
+/// handshake (e.g. a dead container's still-forwarded :5432) therefore parked
+/// the guard — and every test queued behind the same module lock — forever.
+/// The 30s bound matches the pooled path's pressure budget; an expired bound
+/// routes through the same skip-or-fail decision as a connect error.
+async fn serial_lock_session(lock_key: i64) -> Option<sqlx::PgConnection> {
+    let url = crate::testing::require_db_url()?;
+    let connect = crate::testing::bounded_connect(&url).await;
+    let mut conn = crate::testing::on_connect_result(connect)?;
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut conn)
         .await
-        .ok()
+        .is_err()
+    {
+        return None;
+    }
+    Some(conn)
 }
 
 /// Advisory-lock key for [`scan_dedup_serial_lock`] (#2000).
@@ -81,23 +107,9 @@ pub struct ScanDedupSerialGuard {
 /// still no-op cleanly. Call this as the first line of a scan-dedup DB test
 /// and bind the result for the whole test body.
 pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
-    use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        return ScanDedupSerialGuard { _conn: None };
-    };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return ScanDedupSerialGuard { _conn: None },
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(SCAN_DEDUP_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return ScanDedupSerialGuard { _conn: None };
+    ScanDedupSerialGuard {
+        _conn: serial_lock_session(SCAN_DEDUP_TEST_LOCK_KEY).await,
     }
-    ScanDedupSerialGuard { _conn: Some(conn) }
 }
 
 /// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
@@ -130,23 +142,44 @@ pub struct BlobGcSerialGuard {
 /// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
 /// test and bind the result for the whole test body.
 pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
-    use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        return BlobGcSerialGuard { _conn: None };
-    };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return BlobGcSerialGuard { _conn: None },
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(BLOB_GC_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return BlobGcSerialGuard { _conn: None };
+    BlobGcSerialGuard {
+        _conn: serial_lock_session(BLOB_GC_TEST_LOCK_KEY).await,
     }
-    BlobGcSerialGuard { _conn: Some(conn) }
+}
+
+/// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the usage-ledger test cluster serializes only against itself.
+const USAGE_LEDGER_TEST_LOCK_KEY: i64 = 0x554C_2992; // "UL" + issue #2992
+
+/// Cross-process serialization guard for the DB-backed usage-ledger tests
+/// (#2992).
+///
+/// `reconcile_all_usage_ledgers` operates on the WHOLE database: it reads
+/// every repository's live sums and then upserts the ledger row, so a
+/// concurrently mutating peer test can have its ledger row overwritten with a
+/// snapshot taken before its mutation committed (read-then-write race). The
+/// migration-183 trigger tests assert exact per-step ledger values, so that
+/// stale overwrite makes them flaky under `cargo nextest`'s process-per-test
+/// parallelism. A Postgres *session* advisory lock — mirroring
+/// [`scan_dedup_serial_lock`] — makes the global-reconcile test and the
+/// exact-value trigger tests contend for one key. The lock releases when the
+/// guard drops (connection closes), including on panic.
+pub struct UsageLedgerSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide usage-ledger test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed
+/// usage-ledger test and bind the result for the whole test body.
+pub async fn usage_ledger_serial_lock() -> UsageLedgerSerialGuard {
+    UsageLedgerSerialGuard {
+        _conn: serial_lock_session(USAGE_LEDGER_TEST_LOCK_KEY).await,
+    }
 }
 
 /// Advisory-lock key for [`sso_provider_serial_lock`] (#2621).
@@ -179,23 +212,118 @@ pub struct SsoProviderSerialGuard {
 /// that seeds or asserts on enabled SSO providers and bind the result for the
 /// whole test body.
 pub async fn sso_provider_serial_lock() -> SsoProviderSerialGuard {
-    use sqlx::Connection;
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        return SsoProviderSerialGuard { _conn: None };
-    };
-    let mut conn = match sqlx::PgConnection::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => return SsoProviderSerialGuard { _conn: None },
-    };
-    if sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(SSO_PROVIDER_TEST_LOCK_KEY)
-        .execute(&mut conn)
-        .await
-        .is_err()
-    {
-        return SsoProviderSerialGuard { _conn: None };
+    SsoProviderSerialGuard {
+        _conn: serial_lock_session(SSO_PROVIDER_TEST_LOCK_KEY).await,
     }
-    SsoProviderSerialGuard { _conn: Some(conn) }
+}
+
+/// Advisory-lock key for [`curation_global_serial_lock`] (#2947).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the global-curation-rule test cluster serializes only against
+/// itself.
+const CURATION_GLOBAL_TEST_LOCK_KEY: i64 = 0x4355_2947; // "CU" + issue #2947
+
+/// Cross-process serialization guard for tests that seed *global* curation
+/// rules (#2947).
+///
+/// A `scope = 'global'` rule (`staging_repo_id IS NULL`) is instance-wide
+/// policy: `fetch_applicable_rules` unions it into EVERY repository's rule
+/// set. Under `cargo nextest`'s process-per-test parallelism, one test's
+/// freshly-seeded global rule can decide (first-applicable-wins) a peer
+/// test's evaluation mid-assert. A Postgres *session* advisory lock —
+/// mirroring [`scan_dedup_serial_lock`] — makes every such test contend for
+/// one key, so only one runs its seed → evaluate → cleanup critical section
+/// at a time. The lock releases when the guard drops (connection closes),
+/// including on panic.
+pub struct CurationGlobalSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide global-curation-rule test lock, blocking until it
+/// is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of any DB-backed test
+/// that seeds global curation rules and asserts on rule evaluation, and bind
+/// the result for the whole test body.
+pub async fn curation_global_serial_lock() -> CurationGlobalSerialGuard {
+    CurationGlobalSerialGuard {
+        _conn: serial_lock_session(CURATION_GLOBAL_TEST_LOCK_KEY).await,
+    }
+}
+
+/// Advisory-lock key for [`path_stats_serial_lock`] (#2601).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks (including the `hashtext('repository_path_storage_stats_rebuild')`
+/// transaction lock the rebuild itself takes), so the path-stats test cluster
+/// serializes only against itself.
+const PATH_STATS_TEST_LOCK_KEY: i64 = 0x5053_2601; // "PS" + issue #2601
+
+/// Cross-process serialization guard for the DB-backed path-stats tests
+/// (#2601).
+///
+/// `StorageStatsService::recompute_path_stats` rebuilds the WHOLE
+/// `repository_path_storage_stats` table (delete + reinsert in one
+/// transaction), taking row locks across every repository's rows and FK
+/// key-share locks on `repositories`. A peer test's `cleanup` (DELETE FROM
+/// repositories, which cascades into the same stats rows) ordered against a
+/// concurrent rebuild is a textbook two-table deadlock, and a repo deleted
+/// between the rebuild's snapshot and its insert surfaces as an FK violation.
+/// A Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`]
+/// — makes every path-stats test contend for one key, so only one runs its
+/// seed → rebuild → assert → cleanup critical section at a time. The lock
+/// releases when the guard drops (connection closes), including on panic.
+pub struct PathStatsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide path-stats test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed path-stats
+/// test and bind the result for the whole test body.
+pub async fn path_stats_serial_lock() -> PathStatsSerialGuard {
+    PathStatsSerialGuard {
+        _conn: serial_lock_session(PATH_STATS_TEST_LOCK_KEY).await,
+    }
+}
+
+/// Refresh the materialized storage stats for a test, absorbing transient
+/// cross-suite interference.
+///
+/// [`path_stats_serial_lock`] serializes the path-stats tests against each
+/// other, but suites that do NOT take that lock still delete repositories
+/// concurrently (their `cleanup`), which can deadlock against — or FK-abort —
+/// a whole-table rebuild that has already snapshotted the deleted repo. Both
+/// are transient orderings (the scheduler's answer in production is simply
+/// the next tick), so the test helper retries a few times rather than letting
+/// unrelated suite noise flake these assertions. `full` additionally runs the
+/// repo-level persist (`recompute_all`), covering the #2601 chaining change.
+pub async fn recompute_storage_stats_with_retry(pool: &PgPool, full: bool) {
+    let service = crate::services::storage_stats_service::StorageStatsService::new(
+        pool.clone(),
+        "filesystem",
+    );
+    let mut last_err = None;
+    for _ in 0..5 {
+        let result = if full {
+            service.recompute_all().await
+        } else {
+            service.recompute_path_stats().await
+        };
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("storage stats recompute kept failing after retries: {last_err:?}");
 }
 
 /// Build a lazily-connecting pool that never actually opens a connection
@@ -218,6 +346,7 @@ fn cfg(storage_path: &str) -> Config {
         storage_backend: "filesystem".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,
+        backup_s3_bucket: None,
         gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,
@@ -547,11 +676,9 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, Bytes) {
     (status, body)
 }
 
-/// Grant `user_id` the `developer` role scoped to `repo_id`, mirroring the
-/// owner auto-grant that `RepositoryService::create` performs for real
-/// callers. Handler smoke tests authenticate as the fixture user, so without
-/// this grant the per-repo authorization check in `require_visible` /
-/// `require_repo_write_access` would reject them on private repositories.
+/// Grant `user_id` the `developer` role scoped to `repo_id`. Handler smoke
+/// tests use this for an ordinary read/write repository member; owner-specific
+/// tests should grant the `repository-owner` role explicitly.
 pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
@@ -792,6 +919,59 @@ pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 
     .expect("audit_log count query")
 }
 
+/// Poll [`audit_count`] until it reaches `expected` (or a bounded ~2s budget is
+/// exhausted), returning the last observed value.
+///
+/// Since #2522 the fire-and-forget audit emitters (`audit_fire_and_forget`)
+/// SPAWN their INSERT instead of awaiting it, so a test that acts and then reads
+/// the audit trail must tolerate the detached task's async timing. Use this for
+/// the "an event was emitted" (count reaches N) assertions; a subsequent
+/// "not emitted" (count stays 0) assertion can then read [`audit_count`]
+/// directly, since the spawned writes for this resource have already drained.
+pub async fn audit_count_eventually(
+    pool: &PgPool,
+    resource_id: Uuid,
+    action: &str,
+    expected: i64,
+) -> i64 {
+    let mut last = -1;
+    for _ in 0..100 {
+        last = audit_count(pool, resource_id, action).await;
+        if last >= expected {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    last
+}
+
+/// Count `download_statistics` rows for `artifact_id`.
+pub async fn download_count(pool: &PgPool, artifact_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("download_statistics count query")
+}
+
+/// Poll [`download_count`] until it reaches `expected` (or a bounded ~2s budget
+/// is exhausted), returning the last observed value.
+///
+/// Since #2522 `record_download` SPAWNS the `download_statistics` INSERT off the
+/// synchronous download hot path, so a test that serves a body and then reads
+/// the count must tolerate the detached write's async timing.
+pub async fn download_count_eventually(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+    let mut last = -1;
+    for _ in 0..100 {
+        last = download_count(pool, artifact_id).await;
+        if last >= expected {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    last
+}
+
 /// Delete a test user plus the auth-related rows the audit/2FA test modules
 /// create for it (audit_log, refresh/pending jti, password history). Shared
 /// teardown so the identical cleanup block isn't copy-pasted across the #386
@@ -910,6 +1090,9 @@ pub fn make_repo_info(
         promotion_only: false,
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        age_gate_mode: "upstream_publish_time".to_string(),
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     }
 }
 
@@ -1019,10 +1202,9 @@ impl Fixture {
         let pool = try_pool().await?;
         let (user_id, username) = create_user(&pool).await;
         let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
-        // Owner auto-grant: the fixture user is the de-facto owner of the
-        // fixture repo, so grant them per-repo access. This keeps the
+        // Make the fixture user an ordinary repository member. This keeps the
         // authenticated-router smoke tests valid under per-repo authorization
-        // (private repos now require a role assignment, not just a token).
+        // without silently giving every fixture durable owner capability.
         grant_repo_access(&pool, repo_id, user_id).await;
         let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
         Some(Self {
@@ -1128,6 +1310,64 @@ pub fn build_state_with_proxy(
     let mut state = app_state_with(cfg(storage_path), pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
+}
+
+/// Like [`build_state_with_proxy`] but also wires a
+/// [`crate::services::scanner_service::ScannerService`] onto the state, so
+/// handler tests can exercise the inline proxy scan + verdict-freshness wiring
+/// end-to-end (#2954/#2976): the serve path only re-scans (and only consults
+/// the live CVE-scanner version) when a scanner service is present.
+pub fn build_state_with_proxy_and_scanner(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+    scanner: Arc<crate::services::scanner_service::ScannerService>,
+) -> crate::api::SharedState {
+    let mut state = app_state_with(cfg(storage_path), pool, storage_path);
+    state.set_proxy_service(proxy);
+    state.set_scanner_service(scanner);
+    Arc::new(state)
+}
+
+/// Enable scan-on-proxy for a repository with the given
+/// `proxy_scan_action` (`"fail_open"` / `"fail_closed"`). Shared by the
+/// inline scan-and-block handler tests (#2954 PyPI, #3003 npm).
+pub async fn enable_proxy_scan(pool: &PgPool, repo_id: Uuid, action: &str) {
+    sqlx::query(
+        "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+             scan_on_proxy, block_on_policy_violation, severity_threshold, \
+             proxy_scan_action) \
+         VALUES ($1, true, false, true, false, 'high', $2)",
+    )
+    .bind(repo_id)
+    .bind(action)
+    .execute(pool)
+    .await
+    .expect("enable scan-on-proxy");
+}
+
+/// Build a state whose scanner service holds exactly the given mock leaf
+/// scanners, wired over the fixture's storage + a real proxy service. Shared
+/// by the #2976 verdict-freshness handler tests across formats so each format
+/// file does not re-assemble the ScannerService by hand.
+pub fn build_scan_state_with_leaf_scanners(
+    fx: &Fixture,
+    storage_path: &str,
+    scanners: Vec<Arc<dyn crate::services::scanner_service::Scanner>>,
+) -> crate::api::SharedState {
+    let proxy = build_proxy_service_with_fs(fx.pool.clone(), storage_path);
+    let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
+        fx.pool.clone(),
+        scanners,
+        fx.state.storage.clone(),
+        fx.state.storage_registry.clone(),
+        storage_path.to_string(),
+        fx.storage_dir
+            .join("scan-workspace")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    build_state_with_proxy_and_scanner(fx.pool.clone(), storage_path, proxy, Arc::new(svc))
 }
 
 /// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the

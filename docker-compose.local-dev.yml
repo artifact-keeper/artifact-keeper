@@ -128,8 +128,12 @@ services:
       - "4318:4318"
     restart: unless-stopped
 
+  # Runs on a small shell-bearing image (alpine) rather than the backend
+  # image: the hardened runtime image (issue #2059) has no /bin/sh — nor the
+  # `jq` that init-dtrack.sh needs — so it can't host this bootstrap script
+  # (issue #2084). Mirrors the dtrack-init fix in docker-compose.yml.
   dtrack-init:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+    image: alpine:3.23
     container_name: artifact-keeper-dev-dtrack-init
     depends_on:
       postgres:
@@ -142,7 +146,11 @@ services:
     environment:
       DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
       DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
-    entrypoint: ["/bin/sh", "/init-dtrack.sh"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq >/dev/null 2>&1
+        exec /bin/sh /init-dtrack.sh
     restart: "no"
     healthcheck:
       disable: true
@@ -186,17 +194,21 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - |
-        if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
-          export DEPENDENCY_TRACK_API_KEY="$$(cat /shared/dtrack-api-key)"
-        fi
-        cargo watch -x 'run --bin artifact-keeper'
+      - cargo watch -x 'run --bin artifact-keeper'
     environment:
+      # Reduce peak rustc memory for this large workspace so the compile
+      # doesn't get OOM-killed inside the podman VM. line-tables-only keeps
+      # enough debug info for stack traces/backtraces without full DWARF, and
+      # capping parallel jobs avoids stacking multiple heavy crates (wasmtime,
+      # git2, sqlx, tonic) in memory at once. Dev-container only; does not
+      # affect native builds, CI, or other contributors.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_BUILD_JOBS: "3"
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
-      JWT_SECRET: dev-secret-change-in-production
+      JWT_SECRET: dev-secret-change-in-production-please
       ADMIN_PASSWORD: admin
       RUST_LOG: info,artifact_keeper=debug
       LOG_FORMAT: ${LOG_FORMAT:-pretty}
@@ -208,6 +220,7 @@ services:
       SCAN_WORKSPACE_PATH: /scan-workspace
       OPENSEARCH_URL: http://opensearch:9200
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
+      DEPENDENCY_TRACK_API_KEY_FILE: /shared/dtrack-api-key
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.

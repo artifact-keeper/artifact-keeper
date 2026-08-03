@@ -118,6 +118,36 @@ async fn resolve_ansible_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, R
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["ansible"], "an Ansible").await
 }
 
+/// The canonical Galaxy collection artifact filename `{namespace}-{name}-{version}.tar.gz`.
+fn collection_filename(namespace: &str, name: &str, version: &str) -> String {
+    format!("{}-{}-{}.tar.gz", namespace, name, version)
+}
+
+/// Build the `download_url` advertised in the collection/version metadata.
+///
+/// The download route (`GET /ansible/{repo}/download/{file}`) resolves a hosted
+/// collection by its trailing filename suffix (#2587), so the advertised URL
+/// must carry the artifact's actual stored basename. A collection published
+/// through the native `ansible-galaxy` upload is stored at
+/// `{namespace}-{name}-{version}.tar.gz`, byte-identical to the reconstructed
+/// filename; one pushed through the generic upload flow is stored at its bare
+/// path with generically-derived coordinates, so reconstructing the canonical
+/// filename would advertise a path the download route cannot resolve (the
+/// Ansible analogue of the RPM `<location>` fix, #2587 / #2589).
+fn collection_download_url(
+    repo_key: &str,
+    path: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> String {
+    let filename = proxy_helpers::advertised_download_filename(
+        path,
+        &collection_filename(namespace, name, version),
+    );
+    format!("/ansible/{}/download/{}", repo_key, filename)
+}
+
 // ---------------------------------------------------------------------------
 // GET /ansible/{repo_key}/api/v3/collections/ — List collections (paginated)
 // ---------------------------------------------------------------------------
@@ -231,9 +261,12 @@ async fn collection_info(
             "/ansible/{}/api/v3/collections/{}/{}/versions/",
             repo_key, namespace, name
         ),
-        "download_url": format!(
-            "/ansible/{}/download/{}-{}-{}.tar.gz",
-            repo_key, namespace, name, latest_version
+        "download_url": collection_download_url(
+            &repo_key,
+            &artifact.path,
+            &namespace,
+            &name,
+            &latest_version,
         ),
     });
 
@@ -326,12 +359,12 @@ async fn version_info(
         "namespace": namespace,
         "name": name,
         "version": version,
-        "download_url": format!(
-            "/ansible/{}/download/{}-{}-{}.tar.gz",
-            repo_key, namespace, name, version
-        ),
+        "download_url": collection_download_url(&repo_key, &artifact.path, &namespace, &name, &version),
         "artifact": {
-            "filename": format!("{}-{}-{}.tar.gz", namespace, name, version),
+            "filename": proxy_helpers::advertised_download_filename(
+                &artifact.path,
+                &collection_filename(&namespace, &name, &version),
+            ),
             "size": artifact.size_bytes,
             "sha256": artifact.checksum_sha256,
         },
@@ -408,7 +441,7 @@ async fn upload_collection(
     Path(repo_key): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ansible", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "ansible", "write:artifacts")?.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -653,10 +686,42 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.storage_path, "/tmp/test");
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.upstream_url, Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_collection_download_url_native_path_is_byte_identical() {
+        assert_eq!(
+            collection_download_url(
+                "gx",
+                "community-general-1.2.3.tar.gz",
+                "community",
+                "general",
+                "1.2.3"
+            ),
+            "/ansible/gx/download/community-general-1.2.3.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_collection_download_url_bare_path_advertises_stored_basename() {
+        // Generic upload at a bare/arbitrary path: advertise the real basename
+        // so the suffix download route (with #2587 exact-path fallback) serves
+        // it, instead of the canonical filename that would 404.
+        assert_eq!(
+            collection_download_url("gx", "blob.tar.gz", "community", "general", "1.2.3"),
+            "/ansible/gx/download/blob.tar.gz"
+        );
+        assert_eq!(
+            collection_download_url("gx", "uploads/x/c.tar.gz", "community", "general", "1.2.3"),
+            "/ansible/gx/download/c.tar.gz"
+        );
     }
 
     #[test]

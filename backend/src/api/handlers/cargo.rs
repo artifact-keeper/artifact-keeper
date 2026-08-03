@@ -34,7 +34,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::api::{CachedRepo, IndexCache, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // In-process caches
@@ -724,7 +724,7 @@ async fn publish(
     // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
     // accepted for `cargo publish`. Enforce the write scope on the token
     // before falling back to the Bearer-as-base64 credential path.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
@@ -827,6 +827,20 @@ async fn download(
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
 
+    // Curation enforcement (#2930): block a curated crate before it is resolved
+    // locally or proxied from upstream. The cargo handler's private `RepoInfo`
+    // does not carry the curation columns, so use the by-id lookup variant
+    // (no-op / no query for hosted repos and when curation is off).
+    proxy_helpers::enforce_curation_lookup(
+        &state.db,
+        repo.id,
+        &repo_key,
+        &repo.repo_type,
+        &name_lower,
+        Some(&version),
+    )
+    .await?;
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes, checksum_sha256
@@ -879,31 +893,61 @@ async fn download(
                     // upstream URL was resolved so that subsequent requests hit
                     // the proxy cache even after a config.json TTL change.
                     let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
-                    let (content, _content_type) =
-                        proxy_helpers::proxy_fetch_capped_with_cache_key(
-                            proxy,
-                            repo.id,
-                            &repo_key,
-                            &dl_base,
-                            &dl_path,
-                            &cache_path,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                        )
-                        .await?;
+
+                    // Stream the crate rather than buffering it (#895 / #2192,
+                    // the cargo instance of that class). This used to be a
+                    // `proxy_fetch_capped_with_cache_key` at
+                    // `DEFAULT_METADATA_MAX_BYTES`, which is an 8 MiB *metadata*
+                    // ceiling applied to an artifact binary:
+                    // `read_upstream_response_capped` does not truncate, it
+                    // returns `BadGateway` the moment the accumulated body would
+                    // exceed the cap — and it does so BEFORE the cache write, so
+                    // nothing is persisted and every retry fails identically.
+                    // There was no warm-cache escape: a crate over the cap could
+                    // never become a cache hit through this path. crates.io's
+                    // default publish limit is 10 MiB, so ordinary crates in the
+                    // 8-10 MiB band failed outright, as did every crate holding a
+                    // raised limit (vendored C/C++ sources, large generated
+                    // bindings).
+                    //
+                    // `dl_base` / `dl_path` / `cache_path` are unchanged, so the
+                    // canonical `api/v1/crates/{name}/{version}/download` cache
+                    // key is preserved and already-warm entries are not orphaned.
+                    // The *metadata* fetches on this handler (config.json, sparse
+                    // index) stay capped and buffered — an 8 MiB ceiling is
+                    // correct for those.
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        &dl_base,
+                        &dl_path,
+                        &cache_path,
+                        RepositoryFormat::Cargo,
+                    )
+                    .await?;
 
                     let filename = format!("{}-{}.crate", name_lower, version);
 
-                    return Ok(Response::builder()
+                    // Headers match what the buffered arm sent, so only the
+                    // transfer mechanism changes. In particular the content type
+                    // stays pinned to `application/x-tar` rather than forwarding
+                    // upstream's (crates.io serves `application/gzip`), keeping
+                    // this arm byte-identical to the local-hit arm; and
+                    // `Content-Length` is emitted only when upstream advertised
+                    // one, otherwise the response is chunked.
+                    let mut builder = Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/x-tar")
                         .header(
                             "Content-Disposition",
                             format!("attachment; filename=\"{}\"", filename),
                         )
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .header("cache-control", "public, max-age=31536000, immutable")
-                        .body(Body::from(content))
-                        .unwrap());
+                        .header("cache-control", "public, max-age=31536000, immutable");
+                    if let Some(size) = result.content_length {
+                        builder = builder.header(CONTENT_LENGTH, size.to_string());
+                    }
+                    return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                 }
             }
             // Virtual repo: try each member in priority order
@@ -1603,6 +1647,101 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// Regression test for the cargo instance of the buffered-download class
+    /// (#895 / #2192).
+    ///
+    /// The Remote arm used to fetch the `.crate` through
+    /// `proxy_fetch_capped_with_cache_key` at `DEFAULT_METADATA_MAX_BYTES`, an
+    /// 8 MiB *metadata* ceiling applied to an artifact binary. The capped reader
+    /// does not truncate — it returns `BadGateway` as soon as the accumulated
+    /// body would exceed the cap, and it does so before the cache write, so the
+    /// failure was permanent: nothing was persisted and every retry failed
+    /// identically. crates.io's default publish limit is 10 MiB, so ordinary
+    /// crates in the 8-10 MiB band could never be downloaded through a Remote
+    /// cargo repository.
+    ///
+    /// The body is deliberately non-uniform and position-dependent so a
+    /// truncate-or-pad regression cannot satisfy the byte-equality assertion.
+    /// Both a cold and a warm request are checked, with the upstream mock
+    /// expecting exactly one hit, so this also proves the streamed body is tee'd
+    /// into the proxy cache rather than refetched.
+    #[tokio::test]
+    async fn test_remote_crate_download_streams_body_over_metadata_cap() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+
+        let name = "big-crate";
+        let version = "1.2.3";
+        let body: Vec<u8> = (0..(9 * 1024 * 1024u32))
+            .map(|i| ((i.wrapping_mul(31)) ^ (i >> 11)) as u8)
+            .collect();
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "fixture must exceed the metadata cap or the test proves nothing",
+        );
+
+        let server = MockServer::start().await;
+        let upstream_path = format!("/api/v1/crates/{name}/{version}/download");
+        Mock::given(wm_method("GET"))
+            .and(wm_path(upstream_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let request_path = format!(
+            "/cargo/{}/api/v1/crates/{}/{}/download",
+            fx.repo_key, name, version
+        );
+
+        let (cold_status, cold_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(request_path.clone()),
+        )
+        .await;
+
+        assert_eq!(
+            cold_status,
+            StatusCode::OK,
+            "a .crate larger than the 8 MiB buffered cap must stream, not 502; body was {}",
+            String::from_utf8_lossy(&cold_body)
+        );
+        assert_eq!(cold_body.len(), body.len(), "full body must be served");
+        assert_eq!(
+            &cold_body[..],
+            &body[..],
+            "served bytes must match upstream"
+        );
+
+        // The streaming tee commits asynchronously, so wait for the cached body
+        // to land before asserting the warm read is served from it — otherwise the
+        // second request races the writer and refetches upstream.
+        tdh::wait_for_cache_commit(dir.path(), body.len() as u64).await;
+
+        // Second request must be served from the proxy cache; the mock's
+        // `.expect(1)` fails on drop if the tee did not commit.
+        let (warm_status, warm_body) = tdh::send(
+            tdh::router_anon(mounted_router(), state.clone()),
+            tdh::get(request_path),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(warm_status, StatusCode::OK, "warm read must also succeed");
+        assert_eq!(
+            &warm_body[..],
+            &body[..],
+            "warm read must serve the identical bytes"
+        );
+    }
 
     fn make_publish_payload(metadata: &serde_json::Value, crate_data: &[u8]) -> Bytes {
         let json_bytes = serde_json::to_vec(metadata).unwrap();
@@ -3395,6 +3534,103 @@ mod tests {
         assert!(
             err.to_string().contains("private/internal network"),
             "expected SSRF rejection reason in error message, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `dl` template a cargo client reads from `config.json` is what it
+    // appends `{name}/{version}/download` to. The unit tests above prove the
+    // builder emits a string; only routing the resulting URL against the REAL
+    // router (mounted where `api::routes` nests it) proves a `cargo` client can
+    // actually fetch the published `.crate`.
+    // -----------------------------------------------------------------------
+
+    /// The cargo routes mounted exactly where `api::routes` nests them. The
+    /// `dl` URL in `config.json` is absolute and carries the `/cargo` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/cargo", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// The download URL a cargo client builds from the advertised `dl` template
+    /// must resolve against the real router and serve the published `.crate`.
+    #[tokio::test]
+    async fn test_advertised_dl_download_url_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+
+        let name = "my-crate";
+        let version = "0.1.0";
+        let crate_data: &[u8] = b"fake-crate-tarball-bytes-for-advertised-url";
+
+        // Publish through the real publish handler.
+        let publish_status = {
+            let app = tdh::router_with_auth(
+                mounted_router(),
+                fx.state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, _) = tdh::send(
+                app,
+                tdh::put(
+                    format!("/cargo/{}/api/v1/crates/new", fx.repo_key),
+                    make_publish_payload(&sample_metadata(), crate_data),
+                ),
+            )
+            .await;
+            status
+        };
+
+        // Read the advertised `dl` template from config.json.
+        let config_path = format!("/cargo/{}/config.json", fx.repo_key);
+        let config_doc_url = format!("http://ak.test{config_path}");
+        let (config_status, config_body) = tdh::send(
+            tdh::router_anon(mounted_router(), fx.state.clone()),
+            tdh::get(config_path.clone()),
+        )
+        .await;
+        let config: serde_json::Value = serde_json::from_slice(&config_body).unwrap_or_default();
+        let dl = config["dl"].as_str().unwrap_or_default().to_string();
+
+        // Build the download URL exactly as cargo does: `{dl}/{name}/{version}/download`.
+        let advertised = format!("{dl}/{name}/{version}/download");
+        let (dl_status, dl_body) = if dl.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let path = resolve_advertised(&config_doc_url, &advertised);
+            tdh::send(
+                tdh::router_anon(mounted_router(), fx.state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(publish_status, StatusCode::OK, "publish must succeed");
+        assert_eq!(config_status, StatusCode::OK, "config.json");
+        assert!(!dl.is_empty(), "config.json must advertise a `dl` template");
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the download URL built from the advertised `dl` ({advertised}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            crate_data,
+            "the advertised download URL must serve the published .crate bytes"
         );
     }
 }

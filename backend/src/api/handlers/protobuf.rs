@@ -441,6 +441,9 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         format: "generic".to_string(),
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        age_gate_mode: "upstream_publish_time".to_string(),
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     })
 }
 
@@ -634,7 +637,7 @@ async fn load_label_index(
     repo_id: uuid::Uuid,
     module_name: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
-    let label_path = format!("modules/{}/_labels", module_name);
+    let label_path = build_label_path(module_name);
 
     let row = sqlx::query(
         r#"SELECT am.metadata
@@ -678,7 +681,7 @@ async fn save_label_index(
     labels: &serde_json::Map<String, serde_json::Value>,
     user_id: uuid::Uuid,
 ) -> Result<(), Response> {
-    let label_path = format!("modules/{}/_labels", module_name);
+    let label_path = build_label_path(module_name);
     let metadata = serde_json::json!({ "labels": labels });
 
     // Check if the label artifact already exists
@@ -895,7 +898,7 @@ async fn create_modules(
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1007,12 +1010,8 @@ async fn list_commits(
         }
     };
 
-    let page_size = body.page_size.unwrap_or(50).min(250);
-    let offset: i64 = body
-        .page_token
-        .as_deref()
-        .and_then(|t| t.parse::<i64>().ok())
-        .unwrap_or(0);
+    let page_size = clamp_page_size(body.page_size, 250);
+    let offset: i64 = parse_page_token(body.page_token.as_deref());
 
     let rows = sqlx::query(
         r#"SELECT id, name, version, created_at, updated_at, uploaded_by, checksum_sha256
@@ -1039,11 +1038,7 @@ async fn list_commits(
 
     let commits: Vec<CommitInfo> = rows.iter().map(build_commit_info_from_row).collect();
 
-    let next_page_token = if commits.len() as i64 >= page_size {
-        (offset + page_size).to_string()
-    } else {
-        String::new()
-    };
+    let next_page_token = compute_next_page_token(commits.len(), page_size, offset);
 
     let resp = ListCommitsResponse {
         commits,
@@ -1067,7 +1062,7 @@ async fn upload(
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1079,21 +1074,22 @@ async fn upload(
         let module_name = module_name_from_ref(&content.module_ref)?;
 
         // Decode and hash all files to compute the commit digest
-        let mut hasher = Sha256::new();
-        for file in &content.files {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&file.content)
-                .map_err(|e| {
-                    connect_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_argument",
-                        &format!("Invalid base64 content for file '{}': {}", file.path, e),
-                    )
-                })?;
-            hasher.update(file.path.as_bytes());
-            hasher.update(&decoded);
-        }
-        let commit_digest = format!("{:x}", hasher.finalize_reset());
+        let commit_digest = {
+            let mut decoded_files = Vec::with_capacity(content.files.len());
+            for file in &content.files {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&file.content)
+                    .map_err(|e| {
+                        connect_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_argument",
+                            &format!("Invalid base64 content for file '{}': {}", file.path, e),
+                        )
+                    })?;
+                decoded_files.push((file.path.clone(), decoded));
+            }
+            compute_commit_digest(&decoded_files)
+        };
 
         // Check for duplicate (idempotent)
         let existing = sqlx::query(
@@ -1142,7 +1138,7 @@ async fn upload(
         let size_bytes = bundle_bytes.len() as i64;
 
         // Store via StorageBackend
-        let storage_key = format!("modules/{}/commits/{}", module_name, commit_digest);
+        let storage_key = build_module_storage_key(&module_name, &commit_digest);
         proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
             .await?;
         let storage = state
@@ -1156,7 +1152,7 @@ async fn upload(
             )
         })?;
 
-        let artifact_path = format!("modules/{}/commits/{}", module_name, commit_digest);
+        let artifact_path = build_module_artifact_path(&module_name, &commit_digest);
 
         super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -1198,21 +1194,14 @@ async fn upload(
         .await;
 
         // Build metadata including dependency refs
-        let dep_names: Vec<String> = content
-            .dep_refs
-            .iter()
-            .filter_map(|d| match (&d.owner, &d.module) {
-                (Some(o), Some(m)) => Some(format!("{}/{}", o, m)),
-                _ => d.id.clone(),
-            })
-            .collect();
+        let dep_names = extract_dep_names(&content.dep_refs);
 
-        let protobuf_metadata = serde_json::json!({
-            "module": module_name,
-            "commitDigest": commit_digest,
-            "fileCount": content.files.len(),
-            "dependencies": dep_names,
-        });
+        let protobuf_metadata = build_protobuf_metadata(
+            &module_name,
+            &commit_digest,
+            content.files.len(),
+            &dep_names,
+        );
 
         // Store metadata
         let _ = sqlx::query(
@@ -1365,16 +1354,13 @@ async fn download(
                             extract_files_from_bundle(&bundle_data)
                         })
                         .map_err(|e| e.into_response())??;
-                        let commit = CommitInfo {
-                            id: digest.to_string(),
-                            create_time: chrono::Utc::now().to_rfc3339(),
-                            owner_id: String::new(),
-                            module_id: module_name.clone(),
-                            digest: CommitDigest {
-                                digest_type: "sha256".to_string(),
-                                value: digest.to_string(),
-                            },
-                        };
+                        let commit = build_commit_info(
+                            digest,
+                            &chrono::Utc::now().to_rfc3339(),
+                            "",
+                            &module_name,
+                            digest,
+                        );
                         contents.push(DownloadContent { commit, files });
                         continue;
                     }
@@ -1415,16 +1401,13 @@ async fn download(
                         extract_files_from_bundle(&bundle_data)
                     })
                     .map_err(|e| e.into_response())??;
-                    let commit = CommitInfo {
-                        id: digest.clone(),
-                        create_time: chrono::Utc::now().to_rfc3339(),
-                        owner_id: String::new(),
-                        module_id: module_name.clone(),
-                        digest: CommitDigest {
-                            digest_type: "sha256".to_string(),
-                            value: digest,
-                        },
-                    };
+                    let commit = build_commit_info(
+                        &digest,
+                        &chrono::Utc::now().to_rfc3339(),
+                        "",
+                        &module_name,
+                        &digest,
+                    );
                     contents.push(DownloadContent { commit, files });
                     continue;
                 }
@@ -1509,26 +1492,14 @@ async fn get_labels(
             if let Some(digest_val) = label_index.get(label_name) {
                 let digest = digest_val.as_str().unwrap_or_default();
                 let now = chrono::Utc::now().to_rfc3339();
-                labels.push(LabelInfo {
-                    id: format!("{}:{}:{}", module_name, label_name, digest),
-                    name: label_name.clone(),
-                    commit_id: digest.to_string(),
-                    create_time: now.clone(),
-                    update_time: now,
-                });
+                labels.push(build_label_info(&module_name, label_name, digest, &now));
             }
         } else {
             // Return all labels for the module
             let now = chrono::Utc::now().to_rfc3339();
             for (name, digest_val) in &label_index {
                 let digest = digest_val.as_str().unwrap_or_default();
-                labels.push(LabelInfo {
-                    id: format!("{}:{}:{}", module_name, name, digest),
-                    name: name.clone(),
-                    commit_id: digest.to_string(),
-                    create_time: now.clone(),
-                    update_time: now.clone(),
-                });
+                labels.push(build_label_info(&module_name, name, digest, &now));
             }
         }
     }
@@ -1552,7 +1523,7 @@ async fn create_or_update_labels(
     axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1618,13 +1589,12 @@ async fn create_or_update_labels(
         )
         .await?;
 
-        labels.push(LabelInfo {
-            id: format!("{}:{}:{}", module_name, value.name, value.commit_id),
-            name: value.name.clone(),
-            commit_id: value.commit_id.clone(),
-            create_time: now.clone(),
-            update_time: now.clone(),
-        });
+        labels.push(build_label_info(
+            &module_name,
+            &value.name,
+            &value.commit_id,
+            &now,
+        ));
     }
 
     let resp = CreateOrUpdateLabelsResponse { labels };
@@ -1709,18 +1679,7 @@ async fn get_graph(
 
             // Extract dependency edges from metadata
             let metadata: Option<serde_json::Value> = row.get("metadata");
-            if let Some(meta) = metadata {
-                if let Some(deps) = meta.get("dependencies").and_then(|d| d.as_array()) {
-                    for dep in deps {
-                        if let Some(dep_name) = dep.as_str() {
-                            edges.push(GraphEdge {
-                                from_commit_id: commit_id.clone(),
-                                to_commit_id: dep_name.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
+            edges.extend(extract_graph_edges(&metadata, &commit_id));
 
             commits.push(commit);
         }
@@ -1811,160 +1770,139 @@ async fn get_resources(
         .unwrap())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ---------------------------------------------------------------------------
+// Pure builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Compute the commit digest from a list of file path/content pairs.
-    /// The digest is the hex-encoded SHA-256 of all (path_bytes || content_bytes).
-    fn compute_commit_digest(files: &[(String, Vec<u8>)]) -> String {
-        let mut hasher = Sha256::new();
-        for (path, content) in files {
-            hasher.update(path.as_bytes());
-            hasher.update(content);
-        }
-        format!("{:x}", hasher.finalize())
+/// Compute the commit digest from a list of file path/content pairs.
+/// The digest is the hex-encoded SHA-256 of all (path_bytes || content_bytes).
+fn compute_commit_digest(files: &[(String, Vec<u8>)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, content) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(content);
     }
+    format!("{:x}", hasher.finalize())
+}
 
-    /// Build the storage key for a protobuf module commit.
-    fn build_module_storage_key(module_name: &str, commit_digest: &str) -> String {
-        format!("modules/{}/commits/{}", module_name, commit_digest)
-    }
+/// Build the storage key for a protobuf module commit.
+fn build_module_storage_key(module_name: &str, commit_digest: &str) -> String {
+    format!("modules/{}/commits/{}", module_name, commit_digest)
+}
 
-    /// Build the artifact path for a protobuf module commit.
-    fn build_module_artifact_path(module_name: &str, commit_digest: &str) -> String {
-        format!("modules/{}/commits/{}", module_name, commit_digest)
-    }
+/// Build the artifact path for a protobuf module commit.
+fn build_module_artifact_path(module_name: &str, commit_digest: &str) -> String {
+    format!("modules/{}/commits/{}", module_name, commit_digest)
+}
 
-    /// Build the label path for a module.
-    fn build_label_path(module_name: &str) -> String {
-        format!("modules/{}/_labels", module_name)
-    }
+/// Build the label path for a module.
+fn build_label_path(module_name: &str) -> String {
+    format!("modules/{}/_labels", module_name)
+}
 
-    /// Build protobuf metadata JSON for an upload.
-    fn build_protobuf_metadata(
-        module_name: &str,
-        commit_digest: &str,
-        file_count: usize,
-        dep_names: &[String],
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "module": module_name,
-            "commitDigest": commit_digest,
-            "fileCount": file_count,
-            "dependencies": dep_names,
+/// Build protobuf metadata JSON for an upload.
+fn build_protobuf_metadata(
+    module_name: &str,
+    commit_digest: &str,
+    file_count: usize,
+    dep_names: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "module": module_name,
+        "commitDigest": commit_digest,
+        "fileCount": file_count,
+        "dependencies": dep_names,
+    })
+}
+
+/// Extract dependency names from a list of ModuleRefs.
+fn extract_dep_names(dep_refs: &[ModuleRef]) -> Vec<String> {
+    dep_refs
+        .iter()
+        .filter_map(|d| match (&d.owner, &d.module) {
+            (Some(o), Some(m)) => Some(format!("{}/{}", o, m)),
+            _ => d.id.clone(),
         })
-    }
+        .collect()
+}
 
-    /// Extract dependency names from a list of ModuleRefs.
-    fn extract_dep_names(dep_refs: &[ModuleRef]) -> Vec<String> {
-        dep_refs
-            .iter()
-            .filter_map(|d| match (&d.owner, &d.module) {
-                (Some(o), Some(m)) => Some(format!("{}/{}", o, m)),
-                _ => d.id.clone(),
-            })
-            .collect()
+/// Build a CommitInfo struct from plain parameters.
+fn build_commit_info(
+    id: &str,
+    create_time: &str,
+    owner_id: &str,
+    module_id: &str,
+    digest_value: &str,
+) -> CommitInfo {
+    CommitInfo {
+        id: id.to_string(),
+        create_time: create_time.to_string(),
+        owner_id: owner_id.to_string(),
+        module_id: module_id.to_string(),
+        digest: CommitDigest {
+            digest_type: "sha256".to_string(),
+            value: digest_value.to_string(),
+        },
     }
+}
 
-    /// Build a ModuleInfo struct from plain parameters.
-    fn build_module_info(
-        id: &str,
-        owner_id: &str,
-        name: &str,
-        create_time: &str,
-        update_time: &str,
-    ) -> ModuleInfo {
-        ModuleInfo {
-            id: id.to_string(),
-            owner_id: owner_id.to_string(),
-            name: name.to_string(),
-            create_time: create_time.to_string(),
-            update_time: update_time.to_string(),
-            state: "ACTIVE".to_string(),
-            default_label_name: "main".to_string(),
-        }
+/// Build a LabelInfo struct from parameters.
+fn build_label_info(
+    module_name: &str,
+    label_name: &str,
+    digest: &str,
+    timestamp: &str,
+) -> LabelInfo {
+    LabelInfo {
+        id: format!("{}:{}:{}", module_name, label_name, digest),
+        name: label_name.to_string(),
+        commit_id: digest.to_string(),
+        create_time: timestamp.to_string(),
+        update_time: timestamp.to_string(),
     }
+}
 
-    /// Build a CommitInfo struct from plain parameters.
-    fn build_commit_info(
-        id: &str,
-        create_time: &str,
-        owner_id: &str,
-        module_id: &str,
-        digest_value: &str,
-    ) -> CommitInfo {
-        CommitInfo {
-            id: id.to_string(),
-            create_time: create_time.to_string(),
-            owner_id: owner_id.to_string(),
-            module_id: module_id.to_string(),
-            digest: CommitDigest {
-                digest_type: "sha256".to_string(),
-                value: digest_value.to_string(),
-            },
-        }
+/// Compute the next page token for pagination.
+fn compute_next_page_token(count: usize, page_size: i64, offset: i64) -> String {
+    if count as i64 >= page_size {
+        (offset + page_size).to_string()
+    } else {
+        String::new()
     }
+}
 
-    /// Build a LabelInfo struct from parameters.
-    fn build_label_info(
-        module_name: &str,
-        label_name: &str,
-        digest: &str,
-        timestamp: &str,
-    ) -> LabelInfo {
-        LabelInfo {
-            id: format!("{}:{}:{}", module_name, label_name, digest),
-            name: label_name.to_string(),
-            commit_id: digest.to_string(),
-            create_time: timestamp.to_string(),
-            update_time: timestamp.to_string(),
-        }
-    }
+/// Parse a page token string into an offset.
+fn parse_page_token(token: Option<&str>) -> i64 {
+    token.and_then(|t| t.parse::<i64>().ok()).unwrap_or(0)
+}
 
-    /// Compute the next page token for pagination.
-    fn compute_next_page_token(count: usize, page_size: i64, offset: i64) -> String {
-        if count as i64 >= page_size {
-            (offset + page_size).to_string()
-        } else {
-            String::new()
-        }
-    }
+/// Clamp page size to a maximum value.
+fn clamp_page_size(page_size: Option<i64>, max: i64) -> i64 {
+    page_size.unwrap_or(50).min(max)
+}
 
-    /// Parse a page token string into an offset.
-    fn parse_page_token(token: Option<&str>) -> i64 {
-        token.and_then(|t| t.parse::<i64>().ok()).unwrap_or(0)
-    }
-
-    /// Clamp page size to a maximum value.
-    fn clamp_page_size(page_size: Option<i64>, max: i64) -> i64 {
-        page_size.unwrap_or(50).min(max)
-    }
-
-    /// Extract graph edges from artifact metadata.
-    fn extract_graph_edges(
-        metadata: &Option<serde_json::Value>,
-        commit_id: &str,
-    ) -> Vec<GraphEdge> {
-        let mut edges = Vec::new();
-        if let Some(meta) = metadata {
-            if let Some(deps) = meta.get("dependencies").and_then(|d| d.as_array()) {
-                for dep in deps {
-                    if let Some(dep_name) = dep.as_str() {
-                        edges.push(GraphEdge {
-                            from_commit_id: commit_id.to_string(),
-                            to_commit_id: dep_name.to_string(),
-                        });
-                    }
+/// Extract graph edges from artifact metadata.
+fn extract_graph_edges(metadata: &Option<serde_json::Value>, commit_id: &str) -> Vec<GraphEdge> {
+    let mut edges = Vec::new();
+    if let Some(meta) = metadata {
+        if let Some(deps) = meta.get("dependencies").and_then(|d| d.as_array()) {
+            for dep in deps {
+                if let Some(dep_name) = dep.as_str() {
+                    edges.push(GraphEdge {
+                        from_commit_id: commit_id.to_string(),
+                        to_commit_id: dep_name.to_string(),
+                    });
                 }
             }
         }
-        edges
     }
+    edges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     // -----------------------------------------------------------------------
     // connect_error
@@ -2518,28 +2456,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_module_info / build_commit_info / build_label_info
+    // ModuleInfo serialization / build_commit_info / build_label_info
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_module_info_fields() {
-        let info = build_module_info(
-            "id1",
-            "owner1",
-            "buf/validate",
-            "2024-01-01T00:00:00Z",
-            "2024-06-01T00:00:00Z",
-        );
-        assert_eq!(info.id, "id1");
-        assert_eq!(info.owner_id, "owner1");
-        assert_eq!(info.name, "buf/validate");
-        assert_eq!(info.state, "ACTIVE");
-        assert_eq!(info.default_label_name, "main");
-    }
-
-    #[test]
-    fn test_build_module_info_serialization() {
-        let info = build_module_info("id", "o", "n", "t1", "t2");
+    fn test_module_info_serialization() {
+        // Pins the wire shape (camelCase renames) of the production struct.
+        let info = ModuleInfo {
+            id: "id".to_string(),
+            owner_id: "o".to_string(),
+            name: "n".to_string(),
+            create_time: "t1".to_string(),
+            update_time: "t2".to_string(),
+            state: "ACTIVE".to_string(),
+            default_label_name: "main".to_string(),
+        };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"ownerId\""));
         assert!(json.contains("\"defaultLabelName\":\"main\""));

@@ -40,9 +40,10 @@
 //! [`AppError::Validation`] (HTTP 400) so ingestion **rejects** the bomb rather
 //! than silently truncating or hanging.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Seek};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -156,12 +157,21 @@ fn ingest_extraction_semaphore() -> &'static Arc<Semaphore> {
 
 /// RAII guard representing one in-flight ingestion decompression. Hold it across
 /// the (synchronous) decode call and drop it promptly afterwards — dropping it
-/// releases the permit so a slow downstream (DB/storage) never keeps a decode
+/// releases the permit(s) so a slow downstream (DB/storage) never keeps a decode
 /// slot occupied. Acquire it with [`acquire_ingest_extraction`].
+///
+/// The guard holds up to two permits: the process-wide global permit (the hard
+/// ceiling, #2561) and — when the extraction is attributed to a tenant (#2598) —
+/// the tenant's per-tenant sub-limit permit. Both are released together on drop.
 #[must_use = "hold the guard across the decode; dropping it immediately releases the permit"]
 #[derive(Debug)]
 pub struct IngestExtractionGuard {
-    _permit: OwnedSemaphorePermit,
+    /// Global ceiling permit (#2561) — always held.
+    _global: OwnedSemaphorePermit,
+    /// Per-tenant sub-limit permit (#2598) — held only on the keyed path; the
+    /// global-only `_from` seam and background/unattributed callers leave it
+    /// `None`.
+    _tenant: Option<OwnedSemaphorePermit>,
 }
 
 /// Try to reserve one ingestion-decompression slot on `sem`, FAST-FAIL: on
@@ -169,22 +179,40 @@ pub struct IngestExtractionGuard {
 /// blocking, so an overloaded server sheds excess decode work instead of piling
 /// up memory/CPU. The `_from` seam takes the semaphore explicitly so tests can
 /// drive a local cap without touching the process singleton.
+///
+/// This is the *global-only* acquire (no per-tenant sub-limit); the keyed
+/// fairness path is [`acquire_ingest_extraction_paired`].
 fn acquire_ingest_extraction_from(sem: &Arc<Semaphore>) -> Result<IngestExtractionGuard> {
     match sem.clone().try_acquire_owned() {
-        Ok(permit) => Ok(IngestExtractionGuard { _permit: permit }),
-        Err(_) => Err(AppError::ServiceUnavailable(
-            "Server is busy decompressing other uploads; please retry shortly".to_string(),
-        )),
+        Ok(permit) => Ok(IngestExtractionGuard {
+            _global: permit,
+            _tenant: None,
+        }),
+        Err(_) => Err(global_ingest_busy_err()),
     }
 }
 
+/// The 503 shed when the *global* ingestion ceiling is saturated.
+fn global_ingest_busy_err() -> AppError {
+    AppError::ServiceUnavailable(
+        "Server is busy decompressing other uploads; please retry shortly".to_string(),
+    )
+}
+
 /// Reserve one process-wide ingestion-decompression slot, FAST-FAIL to a 503 on
-/// saturation. Call this in the async handler immediately before invoking the
+/// saturation. Applies the per-tenant fairness sub-limit (#2598) for the
+/// ambient tenant (see [`current_tenant`]) *before* the global ceiling, so a
+/// single noisy tenant can never consume the whole global budget and starve its
+/// neighbours. Call this in the async handler immediately before invoking the
 /// (synchronous) archive extractor and hold the returned guard across that call.
 /// Most call sites should prefer [`with_ingest_extraction`] /
 /// [`with_ingest_extraction_async`], which scope the permit for you.
 pub fn acquire_ingest_extraction() -> Result<IngestExtractionGuard> {
-    acquire_ingest_extraction_from(ingest_extraction_semaphore())
+    acquire_ingest_extraction_keyed(
+        ingest_extraction_semaphore(),
+        &current_tenant(),
+        max_concurrent_ingest_extractions_per_tenant(),
+    )
 }
 
 /// Run `decode` (a synchronous archive decompression) while holding one
@@ -205,11 +233,13 @@ pub fn acquire_ingest_extraction() -> Result<IngestExtractionGuard> {
 /// that needs to re-open a stored archive must use
 /// [`with_registry_extraction`] instead — see its docs for why.
 pub fn with_ingest_extraction<T>(decode: impl FnOnce() -> T) -> Result<T> {
-    with_ingest_extraction_from(ingest_extraction_semaphore(), decode)
+    let _permit = acquire_ingest_extraction()?;
+    Ok(decode())
 }
 
 /// `_from` seam for [`with_ingest_extraction`] — lets unit tests drive a local
-/// cap without touching the process singleton.
+/// (global-only) cap without touching the process singleton or the per-tenant
+/// registry.
 fn with_ingest_extraction_from<T>(sem: &Arc<Semaphore>, decode: impl FnOnce() -> T) -> Result<T> {
     let _permit = acquire_ingest_extraction_from(sem)?;
     Ok(decode())
@@ -223,8 +253,191 @@ pub async fn with_ingest_extraction_async<T, F>(decode: impl FnOnce() -> F) -> R
 where
     F: std::future::Future<Output = T>,
 {
-    let _permit = acquire_ingest_extraction_from(ingest_extraction_semaphore())?;
+    let _permit = acquire_ingest_extraction()?;
     Ok(decode().await)
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant fairness sub-limit (#2598)
+// ---------------------------------------------------------------------------
+//
+// The global cap above (#2561) bounds worst-case aggregate decode memory/CPU,
+// but it is fair only in aggregate: one noisy tenant firing many concurrent
+// uploads can consume every global permit and starve other tenants, which then
+// see 503s caused entirely by a neighbour. This layer adds per-tenant fairness
+// at the SAME acquire seam so all ~20 extractor call sites inherit it.
+//
+// Fairness key: the **repository** (`TenantKey::Repo(repo_id)`). A repository is
+// AK's natural tenant boundary — it belongs to exactly one organisation and
+// every ingestion/serve decode targets exactly one repo. Crucially,
+// `repo_visibility_middleware` already resolves the repo id once for every
+// format ingestion/serve route, so a single ambient scope set there
+// ([`run_with_tenant_scope`]) attributes every downstream extractor decode to
+// its tenant with no per-handler plumbing. Contexts with no request-scoped repo
+// (background curation sync / migration import, or the middleware branches that
+// never resolve a repo) run under [`TenantKey::Unattributed`], a shared bucket
+// still bounded by the global ceiling.
+//
+// Mechanism: each tenant gets its own small semaphore (the sub-limit). An
+// acquire takes the tenant sub-permit FIRST (fast-fail 503 when the tenant is
+// already at its sub-limit, so it sheds without ever touching a global permit),
+// THEN the global permit as the hard backstop (fast-fail 503 when the global
+// ceiling is saturated). Shedding both with a 503 mirrors #2561's fast-fail
+// semantics rather than queueing more decode work. The sub-limit is clamped to
+// at most the global ceiling (a sub-limit above the ceiling can never bind).
+//
+// The tenant semaphores live in a `Weak`-valued registry: while a tenant holds
+// any permit its semaphore is kept alive by the guard's owned permit; once idle
+// the `Arc` drops, the `Weak` dies, and the entry self-cleans on the next
+// lookup, so the registry cannot grow unboundedly across a churn of tenants.
+
+/// Fairness key identifying a tenant for the per-tenant ingest sub-limit.
+///
+/// See the module note above: the repository is the tenant boundary. Background
+/// or pre-resolve contexts with no request-scoped repo share
+/// [`TenantKey::Unattributed`], which is still bounded by the global ceiling.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TenantKey {
+    /// A request attributed to a specific repository.
+    Repo(uuid::Uuid),
+    /// No request-scoped repository (background workers, or middleware branches
+    /// that never resolved a repo). One shared bucket, global ceiling only.
+    Unattributed,
+}
+
+/// Default per-tenant sub-limit: at most this many concurrent ingestion decodes
+/// may be attributed to a single tenant. Kept below the global default (8) so
+/// one tenant cannot monopolise the global budget; the remainder always stays
+/// available to other tenants.
+pub const DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT: usize = 4;
+
+// Compile-time invariant: the per-tenant sub-limit must be strictly below the
+// global cap, or one tenant could take the whole global budget and the fairness
+// layer would be a no-op. Enforced at compile time so a future edit to either
+// default that breaks the relationship fails the build.
+const _: () = assert!(
+    DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT
+        < DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS,
+    "the per-tenant ingest sub-limit default must be strictly below the global cap default"
+);
+
+/// Env var overriding [`DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT`].
+/// Same blank/non-numeric/zero fallback rules as the global cap; additionally
+/// clamped to at most the effective global ceiling (see
+/// [`effective_per_tenant_cap`]).
+pub const MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT_ENV: &str =
+    "MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT";
+
+/// Clamp a configured per-tenant sub-limit into `[1, global]`. A sub-limit above
+/// the global ceiling can never bind (the global backstop sheds first), so it is
+/// pointless and is clamped to the ceiling; the floor of 1 keeps the sub-limit
+/// usable. Pure (no env / no singletons) so it is trivially unit-testable.
+fn effective_per_tenant_cap(configured: usize, global: usize) -> usize {
+    configured.min(global).max(1)
+}
+
+/// Effective per-tenant concurrent-ingest sub-limit, honouring
+/// [`MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT_ENV`] over the default and
+/// clamped to the global ceiling.
+fn max_concurrent_ingest_extractions_per_tenant() -> usize {
+    let configured = clamp_ingest_permits(positive_env_or(
+        MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT_ENV,
+        DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT as u64,
+    ));
+    effective_per_tenant_cap(configured, max_concurrent_ingest_extractions())
+}
+
+tokio::task_local! {
+    /// The tenant the current request's ingestion decodes are attributed to.
+    /// Set once per request by `repo_visibility_middleware` via
+    /// [`run_with_tenant_scope`]; unset outside a request (background workers).
+    static INGEST_TENANT: TenantKey;
+}
+
+/// The tenant key in ambient scope, or [`TenantKey::Unattributed`] when none is
+/// set (background workers, tests, or the pre-resolve middleware branches).
+/// A plain synchronous read — safe to call from the non-async acquire seam.
+fn current_tenant() -> TenantKey {
+    INGEST_TENANT
+        .try_with(|k| k.clone())
+        .unwrap_or(TenantKey::Unattributed)
+}
+
+/// Run `fut` with `key` as the ambient ingest tenant, so every
+/// `acquire_ingest_extraction` / `with_ingest_extraction*` call made while `fut`
+/// runs is attributed to that tenant's fairness sub-limit. Called by
+/// `repo_visibility_middleware` around the downstream handler once the repo is
+/// resolved — the single seam that gives every format extractor per-tenant
+/// fairness with no per-handler plumbing.
+pub async fn run_with_tenant_scope<F>(key: TenantKey, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    INGEST_TENANT.scope(key, fut).await
+}
+
+/// Process-wide registry of per-tenant sub-semaphores. `Weak` values so an idle
+/// tenant's semaphore self-evicts once no permit is held (see the module note).
+fn tenant_registry() -> &'static Mutex<HashMap<TenantKey, Weak<Semaphore>>> {
+    static REG: OnceLock<Mutex<HashMap<TenantKey, Weak<Semaphore>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get (or create) the sub-semaphore for `key`, sized `per_tenant`. While a
+/// tenant holds any permit the returned `Arc` (ultimately the guard's owned
+/// permit) keeps it alive; once idle the `Weak` dies and the entry is pruned on
+/// the next lookup, bounding the registry to the set of *currently active*
+/// tenants.
+fn tenant_semaphore_for(key: &TenantKey, per_tenant: usize) -> Arc<Semaphore> {
+    let mut map = tenant_registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    // Miss or dead entry: prune any other dead entries (cheap self-cleaning),
+    // then create and register a fresh sub-semaphore for this tenant.
+    map.retain(|_, w| w.strong_count() > 0);
+    let sem = Arc::new(Semaphore::new(per_tenant));
+    map.insert(key.clone(), Arc::downgrade(&sem));
+    sem
+}
+
+/// Acquire against an explicit (global, tenant) semaphore pair, FAST-FAIL. Takes
+/// the tenant sub-permit first (so a tenant at its sub-limit sheds without
+/// touching a global permit), then the global permit as the hard backstop. On a
+/// global shed the already-taken tenant permit is dropped on early return, so no
+/// permit leaks. The explicit-pair signature is the deterministic unit-test
+/// seam (no singletons / no ambient scope).
+fn acquire_ingest_extraction_paired(
+    global_sem: &Arc<Semaphore>,
+    tenant_sem: &Arc<Semaphore>,
+) -> Result<IngestExtractionGuard> {
+    let tenant_permit = tenant_sem.clone().try_acquire_owned().map_err(|_| {
+        AppError::ServiceUnavailable(
+            "Too many concurrent uploads for this repository; please retry shortly".to_string(),
+        )
+    })?;
+    let global_permit = global_sem
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| global_ingest_busy_err())?;
+    Ok(IngestExtractionGuard {
+        _global: global_permit,
+        _tenant: Some(tenant_permit),
+    })
+}
+
+/// Keyed acquire: resolve the tenant sub-semaphore for `key` from the registry
+/// and acquire the (tenant, global) pair. This is the production path
+/// [`acquire_ingest_extraction`] uses with the process singleton global.
+fn acquire_ingest_extraction_keyed(
+    global_sem: &Arc<Semaphore>,
+    key: &TenantKey,
+    per_tenant: usize,
+) -> Result<IngestExtractionGuard> {
+    let tenant_sem = tenant_semaphore_for(key, per_tenant);
+    acquire_ingest_extraction_paired(global_sem, &tenant_sem)
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,5 +1494,182 @@ mod tests {
         let _lock = lock_singletons();
         let out = with_registry_extraction(|| 6 * 7).expect("uncontended decode runs");
         assert_eq!(out, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2598 — per-tenant fairness sub-limit
+    // -----------------------------------------------------------------------
+
+    fn repo_key(n: u128) -> TenantKey {
+        TenantKey::Repo(uuid::Uuid::from_u128(n))
+    }
+
+    #[test]
+    fn effective_per_tenant_cap_clamps_to_ceiling_and_floor() {
+        // In-range passes through.
+        assert_eq!(effective_per_tenant_cap(4, 8), 4);
+        assert_eq!(effective_per_tenant_cap(8, 8), 8);
+        // Above the global ceiling clamps DOWN to the ceiling (a sub-limit that
+        // can never bind is pointless).
+        assert_eq!(effective_per_tenant_cap(100, 8), 8);
+        assert_eq!(effective_per_tenant_cap(usize::MAX, 8), 8);
+        // Floor of 1 keeps the sub-limit usable even at a degenerate 0.
+        assert_eq!(effective_per_tenant_cap(0, 8), 1);
+    }
+
+    /// A single tenant cannot exceed its sub-limit even while the GLOBAL ceiling
+    /// still has ample room — the fairness sub-limit, not the global cap, is
+    /// what bounds one tenant. Mirrors #2561's saturation test but per tenant.
+    #[test]
+    fn one_tenant_cannot_exceed_its_sub_limit_while_global_has_room() {
+        let global = Arc::new(Semaphore::new(8)); // plenty of global headroom
+        let tenant = Arc::new(Semaphore::new(2)); // this tenant's sub-limit
+
+        let g1 = acquire_ingest_extraction_paired(&global, &tenant).expect("tenant 1/2");
+        let g2 = acquire_ingest_extraction_paired(&global, &tenant).expect("tenant 2/2");
+
+        // The 3rd concurrent decode for this tenant sheds a 503 — even though
+        // the global ceiling still has 6 permits free.
+        let err = acquire_ingest_extraction_paired(&global, &tenant)
+            .expect_err("a tenant past its sub-limit must shed, not consume global permits");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "tenant-sub-limit saturation must map to a 503, got {:?}",
+            err
+        );
+        assert_eq!(
+            global.available_permits(),
+            6,
+            "a single tenant must not exhaust the global ceiling"
+        );
+
+        // Releasing the tenant's guards frees its slots promptly (no leak).
+        drop((g1, g2));
+        let _g = acquire_ingest_extraction_paired(&global, &tenant)
+            .expect("tenant slot reusable after release");
+    }
+
+    /// Cross-tenant isolation under load: tenant A saturating its own sub-limit
+    /// does not starve tenant B, which draws on its own sub-limit and the shared
+    /// global headroom.
+    #[test]
+    fn tenant_a_saturating_its_sub_limit_does_not_starve_tenant_b() {
+        let global = Arc::new(Semaphore::new(8));
+        let tenant_a = Arc::new(Semaphore::new(2));
+        let tenant_b = Arc::new(Semaphore::new(2));
+
+        // A saturates its own sub-limit.
+        let a1 = acquire_ingest_extraction_paired(&global, &tenant_a).expect("A 1/2");
+        let a2 = acquire_ingest_extraction_paired(&global, &tenant_a).expect("A 2/2");
+        assert!(
+            acquire_ingest_extraction_paired(&global, &tenant_a).is_err(),
+            "A is capped at its own sub-limit"
+        );
+
+        // B is unaffected — it is not shed by A's saturation.
+        let b1 = acquire_ingest_extraction_paired(&global, &tenant_b)
+            .expect("B must not be starved by A saturating its sub-limit");
+        let b2 = acquire_ingest_extraction_paired(&global, &tenant_b).expect("B 2/2");
+        assert!(
+            acquire_ingest_extraction_paired(&global, &tenant_b).is_err(),
+            "B is likewise capped at ITS own sub-limit"
+        );
+
+        drop((a1, a2, b1, b2));
+    }
+
+    /// The global ceiling remains the HARD backstop: once it is exhausted, a
+    /// tenant that is still under its own sub-limit is nonetheless shed.
+    #[test]
+    fn global_ceiling_is_the_hard_backstop_across_tenants() {
+        let global = Arc::new(Semaphore::new(2)); // smaller than the sub-limits
+        let tenant_a = Arc::new(Semaphore::new(4));
+        let tenant_b = Arc::new(Semaphore::new(4));
+
+        let a1 = acquire_ingest_extraction_paired(&global, &tenant_a).expect("A 1");
+        let a2 = acquire_ingest_extraction_paired(&global, &tenant_a).expect("A 2");
+        assert_eq!(global.available_permits(), 0, "global now exhausted");
+
+        // B is well under its own sub-limit (0/4), yet the global backstop sheds.
+        let err = acquire_ingest_extraction_paired(&global, &tenant_b)
+            .expect_err("the global ceiling must shed once exhausted, regardless of sub-limit");
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+        // The tenant permit taken before the global shed was released on the
+        // early return — B's sub-limit is intact.
+        assert_eq!(
+            tenant_b.available_permits(),
+            4,
+            "a global shed must not leak the tenant permit"
+        );
+
+        drop((a1, a2));
+        let _b = acquire_ingest_extraction_paired(&global, &tenant_b)
+            .expect("B proceeds once the global frees up");
+    }
+
+    #[test]
+    fn tenant_semaphore_registry_is_per_key_and_self_cleaning() {
+        let key_a = repo_key(0xA);
+        let key_b = repo_key(0xB);
+
+        // Same key returns the SAME sub-semaphore while it is live.
+        let sa1 = tenant_semaphore_for(&key_a, 3);
+        let sa2 = tenant_semaphore_for(&key_a, 3);
+        assert!(
+            Arc::ptr_eq(&sa1, &sa2),
+            "a live tenant reuses one sub-semaphore"
+        );
+
+        // Distinct keys get distinct sub-semaphores.
+        let sb = tenant_semaphore_for(&key_b, 3);
+        assert!(
+            !Arc::ptr_eq(&sa1, &sb),
+            "distinct tenants get distinct sub-semaphores"
+        );
+        assert_eq!(
+            sa1.available_permits(),
+            3,
+            "sub-semaphore sized as requested"
+        );
+
+        // Drop every strong ref to A's semaphore → its Weak dies and the entry
+        // self-cleans on the next lookup; a fresh, usable semaphore is built.
+        drop((sa1, sa2));
+        let sa3 = tenant_semaphore_for(&key_a, 3);
+        assert_eq!(
+            sa3.available_permits(),
+            3,
+            "a re-created tenant sub-semaphore starts fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_tenant_scope_sets_and_reverts_the_key() {
+        // Outside any scope the key defaults to Unattributed.
+        assert_eq!(current_tenant(), TenantKey::Unattributed);
+
+        let key = repo_key(7);
+        let seen = run_with_tenant_scope(key.clone(), async { current_tenant() }).await;
+        assert_eq!(seen, key, "inside the scope the ambient key is the tenant");
+
+        // The scope reverts on exit.
+        assert_eq!(current_tenant(), TenantKey::Unattributed);
+    }
+
+    #[tokio::test]
+    async fn public_acquire_reads_the_ambient_tenant_key() {
+        let _lock = lock_singletons_async().await;
+        let key = repo_key(0xFEED);
+        run_with_tenant_scope(key.clone(), async {
+            // The public seam resolves the ambient key (not Unattributed) and
+            // acquires a tenant + global permit successfully.
+            let guard = acquire_ingest_extraction().expect("acquire under ambient tenant");
+            assert_eq!(current_tenant(), key);
+            drop(guard);
+            // Scoped decode helper also flows through the keyed path.
+            let out = with_ingest_extraction(|| 21 * 2).expect("scoped decode under tenant");
+            assert_eq!(out, 42);
+        })
+        .await;
     }
 }

@@ -291,8 +291,43 @@ fn rewrite_v3_registration(
     out
 }
 
+/// True when `resource_url`'s origin (host + effective port) matches the
+/// configured `upstream_url`'s origin.
+///
+/// NuGet V3 discovers the `RegistrationsBaseUrl` / `PackageBaseAddress` bases
+/// from the upstream *service index response*, then fetches from them carrying
+/// the repo's configured upstream credentials (`apply_upstream_auth`, keyed by
+/// repo). A malicious or compromised upstream service index could therefore
+/// name an attacker-controlled host in those resources and have the proxy send
+/// the configured credentials there (credential exfiltration, #2925). Pinning
+/// the discovered bases to the operator-configured upstream origin keeps
+/// credentialed fetches on the host the operator actually trusts.
+///
+/// Comparison is host + effective port (`port_or_known_default`, so an
+/// `https`→`http` downgrade to the same host is also rejected because 443 ≠ 80)
+/// and case-insensitive on the host. The real nuget.org feed, GitHub Packages,
+/// Azure DevOps Artifacts and other private feeds all serve their registration
+/// and flat-container resources from the same host as their `index.json`, so
+/// this does not affect legitimate proxying; an upstream that legitimately
+/// fans resources out to a different host is refused by design (host-match on
+/// the upstream origin is the conservative default for a credentialed proxy).
+fn same_upstream_origin(upstream_url: &str, resource_url: &str) -> bool {
+    match (
+        reqwest::Url::parse(upstream_url),
+        reqwest::Url::parse(resource_url),
+    ) {
+        (Ok(up), Ok(res)) => {
+            up.host_str().map(str::to_ascii_lowercase)
+                == res.host_str().map(str::to_ascii_lowercase)
+                && up.port_or_known_default() == res.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 /// Resolve a discovered upstream base URL, rejecting a service index that omits
-/// it or advertises a non-http(s) base.
+/// it, advertises a non-http(s) base, or points the base at a host other than
+/// the configured upstream (#2925 — see [`same_upstream_origin`]).
 ///
 /// The anti-SSRF hard block for the actual outbound request is enforced by the
 /// proxy fetch layer's connect-time DNS guard (`is_blocked_resolved_ip`,
@@ -300,9 +335,15 @@ fn rewrite_v3_registration(
 /// codebase relies on it. A hostile upstream that points a base at a loopback /
 /// link-local / cloud-metadata address is refused there, before any bytes are
 /// read, for both the discovered registration/flat-container fetches here and
-/// the V2 OData fetches below.
+/// the V2 OData fetches below. The origin check added here is complementary: it
+/// keeps the configured upstream *credentials* from being sent to any host the
+/// service index names other than the configured upstream itself.
 #[allow(clippy::result_large_err)]
-fn guard_upstream_base(base: Option<&String>, what: &str) -> Result<String, Response> {
+fn guard_upstream_base(
+    base: Option<&String>,
+    upstream_url: &str,
+    what: &str,
+) -> Result<String, Response> {
     let base = base.ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -314,6 +355,16 @@ fn guard_upstream_base(base: Option<&String>, what: &str) -> Result<String, Resp
         return Err((
             StatusCode::BAD_GATEWAY,
             format!("Upstream {what} is not an http(s) URL"),
+        )
+            .into_response());
+    }
+    if !same_upstream_origin(upstream_url, base) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream {what} points off the configured upstream host; \
+                 refusing to send upstream credentials off-host"
+            ),
         )
             .into_response());
     }
@@ -336,8 +387,11 @@ async fn proxy_v3_registration(
 ) -> Result<Response, Response> {
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let reg_base =
-        guard_upstream_base(resources.registration_base.as_ref(), "RegistrationsBaseUrl")?;
+    let reg_base = guard_upstream_base(
+        resources.registration_base.as_ref(),
+        upstream_url,
+        "RegistrationsBaseUrl",
+    )?;
     let fetch_url = format!("{}/{}/index.json", reg_base, package_id_lower);
     let cache_path = format!("v3/registration/{}/index.json", package_id_lower);
     let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
@@ -377,7 +431,11 @@ async fn proxy_v3_flatcontainer(
 ) -> Result<Response, Response> {
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let pkg_base = guard_upstream_base(resources.package_base.as_ref(), "PackageBaseAddress")?;
+    let pkg_base = guard_upstream_base(
+        resources.package_base.as_ref(),
+        upstream_url,
+        "PackageBaseAddress",
+    )?;
     let fetch_url = format!("{}/{}", pkg_base, sub_path);
     let cache_path = format!("v3/flatcontainer/{}", sub_path);
     if streaming {
@@ -426,7 +484,7 @@ async fn service_index(
     let _repo = resolve_nuget_repo(&state.db, &repo_key).await?;
 
     // Determine the base URL from reverse-proxy / Host headers.
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     let index = serde_json::json!({
         "version": "3.0.0",
@@ -515,10 +573,10 @@ async fn search_packages(
     let prerelease = params.prerelease.unwrap_or(false);
 
     // Determine base URL for building resource links.
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     // Search distinct package names matching the query term.
-    let search_pattern = format!("%{}%", query_term.to_lowercase());
+    let search_pattern = build_nuget_search_pattern(&query_term);
 
     // Federate over virtual members (local/staging) when the repo is virtual;
     // otherwise query the repo itself.
@@ -625,7 +683,7 @@ async fn registration_index(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
-    let base = format!("{}/nuget/{}", base_url.as_str(), repo_key);
+    let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
     // Resolve the set of local repo IDs to query: the repo itself, or all
     // local/staging members for a virtual repo.
@@ -870,9 +928,7 @@ async fn flatcontainer_versions(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
-    let response = serde_json::json!({
-        "versions": versions
-    });
+    let response = build_flatcontainer_versions_json(&versions);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -892,6 +948,11 @@ async fn flatcontainer_download(
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
+
+    // Curation enforcement (#2930): block a curated package before it is
+    // resolved locally or proxied from an upstream V3 feed. No-op for hosted
+    // repos / curation off.
+    proxy_helpers::enforce_curation(&state.db, &repo, &package_id_lower, Some(&version)).await?;
 
     // Find the artifact matching this package/version.
     let artifact = sqlx::query!(
@@ -1453,6 +1514,11 @@ async fn v2_download(
     version: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // Curation enforcement (#2930): gate the V2 .nupkg download seam too, so a
+    // block rule holds regardless of whether the client uses the V3 flat
+    // container or the legacy V2 package route. No-op for hosted / curation off.
+    proxy_helpers::enforce_curation(&state.db, repo, &id.to_lowercase(), Some(version)).await?;
+
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
@@ -1515,7 +1581,7 @@ async fn v2_download(
         })?;
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
     use futures::StreamExt as _;
-    let filename = format!("{}.{}.nupkg", id_lower, version);
+    let filename = build_nupkg_filename(&id_lower, version);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/octet-stream")
@@ -1563,7 +1629,7 @@ async fn push_package(
             .unwrap()
     })?;
     // GHSA-vvc3-h39c-mrq5: enforce write scope before doing anything else.
-    crate::api::middleware::auth::require_scope_response(Some(&auth), "write")?;
+    crate::api::middleware::auth::require_scope_response(Some(&auth), "write:artifacts")?;
     let user_id = auth.user_id;
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1644,8 +1710,8 @@ async fn push_package(
     }
 
     let size_bytes = staged.size_bytes();
-    let filename = format!("{}.{}.nupkg", package_id, version);
-    let artifact_path = format!("{}/{}/{}", package_id, version, filename);
+    let filename = build_nupkg_filename(&package_id, &version);
+    let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
     // Converge onto the shared content-addressed streaming service method:
     // deduplication, the release-immutability backstop (a duplicate id.version or
@@ -1677,13 +1743,7 @@ async fn push_package(
     drop(staged);
 
     // Build metadata JSON.
-    let metadata = serde_json::json!({
-        "id": nuspec.id,
-        "version": nuspec.version,
-        "description": nuspec.description,
-        "authors": nuspec.authors,
-        "filename": filename,
-    });
+    let metadata = build_nuget_push_metadata(&nuspec);
 
     // Store metadata.
     let _ = sqlx::query!(
@@ -1801,6 +1861,52 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(content[..end_pos].trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Path/URL builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the base URL for NuGet service index resources from the request base
+/// (`{scheme}://{host}`) and repo key.
+fn build_nuget_base_url(request_base: &str, repo_key: &str) -> String {
+    format!("{}/nuget/{}", request_base, repo_key)
+}
+
+/// Build the flatcontainer versions JSON response.
+fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "versions": versions
+    })
+}
+
+/// Build the canonical `.nupkg` filename (`{id}.{version}.nupkg`; the caller
+/// passes the lowercased package id).
+fn build_nupkg_filename(package_id: &str, version: &str) -> String {
+    format!("{}.{}.nupkg", package_id, version)
+}
+
+/// Build the NuGet artifact path for a .nupkg.
+fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
+    let filename = build_nupkg_filename(package_id, version);
+    format!("{}/{}/{}", package_id, version, filename)
+}
+
+/// Build the NuGet push metadata JSON.
+fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.id,
+        "version": info.version,
+        "description": info.description,
+        "authors": info.authors,
+        "filename": build_nupkg_filename(&info.id.to_lowercase(), &info.version),
+    })
+}
+
+/// Build the search pattern for NuGet package queries.
+fn build_nuget_search_pattern(query_term: &str) -> String {
+    format!("%{}%", query_term.to_lowercase())
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
@@ -1882,10 +1988,6 @@ mod tests {
         .expect("encode jwt")
     }
 
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
     /// The handler must never authenticate a push itself.
     ///
     /// `repo_visibility_middleware` is the single credential authority for
@@ -1945,123 +2047,16 @@ mod tests {
         }
     }
 
-    /// Build the base URL for NuGet service index resources.
-    fn build_nuget_base_url(scheme: &str, host: &str, repo_key: &str) -> String {
-        format!("{}://{}/nuget/{}", scheme, host, repo_key)
-    }
-
-    /// Build the NuGet service index JSON (v3/index.json).
-    fn build_nuget_service_index(base: &str) -> serde_json::Value {
-        serde_json::json!({
-            "version": "3.0.0",
-            "resources": [
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService/3.0.0-beta",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/search", base),
-                    "@type": "SearchQueryService/3.0.0-rc",
-                    "comment": "Search packages"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl/3.0.0-beta",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/registration/", base),
-                    "@type": "RegistrationsBaseUrl/3.0.0-rc",
-                    "comment": "Package registrations"
-                },
-                {
-                    "@id": format!("{}/v3/flatcontainer/", base),
-                    "@type": "PackageBaseAddress/3.0.0",
-                    "comment": "Package content"
-                },
-                {
-                    "@id": format!("{}/api/v2/package", base),
-                    "@type": "PackagePublish/2.0.0",
-                    "comment": "Push packages"
-                }
-            ]
-        })
-    }
-
-    /// Build a single registration item JSON for a NuGet package version.
-    fn build_registration_item(
-        base: &str,
-        package_id: &str,
-        version: &str,
-        description: &str,
-        authors: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
-            "catalogEntry": {
-                "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
-                "id": package_id,
-                "version": version,
-                "description": description,
-                "authors": authors,
-                "packageContent": format!(
-                    "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
-                    base, package_id, version, package_id, version
-                ),
-                "listed": true,
-            },
-            "packageContent": format!(
-                "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
-                base, package_id, version, package_id, version
-            ),
-        })
-    }
-
-    /// Build the flatcontainer versions JSON response.
-    fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
-        serde_json::json!({
-            "versions": versions
-        })
-    }
-
-    /// Build the NuGet artifact path for a .nupkg.
-    fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
-        let filename = format!("{}.{}.nupkg", package_id, version);
-        format!("{}/{}/{}", package_id, version, filename)
-    }
-
-    /// Build the NuGet storage key for a .nupkg.
-    fn build_nuget_storage_key(package_id: &str, version: &str) -> String {
-        let filename = format!("{}.{}.nupkg", package_id, version);
-        format!("nuget/{}/{}/{}", package_id, version, filename)
-    }
-
-    /// Build the NuGet push metadata JSON.
-    fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
-        serde_json::json!({
-            "id": info.id,
-            "version": info.version,
-            "description": info.description,
-            "authors": info.authors,
-            "filename": format!("{}.{}.nupkg", info.id.to_lowercase(), info.version),
-        })
-    }
-
-    /// Build the search pattern for NuGet package queries.
-    fn build_nuget_search_pattern(query_term: &str) -> String {
-        format!("%{}%", query_term.to_lowercase())
-    }
+    // NOTE: the test-local `build_registration_item` / `build_nuget_service_index`
+    // copies were removed (#2657). They fabricated advertised-URL documents and
+    // asserted a builder matched its own literal, so they could not catch a
+    // production document advertising a URL that 404s — the exact class behind
+    // #2587. The registration leaf `@id` those copies emitted
+    // (`.../registration/{id}/{version}.json`) is a route the server does NOT
+    // serve; production emits `.../index.json#{version}` instead. The real
+    // service-index resources, registration leaf `@id`, and `packageContent`
+    // are now driven through the mounted router in
+    // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
 
     // -----------------------------------------------------------------------
     // extract_xml_tag
@@ -2292,6 +2287,9 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -2372,7 +2370,7 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_https() {
         assert_eq!(
-            build_nuget_base_url("https", "registry.example.com", "nuget-hosted"),
+            build_nuget_base_url("https://registry.example.com", "nuget-hosted"),
             "https://registry.example.com/nuget/nuget-hosted"
         );
     }
@@ -2380,7 +2378,7 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_http_localhost() {
         assert_eq!(
-            build_nuget_base_url("http", "localhost", "main"),
+            build_nuget_base_url("http://localhost", "main"),
             "http://localhost/nuget/main"
         );
     }
@@ -2388,102 +2386,16 @@ mod tests {
     #[test]
     fn test_build_nuget_base_url_with_port() {
         assert_eq!(
-            build_nuget_base_url("http", "localhost:8080", "nuget-local"),
+            build_nuget_base_url("http://localhost:8080", "nuget-local"),
             "http://localhost:8080/nuget/nuget-local"
         );
     }
 
-    // -----------------------------------------------------------------------
-    // build_nuget_service_index
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_nuget_service_index_structure() {
-        let base = "https://example.com/nuget/main";
-        let index = build_nuget_service_index(base);
-        assert_eq!(index["version"], "3.0.0");
-        let resources = index["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 8);
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_search_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let search = &resources[0];
-        assert_eq!(search["@id"], "https://example.com/nuget/repo/v3/search");
-        assert_eq!(search["@type"], "SearchQueryService");
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_push_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let push = &resources[7];
-        assert_eq!(push["@id"], "https://example.com/nuget/repo/api/v2/package");
-        assert_eq!(push["@type"], "PackagePublish/2.0.0");
-    }
-
-    #[test]
-    fn test_build_nuget_service_index_registration_url() {
-        let base = "https://example.com/nuget/repo";
-        let index = build_nuget_service_index(base);
-        let resources = index["resources"].as_array().unwrap();
-        let reg = &resources[3];
-        assert_eq!(
-            reg["@id"],
-            "https://example.com/nuget/repo/v3/registration/"
-        );
-        assert_eq!(reg["@type"], "RegistrationsBaseUrl");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_registration_item
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_registration_item_basic() {
-        let item = build_registration_item(
-            "https://example.com/nuget/repo",
-            "newtonsoft.json",
-            "13.0.1",
-            "Popular JSON framework",
-            "James Newton-King",
-        );
-        assert_eq!(item["catalogEntry"]["id"], "newtonsoft.json");
-        assert_eq!(item["catalogEntry"]["version"], "13.0.1");
-        assert_eq!(
-            item["catalogEntry"]["description"],
-            "Popular JSON framework"
-        );
-        assert_eq!(item["catalogEntry"]["authors"], "James Newton-King");
-        assert_eq!(item["catalogEntry"]["listed"], true);
-    }
-
-    #[test]
-    fn test_build_registration_item_package_content_url() {
-        let item = build_registration_item(
-            "https://example.com/nuget/repo",
-            "mypackage",
-            "1.0.0",
-            "",
-            "",
-        );
-        let url = item["packageContent"].as_str().unwrap();
-        assert_eq!(
-            url,
-            "https://example.com/nuget/repo/v3/flatcontainer/mypackage/1.0.0/mypackage.1.0.0.nupkg"
-        );
-    }
-
-    #[test]
-    fn test_build_registration_item_empty_metadata() {
-        let item = build_registration_item("http://localhost/nuget/local", "pkg", "0.1.0", "", "");
-        assert_eq!(item["catalogEntry"]["description"], "");
-        assert_eq!(item["catalogEntry"]["authors"], "");
-    }
+    // The `build_nuget_service_index` / `build_registration_item` self-referential
+    // tests were removed with their builders (#2657); the real service-index
+    // resources, registration leaf `@id`, and `packageContent` are now driven
+    // through the mounted router in
+    // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
 
     // -----------------------------------------------------------------------
     // build_flatcontainer_versions_json
@@ -2536,18 +2448,6 @@ mod tests {
         assert_eq!(
             build_nuget_artifact_path("mypackage", "1.0.0-beta.1"),
             "mypackage/1.0.0-beta.1/mypackage.1.0.0-beta.1.nupkg"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // build_nuget_storage_key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_nuget_storage_key_basic() {
-        assert_eq!(
-            build_nuget_storage_key("newtonsoft.json", "13.0.1"),
-            "nuget/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"
         );
     }
 
@@ -3403,6 +3303,69 @@ mod read_db_tests {
         );
     }
 
+    // #2925 — upstream credentials must stay pinned to the configured upstream
+    // host. A discovered service-index resource base that names a foreign host
+    // is refused by `guard_upstream_base`, so the repo's configured upstream
+    // credentials are never sent to a host the service index chose.
+    #[test]
+    fn test_same_upstream_origin_matches_same_host() {
+        // nuget.org: index.json and the discovered bases share host `api.nuget.org`.
+        assert!(same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json",
+        ));
+        // Host comparison is case-insensitive.
+        assert!(same_upstream_origin(
+            "https://API.NuGet.org/v3/index.json",
+            "https://api.nuget.org/v3-flatcontainer/",
+        ));
+    }
+
+    #[test]
+    fn test_same_upstream_origin_rejects_foreign_host_and_downgrade() {
+        // Foreign host named by a hostile service index → not the same origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://attacker.example/v3-flatcontainer/",
+        ));
+        // Same registrable domain but different host is still a different origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://evil.nuget.org.attacker.example/reg/",
+        ));
+        // http downgrade to the same host is rejected (443 != 80).
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "http://api.nuget.org/v3-flatcontainer/",
+        ));
+        // Different explicit port is a different origin.
+        assert!(!same_upstream_origin(
+            "https://api.nuget.org/v3/index.json",
+            "https://api.nuget.org:8443/v3-flatcontainer/",
+        ));
+    }
+
+    #[test]
+    fn test_guard_upstream_base_refuses_offhost_resource() {
+        // A service index that points the flat-container base at an attacker
+        // host is refused before any credentialed fetch is issued.
+        let upstream = "https://api.nuget.org/v3/index.json";
+        let foreign = Some("https://attacker.example/flat".to_string());
+        let err = guard_upstream_base(foreign.as_ref(), upstream, "PackageBaseAddress")
+            .expect_err("off-host base must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_guard_upstream_base_accepts_same_host_resource() {
+        // The legitimate same-host base is accepted and returned unchanged.
+        let upstream = "https://api.nuget.org/v3/index.json";
+        let same = Some("https://api.nuget.org/v3-flatcontainer".to_string());
+        let base = guard_upstream_base(same.as_ref(), upstream, "PackageBaseAddress")
+            .expect("same-host base must be accepted");
+        assert_eq!(base, "https://api.nuget.org/v3-flatcontainer");
+    }
+
     #[test]
     fn test_rewrite_v3_registration_points_urls_at_proxy() {
         let resources = NugetUpstreamResources {
@@ -3821,6 +3784,199 @@ mod read_db_tests {
             &body[..],
             nupkg.as_ref(),
             "streamed choco .nupkg must match upstream"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 / #2587 class)
+    //
+    // These assert the URLs a NuGet V3 document hands a client against the REAL
+    // router, mounted exactly where `api::routes` nests it (`/nuget`). The
+    // `build_*` unit tests in the sibling `tests` module only prove a
+    // *test-local* builder emits the string it was written to emit; they cannot
+    // catch a production document advertising a URL that 404s. Regression guard:
+    // the registration leaf `@id` was once emitted as
+    // `.../registration/{id}/{version}.json`, for which no route exists — every
+    // protocol-conformant client 404'd resolving a package version while
+    // `search`/`index` passed (the #2587 rpm `<location>` shape, in NuGet).
+    // -----------------------------------------------------------------------
+
+    /// The NuGet routes mounted exactly where `api::routes` nests them. The
+    /// advertised `@id`/`packageContent` URLs are absolute and carry the
+    /// `/nuget` prefix, so a router mounted at the root could not resolve them —
+    /// the mount point is part of what these tests pin.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/nuget", super::router())
+    }
+
+    /// Resolve a (possibly relative) advertised URL the way a client does —
+    /// against the URL of the document that advertised it — and return the
+    /// path+query to request, dropping any `#fragment` (a client strips the
+    /// fragment before the GET, so the server never sees it).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    /// Every URL a NuGet V3 client dereferences — the service-index resources,
+    /// the registration index, its per-version leaf `@id`, and the
+    /// `packageContent` .nupkg link — must resolve against the real router, not
+    /// merely against a test-local string builder.
+    #[tokio::test]
+    async fn test_advertised_v3_urls_resolve_against_real_router() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+
+        let package_id = "Qa.AdUrlPkg";
+        let package_id_lower = package_id.to_lowercase();
+        let version = "1.2.3";
+        let nupkg = build_nupkg(package_id, version, "advertised-url probe");
+
+        // Publish through the real push handler so the document is rendered from
+        // real `artifacts` rows.
+        {
+            let app = f.router_with_auth(mounted_router());
+            let (status, body) = tdh::send(
+                app,
+                tdh::put(
+                    format!("/nuget/{}/api/v2/package", f.repo_key),
+                    bytes::Bytes::from(nupkg.clone()),
+                ),
+            )
+            .await;
+            if !status.is_success() {
+                f.teardown().await;
+                panic!("push failed: {status} {}", String::from_utf8_lossy(&body));
+            }
+        }
+
+        // Helper: GET a path anonymously (read paths need no auth) and parse JSON.
+        async fn get_json(f: &tdh::Fixture, path: String) -> (StatusCode, serde_json::Value) {
+            let app = f.router_anon(mounted_router());
+            let (status, body) = tdh::send(app, tdh::get(path)).await;
+            (
+                status,
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+            )
+        }
+
+        // 1. Service index → the RegistrationsBaseUrl and PackageBaseAddress
+        //    resources a client discovers first.
+        let index_path = format!("/nuget/{}/v3/index.json", f.repo_key);
+        let index_doc_url = format!("http://ak.test{index_path}");
+        let (index_status, index) = get_json(&f, index_path.clone()).await;
+
+        let resource_id = |ty: &str| -> String {
+            index
+                .get("resources")
+                .and_then(|r| r.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|res| res.get("@type").and_then(|v| v.as_str()) == Some(ty))
+                })
+                .and_then(|res| res.get("@id").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let reg_base = resource_id("RegistrationsBaseUrl");
+        let flat_base = resource_id("PackageBaseAddress/3.0.0");
+
+        // 2. Registration index — resolved by appending `{id}/index.json` to the
+        //    advertised RegistrationsBaseUrl, exactly as a client builds it.
+        let reg_index_advertised = format!("{}{}/index.json", reg_base, package_id_lower);
+        let reg_index_path = resolve_advertised(&index_doc_url, &reg_index_advertised);
+        let reg_doc_url = format!("http://ak.test{reg_index_path}");
+        let (reg_status, reg) = get_json(&f, reg_index_path.clone()).await;
+
+        // 3. The registration leaf `@id` + `packageContent` the document
+        //    advertises for the published version.
+        let leaf = reg
+            .get("items")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|page| page.get("items"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let leaf_id = leaf
+            .get("@id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let package_content = leaf
+            .get("packageContent")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let leaf_path = if leaf_id.is_empty() {
+            String::new()
+        } else {
+            resolve_advertised(&reg_doc_url, &leaf_id)
+        };
+        let content_path = if package_content.is_empty() {
+            String::new()
+        } else {
+            resolve_advertised(&reg_doc_url, &package_content)
+        };
+
+        // 4. Flat-container version list — appended to the advertised
+        //    PackageBaseAddress the same way a client resolves it.
+        let flat_advertised = format!("{}{}/index.json", flat_base, package_id_lower);
+        let flat_path = resolve_advertised(&index_doc_url, &flat_advertised);
+
+        // Follow each advertised URL against the real router.
+        let leaf_status = if leaf_path.is_empty() {
+            StatusCode::NOT_FOUND
+        } else {
+            get_json(&f, leaf_path.clone()).await.0
+        };
+        let (content_status, content_body) = if content_path.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let app = f.router_anon(mounted_router());
+            tdh::send(app, tdh::get(content_path.clone())).await
+        };
+        let flat_status = get_json(&f, flat_path.clone()).await.0;
+
+        f.teardown().await;
+
+        assert_eq!(index_status, StatusCode::OK, "service index");
+        assert_ne!(
+            reg_base, "",
+            "service index must advertise a RegistrationsBaseUrl"
+        );
+        assert_ne!(
+            flat_base, "",
+            "service index must advertise a PackageBaseAddress"
+        );
+        assert_eq!(
+            reg_status,
+            StatusCode::OK,
+            "advertised registration index ({reg_index_path})"
+        );
+        assert_eq!(
+            leaf_status,
+            StatusCode::OK,
+            "the registration leaf @id ({leaf_id}) must resolve, not 404"
+        );
+        assert_eq!(
+            content_status,
+            StatusCode::OK,
+            "the advertised packageContent ({package_content}) must resolve, not 404"
+        );
+        assert_eq!(
+            &content_body[..],
+            nupkg.as_slice(),
+            "packageContent must serve the published .nupkg bytes"
+        );
+        assert_eq!(
+            flat_status,
+            StatusCode::OK,
+            "the advertised PackageBaseAddress version list ({flat_path}) must resolve, not 404"
         );
     }
 }

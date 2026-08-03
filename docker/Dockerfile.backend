@@ -68,7 +68,7 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 # Install only essential runtime libraries into a clean rootfs.
 # --refresh forces fresh repo metadata and the follow-up `upgrade -y` pulls
 # the latest RHEL 9 z-stream security errata for every installed package
-# (curl-minimal/libcurl, glibc*, tar, openssl-libs, xz-libs,
+# (curl-minimal/libcurl, glibc*, tar, openssl-libs, xz, xz-libs,
 # zlib, zstd) that the install step alone may miss when the metadata cache is
 # stale. This guarantees the rootfs is rebuilt against current errata on every
 # image build. The reposdir override is required on the upgrade step because
@@ -91,6 +91,7 @@ RUN mkdir -p /mnt/rootfs && \
         openssl-libs \
         zlib \
         xz-libs \
+        xz \
         curl-minimal \
         tar \
         gzip \

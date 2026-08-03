@@ -556,6 +556,11 @@ pub async fn create_api_token(
     crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
         .map_err(AppError::Authorization)?;
 
+    // Delegation ceiling (#2996): a scoped credential may not mint a token
+    // that exceeds its own scopes. Interactive sessions (`scopes: None`)
+    // are unaffected.
+    auth.enforce_mint_ceiling(&payload.scopes)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (token, id) = auth_service
@@ -2048,17 +2053,6 @@ mod admin_scope_policy_tests {
 
     // ── #1617 Phase 1: token-lifecycle audit coverage ───────────────────
 
-    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
-        )
-        .bind(token_id)
-        .bind(action)
-        .fetch_one(pool)
-        .await
-        .expect("audit_log count query")
-    }
-
     /// Minting an API token must emit an `API_TOKEN_CREATED` audit event
     /// attributed to the acting user, carrying the token id (never the secret).
     #[tokio::test]
@@ -2091,8 +2085,9 @@ mod admin_scope_policy_tests {
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
 
+        // #2522: audit write is fire-and-forget (spawned) — poll for the row.
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_CREATED", 1).await,
             1,
             "mint MUST write exactly one API_TOKEN_CREATED audit row"
         );
@@ -2136,7 +2131,7 @@ mod admin_scope_policy_tests {
         assert!(status.is_success(), "revoke should succeed, got {status}");
 
         assert_eq!(
-            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            tdh::audit_count_eventually(&pool, token_id, "API_TOKEN_REVOKED", 1).await,
             1,
             "revoke MUST write exactly one API_TOKEN_REVOKED audit row"
         );
@@ -2171,5 +2166,185 @@ mod admin_scope_policy_tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "FK-violating audit write must not persist a row");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2996: mint-path scope validation (vocabulary backstop + delegation ceiling)
+//
+// End-to-end handler assertions for the two new controls on
+// `POST /api/v1/auth/tokens`:
+//   * the mint primitive rejects scopes outside `ALLOWED_SCOPES` (400) — bare
+//     action parents (`delete`, `write`, `read`) are un-mintable, which
+//     matters because `scopes_grant_access` treats a held bare parent as
+//     covering every colon-form child (#2989);
+//   * a scoped presenting credential cannot mint a token exceeding its own
+//     scopes (403), while interactive sessions (`scopes: None`) are
+//     unaffected.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mint_scope_validation_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        protected_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn mint(
+        state: SharedState,
+        auth: AuthExtension,
+        scopes: serde_json::Value,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let body = json!({
+            "name": format!("t-{}", Uuid::new_v4()),
+            "scopes": scopes,
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        tdh::send(build_app(state, auth), req).await
+    }
+
+    /// The closed escalation: a non-admin presenting a `read:artifacts` API
+    /// token may not mint a `write:artifacts` token (403), while the same
+    /// non-admin on an interactive session (scopes = None) still can (200).
+    #[tokio::test]
+    async fn scoped_token_cannot_mint_beyond_itself_but_interactive_can() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+
+        // Presenting credential = read-scoped API token (or a JWT exchanged
+        // from one): ceiling binds.
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.scopes = Some(vec!["read:artifacts".to_string()]);
+        let (status, body) = mint(state.clone(), scoped, json!(["write:artifacts"])).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-scoped token minting write:artifacts MUST 403; body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        // Same non-admin, interactive session: unaffected.
+        let interactive = tdh::make_auth(user_id, &username); // scopes: None
+        let (status, body) = mint(state, interactive, json!(["write:artifacts"])).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "interactive non-admin minting write:artifacts MUST stay 200; body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// A scoped token re-minting within its own ceiling is allowed.
+    #[tokio::test]
+    async fn scoped_token_can_mint_within_its_ceiling() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.scopes = Some(vec!["read:artifacts".to_string()]);
+        let (status, body) = mint(state, scoped, json!(["read:artifacts"])).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "read-scoped token re-minting read:artifacts MUST 200; body: {}",
+            String::from_utf8_lossy(&body),
+        );
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Bare action parents and arbitrary strings are rejected by the mint
+    /// primitive with 400 (invalid vocabulary) for everyone — bare `delete`
+    /// would otherwise cover the admin-only `delete:artifacts` under the
+    /// #2989 parent rule.
+    #[tokio::test]
+    async fn bare_parents_and_unknown_scopes_are_unmintable() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        for bad in ["delete", "write", "read", "hack:system"] {
+            let auth = tdh::make_auth(user_id, &username);
+            let (status, body) = mint(state.clone(), auth, json!([bad])).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "minting scope {bad:?} MUST 400; got {status} body: {}",
+                String::from_utf8_lossy(&body),
+            );
+        }
+        // Vocabulary applies to admins too (backstop is caller-independent).
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let (status, _) = mint(state, admin, json!(["hack:system"])).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "admin minting non-vocabulary scope MUST 400"
+        );
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Admin-only scopes stay 403 for non-admins (unchanged by #2996), and
+    /// the routine CI scope stays mintable.
+    #[tokio::test]
+    async fn admin_only_still_403_and_ci_scope_still_mints() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        for admin_scope in ["admin", "*"] {
+            let auth = tdh::make_auth(user_id, &username);
+            let (status, _) = mint(state.clone(), auth, json!([admin_scope])).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin minting {admin_scope:?} MUST 403"
+            );
+        }
+        let auth = tdh::make_auth(user_id, &username);
+        let (status, body) = mint(state, auth, json!(["write:artifacts"])).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "interactive non-admin minting write:artifacts MUST 200; body: {}",
+            String::from_utf8_lossy(&body),
+        );
+        cleanup(&pool, user_id).await;
     }
 }

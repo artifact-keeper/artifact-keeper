@@ -580,7 +580,7 @@ async fn new_upload_url(
     Path(repo_key): Path<String>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
     let _repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
     let upload_url = format!(
@@ -611,7 +611,7 @@ async fn upload_package(
     base_url: RequestBaseUrl,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1776,6 +1776,114 @@ mod tests {
         fx.teardown().await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The Dart `pub` client reads `archive_url` from the package listing and
+    // fetches the archive from it. The `build_pub_*` unit tests only prove the
+    // builder emits a string; routing that `archive_url` against the REAL router
+    // (mounted where `api::routes` nests it, `/pub`) proves a `pub` client can
+    // download the published package.
+    // -----------------------------------------------------------------------
+
+    /// The pub routes mounted exactly where `api::routes` nests them. The
+    /// advertised `archive_url` is absolute and carries the `/pub` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/pub", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_archive_url_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        let name = "test_pkg";
+        let version = "1.0.0";
+        let pubspec_yaml = "name: test_pkg\nversion: 1.0.0\n";
+        let mut tar_data = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use tar::Builder as TarBuilder;
+
+            let encoder = GzEncoder::new(&mut tar_data, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            tar.append_data(&mut header, "pubspec.yaml", pubspec_yaml.as_bytes())
+                .unwrap();
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+        let archive = bytes::Bytes::from(tar_data);
+
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            &format!("pub/{name}/{version}/{name}-{version}.tar.gz"),
+            &format!("{name}/{version}/{name}-{version}.tar.gz"),
+            name,
+            version,
+            "application/gzip",
+            archive.clone(),
+            fx.user_id,
+        )
+        .await;
+
+        let info_path = format!("/pub/{}/api/packages/{}", fx.repo_key, name);
+        let info_doc_url = format!("http://ak.test{info_path}");
+        let (info_status, info_body) = tdh::send(
+            tdh::router_anon(mounted_router(), fx.state.clone()),
+            tdh::get(info_path.clone()),
+        )
+        .await;
+        let info: serde_json::Value = serde_json::from_slice(&info_body).unwrap_or_default();
+        let archive_url = info["versions"][0]["archive_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if archive_url.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&info_doc_url, &archive_url);
+            tdh::send(
+                tdh::router_anon(mounted_router(), fx.state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(info_status, StatusCode::OK, "package info");
+        assert!(
+            !archive_url.is_empty(),
+            "listing must advertise an archive_url"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised archive_url ({archive_url}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            &archive[..],
+            "the advertised archive_url must serve the published package bytes"
+        );
     }
 }
 

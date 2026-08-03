@@ -1073,6 +1073,7 @@ mod tests {
             environment: "development".into(),
             storage_path: "/tmp/artifacts".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
