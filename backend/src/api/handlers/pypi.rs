@@ -38,7 +38,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::upstream_metadata::metadata_http_client;
 use chrono::Utc;
 
@@ -1580,10 +1580,11 @@ fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> Stri
 /// index (#1944). The JSON and HTML representations of one index must
 /// withhold the same young versions, or a JSON-negotiating client (modern
 /// pip) sees everything the HTML filter hides. Mirrors the HTML hook in
-/// `simple_project`: a filter failure serves the unfiltered listing rather
-/// than failing the request — the download path re-checks every version
-/// independently and fails closed, so enforcement never rests on this
-/// listing-side filter.
+/// `simple_project`: an evaluation/filter failure serves the unfiltered
+/// listing rather than failing the request, while an authoritative policy
+/// resolution failure returns a structurally valid empty listing. The
+/// download path re-checks every version independently and fails closed, so
+/// enforcement never rests on this listing-side filter.
 async fn filter_pypi_simple_json_response(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1594,10 +1595,22 @@ async fn filter_pypi_simple_json_response(
     let Some(svc) = state.age_gate_service.as_ref() else {
         return json;
     };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Quick struct-derived check, then DB-resolve the authoritative policy
+    // (mode + upstream identity) — a virtual member's RepoInfo carries a
+    // defaulted mode (#2264). A resolve failure suppresses the listing with a
+    // valid PEP 691 empty response; the download path re-checks fail-closed.
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return json;
     }
+    let params = match crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, repo_key = %repo.key, "Failed to resolve age-gate params for PyPI simple JSON response; suppressing listing");
+            return empty_pep691_listing(project);
+        }
+    };
     let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&json) else {
         // `rewrite_upstream_simple_json` only returns JSON it serialized
         // itself, so this branch is unreachable in practice.
@@ -1632,19 +1645,40 @@ async fn filter_pypi_simple_html_response(
     let Some(svc) = state.age_gate_service.as_ref() else {
         return html;
     };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Quick struct-derived check, then DB-resolve the authoritative policy —
+    // same rationale as the JSON twin above (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return html;
     }
-    let Ok(client) = metadata_http_client() else {
-        return html;
-    };
-    let Ok(times) = svc
-        .metadata_cache()
-        .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+    let params = match crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
         .await
-    else {
-        return html;
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, repo_key = %repo.key, "Failed to resolve age-gate params for PyPI simple HTML response; suppressing listing");
+            return "<html><body></body></html>".to_string();
+        }
+    };
+    // Publish times are only the basis in `upstream_publish_time` mode;
+    // `first_seen` substitutes this server's own observations inside the
+    // filter, so the fetch is skipped (and a fetch failure must not skip
+    // filtering there).
+    let times = if params.age_gate_mode
+        == crate::services::age_gate_service::AgeGateMode::UpstreamPublishTime
+    {
+        let Ok(client) = metadata_http_client() else {
+            return html;
+        };
+        let Ok(times) = svc
+            .metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+            .await
+        else {
+            return html;
+        };
+        times
+    } else {
+        std::collections::HashMap::new()
     };
     match svc
         .filter_pypi_simple_index(&params, project, &times, &html)
@@ -1661,14 +1695,16 @@ async fn apply_pypi_download_age_gate(
     project: &str,
     filename: &str,
 ) -> Result<Option<String>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Cheap struct-derived pre-check, then DB-resolve the authoritative
+    // policy (mode + upstream identity) by id — struct-derived params can
+    // carry a stale or defaulted mode (e.g. a virtual member's RepoInfo),
+    // and gate policy is enforcement input (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return Ok(None);
     }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let info = PypiHandler::parse_filename(filename)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
@@ -1676,44 +1712,41 @@ async fn apply_pypi_download_age_gate(
         AppError::Validation("Missing version in filename".to_string()).into_response()
     })?;
 
-    let published_at =
-        if let (Some(upstream_url), Ok(client)) = (&repo.upstream_url, metadata_http_client()) {
-            svc.metadata_cache()
-                .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-                .await
-                .ok()
-                .and_then(|times| times.get(&version).copied())
-        } else {
-            None
-        };
-
-    match svc
-        .check(&params, project, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?
+    let svc = state.age_gate_service.as_deref();
+    // Publish-time evidence from the project's upstream JSON metadata; under
+    // `first_seen` the time itself is ignored, but presence in the document
+    // is the existence evidence that may start the observation clock.
+    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
+        (svc, &repo.upstream_url, metadata_http_client())
     {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(lkg),
-        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
-            &lkg.artifact_path,
-        ))),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
+        svc.metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+            .await
+            .ok()
+            .and_then(|times| times.get(&version).copied())
+    } else {
+        None
+    };
+    let basis = match svc {
+        Some(svc) => svc
+            .download_basis(
+                &params,
                 project,
                 &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
-    }
+                published_at,
+                published_at.is_some(),
+            )
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published_at,
+    };
+
+    // The shared seam (#2264) owns the decision and the terminal 451; only
+    // the LKG wheel-filename substitution below is pypi-specific.
+    let lkg = proxy_helpers::enforce_age_gate(svc, &params, project, &version, basis).await?;
+    Ok(lkg.map(|blocked| {
+        pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path)
+    }))
 }
 
 /// Run the remote-PyPI download age gate and, when the requested version is
@@ -3827,11 +3860,13 @@ fn case_a_filter_remote_body(
     Bytes::from(filtered)
 }
 
-/// An empty PEP 691 simple-index listing for `normalized` — the fail-closed body
-/// for a locally-owned name whose suppressed Remote member returned a body that
-/// could not be ownership-filtered (#2967 R4). Mirrors the PEP 691 shape the
-/// merge path expects (`meta`/`name`/`versions`/`files`) so the local splice
-/// still runs, and guarantees no raw upstream byte is ever surfaced.
+/// A structurally valid empty PEP 691 simple-index listing for `normalized`.
+/// Used whenever a listing must fail closed without breaking JSON-simple
+/// clients: for a locally-owned name whose suppressed Remote member returned a
+/// body that could not be ownership-filtered (#2967 R4), and for an age-gate
+/// policy-resolution failure. Mirrors the shape the merge path expects
+/// (`meta`/`name`/`versions`/`files`) and guarantees no raw upstream byte is
+/// surfaced.
 fn empty_pep691_listing(normalized: &str) -> String {
     serde_json::json!({
         "meta": {"api-version": "1.0"},
@@ -4717,6 +4752,17 @@ mod tests {
     #[test]
     fn test_rewrite_upstream_simple_json_returns_none_for_non_json() {
         assert!(rewrite_upstream_simple_json(b"<!DOCTYPE html><html></html>", "r", "p").is_none());
+    }
+
+    #[test]
+    fn test_empty_pep691_listing_preserves_required_project_shape() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&empty_pep691_listing("my-package")).unwrap();
+
+        assert_eq!(doc["meta"]["api-version"], "1.0");
+        assert_eq!(doc["name"], "my-package");
+        assert_eq!(doc["versions"], serde_json::json!([]));
+        assert_eq!(doc["files"], serde_json::json!([]));
     }
 
     // -----------------------------------------------------------------------
@@ -6471,7 +6517,17 @@ mod tests {
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
         repo_info.age_gate_enabled = true;
-        repo_info.age_gate_min_age_days = 36_500; // 100 years
+        repo_info.age_gate_min_age_days = 3650; // 10 years
+                                                // The gate re-resolves policy from the repositories row (the struct
+                                                // only pre-screens), so the DB must agree with the struct above.
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 3650 \
+             WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable age gate on repo row");
 
         // Seed the local `artifacts` row + payload that would otherwise be
         // served straight from storage on the cache-hit branch.

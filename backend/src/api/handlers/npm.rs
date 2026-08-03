@@ -37,7 +37,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
@@ -2055,10 +2055,14 @@ async fn get_package_metadata(
 
             match result {
                 Ok((content, content_type, _budget_permit)) => {
-                    let params =
-                        crate::services::age_gate_service::AgeGateRepoParams::from_repository(
-                            member,
-                        );
+                    // DB-resolve the member's gate policy: the Repository
+                    // model deliberately carries no `age_gate_mode`, and
+                    // policy inputs are read from the source of truth (#2264).
+                    let params = crate::services::age_gate_service::resolve_repo_params(
+                        &state.db, member.id,
+                    )
+                    .await
+                    .map_err(|e| e.into_response())?;
                     return rewrite_and_respond_with_age_gate_params(
                         state,
                         &params,
@@ -2402,22 +2406,14 @@ fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String
     build_tarball_upstream_path(package_name, filename)
 }
 
-/// Map an age-gate block decision with LKG into upstream path + filename.
-fn npm_lkg_redirect_from_decision(
-    decision: &AgeGateDecision,
+/// Map an age-gate last-known-good version into upstream path + filename.
+fn npm_lkg_redirect(
+    lkg: &crate::services::age_gate_service::LastKnownGood,
     package_name: &str,
-) -> Option<(String, String)> {
-    if let AgeGateDecision::Block {
-        last_known_good: Some(lkg),
-        ..
-    } = decision
-    {
-        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
-        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
-        Some((lkg_path, lkg_filename))
-    } else {
-        None
-    }
+) -> (String, String) {
+    let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+    let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+    (lkg_path, lkg_filename)
 }
 
 async fn npm_publish_time_for_version(
@@ -2456,46 +2452,52 @@ async fn apply_npm_download_age_gate(
     package_name: &str,
     filename: &str,
 ) -> Result<Option<(String, String)>, Response> {
-    let svc = match state.age_gate_service.as_ref() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let params = proxy_helpers::age_gate_params(repo);
-    if !AgeGateService::is_applicable(&params) {
+    // Cheap struct-derived pre-check so an ungated repo skips the filename
+    // parse, the DB policy resolve, and the upstream publish-time fetch. The
+    // authoritative policy (mode + upstream identity) is then re-resolved
+    // from the database by id: struct-derived params can carry a stale or
+    // defaulted mode (e.g. a virtual member's RepoInfo), and gate policy is
+    // enforcement input, so it is read from the source of truth (#2264).
+    if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
         return Ok(None);
     }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let short_name = npm_tarball_short_name(package_name);
     let version =
         crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
             .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
+    // Publish-time evidence from the packument; under `first_seen` the time
+    // itself is ignored, but presence in the upstream-served document is the
+    // existence evidence that may start the version's observation clock.
     let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
-    let decision = svc
-        .check(&params, package_name, &version, published_at)
-        .await
-        .map_err(|e| e.into_response())?;
-    match decision {
-        AgeGateDecision::Allow => Ok(None),
-        AgeGateDecision::Block {
-            review_id: _,
-            last_known_good: Some(_),
-        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
-        AgeGateDecision::Block {
-            review_id,
-            last_known_good: None,
-        } => {
-            let requested_age_days =
-                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
-            Err(proxy_helpers::age_gate_blocked_response(
-                review_id,
+    let basis = match state.age_gate_service.as_deref() {
+        Some(svc) => svc
+            .download_basis(
+                &params,
                 package_name,
                 &version,
-                repo.age_gate_min_age_days,
-                requested_age_days,
-            ))
-        }
-    }
+                published_at,
+                published_at.is_some(),
+            )
+            .await
+            .map_err(|e| e.into_response())?,
+        None => published_at,
+    };
+    // The shared seam (#2264) owns the decision and the terminal 451; only
+    // the LKG substitution below is npm-specific.
+    let lkg = proxy_helpers::enforce_age_gate(
+        state.age_gate_service.as_deref(),
+        &params,
+        package_name,
+        &version,
+        basis,
+    )
+    .await?;
+    Ok(lkg.map(|blocked| npm_lkg_redirect(&blocked.last_known_good, package_name)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2509,9 +2511,19 @@ async fn rewrite_and_respond_with_age_gate(
     repo_key: &str,
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
+    // Quick struct-derived check, then DB-resolve the authoritative policy
+    // (mode + upstream identity) for the filter (#2264).
+    let quick = proxy_helpers::age_gate_params(repo);
+    let params = if AgeGateService::is_applicable(&quick) {
+        crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+            .await
+            .map_err(|e| e.into_response())?
+    } else {
+        quick
+    };
     rewrite_and_respond_with_age_gate_params(
         state,
-        &proxy_helpers::age_gate_params(repo),
+        &params,
         package_name,
         content,
         content_type,
@@ -5757,6 +5769,7 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
         };
@@ -6350,28 +6363,14 @@ mod tests {
     fn test_npm_lkg_redirect_uses_literal_slash_path() {
         use crate::services::age_gate_service::LastKnownGood;
 
-        let decision = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: Some(LastKnownGood {
-                version: "16.0.0".to_string(),
-                artifact_path: "ignored".to_string(),
-            }),
+        let lkg = LastKnownGood {
+            version: "16.0.0".to_string(),
+            artifact_path: "ignored".to_string(),
         };
-        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        let (path, filename) = npm_lkg_redirect(&lkg, "@angular/core");
         assert_eq!(filename, "core-16.0.0.tgz");
         assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
         assert!(!path.contains("%2F"));
-    }
-
-    #[test]
-    fn test_npm_lkg_redirect_none_without_last_known_good() {
-        // Allow and Block-without-LKG decisions produce no redirect target.
-        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
-        let blocked_no_lkg = AgeGateDecision::Block {
-            review_id: uuid::Uuid::new_v4(),
-            last_known_good: None,
-        };
-        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
     }
 
     #[test]
@@ -8267,6 +8266,8 @@ mod tests {
                 RepositoryFormat::Npm,
                 enabled,
                 7,
+                Default::default(),
+                None,
             )
         };
 

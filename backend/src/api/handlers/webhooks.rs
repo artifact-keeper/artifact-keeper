@@ -143,6 +143,11 @@ pub enum WebhookEvent {
     AgeGateQueued,
     AgeGateApproved,
     AgeGateRejected,
+    /// A decided review moved back to `pending` (#2968). Emitted on the
+    /// internal bus since reopen shipped; mapped to a webhook so subscribers
+    /// that saw `age_gate_approved` / `age_gate_rejected` also see the
+    /// decision being voided (#2264 rides this along).
+    AgeGateReopened,
 }
 
 impl std::fmt::Display for WebhookEvent {
@@ -160,6 +165,7 @@ impl std::fmt::Display for WebhookEvent {
             WebhookEvent::AgeGateQueued => write!(f, "age_gate_queued"),
             WebhookEvent::AgeGateApproved => write!(f, "age_gate_approved"),
             WebhookEvent::AgeGateRejected => write!(f, "age_gate_rejected"),
+            WebhookEvent::AgeGateReopened => write!(f, "age_gate_reopened"),
         }
     }
 }

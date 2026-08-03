@@ -51,6 +51,10 @@ pub fn map_event_type(event_type: &str) -> Option<&'static str> {
         "age_gate.queued" => Some("age_gate_queued"),
         "age_gate.approved" => Some("age_gate_approved"),
         "age_gate.rejected" => Some("age_gate_rejected"),
+        // A decided review voided back to pending (#2968): without this arm
+        // subscribers that saw the approval/rejection never learn it was
+        // reopened — the gap #2264's review-identity work rides along with.
+        "age_gate.reopened" => Some("age_gate_reopened"),
         _ => None,
     }
 }
@@ -417,6 +421,7 @@ mod tests {
                 WebhookEvent::AgeGateQueued => ("age_gate.queued", "age_gate_queued"),
                 WebhookEvent::AgeGateApproved => ("age_gate.approved", "age_gate_approved"),
                 WebhookEvent::AgeGateRejected => ("age_gate.rejected", "age_gate_rejected"),
+                WebhookEvent::AgeGateReopened => ("age_gate.reopened", "age_gate_reopened"),
             }
         }
 

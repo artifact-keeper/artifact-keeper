@@ -713,6 +713,170 @@ mod qc_metadata_leak_2437 {
 }
 
 // ---------------------------------------------------------------------------
+// #2264 (low-sev) — age-gate config disclosure to read-scope callers.
+// Class:  Missing function-level authorization / configuration disclosure.
+// Seam:   `GET /repositories/{key}/age-gate`, exercised end-to-end over the
+//         real repo-config router against a live DB (the external HTTP
+//         vantage), not a helper.
+// What:   `get_repo_age_gate` checked only `require_scope("read")` — no
+//         per-repo access, no admin — so ANY authenticated read-scope caller
+//         (e.g. a read-only API token) could read gate posture
+//         (`enabled` + `min_age_days`) for every repository. The PUT and all
+//         four /admin review endpoints were already admin-only; the GET now
+//         matches them with `require_admin()`.
+// Asserts: a read-scope API token and a plain non-admin user both get 403
+//         with no config fields in the body; an admin still gets 200 with the
+//         config row (migration-146 defaults for a fresh repo).
+//
+// DB-gated; run with:
+//   DATABASE_URL="postgresql://.../artifact_registry" \
+//     cargo test --test security_regression_tests -- --ignored
+// ---------------------------------------------------------------------------
+mod age_gate_config_2264 {
+    // streaming-invariant: test file exempt — buffering a 403/200 response body
+    // in an assertion is not an artifact path (#1608).
+    #![allow(clippy::disallowed_methods)]
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Extension;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use artifact_keeper_backend::api::handlers::age_gate;
+    use artifact_keeper_backend::api::middleware::auth::AuthExtension;
+    use artifact_keeper_backend::api::{AppState, SharedState};
+    use artifact_keeper_backend::config::Config;
+    use artifact_keeper_backend::models::access_scope::AccessScope;
+
+    fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+        let config = Config {
+            database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+            storage_path: storage_path.into(),
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            ..Default::default()
+        };
+        let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        let registry = Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    /// A non-admin caller. `scopes` distinguishes the read-only API token
+    /// (the exact pre-fix caller) from a plain session user (scopes = None).
+    fn non_admin(scopes: Option<Vec<String>>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "ag2264-caller".to_string(),
+            email: "ag2264@test.local".to_string(),
+            is_admin: false,
+            is_api_token: scopes.is_some(),
+            is_service_account: false,
+            scopes,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+    }
+
+    fn admin() -> AuthExtension {
+        AuthExtension {
+            is_admin: true,
+            ..non_admin(None)
+        }
+    }
+
+    /// Insert a remote npm repo (age-gate columns keep migration-146 defaults).
+    /// Returns (repo id, repo key, storage dir).
+    async fn create_remote_repo(pool: &PgPool) -> (Uuid, String, String) {
+        let id = Uuid::new_v4();
+        let key = format!("ag2264-{}", &id.to_string()[..8]);
+        let dir = std::env::temp_dir().join(&key);
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $2, $3, 'remote', 'npm'::repository_format, 'https://registry.npmjs.org')",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        (id, key, dir.to_string_lossy().to_string())
+    }
+
+    /// GET `uri` as `caller` through the real repo-config router. The age-gate
+    /// handlers extract `Extension<Option<AuthExtension>>`, so inject the
+    /// Option form (as the production `auth_middleware` does).
+    async fn get_as(state: SharedState, caller: AuthExtension, uri: &str) -> (StatusCode, String) {
+        let app = age_gate::repo_config_routes()
+            .with_state(state)
+            .layer(Extension(Some(caller)));
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+    async fn regression_2264_age_gate_config_admin_only() {
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let (repo_id, key, storage) = create_remote_repo(&pool).await;
+        let state = build_state(pool.clone(), &storage);
+        let uri = format!("/{key}/age-gate");
+
+        // The exact disclosure: a read-only API token (passed the old
+        // `require_scope("read")` gate) must now get 403 with no config leak.
+        let (status, body) = get_as(
+            state.clone(),
+            non_admin(Some(vec!["read".to_string()])),
+            &uri,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "read-scope token must 403");
+        for needle in ["min_age_days", "enabled"] {
+            assert!(
+                !body.contains(needle),
+                "403 body must not leak `{needle}`: {body}"
+            );
+        }
+
+        // A plain non-admin session user is equally rejected — repo-access
+        // bits do not grant config reads.
+        let (status, _body) = get_as(state.clone(), non_admin(None), &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "non-admin user must 403");
+
+        // Admin parity with the PUT: still 200 with the config row.
+        let (status, body) = get_as(state.clone(), admin(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "admin GET must still succeed");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["repository_key"], key.as_str());
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["min_age_days"], 7);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #2439  Cross-repo authorization: ungated /security scan+finding reads and
 //        /sbom generate/cve-status writes.
 // ---------------------------------------------------------------------------
