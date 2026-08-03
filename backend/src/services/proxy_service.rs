@@ -4967,8 +4967,19 @@ impl ProxyService {
     /// re-asks upstream.
     async fn write_negative_cache(&self, cache_key: &str, metadata_key: &str, cache_path: &str) {
         // Drop any stale positive body so a future read can never serve it
-        // alongside the negative marker.
-        let _ = self.storage.delete(cache_key).await;
+        // alongside the negative marker. Probe first (#1611 follow-up):
+        // every negative-cache *renewal* on an already-, or never-, cached
+        // path re-enters this function every TTL window, and on a versioned
+        // backend an unconditional delete() always writes a new
+        // delete-marker version even when there is nothing to delete --
+        // observed stacking to 9+ marker versions on repeatedly-missed
+        // paths (e.g. checksum-file probes for deps that never publish a
+        // .sha1) with zero real content ever written. Gate the delete on a
+        // real object being present so renewals of an existing negative (or
+        // a path that never had content) don't write a redundant marker.
+        if matches!(self.storage.exists(cache_key).await, Ok(true)) {
+            let _ = self.storage.delete(cache_key).await;
+        }
 
         let now = Utc::now();
         let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
