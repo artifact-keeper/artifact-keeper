@@ -28,6 +28,7 @@ use crate::services::audit_service::{
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
+use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
 use crate::services::ldap_service::LdapService;
 use crate::services::saml_service::SamlService;
 
@@ -167,14 +168,15 @@ pub async fn oidc_login(
     // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
     // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
     let http_client = crate::services::http_client::sso_client();
-    let discovery: serde_json::Value = http_client
+    let discovery_response = http_client
         .get(&discovery_url)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
+    let discovery: serde_json::Value =
+        read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
 
     let authorization_endpoint = discovery["authorization_endpoint"]
         .as_str()
@@ -415,14 +417,15 @@ async fn oidc_callback_inner(
     // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
     // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
     let http_client = crate::services::http_client::sso_client();
-    let discovery: serde_json::Value = http_client
+    let discovery_response = http_client
         .get(&discovery_url)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
+    let discovery: serde_json::Value =
+        read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
 
     let token_endpoint = discovery["token_endpoint"]
         .as_str()
@@ -444,15 +447,16 @@ async fn oidc_callback_inner(
     if let Some(verifier) = pkce_code_verifier.as_deref() {
         form.push(("code_verifier", verifier));
     }
-    let token_response: serde_json::Value = http_client
+    let token_exchange_response = http_client
         .post(token_endpoint)
         .form(&form)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?;
+    let token_response: serde_json::Value =
+        read_json_capped(token_exchange_response, MAX_OIDC_RESPONSE_BYTES)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
 
     let id_token = token_response["id_token"]
         .as_str()
@@ -1387,7 +1391,7 @@ async fn fetch_userinfo_groups(
         tracing::warn!(status = %resp.status(), "OIDC userinfo non-200; using id_token groups only");
         return Vec::new();
     }
-    let body: serde_json::Value = match resp.json().await {
+    let body: serde_json::Value = match read_json_capped(resp, MAX_OIDC_RESPONSE_BYTES).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "OIDC userinfo not JSON; using id_token groups only");
@@ -1802,12 +1806,12 @@ async fn validate_id_token(
         .ok_or_else(|| AppError::Internal("OIDC discovery missing jwks_uri".into()))?;
     validate_oidc_fetch_url(jwks_uri, "OIDC JWKS URI")?;
 
-    let jwks: serde_json::Value = http_client
+    let jwks_response = http_client
         .get(jwks_uri)
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?
-        .json()
+        .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?;
+    let jwks: serde_json::Value = read_json_capped(jwks_response, MAX_OIDC_RESPONSE_BYTES)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse JWKS: {e}")))?;
 

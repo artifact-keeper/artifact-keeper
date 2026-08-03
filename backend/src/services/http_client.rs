@@ -205,6 +205,54 @@ pub fn sso_client() -> reqwest::Client {
         .expect("failed to build SSO HTTP client")
 }
 
+/// Maximum bytes accepted from an OIDC/SSO identity-provider JSON response
+/// (discovery document, token exchange, JWKS, userinfo). Real-world documents
+/// are a few KB; the cap stops a malicious or compromised IdP from returning
+/// a multi-hundred-MB body that a plain `reqwest .json()` would buffer
+/// entirely into memory (memory-DoS, issue #2834).
+pub const MAX_OIDC_RESPONSE_BYTES: usize = 512 * 1024;
+
+/// Deserialize a JSON response body while enforcing a hard byte cap.
+///
+/// Unlike `reqwest::Response::json()`, which buffers however many bytes the
+/// server chooses to send, this short-circuits on a `Content-Length` header
+/// above `max_bytes` (without reading any of the body), and otherwise streams
+/// the body chunk by chunk, erroring as soon as the accumulated size would
+/// exceed the cap. Only the bounded bytes are then deserialized.
+///
+/// Returns the error as a `String` so each call site can wrap it in its own
+/// error variant (`AppError::Internal`, `AppError::Authentication`, ...)
+/// while keeping its existing message prefix.
+pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<T, String> {
+    if let Some(declared) = response.content_length() {
+        if declared > max_bytes as u64 {
+            return Err(format!(
+                "response body of {declared} bytes exceeds the {max_bytes}-byte limit"
+            ));
+        }
+    }
+
+    let mut body: Vec<u8> = Vec::with_capacity(std::cmp::min(
+        response.content_length().unwrap_or(8 * 1024) as usize,
+        max_bytes,
+    ));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed to read response body: {e}"))?
+    {
+        if body.len() + chunk.len() > max_bytes {
+            return Err(format!("response body exceeds the {max_bytes}-byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|e| format!("invalid JSON in response body: {e}"))
+}
+
 /// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
 /// into the builder when configured. Shared by every client builder so the
 /// private-CA handling is identical and lives in one place.
@@ -902,6 +950,180 @@ mod tests {
             send_errored,
             "the request through an unexempted loopback proxy must fail at the \
              resolver instead of connecting"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // read_json_capped (#2834): OIDC outbound response-size cap
+    // -------------------------------------------------------------------
+
+    use super::read_json_capped;
+
+    /// A small, well-formed JSON body under the cap deserializes normally.
+    #[tokio::test]
+    async fn test_read_json_capped_small_body_ok() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"issuer": "https://idp.example.com"})),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let value: serde_json::Value = read_json_capped(resp, 1024).await.unwrap();
+        assert_eq!(value["issuer"], "https://idp.example.com");
+    }
+
+    /// A valid JSON body exactly at the cap is still accepted (the limit is
+    /// inclusive; only EXCEEDING it errors).
+    #[tokio::test]
+    async fn test_read_json_capped_body_exactly_at_cap_ok() {
+        // 64-byte JSON document, read with a 64-byte cap.
+        let body = format!("{{\"pad\":\"{}\"}}", "x".repeat(64 - 10));
+        assert_eq!(body.len(), 64);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let value: serde_json::Value = read_json_capped(resp, 64).await.unwrap();
+        assert!(value["pad"].is_string());
+    }
+
+    /// A chunked body (no Content-Length, so the header short-circuit cannot
+    /// fire) that grows past the cap must be aborted mid-stream with a clear
+    /// error, not buffered to completion.
+    #[tokio::test]
+    async fn test_read_json_capped_streamed_body_over_cap_errors() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let payload = vec![b'a'; 256];
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: application/json\r\n\
+                          Transfer-Encoding: chunked\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.write_all(b"100\r\n").await;
+                let _ = sock.write_all(&payload).await;
+                let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
+            }
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.content_length(),
+            None,
+            "chunked response must not carry a Content-Length, or this test \
+             would exercise the header short-circuit instead of the stream cap"
+        );
+        let err = read_json_capped::<serde_json::Value>(resp, 64)
+            .await
+            .expect_err("a 256-byte chunked body must exceed the 64-byte cap");
+        let _ = server.await;
+        assert!(
+            err.contains("exceeds the 64-byte limit"),
+            "expected size-cap error, got: {err}"
+        );
+    }
+
+    /// A Content-Length header above the cap must be refused WITHOUT reading
+    /// the body: the server here never sends a single body byte and holds the
+    /// socket open, so anything that tried to read would hang until the outer
+    /// timeout instead of returning immediately.
+    #[tokio::test]
+    async fn test_read_json_capped_content_length_over_cap_errors_without_reading_body() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: application/json\r\n\
+                          Content-Length: 10485760\r\n\r\n",
+                    )
+                    .await;
+                // Hold the connection open, never sending the body.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_json_capped::<serde_json::Value>(resp, 512 * 1024),
+        )
+        .await
+        .expect("oversized Content-Length must be refused immediately, not by reading the body");
+        server.abort();
+
+        let err = result.expect_err("10 MiB declared body must exceed the 512 KiB cap");
+        assert!(
+            err.contains("10485760") && err.contains("exceeds"),
+            "expected declared-length cap error, got: {err}"
+        );
+    }
+
+    /// A body under the cap that is not valid JSON surfaces a parse error
+    /// (the cap must not mask deserialization failures).
+    #[tokio::test]
+    async fn test_read_json_capped_invalid_json_errors() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("not json at all", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = read_json_capped::<serde_json::Value>(resp, 1024)
+            .await
+            .expect_err("non-JSON body must fail deserialization");
+        assert!(
+            err.contains("invalid JSON"),
+            "expected JSON parse error, got: {err}"
         );
     }
 }
