@@ -7893,6 +7893,18 @@ async fn handle_put_manifest(
 
     // Compute digest
     let digest = compute_sha256(&body);
+    // Integrity (OCI conformance corpus, distribution-spec): when a manifest is
+    // PUT BY DIGEST, the body must hash to that digest or the registry must
+    // reject with 400 DIGEST_INVALID. Tag references (non-`sha256:`) are
+    // unaffected. The blob-completion path already enforced this; the manifest
+    // path did not, so a mismatched-digest manifest was accepted (201).
+    if reference.starts_with("sha256:") && reference != digest {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "provided digest did not match the uploaded manifest content",
+        );
+    }
     let manifest_key = manifest_storage_key(&digest);
 
     // Classify by content BEFORE storing or tagging. The Content-Type header

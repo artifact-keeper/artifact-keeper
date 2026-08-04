@@ -1343,6 +1343,14 @@ fn build_simple_project_response(
                 if let Some(rp) = requires_python {
                     file["requires-python"] = serde_json::Value::String(rp);
                 }
+                // PEP 658/714: a wheel ships its METADATA and AK already serves
+                // it at `<file>.metadata`, so advertise `core-metadata` here so
+                // installers (pip/uv) can fetch metadata without downloading the
+                // whole wheel. sdists carry no such metadata, so they must not
+                // advertise it. Surfaced by the conformance corpus (pip harvest).
+                if filename.ends_with(".whl") {
+                    file["core-metadata"] = serde_json::Value::Bool(true);
+                }
                 // PEP 700: surface the distribution's upload timestamp as an
                 // RFC 3339 / ISO 8601 `upload-time` field (#1773).
                 if let Some(ut) = a.upload_time {
@@ -7834,6 +7842,62 @@ mod tests {
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files[0]["upload-time"], "2026-01-02T03:04:05Z");
+    }
+
+    // Conformance corpus (pip/warehouse harvest): a wheel's METADATA is served
+    // at `<file>.metadata`, so the PEP 691 JSON must advertise `core-metadata`
+    // (PEP 658/714) for the installer fast path; sdists must not. RED before the
+    // core-metadata emission, GREEN after.
+    #[test]
+    fn test_build_simple_project_response_json_advertises_core_metadata_for_wheels() {
+        let artifacts = vec![
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 3000,
+                checksum_sha256: "cafe".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0.tar.gz".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 2000,
+                checksum_sha256: "beef".to_string(),
+                metadata: None,
+                upload_time: None,
+            },
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let files = json["files"].as_array().unwrap();
+        let wheel = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".whl"))
+            .unwrap();
+        let sdist = files
+            .iter()
+            .find(|f| f["filename"].as_str().unwrap().ends_with(".tar.gz"))
+            .unwrap();
+        assert_eq!(
+            wheel["core-metadata"],
+            serde_json::Value::Bool(true),
+            "wheel must advertise core-metadata: {json}"
+        );
+        assert!(
+            sdist.get("core-metadata").is_none(),
+            "sdist must not advertise core-metadata: {json}"
+        );
     }
 
     #[test]
