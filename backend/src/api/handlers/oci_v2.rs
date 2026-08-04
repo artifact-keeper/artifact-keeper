@@ -606,6 +606,14 @@ pub(crate) fn manifest_storage_key(digest: &str) -> String {
     format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, digest)
 }
 
+/// A manifest PUT *by digest* must hash to that digest (compared
+/// case-insensitively, since clients may send uppercase hex); a *tag* reference
+/// is unconstrained. Extracted so the integrity guard in `handle_put_manifest`
+/// is unit-testable. (#3104 review)
+fn manifest_digest_reference_matches(reference: &str, computed_digest: &str) -> bool {
+    !reference.starts_with("sha256:") || reference.eq_ignore_ascii_case(computed_digest)
+}
+
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
@@ -7898,7 +7906,7 @@ async fn handle_put_manifest(
     // reject with 400 DIGEST_INVALID. Tag references (non-`sha256:`) are
     // unaffected. The blob-completion path already enforced this; the manifest
     // path did not, so a mismatched-digest manifest was accepted (201).
-    if reference.starts_with("sha256:") && reference != digest {
+    if !manifest_digest_reference_matches(reference, &digest) {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
@@ -26211,5 +26219,27 @@ mod virtual_scan_gate_tests {
         );
         // A path with no content operation does not route.
         assert_eq!(parse_oci_path("/repo/foo/bar"), None);
+    }
+
+    // Review: the manifest push-by-digest integrity guard (previously untested).
+    #[test]
+    fn test_manifest_digest_reference_matches() {
+        let d = "sha256:abcdef";
+        assert!(
+            manifest_digest_reference_matches("latest", d),
+            "a tag reference is unconstrained"
+        );
+        assert!(
+            manifest_digest_reference_matches("sha256:abcdef", d),
+            "a matching digest reference passes"
+        );
+        assert!(
+            manifest_digest_reference_matches("sha256:ABCDEF", d),
+            "an uppercase digest reference matches case-insensitively"
+        );
+        assert!(
+            !manifest_digest_reference_matches("sha256:deadbeef", d),
+            "a mismatched digest reference is rejected"
+        );
     }
 }

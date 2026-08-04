@@ -1411,10 +1411,18 @@ fn build_simple_project_response(
     html.push_str(&format!("<h1>Links for {}</h1>\n", normalized));
 
     for a in artifacts {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        // Security: the filename is publisher-controlled, so it must be
+        // HTML-escaped before it is spliced into this Simple-index page —
+        // otherwise a filename like `x"><script>...</script>.whl` is stored XSS
+        // that runs for anyone (incl. admins) viewing the index.
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
 
         let requires_python = a
@@ -1435,9 +1443,17 @@ fn build_simple_project_response(
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
 
+        // PEP 658/714: advertise the wheel's METADATA (HTML parity with the JSON
+        // branch), since AK serves `<file>.metadata`.
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
+
         html.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -1477,13 +1493,20 @@ fn merge_local_into_remote_simple_html(
 
     let mut local_lines = String::new();
     for a in local {
-        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
-        if existing.contains(filename) {
+        let raw_filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(raw_filename) {
             continue;
         }
+        // Security: escape the publisher-controlled filename before splicing it
+        // into the merged HTML index (stored-XSS otherwise; see the sibling
+        // build_simple_project_response HTML branch).
+        let filename = html_escape(raw_filename);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
+            repo_key,
+            normalized,
+            filename,
+            html_escape(&a.checksum_sha256)
         );
         let requires_python = a
             .metadata
@@ -1499,9 +1522,15 @@ fn merge_local_into_remote_simple_html(
             .upload_time
             .map(|ut| format!(" data-upload-time=\"{}\"", ut.format("%Y-%m-%dT%H:%M:%SZ")))
             .unwrap_or_default();
+        // PEP 658/714: advertise wheel METADATA (HTML parity with the JSON path).
+        let cm_attr = if raw_filename.ends_with(".whl") {
+            " data-core-metadata=\"true\""
+        } else {
+            ""
+        };
         local_lines.push_str(&format!(
-            "<a href=\"{}\"{}{}>{}</a><br/>\n",
-            url, rp_attr, ut_attr, filename
+            "<a href=\"{}\"{}{}{}>{}</a><br/>\n",
+            url, rp_attr, ut_attr, cm_attr, filename
         ));
     }
 
@@ -3481,11 +3510,12 @@ fn pypi_content_type(filename: &str) -> &'static str {
     }
 }
 
-/// Reject an uploaded PyPI filename that could escape the artifact storage path.
-/// The filename becomes a path segment (`<name>/<version>/<filename>`), so a
-/// separator, a parent reference, or a control character would let a malicious
-/// or compromised publisher write outside the intended location. Legitimate
-/// wheel/sdist filenames never contain any of these. (#3107)
+/// Reject an uploaded PyPI filename that is unsafe as a path segment or when
+/// rendered. Physical storage is content-addressed (keyed by SHA-256), so this
+/// is not the sole defense — the Simple-index render sites HTML-escape the
+/// filename — but it is defense-in-depth at the ingest choke-point: reject path
+/// separators, parent references, control characters, and HTML metacharacters
+/// (`< > "`). Legitimate wheel/sdist filenames never contain any of these. (#3107)
 fn is_safe_upload_filename(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -3493,6 +3523,9 @@ fn is_safe_upload_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains("..")
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.contains('"')
         && !name.chars().any(|c| c.is_control())
 }
 
@@ -3707,9 +3740,18 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
     // Neutralize any upstream `<base href>` first: our rewritten download links
-    // are root-relative, so a surviving `<base>` would re-anchor them onto the
-    // upstream origin (proxy bypass + upstream-host disclosure). See BASE_TAG_RE.
-    let html = BASE_TAG_RE.replace_all(html, "");
+    // are root-relative, so a surviving `<base>` re-anchors them onto the
+    // upstream origin (proxy bypass + host disclosure). Strip to a FIXPOINT:
+    // removing one `<base>` can splice surrounding bytes into a NEW one
+    // (`<ba<base x>se href=...>`), so loop until nothing more matches.
+    let mut html = html.to_string();
+    loop {
+        let stripped = BASE_TAG_RE.replace_all(&html, "").into_owned();
+        if stripped == html {
+            break;
+        }
+        html = stripped;
+    }
 
     REWRITE_RE
         .replace_all(&html, |caps: &regex::Captures| {
@@ -11245,5 +11287,56 @@ mod tests {
         assert!(!safe(""));
         assert!(!safe("foo\0bar.whl"));
         assert!(!safe("x..y.whl"));
+        // HTML metacharacters (defense-in-depth for the Simple-index render).
+        assert!(!safe("x\"><script>.whl"));
+        assert!(!safe("a<b.whl"));
+        assert!(!safe("a>b.whl"));
+    }
+
+    // Review (security blocker): the <base> strip must reach a FIXPOINT — a
+    // self-splicing decoy that reconstitutes a <base> after one pass must not
+    // survive, or the proxy-bypass/host-disclosure returns.
+    #[test]
+    fn test_rewrite_upstream_urls_strips_spliced_base_tag() {
+        let html = r#"<ba<base dummy>se href="//evil.example/"><a href="pkg-1.0.whl">pkg</a>"#;
+        let out = super::rewrite_upstream_urls(html, "myrepo", "proj");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "reconstituted <base> survived: {out}"
+        );
+        assert!(!out.contains("evil.example"), "upstream host leaked: {out}");
+        assert!(out.contains("/pypi/myrepo/simple/proj/pkg-1.0.whl"));
+    }
+
+    // Review (security blocker): a publisher-controlled filename must be
+    // HTML-escaped in the Simple-index HTML page (stored XSS otherwise); wheels
+    // also advertise data-core-metadata in the HTML branch (parity with JSON).
+    #[test]
+    fn test_build_simple_project_response_html_escapes_filename_and_advertises_core_metadata() {
+        // A slash-free payload so `rsplit('/')` keeps the whole filename (a real
+        // filename can't contain '/'; the injection vector is < > " ).
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "evil\"><img src=y onerror=alert(1)>.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 10,
+            checksum_sha256: "cafe".to_string(),
+            metadata: None,
+            upload_time: None,
+        }];
+        let headers = HeaderMap::new(); // no Accept -> HTML branch
+        let response =
+            build_simple_project_response(&headers, "repo", "x", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<img"), "unescaped tag rendered: {html}");
+        assert!(html.contains("&lt;img"), "filename not HTML-escaped: {html}");
+        assert!(html.contains("&quot;"), "quote not HTML-escaped: {html}");
+        assert!(
+            html.contains("data-core-metadata"),
+            "wheel core-metadata not advertised in the HTML branch"
+        );
     }
 }
