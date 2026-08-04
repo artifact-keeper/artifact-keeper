@@ -4362,4 +4362,183 @@ mod tests {
         .expect("ledger row after re-delete");
         assert_eq!(hosted_after, 0, "re-delete must not decrement again");
     }
+
+    // ---- #3064 migration 192: seeded backfill behaviour ------------------
+
+    /// Migration 192 rewrites `package_versions.version` for Maven catalog
+    /// rows whose version does not match any on-disk version directory. It is
+    /// data-dependent, and CI only ever applies migrations to an EMPTY
+    /// database, so the risky arms are exercised here against seeded rows.
+    ///
+    /// The regression this pins: `package_versions` carries
+    /// UNIQUE(package_id, version). An earlier revision rewrote EVERY broken
+    /// row whose package had exactly one candidate version directory. With two
+    /// broken rows and one candidate, both were updated to the same version and
+    /// the statement raised 23505, aborting the migration transaction. Because
+    /// migrations run at boot, that turned into a startup crash loop that only
+    /// manual DB surgery could clear. The fix rewrites at most one row per
+    /// package and deletes the rest, so this shape must now resolve cleanly.
+    ///
+    /// Uses TEMP tables (ON COMMIT DROP) inside a rolled-back transaction so
+    /// the real catalog is never touched, mirroring
+    /// `test_repository_owner_migration_backfills_without_flag_day`.
+    /// Skips without `DATABASE_URL`.
+    #[tokio::test]
+    async fn migration_192_repairs_maven_catalog_versions_without_unique_violation() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut tx = pool.begin().await.expect("begin migration fixture");
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE repositories (
+                id UUID PRIMARY KEY,
+                format TEXT NOT NULL
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE packages (
+                id UUID PRIMARY KEY,
+                repository_id UUID NOT NULL,
+                name TEXT NOT NULL
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE package_versions (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                package_id UUID NOT NULL,
+                version VARCHAR(100) NOT NULL,
+                UNIQUE (package_id, version)
+            ) ON COMMIT DROP;
+            CREATE TEMP TABLE artifacts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                repository_id UUID NOT NULL,
+                path TEXT NOT NULL
+            ) ON COMMIT DROP;
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("create isolated migration tables");
+
+        let repo = Uuid::new_v4();
+        // p_two: TWO broken rows, ONE candidate -> the 23505 shape.
+        let p_two = Uuid::new_v4();
+        // p_one: ONE broken row, ONE candidate -> unambiguous rewrite.
+        let p_one = Uuid::new_v4();
+        // p_healthy: already correct -> must be left alone.
+        let p_healthy = Uuid::new_v4();
+        // p_multi: ONE broken row, TWO candidates -> ambiguous, delete.
+        let p_multi = Uuid::new_v4();
+
+        sqlx::query("INSERT INTO repositories (id, format) VALUES ($1, 'maven')")
+            .bind(repo)
+            .execute(&mut *tx)
+            .await
+            .expect("seed repository");
+
+        sqlx::query(
+            "INSERT INTO packages (id, repository_id, name) VALUES \
+             ($1, $5, 'com.example.two:app'), \
+             ($2, $5, 'com.example.one:app'), \
+             ($3, $5, 'com.example.ok:app'), \
+             ($4, $5, 'com.example.multi:app')",
+        )
+        .bind(p_two)
+        .bind(p_one)
+        .bind(p_healthy)
+        .bind(p_multi)
+        .bind(repo)
+        .execute(&mut *tx)
+        .await
+        .expect("seed packages");
+
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path) VALUES \
+             ($1, 'com/example/two/app/2.0.0/app-2.0.0.jar'), \
+             ($1, 'com/example/one/app/3.0.0/app-3.0.0.jar'), \
+             ($1, 'com/example/ok/app/4.0.0/app-4.0.0.jar'), \
+             ($1, 'com/example/multi/app/5.0.0/app-5.0.0.jar'), \
+             ($1, 'com/example/multi/app/6.0.0/app-6.0.0.jar')",
+        )
+        .bind(repo)
+        .execute(&mut *tx)
+        .await
+        .expect("seed artifacts");
+
+        sqlx::query(
+            "INSERT INTO package_versions (package_id, version) VALUES \
+             ($1, 'example'), ($1, '1.0.0-STALE'), \
+             ($2, 'example'), \
+             ($3, '4.0.0'), \
+             ($4, 'multi')",
+        )
+        .bind(p_two)
+        .bind(p_one)
+        .bind(p_healthy)
+        .bind(p_multi)
+        .execute(&mut *tx)
+        .await
+        .expect("seed catalog rows");
+
+        // Must not raise 23505. Before the fix this errored and aborted.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/192_maven_package_versions_version_backfill.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("migration 192 must survive two broken rows sharing one candidate");
+
+        // Replay must be a no-op: the migration is forward-only and idempotent.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/192_maven_package_versions_version_backfill.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("migration 192 replays cleanly");
+
+        async fn versions_for(
+            tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            pkg: Uuid,
+        ) -> Vec<String> {
+            sqlx::query_scalar::<_, String>(
+                "SELECT version FROM package_versions WHERE package_id = $1 ORDER BY version",
+            )
+            .bind(pkg)
+            .fetch_all(&mut **tx)
+            .await
+            .expect("read catalog rows")
+        }
+
+        // The 23505 shape: ambiguous, so both rows are dropped rather than
+        // collapsed onto the same (package_id, version).
+        let two = versions_for(&mut tx, p_two).await;
+        assert!(
+            two.is_empty(),
+            "two broken rows sharing one candidate are deleted, not merged; got {two:?}"
+        );
+
+        // Unambiguous: repaired to the real on-disk version directory.
+        let one = versions_for(&mut tx, p_one).await;
+        assert_eq!(
+            one,
+            vec!["3.0.0".to_string()],
+            "single broken row with a single candidate is rewritten from the GAV path"
+        );
+
+        // Healthy rows are never touched.
+        let healthy = versions_for(&mut tx, p_healthy).await;
+        assert_eq!(
+            healthy,
+            vec!["4.0.0".to_string()],
+            "a row that already matches a version directory must be left alone"
+        );
+
+        // Ambiguous by candidate count: cannot attribute, so drop.
+        let multi = versions_for(&mut tx, p_multi).await;
+        assert!(
+            multi.is_empty(),
+            "a broken row with several candidate versions is deleted; got {multi:?}"
+        );
+
+        tx.rollback().await.expect("rollback migration fixture");
+    }
 }
