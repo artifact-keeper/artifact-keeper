@@ -1361,12 +1361,28 @@ fn build_simple_project_response(
             })
             .collect();
 
-        let versions: Vec<String> = artifacts
+        // PEP 691 `versions`: dedupe, then order by PEP 440 instead of
+        // lexicographically, so `1.9` precedes `1.10` (#3106). Anything that
+        // does not parse as PEP 440 has no defined position, so it sorts after
+        // every parseable version (by string, for stability) rather than
+        // interleaving with them.
+        let mut versions: Vec<String> = artifacts
             .iter()
             .filter_map(|a| a.version.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        versions.sort_by(|a, b| {
+            match (
+                PypiHandler::pep440_sort_key(a),
+                PypiHandler::pep440_sort_key(b),
+            ) {
+                (Some(ka), Some(kb)) => ka.cmp(&kb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
 
         // PEP 708 / Simple API v1.2: advertise v1.2 and, when the project has
         // operator `tracks` declarations, emit them under meta.tracks so
@@ -7961,6 +7977,50 @@ mod tests {
         assert!(
             sdist.get("core-metadata").is_none(),
             "sdist must not advertise core-metadata: {json}"
+        );
+    }
+
+    // Conformance corpus (pypa/packaging ordering vectors): the PEP 691
+    // `versions` array must be ordered by PEP 440, not lexicographically.
+    // The old BTreeSet<String> put `1.10` before `1.9` and `10.0` before `9.0`,
+    // which misleads any consumer treating the last entry as "latest".
+    // RED before the pep440_sort_key ordering, GREEN after. (#3106)
+    #[test]
+    fn test_build_simple_project_response_json_versions_are_pep440_ordered() {
+        let raw = ["1.9", "1.10", "10.0", "9.0", "1.0", "2.0rc1", "2.0"];
+        let artifacts: Vec<SimpleProjectArtifact> = raw
+            .iter()
+            .map(|v| SimpleProjectArtifact {
+                path: format!("pkg-{v}.tar.gz"),
+                version: Some((*v).to_string()),
+                size_bytes: 10,
+                checksum_sha256: "abc".to_string(),
+                metadata: None,
+                upload_time: None,
+            })
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+        let response =
+            build_simple_project_response(&headers, "repo", "pkg", &artifacts, &[]).unwrap();
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions: Vec<&str> = json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["1.0", "1.9", "1.10", "2.0rc1", "2.0", "9.0", "10.0"],
+            "versions must be PEP 440-ordered, not lexicographic: {json}"
         );
     }
 
