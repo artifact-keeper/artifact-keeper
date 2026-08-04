@@ -26131,4 +26131,49 @@ mod virtual_scan_gate_tests {
         let h = build_pagination_link_header("/v2/repo/tags/list", "a b", 50);
         assert_eq!(h, "</v2/repo/tags/list?n=50&last=a%20b>; rel=\"next\"");
     }
+
+    #[test]
+    fn test_is_index_content_type_matches_index_media_types_only() {
+        assert!(is_index_content_type(
+            "application/vnd.oci.image.index.v1+json"
+        ));
+        assert!(is_index_content_type(
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        ));
+        // Media-type parameters and casing are tolerated.
+        assert!(is_index_content_type(
+            "Application/VND.OCI.Image.Index.V1+JSON; charset=utf-8"
+        ));
+        // A single-image manifest is NOT an index.
+        assert!(!is_index_content_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+        assert!(!is_index_content_type("text/plain"));
+    }
+
+    #[test]
+    fn test_upload_storage_keys_and_progress_range() {
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            upload_storage_key(&id),
+            "oci-uploads/00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            upload_part_storage_key("oci-uploads/x", 5, &id),
+            "oci-uploads/x.part.00000005.00000000-0000-0000-0000-000000000000"
+        );
+        // Received-byte range is inclusive: empty -> "0-0", else "0-(n-1)".
+        assert_eq!(upload_progress_range(0), "0-0");
+        assert_eq!(upload_progress_range(1), "0-0");
+        assert_eq!(upload_progress_range(100), "0-99");
+        assert_eq!(upload_progress_range(-5), "0-0");
+    }
+
+    #[test]
+    fn test_manifest_storage_key_embeds_digest_and_is_deterministic() {
+        let k = manifest_storage_key("sha256:abcd");
+        assert!(k.contains("sha256:abcd"), "key must embed the digest: {k}");
+        assert_eq!(k, manifest_storage_key("sha256:abcd"));
+        assert_ne!(k, manifest_storage_key("sha256:ef01"));
+    }
 }
