@@ -11091,4 +11091,64 @@ mod tests {
             "anchor was not rewritten through the proxy: {out}"
         );
     }
+
+    // Conformance corpus (#2801): sniff_simple_index must classify a proxied
+    // body by content, never trusting a mislabeled upstream Content-Type. JSON
+    // (leading {/[), HTML (anchor/doctype/root), else Binary -> 502.
+    #[test]
+    fn test_sniff_simple_index_classifies_by_content() {
+        use super::{sniff_simple_index as sniff, SniffedSimpleIndex as S};
+        assert_eq!(sniff(br#"{"meta":{"api-version":"1.1"}}"#), S::Json);
+        assert_eq!(sniff(b"  \n\t[ ]"), S::Json, "leading whitespace then [");
+        assert_eq!(sniff(b"\xEF\xBB\xBF{}"), S::Json, "UTF-8 BOM then {{");
+        assert_eq!(sniff(b"<!DOCTYPE html><html></html>"), S::Html);
+        assert_eq!(sniff(b"<html><body></body></html>"), S::Html);
+        assert_eq!(sniff(b"<a href=\"x-1.0.whl\">x</a>"), S::Html);
+        assert_eq!(sniff(b"PK\x03\x04 not an index", ), S::Binary, "zip/binary");
+        assert_eq!(sniff(b"plain text, no markers"), S::Binary);
+        assert_eq!(sniff(b""), S::Binary, "empty body");
+    }
+
+    // Regression guard: the HTML rewriter rebuilds each download URL from the
+    // FILENAME, so a relative upstream href can never survive (this is why the
+    // earlier "relative-url leak" was a false alarm), and the #sha256 fragment
+    // is preserved.
+    #[test]
+    fn test_rewrite_upstream_urls_is_relative_safe_and_keeps_fragment() {
+        let html = concat!(
+            "<a href=\"../../packages/ab/foo-1.0-py3-none-any.whl#sha256=dead\">w</a>",
+            "<a href=\"foo-1.0.tar.gz\">s</a>"
+        );
+        let out = super::rewrite_upstream_urls(html, "r", "p");
+        assert!(!out.contains("../../"), "relative path survived: {out}");
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0-py3-none-any.whl#sha256=dead"),
+            "wheel url/fragment wrong: {out}"
+        );
+        assert!(
+            out.contains("/pypi/r/simple/p/foo-1.0.tar.gz"),
+            "sdist url wrong: {out}"
+        );
+    }
+
+    // Regression guard: the JSON rewriter rebuilds files[].url from the filename
+    // (relative-safe), returns None for non-PEP-691 bodies, and preserves the
+    // other file fields (hashes).
+    #[test]
+    fn test_rewrite_upstream_simple_json_rebuilds_and_preserves() {
+        let json = br#"{"meta":{"api-version":"1.1"},"name":"p","files":[
+            {"filename":"foo-1.0-py3-none-any.whl","url":"../../x/foo-1.0-py3-none-any.whl",
+             "hashes":{"sha256":"deadbeef"}}]}"#;
+        let out = super::rewrite_upstream_simple_json(json, "r", "p").expect("valid PEP 691");
+        assert!(!out.contains("../../"), "relative url survived: {out}");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            doc["files"][0]["url"],
+            "/pypi/r/simple/p/foo-1.0-py3-none-any.whl"
+        );
+        assert_eq!(doc["files"][0]["hashes"]["sha256"], "deadbeef");
+        // Not a PEP 691 body (no files array) -> None so the caller falls back.
+        assert!(super::rewrite_upstream_simple_json(b"<html></html>", "r", "p").is_none());
+        assert!(super::rewrite_upstream_simple_json(br#"{"nope":1}"#, "r", "p").is_none());
+    }
 }
