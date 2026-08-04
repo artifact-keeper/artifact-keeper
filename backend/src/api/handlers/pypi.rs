@@ -11192,4 +11192,18 @@ mod tests {
         assert_eq!(esc("\"q\" 'a'"), "&quot;q&quot; &#39;a&#39;");
         assert_eq!(esc("plain"), "plain");
     }
+
+    // version_from_pypi_filename: the version is the field after the name for a
+    // wheel, and the final '-'-segment for an sdist (project names may contain
+    // '-', PEP 440 versions do not). Unknown/degenerate names have no version.
+    #[test]
+    fn test_version_from_pypi_filename() {
+        use super::version_from_pypi_filename as ver;
+        assert_eq!(ver("foo-1.2.3-py3-none-any.whl").as_deref(), Some("1.2.3"));
+        assert_eq!(ver("my-cool-pkg-2.0.tar.gz").as_deref(), Some("2.0"));
+        assert_eq!(ver("pkg-1.0.zip").as_deref(), Some("1.0"));
+        assert_eq!(ver("pkg-3.1.tar.xz").as_deref(), Some("3.1"));
+        assert_eq!(ver("nover.txt"), None);
+        assert_eq!(ver("noversion.whl"), None);
+    }
 }
