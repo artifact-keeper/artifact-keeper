@@ -3303,6 +3303,14 @@ async fn upload(
     let filename = file_name.ok_or_else(|| {
         AppError::Validation("Missing filename in content field".to_string()).into_response()
     })?;
+    // Security (#3107): the filename becomes a segment of the artifact storage
+    // path, so reject anything that could escape it before it is used below.
+    if !is_safe_upload_filename(&filename) {
+        return Err(
+            AppError::Validation(format!("Invalid upload filename: {filename:?}"))
+                .into_response(),
+        );
+    }
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
@@ -3471,6 +3479,21 @@ fn pypi_content_type(filename: &str) -> &'static str {
     } else {
         "application/octet-stream"
     }
+}
+
+/// Reject an uploaded PyPI filename that could escape the artifact storage path.
+/// The filename becomes a path segment (`<name>/<version>/<filename>`), so a
+/// separator, a parent reference, or a control character would let a malicious
+/// or compromised publisher write outside the intended location. Legitimate
+/// wheel/sdist filenames never contain any of these. (#3107)
+fn is_safe_upload_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.chars().any(|c| c.is_control())
 }
 
 fn html_escape(s: &str) -> String {
@@ -11205,5 +11228,22 @@ mod tests {
         assert_eq!(ver("pkg-3.1.tar.xz").as_deref(), Some("3.1"));
         assert_eq!(ver("nover.txt"), None);
         assert_eq!(ver("noversion.whl"), None);
+    }
+
+    // Security (#3107): the upload filename guard accepts real wheel/sdist names
+    // and rejects path separators, parent references, and control characters.
+    #[test]
+    fn test_is_safe_upload_filename_rejects_traversal_and_separators() {
+        use super::is_safe_upload_filename as safe;
+        assert!(safe("dtfpkg-1.0.0-py3-none-any.whl"));
+        assert!(safe("dtfpkg-1.0.0.tar.gz"));
+        assert!(!safe("../evil.whl"));
+        assert!(!safe("a/b.whl"));
+        assert!(!safe("a\\b.whl"));
+        assert!(!safe(".."));
+        assert!(!safe("."));
+        assert!(!safe(""));
+        assert!(!safe("foo\0bar.whl"));
+        assert!(!safe("x..y.whl"));
     }
 }
