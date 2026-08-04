@@ -192,9 +192,38 @@ jobs:
               patch = f.get('patch')
               if not patch:
                   full_ci(f'{name!r} has no inline patch to validate (diff too large)')
-              for line in patch.splitlines():
-                  if line.startswith('+++') or line.startswith('---'):
-                      continue
+              # Split on '\n' ONLY. str.splitlines() also breaks on the
+              # vertical tab, form feed, file/group/record separators, NEL and
+              # the Unicode line/paragraph separators -- none of which git or
+              # the GitHub patch field treat as a line terminator. Every one of
+              # them is also valid Rust/TOML whitespace, so splitlines() turned
+              # a single physical diff line into two Python "lines" and the
+              # trailing fragment -- which does not start with +/- -- was
+              # skipped entirely, letting arbitrary code ride into openapi.rs
+              # on a line whose prefix matched the version regex. The gate then
+              # skipped Check Rust, Backend Unit Tests and Code Coverage while
+              # CI Complete reported success. Belt and braces: reject outright
+              # any patch containing one of those separators.
+              SPLIT_ONLY_IN_PYTHON = (
+                  '\x0b', '\x0c', '\x1c', '\x1d', '\x1e',
+                  '\x85', '\u2028', '\u2029',
+              )
+              if any(sep in patch for sep in SPLIT_ONLY_IN_PYTHON):
+                  full_ci(f'{name!r} patch contains a non-newline line separator')
+              lines = [ln.rstrip('\r') for ln in patch.split('\n')]
+              # Cargo.toml: the regex alone is position-blind. A section table
+              # ([dependencies.foo], [patch.crates-io.foo], ...) also puts
+              # `version = "X.Y.Z"` at column 0, so a dependency edit would
+              # match. Require that the only TOML section the hunk touches is
+              # [workspace.package]; anything else falls back to full CI.
+              if name == 'Cargo.toml':
+                  sections = {
+                      ln[1:].strip() for ln in lines
+                      if ln[1:2] == '[' and ln[:1] in (' ', '+', '-')
+                  }
+                  if sections - {'[workspace.package]'}:
+                      full_ci(f'Cargo.toml hunk touches sections {sorted(sections)}')
+              for line in lines:
                   if line.startswith(('+', '-')) and not line_re.match(line):
                       full_ci(f'{name!r} changes a non-version line: {line!r}')
 
