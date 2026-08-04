@@ -3498,6 +3498,15 @@ static REWRITE_RE: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 
+/// Matches an upstream `<base ...>` element. A `<base href>` re-anchors every
+/// relative/root-relative link on the page; because `rewrite_upstream_urls`
+/// emits ROOT-RELATIVE download URLs (`/pypi/<repo>/...`), a surviving `<base>`
+/// would make the client resolve them against the upstream origin instead of
+/// Artifact Keeper — a proxy bypass that also discloses the upstream host and
+/// breaks air-gapped installs. We strip it. Same class as the #2801
+/// Content-Type sniff fix, for the `<base>` vector.
+static BASE_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<base\b[^>]*>").unwrap());
+
 /// Split a URL into its base (scheme + host) and path components.
 ///
 /// For example, `https://files.pythonhosted.org/packages/ab/cd/file.whl` splits
@@ -3666,8 +3675,13 @@ fn bad_upstream_simple_index() -> Response {
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     let normalized = PypiHandler::normalize_name(project);
 
+    // Neutralize any upstream `<base href>` first: our rewritten download links
+    // are root-relative, so a surviving `<base>` would re-anchor them onto the
+    // upstream origin (proxy bypass + upstream-host disclosure). See BASE_TAG_RE.
+    let html = BASE_TAG_RE.replace_all(html, "");
+
     REWRITE_RE
-        .replace_all(html, |caps: &regex::Captures| {
+        .replace_all(&html, |caps: &regex::Captures| {
             let before_href = &caps[1];
             // The href value is in whichever quote-alternation group matched
             // (double / single / unquoted); `after` is the trailing group.
@@ -10982,6 +10996,35 @@ mod tests {
             scan_header.as_deref(),
             Some("clean"),
             "fail-open keeps the cached-verdict fast path on an unknown probe"
+        );
+    }
+
+    // Conformance corpus (pip harvest, MIT): a `<base href>` on an upstream
+    // Simple index must be neutralized, or it re-anchors our root-relative
+    // rewritten download URLs onto the upstream origin — a proxy bypass that
+    // discloses the upstream host and breaks air-gapped installs. RED before
+    // the BASE_TAG_RE strip, GREEN after. Sibling of the #2801 sniff fix.
+    #[test]
+    fn test_rewrite_upstream_urls_neutralizes_base_href() {
+        let upstream = concat!(
+            "<!DOCTYPE html><html><head>",
+            "<base href=\"https://internal-mirror.example/simple/\">",
+            "</head><body>",
+            "<a href=\"foo-1.0.tar.gz#sha256=abc\">foo-1.0.tar.gz</a>",
+            "</body></html>"
+        );
+        let out = super::rewrite_upstream_urls(upstream, "myrepo", "foo");
+        assert!(
+            !out.to_lowercase().contains("<base"),
+            "<base> tag survived the rewrite: {out}"
+        );
+        assert!(
+            !out.contains("internal-mirror.example"),
+            "upstream host leaked through <base>: {out}"
+        );
+        assert!(
+            out.contains("/pypi/myrepo/simple/foo/foo-1.0.tar.gz"),
+            "anchor was not rewritten through the proxy: {out}"
         );
     }
 }
