@@ -26176,4 +26176,40 @@ mod virtual_scan_gate_tests {
         assert_eq!(k, manifest_storage_key("sha256:abcd"));
         assert_ne!(k, manifest_storage_key("sha256:ef01"));
     }
+
+    #[test]
+    fn test_parse_oci_path_routes_operations_and_multi_segment_names() {
+        let s = |x: &str| x.to_string();
+        // Tag listing.
+        assert_eq!(
+            parse_oci_path("/myrepo/tags/list"),
+            Some((s("myrepo"), s("tags"), Some(s("list"))))
+        );
+        // Manifest by tag, multi-segment repository name.
+        assert_eq!(
+            parse_oci_path("/library/alpine/manifests/3.19"),
+            Some((s("library/alpine"), s("manifests"), Some(s("3.19"))))
+        );
+        // Manifest by digest.
+        assert_eq!(
+            parse_oci_path("/repo/manifests/sha256:abc"),
+            Some((s("repo"), s("manifests"), Some(s("sha256:abc"))))
+        );
+        // Blob by digest.
+        assert_eq!(
+            parse_oci_path("/repo/blobs/sha256:def"),
+            Some((s("repo"), s("blobs"), Some(s("sha256:def"))))
+        );
+        // Blob upload session: no uuid, and with a uuid.
+        assert_eq!(
+            parse_oci_path("/repo/blobs/uploads"),
+            Some((s("repo"), s("uploads"), None))
+        );
+        assert_eq!(
+            parse_oci_path("/repo/blobs/uploads/uuid-123"),
+            Some((s("repo"), s("uploads"), Some(s("uuid-123"))))
+        );
+        // A path with no content operation does not route.
+        assert_eq!(parse_oci_path("/repo/foo/bar"), None);
+    }
 }
