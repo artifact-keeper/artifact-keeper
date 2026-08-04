@@ -43,7 +43,10 @@ fn sdist_zip_parses_name_and_version() {
 
 #[test]
 fn unknown_extension_and_malformed_names_are_rejected() {
-    assert!(PypiHandler::parse_filename("pkg-1.0.rpm").is_err(), "unknown ext");
+    assert!(
+        PypiHandler::parse_filename("pkg-1.0.rpm").is_err(),
+        "unknown ext"
+    );
     assert!(
         PypiHandler::parse_filename("too-short.whl").is_err(),
         "wheel needs >=5 hyphen fields"

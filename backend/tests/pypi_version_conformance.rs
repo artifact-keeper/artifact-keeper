@@ -83,7 +83,15 @@ fn pep440_distinct_versions_do_not_collide() {
     assert_ne!(canon("1.0"), canon("2.0"), "different release");
     assert_ne!(canon("1.0rc1"), canon("1.0rc2"), "rc1 vs rc2");
     // All of these are valid, so distinctness is a real (not vacuous) check.
-    for v in ["1.0a1", "1.0b1", "1.0", "1!1.0", "1.0.post1", "1.0.dev1", "2.0"] {
+    for v in [
+        "1.0a1",
+        "1.0b1",
+        "1.0",
+        "1!1.0",
+        "1.0.post1",
+        "1.0.dev1",
+        "2.0",
+    ] {
         assert!(canon(v).is_some(), "'{v}' should be a valid version");
     }
 }

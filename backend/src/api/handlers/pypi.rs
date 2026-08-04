@@ -3336,8 +3336,7 @@ async fn upload(
     // path, so reject anything that could escape it before it is used below.
     if !is_safe_upload_filename(&filename) {
         return Err(
-            AppError::Validation(format!("Invalid upload filename: {filename:?}"))
-                .into_response(),
+            AppError::Validation(format!("Invalid upload filename: {filename:?}")).into_response(),
         );
     }
 
@@ -11169,7 +11168,7 @@ mod tests {
         assert_eq!(sniff(b"<!DOCTYPE html><html></html>"), S::Html);
         assert_eq!(sniff(b"<html><body></body></html>"), S::Html);
         assert_eq!(sniff(b"<a href=\"x-1.0.whl\">x</a>"), S::Html);
-        assert_eq!(sniff(b"PK\x03\x04 not an index", ), S::Binary, "zip/binary");
+        assert_eq!(sniff(b"PK\x03\x04 not an index",), S::Binary, "zip/binary");
         assert_eq!(sniff(b"plain text, no markers"), S::Binary);
         assert_eq!(sniff(b""), S::Binary, "empty body");
     }
@@ -11227,9 +11226,15 @@ mod tests {
             tag("numpy-1.0.0-cp39-cp39-manylinux1_x86_64.whl").as_deref(),
             Some("cp39-cp39-manylinux1_x86_64")
         );
-        assert_eq!(tag("foo-1.0-py3-none-any.whl").as_deref(), Some("py3-none-any"));
+        assert_eq!(
+            tag("foo-1.0-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
         // A build tag (6 fields) still yields the trailing python-abi-platform.
-        assert_eq!(tag("foo-1.0-1-py3-none-any.whl").as_deref(), Some("py3-none-any"));
+        assert_eq!(
+            tag("foo-1.0-1-py3-none-any.whl").as_deref(),
+            Some("py3-none-any")
+        );
         // Case-insensitive (tags are lowercased).
         assert_eq!(
             tag("Foo-1.0-CP39-CP39-Win_AMD64.whl").as_deref(),
@@ -11332,7 +11337,10 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<img"), "unescaped tag rendered: {html}");
-        assert!(html.contains("&lt;img"), "filename not HTML-escaped: {html}");
+        assert!(
+            html.contains("&lt;img"),
+            "filename not HTML-escaped: {html}"
+        );
         assert!(html.contains("&quot;"), "quote not HTML-escaped: {html}");
         assert!(
             html.contains("data-core-metadata"),

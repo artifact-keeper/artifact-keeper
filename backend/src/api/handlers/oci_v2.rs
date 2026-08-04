@@ -26062,8 +26062,7 @@ mod virtual_scan_gate_tests {
     // manifest_storage_key are already tested above and are not duplicated here.)
     #[test]
     fn test_apply_cursor_pagination_n_zero_is_empty_page() {
-        let (page, more) =
-            apply_cursor_pagination(vec!["a".to_string(), "b".to_string()], None, 0);
+        let (page, more) = apply_cursor_pagination(vec!["a".to_string(), "b".to_string()], None, 0);
         assert!(page.is_empty(), "n=0 must yield an empty page");
         assert!(!more, "n=0 must not advertise more");
     }
@@ -26071,7 +26070,10 @@ mod virtual_scan_gate_tests {
     #[test]
     fn test_classify_manifest_image_index_malformed() {
         // Not JSON, and a degenerate object (no config, no manifests) -> Malformed.
-        assert!(matches!(classify_manifest(b"not json"), ManifestClass::Malformed));
+        assert!(matches!(
+            classify_manifest(b"not json"),
+            ManifestClass::Malformed
+        ));
         assert!(matches!(classify_manifest(b"{}"), ManifestClass::Malformed));
         // A manifests array with no image config of its own -> Index.
         let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:aa","mediaType":"application/vnd.oci.image.manifest.v1+json"}]}"#;

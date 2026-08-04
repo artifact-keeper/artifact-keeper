@@ -48,6 +48,10 @@ fn pep503_all_separator_input_normalizes_to_empty() {
 fn pep503_is_idempotent() {
     for raw in ["Foo.Bar", "a--b", "zope.interface", "Already-Norm"] {
         let once = norm(raw);
-        assert_eq!(norm(&once), once, "normalize_name not idempotent for '{raw}'");
+        assert_eq!(
+            norm(&once),
+            once,
+            "normalize_name not idempotent for '{raw}'"
+        );
     }
 }
