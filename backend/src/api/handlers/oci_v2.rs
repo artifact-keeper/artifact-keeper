@@ -26056,37 +26056,10 @@ mod virtual_scan_gate_tests {
         );
     }
 
-    // Conformance corpus (distribution-spec): tag-list pagination + manifest
-    // classification are pure functions and are the OCI slice's UNIT targets.
-    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn test_parse_pagination_params_defaults_bounds_and_errors() {
-        // No params -> spec "all", capped to the 100 default; no cursor.
-        let (n, last) = parse_pagination_params(&params(&[])).unwrap();
-        assert_eq!(n, 100);
-        assert!(last.is_none());
-        // Explicit n + last cursor are echoed.
-        let (n, last) = parse_pagination_params(&params(&[("n", "5"), ("last", "foo")])).unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(last.as_deref(), Some("foo"));
-        // n=0 is valid (empty page).
-        assert_eq!(parse_pagination_params(&params(&[("n", "0")])).unwrap().0, 0);
-        // Oversized n is capped at 10000 (unbounded-response guard).
-        assert_eq!(
-            parse_pagination_params(&params(&[("n", "999999")])).unwrap().0,
-            10000
-        );
-        // Non-numeric and negative n are rejected (400 PAGINATION_NUMBER_INVALID).
-        assert!(parse_pagination_params(&params(&[("n", "abc")])).is_err());
-        assert!(parse_pagination_params(&params(&[("n", "-1")])).is_err());
-    }
-
+    // Conformance corpus (distribution-spec): OCI pure-function UNIT targets not
+    // already covered elsewhere in this file. (parse_pagination_params,
+    // compute_sha256, oci_lexical_cmp, build_pagination_link_header, and
+    // manifest_storage_key are already tested above and are not duplicated here.)
     #[test]
     fn test_apply_cursor_pagination_n_zero_is_empty_page() {
         let (page, more) =
@@ -26106,38 +26079,6 @@ mod virtual_scan_gate_tests {
         // An image config descriptor with a rootfs layer -> Image.
         let image = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cc"},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:dd"}]}"#;
         assert!(matches!(classify_manifest(image), ManifestClass::Image));
-    }
-
-    #[test]
-    fn test_compute_sha256_is_prefixed_hex_and_deterministic() {
-        // Known SHA-256 vectors, with the OCI `sha256:` prefix.
-        assert_eq!(
-            compute_sha256(b""),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            compute_sha256(b"abc"),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(compute_sha256(b"abc"), compute_sha256(b"abc"));
-        assert_ne!(compute_sha256(b"abc"), compute_sha256(b"abd"));
-    }
-
-    #[test]
-    fn test_oci_lexical_cmp_case_insensitive_with_raw_tiebreak() {
-        use std::cmp::Ordering;
-        // Primary sort is case-insensitive...
-        assert_eq!(oci_lexical_cmp("Alpha", "beta"), Ordering::Less);
-        assert_eq!(oci_lexical_cmp("v1.0", "v1.0"), Ordering::Equal);
-        // ...ties broken by raw bytes so ordering is total ('A' < 'a').
-        assert_eq!(oci_lexical_cmp("Tag", "tag"), Ordering::Less);
-        assert_eq!(oci_lexical_cmp("tag", "Tag"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_build_pagination_link_header_url_encodes_last() {
-        let h = build_pagination_link_header("/v2/repo/tags/list", "a b", 50);
-        assert_eq!(h, "</v2/repo/tags/list?n=50&last=a%20b>; rel=\"next\"");
     }
 
     #[test]
@@ -26175,14 +26116,6 @@ mod virtual_scan_gate_tests {
         assert_eq!(upload_progress_range(1), "0-0");
         assert_eq!(upload_progress_range(100), "0-99");
         assert_eq!(upload_progress_range(-5), "0-0");
-    }
-
-    #[test]
-    fn test_manifest_storage_key_embeds_digest_and_is_deterministic() {
-        let k = manifest_storage_key("sha256:abcd");
-        assert!(k.contains("sha256:abcd"), "key must embed the digest: {k}");
-        assert_eq!(k, manifest_storage_key("sha256:abcd"));
-        assert_ne!(k, manifest_storage_key("sha256:ef01"));
     }
 
     #[test]
