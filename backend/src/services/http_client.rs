@@ -265,7 +265,10 @@ fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
                     for cert in certs {
                         builder = builder.add_root_certificate(cert);
                     }
-                    tracing::info!(
+                    // debug, not info: this fires on every client build (many
+                    // per request, e.g. /health's Trivy sub-check), not once at
+                    // startup, so info-level floods the logs.
+                    tracing::debug!(
                         path = %ca_path,
                         count,
                         "Loaded custom CA certificate(s)"

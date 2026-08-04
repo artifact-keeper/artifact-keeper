@@ -155,6 +155,11 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
 
     tracing::Span::current().record("correlation_id", tracing::field::display(&correlation_id));
 
+    // K8s/Prometheus poll the probe endpoints on a tight loop forever; their
+    // per-request "Request completed" lines bury real request logs. Skip them
+    // unless the operator opts back in via LOG_PROBE_REQUESTS (see #544).
+    let log_completed = !is_probe_path(request.uri().path()) || log_probe_requests();
+
     // Scope the task-local around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
     // the span carries and the response header echoes (#2414).
@@ -165,15 +170,39 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
             response.headers_mut().insert(CORRELATION_ID_HEADER, value);
         }
 
-        tracing::info!(
-            correlation_id = %correlation_id,
-            status = %response.status().as_u16(),
-            "Request completed"
-        );
+        if log_completed {
+            tracing::info!(
+                correlation_id = %correlation_id,
+                status = %response.status().as_u16(),
+                "Request completed"
+            );
+        }
 
         response
     })
     .await
+}
+
+/// Health/readiness/liveness/metrics paths (see `api::routes`). Kubernetes and
+/// Prometheus hit these continuously, so their per-request logs are pure noise.
+/// Same set the setup/guest-access middlewares treat as unauthenticated probes.
+fn is_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health" | "/healthz" | "/ready" | "/readyz" | "/livez" | "/metrics"
+    )
+}
+
+/// Whether probe requests should still be logged. Defaults to off (silent);
+/// set `LOG_PROBE_REQUESTS=true` to restore per-probe request logging. Read
+/// once — env is fixed for the process lifetime.
+fn log_probe_requests() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LOG_PROBE_REQUESTS")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -184,6 +213,19 @@ mod tests {
     fn test_correlation_id_generate() {
         let id = CorrelationId::generate();
         assert!(Uuid::parse_str(id.as_str()).is_ok());
+    }
+
+    #[test]
+    fn probe_paths_match_routes_and_nothing_else() {
+        // Same set wired in api::routes plus /metrics (setup/guest_access).
+        for p in [
+            "/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics",
+        ] {
+            assert!(is_probe_path(p), "{p} should be treated as a probe");
+        }
+        for p in ["/api/v1/packages", "/health/dashboard", "/", "/readyz/x"] {
+            assert!(!is_probe_path(p), "{p} must not be suppressed");
+        }
     }
 
     #[test]
