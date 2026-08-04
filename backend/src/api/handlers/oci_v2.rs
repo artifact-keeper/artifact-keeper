@@ -26047,4 +26047,56 @@ mod virtual_scan_gate_tests {
             "a clean image's blob through the virtual must still serve (no over-block)"
         );
     }
+
+    // Conformance corpus (distribution-spec): tag-list pagination + manifest
+    // classification are pure functions and are the OCI slice's UNIT targets.
+    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_pagination_params_defaults_bounds_and_errors() {
+        // No params -> spec "all", capped to the 100 default; no cursor.
+        let (n, last) = parse_pagination_params(&params(&[])).unwrap();
+        assert_eq!(n, 100);
+        assert!(last.is_none());
+        // Explicit n + last cursor are echoed.
+        let (n, last) = parse_pagination_params(&params(&[("n", "5"), ("last", "foo")])).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(last.as_deref(), Some("foo"));
+        // n=0 is valid (empty page).
+        assert_eq!(parse_pagination_params(&params(&[("n", "0")])).unwrap().0, 0);
+        // Oversized n is capped at 10000 (unbounded-response guard).
+        assert_eq!(
+            parse_pagination_params(&params(&[("n", "999999")])).unwrap().0,
+            10000
+        );
+        // Non-numeric and negative n are rejected (400 PAGINATION_NUMBER_INVALID).
+        assert!(parse_pagination_params(&params(&[("n", "abc")])).is_err());
+        assert!(parse_pagination_params(&params(&[("n", "-1")])).is_err());
+    }
+
+    #[test]
+    fn test_apply_cursor_pagination_n_zero_is_empty_page() {
+        let (page, more) =
+            apply_cursor_pagination(vec!["a".to_string(), "b".to_string()], None, 0);
+        assert!(page.is_empty(), "n=0 must yield an empty page");
+        assert!(!more, "n=0 must not advertise more");
+    }
+
+    #[test]
+    fn test_classify_manifest_image_index_malformed() {
+        // Not JSON, and a degenerate object (no config, no manifests) -> Malformed.
+        assert!(matches!(classify_manifest(b"not json"), ManifestClass::Malformed));
+        assert!(matches!(classify_manifest(b"{}"), ManifestClass::Malformed));
+        // A manifests array with no image config of its own -> Index.
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:aa","mediaType":"application/vnd.oci.image.manifest.v1+json"}]}"#;
+        assert!(matches!(classify_manifest(index), ManifestClass::Index));
+        // An image config descriptor with a rootfs layer -> Image.
+        let image = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cc"},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:dd"}]}"#;
+        assert!(matches!(classify_manifest(image), ManifestClass::Image));
+    }
 }
