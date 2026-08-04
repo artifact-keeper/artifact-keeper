@@ -314,14 +314,24 @@ impl PypiHandler {
             out.push_str(&format!(".dev{}", n));
         }
         if let Some(local) = local {
-            let parts: Vec<&str> = local
-                .split(['.', '-', '_'])
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                out.push('+');
-                out.push_str(&parts.join(".").to_ascii_lowercase());
+            // PEP 440 local version: one or more `[a-zA-Z0-9]+` segments joined
+            // by a single `.`/`-`/`_`. A present-but-empty local (`1.0+`), an
+            // empty segment from a leading/trailing/doubled separator
+            // (`1.0+_foo`, `1.0+a..b`), or a non-alphanumeric segment (`1.0++`)
+            // is INVALID — reject it rather than silently mangling it, so the
+            // canonical key can't false-equate two distinct/invalid inputs. (#3111)
+            if local.is_empty() {
+                return None;
             }
+            let parts: Vec<&str> = local.split(['.', '-', '_']).collect();
+            if parts
+                .iter()
+                .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric()))
+            {
+                return None;
+            }
+            out.push('+');
+            out.push_str(&parts.join(".").to_ascii_lowercase());
         }
         Some(out)
     }

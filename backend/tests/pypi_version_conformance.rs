@@ -102,3 +102,17 @@ fn pep440_invalid_versions_are_rejected() {
         assert_eq!(canon(bad), None, "'{bad}' should be rejected as invalid");
     }
 }
+
+#[test]
+fn pep440_invalid_local_versions_are_rejected() {
+    // #3111: a local version must be `[a-zA-Z0-9]+` segments joined by a single
+    // `.`/`-`/`_`. These were silently mangled before, not rejected.
+    assert_eq!(canon("1.0+"), None, "empty local");
+    assert_eq!(canon("1.0++"), None, "non-alphanumeric local segment");
+    assert_eq!(canon("1.0+_foo"), None, "leading separator in local");
+    assert_eq!(canon("1.0+abc..def"), None, "doubled separator in local");
+    // ...but valid local versions still canonicalize.
+    assert!(canon("1.0+abc").is_some());
+    assert!(canon("1.0+ubuntu.1").is_some());
+    assert!(canon("1.0+abc-def").is_some());
+}
