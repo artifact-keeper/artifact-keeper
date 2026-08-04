@@ -11151,4 +11151,45 @@ mod tests {
         assert!(super::rewrite_upstream_simple_json(b"<html></html>", "r", "p").is_none());
         assert!(super::rewrite_upstream_simple_json(br#"{"nope":1}"#, "r", "p").is_none());
     }
+
+    // Binary-distribution spec: the wheel compatibility tag is the last three
+    // '-'-fields of the stem (python-abi-platform), lowercased; non-wheels and
+    // too-short names have no tag.
+    #[test]
+    fn test_wheel_compat_tag_extracts_last_three_fields_lowercased() {
+        use super::wheel_compat_tag as tag;
+        assert_eq!(
+            tag("numpy-1.0.0-cp39-cp39-manylinux1_x86_64.whl").as_deref(),
+            Some("cp39-cp39-manylinux1_x86_64")
+        );
+        assert_eq!(tag("foo-1.0-py3-none-any.whl").as_deref(), Some("py3-none-any"));
+        // A build tag (6 fields) still yields the trailing python-abi-platform.
+        assert_eq!(tag("foo-1.0-1-py3-none-any.whl").as_deref(), Some("py3-none-any"));
+        // Case-insensitive (tags are lowercased).
+        assert_eq!(
+            tag("Foo-1.0-CP39-CP39-Win_AMD64.whl").as_deref(),
+            Some("cp39-cp39-win_amd64")
+        );
+        // Non-wheel and malformed names have no platform tag.
+        assert_eq!(tag("foo-1.0.tar.gz"), None);
+        assert_eq!(tag("foo-1.0.whl"), None);
+    }
+
+    #[test]
+    fn test_pypi_content_type_by_extension() {
+        use super::pypi_content_type as ct;
+        assert_eq!(ct("x-1.0-py3-none-any.whl"), "application/zip");
+        assert_eq!(ct("x.zip"), "application/zip");
+        assert_eq!(ct("x-1.0.tar.gz"), "application/gzip");
+        assert_eq!(ct("x-1.0.tar.bz2"), "application/x-bzip2");
+        assert_eq!(ct("x-1.0.exe"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_html_escape_escapes_markup_and_quotes() {
+        use super::html_escape as esc;
+        assert_eq!(esc("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(esc("\"q\" 'a'"), "&quot;q&quot; &#39;a&#39;");
+        assert_eq!(esc("plain"), "plain");
+    }
 }
