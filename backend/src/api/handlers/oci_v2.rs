@@ -26099,4 +26099,36 @@ mod virtual_scan_gate_tests {
         let image = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cc"},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:dd"}]}"#;
         assert!(matches!(classify_manifest(image), ManifestClass::Image));
     }
+
+    #[test]
+    fn test_compute_sha256_is_prefixed_hex_and_deterministic() {
+        // Known SHA-256 vectors, with the OCI `sha256:` prefix.
+        assert_eq!(
+            compute_sha256(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            compute_sha256(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(compute_sha256(b"abc"), compute_sha256(b"abc"));
+        assert_ne!(compute_sha256(b"abc"), compute_sha256(b"abd"));
+    }
+
+    #[test]
+    fn test_oci_lexical_cmp_case_insensitive_with_raw_tiebreak() {
+        use std::cmp::Ordering;
+        // Primary sort is case-insensitive...
+        assert_eq!(oci_lexical_cmp("Alpha", "beta"), Ordering::Less);
+        assert_eq!(oci_lexical_cmp("v1.0", "v1.0"), Ordering::Equal);
+        // ...ties broken by raw bytes so ordering is total ('A' < 'a').
+        assert_eq!(oci_lexical_cmp("Tag", "tag"), Ordering::Less);
+        assert_eq!(oci_lexical_cmp("tag", "Tag"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_build_pagination_link_header_url_encodes_last() {
+        let h = build_pagination_link_header("/v2/repo/tags/list", "a b", 50);
+        assert_eq!(h, "</v2/repo/tags/list?n=50&last=a%20b>; rel=\"next\"");
+    }
 }
