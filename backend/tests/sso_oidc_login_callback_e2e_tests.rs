@@ -71,7 +71,7 @@ use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use artifact_keeper_backend::api::SharedState;
-use artifact_keeper_backend::services::audit_service::AuditService;
+use artifact_keeper_backend::services::audit_service::{AuditLogEntryWithActor, AuditService};
 use artifact_keeper_backend::services::auth_config_service::{
     AuthConfigService, CreateOidcConfigRequest,
 };
@@ -313,6 +313,42 @@ async fn delete_user_by_sub(pool: &PgPool, external_id: &str) {
         .bind(external_id)
         .execute(pool)
         .await;
+}
+
+/// Poll an audit query until some returned row satisfies `pred`, or a bounded
+/// ~2s budget is exhausted. Returns whether a match was observed.
+///
+/// Load-bearing since #2905: `audit_fire_and_forget` SPAWNS the audit INSERT
+/// rather than awaiting it, so the OIDC callback handler returns to the client
+/// *before* its LOGIN / LOGIN_FAILED row is durable. Reading the trail
+/// synchronously right after the callback therefore races the detached write
+/// and fails intermittently-to-always depending on scheduling.
+///
+/// This mirrors `audit_count_eventually` in
+/// `backend/src/api/handlers/test_db_helpers.rs`, which #2905 added to fix the
+/// same race for the in-crate assertions. That module lives in `src/` and so is
+/// unreachable from this separate integration-test binary, which is exactly how
+/// this call site was missed.
+async fn audit_row_eventually<F>(
+    audit: &AuditService,
+    user_id: Option<Uuid>,
+    action: &str,
+    pred: F,
+) -> bool
+where
+    F: Fn(&AuditLogEntryWithActor) -> bool,
+{
+    for _ in 0..100 {
+        let (rows, _) = audit
+            .query(user_id, Some(action), None, None, None, None, None, 0, 200)
+            .await
+            .expect("audit query");
+        if rows.iter().any(&pred) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
 }
 
 /// Look up a provisioned federated user by `external_id`.
@@ -880,31 +916,17 @@ async fn test_oidc_callback_emits_audit_records() {
     assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
 
     let (user_id, _, _) = get_user(&pool, &external_id).await.expect("provisioned");
-    let (login_rows, _) = audit
-        .query(
-            Some(user_id),
-            Some("LOGIN"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            50,
-        )
-        .await
-        .expect("audit query LOGIN");
-    assert!(
-        login_rows.iter().any(|r| {
-            r.resource_type == "user"
-                && r.details
-                    .as_ref()
-                    .and_then(|d| d.get("provider"))
-                    .and_then(|p| p.as_str())
-                    == Some("oidc")
-        }),
-        "a LOGIN audit row with details.provider=oidc must exist for the user"
-    );
+    // Poll: the LOGIN row is written by a detached task (#2905), so it is not
+    // guaranteed to be visible the instant the callback returns.
+    let login_ok = audit_row_eventually(&audit, Some(user_id), "LOGIN", |r| {
+        r.resource_type == "user"
+            && r.details
+                .as_ref()
+                .and_then(|d| d.get("provider"))
+                .and_then(|p| p.as_str())
+                == Some("oidc")
+    })
+    .await;
 
     // --- failure -> LOGIN_FAILED ---
     // auto_create_users=false + a brand-new sub -> authenticate_federated errors,
@@ -935,38 +957,38 @@ async fn test_oidc_callback_emits_audit_records() {
         resp.status()
     );
 
-    let (fail_rows, _) = audit
-        .query(
-            None,
-            Some("LOGIN_FAILED"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            200,
-        )
-        .await
-        .expect("audit query LOGIN_FAILED");
-    assert!(
-        fail_rows.iter().any(|r| {
-            let details = r.details.as_ref();
-            details
-                .and_then(|d| d.get("provider"))
-                .and_then(|p| p.as_str())
-                == Some("oidc")
-                && details
-                    .and_then(|d| d.get("username"))
-                    .and_then(|u| u.as_str())
-                    == Some(fail_username.as_str())
-        }),
-        "a LOGIN_FAILED audit row with details.provider=oidc for the attempted username must exist"
-    );
+    // Same detached-write race as the LOGIN row above.
+    let fail_ok = audit_row_eventually(&audit, None, "LOGIN_FAILED", |r| {
+        let details = r.details.as_ref();
+        details
+            .and_then(|d| d.get("provider"))
+            .and_then(|p| p.as_str())
+            == Some("oidc")
+            && details
+                .and_then(|d| d.get("username"))
+                .and_then(|u| u.as_str())
+                == Some(fail_username.as_str())
+    })
+    .await;
 
+    // Clean up BEFORE asserting. A panicking assertion would otherwise skip
+    // these deletes and strand a provisioned user, and because a federated user
+    // with no `email` claim is stored with an empty-string email against the
+    // `users_email_key` UNIQUE constraint, that single leftover row makes every
+    // later no-email-claim test in this file fail with a duplicate-key error.
+    // Deferring the asserts keeps one failure from cascading into three.
     delete_user_by_sub(&pool, &external_id).await;
     delete_provider(&pool, provider_id).await;
     delete_provider(&pool, fail_provider).await;
+
+    assert!(
+        login_ok,
+        "a LOGIN audit row with details.provider=oidc must exist for the user"
+    );
+    assert!(
+        fail_ok,
+        "a LOGIN_FAILED audit row with details.provider=oidc for the attempted username must exist"
+    );
 }
 
 /// IdP error redirect (RFC 6749 4.1.2.1): `?error=access_denied` -> 401, and
