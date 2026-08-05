@@ -8441,6 +8441,13 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
+        // #1611-style guard support: a successful put_stream (even a
+        // zero-byte one) creates a real object at the key, same as a real S3
+        // PutObject. exists() reflects that so the reject-arm delete tests
+        // below exercise the same exists()-before-delete guard as prod,
+        // rather than the guard vacuously short-circuiting on an
+        // always-absent mock.
+        object_written: std::sync::atomic::AtomicBool,
     }
 
     impl TeeRecordingBackend {
@@ -8450,6 +8457,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn failing() -> Arc<Self> {
@@ -8458,6 +8466,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -8477,7 +8486,9 @@ mod tests {
             Err(AppError::NotFound("not relevant for tee tests".into()))
         }
         async fn exists(&self, _key: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self
+                .object_written
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.deletes.lock().await.push(key.to_string());
@@ -8511,6 +8522,8 @@ mod tests {
                 total += chunk.len() as u64;
                 chunks.push(chunk);
             }
+            self.object_written
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
