@@ -7135,14 +7135,12 @@ mod tests {
             }
         }
 
-        /// Redirect-capable but reports the key as absent — for the #2274/#1691
-        /// style existence-gate tests, where `supports_redirect() == true` must
-        /// not be enough on its own to trigger a presign.
-        fn new_with_exists(supports: bool, exists_result: bool) -> Self {
-            Self {
-                exists_result,
-                ..Self::new(supports)
-            }
+        /// Override the `exists()` result — for the #3067/#3068 existence-gate
+        /// tests, where `supports_redirect() == true` must not be enough on
+        /// its own to trigger a presign.
+        fn with_exists(mut self, exists_result: bool) -> Self {
+            self.exists_result = exists_result;
+            self
         }
     }
 
@@ -10846,99 +10844,105 @@ mod tests {
     /// out-of-band delete, e.g. a lifecycle rule) must fall through to the
     /// buffered read instead of presigning. Complements the #1555 test above,
     /// which only covers the `supports_redirect() == false` short-circuit.
+    ///
+    /// Runs both `exists()` outcomes so the `true` case is a positive
+    /// control: without it, this test would pass identically if the
+    /// proxy-cache redirect branch were never entered at all (e.g. from a
+    /// storage-key shape regression), not because `exists()` gates it.
     #[tokio::test]
-    async fn test_local_fetch_or_redirect_skips_presign_when_object_missing_3068() {
+    async fn test_local_fetch_or_redirect_gated_by_object_existence_3068() {
         use crate::api::handlers::test_db_helpers as tdh;
-        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
-            return;
-        };
 
-        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
-        let repo_info = tdh::make_repo_info(
-            fx.repo_id,
-            &fx.repo_key,
-            &fx.storage_dir,
-            "remote",
-            Some("https://upstream.example.test"),
-        );
+        for exists in [false, true] {
+            let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+                return;
+            };
 
-        // Redirect-capable proxy-cache backend that reports the object as
-        // absent — the DB row below is stale relative to it, same shape as an
-        // out-of-band delete.
-        let proxy_backend = StdArc::new(RecordingStorage::new_with_exists(
-            /* supports = */ true, /* exists_result = */ false,
-        ));
-        let service = StdArc::new(crate::services::storage_service::StorageService::new(
-            proxy_backend.clone(),
-        ));
-        let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
-            fx.pool.clone(),
-            service,
-        ));
-        let state = tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let repo_info = fx.repo_info("remote", Some("https://upstream.example.test"));
 
-        // Seed real bytes on the repo's own (filesystem) storage, separate
-        // from the mock proxy-cache backend above, so the fallback path has
-        // something real to stream once the redirect is denied.
-        let body: &[u8] = b"still-here";
-        let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
-        let storage_key = format!("proxy-cache/{}/{}", fx.repo_key, artifact_path);
-        super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
-            .await
-            .expect("seed proxy-cache payload on disk");
-        sqlx::query(
-            "INSERT INTO artifacts ( \
-                 repository_id, path, name, version, size_bytes, \
-                 checksum_sha256, content_type, storage_key, uploaded_by \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(fx.repo_id)
-        .bind(artifact_path)
-        .bind("foo")
-        .bind("1.0")
-        .bind(body.len() as i64)
-        .bind("test-foo")
-        .bind("application/zip")
-        .bind(&storage_key)
-        .bind(fx.user_id)
-        .execute(&fx.pool)
-        .await
-        .expect("seed proxy-cache artifact row");
+            // Redirect-capable proxy-cache backend whose exists() is the
+            // thing under test: false simulates a DB row surviving an
+            // out-of-band delete; true is the ordinary fresh-cache case.
+            let proxy_backend = StdArc::new(RecordingStorage::new(true).with_exists(exists));
+            let service = StdArc::new(crate::services::storage_service::StorageService::new(
+                proxy_backend.clone(),
+            ));
+            let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
+                fx.pool.clone(),
+                service,
+            ));
+            let state =
+                tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);
 
-        let location = repo_info.storage_location();
-        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
-            client_ip: None,
-            user_id: None,
-            user_agent: None,
-            is_head: false,
-        };
-        let result = super::local_fetch_or_redirect(
-            &fx.pool,
-            &state,
-            fx.repo_id,
-            &location,
-            artifact_path,
-            &ctx,
-        )
-        .await;
+            // Seed real bytes on the repo's own (filesystem) storage,
+            // separate from the mock proxy-cache backend above, so the
+            // exists() == false case has something real to fall through to.
+            let body: &[u8] = b"still-here";
+            let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
+            let storage_key = format!("proxy-cache/{}/{}", fx.repo_key, artifact_path);
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &repo_info,
+                &storage_key,
+                artifact_path,
+                "foo",
+                "1.0",
+                "application/zip",
+                Bytes::from_static(body),
+                fx.user_id,
+            )
+            .await;
 
-        fx.teardown().await;
+            let location = repo_info.storage_location();
+            let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+                client_ip: None,
+                user_id: None,
+                user_agent: None,
+                is_head: false,
+            };
+            let result = super::local_fetch_or_redirect(
+                &fx.pool,
+                &state,
+                fx.repo_id,
+                &location,
+                artifact_path,
+                &ctx,
+            )
+            .await;
 
-        let resp = result.expect("missing-object fetch must fall through to streaming");
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "exists() == false must fall through to a streamed 200, never a stale 302"
-        );
-        assert!(
-            resp.headers().get("location").is_none(),
-            "a redirect-capable backend reporting the object absent must NOT redirect"
-        );
-        assert_eq!(
-            proxy_backend.presigned_calls.load(Ordering::SeqCst),
-            0,
-            "get_presigned_url must never be attempted when exists() == false"
-        );
+            fx.teardown().await;
+
+            let resp = result.expect("fetch must succeed (redirect or streamed fallback)");
+            if exists {
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FOUND,
+                    "exists() == true must sign a redirect"
+                );
+                assert_eq!(
+                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
+                    1,
+                    "exists() == true must attempt exactly one presign"
+                );
+            } else {
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "exists() == false must fall through to a streamed 200, never a stale 302"
+                );
+                assert!(
+                    resp.headers().get("location").is_none(),
+                    "a redirect-capable backend reporting the object absent must NOT redirect"
+                );
+                assert_eq!(
+                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
+                    0,
+                    "get_presigned_url must never be attempted when exists() == false"
+                );
+            }
+        }
     }
 
     /// Count `download_statistics` rows attributed to any artifact in `repo_id`.
