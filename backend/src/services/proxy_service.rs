@@ -1559,14 +1559,30 @@ impl CachePersister {
                                      not caching (no metadata sidecar) so the cache entry cannot \
                                      be poisoned"
                                 );
-                                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                                    tracing::debug!(
-                                        cache_key = %cache_key_for_writer,
-                                        error = %e,
-                                        "best-effort delete of digest-mismatched proxy-cache \
-                                         object failed; the missing metadata sidecar still forces \
-                                         a refetch"
-                                    );
+                                // #1611-style guard: put_stream above already
+                                // overwrote cache_key_for_writer with these
+                                // mismatched bytes, but on a revalidation
+                                // refill that key may have held good,
+                                // still-serving content immediately before
+                                // this request ran. An unconditional delete()
+                                // on a versioned backend doesn't undo the
+                                // overwrite -- it stacks a delete marker on
+                                // top of the whole version history, silently
+                                // hiding that prior-good version too. The
+                                // missing metadata sidecar alone already
+                                // forces the self-heal refetch (see the reject
+                                // arm below), so only delete when a real
+                                // object is actually present to clean up.
+                                if matches!(storage_clone.exists(&cache_key_for_writer).await, Ok(true)) {
+                                    if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                                        tracing::debug!(
+                                            cache_key = %cache_key_for_writer,
+                                            error = %e,
+                                            "best-effort delete of digest-mismatched proxy-cache \
+                                             object failed; the missing metadata sidecar still forces \
+                                             a refetch"
+                                        );
+                                    }
                                 }
                                 return;
                             }
@@ -1688,13 +1704,24 @@ impl CachePersister {
                                 );
                             }
                         }
-                        if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                            tracing::debug!(
-                                cache_key = %cache_key_for_writer,
-                                error = %e,
-                                "best-effort delete of rejected proxy-cache object failed; \
-                                 the missing metadata sidecar still forces a refetch"
-                            );
+                        // #1611-style guard: same reasoning as the
+                        // digest-mismatch arm above -- a rejected write on a
+                        // revalidation refill may still leave good, prior
+                        // content one version back, and delete() on a
+                        // versioned backend would bury it under a marker
+                        // rather than clean up. Only delete when there's
+                        // actually a real object present; the missing
+                        // metadata sidecar is what forces the self-heal
+                        // refetch either way.
+                        if matches!(storage_clone.exists(&cache_key_for_writer).await, Ok(true)) {
+                            if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                                tracing::debug!(
+                                    cache_key = %cache_key_for_writer,
+                                    error = %e,
+                                    "best-effort delete of rejected proxy-cache object failed; \
+                                     the missing metadata sidecar still forces a refetch"
+                                );
+                            }
                         }
                     }
                 },
