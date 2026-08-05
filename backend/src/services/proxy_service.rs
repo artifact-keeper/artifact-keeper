@@ -1573,8 +1573,13 @@ impl CachePersister {
                                 // forces the self-heal refetch (see the reject
                                 // arm below), so only delete when a real
                                 // object is actually present to clean up.
-                                if matches!(storage_clone.exists(&cache_key_for_writer).await, Ok(true)) {
-                                    if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
+                                if matches!(
+                                    storage_clone.exists(&cache_key_for_writer).await,
+                                    Ok(true)
+                                ) {
+                                    if let Err(e) =
+                                        storage_clone.delete(&cache_key_for_writer).await
+                                    {
                                         tracing::debug!(
                                             cache_key = %cache_key_for_writer,
                                             error = %e,
