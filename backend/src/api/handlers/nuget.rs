@@ -312,12 +312,21 @@ fn rewrite_v3_registration(
 ///
 /// Comparison is host + effective port (`port_or_known_default`, so an
 /// `https`→`http` downgrade to the same host is also rejected because 443 ≠ 80)
-/// and case-insensitive on the host. The real nuget.org feed, GitHub Packages,
-/// Azure DevOps Artifacts and other private feeds all serve their registration
-/// and flat-container resources from the same host as their `index.json`, so
-/// this does not affect legitimate proxying; an upstream that legitimately
-/// fans resources out to a different host is refused by design (host-match on
-/// the upstream origin is the conservative default for a credentialed proxy).
+/// and case-insensitive on the host.
+///
+/// How real feeds relate to this check is SPLIT by resource type (#3130):
+///
+/// * **Registration / flat-container**: nuget.org, GitHub Packages, Azure
+///   DevOps Artifacts and other private feeds serve these from the same host
+///   as their `index.json`, so origin-pinning them ([`guard_upstream_base`])
+///   does not affect legitimate proxying.
+/// * **Search**: nuget.org itself advertises `SearchQueryService` on sibling
+///   hosts — `azuresearch-usnc.nuget.org` / `azuresearch-ussc.nuget.org` —
+///   while its `index.json` lives on `api.nuget.org`. An off-origin search
+///   base is therefore NOT refused; instead [`guard_search_base`] reports the
+///   mismatch and the caller fetches it **without** the repo's configured
+///   upstream credentials, preserving the #2925 invariant (credentials only
+///   ever go to the operator-configured origin) without breaking search.
 fn same_upstream_origin(upstream_url: &str, resource_url: &str) -> bool {
     match (
         reqwest::Url::parse(upstream_url),
@@ -351,6 +360,24 @@ fn guard_upstream_base(
     upstream_url: &str,
     what: &str,
 ) -> Result<String, Response> {
+    let base = require_http_base(base, what)?;
+    if !same_upstream_origin(upstream_url, &base) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Upstream {what} points off the configured upstream host; \
+                 refusing to send upstream credentials off-host"
+            ),
+        )
+            .into_response());
+    }
+    Ok(base)
+}
+
+/// Presence + scheme validation shared by every discovered-base guard: the
+/// service index must advertise the resource and it must be an http(s) URL.
+#[allow(clippy::result_large_err)]
+fn require_http_base(base: Option<&String>, what: &str) -> Result<String, Response> {
     let base = base.ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -365,17 +392,28 @@ fn guard_upstream_base(
         )
             .into_response());
     }
-    if !same_upstream_origin(upstream_url, base) {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "Upstream {what} points off the configured upstream host; \
-                 refusing to send upstream credentials off-host"
-            ),
-        )
-            .into_response());
-    }
     Ok(base.clone())
+}
+
+/// Resolve the discovered `SearchQueryService` base (#3130).
+///
+/// Unlike registration / flat-container ([`guard_upstream_base`]) an
+/// off-origin search base is NOT refused: real feeds legitimately advertise
+/// search on a sibling host (nuget.org's `index.json` on `api.nuget.org`
+/// names `azuresearch-*.nuget.org`). The #2925 invariant — never send the
+/// repo's configured upstream credentials to a host the operator did not
+/// configure — is preserved by the caller instead: the returned `bool`
+/// reports whether the base shares the configured upstream's origin, and an
+/// off-origin base is fetched anonymously (no credentials loaded at all).
+/// A missing or non-http(s) base is still refused.
+#[allow(clippy::result_large_err)]
+fn guard_search_base(
+    base: Option<&String>,
+    upstream_url: &str,
+) -> Result<(String, bool), Response> {
+    let base = require_http_base(base, "SearchQueryService")?;
+    let same_origin = same_upstream_origin(upstream_url, &base);
+    Ok((base, same_origin))
 }
 
 /// Proxy + rewrite an upstream V3 registration index for one remote upstream.
@@ -460,8 +498,12 @@ fn build_search_cache_key(q: &str, skip: i64, take: i64, prerelease: bool) -> St
 /// it directly (Remote repos) or merge it with local rows (Virtual repos).
 ///
 /// The discovered `SearchQueryService` base goes through
-/// [`guard_upstream_base`] like every other discovered resource: credentialed
-/// fetches stay pinned to the operator-configured upstream origin (#2925).
+/// [`guard_search_base`]: a same-origin base is fetched with the repo's
+/// configured upstream credentials through the proxy cache exactly like
+/// registration documents; an off-origin base (nuget.org's `azuresearch-*`)
+/// is fetched WITHOUT credentials and WITHOUT the cache, preserving the #2925
+/// invariant that configured upstream credentials only ever go to the
+/// operator-configured origin.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_v3_search(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -477,27 +519,41 @@ async fn proxy_v3_search(
 ) -> Result<serde_json::Value, Response> {
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let search_base = guard_upstream_base(
-        resources.search_base.as_ref(),
-        upstream_url,
-        "SearchQueryService",
-    )?;
+    let (search_base, same_origin) =
+        guard_search_base(resources.search_base.as_ref(), upstream_url)?;
     let fetch_url = format!(
         "{}?{}",
         search_base,
         build_search_fetch_query(query_term, skip, take, prerelease)
     );
-    let cache_path = build_search_cache_key(query_term, skip, take, prerelease);
-    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
-        proxy,
-        fetch_repo_id,
-        fetch_repo_key,
-        upstream_url,
-        &fetch_url,
-        &cache_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-    )
-    .await?;
+    let (content, _content_type) = if same_origin {
+        let cache_path = build_search_cache_key(query_term, skip, take, prerelease);
+        proxy_helpers::proxy_fetch_capped_with_cache_key(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+            &cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?
+    } else {
+        // Off-origin advertised search host: fetch anonymously and uncached.
+        // Every cached-entry code path (single-flight refill, stale
+        // revalidation) attaches the repo's configured credentials, so the
+        // uncached anonymous fetch is the narrowest surface that provably
+        // cannot carry them (#2925). The SSRF connect-time DNS guard and the
+        // byte ceiling still apply.
+        proxy_helpers::proxy_fetch_capped_anonymous(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            &fetch_url,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?
+    };
     let body = String::from_utf8_lossy(&content);
     let rewritten = rewrite_v3_registration(&body, &resources, ak_base, client_repo_key);
     serde_json::from_str(&rewritten).map_err(|_| {
@@ -789,10 +845,10 @@ async fn search_packages(
     // Remote repo: proxy the search to the upstream feed (#3130). The service
     // index advertises SearchQueryService, so answering purely from local
     // `artifacts` rows returned an empty result for an uncached remote. Any
-    // failure (no advertised SearchQueryService, off-origin base refused by
-    // the #2925 guard, fetch error, non-JSON payload) degrades to the local
-    // result rather than 5xx-ing — a hard error here breaks the client's
-    // package-manager UI entirely.
+    // failure (no advertised SearchQueryService, a non-http(s) base, fetch
+    // error, non-JSON payload) degrades to the local result rather than
+    // 5xx-ing — a hard error here breaks the client's package-manager UI
+    // entirely.
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
@@ -2333,21 +2389,60 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_upstream_base_rejects_off_origin_search_base() {
-        // #2925: a hostile upstream service index must not be able to point
-        // the search base at another host and have the proxy send the
-        // configured upstream credentials there.
+    fn test_guard_search_base_same_origin_is_credentialed() {
+        // A same-origin search base fetches exactly as before: with the
+        // repo's configured upstream credentials (`same_origin == true`).
         let upstream = "https://feed.example.com/v3/index.json";
-        let off_origin = "https://evil.example.net/query".to_string();
-        let err = guard_upstream_base(Some(&off_origin), upstream, "SearchQueryService")
-            .expect_err("off-origin SearchQueryService must be refused");
-        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
-
-        // Same-origin base is accepted.
-        let same_origin = "https://feed.example.com/query".to_string();
-        let ok = guard_upstream_base(Some(&same_origin), upstream, "SearchQueryService")
+        let same_origin = Some("https://feed.example.com/query".to_string());
+        let (base, credentialed) = guard_search_base(same_origin.as_ref(), upstream)
             .expect("same-origin SearchQueryService is allowed");
-        assert_eq!(ok, "https://feed.example.com/query");
+        assert_eq!(base, "https://feed.example.com/query");
+        assert!(credentialed, "same-origin search base fetches credentialed");
+    }
+
+    #[test]
+    fn test_guard_search_base_off_origin_allowed_but_anonymous() {
+        // nuget.org advertises SearchQueryService on azuresearch-*.nuget.org
+        // while index.json lives on api.nuget.org: an off-origin search base
+        // is ALLOWED, but flagged for an anonymous (credential-free) fetch —
+        // the #2925 invariant is enforced by stripping credentials, not by
+        // refusing the fetch.
+        let upstream = "https://api.nuget.org/v3/index.json";
+        let off_origin = Some("https://azuresearch-usnc.nuget.org/query".to_string());
+        let (base, credentialed) = guard_search_base(off_origin.as_ref(), upstream)
+            .expect("off-origin SearchQueryService is allowed (anonymous)");
+        assert_eq!(base, "https://azuresearch-usnc.nuget.org/query");
+        assert!(
+            !credentialed,
+            "off-origin search base must never fetch with the repo's configured credentials"
+        );
+    }
+
+    #[test]
+    fn test_guard_search_base_rejects_non_http_and_missing() {
+        let upstream = "https://feed.example.com/v3/index.json";
+        // A non-http(s) base is still refused.
+        let ftp = Some("ftp://feed.example.com/query".to_string());
+        let err = guard_search_base(ftp.as_ref(), upstream)
+            .expect_err("non-http(s) SearchQueryService must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        // A feed that advertises no search resource is refused (the caller
+        // degrades to the local result).
+        let err = guard_search_base(None, upstream)
+            .expect_err("absent SearchQueryService must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_guard_upstream_base_registration_still_rejects_off_origin() {
+        // #2925 regression pin: the search-only anonymous allowance must NOT
+        // leak into registration / flat-container resolution — those remain
+        // origin-pinned and refuse an off-origin base outright.
+        let upstream = "https://feed.example.com/v3/index.json";
+        let off_origin = Some("https://evil.example.net/reg".to_string());
+        let err = guard_upstream_base(off_origin.as_ref(), upstream, "RegistrationsBaseUrl")
+            .expect_err("off-origin RegistrationsBaseUrl must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -3822,17 +3917,21 @@ mod read_db_tests {
     }
 
     // Mount an upstream V3 service index at `/v3/index.json` advertising the
-    // registration/flat bases under `/reg/` and `/flat/` on the mock server.
-    async fn mount_v3_index(upstream: &wiremock::MockServer) {
+    // registration/flat bases under `/reg/` and `/flat/` on the mock server,
+    // plus (optionally) a `SearchQueryService` at `search_base` — which may be
+    // on a different origin, as nuget.org's azuresearch-* is (#3130).
+    async fn mount_v3_index_with(upstream: &wiremock::MockServer, search_base: Option<&str>) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-        let index = serde_json::json!({
-            "version": "3.0.0",
-            "resources": [
-                {"@id": format!("{}/reg/", upstream.uri()), "@type": "RegistrationsBaseUrl"},
-                {"@id": format!("{}/flat/", upstream.uri()), "@type": "PackageBaseAddress/3.0.0"}
-            ]
-        });
+        let mut resources = vec![
+            serde_json::json!({"@id": format!("{}/reg/", upstream.uri()), "@type": "RegistrationsBaseUrl"}),
+            serde_json::json!({"@id": format!("{}/flat/", upstream.uri()), "@type": "PackageBaseAddress/3.0.0"}),
+        ];
+        if let Some(search) = search_base {
+            resources
+                .push(serde_json::json!({"@id": search, "@type": "SearchQueryService/3.0.0-rc"}));
+        }
+        let index = serde_json::json!({"version": "3.0.0", "resources": resources});
         Mock::given(method("GET"))
             .and(path("/v3/index.json"))
             .respond_with(
@@ -3842,6 +3941,180 @@ mod read_db_tests {
             )
             .mount(upstream)
             .await;
+    }
+
+    async fn mount_v3_index(upstream: &wiremock::MockServer) {
+        mount_v3_index_with(upstream, None).await;
+    }
+
+    /// Mount a `/query` search endpoint returning one upstream-hosted result.
+    async fn mount_search_endpoint(server: &wiremock::MockServer, reg_base: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let payload = serde_json::json!({
+            "totalHits": 1,
+            "data": [{
+                "id": "Newtonsoft.Json",
+                "version": "13.0.1",
+                "registration": format!("{}/newtonsoft.json/index.json", reg_base)
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(serde_json::to_string(&payload).unwrap()),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Configure bearer upstream credentials + `upstream_url` on the fixture
+    /// repo, run a `q=newtonsoft` search through the real handler, and return
+    /// the parsed response JSON.
+    async fn run_search_against(
+        fx: &tdh::Fixture,
+        index_host: &wiremock::MockServer,
+    ) -> serde_json::Value {
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: "sekret-token".to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&fx.pool, fx.repo_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", index_host.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+
+        let resp = super::search_packages(
+            axum::extract::State(state),
+            axum::extract::Path(fx.repo_key.clone()),
+            axum::extract::Query(SearchQuery {
+                q: Some("newtonsoft".to_string()),
+                skip: None,
+                take: None,
+                prerelease: None,
+            }),
+            crate::api::extractors::RequestBaseUrl("https://ak.example".to_string()),
+        )
+        .await
+        .expect("remote search must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&body).expect("search response is JSON")
+    }
+
+    /// Same-origin `SearchQueryService`: the search fetch must carry the
+    /// repo's configured upstream credentials, exactly like every other
+    /// same-origin discovered-resource fetch (#3130).
+    #[tokio::test]
+    async fn test_remote_v3_search_same_origin_fetches_with_credentials() {
+        use wiremock::MockServer;
+        // `save_upstream_auth` encrypts via `encryption_key()`; skip when no
+        // key env is configured (same guard as the upstream_auth DB tests).
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let search_base = format!("{}/query", upstream.uri());
+        mount_v3_index_with(&upstream, Some(&search_base)).await;
+        mount_search_endpoint(&upstream, &format!("{}/reg", upstream.uri())).await;
+
+        let json = run_search_against(&fx, &upstream).await;
+
+        let reqs = upstream.received_requests().await.expect("recorded");
+        let auth = reqs
+            .iter()
+            .find(|r| r.url.path() == "/query")
+            .expect("upstream search endpoint must be queried")
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        fx.teardown().await;
+
+        assert_eq!(json["data"][0]["id"], "Newtonsoft.Json");
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer sekret-token"),
+            "a same-origin search fetch must carry the configured upstream credentials"
+        );
+    }
+
+    /// Off-origin `SearchQueryService` (the nuget.org azuresearch shape): the
+    /// search is ALLOWED and served, but the actual outbound request to the
+    /// off-origin host must carry NO Authorization header — while the
+    /// same-origin index fetch in the same flow proves the credentials were
+    /// configured and applied where permitted (#3130 / #2925).
+    #[tokio::test]
+    async fn test_remote_v3_search_off_origin_is_served_but_anonymous() {
+        use wiremock::MockServer;
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        // Two servers on different ports = different origins.
+        let index_host = MockServer::start().await;
+        let search_host = MockServer::start().await;
+        mount_v3_index_with(&index_host, Some(&format!("{}/query", search_host.uri()))).await;
+        mount_search_endpoint(&search_host, &format!("{}/reg", index_host.uri())).await;
+
+        let json = run_search_against(&fx, &index_host).await;
+
+        let index_reqs = index_host.received_requests().await.expect("recorded");
+        let index_fetch_credentialed = index_reqs
+            .iter()
+            .find(|r| r.url.path() == "/v3/index.json")
+            .expect("service index must be fetched")
+            .headers
+            .get("authorization")
+            .is_some();
+        let search_reqs = search_host.received_requests().await.expect("recorded");
+        let search_req = search_reqs
+            .iter()
+            .find(|r| r.url.path() == "/query")
+            .expect("off-origin search host must be queried")
+            .clone();
+        let search_auth_header = search_req
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let q_forwarded = search_req
+            .url
+            .query_pairs()
+            .any(|(k, v)| k == "q" && v == "newtonsoft");
+        fx.teardown().await;
+
+        assert!(
+            index_fetch_credentialed,
+            "control: the same-origin index fetch must carry the configured credentials, \
+             proving they exist and are applied where permitted"
+        );
+        assert_eq!(
+            search_auth_header, None,
+            "the outbound off-origin search request must carry NO Authorization header"
+        );
+        assert!(q_forwarded, "client query must be forwarded upstream");
+        assert_eq!(
+            json["data"][0]["id"], "Newtonsoft.Json",
+            "off-origin upstream search results are served to the client"
+        );
     }
 
     #[tokio::test]

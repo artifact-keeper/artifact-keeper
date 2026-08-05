@@ -1841,16 +1841,23 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
         max: usize,
+        auth_mode: crate::services::upstream_auth::UpstreamAuthMode,
     ) -> Result<UpstreamResponse> {
         let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
-            "Fetching artifact from upstream: {} (accept={:?})",
+            "Fetching artifact from upstream: {} (accept={:?}, auth_mode={:?})",
             diagnostic_url,
-            accept
+            accept,
+            auth_mode
         );
 
-        let upstream_auth =
-            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+        // #3130: `Anonymous` short-circuits to `None` before the credential
+        // store is read, so neither the initial request nor the bearer retry
+        // below can attach the repo's configured upstream credentials.
+        let upstream_auth = crate::services::upstream_auth::load_upstream_auth_for_mode(
+            &self.db, repo_id, auth_mode,
+        )
+        .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
         let mut request = self.http_client.get(url);
@@ -5087,8 +5094,49 @@ impl ProxyService {
         max: usize,
     ) -> Result<UpstreamResponse> {
         self.upstream_client
-            .fetch_buffered(url, repo_id, accept, max)
+            .fetch_buffered(
+                url,
+                repo_id,
+                accept,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
             .await
+    }
+
+    /// Buffered, byte-capped upstream metadata fetch that NEVER attaches the
+    /// repository's configured upstream credentials (#3130 / #2925).
+    ///
+    /// For URLs a service index legitimately advertises on a host other than
+    /// the configured upstream (nuget.org's `SearchQueryService` lives on
+    /// `azuresearch-*.nuget.org` while its `index.json` is on
+    /// `api.nuget.org`). The request still goes through the shared proxy HTTP
+    /// client — so the connect-time SSRF DNS guard (`is_blocked_resolved_ip`,
+    /// #1832/#2570) and the `max`-byte body ceiling both apply — but auth
+    /// resolution is [`UpstreamAuthMode::Anonymous`], which short-circuits
+    /// before the credential store is read.
+    ///
+    /// Deliberately does NOT touch the proxy cache: every cached-entry code
+    /// path (single-flight refill, stale revalidation via `check_etag_changed`,
+    /// conditional refetch) loads the repo's credentials, so an uncached
+    /// direct fetch is the narrowest surface that provably cannot carry them.
+    pub async fn fetch_metadata_capped_anonymous(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        max: usize,
+    ) -> Result<(Bytes, Option<String>)> {
+        let resp = self
+            .upstream_client
+            .fetch_buffered(
+                url,
+                repo_id,
+                None,
+                max,
+                crate::services::upstream_auth::UpstreamAuthMode::Anonymous,
+            )
+            .await?;
+        Ok((resp.content, resp.content_type))
     }
 
     /// Streaming variant of [`Self::fetch_from_upstream`] used by the

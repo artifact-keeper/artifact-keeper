@@ -1352,6 +1352,26 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
     .await
 }
 
+/// Anonymous (credential-free) capped metadata fetch for a URL a service index
+/// advertises on a host other than the configured upstream (#3130 / #2925).
+///
+/// Same SSRF connect-time guard and `max`-byte ceiling as the other capped
+/// helpers, but the repo's configured upstream credentials are never loaded
+/// (see [`ProxyService::fetch_metadata_capped_anonymous`]) and the proxy cache
+/// is not consulted or written.
+pub async fn proxy_fetch_capped_anonymous(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    url: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    proxy_service
+        .fetch_metadata_capped_anonymous(url, repo_id, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, url, e))
+}
+
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key`] (#1608 Phase
 /// 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
 pub async fn proxy_fetch_capped_with_cache_key(
