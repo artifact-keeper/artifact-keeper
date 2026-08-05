@@ -143,6 +143,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         &otel_service_name,
     );
 
+    // Resolve LOG_PROBE_REQUESTS now so a typo warns at startup rather than on
+    // the first probe request.
+    artifact_keeper_backend::api::middleware::tracing::init_probe_request_logging();
+
     // Initialize the structured audit-event stream (#2413) from AUDIT_STREAM,
     // following the same pre-Config env-read pattern as telemetry. Default
     // `off`; `stdout` opts in to NDJSON audit records on stdout.

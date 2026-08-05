@@ -257,6 +257,12 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
 /// into the builder when configured. Shared by every client builder so the
 /// private-CA handling is identical and lives in one place.
 fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
+    // apply_custom_ca_cert runs on every client build (many per request, e.g.
+    // /health's Trivy sub-check), so logging the result per build floods the
+    // logs. Log once for the process lifetime instead, mirroring log_proxy_env.
+    // Applies to the warn arms too: a misconfigured path is the louder flood.
+    use std::sync::Once;
+    static LOG_ONCE: Once = Once::new();
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
         match std::fs::read(&ca_path) {
             Ok(pem_bytes) => match Certificate::from_pem_bundle(&pem_bytes) {
@@ -265,29 +271,22 @@ fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
                     for cert in certs {
                         builder = builder.add_root_certificate(cert);
                     }
-                    // debug, not info: this fires on every client build (many
-                    // per request, e.g. /health's Trivy sub-check), not once at
-                    // startup, so info-level floods the logs.
-                    tracing::debug!(
-                        path = %ca_path,
-                        count,
-                        "Loaded custom CA certificate(s)"
-                    );
+                    // count == 0 (a valid-but-empty bundle) still logs, so the
+                    // "loaded nothing" case stays visible at info.
+                    LOG_ONCE.call_once(|| {
+                        tracing::info!(path = %ca_path, count, "Loaded custom CA certificate(s)");
+                    });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        path = %ca_path,
-                        error = %e,
-                        "Failed to parse CA certificate(s)"
-                    );
+                    LOG_ONCE.call_once(|| {
+                        tracing::warn!(path = %ca_path, error = %e, "Failed to parse CA certificate(s)");
+                    });
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    path = %ca_path,
-                    error = %e,
-                    "Failed to read custom CA certificate file"
-                );
+                LOG_ONCE.call_once(|| {
+                    tracing::warn!(path = %ca_path, error = %e, "Failed to read custom CA certificate file");
+                });
             }
         }
     }
