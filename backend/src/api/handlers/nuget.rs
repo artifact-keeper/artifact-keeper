@@ -19,8 +19,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -180,6 +181,7 @@ fn select_latest_version(versions: &[String], include_prerelease: bool) -> &str 
 struct NugetUpstreamResources {
     registration_base: Option<String>,
     package_base: Option<String>,
+    search_base: Option<String>,
 }
 
 /// Normalise a configured upstream URL to its `index.json` service document.
@@ -228,6 +230,11 @@ fn parse_upstream_resources(index: &serde_json::Value) -> NugetUpstreamResources
         registration_base: pick_resource(resources, "RegistrationsBaseUrl", "RegistrationsBaseUrl")
             .map(|s| s.trim_end_matches('/').to_string()),
         package_base: pick_resource(resources, "PackageBaseAddress/3.0.0", "PackageBaseAddress")
+            .map(|s| s.trim_end_matches('/').to_string()),
+        // Feeds advertise search under bare `SearchQueryService` and versioned
+        // spellings (`/3.0.0-beta`, `/3.0.0-rc`, ...); the exact/prefix pair
+        // covers all of them (#3130).
+        search_base: pick_resource(resources, "SearchQueryService", "SearchQueryService")
             .map(|s| s.trim_end_matches('/').to_string()),
     }
 }
@@ -416,6 +423,124 @@ async fn proxy_v3_registration(
         .unwrap())
 }
 
+/// Build the normalized query string for an upstream V3 search fetch.
+///
+/// `q` is user-controlled free text, so it is percent-encoded — it must not be
+/// able to smuggle extra query parameters or break out of the URL — and
+/// lowercased (NuGet search is case-insensitive) so equivalent queries share
+/// one upstream fetch/cache entry. Defaults are included explicitly so the
+/// same effective query always yields the same string.
+fn build_search_fetch_query(q: &str, skip: i64, take: i64, prerelease: bool) -> String {
+    format!(
+        "q={}&skip={}&take={}&prerelease={}",
+        urlencoding::encode(&q.to_lowercase()),
+        skip,
+        take,
+        prerelease
+    )
+}
+
+/// Build the proxy-cache key for an upstream V3 search response.
+///
+/// Unlike registrations (keyed by package id alone), a search response depends
+/// on **every** query parameter — a shared key would serve the first query's
+/// cached results to every later query. The key therefore hashes the full
+/// normalized parameter set ([`build_search_fetch_query`]); hashing (rather
+/// than sanitizing the raw string into the key) prevents distinct queries from
+/// colliding after filesystem-unsafe characters are squashed.
+fn build_search_cache_key(q: &str, skip: i64, take: i64, prerelease: bool) -> String {
+    let normalized = build_search_fetch_query(q, skip, take, prerelease);
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("v3/search/{:x}", digest)
+}
+
+/// Proxy an upstream V3 search query for one remote upstream and rewrite the
+/// embedded upstream registration/flat-container URLs back to this proxy
+/// (#3130). Returns the rewritten payload as JSON so callers can either serve
+/// it directly (Remote repos) or merge it with local rows (Virtual repos).
+///
+/// The discovered `SearchQueryService` base goes through
+/// [`guard_upstream_base`] like every other discovered resource: credentialed
+/// fetches stay pinned to the operator-configured upstream origin (#2925).
+#[allow(clippy::too_many_arguments)]
+async fn proxy_v3_search(
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch_repo_id: uuid::Uuid,
+    fetch_repo_key: &str,
+    upstream_url: &str,
+    query_term: &str,
+    skip: i64,
+    take: i64,
+    prerelease: bool,
+    ak_base: &str,
+    client_repo_key: &str,
+) -> Result<serde_json::Value, Response> {
+    let resources =
+        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
+    let search_base = guard_upstream_base(
+        resources.search_base.as_ref(),
+        upstream_url,
+        "SearchQueryService",
+    )?;
+    let fetch_url = format!(
+        "{}?{}",
+        search_base,
+        build_search_fetch_query(query_term, skip, take, prerelease)
+    );
+    let cache_path = build_search_cache_key(query_term, skip, take, prerelease);
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
+        proxy,
+        fetch_repo_id,
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&content);
+    let rewritten = rewrite_v3_registration(&body, &resources, ak_base, client_repo_key);
+    serde_json::from_str(&rewritten).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet search response was not valid JSON",
+        )
+            .into_response()
+    })
+}
+
+/// Merge upstream search `data` entries into the local result set, deduped
+/// case-insensitively by package id with local entries winning, bounded by
+/// `take`. Returns how many upstream entries were added.
+fn merge_upstream_search_data(
+    data: &mut Vec<serde_json::Value>,
+    upstream: &serde_json::Value,
+    take: usize,
+) -> usize {
+    let mut seen: std::collections::HashSet<String> = data
+        .iter()
+        .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut added = 0;
+    let Some(entries) = upstream.get("data").and_then(|d| d.as_array()) else {
+        return added;
+    };
+    for entry in entries {
+        if data.len() >= take {
+            break;
+        }
+        let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if seen.insert(id.to_ascii_lowercase()) {
+            data.push(entry.clone());
+            added += 1;
+        }
+    }
+    added
+}
+
 /// Proxy an upstream V3 flat-container document (version list or `.nupkg`).
 /// `sub_path` is the portion after the package-content base, e.g.
 /// `{id}/index.json` or `{id}/{version}/{file}`. Version lists carry no URLs so
@@ -580,7 +705,7 @@ async fn search_packages(
 
     // Federate over virtual members (local/staging) when the repo is virtual;
     // otherwise query the repo itself.
-    let (repo_ids, _members) = effective_local_repo_ids(&state.db, &repo).await?;
+    let (repo_ids, members) = effective_local_repo_ids(&state.db, &repo).await?;
 
     // Pull the latest-by-created_at description per package via a LATERAL
     // join so the search payload carries the package summary instead of a
@@ -632,7 +757,7 @@ async fn search_packages(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    let data: Vec<serde_json::Value> = packages
+    let mut data: Vec<serde_json::Value> = packages
         .iter()
         .map(|p| {
             let id = &p.name;
@@ -659,8 +784,102 @@ async fn search_packages(
         })
         .collect();
 
+    let mut total_hits = total_count;
+
+    // Remote repo: proxy the search to the upstream feed (#3130). The service
+    // index advertises SearchQueryService, so answering purely from local
+    // `artifacts` rows returned an empty result for an uncached remote. Any
+    // failure (no advertised SearchQueryService, off-origin base refused by
+    // the #2925 guard, fetch error, non-JSON payload) degrades to the local
+    // result rather than 5xx-ing — a hard error here breaks the client's
+    // package-manager UI entirely.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            match proxy_v3_search(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &query_term,
+                skip,
+                take,
+                prerelease,
+                base_url.as_str(),
+                &repo_key,
+            )
+            .await
+            {
+                Ok(upstream) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_string(&upstream).unwrap()))
+                        .unwrap());
+                }
+                Err(resp) => {
+                    warn!(
+                        repo_key = %repo_key,
+                        status = %resp.status(),
+                        "upstream NuGet search failed; falling back to local results"
+                    );
+                }
+            }
+        }
+    }
+
+    // Virtual repo: merge each remote member's upstream results into the local
+    // ones, deduped case-insensitively by package id with local entries
+    // winning. `totalHits` takes the max of the local and upstream totals —
+    // the true merged total is unknowable without enumerating both corpora,
+    // and max never double-counts a package present on both sides.
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(proxy) = &state.proxy_service {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(upstream_url) = member.upstream_url.as_deref() else {
+                    continue;
+                };
+                match proxy_v3_search(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &query_term,
+                    skip,
+                    take,
+                    prerelease,
+                    base_url.as_str(),
+                    &repo_key,
+                )
+                .await
+                {
+                    Ok(upstream) => {
+                        let upstream_total = upstream
+                            .get("totalHits")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        total_hits = total_hits.max(upstream_total);
+                        merge_upstream_search_data(&mut data, &upstream, take as usize);
+                    }
+                    Err(resp) => {
+                        warn!(
+                            repo_key = %repo_key,
+                            member_key = %member.key,
+                            status = %resp.status(),
+                            "upstream NuGet search failed for virtual member; skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let response = serde_json::json!({
-        "totalHits": total_count,
+        "totalHits": total_hits,
         "data": data
     });
 
@@ -2059,6 +2278,166 @@ mod tests {
     // `read_db_tests::test_advertised_v3_urls_resolve_against_real_router`.
 
     // -----------------------------------------------------------------------
+    // Upstream search proxying (#3130)
+    // -----------------------------------------------------------------------
+
+    /// A minimal upstream service index advertising search under `@type`
+    /// `search_type`, with resources on the same host as the index itself.
+    fn upstream_index_with_search_type(search_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {
+                    "@id": "https://feed.example.com/v3/registration/",
+                    "@type": "RegistrationsBaseUrl"
+                },
+                {
+                    "@id": "https://feed.example.com/v3-flatcontainer/",
+                    "@type": "PackageBaseAddress/3.0.0"
+                },
+                {
+                    "@id": "https://feed.example.com/query",
+                    "@type": search_type
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn test_parse_upstream_resources_picks_each_search_query_service_spelling() {
+        // NuGet feeds advertise the search resource under several `@type`
+        // spellings; each must resolve the search base (#3130).
+        for search_type in [
+            "SearchQueryService",
+            "SearchQueryService/3.0.0-beta",
+            "SearchQueryService/3.0.0-rc",
+        ] {
+            let parsed = parse_upstream_resources(&upstream_index_with_search_type(search_type));
+            assert_eq!(
+                parsed.search_base.as_deref(),
+                Some("https://feed.example.com/query"),
+                "@type {search_type} must resolve the search base"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_upstream_resources_no_search_resource() {
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": "https://feed.example.com/v3/registration/", "@type": "RegistrationsBaseUrl"}
+            ]
+        });
+        assert_eq!(parse_upstream_resources(&index).search_base, None);
+    }
+
+    #[test]
+    fn test_guard_upstream_base_rejects_off_origin_search_base() {
+        // #2925: a hostile upstream service index must not be able to point
+        // the search base at another host and have the proxy send the
+        // configured upstream credentials there.
+        let upstream = "https://feed.example.com/v3/index.json";
+        let off_origin = "https://evil.example.net/query".to_string();
+        let err = guard_upstream_base(Some(&off_origin), upstream, "SearchQueryService")
+            .expect_err("off-origin SearchQueryService must be refused");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+
+        // Same-origin base is accepted.
+        let same_origin = "https://feed.example.com/query".to_string();
+        let ok = guard_upstream_base(Some(&same_origin), upstream, "SearchQueryService")
+            .expect("same-origin SearchQueryService is allowed");
+        assert_eq!(ok, "https://feed.example.com/query");
+    }
+
+    #[test]
+    fn test_rewrite_search_payload_rebinds_registration_urls_to_proxy() {
+        // The upstream search payload embeds upstream registration URLs; they
+        // must be rewritten to AK's own base so the client's follow-up
+        // registration fetches come back through the proxy.
+        let resources = NugetUpstreamResources {
+            registration_base: Some("https://feed.example.com/v3/registration".to_string()),
+            package_base: Some("https://feed.example.com/v3-flatcontainer".to_string()),
+            search_base: Some("https://feed.example.com/query".to_string()),
+        };
+        let body = r#"{"totalHits":1,"data":[{
+            "@id":"https://feed.example.com/v3/registration/newtonsoft.json/index.json",
+            "registration":"https://feed.example.com/v3/registration/newtonsoft.json/index.json",
+            "id":"Newtonsoft.Json",
+            "versions":[{"version":"13.0.1",
+                "@id":"https://feed.example.com/v3/registration/newtonsoft.json/13.0.1.json"}]
+        }]}"#;
+        let out = rewrite_v3_registration(body, &resources, "http://ak.local:8080", "nuget-remote");
+        assert!(
+            out.contains("http://ak.local:8080/nuget/nuget-remote/v3/registration/newtonsoft.json/index.json"),
+            "registration URLs must be rebound to the proxy: {out}"
+        );
+        assert!(
+            !out.contains("https://feed.example.com/v3/registration"),
+            "no upstream registration URL may survive the rewrite: {out}"
+        );
+    }
+
+    #[test]
+    fn test_search_cache_key_encodes_every_parameter() {
+        // Regression test for cross-query cache contamination: the proxy-cache
+        // key must differ whenever any search parameter differs, or every
+        // query would serve the first query's cached results.
+        let base = build_search_cache_key("newtonsoft", 0, 20, false);
+        assert_ne!(base, build_search_cache_key("serilog", 0, 20, false), "q");
+        assert_ne!(
+            base,
+            build_search_cache_key("newtonsoft", 5, 20, false),
+            "skip"
+        );
+        assert_ne!(
+            base,
+            build_search_cache_key("newtonsoft", 0, 50, false),
+            "take"
+        );
+        assert_ne!(
+            base,
+            build_search_cache_key("newtonsoft", 0, 20, true),
+            "prerelease"
+        );
+
+        // Deterministic normalization: equivalent queries share a key.
+        assert_eq!(base, build_search_cache_key("NewtonSoft", 0, 20, false));
+    }
+
+    #[test]
+    fn test_search_fetch_query_encodes_user_controlled_q() {
+        // `q` is attacker/user-controlled free text: it must not be able to
+        // inject extra query parameters or break out of the URL.
+        let query = build_search_fetch_query("a&take=1000#frag", 0, 20, false);
+        assert_eq!(
+            query,
+            "q=a%26take%3D1000%23frag&skip=0&take=20&prerelease=false"
+        );
+    }
+
+    #[test]
+    fn test_merge_upstream_search_data_dedupes_local_wins() {
+        let mut data = vec![serde_json::json!({"id": "Newtonsoft.Json", "version": "1.0.0-local"})];
+        let upstream = serde_json::json!({
+            "totalHits": 3,
+            "data": [
+                {"id": "newtonsoft.json", "version": "13.0.1"},
+                {"id": "Serilog", "version": "3.1.1"},
+                {"id": "Dapper", "version": "2.1.0"}
+            ]
+        });
+        let added = merge_upstream_search_data(&mut data, &upstream, 2);
+        assert_eq!(added, 1, "bounded by take and deduped case-insensitively");
+        assert_eq!(data.len(), 2);
+        assert_eq!(
+            data[0]["version"], "1.0.0-local",
+            "the local entry wins over the upstream duplicate"
+        );
+        assert_eq!(data[1]["id"], "Serilog");
+    }
+
+    // -----------------------------------------------------------------------
     // extract_xml_tag
     // -----------------------------------------------------------------------
 
@@ -3373,6 +3752,7 @@ mod read_db_tests {
                 "https://api.nuget.org/v3/registration5-gz-semver2".to_string(),
             ),
             package_base: Some("https://api.nuget.org/v3-flatcontainer".to_string()),
+            search_base: None,
         };
         let upstream_doc = r#"{
             "@id":"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json",
