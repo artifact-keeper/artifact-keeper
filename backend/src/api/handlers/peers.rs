@@ -543,7 +543,7 @@ pub async fn get_sync_tasks(
         ("id" = Uuid, Path, description = "Peer instance ID")
     ),
     responses(
-        (status = 200, description = "List of assigned repository IDs", body = Vec<Uuid>),
+        (status = 200, description = "Subscriptions for this peer (repo id + replication mode)", body = Vec<SubscriptionResponse>),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -552,10 +552,25 @@ pub async fn get_sync_tasks(
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<Uuid>>> {
+) -> Result<Json<Vec<SubscriptionResponse>>> {
     let service = PeerInstanceService::new(state.db.clone());
-    let repos = service.get_assigned_repositories(id).await?;
-    Ok(Json(repos))
+    let items = service
+        .list_subscriptions(id)
+        .await?
+        .into_iter()
+        .map(|s| SubscriptionResponse {
+            id: s.id,
+            peer_instance_id: s.peer_instance_id,
+            repository_id: s.repository_id,
+            sync_enabled: s.sync_enabled,
+            replication_mode: s.replication_mode,
+            replication_schedule: s.replication_schedule,
+            replication_filter: s.replication_filter,
+            last_replicated_at: s.last_replicated_at,
+            created_at: s.created_at,
+        })
+        .collect();
+    Ok(Json(items))
 }
 
 /// Assign repository to peer instance
