@@ -560,14 +560,32 @@ impl PromotionRuleService {
         Ok(classify_scan_state(&rows))
     }
 
+    /// Severity counts across the latest completed scan of EVERY scanner.
+    ///
+    /// The old form was `ORDER BY created_at DESC LIMIT 1` over all completed
+    /// rows regardless of `scan_type`, so whichever engine finished last supplied
+    /// the entire CVE verdict for `max_cve_severity` and every other engine's
+    /// findings were invisible to the gate — a clean-but-later scan silently hid
+    /// an earlier scan's criticals. Per-severity `MAX` rather than `SUM` because
+    /// the per-scanner aggregates describe overlapping finding sets, and `MAX`
+    /// cannot weaken a "greater than allowed" threshold. `HAVING COUNT(*) > 0`
+    /// preserves the `None` = "no completed scan" signal the caller falls back on.
     async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
             r#"
-            SELECT critical_count, high_count, medium_count, low_count
-            FROM scan_results
-            WHERE artifact_id = $1 AND status = 'completed'
-            ORDER BY created_at DESC
-            LIMIT 1
+            WITH latest_per_type AS (
+                SELECT DISTINCT ON (scan_type)
+                       critical_count, high_count, medium_count, low_count
+                FROM scan_results
+                WHERE artifact_id = $1 AND status = 'completed'
+                ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+            )
+            SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
+                   COALESCE(MAX(high_count), 0)::int     AS high_count,
+                   COALESCE(MAX(medium_count), 0)::int   AS medium_count,
+                   COALESCE(MAX(low_count), 0)::int      AS low_count
+            FROM latest_per_type
+            HAVING COUNT(*) > 0
             "#,
         )
         .bind(artifact_id)

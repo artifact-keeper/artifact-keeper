@@ -20,6 +20,45 @@ fn block_unscanned_violated(block_unscanned: bool, scan_state: ScanState) -> boo
     block_unscanned && scan_state.is_unscanned()
 }
 
+/// Which post-scan gates apply to an artifact, derived from its `scan_results`
+/// rows.
+#[derive(Debug, PartialEq, Eq)]
+struct PostScanGates {
+    /// The newest scan row (any status) is `failed`, so `block_on_fail` may fire.
+    block_on_fail_applies: bool,
+    /// A completed scan exists, so the `max_severity` threshold check must run.
+    severity_applies: bool,
+}
+/// Decide which post-scan gates apply from the artifact's scan rows.
+///
+/// The two gates deliberately read DIFFERENT inputs:
+///
+/// * `block_on_fail` is about the most recent attempt, so it keys on the newest
+///   row's status.
+/// * `max_severity` is about the findings on record, so it keys on "a completed
+///   scan EXISTS for this artifact" — not on "the newest row happens to be
+///   completed".
+///
+/// Both used to read the single newest row of any status, which made the
+/// severity gate silently inert whenever the newest row was not `completed`.
+/// Any scanner that records a non-terminal row (`pending`/`running`) or a
+/// `not_applicable` row AFTER a completed one — an asynchronous or external
+/// scanner does this routinely — therefore disabled severity blocking for that
+/// artifact entirely, and a download with critical findings on record was
+/// served with a 200. Keying on existence closes that fail-open.
+///
+/// Note the consequence for a `failed` newest row with `block_on_fail` off:
+/// severity now still evaluates against the findings of the older completed
+/// scan, where it previously skipped the check. That is the intended, strictly
+/// safer direction — a crashed rescan must not clear an artifact's history.
+/// Pure / unit-testable.
+fn post_scan_gates(latest_status: Option<&str>, has_completed_scan: bool) -> PostScanGates {
+    PostScanGates {
+        block_on_fail_applies: latest_status == Some("failed"),
+        severity_applies: has_completed_scan,
+    }
+}
+
 /// Allowed values for `scan_policies.max_severity`, mirroring the DB CHECK
 /// constraint in `migrations/022_security_scanning.sql`.
 ///
@@ -105,35 +144,41 @@ impl PolicyService {
 
         let mut violations = Vec::new();
 
-        // Check for completed scans on this artifact
+        // Post-scan gate inputs, in one round trip. `latest_status` is the newest
+        // row of ANY status (drives `block_on_fail`); `has_completed_scan` is an
+        // existence check (drives `max_severity`). See [`post_scan_gates`] for
+        // why these two must not share a single "newest row" lookup.
         #[derive(sqlx::FromRow)]
-        struct ScanRow {
-            status: String,
-            #[allow(dead_code)]
-            findings_count: i32,
-            #[allow(dead_code)]
-            critical_count: i32,
-            #[allow(dead_code)]
-            high_count: i32,
-            #[allow(dead_code)]
-            medium_count: i32,
-            #[allow(dead_code)]
-            low_count: i32,
+        struct ScanGateRow {
+            latest_status: Option<String>,
+            has_completed_scan: bool,
         }
 
-        let latest_scan: Option<ScanRow> = sqlx::query_as(
+        let gate_row: ScanGateRow = sqlx::query_as(
             r#"
-            SELECT status, findings_count, critical_count, high_count, medium_count, low_count
-            FROM scan_results
-            WHERE artifact_id = $1
-            ORDER BY created_at DESC
-            LIMIT 1
+            SELECT
+                (SELECT status
+                   FROM scan_results
+                  WHERE artifact_id = $1
+                  ORDER BY created_at DESC
+                  LIMIT 1) AS latest_status,
+                EXISTS (
+                    SELECT 1
+                      FROM scan_results
+                     WHERE artifact_id = $1
+                       AND status = 'completed'
+                ) AS has_completed_scan
             "#,
         )
         .bind(artifact_id)
-        .fetch_optional(&self.db)
+        .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let gates = post_scan_gates(
+            gate_row.latest_status.as_deref(),
+            gate_row.has_completed_scan,
+        );
 
         // #1649: classify the artifact's overall scan state from ALL its
         // scan_results rows (the same precedence the promotion gate uses), not
@@ -162,47 +207,45 @@ impl PolicyService {
                 continue;
             }
 
-            if let Some(ref scan) = latest_scan {
-                // Check: block_on_fail
-                if policy.block_on_fail && scan.status == "failed" {
-                    violations.push(format!("Policy '{}': latest scan failed", policy.name));
-                    continue;
-                }
+            // Check: block_on_fail
+            if policy.block_on_fail && gates.block_on_fail_applies {
+                violations.push(format!("Policy '{}': latest scan failed", policy.name));
+                continue;
+            }
 
-                // Check: max_severity threshold (non-acknowledged findings only)
-                if scan.status == "completed" {
-                    let _threshold = Severity::from_str_loose(&policy.max_severity)
-                        .unwrap_or(Severity::Critical);
+            // Check: max_severity threshold (non-acknowledged findings only)
+            if gates.severity_applies {
+                let _threshold =
+                    Severity::from_str_loose(&policy.max_severity).unwrap_or(Severity::Critical);
 
-                    // Count non-acknowledged findings at or above the threshold
-                    let violating_count: i64 = sqlx::query_scalar(
-                        r#"
-                        SELECT COUNT(*)
-                        FROM scan_findings
-                        WHERE artifact_id = $1
-                          AND NOT is_acknowledged
-                          AND severity IN (
-                              SELECT unnest(CASE $2
-                                  WHEN 'critical' THEN ARRAY['critical']
-                                  WHEN 'high' THEN ARRAY['critical', 'high']
-                                  WHEN 'medium' THEN ARRAY['critical', 'high', 'medium']
-                                  WHEN 'low' THEN ARRAY['critical', 'high', 'medium', 'low']
-                              END)
-                          )
-                        "#,
-                    )
-                    .bind(artifact_id)
-                    .bind(&policy.max_severity)
-                    .fetch_one(&self.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                // Count non-acknowledged findings at or above the threshold
+                let violating_count: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM scan_findings
+                    WHERE artifact_id = $1
+                      AND NOT is_acknowledged
+                      AND severity IN (
+                          SELECT unnest(CASE $2
+                              WHEN 'critical' THEN ARRAY['critical']
+                              WHEN 'high' THEN ARRAY['critical', 'high']
+                              WHEN 'medium' THEN ARRAY['critical', 'high', 'medium']
+                              WHEN 'low' THEN ARRAY['critical', 'high', 'medium', 'low']
+                          END)
+                      )
+                    "#,
+                )
+                .bind(artifact_id)
+                .bind(&policy.max_severity)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
 
-                    if violating_count > 0 {
-                        violations.push(format!(
-                            "Policy '{}': {} findings at or above {} severity",
-                            policy.name, violating_count, policy.max_severity
-                        ));
-                    }
+                if violating_count > 0 {
+                    violations.push(format!(
+                        "Policy '{}': {} findings at or above {} severity",
+                        policy.name, violating_count, policy.max_severity
+                    ));
                 }
             }
         }
@@ -442,6 +485,63 @@ mod tests {
                 "gate disabled -> never a violation regardless of scan state"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // post-scan gate inputs (block_on_fail vs max_severity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_gate_survives_a_newer_non_completed_scan_row() {
+        // Regression: both gates used to read the single newest scan_results row
+        // and the severity check ran only `if that_row.status == "completed"`. A
+        // scanner that recorded a non-terminal row AFTER a completed one — the
+        // normal shape for an asynchronous/external scanner — therefore turned
+        // the max_severity download gate off entirely, and an artifact with
+        // critical findings on record was served with a 200.
+        for newest in ["pending", "running", "not_applicable"] {
+            let gates = post_scan_gates(Some(newest), true);
+            assert!(
+                gates.severity_applies,
+                "a newer '{newest}' row must NOT disable severity blocking while a completed scan exists"
+            );
+            assert!(
+                !gates.block_on_fail_applies,
+                "'{newest}' is not a failure, so block_on_fail must stay quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_severity_gate_requires_a_completed_scan_somewhere() {
+        // Without any completed scan there are no findings on record to grade,
+        // so the severity gate must not fire. `block_unscanned` is the gate that
+        // covers this case.
+        for newest in [None, Some("pending"), Some("running"), Some("failed")] {
+            assert!(
+                !post_scan_gates(newest, false).severity_applies,
+                "no completed scan -> severity gate must not fire (newest={newest:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_on_fail_keys_on_the_newest_row_only() {
+        assert!(post_scan_gates(Some("failed"), false).block_on_fail_applies);
+        // A failed rescan on top of an older completed scan still trips
+        // block_on_fail, and severity now ALSO evaluates against the completed
+        // scan's findings rather than being skipped — strictly safer.
+        let gates = post_scan_gates(Some("failed"), true);
+        assert!(gates.block_on_fail_applies);
+        assert!(
+            gates.severity_applies,
+            "a crashed rescan must not clear an artifact's finding history"
+        );
+        assert!(!post_scan_gates(Some("completed"), true).block_on_fail_applies);
+        assert!(
+            !post_scan_gates(None, false).block_on_fail_applies,
+            "an artifact with no scan rows has nothing to fail"
+        );
     }
 
     // -----------------------------------------------------------------------
