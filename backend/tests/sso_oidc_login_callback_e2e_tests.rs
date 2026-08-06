@@ -71,14 +71,14 @@ use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use artifact_keeper_backend::api::SharedState;
-use artifact_keeper_backend::services::audit_service::{AuditLogEntryWithActor, AuditService};
+use artifact_keeper_backend::services::audit_service::AuditService;
 use artifact_keeper_backend::services::auth_config_service::{
     AuthConfigService, CreateOidcConfigRequest,
 };
 
 use common::sso_support::{
-    allow_private_sso_ip, build_state, ensure_sso_encryption_key, non_loopback_bind_ip, sso_app,
-    try_pool,
+    allow_private_sso_ip, audit_row_eventually, build_state, ensure_sso_encryption_key,
+    non_loopback_bind_ip, sso_app, try_pool,
 };
 
 // ===========================================================================
@@ -313,42 +313,6 @@ async fn delete_user_by_sub(pool: &PgPool, external_id: &str) {
         .bind(external_id)
         .execute(pool)
         .await;
-}
-
-/// Poll an audit query until some returned row satisfies `pred`, or a bounded
-/// ~2s budget is exhausted. Returns whether a match was observed.
-///
-/// Load-bearing since #2905: `audit_fire_and_forget` SPAWNS the audit INSERT
-/// rather than awaiting it, so the OIDC callback handler returns to the client
-/// *before* its LOGIN / LOGIN_FAILED row is durable. Reading the trail
-/// synchronously right after the callback therefore races the detached write
-/// and fails intermittently-to-always depending on scheduling.
-///
-/// This mirrors `audit_count_eventually` in
-/// `backend/src/api/handlers/test_db_helpers.rs`, which #2905 added to fix the
-/// same race for the in-crate assertions. That module lives in `src/` and so is
-/// unreachable from this separate integration-test binary, which is exactly how
-/// this call site was missed.
-async fn audit_row_eventually<F>(
-    audit: &AuditService,
-    user_id: Option<Uuid>,
-    action: &str,
-    pred: F,
-) -> bool
-where
-    F: Fn(&AuditLogEntryWithActor) -> bool,
-{
-    for _ in 0..100 {
-        let (rows, _) = audit
-            .query(user_id, Some(action), None, None, None, None, None, 0, 200)
-            .await
-            .expect("audit query");
-        if rows.iter().any(&pred) {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    false
 }
 
 /// Look up a provisioned federated user by `external_id`.

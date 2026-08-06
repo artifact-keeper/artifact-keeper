@@ -69,8 +69,9 @@ use artifact_keeper_backend::services::auth_config_service::{
 };
 
 use common::sso_support::{
-    base64_standard, build_state, ensure_sso_encryption_key, saml_idp_cert_pem, sign_saml_document,
-    sign_saml_document_with_key, sso_app, try_pool, SamlResponseSpec,
+    audit_row_eventually, base64_standard, build_state, ensure_sso_encryption_key,
+    saml_idp_cert_pem, sign_saml_document, sign_saml_document_with_key, sso_app, try_pool,
+    SamlResponseSpec,
 };
 
 // ===========================================================================
@@ -797,31 +798,17 @@ async fn test_saml_acs_emits_audit_records() {
     assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
 
     let (user_id, _, _, _) = get_saml_user(&pool, &name_id).await.expect("provisioned");
-    let (login_rows, _) = audit
-        .query(
-            Some(user_id),
-            Some("LOGIN"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            50,
-        )
-        .await
-        .expect("audit query LOGIN");
-    assert!(
-        login_rows.iter().any(|r| {
-            r.resource_type == "user"
-                && r.details
-                    .as_ref()
-                    .and_then(|d| d.get("provider"))
-                    .and_then(|p| p.as_str())
-                    == Some("saml")
-        }),
-        "a LOGIN audit row with details.provider=saml must exist for the user"
-    );
+    // Poll: the LOGIN row is written by a detached task (#2905), so it is not
+    // guaranteed to be visible the instant the ACS handler returns.
+    let login_ok = audit_row_eventually(&audit, Some(user_id), "LOGIN", |r| {
+        r.resource_type == "user"
+            && r.details
+                .as_ref()
+                .and_then(|d| d.get("provider"))
+                .and_then(|p| p.as_str())
+                == Some("saml")
+    })
+    .await;
 
     // --- failure → LOGIN_FAILED (unsolicited response, rejected before user sync) ---
     let mut unsolicited = happy_spec(
@@ -837,33 +824,30 @@ async fn test_saml_acs_emits_audit_records() {
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    let (fail_rows, _) = audit
-        .query(
-            None,
-            Some("LOGIN_FAILED"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            200,
-        )
-        .await
-        .expect("audit query LOGIN_FAILED");
-    assert!(
-        fail_rows.iter().any(|r| {
-            r.details
-                .as_ref()
-                .and_then(|d| d.get("provider"))
-                .and_then(|p| p.as_str())
-                == Some("saml")
-        }),
-        "a LOGIN_FAILED audit row with details.provider=saml must exist"
-    );
+    // Same detached-write race as the LOGIN row above.
+    let fail_ok = audit_row_eventually(&audit, None, "LOGIN_FAILED", |r| {
+        r.details
+            .as_ref()
+            .and_then(|d| d.get("provider"))
+            .and_then(|p| p.as_str())
+            == Some("saml")
+    })
+    .await;
 
+    // Clean up BEFORE asserting (#3120 pattern): a panicking assertion would
+    // otherwise skip these deletes and strand the provisioned user + provider
+    // for the rest of the run.
     delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;
+
+    assert!(
+        login_ok,
+        "a LOGIN audit row with details.provider=saml must exist for the user"
+    );
+    assert!(
+        fail_ok,
+        "a LOGIN_FAILED audit row with details.provider=saml must exist"
+    );
 }
 
 /// Full flow: `GET /saml/{id}/login` persists a pending SSO session whose id is
